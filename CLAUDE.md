@@ -24,9 +24,15 @@ Design phase complete; no implementation yet. Next step is M0 in ROADMAP.md
 
 ## Key constraints
 
-- Reuses `coppa-dsp` (FFT) and `coppa-channel` (Watterson fading for tests)
-  from the sibling coppa repo. Note: coppa has NO Kaiser filter designer — the
-  PFB prototype designer is new code here (`skimmer-dsp::proto`).
+- Reuses `coppa-dsp` (FFT) from the sibling coppa repo. Note: coppa has NO
+  Kaiser filter designer — the PFB prototype designer is new code here
+  (`skimmer-dsp::proto`).
+- **Correction (2026-07-07):** ARCHITECTURE.md and SPEC-decode-core.md assume
+  `coppa-channel` provides Watterson HF fading for the golden test vectors —
+  it does NOT yet (only AWGN + sinusoidal fade). The Watterson simulator must
+  be built first, ideally upstreamed to coppa; the coppa-adoption proposal
+  (fabletest/proposals/coppa-adoption/) plans exactly that, so sequence
+  accordingly or build it in `skimmer-testkit`.
 - Deterministic decode path is a hard requirement: file input → byte-identical
   spot logs.
 - Classical decoder first; ML fusion (dit's pattern) only at M4, gated on
