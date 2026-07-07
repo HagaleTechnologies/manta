@@ -1,0 +1,278 @@
+# skimmer — Architecture
+
+Headless wideband CW skimmer: SDR IQ in, RBN-compatible spots out.
+
+This document records the core design decisions. It is deliberately opinionated:
+where a choice had to be made, it is made here, with the rationale. Sections
+marked **(research-dependent)** are the only intentionally open questions.
+
+## 1. System overview
+
+```
+                ┌─────────────────────────────────────────────────────────────┐
+                │                        skimmer daemon                        │
+                │                                                              │
+ RTL-SDR ──┐    │  ┌──────────┐   ┌─────────────┐   ┌───────────────────────┐  │
+ Airspy  ──┼─▶  │  │  input   │──▶│ channelizer │──▶│  detector             │  │
+ SDRplay ──┘    │  │ (IQ src) │   │ (PFB, 1024  │   │  (noise floor, SNR    │  │
+ (SoapySDR)     │  └──────────┘   │  channels)  │   │   gate, track mgmt)   │  │
+ KiwiSDR ──────▶│       ▲         └─────────────┘   └──────────┬────────────┘  │
+ (network)      │       │                                      │ active tracks │
+ IQ/WAV file ──▶│       │ config                    ┌──────────▼────────────┐  │
+ rig audio ────▶│       │                           │  decoder pool         │  │
+ (cpal)         │       │                           │  (per-signal CW       │  │
+                │       │                           │   decoders, N ≤ 500)  │  │
+                │       │                           └──────────┬────────────┘  │
+                │       │                                      │ decoded text  │
+                │  ┌────┴─────┐   ┌─────────────┐   ┌──────────▼────────────┐  │
+                │  │ metrics/ │◀──│ spot server │◀──│  validator            │  │
+                │  │ tracing  │   │ telnet+JSON │   │  (callsign, CQ/DE,    │  │
+                │  └──────────┘   └──────┬──────┘   │   dedupe, confidence) │  │
+                │                        │          └───────────────────────┘  │
+                └────────────────────────┼─────────────────────────────────────┘
+                                         │
+                        telnet :7300 (DX cluster protocol, RBN format)
+                        tcp/ws :7301 (JSON Lines spot stream → cqdx)
+```
+
+Data flows one direction. Every stage is a bounded-queue actor on the tokio
+runtime except the channelizer and decoders, which run on dedicated
+compute threads fed by lock-free SPSC rings (`rtrb`, same as coppa-audio) —
+IQ never touches the async runtime.
+
+## 2. Workspace layout
+
+Multi-crate workspace following coppa's conventions (edition 2021, MIT/Apache-2.0,
+workspace-level dependency table, `criterion` benches, `proptest` where invariants
+allow).
+
+```
+skimmer/
+├── Cargo.toml                 # workspace
+├── crates/
+│   ├── skimmer-input          # IQ sources: SoapySDR, KiwiSDR client, file, audio
+│   ├── skimmer-dsp            # PFB channelizer, noise-floor estimation, envelope
+│   ├── skimmer-decode         # CW keying state machine, timing, Morse decode
+│   ├── skimmer-spot           # callsign validation, CQ/DE parse, dedupe, scoring
+│   ├── skimmer-server         # telnet cluster server + JSON/WebSocket stream
+│   ├── skimmer-engine         # orchestration: track lifecycle, decoder pool
+│   ├── skimmer-testkit        # synthetic CW generator, golden-IQ harness
+│   └── skimmer-cli            # `skimmer` binary: daemon + subcommands
+```
+
+Dependency graph (arrows = depends on):
+
+```
+skimmer-cli ──▶ skimmer-engine ──▶ skimmer-input
+                     │        ├──▶ skimmer-dsp ──────▶ coppa-dsp
+                     │        ├──▶ skimmer-decode
+                     │        └──▶ skimmer-spot
+                     └──▶ skimmer-server
+skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
+```
+
+### Reused from coppa vs. new
+
+| Capability | Source |
+|---|---|
+| FFT (`FftProcessor`) | **reuse** `coppa-dsp::fft` |
+| FIR design / filtering | **reuse** `coppa-dsp::filter` (PFB prototype filter design) |
+| AGC | **reuse** `coppa-dsp::agc` (per-channel envelope normalization) |
+| Channel impairments for tests (AWGN, freq offset, fading, **Watterson HF**) | **reuse** `coppa-channel` |
+| Audio-device input (single-channel mode) | **reuse** `coppa-audio` (cpal) |
+| Polyphase filterbank channelizer | **new** (`skimmer-dsp`) — coppa has no channelizer |
+| Order-statistic noise-floor estimator | **new** (`skimmer-dsp`) |
+| CW keying/timing/Morse decode | **new** (`skimmer-decode`) — dit's algorithms, ported & headless |
+| Callsign/spot validation | **new** (`skimmer-spot`) |
+| DX cluster telnet protocol | **new** (`skimmer-server`) |
+
+coppa crates are consumed as git dependencies (path deps during co-development in
+this workspace-of-workspaces). If coppa publishes to crates.io first, switch to
+versioned deps.
+
+## 3. Input layer (`skimmer-input`)
+
+One trait, four implementations:
+
+```
+trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
+```
+
+- **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
+  8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
+  selection by driver string. Feature-gating keeps the core buildable without the
+  native SoapySDR library (CI, contributors without hardware).
+- **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
+  narrow, but gives instant worldwide receiver access for development and lets
+  low-budget nodes contribute spots.
+- **File playback**: WAV (via `hound`, matching coppa) and raw interleaved
+  `f32`/`i16` IQ with a small JSON sidecar for rate/center-freq. Drives the entire
+  test strategy; the daemon must run identically from file and live SDR.
+- **Audio passband** (via `coppa-audio`): 48 kHz real audio from a rig's RX audio,
+  Hilbert-transformed to analytic. Degenerate ~3 kHz "wideband" mode; exists
+  because it makes skimmer useful to people with zero SDR hardware, and it is the
+  M1 bring-up path.
+
+**Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
+band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
+(Airspy HF+ full span). The channelizer parameterizes N to hold channel spacing
+near 100 Hz regardless of input rate (§4). Multi-band via multiple daemon
+instances, not one instance retuning — simpler, and SDRs are cheap.
+
+All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
+input overruns are counted, surfaced as metrics, and never block the SDR thread.
+
+## 4. Channelizer (`skimmer-dsp`)
+
+**Decision: 4×-oversampled polyphase filterbank (PFB), ~100 Hz channel spacing,
+detection on channel powers, decoders attached only to active channels.**
+
+- N = input_rate / ~93.75 Hz, rounded to a power of two: N=1024 at 96 kS/s,
+  N=2048 at 192 kS/s, N=8192 at 768 kS/s. Channel spacing = rate/N ≈ 94 Hz.
+- Prototype lowpass: Kaiser-designed FIR (via `coppa-dsp::filter`), 8 taps/branch,
+  passband ~140 Hz — each channel fully contains a CW signal up to ~45 WPM
+  (occupied BW ≈ 4·WPM Hz ≈ 180 Hz at 45 WPM spans ≤ 2 channels; the decoder reads
+  the peak channel, and the 50%+ spectral overlap between adjacent channels means
+  no signal is lost straddling an edge).
+- **4× oversampled outputs** (hop = N/4): per-channel output rate ≈ 375 Hz. At
+  40 WPM a dit is 30 ms ≈ 11 samples — comfortably enough for envelope timing.
+  2× (187 Hz, 5.6 samples/dit) was rejected as too marginal for QSB'd fast CW.
+- Implementation: polyphase FIR commutator + one N-point FFT per hop
+  (`coppa-dsp::fft::FftProcessor`). Frequency-domain output magnitude² feeds the
+  detector directly — the PFB *is* the spectrum analyzer; no separate FFT path.
+
+**Detector / track manager.** Per-channel noise floor by order statistics
+(median of channel power over a sliding ~10 s window — median, not mean, so CW
+keying doesn't inflate its own floor). A channel goes *active* when smoothed power
+exceeds floor + threshold (default 6 dB) with hysteresis (3 dB drop + 5 s hang to
+survive QSB and inter-word gaps). Active channel ⇒ a **track** (center channel ±1
+neighbor, combined by max-power selection) ⇒ a decoder is leased from the pool.
+Track cap (default 500) with lowest-SNR eviction; evictions are counted and
+reported (no silent coverage loss).
+
+**CPU budget** (the reason this whole design is viable):
+
+| Stage | Cost at 192 kS/s | Notes |
+|---|---|---|
+| PFB FIR (8 taps/branch, complex) | ~12 MFLOP/s | 192k samples × 8 CMACs |
+| FFT (2048-pt, 375/s) | ~35 MFLOP/s | 5·N·log₂N per FFT |
+| Detection (power, medians) | ~5 MFLOP/s | incremental order statistics |
+| 300 active decoders @ 375 Hz | ~10 MFLOP/s | envelope + state machine is cheap |
+| **Total** | **< 100 MFLOP/s** | **≪ 1 core**; a Pi 4 core does ~5 GFLOP/s |
+
+Even at 768 kS/s the pipeline stays under half a core; the machine's job is I/O,
+not math. This budget is enforced by `criterion` benches in CI (M2 acceptance).
+
+## 5. Per-channel decoder (`skimmer-decode`)
+
+The wideband, headless port of dit's proven single-channel chain. Classical
+first; ML is a fusion stage later (M4), exactly as dit evolved.
+
+Per track, operating on the ~375 Hz complex channel stream:
+
+1. **Envelope**: |x| → per-channel AGC (`coppa-dsp::agc`) → smoothed magnitude.
+   (Goertzel, dit's tone finder, is unnecessary here — the PFB already did the
+   frequency selection.)
+2. **Keying detection**: dual-rail noise/signal EMA estimators → adaptive
+   threshold at their geometric mean → key-down/key-up decisions with hysteresis
+   and minimum-duration debounce (dit's `KeyingDecision` concept, simplified).
+3. **Speed tracking**: online 2-means clustering of mark durations into
+   {dit, dah}; WPM = 1200/dit_ms, tracked with EMA. Handles 10–40+ WPM and drift;
+   Farnsworth spacing tolerated by decoupling inter-element and inter-word gap
+   thresholds (dit's speed-detector lesson).
+4. **Element→character decode**: marks/spaces classified against the tracked
+   timing model with per-element likelihoods, then a **beam search (width 4) over
+   the Morse code tree** — small-Viterbi rather than hard thresholding, so a
+   marginal dit/dah keeps both hypotheses alive until character boundary. Emits
+   characters with confidence.
+5. **(M4, research-dependent) ML decoder**: small CTC model on the channel
+   envelope, fused with the classical decoder by adaptive confidence weighting —
+   a direct port of dit's `DecoderFusionEngine` design (sliding-window accuracy
+   tracking, EMA-smoothed weights, weight floor). Training corpus comes from
+   `skimmer-testkit` synthesis + RBN-validated on-air recordings. The classical
+   decoder must ship first and defines the accuracy baseline the ML stage has to
+   beat under QRM/QSB (measured, not assumed).
+
+Decoder output: timestamped character stream + WPM + SNR + confidence per track.
+
+## 6. Spot validation (`skimmer-spot`)
+
+Decoded text is noisy; validation is what makes spots trustworthy. Pipeline per
+track, over a rolling text window:
+
+1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
+   `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`). Context determines
+   spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
+   designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
+   refreshable) — a call with an unallocated prefix is rejected.
+3. **SCP cross-check** (optional, default on if file present): membership in
+   `master.scp` (contest super-check-partial list) *raises* confidence; absence
+   only lowers it (new/rare calls must still spot — cqdx exists precisely for
+   rare ones).
+4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
+   the same track before first spot (CW ops repeat their calls; single decodes
+   are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
+   SNR, SCP/cty hits).
+5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
+   re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
+   carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
+   WPM, type, confidence.
+
+## 7. Output layer (`skimmer-server`)
+
+- **Telnet DX cluster server** (default :7300): standard login prompt, emits
+  RBN-format spots —
+  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
+  Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
+  clients not to choke. This is the RBN/aggregator compatibility surface.
+- **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
+  (adds confidence, track id, decoder text context). This is the cqdx ingest
+  surface; schema published in `dispensa` as a JSON Schema contract alongside the
+  existing ecosystem contracts.
+- Both servers are thin fan-out consumers of one broadcast channel; slow clients
+  are disconnected, never back-pressure the pipeline.
+
+## 8. Configuration & observability
+
+- Single TOML config (coppa convention): device, center freq, band plan
+  (CW segment limits — don't decode/spot outside them), thresholds, track cap,
+  server ports, cty/scp paths, station callsign (spotter ID).
+- `tracing` throughout with `EnvFilter`; `skimmer --status` hits a local control
+  socket for live stats. Prometheus text endpoint (feature `metrics`): input
+  overruns, active tracks, evictions, decode rate, spots/min, per-stage queue
+  depths, spot confidence histogram.
+- Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
+  the pipeline** — if coverage was bounded, the metrics say so.
+
+## 9. Test strategy (`skimmer-testkit`)
+
+The decisive advantage of building this in this ecosystem: **synthetic ground
+truth with realistic HF impairment already exists.**
+
+- **Synthetic CW generator**: text → keyed envelope (configurable WPM, weighting,
+  rise-time/click shaping, human timing jitter model) → complex tone at arbitrary
+  offset. Compose *many* generators into one wideband IQ scene ("50 signals,
+  10–35 WPM, −5 to +30 dB SNR, 200 Hz–96 kHz spread").
+- **Impairments from `coppa-channel`**: AWGN, frequency offset/drift, and the
+  **Watterson HF model** (the standard ionospheric fading/multipath model) —
+  reused, not rebuilt. Skimmer accuracy is quoted *under Watterson CCIR-poor*,
+  not just clean AWGN.
+- **Golden IQ corpus**: recorded band segments (contest weekends = dense QRM;
+  quiet weekdays = weak-signal) with RBN's own spots for the same time/frequency
+  window as reference labels → recall/precision vs. the incumbent, the headline
+  benchmark for M3.
+- Unit level: proptest round-trips (text → CW → decode == text) across the
+  WPM/SNR envelope; criterion benches gate the CPU budget (§4).
+- End-to-end: daemon run from an IQ file must produce byte-identical spot logs
+  across platforms (determinism requirement; no wall-clock in the decode path).
+
+## 10. Concurrency model
+
+- SDR/input thread → `rtrb` ring → **channelizer thread** (owns PFB, detector) →
+  per-track sample queues → **decoder pool** (rayon-style fixed worker pool,
+  tracks are work items; decoders are `Send` state machines, no shared state) →
+  crossbeam channel → **tokio runtime** (validator, servers, metrics, control).
+- Rationale: identical to coppa's proven audio/engine split — real-time DSP on
+  dedicated threads with lock-free handoff; everything with a socket lives in
+  async-land.
