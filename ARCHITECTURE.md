@@ -76,8 +76,8 @@ skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
 | Capability | Source |
 |---|---|
 | FFT (`FftProcessor`) | **reuse** `coppa-dsp::fft` |
-| FIR design / filtering | **reuse** `coppa-dsp::filter` (PFB prototype filter design) |
-| AGC | **reuse** `coppa-dsp::agc` (per-channel envelope normalization) |
+| FIR design (PFB prototype) | **new** (`skimmer-dsp::proto`) — `coppa-dsp::filter` ships only `RrcFilter` (SPEC §10.1) |
+| Envelope normalization | **new** — per-track fixed reference scale; `coppa-dsp::agc` not used in the decode path (SPEC §10.2) |
 | Channel impairments for tests (AWGN, freq offset, fading, **Watterson HF**) | **reuse** `coppa-channel` |
 | Audio-device input (single-channel mode) | **reuse** `coppa-audio` (cpal) |
 | Polyphase filterbank channelizer | **new** (`skimmer-dsp`) — coppa has no channelizer |
@@ -129,7 +129,8 @@ detection on channel powers, decoders attached only to active channels.**
 
 - N = input_rate / ~93.75 Hz, rounded to a power of two: N=1024 at 96 kS/s,
   N=2048 at 192 kS/s, N=8192 at 768 kS/s. Channel spacing = rate/N ≈ 94 Hz.
-- Prototype lowpass: Kaiser-designed FIR (via `coppa-dsp::filter`), 8 taps/branch,
+- Prototype lowpass: Kaiser-designed FIR (new code, `skimmer-dsp::proto` — see
+  SPEC §1.2), 8 taps/branch,
   passband ~140 Hz — each channel fully contains a CW signal up to ~45 WPM
   (occupied BW ≈ 4·WPM Hz ≈ 180 Hz at 45 WPM spans ≤ 2 channels; the decoder reads
   the peak channel, and the 50%+ spectral overlap between adjacent channels means
@@ -155,7 +156,7 @@ reported (no silent coverage loss).
 | Stage | Cost at 192 kS/s | Notes |
 |---|---|---|
 | PFB FIR (8 taps/branch, complex) | ~12 MFLOP/s | 192k samples × 8 CMACs |
-| FFT (2048-pt, 375/s) | ~35 MFLOP/s | 5·N·log₂N per FFT |
+| FFT (2048-pt, 375/s) | ~42 MFLOP/s | 5·N·log₂N per FFT |
 | Detection (power, medians) | ~5 MFLOP/s | incremental order statistics |
 | 300 active decoders @ 375 Hz | ~10 MFLOP/s | envelope + state machine is cheap |
 | **Total** | **< 100 MFLOP/s** | **≪ 1 core**; a Pi 4 core does ~5 GFLOP/s |
@@ -170,7 +171,8 @@ first; ML is a fusion stage later (M4), exactly as dit evolved.
 
 Per track, operating on the ~375 Hz complex channel stream:
 
-1. **Envelope**: |x| → per-channel AGC (`coppa-dsp::agc`) → smoothed magnitude.
+1. **Envelope**: |x| → per-track fixed reference scale (SPEC §3.1; coppa's
+   block AGC is not used) → smoothed magnitude.
    (Goertzel, dit's tone finder, is unnecessary here — the PFB already did the
    frequency selection.)
 2. **Keying detection**: dual-rail noise/signal EMA estimators → adaptive

@@ -11,7 +11,8 @@ file playback, single hardwired channel (no PFB), classical decoder chain
 (envelope → keying → speed tracking → beam-search Morse decode).
 
 **Accept when:**
-- `skimmer decode fixture.iq` prints the correct text for a synthetic
+- `skimmer decode fixture.wav` (WAV input, per SPEC-decode-core §7's M0
+  definition) prints the correct text for a synthetic
   25 WPM / +20 dB SNR / AWGN-only single-signal IQ file.
 - Proptest round-trip (text → testkit CW → decoder) passes for 10–40 WPM at
   ≥ +15 dB SNR, CER = 0.
@@ -27,8 +28,8 @@ SDR.
 - Copies a live W1AW code-practice transmission (or equivalent scheduled CW) end
   to end with recognizable text.
 - Runs ≥ 1 hour without panic, unbounded memory, or input overrun.
-- Decoder handles QSB: testkit scene with Watterson CCIR-good fading at +15 dB,
-  CER < 5 %.
+- Decoder handles QSB: testkit scene with Watterson CCIR-good fading at +10 dB,
+  CER < 5 % (= spec vector V4; M1 gate is V1–V6 per SPEC-decode-core §7).
 
 ## M2 — Wideband: PFB + detector + decoder pool
 
@@ -37,10 +38,10 @@ floor, track manager, decoder pool, SoapySDR input (Airspy HF+ / RTL-SDR),
 KiwiSDR input.
 
 **Accept when:**
-- Testkit scene with **50 simultaneous signals** (10–35 WPM, −5…+30 dB SNR,
-  spread over 96 kHz, Watterson CCIR-poor): ≥ 90 % of signals ≥ +6 dB SNR decoded
-  with CER < 10 %; zero cross-channel ghost decodes (a signal decoded on a wrong
-  track).
+- Pileup vectors V8 (AWGN: ≥ 45/50 callsigns validated, 0 bogus) and V8w
+  (same 50-signal scene under Watterson CCIR-poor: ≥ 90 % of signals ≥ +6 dB
+  SNR decoded with CER < 10 %, 0 bogus, zero cross-channel ghost decodes)
+  both pass per SPEC-decode-core §7.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
   of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track

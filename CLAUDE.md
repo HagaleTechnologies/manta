@@ -34,7 +34,8 @@ Design phase complete; no implementation yet. Next step is M0 in ROADMAP.md
   correctness bugs: Doppler spread ~41% too fast vs ITU-R F.1487, and
   per-block SNR renormalization that erases fading dynamics. Those fixes
   change all fading outputs — they MUST land upstream before freezing the
-  golden test vectors V1–V10. Also note SNR convention: this repo's spec
+  Watterson-dependent golden vectors (V4/V5/V8w; freeze the whole fixture
+  set together regardless). Also note SNR convention: this repo's spec
   froze SNR-in-2500-Hz; the shared `awgn_ref_bw()` design in SPEC-watterson
   reconciles it with the benchmark harness's 3 kHz convention.
 - Deterministic decode path is a hard requirement: file input → byte-identical

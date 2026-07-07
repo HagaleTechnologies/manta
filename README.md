@@ -40,9 +40,10 @@ them with zero changes.
 
 ## Relationship to sibling projects
 
-- **[coppa](../coppa)** — skimmer reuses `coppa-dsp` (FFT, FIR design, AGC) and
+- **[coppa](../coppa)** — skimmer reuses `coppa-dsp` (FFT) and
   `coppa-channel` (AWGN / Watterson HF fading models) for its DSP core and test
-  harness rather than reimplementing them.
+  harness rather than reimplementing them. (FIR prototype design and AGC are
+  new code here — see SPEC-decode-core §10.)
 - **[dit](../dit)** — skimmer's decoder design is the wideband, headless evolution
   of dit's single-channel CW engine (envelope → keying state machine → adaptive
   speed tracking → character decode, with an optional ML decoder fused by
