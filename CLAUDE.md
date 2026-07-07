@@ -27,12 +27,16 @@ Design phase complete; no implementation yet. Next step is M0 in ROADMAP.md
 - Reuses `coppa-dsp` (FFT) from the sibling coppa repo. Note: coppa has NO
   Kaiser filter designer — the PFB prototype designer is new code here
   (`skimmer-dsp::proto`).
-- **Correction (2026-07-07):** ARCHITECTURE.md and SPEC-decode-core.md assume
-  `coppa-channel` provides Watterson HF fading for the golden test vectors —
-  it does NOT yet (only AWGN + sinusoidal fade). The Watterson simulator must
-  be built first, ideally upstreamed to coppa; the coppa-adoption proposal
-  (fabletest/proposals/coppa-adoption/) plans exactly that, so sequence
-  accordingly or build it in `skimmer-testkit`.
+- **Correction (2026-07-07, supersedes the earlier note):** `coppa-channel`
+  DOES have a Watterson model (`crates/coppa-channel/src/watterson.rs`) —
+  coppa's own CLAUDE.md limitation bullet was stale. However, an audit
+  (SPEC-watterson.md in the coppa-adoption proposal package) found two
+  correctness bugs: Doppler spread ~41% too fast vs ITU-R F.1487, and
+  per-block SNR renormalization that erases fading dynamics. Those fixes
+  change all fading outputs — they MUST land upstream before freezing the
+  golden test vectors V1–V10. Also note SNR convention: this repo's spec
+  froze SNR-in-2500-Hz; the shared `awgn_ref_bw()` design in SPEC-watterson
+  reconciles it with the benchmark harness's 3 kHz convention.
 - Deterministic decode path is a hard requirement: file input → byte-identical
   spot logs.
 - Classical decoder first; ML fusion (dit's pattern) only at M4, gated on
