@@ -1,0 +1,7 @@
+schema = "wiki-config/v1"
+repo = "skimmer"
+visibility = "private"
+# public | private
+# optional overrides:
+# max_pages = 100
+# export_max_bytes = 400000

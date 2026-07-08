@@ -1,0 +1,223 @@
+{
+  "generated_at": "2026-07-07T18:04:32Z",
+  "head_commit": "e68b106",
+  "pages": [
+    {
+      "hash": "sha256:849820d9d2912c471414d406acf6c37eab9c75510017a306e1ff7cfcb3d30729",
+      "id": "coppa-reuse",
+      "kind": "interface",
+      "links": [
+        "pfb-channelizer",
+        "decode-chain",
+        "watterson-dependency"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/coppa-reuse.md",
+      "sources": [
+        "ARCHITECTURE.md",
+        "docs/SPEC-decode-core.md#10-deviations-from-architecture-md",
+        "CLAUDE.md"
+      ],
+      "status": "current",
+      "title": "What does skimmer reuse from coppa, and what is deliberately new code?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:090f03938bcb57207294c76ae7dffe6ea5854c4170d6b2e1ba9efdd11331f962",
+      "id": "decode-chain",
+      "kind": "subsystem",
+      "links": [
+        "detector-tracks",
+        "spot-validation"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/decode-chain.md",
+      "sources": [
+        "docs/SPEC-decode-core.md#3-per-track-demodulation",
+        "ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "How does the per-track CW decode chain work?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:b6e5833fa0f410304f8cb4f57d99a5e3dcc587c2d33142855b2b81cdd9119787",
+      "id": "detector-tracks",
+      "kind": "subsystem",
+      "links": [
+        "pfb-channelizer",
+        "decode-chain"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/detector-tracks.md",
+      "sources": [
+        "docs/SPEC-decode-core.md#2-noise-floor-signal-presence-detection",
+        "ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "How does the detector and track manager decide what to decode?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:552750b6d36fd4da58a1c02a6ebb3a80221657c88f98ca187cdf172d0a4db051",
+      "id": "determinism",
+      "kind": "gotcha",
+      "links": [
+        "decode-chain"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/determinism.md",
+      "sources": [
+        "docs/SPEC-decode-core.md#6-determinism-requirements",
+        "ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about the byte-identical decode requirement?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:77f6164d209809f6d4b8f8a92ff11e2be3feb333f656989d7dc3221a61c01100",
+      "id": "golden-vector-freeze",
+      "kind": "decision-digest",
+      "links": [
+        "watterson-dependency",
+        "coppa-reuse"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/golden-vector-freeze.md",
+      "sources": [
+        "docs/SPEC-decode-core.md#7-golden-test-vectors-m0-m1-acceptance",
+        "CLAUDE.md"
+      ],
+      "status": "current",
+      "title": "Why must the golden test vectors pin an exact coppa commit?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:b5bf4324ed409cb39507a97d7483960d64edf3b581f1c21a9b0b3ba7681f1f14",
+      "id": "overview",
+      "kind": "overview",
+      "links": [
+        "pfb-channelizer",
+        "decode-chain",
+        "coppa-reuse"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/overview.md",
+      "sources": [
+        "README.md",
+        "ARCHITECTURE.md",
+        "ROADMAP.md",
+        "CLAUDE.md"
+      ],
+      "status": "current",
+      "title": "skimmer \u2014 what is this and where do things live?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:599b5753405ba1ab775a19fe93e46ca651408b8b65269d860da73c34387dad35",
+      "id": "pfb-channelizer",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "detector-tracks",
+        "coppa-reuse"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/pfb-channelizer.md",
+      "sources": [
+        "docs/SPEC-decode-core.md#1-channelizer",
+        "ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "How does the PFB channelizer work and why is it shaped this way?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:d5ae10feb45c67f7b0ac942cff7953606a6de90166ec2aea5a7786378dbc8ef9",
+      "id": "spot-output-contract",
+      "kind": "interface",
+      "links": [
+        "spot-validation"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/spot-output-contract.md",
+      "sources": [
+        "ARCHITECTURE.md",
+        "README.md",
+        "CLAUDE.md"
+      ],
+      "status": "current",
+      "title": "What spot-output contracts does skimmer expose (telnet RBN + JSON)?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:904bea8fc41a12b8c531387108e55cd56a6c737b1c138ae2c9aaf5f8e2473762",
+      "id": "spot-validation",
+      "kind": "subsystem",
+      "links": [
+        "decode-chain",
+        "spot-output-contract"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/spot-validation.md",
+      "sources": [
+        "ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "How does skimmer decide a decoded call is trustworthy enough to spot?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    },
+    {
+      "hash": "sha256:a72de6ac72b61069b2c309cb6fc4f665b611c8aa3e70644526d095183e0c5b66",
+      "id": "watterson-dependency",
+      "kind": "gotcha",
+      "links": [
+        "golden-vector-freeze",
+        "coppa-reuse"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/watterson-dependency.md",
+      "sources": [
+        "CLAUDE.md",
+        "ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about depending on coppa's Watterson HF fading model?",
+      "verified_commit": "e68b106",
+      "verified_date": "2026-07-07",
+      "visibility": "private"
+    }
+  ],
+  "repo": "skimmer",
+  "schema": "wiki-manifest/v1",
+  "visibility": "private"
+}
