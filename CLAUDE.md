@@ -22,22 +22,35 @@ Design phase complete; no implementation yet. Next step is M0 in ROADMAP.md
   decisions are already made.
 - `ROADMAP.md` — milestones M0–M4 with acceptance criteria
 
+## Knowledge wiki
+
+`wiki/INDEX.md` is the map of accumulated knowledge — read it before deep
+exploration; open pages relevant to your task. After substantive work, run
+/wiki-update: distill new gotchas/decisions/corrections into the wiki (or
+into docs/ if normative — the wiki points, it never restates). The wiki is
+descriptive and always loses conflicts with code and docs/.
+
 ## Key constraints
 
 - Reuses `coppa-dsp` (FFT) from the sibling coppa repo. Note: coppa has NO
   Kaiser filter designer — the PFB prototype designer is new code here
   (`skimmer-dsp::proto`).
-- **Correction (2026-07-07, supersedes the earlier note):** `coppa-channel`
-  DOES have a Watterson model (`crates/coppa-channel/src/watterson.rs`) —
-  coppa's own CLAUDE.md limitation bullet was stale. However, an audit
-  (SPEC-watterson.md in the coppa-adoption proposal package) found two
-  correctness bugs: Doppler spread ~41% too fast vs ITU-R F.1487, and
-  per-block SNR renormalization that erases fading dynamics. Those fixes
-  change all fading outputs — they MUST land upstream before freezing the
-  Watterson-dependent golden vectors (V4/V5/V8w; freeze the whole fixture
-  set together regardless). Also note SNR convention: this repo's spec
-  froze SNR-in-2500-Hz; the shared `awgn_ref_bw()` design in SPEC-watterson
-  reconciles it with the benchmark harness's 3 kHz convention.
+- **Watterson upstream fixes landed** (`coppa` main 2026-07-07, commits
+  `9ab1547`, `34aec5f`, `fc35895`): the two bugs identified in the
+  SPEC-watterson audit (Doppler spread ~41% too fast vs ITU-R F.1487;
+  per-block SNR renormalization erasing fading dynamics) are fixed. Golden-
+  vector freeze for V4/V5/V8w is **unblocked** — pin the exact coppa
+  commit used when the vectors are generated.
+  - **Convention verified against coppa's current `watterson.rs`:** the
+    fixed convention matches what skimmer's spec expects — `doppler_spread_hz`
+    is the **2σ width** of the Gaussian Doppler PSD (sigma = spread / 2,
+    via `doppler_sigma_hz()`), and normalization is **ensemble-only**
+    (E|g|² = 1 across realizations; per-realization normalization is
+    explicitly rejected in the module doc and code comment). No divergence
+    from skimmer's expected convention.
+  - **SNR convention (still live):** this repo's spec froze SNR-in-2500-Hz;
+    the shared `awgn_ref_bw()` design in SPEC-watterson reconciles it with
+    the benchmark harness's 3 kHz convention.
 - Deterministic decode path is a hard requirement: file input → byte-identical
   spot logs.
 - Classical decoder first; ML fusion (dit's pattern) only at M4, gated on
