@@ -1,0 +1,14 @@
+[package]
+name = "skimmer-dsp"
+description = "Channel extraction and frequency estimation for skimmer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coppa-dsp = { workspace = true }
+num-complex = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

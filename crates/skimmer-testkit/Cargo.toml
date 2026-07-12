@@ -1,0 +1,22 @@
+[package]
+name = "skimmer-testkit"
+description = "Synthetic CW generator and golden-vector harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+hound = { workspace = true }
+num-complex = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+skimmer-decode = { workspace = true }
+skimmer-dsp = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

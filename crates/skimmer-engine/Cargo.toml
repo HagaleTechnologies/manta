@@ -1,0 +1,19 @@
+[package]
+name = "skimmer-engine"
+description = "Pipeline orchestration: input -> channel -> decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+num-complex = { workspace = true }
+serde = { workspace = true }
+skimmer-decode = { workspace = true }
+skimmer-dsp = { workspace = true }
+skimmer-input = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+skimmer-testkit = { workspace = true }
