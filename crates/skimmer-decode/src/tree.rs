@@ -33,6 +33,7 @@ impl Prosign {
     }
 }
 
+/// A decoded tree node's payload: a plain character or a prosign. SPEC §4.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Glyph {
     Char(char),
@@ -40,7 +41,7 @@ pub enum Glyph {
 }
 
 impl Glyph {
-    /// The plain-text rendering, or None for prosigns (dropped from text).
+    /// The plain-text rendering, or None for prosigns (dropped from telnet-facing text, SPEC §4.4).
     pub fn text_char(&self) -> Option<char> {
         match self {
             Glyph::Char(c) => Some(*c),
@@ -49,6 +50,7 @@ impl Glyph {
     }
 }
 
+/// Index into `MorseTree`'s internal node arena. SPEC §4.4.
 pub type NodeId = u16;
 
 /// (pattern, glyph). SPEC §4.4 standard table + prosign terminals.
@@ -119,13 +121,16 @@ struct Node {
     children: [Option<NodeId>; 2], // [dit, dah]
 }
 
+/// The Morse code tree: root, dit = left child, dah = right child, glyph-bearing nodes. SPEC §4.4.
 pub struct MorseTree {
     nodes: Vec<Node>,
 }
 
 impl MorseTree {
+    /// The tree root (empty element sequence). SPEC §4.4.
     pub const ROOT: NodeId = 0;
 
+    /// The process-wide singleton tree, built once. SPEC §4.4.
     pub fn shared() -> &'static MorseTree {
         static TREE: OnceLock<MorseTree> = OnceLock::new();
         TREE.get_or_init(MorseTree::build)
@@ -160,6 +165,7 @@ impl MorseTree {
         MorseTree { nodes }
     }
 
+    /// The child reached from node `n` by keying element `e`, if the sequence is valid. SPEC §4.4.
     pub fn child(&self, n: NodeId, e: Element) -> Option<NodeId> {
         let idx = match e {
             Element::Dit => 0,
@@ -168,12 +174,13 @@ impl MorseTree {
         self.nodes[n as usize].children[idx]
     }
 
+    /// The glyph at node `n`, if this node terminates a valid code. SPEC §4.4.
     pub fn glyph(&self, n: NodeId) -> Option<Glyph> {
         self.nodes[n as usize].glyph
     }
 }
 
-/// Encoding lookup for the testkit keyer: 'W' -> ".--" (case-insensitive).
+/// Encoding lookup for the testkit keyer: 'W' -> ".--" (case-insensitive). SPEC §4.4.
 pub fn pattern_for(c: char) -> Option<&'static str> {
     let up = c.to_ascii_uppercase();
     TABLE
