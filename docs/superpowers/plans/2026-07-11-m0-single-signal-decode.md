@@ -42,6 +42,8 @@ These are implementation decisions this plan makes where SPEC/ROADMAP are silent
 13. **Keyer truncation:** a character is keyed iff all its segments fit inside the scene duration; the keyed-text string returned by the keyer is ground truth for CER.
 14. **Extractor timing:** the extractor emits its first output only once a full L·N-sample filter window is available; output `m` carries `sample_ts = m·hop` (the window *start*), so all decoded events share a constant ~L·N/2 group-delay offset. Uniform shifts are harmless — nothing in V1 asserts absolute time.
 15. **M0 fixture layout:** `<name>.wav` (stereo float32 WAV, ch0=I, ch1=Q) + `<name>.json` sidecar (`center_freq_hz`) + `<name>.manifest.json` (seeds, keyed text, expected frequency).
+16. **Drift-detection anchor (found during Task 3 review, 2026-07-11):** SPEC §4.1's regime-change rule ("their mean is off *that centroid* by > 40%") is ambiguous about which centroid — the live, continuously-EMA-updated one, or a value frozen before the streak began. Task 3's original code compared against the live centroid; since every mark in the drift-detection ring has already been absorbed into that same centroid via `ClusterPair::observe`'s EMA update before the ring push, the off-centroid ratio can never grow large enough to cross the 40% bar — the mechanism was self-defeating and never fired, even for a clean 43% speed step (hand-traced: off-centroid capped at ~10%; reviewer's `step_speed_change_reinitializes` test only passed because its tolerance was loose enough for plain EMA convergence to sneak under it). Pin: the drift check anchors to the centroid as it stood *before* the current streak of 12 marks began — each ring entry now carries a `(pre_lo, pre_hi)` snapshot taken immediately before that mark's `observe()` call, and `check_drift` compares against `ring[0]`'s snapshot (the state right before the streak started) rather than `self.pair.lo`/`hi`. Verified by hand-trace: at steady state 60/180ms then 14×34ms marks, anchor≈60, off%≈43.3% > 40% → reinit fires at mark 12 as intended. The task's test tolerance was tightened from `< 6.0` to `< 1.0` ms to make sure a future regression to the live-centroid comparison fails loudly instead of silently passing via slow EMA convergence.
+17. **`check_flush` must drain `Demod` before committing (found during Task 6 implementation, 2026-07-11):** `Demod` (Task 5) keeps a `held: Option<Run>` field that lags `open` by one full run for debounce confirmation (SPEC §3.3) — a completed run only surfaces via `Demod::push()`'s returned `Vec<Run>` once a FURTHER polarity flip evicts it from `held`. The last run before a track goes quiet (no further flip ever comes) is therefore stuck in `held` and invisible to the normal `push()` path. Task 6's original `check_flush` (SPEC §4.2's 7-dit forced-flush rule) read `demod.open_space_hops()`/`open_space_start_ts()` — which ARE live/un-lagged — to detect the trailing space, but then called `emit_char` directly against `self.cur_marks`, which was missing that stuck last mark. Traced on `decode("PARIS")`: flushing `S` (`...`) with only 2 of its 3 dits visible decoded as `I`, and the real EOF `finish()` call later drained the stuck mark as a spurious extra character plus a duplicate `WordBoundary` — net output `"PARII E"` instead of `"PARIS"`. Pin: `check_flush`, on deciding to force-flush, calls `self.demod.finish()` FIRST — draining both `held` and `open` — feeds any returned mark run through `process_run(r, live=true, ..)` (so it counts toward `cur_marks` and speed tracking), and deliberately does NOT separately gap-classify the returned space run (the manual `emit_char`+`WordBoundary` immediately after already decides that space's fate; classifying it too would double-emit). Verified general (not scenario-specific): `Demod::finish()` mutates only `open`/`held`, never the EMA rails/`a_ref`/`phase`, so mid-stream draining is safe and calibration survives; the held/open opposite-polarity invariant guarantees any drained `held` is always a mark when `check_flush` fires (since firing requires `open` to be a space); and the `word_flushed` guard prevents `demod.finish()` from being called twice for the same flush event.
 
 ## Prior art you must read before implementing
 
@@ -831,7 +833,12 @@ mod tests {
         for _ in 0..14 {
             t.on_mark(34.0); // fast dits, all far below the old dit centroid
         }
-        assert!((t.mu_dit_ms() - 34.0).abs() < 6.0, "mu_dit {}", t.mu_dit_ms());
+        // Tight tolerance (pinned decision 16): the drift rule must actually
+        // fire and reinit from the last 5 (all ~34ms) marks — a loose
+        // tolerance here previously let a self-defeating live-centroid
+        // comparison pass via slow EMA convergence alone, masking that the
+        // reinit path never triggered.
+        assert!((t.mu_dit_ms() - 34.0).abs() < 1.0, "mu_dit {}", t.mu_dit_ms());
     }
 
     #[test]
@@ -993,7 +1000,11 @@ impl ClusterPair {
 #[derive(Debug, Clone)]
 pub struct SpeedTracker {
     pair: ClusterPair,
-    ring: VecDeque<(f32, bool)>, // (dur_ms, assigned_dit) for the drift rule
+    // (dur_ms, assigned_dit, pre_lo, pre_hi): pre_lo/pre_hi are the centroid
+    // as it stood immediately BEFORE this mark's observe() call — the drift
+    // check anchors to ring[0]'s snapshot (pinned decision 16), not the live
+    // centroid, which the same marks have already dragged toward themselves.
+    ring: VecDeque<(f32, bool, f32, f32)>,
     wpm_ema: Option<f32>,
     recent: VecDeque<f32>, // last 5 marks, reinit source
 }
@@ -1035,6 +1046,9 @@ impl SpeedTracker {
         if self.recent.len() > 5 {
             self.recent.pop_front();
         }
+        // Snapshot before observe() can drag it (pinned decision 16).
+        let pre_lo = self.pair.lo;
+        let pre_hi = self.pair.hi;
         let was_init = self.pair.observe(dur_ms);
         if !self.pair.ready() {
             return;
@@ -1042,7 +1056,7 @@ impl SpeedTracker {
         self.apply_constraints();
         if !was_init {
             let is_dit = dur_ms < self.pair.boundary();
-            self.ring.push_back((dur_ms, is_dit));
+            self.ring.push_back((dur_ms, is_dit, pre_lo, pre_hi));
             if self.ring.len() > DRIFT_LEN {
                 self.ring.pop_front();
             }
@@ -1070,22 +1084,26 @@ impl SpeedTracker {
         if self.ring.len() < DRIFT_LEN {
             return;
         }
-        let all_dit = self.ring.iter().all(|&(_, d)| d);
-        let all_dah = self.ring.iter().all(|&(_, d)| !d);
+        let all_dit = self.ring.iter().all(|&(_, d, _, _)| d);
+        let all_dah = self.ring.iter().all(|&(_, d, _, _)| !d);
         if !all_dit && !all_dah {
             return;
         }
         let mut acc = 0.0f64;
-        for &(d, _) in &self.ring {
+        for &(d, _, _, _) in &self.ring {
             acc += d as f64;
         }
         let m = acc / self.ring.len() as f64;
         let mut var = 0.0f64;
-        for &(d, _) in &self.ring {
+        for &(d, _, _, _) in &self.ring {
             var += (d as f64 - m) * (d as f64 - m);
         }
         let cv = (var / self.ring.len() as f64).sqrt() / m;
-        let centroid = if all_dit { self.pair.lo } else { self.pair.hi } as f64;
+        // Anchor to the centroid as it stood BEFORE this streak began
+        // (pinned decision 16) — the live centroid is self-defeating, since
+        // the same 12 marks have already dragged it toward them.
+        let (_, _, anchor_lo, anchor_hi) = self.ring[0];
+        let centroid = if all_dit { anchor_lo } else { anchor_hi } as f64;
         if cv < DRIFT_CV_MAX && (m - centroid).abs() / centroid > DRIFT_OFF_FRAC {
             let vals: Vec<f32> = self.recent.iter().copied().collect();
             self.pair.reinit_from(&vals);
@@ -2202,6 +2220,14 @@ impl TrackDecoder {
     }
 
     /// SPEC §4.2: a trailing space reaching 7*mu_dit forces char + word flush.
+    /// Pinned decision 17: `Demod::open_space_hops`/`open_space_start_ts` are
+    /// live, but `Demod` lags the actual last mark by one run in `held`
+    /// (debounce confirmation, SPEC §3.3) — that mark never surfaces via the
+    /// normal `push()` path if the track goes quiet before another flip.
+    /// Drain `Demod::finish()` first so the stuck mark is recovered into
+    /// `cur_marks` before committing the flush; the returned space run is
+    /// deliberately not separately gap-classified (this flush already
+    /// decides its fate) to avoid a double emission.
     fn check_flush(&mut self, events: &mut Vec<DecoderEvent>) {
         if self.word_flushed || !self.tracker.ready() || self.cur_marks.is_empty() {
             return;
@@ -2209,6 +2235,12 @@ impl TrackDecoder {
         if let (Some(hops), Some(ts)) = (self.demod.open_space_hops(), self.demod.open_space_start_ts()) {
             let gap_ms = hops as f32 * HOP_MS as f32;
             if gap_ms >= self.cfg.flush_gap_dits * self.tracker.mu_dit_ms() {
+                for run in self.demod.finish() {
+                    if run.mark {
+                        self.process_run(run, true, events);
+                    }
+                    // The returned space run is intentionally discarded here.
+                }
                 self.emit_char(ts, events);
                 events.push(DecoderEvent::WordBoundary { track_id: self.track_id, sample_ts: ts });
                 self.word_flushed = true;
