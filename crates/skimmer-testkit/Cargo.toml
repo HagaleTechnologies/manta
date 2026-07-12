@@ -19,4 +19,5 @@ skimmer-dsp = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+skimmer-input = { workspace = true }
 tempfile = { workspace = true }

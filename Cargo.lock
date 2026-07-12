@@ -549,6 +549,7 @@ dependencies = [
  "serde_json",
  "skimmer-decode",
  "skimmer-dsp",
+ "skimmer-input",
  "tempfile",
 ]
 
