@@ -1,1 +1,398 @@
-//! stub
+//! Online 2-means speed tracking and gap classification. SPEC §4.1–§4.2.
+
+use std::collections::VecDeque;
+
+const CLUSTER_ALPHA: f32 = 0.15; // SPEC §9 decode.cluster_alpha
+const RATIO_MIN: f32 = 2.2; // SPEC §9 decode.mu_ratio_bounds
+const RATIO_MAX: f32 = 4.5;
+const DIT_CLAMP_MS: (f32, f32) = (20.0, 150.0); // SPEC §4.1 (60..8 WPM)
+const WPM_ALPHA: f32 = 0.1; // SPEC §4.1 reporting EMA
+const DRIFT_LEN: usize = 12; // SPEC §4.1 regime-change rule
+const DRIFT_CV_MAX: f64 = 0.35;
+const DRIFT_OFF_FRAC: f64 = 0.40;
+const CHAR_GAP_DITS: f32 = 2.0; // SPEC §9 decode.char_gap_dits
+const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
+const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
+const FARNS_MIN_COUNT: u32 = 8; // SPEC §4.2 activation
+const FARNS_MIN_RATIO: f32 = 1.8;
+
+fn mean(xs: &[f32]) -> f32 {
+    let mut acc = 0.0f64;
+    for &x in xs {
+        acc += x as f64;
+    }
+    (acc / xs.len() as f64) as f32
+}
+
+/// Shared 2-means machinery: init-after-5 with largest-ratio-gap split,
+/// EMA centroid updates, geometric-mean boundary. SPEC §4.1 (marks) and
+/// §4.2 (gaps use "the same 2-means machinery").
+#[derive(Debug, Clone)]
+struct ClusterPair {
+    lo: f32,
+    hi: f32,
+    init: Vec<f32>,
+    ready: bool,
+    confirmed: bool,
+}
+
+impl ClusterPair {
+    fn new() -> Self {
+        ClusterPair {
+            lo: 0.0,
+            hi: 0.0,
+            init: Vec::with_capacity(5),
+            ready: false,
+            confirmed: false,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.ready
+    }
+
+    fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    fn boundary(&self) -> f32 {
+        (self.lo * self.hi).sqrt()
+    }
+
+    /// Feed one observation. Returns true while the value was consumed for
+    /// initialization (callers exclude those from drift bookkeeping).
+    fn observe(&mut self, v: f32) -> bool {
+        if !self.ready {
+            self.init.push(v);
+            if self.init.len() == 5 {
+                self.initialize();
+            }
+            return true;
+        }
+        if !self.confirmed && v >= 2.0 * self.lo {
+            // SPEC §4.1: unconfirmed mu_dah re-anchors to the first long mark.
+            self.hi = v;
+            self.confirmed = true;
+            return false;
+        }
+        if v < self.boundary() {
+            self.lo += CLUSTER_ALPHA * (v - self.lo);
+        } else {
+            self.hi += CLUSTER_ALPHA * (v - self.hi);
+        }
+        false
+    }
+
+    fn initialize(&mut self) {
+        let mut s = self.init.clone();
+        s.sort_by(f32::total_cmp);
+        if s[s.len() - 1] / s[0] >= 2.0 {
+            // Split at the largest ratio gap between consecutive sorted values.
+            let mut best_i = 0;
+            let mut best_r = 0.0f32;
+            for i in 0..s.len() - 1 {
+                let r = s[i + 1] / s[i];
+                if r > best_r {
+                    best_r = r;
+                    best_i = i;
+                }
+            }
+            self.lo = mean(&s[..=best_i]);
+            self.hi = mean(&s[best_i + 1..]);
+            self.confirmed = true;
+        } else {
+            let m = mean(&s);
+            self.lo = m;
+            self.hi = 3.0 * m;
+            self.confirmed = false;
+        }
+        self.ready = true;
+        self.init.clear();
+    }
+
+    fn reinit_from(&mut self, vals: &[f32]) {
+        self.init = vals.to_vec();
+        self.ready = false;
+        self.confirmed = false;
+        self.initialize();
+    }
+}
+
+/// Mark-duration speed tracker. SPEC §4.1.
+#[derive(Debug, Clone)]
+pub struct SpeedTracker {
+    pair: ClusterPair,
+    ring: VecDeque<(f32, bool)>, // (dur_ms, assigned_dit) for the drift rule
+    wpm_ema: Option<f32>,
+    recent: VecDeque<f32>, // last 5 marks, reinit source
+}
+
+impl SpeedTracker {
+    /// A tracker with no marks observed yet. SPEC §4.1.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        SpeedTracker {
+            pair: ClusterPair::new(),
+            ring: VecDeque::with_capacity(DRIFT_LEN),
+            wpm_ema: None,
+            recent: VecDeque::with_capacity(5),
+        }
+    }
+
+    /// Whether enough marks have been observed to trust `mu_dit_ms`/`mu_dah_ms`. SPEC §4.1.
+    pub fn ready(&self) -> bool {
+        self.pair.ready()
+    }
+
+    /// Current dit-cluster centroid, in milliseconds. SPEC §4.1.
+    pub fn mu_dit_ms(&self) -> f32 {
+        self.pair.lo
+    }
+
+    /// Current dah-cluster centroid, in milliseconds. SPEC §4.1.
+    pub fn mu_dah_ms(&self) -> f32 {
+        self.pair.hi
+    }
+
+    /// The dit/dah decision boundary: geometric mean of the two centroids. SPEC §4.1.
+    pub fn boundary_ms(&self) -> f32 {
+        self.pair.boundary()
+    }
+
+    /// EMA-smoothed PARIS WPM (SPEC §4.1: 1200/mu_dit, alpha 0.1). None until ready.
+    pub fn wpm(&self) -> Option<f32> {
+        self.wpm_ema
+    }
+
+    /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
+    pub fn on_mark(&mut self, dur_ms: f32) {
+        self.recent.push_back(dur_ms);
+        if self.recent.len() > 5 {
+            self.recent.pop_front();
+        }
+        let was_init = self.pair.observe(dur_ms);
+        if !self.pair.ready() {
+            return;
+        }
+        self.apply_constraints();
+        if !was_init {
+            let is_dit = dur_ms < self.pair.boundary();
+            self.ring.push_back((dur_ms, is_dit));
+            if self.ring.len() > DRIFT_LEN {
+                self.ring.pop_front();
+            }
+            self.check_drift();
+        }
+        let raw = 1200.0 / self.pair.lo;
+        self.wpm_ema = Some(match self.wpm_ema {
+            None => raw,
+            Some(w) => w + WPM_ALPHA * (raw - w),
+        });
+    }
+
+    fn apply_constraints(&mut self) {
+        // SPEC §4.1: clamp mu_dit to [20, 150] ms; enforce 2.2 <= ratio <= 4.5.
+        self.pair.lo = self.pair.lo.clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1);
+        let ratio = self.pair.hi / self.pair.lo;
+        if !(RATIO_MIN..=RATIO_MAX).contains(&ratio) {
+            self.pair.hi = 3.0 * self.pair.lo;
+        }
+    }
+
+    fn check_drift(&mut self) {
+        // SPEC §4.1 regime change: 12 consecutive same-cluster marks, CV < 0.35,
+        // mean off that centroid by > 40 % -> reinit from the last 5 marks.
+        if self.ring.len() < DRIFT_LEN {
+            return;
+        }
+        let all_dit = self.ring.iter().all(|&(_, d)| d);
+        let all_dah = self.ring.iter().all(|&(_, d)| !d);
+        if !all_dit && !all_dah {
+            return;
+        }
+        let mut acc = 0.0f64;
+        for &(d, _) in &self.ring {
+            acc += d as f64;
+        }
+        let m = acc / self.ring.len() as f64;
+        let mut var = 0.0f64;
+        for &(d, _) in &self.ring {
+            var += (d as f64 - m) * (d as f64 - m);
+        }
+        let cv = (var / self.ring.len() as f64).sqrt() / m;
+        let centroid = if all_dit { self.pair.lo } else { self.pair.hi } as f64;
+        if cv < DRIFT_CV_MAX && (m - centroid).abs() / centroid > DRIFT_OFF_FRAC {
+            let vals: Vec<f32> = self.recent.iter().copied().collect();
+            self.pair.reinit_from(&vals);
+            self.apply_constraints();
+            self.ring.clear();
+        }
+    }
+}
+
+/// A classified inter-element gap. SPEC §4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapClass {
+    InterElement,
+    InterChar,
+    InterWord,
+}
+
+/// Gap classifier with Farnsworth decoupling. SPEC §4.2.
+/// Long gaps are clustered in dit units (pinned decision 12).
+#[derive(Debug, Clone)]
+pub struct GapClassifier {
+    pair: ClusterPair,
+    long_seen: u32,
+}
+
+impl GapClassifier {
+    /// A classifier with no gaps observed yet. SPEC §4.2.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        GapClassifier {
+            pair: ClusterPair::new(),
+            long_seen: 0,
+        }
+    }
+
+    fn farnsworth_active(&self) -> bool {
+        self.pair.ready()
+            && self.pair.confirmed()
+            && self.long_seen >= FARNS_MIN_COUNT
+            && self.pair.hi / self.pair.lo >= FARNS_MIN_RATIO
+    }
+
+    /// Classify one gap given the current dit estimate, incorporating it into the
+    /// Farnsworth long-gap statistics if applicable. SPEC §4.2.
+    pub fn classify(&mut self, gap_ms: f32, mu_dit_ms: f32) -> GapClass {
+        let u = gap_ms / mu_dit_ms;
+        // Thresholds from statistics BEFORE this gap is incorporated.
+        let word_thr = if self.farnsworth_active() {
+            self.pair.boundary() // sqrt(mu_cgap * mu_wgap), in dit units
+        } else {
+            WORD_GAP_DITS
+        };
+        let class = if u < CHAR_GAP_DITS {
+            GapClass::InterElement
+        } else if u < word_thr {
+            GapClass::InterChar
+        } else {
+            GapClass::InterWord
+        };
+        if u >= FARNS_LONG_U {
+            self.pair.observe(u);
+            self.long_seen += 1;
+        }
+        class
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 20 WPM nominal: dit 60 ms, dah 180 ms.
+    fn feed(t: &mut SpeedTracker, durs: &[f32]) {
+        for &d in durs {
+            t.on_mark(d);
+        }
+    }
+
+    #[test]
+    fn initializes_bimodal_after_five_marks() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]); // C-ish opening
+        assert!(t.ready());
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 1.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!((t.mu_dah_ms() - 180.0).abs() < 1.0);
+        // B = sqrt(60*180) ~ 103.9
+        assert!((t.boundary_ms() - 103.92).abs() < 0.5);
+        assert!((t.wpm().unwrap() - 20.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn unimodal_init_provisional_then_reanchors() {
+        // "EEE": all dits. SPEC §4.1: mu_dah = 3*mu_dit provisionally,
+        // re-anchor when a mark lands >= 2*mu_dit.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 62.0, 58.0, 60.0, 61.0]);
+        assert!(t.ready());
+        assert!((t.mu_dah_ms() - 3.0 * t.mu_dit_ms()).abs() < 2.0);
+        t.on_mark(185.0); // first real dah re-anchors
+        assert!((t.mu_dah_ms() - 185.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn ratio_constraint_reanchors_dah() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        // Drag mu_dah down toward mu_dit with implausibly short dahs;
+        // constraint 2.2..4.5 must re-anchor mu_dah = 3*mu_dit. SPEC §4.1.
+        for _ in 0..40 {
+            t.on_mark(115.0);
+        }
+        let ratio = t.mu_dah_ms() / t.mu_dit_ms();
+        assert!((2.2..=4.5).contains(&ratio), "ratio {ratio}");
+    }
+
+    #[test]
+    fn dit_clamp_bounds_speed() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[10.0, 30.0, 10.0, 10.0, 30.0]); // 120 WPM: beyond clamp
+        assert!(t.mu_dit_ms() >= 20.0); // SPEC §4.1 clamp [20, 150]
+    }
+
+    #[test]
+    fn step_speed_change_reinitializes() {
+        // QRQ: 20 WPM -> 35 WPM (dit 34 ms). Plain EMA can't follow a 43 % step;
+        // the drift rule (12 consecutive single-cluster, CV < 0.35, off > 40 %)
+        // must reinit. SPEC §4.1.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..3 {
+            feed(&mut t, &[60.0, 180.0, 60.0]);
+        }
+        for _ in 0..14 {
+            t.on_mark(34.0); // fast dits, all far below the old dit centroid
+        }
+        assert!(
+            (t.mu_dit_ms() - 34.0).abs() < 6.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn gap_classification_nominal() {
+        let mut g = GapClassifier::new();
+        let mu = 60.0;
+        assert_eq!(g.classify(60.0, mu), GapClass::InterElement); // 1 dit
+        assert_eq!(g.classify(180.0, mu), GapClass::InterChar); // 3 dits
+        assert_eq!(g.classify(420.0, mu), GapClass::InterWord); // 7 dits
+        assert_eq!(g.classify(119.0, mu), GapClass::InterElement); // < 2.0
+        assert_eq!(g.classify(299.0, mu), GapClass::InterChar); // < 5.0
+        assert_eq!(g.classify(300.0, mu), GapClass::InterWord); // >= 5.0
+    }
+
+    #[test]
+    fn farnsworth_moves_word_threshold() {
+        // Farnsworth: char gaps stretched to 6 dits, word gaps to 14 dits.
+        // Nominal rule would call 6-dit gaps InterWord; after >= 8 long gaps
+        // with ratio >= 1.8 the threshold becomes sqrt(6*14) ~ 9.2 dits. SPEC §4.2.
+        let mut g = GapClassifier::new();
+        let mu = 48.0;
+        for _ in 0..5 {
+            g.classify(6.0 * mu, mu);
+            g.classify(14.0 * mu, mu);
+        }
+        assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(14.0 * mu, mu), GapClass::InterWord);
+        // Element/char boundary is speed-locked, never Farnsworth-adjusted:
+        assert_eq!(g.classify(1.5 * mu, mu), GapClass::InterElement);
+    }
+}
