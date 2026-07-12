@@ -122,7 +122,7 @@ impl ClusterPair {
 #[derive(Debug, Clone)]
 pub struct SpeedTracker {
     pair: ClusterPair,
-    ring: VecDeque<(f32, bool)>, // (dur_ms, assigned_dit) for the drift rule
+    ring: VecDeque<(f32, bool, f32, f32)>, // (dur_ms, assigned_dit, pre_lo, pre_hi)
     wpm_ema: Option<f32>,
     recent: VecDeque<f32>, // last 5 marks, reinit source
 }
@@ -170,6 +170,8 @@ impl SpeedTracker {
         if self.recent.len() > 5 {
             self.recent.pop_front();
         }
+        let pre_lo = self.pair.lo;
+        let pre_hi = self.pair.hi;
         let was_init = self.pair.observe(dur_ms);
         if !self.pair.ready() {
             return;
@@ -177,7 +179,7 @@ impl SpeedTracker {
         self.apply_constraints();
         if !was_init {
             let is_dit = dur_ms < self.pair.boundary();
-            self.ring.push_back((dur_ms, is_dit));
+            self.ring.push_back((dur_ms, is_dit, pre_lo, pre_hi));
             if self.ring.len() > DRIFT_LEN {
                 self.ring.pop_front();
             }
@@ -205,22 +207,29 @@ impl SpeedTracker {
         if self.ring.len() < DRIFT_LEN {
             return;
         }
-        let all_dit = self.ring.iter().all(|&(_, d)| d);
-        let all_dah = self.ring.iter().all(|&(_, d)| !d);
+        let all_dit = self.ring.iter().all(|&(_, d, _, _)| d);
+        let all_dah = self.ring.iter().all(|&(_, d, _, _)| !d);
         if !all_dit && !all_dah {
             return;
         }
         let mut acc = 0.0f64;
-        for &(d, _) in &self.ring {
+        for &(d, _, _, _) in &self.ring {
             acc += d as f64;
         }
         let m = acc / self.ring.len() as f64;
         let mut var = 0.0f64;
-        for &(d, _) in &self.ring {
+        for &(d, _, _, _) in &self.ring {
             var += (d as f64 - m) * (d as f64 - m);
         }
         let cv = (var / self.ring.len() as f64).sqrt() / m;
-        let centroid = if all_dit { self.pair.lo } else { self.pair.hi } as f64;
+        // Anchor to the centroid as it stood BEFORE this streak of DRIFT_LEN
+        // marks began accumulating (ring[0]'s pre-mark snapshot) — comparing
+        // against the LIVE centroid is self-defeating, since the same marks
+        // driving the streak have already dragged it toward them by the time
+        // the ring fills (pinned decision: SPEC §4.1's "off that centroid"
+        // means the pre-streak centroid, not the continuously-adapting one).
+        let (_, _, anchor_lo, anchor_hi) = self.ring[0];
+        let centroid = if all_dit { anchor_lo } else { anchor_hi } as f64;
         if cv < DRIFT_CV_MAX && (m - centroid).abs() / centroid > DRIFT_OFF_FRAC {
             let vals: Vec<f32> = self.recent.iter().copied().collect();
             self.pair.reinit_from(&vals);
@@ -361,7 +370,7 @@ mod tests {
             t.on_mark(34.0); // fast dits, all far below the old dit centroid
         }
         assert!(
-            (t.mu_dit_ms() - 34.0).abs() < 6.0,
+            (t.mu_dit_ms() - 34.0).abs() < 1.0,
             "mu_dit {}",
             t.mu_dit_ms()
         );
