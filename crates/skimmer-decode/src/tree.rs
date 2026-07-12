@@ -22,6 +22,7 @@ pub enum Prosign {
 }
 
 impl Prosign {
+    /// Returns the JSON-stream token for this prosign (e.g. "<AR>"). SPEC §4.4.
     pub fn token(&self) -> &'static str {
         match self {
             Prosign::Ar => "<AR>",
