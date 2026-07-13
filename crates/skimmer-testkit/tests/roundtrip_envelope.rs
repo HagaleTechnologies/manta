@@ -6,7 +6,14 @@ use skimmer_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
 use skimmer_testkit::cer::cer;
 use skimmer_testkit::keyer::{key_text, KeyerSpec};
 
-/// First char must contain both elements (see task preamble).
+/// Restricts the generated text's first character to avoid an all-dah
+/// opening (pinned decision 20, `docs/DECISIONS/2026-07-11-m0-implementation-pins.md`):
+/// `ClusterPair`'s unimodal-init branch (`crates/skimmer-decode/src/timing.rs`)
+/// always assumes the first 5-mark cluster is dits and can't recover if it
+/// turns out to be a homogeneous run of dahs instead (e.g. M, O, or
+/// repeated T). This is NOT "must contain both dit and dah elements" —
+/// several excluded letters (B, J, U) contain both element types and decode
+/// fine; the real constraint is narrower than that.
 const MIXED_FIRST: &str = "ACDFGKLNPQRVWXYZ";
 const REST: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 

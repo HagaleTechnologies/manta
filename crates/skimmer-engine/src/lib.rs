@@ -38,20 +38,37 @@ pub fn decode_samples(
     center_freq_hz: f64,
     cfg: &PipelineConfig,
 ) -> Result<DecodeReport> {
-    let Some(offset_hz) = estimate_peak_hz(iq, fs) else {
-        bail!("no signal found (input shorter than one FFT frame or empty)");
-    };
-    // Degenerate-input guard: a flat spectrum yields a meaningless argmax.
-    // The extractor + demod pre-decode gate will produce no output; that is
-    // handled below, but pure digital silence short-circuits here.
+    // Degenerate-input guard: a flat spectrum yields a meaningless argmax,
+    // and the extractor + demod pre-decode gate would just produce no
+    // output anyway. Check this FIRST, before spending time on the
+    // periodogram in estimate_peak_hz below — bail out immediately on
+    // all-zero input instead of running the FFT peak search on it.
     if iq.iter().all(|s| s.re == 0.0 && s.im == 0.0) {
         bail!("input is digital silence");
     }
+    let Some(offset_hz) = estimate_peak_hz(iq, fs) else {
+        bail!("no signal found (input shorter than one FFT frame or empty)");
+    };
 
     let mut extractor = SingleChannelExtractor::new(fs, offset_hz)
         .map_err(|e| anyhow::anyhow!(e))
         .context("channel extractor")?;
     let hop = extractor.hop() as u64;
+
+    // Cross-crate invariant: skimmer-decode hardcodes FO_HZ = 375.0 and
+    // HOP_MS = 8.0/3.0 (SPEC §3.1) on the assumption that the extractor's
+    // channel output rate is exactly 375 Hz. skimmer-dsp derives that rate
+    // independently from fs / CHANNEL_SPACING_HZ / TAPS_PER_BRANCH
+    // (single.rs), with nothing tying the two together — if either crate's
+    // constants ever changed, this would silently desync (decode.rs's
+    // duration math would go quietly wrong instead of failing loudly).
+    // This check is expected to pass silently for all supported rates.
+    debug_assert!(
+        (fs / hop as f64 - skimmer_decode::FO_HZ).abs() < 0.01,
+        "extractor hop rate {} Hz diverges from skimmer_decode::FO_HZ {}",
+        fs / hop as f64,
+        skimmer_decode::FO_HZ
+    );
 
     // The extractor's causal FIR channel filter has a fixed group delay of
     // (filter_len()-1)/2 samples: no output hop can ever represent a true

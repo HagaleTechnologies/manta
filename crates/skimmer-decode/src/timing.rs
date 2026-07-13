@@ -83,6 +83,17 @@ impl ClusterPair {
         false
     }
 
+    /// Pinned decision 20 (`docs/DECISIONS/2026-07-11-m0-implementation-pins.md`):
+    /// the unimodal branch below always assumes the lone cluster is dits
+    /// (`mu_dit = mean`, `mu_dah = 3*mean`, unconfirmed). If a message's
+    /// first 5 marks are instead a homogeneous run of dahs (an all-dah
+    /// opener — e.g. M, O, or repeated T), this locks in the wrong scale
+    /// for that message: `observe()`'s re-anchor condition `v >= 2.0 *
+    /// self.lo` can never fire from a stream of same-length dahs, since
+    /// `lo` was itself set to that dah duration. Known M0 limitation, not
+    /// fixed here — see pinned decision 20 for the full trace and the
+    /// recommended M1 fix direction (an absolute-ms prior for unimodal
+    /// init).
     fn initialize(&mut self) {
         let mut s = self.init.clone();
         s.sort_by(f32::total_cmp);
