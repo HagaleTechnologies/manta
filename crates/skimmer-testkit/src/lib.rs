@@ -11,6 +11,15 @@ pub mod scene;
 pub mod vectors;
 pub mod wav;
 
+/// Short V1 variant for fast integration/determinism tests. Same code path
+/// as the full 120 s V1 gate. SPEC §7.
+pub fn vectorspec_short() -> vectors::VectorSpec {
+    vectors::VectorSpec {
+        duration_s: 20.0,
+        ..vectors::v1()
+    }
+}
+
 pub(crate) fn u01(rng: &mut rand_chacha::ChaCha8Rng) -> f64 {
     use rand_core::RngCore;
     // 53-bit mantissa, strictly in (0, 1): never 0 (ln-safe), never 1.
