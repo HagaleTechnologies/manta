@@ -59,9 +59,9 @@ them with zero changes.
 
 ## Status
 
-**Pre-implementation.** Architecture and roadmap are committed
-([ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP.md](ROADMAP.md)); code has not
-started. See milestone M0 for the first runnable target.
+**M0 implemented** (single-signal WAV decode, V1 golden vector green); next
+is M1 in [ROADMAP.md](ROADMAP.md). See [ARCHITECTURE.md](ARCHITECTURE.md)
+for the full design.
 
 ## License
 
