@@ -79,11 +79,16 @@ pub fn decode_samples(
     // onset and are exactly what recovers the message's opening element(s)
     // from the extractor's blind zone (see the investigation report).
     // Discarding them (skipping m < pad_hops) would reproduce the original
-    // bug exactly, because the window at m == pad_hops is byte-identical to
-    // the unpadded extractor's very first output (both equal iq[0..ln)) —
-    // proven directly: window start for output m is m*hop, and pad_hops*hop
-    // == pad_samples by construction, so output pad_hops's window starts
-    // exactly where the real samples begin. Rebaseline sample_ts back onto
+    // bug exactly: window start for output m is m*hop, and pad_hops*hop ==
+    // pad_samples by construction, so output pad_hops's window starts
+    // exactly where the real samples begin. That window is NOT byte-
+    // identical to the unpadded extractor's own first output, though —
+    // process() mixes by an absolute-index-dependent NCO phase before
+    // filtering, so the two windows differ by a global complex phase factor.
+    // But the FIR is linear, so that phase factor scales the whole output
+    // uniformly, and decode reads y.norm() (magnitude only, phase discarded)
+    // — so the two envelope magnitudes ARE identical, which is what actually
+    // makes "skip past the padding" a proven no-op. Rebaseline sample_ts back onto
     // the ORIGINAL (unpadded) input-stream counter for SPEC §5, saturating
     // at 0 for hops whose window falls at or before the true recording
     // start — decode correctness does not depend on sample_ts (durations
