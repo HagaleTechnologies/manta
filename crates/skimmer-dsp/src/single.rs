@@ -49,6 +49,14 @@ impl SingleChannelExtractor {
         self.hop
     }
 
+    /// Prototype filter length in taps (L*N). SPEC §1.2. A causal FIR filter of
+    /// this length has no valid output representing a true signal instant
+    /// earlier than `(filter_len()-1)/2` input samples into a recording with no
+    /// prior history — see the M0 lead-in-padding fix in skimmer-engine.
+    pub fn filter_len(&self) -> usize {
+        self.taps.len()
+    }
+
     /// Feed input IQ; returns however many 375 Hz channel samples became
     /// available. SPEC §1.3.
     pub fn process(&mut self, iq: &[Complex32]) -> Vec<Complex32> {

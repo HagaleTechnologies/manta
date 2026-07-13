@@ -53,13 +53,49 @@ pub fn decode_samples(
         .context("channel extractor")?;
     let hop = extractor.hop() as u64;
 
+    // The extractor's causal FIR channel filter has a fixed group delay of
+    // (filter_len()-1)/2 samples: no output hop can ever represent a true
+    // signal instant earlier than that into a recording with no prior
+    // history, so a message keyed with no lead-in silence has its opening
+    // element(s) corrupted or destroyed outright. Fix: prepend synthetic
+    // zero-valued lead-in samples (one full filter length, comfortably more
+    // than the exact group-delay minimum) so the filter's blind zone
+    // consumes only harmless padding, giving it genuine (zero) pre-history
+    // it never had before; then re-baseline sample_ts back onto the
+    // original, unpadded input-stream sample counter (SPEC §5). See
+    // .superpowers/sdd/task-14-investigation-report.md.
+    let pad_samples = extractor.filter_len();
+    let pad_hops = (pad_samples as u64).div_ceil(hop);
+    let mut padded_iq = Vec::with_capacity(pad_samples + iq.len());
+    padded_iq.resize(pad_samples, Complex32::new(0.0, 0.0));
+    padded_iq.extend_from_slice(iq);
+
     let mut decoder = TrackDecoder::new(1, cfg.decode.clone());
     decoder.set_freq_hz(center_freq_hz + offset_hz);
 
-    let channel = extractor.process(iq);
+    // Feed every output the padded stream produces, including those whose
+    // analysis window straddles the padding/real-signal boundary: those
+    // windows mix genuine (zero) pre-history with the real signal's true
+    // onset and are exactly what recovers the message's opening element(s)
+    // from the extractor's blind zone (see the investigation report).
+    // Discarding them (skipping m < pad_hops) would reproduce the original
+    // bug exactly, because the window at m == pad_hops is byte-identical to
+    // the unpadded extractor's very first output (both equal iq[0..ln)) —
+    // proven directly: window start for output m is m*hop, and pad_hops*hop
+    // == pad_samples by construction, so output pad_hops's window starts
+    // exactly where the real samples begin. Rebaseline sample_ts back onto
+    // the ORIGINAL (unpadded) input-stream counter for SPEC §5, saturating
+    // at 0 for hops whose window falls at or before the true recording
+    // start — decode correctness does not depend on sample_ts (durations
+    // are computed from run.hops, a hop count, not from sample_ts
+    // differences; decoder.rs `let dur_ms = run.hops as f32 * HOP_MS`), only
+    // downstream reporting does.
+    let channel = extractor.process(&padded_iq);
     let mut events: Vec<DecoderEvent> = Vec::new();
     for (m, y) in channel.iter().enumerate() {
-        events.extend(decoder.push_envelope(y.norm(), m as u64 * hop));
+        let m = m as u64;
+        let sample_ts = m.saturating_sub(pad_hops) * hop;
+        events.extend(decoder.push_envelope(y.norm(), sample_ts));
     }
     events.extend(decoder.finish());
 
