@@ -13,7 +13,7 @@ file playback, single hardwired channel (no PFB), classical decoder chain
 **Accept when:**
 - `skimmer decode fixture.wav` (WAV input, per SPEC-decode-core §7's M0
   definition) prints the correct text for a synthetic
-  25 WPM / +20 dB SNR / AWGN-only single-signal IQ file.
+  20 WPM / +20 dB SNR / AWGN-only single-signal IQ file (SPEC §7 V1).
 - Proptest round-trip (text → testkit CW → decoder) passes for 10–40 WPM at
   ≥ +15 dB SNR, CER = 0.
 - CI green on Linux + macOS (no SoapySDR dependency in default features).

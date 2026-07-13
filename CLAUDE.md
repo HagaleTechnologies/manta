@@ -7,8 +7,7 @@ Network currently depends on.
 
 ## Status
 
-Design phase complete; no implementation yet. Next step is M0 in ROADMAP.md
-(decode one clean synthetic CW signal from an IQ file).
+M0 implemented (single-signal WAV decode, V1 green); next is M1 in ROADMAP.md.
 
 ## Documents (read in this order)
 
@@ -61,6 +60,9 @@ descriptive and always loses conflicts with code and docs/.
   (ADR pending), not solely here.
 - No GUI: daemon + CLI. Outputs: RBN-format cluster telnet (:7300) and JSON
   Lines/WebSocket (:7301) for cqdx ingest.
+- M0 testkit generates its own ref-bandwidth AWGN (see
+  docs/DECISIONS/2026-07-11-m0-implementation-pins.md); migrate to coppa
+  awgn_ref_bw when it ships.
 
 ## Multi-agent hygiene
 

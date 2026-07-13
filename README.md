@@ -2,6 +2,12 @@
 
 An open-source, cross-platform, wideband multi-signal CW skimmer.
 
+## Quickstart
+
+```
+cargo run -p skimmer-cli -- gen v1 --out /tmp/v1 && cargo run -p skimmer-cli -- decode /tmp/v1/v1.wav
+```
+
 ## Why
 
 The Reverse Beacon Network — infrastructure the entire amateur radio hobby depends
