@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/skimmer-decode",
+    "crates/skimmer-dsp",
+    "crates/skimmer-input",
+    "crates/skimmer-testkit",
+    "crates/skimmer-engine",
+    "crates/skimmer-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85.0"
+repository = "https://github.com/HagaleTechnologies/skimmer"
+
+[workspace.dependencies]
+skimmer-decode = { path = "crates/skimmer-decode" }
+skimmer-dsp = { path = "crates/skimmer-dsp" }
+skimmer-input = { path = "crates/skimmer-input" }
+skimmer-testkit = { path = "crates/skimmer-testkit" }
+skimmer-engine = { path = "crates/skimmer-engine" }
+
+coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "4cbfdac6f93ccbd363fbec248b2739faef38dbc4" }
+
+anyhow = "1.0"
+num-complex = "0.4"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rand_core = "0.9"
+rand_chacha = "0.9"
+proptest = "1.5"
+approx = "0.5"
+tempfile = "3"
+
+# DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 2

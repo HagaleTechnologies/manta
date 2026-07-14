@@ -1,0 +1,23 @@
+[package]
+name = "skimmer-cli"
+description = "skimmer daemon and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "skimmer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+skimmer-engine = { workspace = true }
+skimmer-testkit = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+skimmer-testkit = { workspace = true }
+tempfile = { workspace = true }
