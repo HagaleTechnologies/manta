@@ -31,6 +31,11 @@ SDR.
 - Decoder handles QSB: testkit scene with Watterson CCIR-good fading at +10 dB,
   CER < 5 % (= spec vector V4; M1 gate is V1–V6 per SPEC-decode-core §7).
 
+V1–V4 and V6 pass; V5 (CCIR-poor at +3 dB) is a tracked known limitation, not
+yet met — see `docs/DECISIONS/2026-07-17-m1-implementation-pins.md`. The
+live W1AW copy run (first bullet above) is still outstanding — see
+`docs/RUNBOOKS/m1-w1aw-live-copy.md`.
+
 ## M2 — Wideband: PFB + detector + decoder pool
 
 The core of the project. PFB channelizer (96/192 kS/s), order-statistic noise

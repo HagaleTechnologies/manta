@@ -125,8 +125,10 @@ mod tests {
 
     #[test]
     fn reports_eof_as_zero_read() {
-        let src: Box<dyn AudioSource> =
-            Box::new(coppa_audio::WavSource::from_samples(vec![0.0; 5], TARGET_RATE_HZ));
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 5],
+            TARGET_RATE_HZ,
+        ));
         let mut aiq = AudioIqSource::new(src).unwrap();
         let mut buf = vec![Complex32::new(0.0, 0.0); 5];
         assert_eq!(aiq.read(&mut buf).unwrap(), 5);

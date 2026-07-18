@@ -99,13 +99,9 @@ mod tests {
     fn soak_reports_no_panic_on_a_clean_short_signal() {
         let fs = skimmer_input::TARGET_RATE_HZ;
         let spec = skimmer_testkit::keyer::KeyerSpec::new(20.0);
-        let (env, _) = skimmer_testkit::keyer::key_text_loop(
-            "CQ CQ DE W1AW W1AW K",
-            &spec,
-            fs as f64,
-            8.0,
-        )
-        .unwrap();
+        let (env, _) =
+            skimmer_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 8.0)
+                .unwrap();
         let mut real = vec![0.0f32; env.len()];
         let dphi = std::f64::consts::TAU * 700.0 / fs as f64;
         let mut phi = 0.0f64;
@@ -113,10 +109,8 @@ mod tests {
             *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
             phi += dphi;
         }
-        let src = AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(
-            real, fs,
-        )))
-        .unwrap();
+        let src =
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap();
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
         assert!(!report.panicked);
         assert!(soak_passed(&report));

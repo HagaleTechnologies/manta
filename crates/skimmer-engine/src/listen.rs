@@ -41,8 +41,8 @@ pub fn listen(
         }
         filled += n;
     }
-    let offset_hz = estimate_peak_hz(&calib, fs)
-        .context("no signal found during startup calibration")?;
+    let offset_hz =
+        estimate_peak_hz(&calib, fs).context("no signal found during startup calibration")?;
 
     let mut extractor =
         SingleChannelExtractor::new(fs, offset_hz).map_err(|e| anyhow::anyhow!(e))?;

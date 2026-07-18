@@ -495,7 +495,11 @@ mod tests {
         let mut t = SpeedTracker::new();
         feed(&mut t, &[180.0, 182.0, 178.0, 180.0, 181.0]);
         t.on_mark(60.0); // first real dit re-anchors mu_dit immediately
-        assert!((t.mu_dit_ms() - 60.0).abs() < 0.1, "mu_dit {}", t.mu_dit_ms());
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 0.1,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
     }
 
     #[test]
@@ -505,7 +509,10 @@ mod tests {
         for &v in &[180.0, 182.0, 178.0, 180.0, 181.0] {
             with_ceiling.observe(v);
         }
-        assert!(with_ceiling.placeholder_is_lo, "expected dah-assumed branch");
+        assert!(
+            with_ceiling.placeholder_is_lo,
+            "expected dah-assumed branch"
+        );
 
         // Without a ceiling (GapClassifier's use case): a homogeneous cluster
         // whose mean would exceed 150 if it were milliseconds must NOT trip the
