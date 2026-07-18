@@ -2,6 +2,9 @@
 //! WAV layout: 2 channels, ch0 = I, ch1 = Q; Float32 or Int16.
 //! Center frequency comes from a JSON sidecar `<stem>.json`.
 
+pub mod audio;
+pub use audio::{AudioIqSource, TARGET_RATE_HZ};
+
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use std::path::Path;
