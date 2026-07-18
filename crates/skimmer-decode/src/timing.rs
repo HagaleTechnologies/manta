@@ -41,10 +41,18 @@ struct ClusterPair {
     /// the mirror of the classic case, where `lo` is real and `hi` is the
     /// placeholder.
     placeholder_is_lo: bool,
+    /// Unimodal-init absolute-value ceiling (pinned decision 20 fix, scoped):
+    /// `Some(ceiling)` for millisecond-typed callers (SpeedTracker) enables the
+    /// "mean > ceiling implies dahs, not dits" prior; `None` for dit-ratio-typed
+    /// callers (GapClassifier, whose values are gap_ms/mu_dit_ms, not
+    /// milliseconds -- a ceiling comparison there is semantically meaningless
+    /// and can misfire on long real-audio silence gaps) preserves the original
+    /// "always assume the low cluster is real" default.
+    unimodal_ceiling: Option<f32>,
 }
 
 impl ClusterPair {
-    fn new() -> Self {
+    fn new(unimodal_ceiling: Option<f32>) -> Self {
         ClusterPair {
             lo: 0.0,
             hi: 0.0,
@@ -52,6 +60,7 @@ impl ClusterPair {
             ready: false,
             confirmed: false,
             placeholder_is_lo: false,
+            unimodal_ceiling,
         }
     }
 
@@ -117,6 +126,19 @@ impl ClusterPair {
     /// still defaults to "assume dits", same as before -- this fix resolves
     /// the unambiguous case the pin's stress sweep exercised, not the
     /// inherently ambiguous one.
+    ///
+    /// This ceiling is opt-in via `unimodal_ceiling`, not baked into the
+    /// branch unconditionally: `ClusterPair` is shared by `SpeedTracker`
+    /// (mark durations, milliseconds, where the SPEC §4.1 dit clamp is a
+    /// meaningful absolute-value prior) and `GapClassifier` (gap-to-dit
+    /// ratios, dimensionless -- see `GapClassifier::classify`'s
+    /// `u = gap_ms / mu_dit_ms`). A 150.0 ceiling has no correct semantic
+    /// meaning for dit-ratio values; a homogeneous run of long silence gaps
+    /// (plausible on live audio) could otherwise trip the "assume dahs"
+    /// branch even though GapClassifier's two clusters represent char-gap
+    /// vs. word-gap durations, not dit vs. dah. `SpeedTracker` passes
+    /// `Some(DIT_CLAMP_MS.1)`; `GapClassifier` passes `None` and always
+    /// assumes the low cluster is real, as before this fix existed.
     fn initialize(&mut self) {
         let mut s = self.init.clone();
         s.sort_by(f32::total_cmp);
@@ -137,7 +159,8 @@ impl ClusterPair {
             self.placeholder_is_lo = false;
         } else {
             let m = mean(&s);
-            if m > DIT_CLAMP_MS.1 {
+            let assume_dah = self.unimodal_ceiling.is_some_and(|ceiling| m > ceiling);
+            if assume_dah {
                 self.hi = m;
                 self.lo = m / 3.0;
                 self.placeholder_is_lo = true;
@@ -174,7 +197,7 @@ impl SpeedTracker {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         SpeedTracker {
-            pair: ClusterPair::new(),
+            pair: ClusterPair::new(Some(DIT_CLAMP_MS.1)),
             ring: VecDeque::with_capacity(DRIFT_LEN),
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
@@ -302,7 +325,7 @@ impl GapClassifier {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         GapClassifier {
-            pair: ClusterPair::new(),
+            pair: ClusterPair::new(None),
             long_seen: 0,
         }
     }
@@ -473,5 +496,28 @@ mod tests {
         feed(&mut t, &[180.0, 182.0, 178.0, 180.0, 181.0]);
         t.on_mark(60.0); // first real dit re-anchors mu_dit immediately
         assert!((t.mu_dit_ms() - 60.0).abs() < 0.1, "mu_dit {}", t.mu_dit_ms());
+    }
+
+    #[test]
+    fn unimodal_init_respects_ceiling_config() {
+        // With a ceiling (SpeedTracker's use case): mean > ceiling assumes dahs.
+        let mut with_ceiling = ClusterPair::new(Some(150.0));
+        for &v in &[180.0, 182.0, 178.0, 180.0, 181.0] {
+            with_ceiling.observe(v);
+        }
+        assert!(with_ceiling.placeholder_is_lo, "expected dah-assumed branch");
+
+        // Without a ceiling (GapClassifier's use case): a homogeneous cluster
+        // whose mean would exceed 150 if it were milliseconds must NOT trip the
+        // dah-assumed branch, since GapClassifier's values are dit-ratios, not
+        // milliseconds -- pinned decision 20 follow-up.
+        let mut no_ceiling = ClusterPair::new(None);
+        for &v in &[200.0, 202.0, 198.0, 200.0, 201.0] {
+            no_ceiling.observe(v);
+        }
+        assert!(
+            !no_ceiling.placeholder_is_lo,
+            "GapClassifier must always assume the low cluster is real"
+        );
     }
 }
