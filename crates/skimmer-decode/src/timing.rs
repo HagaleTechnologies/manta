@@ -34,6 +34,13 @@ struct ClusterPair {
     init: Vec<f32>,
     ready: bool,
     confirmed: bool,
+    /// Unimodal-init fallback direction (pinned decision 20 fix): when the
+    /// lone 5-mark cluster's mean already exceeds the SPEC §4.1 dit ceiling,
+    /// `hi` holds the real (confirmed-shape) cluster and `lo` is a
+    /// provisional placeholder awaiting a genuine dit to re-anchor it --
+    /// the mirror of the classic case, where `lo` is real and `hi` is the
+    /// placeholder.
+    placeholder_is_lo: bool,
 }
 
 impl ClusterPair {
@@ -44,6 +51,7 @@ impl ClusterPair {
             init: Vec::with_capacity(5),
             ready: false,
             confirmed: false,
+            placeholder_is_lo: false,
         }
     }
 
@@ -69,11 +77,21 @@ impl ClusterPair {
             }
             return true;
         }
-        if !self.confirmed && v >= 2.0 * self.lo {
-            // SPEC §4.1: unconfirmed mu_dah re-anchors to the first long mark.
-            self.hi = v;
-            self.confirmed = true;
-            return false;
+        if !self.confirmed {
+            if self.placeholder_is_lo {
+                if v <= 0.5 * self.hi {
+                    // Mirror of the dit-assumed re-anchor below: unconfirmed
+                    // mu_dit re-anchors to the first genuinely short mark.
+                    self.lo = v;
+                    self.confirmed = true;
+                    return false;
+                }
+            } else if v >= 2.0 * self.lo {
+                // SPEC §4.1: unconfirmed mu_dah re-anchors to the first long mark.
+                self.hi = v;
+                self.confirmed = true;
+                return false;
+            }
         }
         if v < self.boundary() {
             self.lo += CLUSTER_ALPHA * (v - self.lo);
@@ -83,17 +101,22 @@ impl ClusterPair {
         false
     }
 
-    /// Pinned decision 20 (`docs/DECISIONS/2026-07-11-m0-implementation-pins.md`):
-    /// the unimodal branch below always assumes the lone cluster is dits
-    /// (`mu_dit = mean`, `mu_dah = 3*mean`, unconfirmed). If a message's
-    /// first 5 marks are instead a homogeneous run of dahs (an all-dah
-    /// opener — e.g. M, O, or repeated T), this locks in the wrong scale
-    /// for that message: `observe()`'s re-anchor condition `v >= 2.0 *
-    /// self.lo` can never fire from a stream of same-length dahs, since
-    /// `lo` was itself set to that dah duration. Known M0 limitation, not
-    /// fixed here — see pinned decision 20 for the full trace and the
-    /// recommended M1 fix direction (an absolute-ms prior for unimodal
-    /// init).
+    /// Pinned decision 20 (`docs/DECISIONS/2026-07-11-m0-implementation-pins.md`),
+    /// fixed here: the unimodal branch below used to always assume the lone
+    /// cluster was dits (`mu_dit = mean`, `mu_dah = 3*mean`). A homogeneous
+    /// run of dahs (an all-dah opener -- e.g. M, O, or repeated T) then
+    /// locked in the wrong scale, because `observe()`'s dit-assumed
+    /// re-anchor condition (`v >= 2.0 * self.lo`) can never fire from a
+    /// stream of same-length dahs. Fix: an absolute-ms prior using the
+    /// existing SPEC §4.1 dit clamp `[20, 150]` ms -- a lone cluster whose
+    /// mean already exceeds 150 ms cannot possibly be dits (a real dit is
+    /// clamped at 150 ms), so assume dahs instead, with the placeholder
+    /// direction flipped (`lo` becomes the provisional guess, `hi` the real
+    /// cluster). The ambiguous middle band (roughly 60-150 ms, where either
+    /// interpretation is physically plausible depending on operator speed)
+    /// still defaults to "assume dits", same as before -- this fix resolves
+    /// the unambiguous case the pin's stress sweep exercised, not the
+    /// inherently ambiguous one.
     fn initialize(&mut self) {
         let mut s = self.init.clone();
         s.sort_by(f32::total_cmp);
@@ -111,10 +134,18 @@ impl ClusterPair {
             self.lo = mean(&s[..=best_i]);
             self.hi = mean(&s[best_i + 1..]);
             self.confirmed = true;
+            self.placeholder_is_lo = false;
         } else {
             let m = mean(&s);
-            self.lo = m;
-            self.hi = 3.0 * m;
+            if m > DIT_CLAMP_MS.1 {
+                self.hi = m;
+                self.lo = m / 3.0;
+                self.placeholder_is_lo = true;
+            } else {
+                self.lo = m;
+                self.hi = 3.0 * m;
+                self.placeholder_is_lo = false;
+            }
             self.confirmed = false;
         }
         self.ready = true;
@@ -414,5 +445,33 @@ mod tests {
         assert_eq!(g.classify(14.0 * mu, mu), GapClass::InterWord);
         // Element/char boundary is speed-locked, never Farnsworth-adjusted:
         assert_eq!(g.classify(1.5 * mu, mu), GapClass::InterElement);
+    }
+
+    #[test]
+    fn unimodal_dah_init_assumes_dahs_not_dits() {
+        // Pinned decision 20 fix: a lone ~180 ms cluster (all-dah opener, e.g.
+        // "M", "O", "T T T") must be assumed dahs, not dits -- 180 ms exceeds
+        // the SPEC §4.1 dit ceiling of 150 ms, so it cannot possibly be dits.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[180.0, 182.0, 178.0, 180.0, 181.0]);
+        assert!(t.ready());
+        assert!(
+            (t.mu_dah_ms() - 180.2).abs() < 1.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+        assert!(
+            (t.mu_dit_ms() - t.mu_dah_ms() / 3.0).abs() < 1.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn unimodal_dah_init_reanchors_on_first_real_dit() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[180.0, 182.0, 178.0, 180.0, 181.0]);
+        t.on_mark(60.0); // first real dit re-anchors mu_dit immediately
+        assert!((t.mu_dit_ms() - 60.0).abs() < 0.1, "mu_dit {}", t.mu_dit_ms());
     }
 }
