@@ -27,6 +27,22 @@ pub fn power_db(power: f32) -> f64 {
     10.0 * (power as f64 + POWER_DB_EPSILON).log10()
 }
 
+/// Per-hop fine-frequency interpolation (SPEC §1.4): quadratic
+/// interpolation on dB powers of the three bins around a candidate peak
+/// channel. Returns the sub-bin offset in `[-0.5, 0.5]`, or `None` if the
+/// hop is "unusable" (no local maximum at the center bin).
+pub fn interpolate_offset(p_minus: f32, p_zero: f32, p_plus: f32) -> Option<f64> {
+    let pm = power_db(p_minus);
+    let p0 = power_db(p_zero);
+    let pp = power_db(p_plus);
+    let denom = pm - 2.0 * p0 + pp;
+    if denom < 0.0 {
+        Some((0.5 * (pm - pp) / denom).clamp(-0.5, 0.5))
+    } else {
+        None
+    }
+}
+
 /// WOLA polyphase filterbank: N channels, 4x oversampled (hop = N/4).
 /// SPEC §1.1-1.3.
 pub struct Channelizer {
@@ -294,5 +310,38 @@ mod tests {
         for (a, b) in hops_whole.iter().zip(hops_chunked.iter()) {
             assert_eq!(a.x, b.x);
         }
+    }
+
+    #[test]
+    fn interpolate_offset_finds_symmetric_peak_at_zero() {
+        // A true local max with equal neighbors -> delta = 0.
+        assert_eq!(interpolate_offset(0.5, 1.0, 0.5), Some(0.0));
+    }
+
+    #[test]
+    fn interpolate_offset_leans_toward_the_larger_neighbor() {
+        // Peak biased toward p_plus -> positive delta (SPEC §1.4 formula
+        // sign convention: delta = 0.5*(P_minus - P_plus)/denom).
+        let d = interpolate_offset(0.3, 1.0, 0.6).unwrap();
+        assert!(d > 0.0, "delta {d}");
+        assert!(d <= 0.5);
+    }
+
+    #[test]
+    fn interpolate_offset_clamps_to_half_bin() {
+        // Extremely asymmetric neighbors would produce |delta| > 0.5 unclamped.
+        let d = interpolate_offset(1e-6, 1.0, 0.999).unwrap();
+        assert!((-0.5..=0.5).contains(&d));
+    }
+
+    #[test]
+    fn interpolate_offset_none_when_not_a_local_max() {
+        // A local MINIMUM at the center bin (a valley, not a peak): the
+        // denominator is computed on dB-converted values, and log10 is
+        // concave, so even monotonically-increasing linear power values
+        // produce a local-max-shaped (negative) denominator in dB -- a
+        // genuine valley is the unambiguous "no local max" case.
+        // denom = db(0.5) - 2*db(0.1) + db(0.5) ~= 13.98 >= 0 -> unusable.
+        assert_eq!(interpolate_offset(0.5, 0.1, 0.5), None);
     }
 }
