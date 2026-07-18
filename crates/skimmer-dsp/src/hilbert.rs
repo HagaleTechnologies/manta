@@ -140,6 +140,9 @@ mod tests {
         let y = h.process(&x);
         let delay = h.delay();
         let skip = 2 * delay; // let the filter's transient settle at both ends
+        // Explicit range form is clearer than enumerate/skip/take here since
+        // `i` is used both for the y[i] index and in the assert failure message.
+        #[allow(clippy::needless_range_loop)]
         for i in skip..(n - skip) {
             assert!(
                 (y[i].norm() - 1.0).abs() < 0.05,
