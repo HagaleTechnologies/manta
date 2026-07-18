@@ -60,7 +60,9 @@ fn main() -> Result<()> {
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
                 "v1" => skimmer_testkit::vectors::v1(),
-                other => bail!("unknown vector {other:?} (available: v1)"),
+                "v2" => skimmer_testkit::vectors::v2(),
+                "v3" => skimmer_testkit::vectors::v3(),
+                other => bail!("unknown vector {other:?} (available: v1-v3)"),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = skimmer_testkit::vectors::write_fixture_set(&spec, &out)?;

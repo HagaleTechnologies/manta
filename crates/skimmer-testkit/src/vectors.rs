@@ -1,6 +1,7 @@
 //! Golden test vectors. SPEC §7: definitions live here
 //! (module map §8: "§7 vectors -> skimmer-testkit::vectors").
 
+use crate::keyer::Jitter;
 use crate::scene::{render_scene, SignalSpec};
 use crate::wav::write_fixture;
 use anyhow::Result;
@@ -34,6 +35,50 @@ pub fn v1() -> VectorSpec {
             offset_hz: 12_340.0,
             snr_2500_db: 20.0,
             jitter: None,
+        }],
+    }
+}
+
+/// SPEC §7 V2 "fast-35": 35 WPM, +15 dB, JA1ABC, AWGN + 8% jitter.
+pub fn v2() -> VectorSpec {
+    VectorSpec {
+        name: "v2",
+        fs: 96_000.0,
+        duration_s: 90.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x534B_494D_5632, // "SKIMV2"
+        signals: vec![SignalSpec {
+            text: "CQ CQ DE JA1ABC JA1ABC K".into(),
+            loop_text: true,
+            wpm: 35.0,
+            offset_hz: -8_200.0,
+            snr_2500_db: 15.0,
+            jitter: Some(Jitter {
+                sigma: 0.08,
+                seed: 0x5632,
+            }),
+        }],
+    }
+}
+
+/// SPEC §7 V3 "slow-weak": 12 WPM, +6 dB, VK9DX, AWGN + 8% jitter.
+pub fn v3() -> VectorSpec {
+    VectorSpec {
+        name: "v3",
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x534B_494D_5633, // "SKIMV3"
+        signals: vec![SignalSpec {
+            text: "CQ CQ DE VK9DX VK9DX K".into(),
+            loop_text: true,
+            wpm: 12.0,
+            offset_hz: 5_600.0,
+            snr_2500_db: 6.0,
+            jitter: Some(Jitter {
+                sigma: 0.08,
+                seed: 0x5633,
+            }),
         }],
     }
 }
@@ -119,6 +164,26 @@ mod tests {
         assert_eq!(s.snr_2500_db, 20.0);
         assert!(s.jitter.is_none()); // V1: no jitter
         assert_eq!(s.text, "CQ CQ DE W1AW W1AW K");
+    }
+
+    #[test]
+    fn v2_spec_matches_spec_table() {
+        let v = v2();
+        let s = &v.signals[0];
+        assert_eq!(s.wpm, 35.0);
+        assert_eq!(s.snr_2500_db, 15.0);
+        assert!(s.jitter.is_some());
+        assert_eq!(s.text, "CQ CQ DE JA1ABC JA1ABC K");
+    }
+
+    #[test]
+    fn v3_spec_matches_spec_table() {
+        let v = v3();
+        let s = &v.signals[0];
+        assert_eq!(s.wpm, 12.0);
+        assert_eq!(s.snr_2500_db, 6.0);
+        assert!(s.jitter.is_some());
+        assert_eq!(s.text, "CQ CQ DE VK9DX VK9DX K");
     }
 
     #[test]
