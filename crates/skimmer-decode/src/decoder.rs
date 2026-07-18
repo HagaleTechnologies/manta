@@ -415,4 +415,21 @@ mod tests {
         ];
         assert_eq!(events_to_text(&ev), "A B");
     }
+
+    #[test]
+    fn all_dah_opener_decodes_correctly() {
+        // Pinned decision 20 regression, exercised end-to-end. At 24
+        // hops/dit (dit = 64 ms, ~18.75 WPM), a homogeneous run of dahs
+        // averages 192 ms -- unambiguously over the SPEC §4.1 150 ms dit
+        // ceiling, so unimodal init must assume dahs, not the pre-fix
+        // default of dits (which decoded "TTTTT" as "5").
+        let env = rect_envelope("TTTTT", 24);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        assert_eq!(events_to_text(&events), "TTTTT");
+    }
 }

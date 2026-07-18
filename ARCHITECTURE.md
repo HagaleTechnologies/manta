@@ -63,13 +63,18 @@ skimmer/
 Dependency graph (arrows = depends on):
 
 ```
-skimmer-cli ──▶ skimmer-engine ──▶ skimmer-input
+skimmer-cli ──▶ skimmer-engine ──▶ skimmer-input ──▶ skimmer-dsp
                      │        ├──▶ skimmer-dsp ──────▶ coppa-dsp
                      │        ├──▶ skimmer-decode
                      │        └──▶ skimmer-spot
                      └──▶ skimmer-server
 skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
 ```
+
+M1 added `skimmer-input → skimmer-dsp` (the shared Hilbert transformer, used
+by both `AudioIqSource` and `skimmer-testkit`'s Watterson vector rendering)
+and `skimmer-testkit → coppa-channel` (Watterson fading, see the M1
+pinned-decisions doc).
 
 ### Reused from coppa vs. new
 
@@ -79,7 +84,8 @@ skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
 | FIR design (PFB prototype) | **new** (`skimmer-dsp::proto`) — `coppa-dsp::filter` ships only `RrcFilter` (SPEC §10.1) |
 | Envelope normalization | **new** — per-track fixed reference scale; `coppa-dsp::agc` not used in the decode path (SPEC §10.2) |
 | Channel impairments for tests (AWGN, freq offset, fading, **Watterson HF**) | **reuse** `coppa-channel` |
-| Audio-device input (single-channel mode) | **reuse** `coppa-audio` (cpal) |
+| Audio-device input (single-channel mode) | **reuse** `coppa-audio` (cpal) — no automatic resampling; source must run natively at exactly 48000 Hz (M1 pinned decisions doc) |
+| Real-to-analytic Hilbert conversion | **new** (`skimmer-dsp::hilbert`) — used by both live audio input and offline Watterson vector rendering |
 | Polyphase filterbank channelizer | **new** (`skimmer-dsp`) — coppa has no channelizer |
 | Order-statistic noise-floor estimator | **new** (`skimmer-dsp`) |
 | CW keying/timing/Morse decode | **new** (`skimmer-decode`) — dit's algorithms, ported & headless |

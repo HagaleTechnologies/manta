@@ -7,7 +7,10 @@ Network currently depends on.
 
 ## Status
 
-M0 implemented (single-signal WAV decode, V1 green); next is M1 in ROADMAP.md.
+M1 implemented (live audio decode; V1-V4, V6 green, V5 known-limitation
+tracked — see docs/DECISIONS/2026-07-17-m1-implementation-pins.md; manual
+W1AW live-copy run still outstanding); next is M2 in ROADMAP.md, pending
+that verification.
 
 ## Documents (read in this order)
 
@@ -63,6 +66,10 @@ descriptive and always loses conflicts with code and docs/.
 - M0 testkit generates its own ref-bandwidth AWGN (see
   docs/DECISIONS/2026-07-11-m0-implementation-pins.md); migrate to coppa
   awgn_ref_bw when it ships.
+- coppa pin bumped to `f8a4d16d` for M1 (Watterson fixes; see
+  docs/DECISIONS/2026-07-17-m1-implementation-pins.md). `AudioIqSource`
+  requires exactly 48000 Hz input — coppa-audio's resampler is unreachable
+  (no `mod resampler;`, no `rubato` dep); see that doc's pin 3.
 
 ## Multi-agent hygiene
 

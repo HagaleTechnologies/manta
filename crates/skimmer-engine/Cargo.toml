@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+libc = { workspace = true }
 num-complex = { workspace = true }
 serde = { workspace = true }
 skimmer-decode = { workspace = true }
@@ -15,5 +16,6 @@ skimmer-dsp = { workspace = true }
 skimmer-input = { workspace = true }
 
 [dev-dependencies]
+coppa-audio = { workspace = true }
 proptest = { workspace = true }
 skimmer-testkit = { workspace = true }
