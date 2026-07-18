@@ -77,8 +77,8 @@ impl HilbertTransformer {
             self.hist.push_back(x);
             // Sequential f64 accumulation (SPEC §6.4 determinism convention).
             let mut acc = 0.0f64;
-            for (i, &h) in self.taps.iter().enumerate() {
-                acc += h as f64 * self.hist[i] as f64;
+            for (&h, &x) in self.taps.iter().zip(self.hist.iter()) {
+                acc += h as f64 * x as f64;
             }
             let re = self.hist[center];
             out.push(Complex32::new(re, acc as f32));
