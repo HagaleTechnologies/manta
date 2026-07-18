@@ -1,6 +1,13 @@
+//! **Deprecated** as of M2 sub-project 1 -- `skimmer-dsp::channelizer`'s
+//! real per-channel power output plus its `interpolate_offset` (SPEC §1.4)
+//! replace this periodogram-based estimator. Kept compiled and tested for
+//! now as a reference/fallback; not wired into `skimmer-engine` anymore as
+//! of that sub-project. Candidate for removal once the channelizer path has
+//! run cleanly for a few months; see
+//! `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`.
+//!
 //! M0 frequency finder: averaged periodogram + parabolic interpolation.
-//! Uses the same dB-domain delta formula and clamp as SPEC §1.4. Superseded
-//! by the PFB detector + track centroid at M2.
+//! Uses the same dB-domain delta formula and clamp as SPEC §1.4.
 
 use coppa_dsp::fft::FftProcessor;
 use num_complex::Complex32;
