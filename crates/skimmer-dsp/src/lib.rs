@@ -5,5 +5,6 @@
 //! FFT-peak frequency estimator. The M2 PFB replaces `single` and `freqest`.
 
 pub mod freqest;
+pub mod hilbert;
 pub mod proto;
 pub mod single;
