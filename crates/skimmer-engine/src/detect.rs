@@ -10,6 +10,8 @@ use skimmer_dsp::channelizer::Channelizer;
 /// Run `ch` over `calib_iq`, return the channel index with the highest
 /// average power across the resulting hops, or `None` if no hops were
 /// produced (calibration window shorter than one filter length).
+/// Temporary: no caller yet until Tasks 6/7 wire this into decode_samples/decode_wav and listen.
+#[allow(dead_code)]
 pub(crate) fn calibrate_channel(ch: &mut Channelizer, calib_iq: &[Complex32]) -> Option<usize> {
     let hops = ch.process(calib_iq);
     if hops.is_empty() {
