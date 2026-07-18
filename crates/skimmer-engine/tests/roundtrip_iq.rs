@@ -84,6 +84,7 @@ proptest! {
             offset_hz: offset_khz as f64 * 1000.0,
             snr_2500_db: snr,
             jitter: None,
+            qsb: None,
         };
         let (iq, texts) = render_scene(std::slice::from_ref(&sig), fs, duration_s, Some(noise_seed)).unwrap();
         let report = decode_samples(&iq, fs, 0.0, &PipelineConfig::default()).unwrap();

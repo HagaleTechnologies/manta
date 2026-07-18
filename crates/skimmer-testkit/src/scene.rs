@@ -157,20 +157,28 @@ mod tests {
             jitter: None,
             qsb: Some(QsbSine { rate_hz: 0.2 }),
         };
-        // One full QSB period at 0.2 Hz is 5 s; render 5 s and confirm the
-        // peak envelope magnitude varies by roughly the expected 0.55+-0.45 range.
         let (samples, _) = render_scene(std::slice::from_ref(&sig), fs, 5.0, None).unwrap();
-        let peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
-        let trough_window: Vec<f32> = samples
-            .iter()
-            .skip(samples.len() / 2 - 100)
-            .take(200)
-            .map(|c| c.norm())
-            .collect();
-        let trough_max = trough_window.iter().copied().fold(0.0f32, f32::max);
+        let global_peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+
+        // Bin into 0.3 s windows and take each bin's peak envelope. At 20 WPM an
+        // "E" repeats well inside a 0.3 s window, so every bin is guaranteed to
+        // contain at least one keyed "on" pulse regardless of exact keying
+        // phase -- this avoids the previous version's mistake of guessing a
+        // fixed sample offset, which happened to land in ordinary Morse silence
+        // rather than actually sampling the QSB envelope's minimum. The true
+        // QSB minimum (multiplier 0.10, at t=3.75s where sin(2*pi*0.2*t) = -1)
+        // should produce a visibly smaller bin peak than the bin containing the
+        // QSB maximum (multiplier 1.0, at t=1.25s where sin(2*pi*0.2*t) = 1).
+        let bin_samples = (0.3 * fs) as usize;
+        let min_bin_peak = samples
+            .chunks(bin_samples)
+            .map(|chunk| chunk.iter().map(|c| c.norm()).fold(0.0f32, f32::max))
+            .fold(f32::MAX, f32::min);
+
         assert!(
-            trough_max < peak * 0.5,
-            "expected a QSB trough well below peak: peak={peak} trough_max={trough_max}"
+            min_bin_peak < global_peak * 0.5,
+            "expected some 0.3s bin's peak envelope well below the global peak (QSB trough): \
+             global_peak={global_peak} min_bin_peak={min_bin_peak}"
         );
     }
 }
