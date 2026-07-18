@@ -1,11 +1,10 @@
 //! Integration test: a clean real-audio WAV fixture, decoded end-to-end
 //! through the AudioIqSource -> listen streaming pipeline. Design doc §4.
 
-use num_complex::Complex32;
 use skimmer_engine::{listen, PipelineConfig};
 use skimmer_input::AudioIqSource;
 use skimmer_testkit::keyer::{key_text_loop, KeyerSpec};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 #[test]
