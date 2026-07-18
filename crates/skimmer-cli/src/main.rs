@@ -44,6 +44,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run the listen pipeline for a fixed duration, checking for panics
+    /// and unbounded memory growth (ROADMAP M1 accept criterion).
+    Soak {
+        /// Duration in seconds.
+        #[arg(long)]
+        duration: u64,
+        #[arg(long, conflicts_with = "source")]
+        device: Option<String>,
+        #[arg(long, conflicts_with = "device")]
+        source: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -113,6 +124,25 @@ fn main() -> Result<()> {
                     _ => {}
                 }
             })?;
+        }
+        Command::Soak {
+            duration,
+            device,
+            source,
+        } => {
+            let src = match source {
+                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
+                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+            };
+            let report = skimmer_engine::soak(
+                src,
+                &PipelineConfig::default(),
+                std::time::Duration::from_secs(duration),
+            )?;
+            eprintln!("{report:?}");
+            if !skimmer_engine::soak_passed(&report) {
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

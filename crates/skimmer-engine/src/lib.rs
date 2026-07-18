@@ -3,6 +3,8 @@
 
 pub mod listen;
 pub use listen::listen;
+pub mod soak;
+pub use soak::{soak, soak_passed, SoakReport};
 
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
