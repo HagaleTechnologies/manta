@@ -23,7 +23,13 @@ skimmer-input = { path = "crates/skimmer-input" }
 skimmer-testkit = { path = "crates/skimmer-testkit" }
 skimmer-engine = { path = "crates/skimmer-engine" }
 
-coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "4cbfdac6f93ccbd363fbec248b2739faef38dbc4" }
+coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
+coppa-audio = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
+coppa-channel = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
+
+cpal = "0.18"
+ctrlc = "3"
+libc = "0.2"
 
 anyhow = "1.0"
 num-complex = "0.4"
