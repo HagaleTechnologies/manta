@@ -6,6 +6,8 @@ pub use listen::listen;
 pub mod soak;
 pub use soak::{soak, soak_passed, SoakReport};
 
+mod detect;
+
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use skimmer_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
