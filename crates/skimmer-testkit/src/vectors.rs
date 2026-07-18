@@ -2,7 +2,7 @@
 //! (module map §8: "§7 vectors -> skimmer-testkit::vectors").
 
 use crate::keyer::Jitter;
-use crate::scene::{render_scene, SignalSpec};
+use crate::scene::{render_scene, QsbSine, SignalSpec};
 use crate::wav::write_fixture;
 use anyhow::Result;
 use num_complex::Complex32;
@@ -35,6 +35,7 @@ pub fn v1() -> VectorSpec {
             offset_hz: 12_340.0,
             snr_2500_db: 20.0,
             jitter: None,
+            qsb: None,
         }],
     }
 }
@@ -57,6 +58,7 @@ pub fn v2() -> VectorSpec {
                 sigma: 0.08,
                 seed: 0x5632,
             }),
+            qsb: None,
         }],
     }
 }
@@ -79,6 +81,27 @@ pub fn v3() -> VectorSpec {
                 sigma: 0.08,
                 seed: 0x5633,
             }),
+            qsb: None,
+        }],
+    }
+}
+
+/// SPEC §7 V6 "qsb-sine": 20 WPM, K5ZZZ, AWGN, sinusoidal envelope QSB.
+pub fn v6() -> VectorSpec {
+    VectorSpec {
+        name: "v6",
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x534B_494D_5636, // "SKIMV6"
+        signals: vec![SignalSpec {
+            text: "CQ CQ DE K5ZZZ K5ZZZ K".into(),
+            loop_text: true,
+            wpm: 20.0,
+            offset_hz: -15_000.0,
+            snr_2500_db: 20.0, // peak SNR; QSB brings the trough toward ~0 dB
+            jitter: None,
+            qsb: Some(QsbSine { rate_hz: 0.2 }),
         }],
     }
 }
@@ -184,6 +207,15 @@ mod tests {
         assert_eq!(s.snr_2500_db, 6.0);
         assert!(s.jitter.is_some());
         assert_eq!(s.text, "CQ CQ DE VK9DX VK9DX K");
+    }
+
+    #[test]
+    fn v6_spec_matches_spec_table() {
+        let v = v6();
+        let s = &v.signals[0];
+        assert_eq!(s.wpm, 20.0);
+        let qsb = s.qsb.expect("V6 must carry a QsbSine spec");
+        assert_eq!(qsb.rate_hz, 0.2);
     }
 
     #[test]

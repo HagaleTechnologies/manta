@@ -16,6 +16,14 @@ pub struct SignalSpec {
     pub offset_hz: f64,
     pub snr_2500_db: f32,
     pub jitter: Option<Jitter>,
+    pub qsb: Option<QsbSine>,
+}
+
+/// Sinusoidal QSB envelope multiplier applied on top of the keyed envelope.
+/// SPEC §7 V6: `0.55 + 0.45 * sin(2*pi*rate_hz*t)`.
+#[derive(Debug, Clone, Copy)]
+pub struct QsbSine {
+    pub rate_hz: f32,
 }
 
 /// Headroom scale applied to signal+noise after mixing (float32 WAV; keeps
@@ -51,7 +59,12 @@ pub fn render_scene(
         let dphi = std::f64::consts::TAU * sig.offset_hz / fs;
         let mut phi = 0.0f64;
         for (i, out) in acc.iter_mut().enumerate() {
-            let e = env.get(i).copied().unwrap_or(0.0) * amp;
+            let mut e = env.get(i).copied().unwrap_or(0.0) * amp;
+            if let Some(q) = sig.qsb {
+                let t = i as f64 / fs;
+                let mul = 0.55 + 0.45 * (std::f64::consts::TAU * q.rate_hz as f64 * t).sin();
+                e *= mul as f32;
+            }
             if e != 0.0 {
                 let (s, c) = phi.sin_cos();
                 out.re += e * c as f32;
@@ -90,6 +103,7 @@ mod tests {
             offset_hz: 12_340.0,
             snr_2500_db: 20.0,
             jitter: None,
+            qsb: None,
         };
         let (clean, _) = render_scene(std::slice::from_ref(&sig), fs, 10.0, None).unwrap();
         let (noisy_only, _) = render_scene(&[], fs, 10.0, Some(1)).unwrap();
@@ -123,10 +137,40 @@ mod tests {
                 sigma: 0.08,
                 seed: 9,
             }),
+            qsb: None,
         };
         let a = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
         let b = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
         assert_eq!(a.0, b.0);
         assert_eq!(a.1, b.1);
+    }
+
+    #[test]
+    fn qsb_sine_modulates_envelope_amplitude() {
+        let fs = 96_000.0;
+        let sig = SignalSpec {
+            text: "E".into(), // one dit, looped -- near-continuous keying
+            loop_text: true,
+            wpm: 20.0,
+            offset_hz: 1_000.0,
+            snr_2500_db: 30.0,
+            jitter: None,
+            qsb: Some(QsbSine { rate_hz: 0.2 }),
+        };
+        // One full QSB period at 0.2 Hz is 5 s; render 5 s and confirm the
+        // peak envelope magnitude varies by roughly the expected 0.55+-0.45 range.
+        let (samples, _) = render_scene(std::slice::from_ref(&sig), fs, 5.0, None).unwrap();
+        let peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+        let trough_window: Vec<f32> = samples
+            .iter()
+            .skip(samples.len() / 2 - 100)
+            .take(200)
+            .map(|c| c.norm())
+            .collect();
+        let trough_max = trough_window.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            trough_max < peak * 0.5,
+            "expected a QSB trough well below peak: peak={peak} trough_max={trough_max}"
+        );
     }
 }
