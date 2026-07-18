@@ -12,8 +12,13 @@ use num_complex::Complex32;
 pub const HILBERT_TAPS: usize = 129;
 
 /// Design the length-HILBERT_TAPS windowed-sinc Hilbert FIR:
-/// h[n] = 0 for (n - center) even, 2 / (pi * (n - center)) for odd,
-/// Kaiser-windowed with the PFB prototype's beta (proto.rs).
+/// h\[n\] = 0 for (n - center) even, -2 / (pi * (n - center)) for odd,
+/// Kaiser-windowed with the PFB prototype's beta (proto.rs). The negative
+/// sign is required because `process()` pairs `taps[i]` directly with
+/// `hist[i]` (oldest-first), which reverses the convolution index order
+/// relative to standard causal FIR. Since the ideal Hilbert kernel is
+/// antisymmetric, this index reversal is algebraically equivalent to
+/// negating the kernel.
 pub fn design_hilbert_fir() -> Vec<f32> {
     let len = HILBERT_TAPS;
     let center = (len - 1) as f64 / 2.0; // integer-valued since len is odd
