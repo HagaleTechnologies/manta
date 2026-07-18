@@ -16,5 +16,6 @@ skimmer-dsp = { workspace = true }
 skimmer-input = { workspace = true }
 
 [dev-dependencies]
+coppa-audio = { workspace = true }
 proptest = { workspace = true }
 skimmer-testkit = { workspace = true }

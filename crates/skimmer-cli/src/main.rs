@@ -31,6 +31,19 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Decode a live off-air CW signal continuously from real audio.
+    Listen {
+        /// Input device name substring (default input device if omitted).
+        #[arg(long, conflicts_with = "source")]
+        device: Option<String>,
+        /// Replay a WAV file instead of a live device (paced by its own
+        /// sample rate via AudioIqSource; used for demos and testing).
+        #[arg(long, conflicts_with = "device")]
+        source: Option<PathBuf>,
+        /// Emit DecoderEvents as JSON Lines instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -59,6 +72,42 @@ fn main() -> Result<()> {
                 spec.name,
                 manifest.expected_freq_hz
             );
+        }
+        Command::Listen {
+            device,
+            source,
+            json,
+        } => {
+            let src = match source {
+                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
+                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+            };
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_handler = stop.clone();
+            ctrlc::set_handler(move || {
+                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+            })?;
+            skimmer_engine::listen(src, &PipelineConfig::default(), stop, |ev| {
+                if json {
+                    println!("{}", serde_json::to_string(ev).unwrap());
+                    return;
+                }
+                use skimmer_decode::events::DecoderEvent;
+                use std::io::Write as _;
+                match ev {
+                    DecoderEvent::CharDecoded { glyph, .. } => {
+                        if let Some(c) = glyph.text_char() {
+                            print!("{c}");
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                    DecoderEvent::WordBoundary { .. } => {
+                        print!(" ");
+                        let _ = std::io::stdout().flush();
+                    }
+                    _ => {}
+                }
+            })?;
         }
     }
     Ok(())

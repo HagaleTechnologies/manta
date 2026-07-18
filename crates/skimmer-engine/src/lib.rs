@@ -1,6 +1,9 @@
 //! M0 pipeline: WAV -> frequency estimate -> single channel -> decoder.
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
+pub mod listen;
+pub use listen::listen;
+
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use skimmer_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
