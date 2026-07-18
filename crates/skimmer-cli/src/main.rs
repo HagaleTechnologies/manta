@@ -62,8 +62,10 @@ fn main() -> Result<()> {
                 "v1" => skimmer_testkit::vectors::v1(),
                 "v2" => skimmer_testkit::vectors::v2(),
                 "v3" => skimmer_testkit::vectors::v3(),
+                "v4" => skimmer_testkit::vectors::v4(),
+                "v5" => skimmer_testkit::vectors::v5(),
                 "v6" => skimmer_testkit::vectors::v6(),
-                other => bail!("unknown vector {other:?} (available: v1-v3, v6)"),
+                other => bail!("unknown vector {other:?} (available: v1-v6)"),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = skimmer_testkit::vectors::write_fixture_set(&spec, &out)?;

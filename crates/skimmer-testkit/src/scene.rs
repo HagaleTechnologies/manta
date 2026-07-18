@@ -17,6 +17,7 @@ pub struct SignalSpec {
     pub snr_2500_db: f32,
     pub jitter: Option<Jitter>,
     pub qsb: Option<QsbSine>,
+    pub watterson: Option<WattersonFade>,
 }
 
 /// Sinusoidal QSB envelope multiplier applied on top of the keyed envelope.
@@ -24,6 +25,17 @@ pub struct SignalSpec {
 #[derive(Debug, Clone, Copy)]
 pub struct QsbSine {
     pub rate_hz: f32,
+}
+
+/// Watterson HF fading applied to this signal only, via coppa's real,
+/// currently-shipped `watterson_preset()` (one-shot, real-domain) -- design
+/// doc §6: the streaming `WattersonChannel` SPEC-decode-core.md assumes was
+/// never implemented in coppa; vector generation is offline/batch, so the
+/// streaming requirement doesn't apply.
+#[derive(Debug, Clone, Copy)]
+pub struct WattersonFade {
+    pub preset: coppa_channel::watterson::WattersonPreset,
+    pub seed: u64,
 }
 
 /// Headroom scale applied to signal+noise after mixing (float32 WAV; keeps
@@ -54,8 +66,54 @@ pub fn render_scene(
         };
         texts.push(text);
         let amp = amplitude_for_snr_2500(sig.snr_2500_db, fs);
-        // Phase-accumulator NCO in f64 with wrap: deterministic, no
-        // large-argument sin/cos precision loss.
+
+        if let Some(fade) = sig.watterson {
+            // Real-domain path: build a real passband tone at this
+            // signal's offset, fade it with coppa's model, then
+            // Hilbert-convert back to complex baseband and add directly.
+            //
+            // `cos` is even, so a phase accumulator driven by a *negative*
+            // offset_hz produces a bit-identical real waveform to the same
+            // positive offset -- sign information cannot survive a
+            // real-valued tone. And the Hilbert transform of any real tone
+            // always yields a positive-frequency analytic signal (the
+            // negative-frequency half is exactly what the transform
+            // discards). So build the tone from the offset's magnitude,
+            // then conjugate the analytic result for negative offsets:
+            // conj(e^{+jwt}) = e^{-jwt}, which is exactly the negative-
+            // frequency tone the (possibly negative) offset asked for.
+            let mut real = vec![0.0f32; n];
+            let dphi = std::f64::consts::TAU * sig.offset_hz.abs() / fs;
+            let mut phi = 0.0f64;
+            for (i, r) in real.iter_mut().enumerate() {
+                let e = env.get(i).copied().unwrap_or(0.0) * amp;
+                *r = e * phi.cos() as f32;
+                phi += dphi;
+                if phi > std::f64::consts::PI {
+                    phi -= std::f64::consts::TAU;
+                } else if phi < -std::f64::consts::PI {
+                    phi += std::f64::consts::TAU;
+                }
+            }
+            let faded = coppa_channel::watterson::watterson_preset(
+                &real,
+                fs as f32,
+                fade.preset,
+                fade.seed,
+            );
+            let mut analytic = skimmer_dsp::hilbert::HilbertTransformer::new().process(&faded);
+            if sig.offset_hz < 0.0 {
+                for a in &mut analytic {
+                    *a = a.conj();
+                }
+            }
+            for (out, a) in acc.iter_mut().zip(analytic.iter()) {
+                *out += a;
+            }
+            continue;
+        }
+
+        // AWGN-only path (V1-V3, V6): complex NCO placement.
         let dphi = std::f64::consts::TAU * sig.offset_hz / fs;
         let mut phi = 0.0f64;
         for (i, out) in acc.iter_mut().enumerate() {
@@ -104,6 +162,7 @@ mod tests {
             snr_2500_db: 20.0,
             jitter: None,
             qsb: None,
+            watterson: None,
         };
         let (clean, _) = render_scene(std::slice::from_ref(&sig), fs, 10.0, None).unwrap();
         let (noisy_only, _) = render_scene(&[], fs, 10.0, Some(1)).unwrap();
@@ -138,6 +197,7 @@ mod tests {
                 seed: 9,
             }),
             qsb: None,
+            watterson: None,
         };
         let a = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
         let b = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
@@ -164,6 +224,7 @@ mod tests {
             snr_2500_db: 30.0,
             jitter: None,
             qsb: Some(QsbSine { rate_hz: 0.2 }),
+            watterson: None,
         };
         let (samples, _) = render_scene(std::slice::from_ref(&sig), fs, 5.0, None).unwrap();
         let global_peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);

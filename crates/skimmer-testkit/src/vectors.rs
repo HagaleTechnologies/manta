@@ -2,9 +2,10 @@
 //! (module map §8: "§7 vectors -> skimmer-testkit::vectors").
 
 use crate::keyer::Jitter;
-use crate::scene::{render_scene, QsbSine, SignalSpec};
+use crate::scene::{render_scene, QsbSine, SignalSpec, WattersonFade};
 use crate::wav::write_fixture;
 use anyhow::Result;
+use coppa_channel::watterson::WattersonPreset;
 use num_complex::Complex32;
 use std::path::Path;
 
@@ -36,6 +37,7 @@ pub fn v1() -> VectorSpec {
             snr_2500_db: 20.0,
             jitter: None,
             qsb: None,
+            watterson: None,
         }],
     }
 }
@@ -59,6 +61,7 @@ pub fn v2() -> VectorSpec {
                 seed: 0x5632,
             }),
             qsb: None,
+            watterson: None,
         }],
     }
 }
@@ -82,6 +85,7 @@ pub fn v3() -> VectorSpec {
                 seed: 0x5633,
             }),
             qsb: None,
+            watterson: None,
         }],
     }
 }
@@ -102,6 +106,55 @@ pub fn v6() -> VectorSpec {
             snr_2500_db: 20.0, // peak SNR; QSB brings the trough toward ~0 dB
             jitter: None,
             qsb: Some(QsbSine { rate_hz: 0.2 }),
+            watterson: None,
+        }],
+    }
+}
+
+/// SPEC §7 V4 "fade-good": 25 WPM, +10 dB, DL1ABC, Watterson CCIR-good.
+pub fn v4() -> VectorSpec {
+    VectorSpec {
+        name: "v4",
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x534B_494D_5634, // "SKIMV4"
+        signals: vec![SignalSpec {
+            text: "CQ CQ DE DL1ABC DL1ABC K".into(),
+            loop_text: true,
+            wpm: 25.0,
+            offset_hz: 9_100.0,
+            snr_2500_db: 10.0,
+            jitter: None,
+            qsb: None,
+            watterson: Some(WattersonFade {
+                preset: WattersonPreset::Good,
+                seed: 0x5663,
+            }),
+        }],
+    }
+}
+
+/// SPEC §7 V5 "fade-poor": 22 WPM, +3 dB, ZL2XYZ, Watterson CCIR-poor.
+pub fn v5() -> VectorSpec {
+    VectorSpec {
+        name: "v5",
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x534B_494D_5635, // "SKIMV5"
+        signals: vec![SignalSpec {
+            text: "CQ CQ DE ZL2XYZ ZL2XYZ K".into(),
+            loop_text: true,
+            wpm: 22.0,
+            offset_hz: -11_300.0,
+            snr_2500_db: 3.0,
+            jitter: None,
+            qsb: None,
+            watterson: Some(WattersonFade {
+                preset: WattersonPreset::Poor,
+                seed: 0x5635,
+            }),
         }],
     }
 }
@@ -216,6 +269,24 @@ mod tests {
         assert_eq!(s.wpm, 20.0);
         let qsb = s.qsb.expect("V6 must carry a QsbSine spec");
         assert_eq!(qsb.rate_hz, 0.2);
+    }
+
+    #[test]
+    fn v4_spec_matches_spec_table() {
+        let v = v4();
+        let s = &v.signals[0];
+        assert_eq!(s.wpm, 25.0);
+        assert_eq!(s.snr_2500_db, 10.0);
+        assert!(s.watterson.is_some());
+    }
+
+    #[test]
+    fn v5_spec_matches_spec_table() {
+        let v = v5();
+        let s = &v.signals[0];
+        assert_eq!(s.wpm, 22.0);
+        assert_eq!(s.snr_2500_db, 3.0);
+        assert!(s.watterson.is_some());
     }
 
     #[test]
