@@ -149,7 +149,15 @@ mod tests {
     fn qsb_sine_modulates_envelope_amplitude() {
         let fs = 96_000.0;
         let sig = SignalSpec {
-            text: "E".into(), // one dit, looped -- near-continuous keying
+            // Ten E's as a single word: only 3-unit (180 ms) intra-word gaps
+            // apply between characters, giving a 240 ms dit+gap cadence --
+            // well under the 300 ms bin width below. (A single-character "E"
+            // loop instead inserts a 7-unit, 420 ms inter-repetition gap
+            // after every pass -- a 480 ms repeat cycle that can leave a
+            // whole 0.3 s bin sitting entirely in silence regardless of the
+            // QSB multiplier there; confirmed empirically that version could
+            // not distinguish QSB enabled from QSB disabled.)
+            text: "EEEEEEEEEE".into(),
             loop_text: true,
             wpm: 20.0,
             offset_hz: 1_000.0,
@@ -160,15 +168,16 @@ mod tests {
         let (samples, _) = render_scene(std::slice::from_ref(&sig), fs, 5.0, None).unwrap();
         let global_peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
 
-        // Bin into 0.3 s windows and take each bin's peak envelope. At 20 WPM an
-        // "E" repeats well inside a 0.3 s window, so every bin is guaranteed to
-        // contain at least one keyed "on" pulse regardless of exact keying
-        // phase -- this avoids the previous version's mistake of guessing a
-        // fixed sample offset, which happened to land in ordinary Morse silence
-        // rather than actually sampling the QSB envelope's minimum. The true
-        // QSB minimum (multiplier 0.10, at t=3.75s where sin(2*pi*0.2*t) = -1)
-        // should produce a visibly smaller bin peak than the bin containing the
-        // QSB maximum (multiplier 1.0, at t=1.25s where sin(2*pi*0.2*t) = 1).
+        // Bin into 0.3 s windows and take each bin's peak envelope. At 20 WPM
+        // this cadence repeats well inside a 0.3 s window, so every bin is
+        // guaranteed to contain at least one keyed "on" pulse regardless of
+        // exact keying phase -- this avoids the previous version's mistake of
+        // guessing a fixed sample offset, which happened to land in ordinary
+        // Morse silence rather than actually sampling the QSB envelope's
+        // minimum. The true QSB minimum (multiplier 0.10, at t=3.75s where
+        // sin(2*pi*0.2*t) = -1) should produce a visibly smaller bin peak
+        // than the bin containing the QSB maximum (multiplier 1.0, at
+        // t=1.25s where sin(2*pi*0.2*t) = 1).
         let bin_samples = (0.3 * fs) as usize;
         let min_bin_peak = samples
             .chunks(bin_samples)
