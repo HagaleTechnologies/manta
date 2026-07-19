@@ -1,1 +1,19 @@
 /target
+
+# Agent harness scratch state (worktrees, session ledgers) -- never source.
+.claude/
+.worktrees/
+worktrees/
+
+# Secrets -- should never be committed; explicit patterns as a backstop.
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+
+# OS / editor cruft.
+.DS_Store
+.idea/
+.vscode/
