@@ -182,11 +182,12 @@ Per track, operating on the ~375 Hz complex channel stream:
 
 1. **Envelope**: |x| → per-track fixed reference scale (SPEC §3.1; coppa's
    block AGC is not used) → smoothed magnitude.
-   (Goertzel, dit's tone finder, is unnecessary here — the PFB already did the
+   (A separate tone-finder stage is unnecessary here — the PFB already did the
    frequency selection.)
 2. **Keying detection**: dual-rail noise/signal EMA estimators → adaptive
    threshold at their geometric mean → key-down/key-up decisions with hysteresis
-   and minimum-duration debounce (dit's `KeyingDecision` concept, simplified).
+   and minimum-duration debounce (the same keying-decision approach as dit,
+   simplified).
 3. **Speed tracking**: online 2-means clustering of mark durations into
    {dit, dah}; WPM = 1200/dit_ms, tracked with EMA. Handles 10–40+ WPM and drift;
    Farnsworth spacing tolerated by decoupling inter-element and inter-word gap
@@ -198,7 +199,7 @@ Per track, operating on the ~375 Hz complex channel stream:
    characters with confidence.
 5. **(M4, research-dependent) ML decoder**: small CTC model on the channel
    envelope, fused with the classical decoder by adaptive confidence weighting —
-   a direct port of dit's `DecoderFusionEngine` design (sliding-window accuracy
+   a direct port of dit's fusion-engine design (sliding-window accuracy
    tracking, EMA-smoothed weights, weight floor). Training corpus comes from
    `skimmer-testkit` synthesis + RBN-validated on-air recordings. The classical
    decoder must ship first and defines the accuracy baseline the ML stage has to
@@ -219,8 +220,7 @@ track, over a rolling text window:
    refreshable) — a call with an unallocated prefix is rejected.
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
-   only lowers it (new/rare calls must still spot — cqdx exists precisely for
-   rare ones).
+   only lowers it (new/rare calls must still spot, not just well-known ones).
 4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
    the same track before first spot (CW ops repeat their calls; single decodes
    are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,

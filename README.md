@@ -67,4 +67,6 @@ milestone breakdown and [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 
 ## License
 
-MIT OR Apache-2.0 (matching coppa).
+MIT OR Apache-2.0 (matching coppa). Unless you explicitly state otherwise, any
+contribution intentionally submitted for inclusion in this project shall be
+dual licensed as above, without any additional terms or conditions.

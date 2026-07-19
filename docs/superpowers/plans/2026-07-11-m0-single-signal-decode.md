@@ -384,7 +384,7 @@ jobs:
       - run: cargo test --workspace
 ```
 
-Note: the coppa git dependency requires the coppa repo to be readable by CI. If `HagaleTechnologies/coppa` is private, add a `git config url."https://x-access-token:${{ secrets.COPPA_TOKEN }}@github.com/".insteadOf "https://github.com/"` step and surface that to the user — don't silently mint tokens.
+Note: the coppa git dependency requires the coppa repo to be readable by CI. (Moot now — coppa is public.)
 
 - [ ] **Step 7: Verify the workspace builds and tests run**
 
