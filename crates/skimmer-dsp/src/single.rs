@@ -1,6 +1,12 @@
+//! **Deprecated** as of M2 sub-project 1 (`skimmer-dsp::channelizer`
+//! implements the real WOLA polyphase filterbank, SPEC §1.3). Kept
+//! compiled and tested for now as a reference/fallback -- not wired into
+//! `skimmer-engine` anymore as of that sub-project. Candidate for removal
+//! once the channelizer path has run cleanly for a few months; see
+//! `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`.
+//!
 //! Single-channel extractor: one PFB channel computed directly (M0 shim).
 //! Mix by -offset, prototype lowpass, decimate by N/4 to 375 Hz.
-//! Superseded by the full PFB (SPEC §1.3) at M2.
 
 use crate::proto::{design_prototype, TAPS_PER_BRANCH};
 use num_complex::Complex32;

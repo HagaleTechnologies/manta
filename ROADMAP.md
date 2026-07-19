@@ -52,6 +52,14 @@ KiwiSDR input.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics.
 
+M2 sub-project 1 (PFB channelizer, `skimmer-dsp::channelizer`) is complete —
+see `docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md` and
+`docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`. Remaining M2
+sub-projects: detector/track manager (order-statistic noise floor, hysteresis,
+track lifecycle — the placeholder single-channel-argmax detector wired in by
+sub-project 1 is not it), decoder pool, SoapySDR input, KiwiSDR input. M2
+itself is not yet complete.
+
 ## M3 — Spots: validation + servers + RBN parity benchmark
 
 `skimmer-spot` (cty.dat, SCP, CQ/DE parse, repetition gate, dedupe),

@@ -7,10 +7,14 @@ Network currently depends on.
 
 ## Status
 
-M1 implemented (live audio decode; V1-V4, V6 green, V5 known-limitation
-tracked — see docs/DECISIONS/2026-07-17-m1-implementation-pins.md; manual
-W1AW live-copy run still outstanding); next is M2 in ROADMAP.md, pending
-that verification.
+M1 implemented (live audio decode; manual W1AW live-copy run still
+outstanding). M2 sub-project 1 (PFB channelizer, `skimmer-dsp::channelizer`)
+implemented; V1/V3/V4/V6 green through the new channelizer, V2 and V5 are
+both tracked known limitations (`#[ignore]`d, not fixed) — see
+docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md and
+docs/DECISIONS/2026-07-17-m1-implementation-pins.md. `skimmer-dsp::single`/
+`freqest` deprecated in place. Next: M2 sub-project 2 (detector/track
+manager), then decoder pool, SoapySDR input, KiwiSDR input.
 
 ## Documents (read in this order)
 

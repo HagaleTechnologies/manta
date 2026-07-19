@@ -7,8 +7,6 @@ use anyhow::{Context, Result};
 use num_complex::Complex32;
 use skimmer_decode::decoder::TrackDecoder;
 use skimmer_decode::events::DecoderEvent;
-use skimmer_dsp::freqest::estimate_peak_hz;
-use skimmer_dsp::single::SingleChannelExtractor;
 use skimmer_input::{AudioIqSource, IqSource};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,35 +39,31 @@ pub fn listen(
         }
         filled += n;
     }
-    let offset_hz =
-        estimate_peak_hz(&calib, fs).context("no signal found during startup calibration")?;
-
-    let mut extractor =
-        SingleChannelExtractor::new(fs, offset_hz).map_err(|e| anyhow::anyhow!(e))?;
-    let hop = extractor.hop() as u64;
+    let mut calib_ch =
+        skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
+    let k0 = crate::detect::calibrate_channel(&mut calib_ch, &calib)
+        .context("no signal found during startup calibration")?;
+    let mut ch =
+        skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
+    let offset_hz = ch.channel_freq_hz(k0);
+    let hop = ch.hop() as u64;
     let mut decoder = TrackDecoder::new(1, cfg.decode.clone());
     decoder.set_freq_hz(offset_hz);
 
-    // Same lead-in fix as the M0 batch path (extractor group-delay blind
-    // zone), applied once at stream start instead of per-file: prime the
-    // extractor with one filter length of zero IQ before real audio, and
-    // feed every resulting output (do not skip -- see M0 pinned decision 19).
-    let pad_samples = extractor.filter_len();
+    let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
     let mut m: u64 = 0;
-    for y in extractor.process(&padding) {
+    for hop_out in ch.process(&padding) {
         let sample_ts = m.saturating_sub(pad_hops) * hop;
-        for ev in decoder.push_envelope(y.norm(), sample_ts) {
+        for ev in decoder.push_envelope(hop_out.power[k0].sqrt(), sample_ts) {
             on_event(&ev);
         }
         m += 1;
     }
-    // Feed the calibration window too -- it was already consumed from the
-    // source and must not be discarded.
-    for y in extractor.process(&calib) {
+    for hop_out in ch.process(&calib) {
         let sample_ts = m.saturating_sub(pad_hops) * hop;
-        for ev in decoder.push_envelope(y.norm(), sample_ts) {
+        for ev in decoder.push_envelope(hop_out.power[k0].sqrt(), sample_ts) {
             on_event(&ev);
         }
         m += 1;
@@ -82,11 +76,11 @@ pub fn listen(
         }
         let n = src.read(&mut chunk)?;
         if n == 0 {
-            break; // EOF (file replay only; live sources block instead)
+            break;
         }
-        for y in extractor.process(&chunk[..n]) {
+        for hop_out in ch.process(&chunk[..n]) {
             let sample_ts = m.saturating_sub(pad_hops) * hop;
-            for ev in decoder.push_envelope(y.norm(), sample_ts) {
+            for ev in decoder.push_envelope(hop_out.power[k0].sqrt(), sample_ts) {
                 on_event(&ev);
             }
             m += 1;
