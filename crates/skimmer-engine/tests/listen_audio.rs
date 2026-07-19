@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn listen_decodes_a_clean_real_audio_signal() {
     let fs = 48_000.0;
-    let tone_hz = 700.0; // typical CW sidetone offset, well inside audio passband
+    let tone_hz = 750.0; // 750 Hz = 8 * 93.75 Hz channel spacing exactly -- a channel-center frequency, avoiding the near-channel-edge decode degradation documented in docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md (the same root cause as V2's #[ignore]'d golden test).
     let spec = KeyerSpec::new(20.0);
     let (env, keyed_text) = key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs, 15.0).unwrap();
 
