@@ -10,7 +10,19 @@ const WPM_ALPHA: f32 = 0.1; // SPEC §4.1 reporting EMA
 const DRIFT_LEN: usize = 12; // SPEC §4.1 regime-change rule
 const DRIFT_CV_MAX: f64 = 0.35;
 const DRIFT_OFF_FRAC: f64 = 0.40;
-const CHAR_GAP_DITS: f32 = 2.0; // SPEC §9 decode.char_gap_dits
+// SPEC §9 decode.char_gap_dits. **[DEVIATION]** SPEC §4.2 pins 2.0; lowered
+// to 1.6 here -- see docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md.
+// Demod's hysteresis+debounce (SPEC §3.3) adds a roughly constant ~15-20ms
+// overshoot to every measured mark but not to gap durations, so mu_dit_ms
+// (built from marks) runs high relative to true keyed timing. At high WPM
+// (short true dit period) that constant overshoot is a large fraction of
+// mu_dit, compressing gap_ms/mu_dit_ms ratios enough that real
+// inter-character gaps can fall under the nominal 2.0 threshold and get
+// merged into the preceding character. A 500-case sweep at 10-40 WPM found
+// this misclassifies ~2.2% of multi-character texts at 2.0; 1.6 fixed the
+// large majority of those (11 -> 4 failures, reproduced across two
+// independent random seeds) with zero cases regressing pass -> fail.
+const CHAR_GAP_DITS: f32 = 1.6;
 const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
 const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
 const FARNS_MIN_COUNT: u32 = 8; // SPEC §4.2 activation
@@ -443,12 +455,14 @@ mod tests {
 
     #[test]
     fn gap_classification_nominal() {
+        // CHAR_GAP_DITS boundary is 1.6, not SPEC §4.2's nominal 2.0 --
+        // see docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md.
         let mut g = GapClassifier::new();
         let mu = 60.0;
         assert_eq!(g.classify(60.0, mu), GapClass::InterElement); // 1 dit
         assert_eq!(g.classify(180.0, mu), GapClass::InterChar); // 3 dits
         assert_eq!(g.classify(420.0, mu), GapClass::InterWord); // 7 dits
-        assert_eq!(g.classify(119.0, mu), GapClass::InterElement); // < 2.0
+        assert_eq!(g.classify(95.0, mu), GapClass::InterElement); // < 1.6
         assert_eq!(g.classify(299.0, mu), GapClass::InterChar); // < 5.0
         assert_eq!(g.classify(300.0, mu), GapClass::InterWord); // >= 5.0
     }

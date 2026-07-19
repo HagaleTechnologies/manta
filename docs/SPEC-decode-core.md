@@ -303,6 +303,18 @@ Nominal thresholds in dits (`u = gap_ms / μ_dit`):
 - `2.0 ≤ u < 5.0` → **inter-character**
 - `u ≥ 5.0` → **inter-word**
 
+**[DEVIATION]** The implementation uses `1.6`, not `2.0`, for the
+element/character boundary (`CHAR_GAP_DITS` in
+`crates/skimmer-decode/src/timing.rs`) — see
+`docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md`. §3.3's
+hysteresis+debounce systematically inflates measured `μ_dit` relative to
+true keyed timing without inflating gap durations the same way; at high WPM
+that overshoot is large enough relative to the (short) true dit period that
+real inter-character gaps can compute to under 2.0 dits and get merged into
+the preceding character. `1.6` was chosen empirically (500-case sweep, two
+independent seeds) as the value that captures the available fix with the
+smallest deviation from the nominal `2.0`.
+
 **Farnsworth decoupling** (ARCHITECTURE §5.3): run the same 2-means machinery
 on gaps with `u ≥ 1.5` (the "long gaps"), yielding `μ_cgap` (character gap)
 and `μ_wgap` (word gap) when bimodal. Once ≥ 8 long gaps have been observed
