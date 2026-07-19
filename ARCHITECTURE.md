@@ -130,6 +130,9 @@ input overruns are counted, surfaced as metrics, and never block the SDR thread.
 
 ## 4. Channelizer (`skimmer-dsp`)
 
+**Implemented** as of M2 sub-project 1 (`skimmer-dsp::channelizer`) -- the
+design below is now built, not just decided.
+
 **Decision: 4×-oversampled polyphase filterbank (PFB), ~100 Hz channel spacing,
 detection on channel powers, decoders attached only to active channels.**
 
