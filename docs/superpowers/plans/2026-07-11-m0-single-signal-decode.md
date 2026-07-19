@@ -118,7 +118,6 @@ Dependency edges (all path deps inside the workspace):
 - [ ] **Step 1: Sync and branch (multi-agent hygiene)**
 
 ```bash
-cd /Users/thagale/Code/skimmer
 git fetch origin && git rebase origin/main
 # Check nobody has claimed M0 already:
 gh pr list --state open

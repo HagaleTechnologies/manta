@@ -46,22 +46,24 @@ them with zero changes.
 
 ## Relationship to sibling projects
 
-- **[coppa](../coppa)** — skimmer reuses `coppa-dsp` (FFT) and
-  `coppa-channel` (AWGN / Watterson HF fading models) for its DSP core and test
-  harness rather than reimplementing them. (FIR prototype design and AGC are
-  new code here — see SPEC-decode-core §10.)
-- **[dit](../dit)** — skimmer's decoder design is the wideband, headless evolution
-  of dit's single-channel CW engine (envelope → keying state machine → adaptive
+- **[coppa](https://github.com/HagaleTechnologies/coppa)** — skimmer reuses
+  `coppa-dsp` (FFT) and `coppa-channel` (AWGN / Watterson HF fading models)
+  for its DSP core and test harness rather than reimplementing them. (FIR
+  prototype design and AGC are new code here — see SPEC-decode-core §10.)
+- **dit** — skimmer's decoder design is the wideband, headless evolution of
+  dit's single-channel CW engine (envelope → keying state machine → adaptive
   speed tracking → character decode, with an optional ML decoder fused by
   confidence). Lessons from dit's fusion engine inform the M4 ML stage.
-- **[cqdx](../cqdx)** — skimmer's JSON spot stream is designed to be a first-class
-  cqdx ingest source.
+- **cqdx** — skimmer's JSON spot stream is designed to be a first-class cqdx
+  ingest source.
 
 ## Status
 
-**M0 implemented** (single-signal WAV decode, V1 golden vector green); next
-is M1 in [ROADMAP.md](ROADMAP.md). See [ARCHITECTURE.md](ARCHITECTURE.md)
-for the full design.
+**M1 implemented** (live audio decode) and **M2 sub-project 1 implemented**
+(PFB channelizer — real N-channel polyphase filterbank wired into the
+engine, replacing the M0/M1 single-channel shim). Next up: M2 sub-project 2
+(detector/track manager). See [ROADMAP.md](ROADMAP.md) for the full
+milestone breakdown and [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 
 ## License
 
