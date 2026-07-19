@@ -26,4 +26,4 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 
 ## Why it is shaped this way
 
-Beam search rather than hard thresholding is what makes a marginal element recoverable — a small-Viterbi, not a guess. The Goertzel tone-finder from dit is dropped here because the PFB ([[pfb-channelizer]]) already did the frequency selection. ML fusion is gated on beating this baseline (ROADMAP M4), not assumed.
+Beam search rather than hard thresholding is what makes a marginal element recoverable — a small-Viterbi, not a guess. A separate tone-finder stage is dropped here because the PFB ([[pfb-channelizer]]) already did the frequency selection. ML fusion is gated on beating this baseline (ROADMAP M4), not assumed.
