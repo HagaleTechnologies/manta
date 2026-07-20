@@ -171,6 +171,8 @@ impl Lifecycle {
     }
 }
 
+use skimmer_decode::decoder::{DecodeConfig, TrackDecoder};
+use skimmer_decode::events::DecoderEvent;
 use skimmer_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
 use skimmer_dsp::floor::{FloorBank, Gate};
 use std::collections::BTreeMap;
@@ -181,16 +183,33 @@ use std::collections::BTreeMap;
 /// realistic drift, e.g. SPEC §7 V9's 50 Hz/min) -- distinct from the
 /// slower track-*lifetime* power-weighted average used for the final
 /// reported frequency (Task 6).
-// Temporary: no caller yet until Task 6's process_hops wires TrackManager::step_hop into the public API.
+// Temporary: Track/TrackManager are not yet reachable from the crate's
+// public API (`track` is a private module) -- no caller yet until Task 7
+// wires TrackManager::process_hops/finish into decode_samples/decode_wav/
+// listen.
 #[allow(dead_code)]
 pub(crate) struct Track {
     pub(crate) id: u32,
     lifecycle: Lifecycle,
     pub(crate) center: f64,
     pub(crate) current_snr_db: f32,
-    pub(crate) sum_weighted: f64,
-    pub(crate) sum_power: f64,
+    sum_weighted: f64,
+    sum_power: f64,
     pub(crate) birth_channel: usize,
+    /// The track's leased decoder, allocated on CANDIDATE -> ACTIVE
+    /// promotion (SPEC §2.4/§5); `None` before promotion.
+    decoder: Option<TrackDecoder>,
+    /// `(magnitude, sample_ts)` queued this hop-batch by `step_hop`,
+    /// drained once per `process_hops` call by `drain_pool` (ARCHITECTURE
+    /// §10's decoder pool).
+    pending: Vec<(f32, u64)>,
+}
+
+/// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
+fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
+    let half = n_channels as i64 / 2;
+    let signed = ((k as i64 + half).rem_euclid(n_channels as i64)) - half;
+    signed as f64
 }
 
 /// SPEC §2.5: a live centroid EMA responsive enough to follow realistic
@@ -199,11 +218,12 @@ pub(crate) struct Track {
 /// against V9 in Task 9 and pinned there.
 const CENTER_EMA_ALPHA: f64 = 0.01;
 
-// Temporary: no caller yet until Task 6's process_hops wires TrackManager::step_hop into the public API.
+// Temporary: no caller yet until Task 7 wires TrackManager::process_hops
+// into decode_samples/decode_wav/listen.
 #[allow(dead_code)]
 impl Track {
     /// A brand-new track: `Lifecycle` seeded fresh, `center` initialized to
-    /// its birth channel. SPEC §2.4/§2.5.
+    /// its birth channel, decoder unleased. SPEC §2.4/§2.5.
     fn new(id: u32, birth_channel: usize, cfg: &DetectorConfig) -> Self {
         Track {
             id,
@@ -213,6 +233,8 @@ impl Track {
             sum_weighted: 0.0,
             sum_power: 0.0,
             birth_channel,
+            decoder: None,
+            pending: Vec::new(),
         }
     }
 
@@ -260,13 +282,25 @@ impl Track {
             self.sum_power += w;
         }
     }
+
+    /// SPEC §1.1/§1.4: absolute Hz for this track's current lifetime
+    /// power-weighted centroid (not the fast ownership-following EMA).
+    fn freq_hz(&self, center_freq_hz: f64, channel_spacing_hz: f64, n_channels: usize) -> f64 {
+        let centroid = if self.sum_power > 0.0 {
+            self.sum_weighted / self.sum_power
+        } else {
+            self.birth_channel as f64
+        };
+        let k0_freq = center_freq_hz
+            + wrapped_channel_offset(self.birth_channel, n_channels) * channel_spacing_hz;
+        k0_freq + (centroid - self.birth_channel as f64) * channel_spacing_hz
+    }
 }
 
 /// Orchestrates SPEC §2's real detector across all channels: per-channel
 /// floor + gate (`skimmer-dsp::floor`), per-channel lifecycle state
-/// machines (`Lifecycle`), and §2.5 adjacent-channel ownership. This task's
-/// `step_hop` returns which ACTIVE tracks selected which channel this hop,
-/// without touching `TrackDecoder` -- Task 6 adds the decoder pool.
+/// machines (`Lifecycle`), and §2.5 adjacent-channel ownership, driving a
+/// rayon-parallel decoder pool (ARCHITECTURE §10) via `process_hops`.
 pub struct TrackManager {
     floor: FloorBank,
     gate: Gate,
@@ -275,26 +309,42 @@ pub struct TrackManager {
     owner_of: Vec<Option<u32>>,
     next_id: u32,
     cfg: DetectorConfig,
+    decode_cfg: DecodeConfig,
     hop_counter: u64,
+    center_freq_hz: f64,
+    // Temporary: no caller yet until Task 7 wires per-track `freq_hz`
+    // (SPEC §1.1/§1.4) into decode_samples/decode_wav/listen's spot output.
+    #[allow(dead_code)]
+    channel_spacing_hz: f64,
 }
 
 // Temporary: TrackManager is not yet reachable from the crate's public API
 // (`track` is a private module; only `DetectorConfig` is re-exported) --
-// no caller yet until Task 6's process_hops entry point is added and wired
-// into lib.rs. Only `tests` calls these methods today.
+// no caller yet until Task 7 wires `process_hops`/`finish` into
+// decode_samples/decode_wav/listen. Only `tests` calls these methods today.
 #[allow(dead_code)]
 impl TrackManager {
     /// A fresh manager over `n_channels` channels, configured per
-    /// `DetectorConfig`. SPEC §2.
-    pub fn new(n_channels: usize, cfg: DetectorConfig) -> Self {
+    /// `DetectorConfig`, with a decoder pool configured per `DecodeConfig`.
+    /// SPEC §2, §5.
+    pub fn new(
+        n_channels: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        detector_cfg: DetectorConfig,
+        decode_cfg: DecodeConfig,
+    ) -> Self {
         TrackManager {
             floor: FloorBank::new(n_channels),
-            gate: Gate::new(n_channels, cfg.on_snr_db, cfg.off_snr_db),
+            gate: Gate::new(n_channels, detector_cfg.on_snr_db, detector_cfg.off_snr_db),
             tracks: BTreeMap::new(),
             owner_of: vec![None; n_channels],
             next_id: 1,
-            cfg,
+            cfg: detector_cfg,
+            decode_cfg,
             hop_counter: 0,
+            center_freq_hz,
+            channel_spacing_hz: fs / n_channels as f64,
         }
     }
 
@@ -314,12 +364,14 @@ impl TrackManager {
     }
 
     /// One hop: update floor/gate, drive every track's lifecycle, spawn new
-    /// CANDIDATEs, apply ownership/merge, evict over cap. Returns
-    /// `(track_id, selected_channel, magnitude)` for every currently-ACTIVE
-    /// track this hop -- `char_emitted` (GC timer input) is always `false`
-    /// here since no decoder is wired yet; Task 6 threads the real value
-    /// through once `TrackDecoder` is attached.
-    fn step_hop(&mut self, hop: &HopOutput) -> Vec<(u32, usize, f32)> {
+    /// CANDIDATEs, apply ownership/merge, evict over cap. Newly-ACTIVE
+    /// tracks lease a decoder; every currently-ACTIVE track queues this
+    /// hop's `(magnitude, sample_ts)` onto its own `pending` (drained later,
+    /// once per hop-batch, by `drain_pool`) -- `char_emitted` (GC timer
+    /// input) is always `false` here; the decoder pool runs after this
+    /// whole batch, so no per-hop decode result is available yet to feed
+    /// back into the same hop's lifecycle bookkeeping.
+    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) {
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -330,6 +382,7 @@ impl TrackManager {
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
         self.floor.update(&power_db_vals);
         let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
+        self.recompute_ownership();
 
         let past_warmup = self.hop_counter >= self.cfg.warmup_hops;
         self.hop_counter += 1;
@@ -337,7 +390,6 @@ impl TrackManager {
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
         let mut closed: Vec<u32> = Vec::new();
-        let mut selections: Vec<(u32, usize, f32)> = Vec::new();
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         for id in ids {
             let n = self.n_channels();
@@ -346,14 +398,22 @@ impl TrackManager {
             track.update_centroid(k, &hop.power, n);
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
-            let event = track.lifecycle.on_hop(rise[k], drop[k], false);
+            let char_emitted = false; // GC timer input; refined below once a decoder exists.
+            let event = track.lifecycle.on_hop(rise[k], drop[k], char_emitted);
             match event {
-                LifecycleEvent::Closed(_) => {
-                    closed.push(id);
+                LifecycleEvent::Closed(_) => closed.push(id),
+                LifecycleEvent::Promoted => {
+                    track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
+                    track
+                        .decoder
+                        .as_mut()
+                        .unwrap()
+                        .set_freq_hz(self.center_freq_hz);
+                    track.pending.push((hop.power[k].sqrt(), sample_ts));
                 }
-                _ => {
+                LifecycleEvent::None => {
                     if track.state() == LifecycleState::Active {
-                        selections.push((id, k, hop.power[k].sqrt()));
+                        track.pending.push((hop.power[k].sqrt(), sample_ts));
                     }
                 }
             }
@@ -389,11 +449,8 @@ impl TrackManager {
             }
         }
         self.recompute_ownership();
-
         self.merge_converged();
         self.evict_over_cap();
-
-        selections
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -460,6 +517,95 @@ impl TrackManager {
             self.tracks.remove(&loser);
         }
         self.recompute_ownership();
+    }
+
+    /// Process one `Channelizer::process()` slice: sequential per-hop
+    /// state-machine bookkeeping (ownership/promotion/eviction), then a
+    /// single rayon-parallel decode pass across all currently-queued
+    /// ACTIVE tracks (the decoder pool -- ARCHITECTURE §10), then
+    /// resequence by `(sample_ts, track_id)` per SPEC §6 rule 6.
+    /// `hop_to_sample_ts` mirrors the existing `decode_samples`/`listen`
+    /// convention of converting a channelizer hop index to a raw-sample
+    /// timestamp.
+    pub fn process_hops(
+        &mut self,
+        hops: &[HopOutput],
+        hop_to_sample_ts: impl Fn(u64) -> u64,
+    ) -> Vec<DecoderEvent> {
+        for h in hops {
+            self.step_hop(h, hop_to_sample_ts(h.m));
+        }
+        self.drain_pool()
+    }
+
+    /// Flush every track's decoder (SPEC §5 end-of-stream). Call once,
+    /// after the last `process_hops`.
+    pub fn finish(&mut self) -> Vec<DecoderEvent> {
+        use rayon::prelude::*;
+        let mut events: Vec<DecoderEvent> = self
+            .tracks
+            .values_mut()
+            .filter_map(|t| t.decoder.as_mut())
+            .par_bridge()
+            .flat_map_iter(|d| d.finish())
+            .collect();
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        events
+    }
+
+    /// Drain every track's `pending` queue through its decoder, in
+    /// parallel (ARCHITECTURE §10's decoder pool: tracks are work items,
+    /// decoders are independent `Send` state machines processed in any
+    /// order). Called once per `process_hops` batch, against the *current*
+    /// `self.tracks` map -- after this batch's merges/evictions have
+    /// already removed any tracks whose `pending` would otherwise be
+    /// stale, so there is no path to draining a since-removed track's
+    /// queue.
+    fn drain_pool(&mut self) -> Vec<DecoderEvent> {
+        use rayon::prelude::*;
+        let mut events: Vec<DecoderEvent> = self
+            .tracks
+            .values_mut()
+            .filter_map(|t| {
+                if t.pending.is_empty() {
+                    None
+                } else {
+                    let pending = std::mem::take(&mut t.pending);
+                    Some((t.decoder.as_mut().unwrap(), pending))
+                }
+            })
+            .par_bridge()
+            .flat_map_iter(|(decoder, pending)| {
+                pending
+                    .into_iter()
+                    .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        events
+    }
+}
+
+/// SPEC §6 rule 6 resequencing key: the sample timestamp an event is
+/// anchored to, or `0` for events with no inherent timestamp (`SpeedUpdate`/
+/// `TrackMeta`), which sort first among ties on `event_track_id`.
+fn event_sample_ts(e: &DecoderEvent) -> u64 {
+    match e {
+        DecoderEvent::CharDecoded { sample_ts, .. }
+        | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
+        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
+    }
+}
+
+/// SPEC §6 rule 6 resequencing key: the owning track's id, every
+/// `DecoderEvent` variant carries one.
+fn event_track_id(e: &DecoderEvent) -> u32 {
+    match e {
+        DecoderEvent::CharDecoded { track_id, .. }
+        | DecoderEvent::WordBoundary { track_id, .. }
+        | DecoderEvent::SpeedUpdate { track_id, .. }
+        | DecoderEvent::TrackMeta { track_id, .. } => *track_id,
     }
 }
 
@@ -561,6 +707,7 @@ mod tests {
         }
     }
 
+    use skimmer_decode::decoder::DecodeConfig;
     use skimmer_dsp::channelizer::HopOutput;
 
     fn hop(m: u64, power: Vec<f32>) -> HopOutput {
@@ -578,37 +725,56 @@ mod tests {
     fn feed_warmup(tm: &mut TrackManager, n: usize) {
         let hops_needed = 250u64 * 15; // floor ring fill, same as skimmer-dsp::floor tests
         for m in 0..hops_needed {
-            tm.step_hop(&hop(m, quiet_power(n)));
+            tm.step_hop(&hop(m, quiet_power(n)), m);
         }
     }
 
     #[test]
     fn spawns_and_promotes_a_track_on_a_strong_channel() {
-        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above the ~-90 dBFS floor
         let mut promoted = false;
         for m in (250 * 15)..(250 * 15 + 25) {
-            tm.step_hop(&hop(m, power.clone()));
-            if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
+            tm.step_hop(&hop(m, power.clone()), m);
+            if tm
+                .tracks
+                .values()
+                .any(|t| t.state() == LifecycleState::Active)
+            {
                 promoted = true;
                 break;
             }
         }
-        assert!(promoted, "a strong channel should spawn and promote a track");
+        assert!(
+            promoted,
+            "a strong channel should spawn and promote a track"
+        );
         assert_eq!(tm.tracks.len(), 1);
     }
 
     #[test]
     fn adjacent_strong_channel_is_absorbed_not_a_new_track() {
-        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         power[11] = 1e-9 * 10f32.powf(15.0 / 10.0); // weaker neighbor, inside the owned window
         for m in (250 * 15)..(250 * 15 + 25) {
-            tm.step_hop(&hop(m, power.clone()));
+            tm.step_hop(&hop(m, power.clone()), m);
         }
         assert_eq!(
             tm.tracks.len(),
@@ -619,13 +785,19 @@ mod tests {
 
     #[test]
     fn two_well_separated_strong_channels_yield_two_tracks() {
-        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         power[40] = 1e-9 * 10f32.powf(20.0 / 10.0);
         for m in (250 * 15)..(250 * 15 + 25) {
-            tm.step_hop(&hop(m, power.clone()));
+            tm.step_hop(&hop(m, power.clone()), m);
         }
         assert_eq!(tm.tracks.len(), 2);
     }
@@ -636,19 +808,23 @@ mod tests {
             track_cap: 1,
             ..DetectorConfig::default()
         };
-        let mut tm = TrackManager::new(64, cfg);
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // strong, spawns first
         for m in (250 * 15)..(250 * 15 + 25) {
-            tm.step_hop(&hop(m, power.clone()));
+            tm.step_hop(&hop(m, power.clone()), m);
         }
         assert_eq!(tm.tracks.len(), 1);
         power[40] = 1e-9 * 10f32.powf(25.0 / 10.0); // stronger second signal, over cap
         for m in (250 * 15 + 25)..(250 * 15 + 50) {
-            tm.step_hop(&hop(m, power.clone()));
+            tm.step_hop(&hop(m, power.clone()), m);
         }
-        assert_eq!(tm.tracks.len(), 1, "cap=1 must hold even with a second strong signal");
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "cap=1 must hold even with a second strong signal"
+        );
         assert!(
             tm.tracks.values().next().unwrap().birth_channel == 40,
             "the lower-SNR (weaker) track must be the one evicted"
@@ -689,10 +865,20 @@ mod tests {
         // channel. This isolates and directly verifies the SPEC §2.5
         // "converge -> merge -> lower SNR closes" logic without depending
         // on gate/floor EMA timing or the window-overlap collision above.
-        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
         tm.spawn(10);
         tm.spawn(40); // any two non-adjacent channels; overwritten below
-        assert_eq!(tm.tracks.len(), 2, "two spawns on non-adjacent channels must yield two tracks");
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "two spawns on non-adjacent channels must yield two tracks"
+        );
 
         let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
         ids.sort();
@@ -721,5 +907,82 @@ mod tests {
             "the higher-SNR track must survive; the lower-SNR one must be closed"
         );
         assert_eq!(survivor.center, 21.1);
+    }
+
+    /// Ignored: at full 1024-channel scale (V1: 96 kHz -> 93.75 Hz spacing),
+    /// `DetectorConfig::default()` false-triggers hundreds of spurious
+    /// CANDIDATE->ACTIVE promotions over V1's 120 s duration, not just one
+    /// real track. Root cause confirmed via direct measurement, independent
+    /// of this task's changes (Lifecycle/Gate/FloorBank -- Tasks 1-4 -- are
+    /// untouched here; this task only adds decoder allocation and
+    /// pending-queue bookkeeping around the unchanged spawn/confirm/close
+    /// path):
+    ///
+    /// - `HopOutput.power[k] = |X[k]|^2` (SPEC §1.3 step 4) is a single
+    ///   complex-Gaussian magnitude-squared sample per hop, so per-hop dB
+    ///   power is inherently noisy (measured on a quiet background channel
+    ///   of V1's real render: raw `PdB` std ~5.2 dB; after the Gate's
+    ///   tau=40ms EMA, still ~1.7 dB std).
+    /// - The EMA's ~15-hop correlation time (tau=40ms at 375 Hz) is close to
+    ///   confirm_hops=19 (SPEC §2.3's ~50ms sustained-rise window), so a
+    ///   "sustained" 19-hop rise gives far fewer *independent* looks at the
+    ///   noise than a naive per-hop-independent false-alarm calculation
+    ///   would assume -- once an EMA excursion crosses on_snr_db=6dB, it
+    ///   tends to stay there for close to a full confirm window purely from
+    ///   autocorrelation.
+    /// - Measured over V1's real 120s/1024-channel render:
+    ///   694,346 total CANDIDATE spawns (nearly all closed Unconfirmed
+    ///   within a few hops -- chatter), of which 298 distinct tracks
+    ///   survived long enough to reach ACTIVE and emit at least one
+    ///   `DecoderEvent`, spread roughly uniformly across the whole
+    ///   recording (not just a warmup-window transient).
+    ///
+    /// This is a pre-existing SPEC §2.1-2.3 noise-floor/gate calibration
+    /// gap in the already-reviewed Tasks 1-5 detector, first surfaced by
+    /// this task's mandated full-scale end-to-end integration test -- not a
+    /// decoder-pool-wiring bug, and not fixable by anything in this task's
+    /// scope (`TrackManager::process_hops`/`drain_pool`/`finish`). A real
+    /// fix needs a SPEC-level decision (re-derive on_snr_db/confirm_hops
+    /// against the channelizer's actual per-hop variance, or add explicit
+    /// averaging ahead of the floor/gate pipeline) -- tracked for a
+    /// docs/DECISIONS entry; revisit and un-ignore once that lands, per
+    /// this repo's existing convention for `v2_passes_end_to_end_from_wav`
+    /// (docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md).
+    #[test]
+    #[ignore]
+    fn active_track_decodes_real_text() {
+        use skimmer_dsp::channelizer::Channelizer;
+        let spec = skimmer_testkit::vectors::v1();
+        let rendered = skimmer_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        let mut all_events = Vec::new();
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            all_events.extend(tm.process_hops(&hops, |m| m * hop_samples));
+        }
+        all_events.extend(tm.finish());
+        let track_ids: std::collections::BTreeSet<u32> =
+            all_events.iter().map(event_track_id).collect();
+        assert_eq!(
+            track_ids.len(),
+            1,
+            "V1 is single-signal, expected exactly 1 track"
+        );
+        let text = skimmer_decode::decoder::events_to_text(&all_events);
+        assert_eq!(
+            skimmer_testkit::cer::cer(&rendered.keyed_texts[0], &text),
+            0.0,
+            "expected {:?} got {:?}",
+            rendered.keyed_texts[0],
+            text
+        );
     }
 }
