@@ -146,6 +146,58 @@ impl FloorBank {
     }
 }
 
+/// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
+/// alpha = 1 - e^(-2.667/40).
+const GATE_EMA_ALPHA: f64 = 0.0645;
+
+/// Per-channel EMA-smoothed power + rise/drop hysteresis booleans. SPEC
+/// §2.3. Carries **no** persistence/timing state (confirm-hop-counting,
+/// hang-ms-counting) -- that's the track lifecycle's job
+/// (`skimmer-engine::track`). This struct is a pure function of its own
+/// per-channel EMA state.
+pub struct Gate {
+    smoothed_db: Vec<f64>,
+    initialized: Vec<bool>,
+    on_snr_db: f32,
+    off_snr_db: f32,
+}
+
+impl Gate {
+    pub fn new(n_channels: usize, on_snr_db: f32, off_snr_db: f32) -> Self {
+        Gate {
+            smoothed_db: vec![0.0; n_channels],
+            initialized: vec![false; n_channels],
+            on_snr_db,
+            off_snr_db,
+        }
+    }
+
+    /// One hop's rise/drop booleans per channel, against `floor`'s current
+    /// effective floor. SPEC §2.3: rise = S >= F + on_snr_db; drop = S < F
+    /// + off_snr_db.
+    pub fn update(&mut self, power_db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
+        debug_assert_eq!(power_db.len(), self.smoothed_db.len());
+        let mut rise = vec![false; power_db.len()];
+        let mut drop = vec![false; power_db.len()];
+        for k in 0..power_db.len() {
+            self.smoothed_db[k] = if self.initialized[k] {
+                self.smoothed_db[k] + GATE_EMA_ALPHA * (power_db[k] - self.smoothed_db[k])
+            } else {
+                self.initialized[k] = true;
+                power_db[k]
+            };
+            let f = floor.effective_floor_db(k);
+            rise[k] = self.smoothed_db[k] >= f + self.on_snr_db as f64;
+            drop[k] = self.smoothed_db[k] < f + self.off_snr_db as f64;
+        }
+        (rise, drop)
+    }
+
+    pub fn smoothed_db(&self, k: usize) -> f64 {
+        self.smoothed_db[k]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +292,55 @@ mod tests {
             (f - (-90.0)).abs() < 1.0,
             "uniform-noise floor should read near -90 dB, got {f}"
         );
+    }
+
+    fn warmed_up_bank(n: usize, floor_db: f64) -> FloorBank {
+        let mut bank = FloorBank::new(n);
+        let hops_needed = RING_LEN as u64 * DECIMATION_HOPS;
+        for _ in 0..hops_needed {
+            bank.update(&vec![floor_db; n]);
+        }
+        bank
+    }
+
+    #[test]
+    fn rise_met_once_ema_settles_above_threshold() {
+        let bank = warmed_up_bank(4, -90.0);
+        let mut gate = Gate::new(4, 6.0, 3.0);
+        let mut rise = vec![false; 4];
+        // Feed a steady +10 dB-above-floor signal on channel 0 until the EMA settles.
+        for _ in 0..200 {
+            let (r, _) = gate.update(&[-80.0, -90.0, -90.0, -90.0], &bank);
+            rise = r;
+        }
+        assert!(rise[0], "channel 0 should meet rise (10 dB above -90 floor, on_snr=6)");
+        assert!(!rise[1], "channel 1 stays at the floor, should not rise");
+    }
+
+    #[test]
+    fn drop_met_when_below_off_threshold() {
+        let bank = warmed_up_bank(1, -90.0);
+        let mut gate = Gate::new(1, 6.0, 3.0);
+        let mut drop = vec![false];
+        for _ in 0..200 {
+            let (_, d) = gate.update(&[-89.0], &bank); // 1 dB above floor, below off_snr=3
+            drop = d;
+        }
+        assert!(drop[0], "1 dB above floor is below the 3 dB off threshold");
+    }
+
+    #[test]
+    fn hysteresis_gap_between_on_and_off() {
+        // At 4.5 dB above floor (between off=3 and on=6): neither rise nor
+        // drop should be true once settled -- this is the hysteresis dead
+        // band SPEC §2.3 depends on for QSB survival.
+        let bank = warmed_up_bank(1, -90.0);
+        let mut gate = Gate::new(1, 6.0, 3.0);
+        let mut last = (false, false);
+        for _ in 0..200 {
+            let (r, d) = gate.update(&[-85.5], &bank);
+            last = (r[0], d[0]);
+        }
+        assert_eq!(last, (false, false), "4.5 dB above floor sits in the hysteresis dead band");
     }
 }
