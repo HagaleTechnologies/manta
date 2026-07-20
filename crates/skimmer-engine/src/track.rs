@@ -218,9 +218,10 @@ use std::collections::BTreeMap;
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
 /// round(center)+1}` per SPEC §2.5; `center` is a live, per-hop EMA of the
 /// fine-frequency-interpolated channel position (fast enough to follow
-/// realistic drift, e.g. SPEC §7 V9's 50 Hz/min) -- distinct from the
-/// slower track-*lifetime* power-weighted average used for the final
-/// reported frequency (Task 6).
+/// realistic drift, e.g. SPEC §7 V9's 50 Hz/min). `Track::freq_hz` also
+/// reports this same EMA converted to absolute Hz (Task 9 remediation --
+/// see that function's doc comment for why this deviates from SPEC §1.4's
+/// literal lifetime-average formula).
 pub(crate) struct Track {
     /// This track's stable identity (SPEC §5/§6), assigned once at birth by
     /// `TrackManager::spawn` and carried into every `DecoderEvent` it emits.
@@ -236,8 +237,6 @@ pub(crate) struct Track {
     /// This hop's SNR estimate for the track's selected channel (SPEC
     /// §2.5), used by `merge_converged`/`evict_over_cap` tie-breaks.
     pub(crate) current_snr_db: f32,
-    sum_weighted: f64,
-    sum_power: f64,
     /// The channel index this track first spawned on (SPEC §2.1); the
     /// anchor for `Track::freq_hz`'s absolute-Hz conversion.
     pub(crate) birth_channel: usize,
@@ -272,8 +271,6 @@ impl Track {
             lifecycle: Lifecycle::new(cfg),
             center: birth_channel as f64,
             current_snr_db: 0.0,
-            sum_weighted: 0.0,
-            sum_power: 0.0,
             birth_channel,
             decoder: None,
             pending: Vec::new(),
@@ -313,34 +310,44 @@ impl Track {
             .unwrap()
     }
 
-    /// Update `center` (live EMA) and the lifetime power-weighted
-    /// accumulator, from this hop's selected channel's fine-frequency
-    /// interpolation. SPEC §1.4/§2.5.
+    /// Update `center` (live EMA), from this hop's selected channel's
+    /// fine-frequency interpolation. SPEC §1.4/§2.5.
     fn update_centroid(&mut self, k: usize, power: &[f32], n_channels: usize) {
         let k_minus = (k + n_channels - 1) % n_channels;
         let k_plus = (k + 1) % n_channels;
         if let Some(delta) = interpolate_offset(power[k_minus], power[k], power[k_plus]) {
             let raw = k as f64 + delta;
             self.center += CENTER_EMA_ALPHA * (raw - self.center);
-            let w = power[k] as f64;
-            self.sum_weighted += raw * w;
-            self.sum_power += w;
         }
     }
 
-    /// SPEC §1.1/§1.4: absolute Hz for this track's current lifetime
-    /// power-weighted centroid (not the fast ownership-following EMA).
-    /// `step_hop` calls this every hop a decoder exists to keep
-    /// `TrackDecoder`'s `TrackMeta.freq_hz` live (SPEC §5).
+    /// Absolute Hz for this track's current centroid, reported as
+    /// `TrackDecoder`'s live `TrackMeta.freq_hz` (SPEC §5). `step_hop` calls
+    /// this every hop a decoder exists to keep it current.
+    ///
+    /// **Deviates from SPEC §1.4's literal formula.** §1.4 specifies a
+    /// lifetime power-weighted running mean with no decay
+    /// (`Σ(k₀+δ_m)·P₀[m] / ΣP₀[m]`, accumulated from track birth). That
+    /// formula is structurally incompatible with SPEC §7 V9's own "final
+    /// freq within ±15 Hz of the drifted end frequency" pass criterion: an
+    /// undecayed lifetime average of a linearly-drifting quantity converges
+    /// toward the midpoint of the observed range, not the current/final
+    /// value (measured 48.3 Hz error on V9's 120 s / 100 Hz drift, ~3x over
+    /// tolerance). Reporting `self.center` -- the same live, per-hop EMA
+    /// (`CENTER_EMA_ALPHA`) already used for ownership/read-selection --
+    /// instead tracks ongoing drift: measured in-pipeline at 9.7 Hz error on
+    /// V9 (real pipeline; an offline centroid replica used to pick this
+    /// estimator predicted 3.9 Hz -- the >2x gap is attributed to the
+    /// channelizer's known parabolic-interpolation bias, deferred
+    /// separately, not to this estimator choice) and 9.9 Hz on V1
+    /// (non-drifting; improved from 16.5 Hz under the old lifetime-mean
+    /// formula, not a regression). Both are within SPEC §7's ±15 Hz
+    /// criterion. See task-9-remediation-report.md and the M2 sub-project 2
+    /// close-out pins doc for the full comparison table and rationale.
     fn freq_hz(&self, center_freq_hz: f64, channel_spacing_hz: f64, n_channels: usize) -> f64 {
-        let centroid = if self.sum_power > 0.0 {
-            self.sum_weighted / self.sum_power
-        } else {
-            self.birth_channel as f64
-        };
         let k0_freq = center_freq_hz
             + wrapped_channel_offset(self.birth_channel, n_channels) * channel_spacing_hz;
-        k0_freq + (centroid - self.birth_channel as f64) * channel_spacing_hz
+        k0_freq + (self.center - self.birth_channel as f64) * channel_spacing_hz
     }
 }
 
@@ -444,12 +451,13 @@ impl TrackManager {
             match event {
                 LifecycleEvent::Closed(_) => closed.push(id),
                 LifecycleEvent::Promoted => {
-                    // SPEC §1.1/§1.4/§5: seed TrackMeta.freq_hz from this
-                    // track's own lifetime power-weighted centroid (already
-                    // warm from its CANDIDATE-period update_centroid calls
-                    // above), not the pipeline's raw center_freq_hz -- every
-                    // track otherwise reports the same wrong frequency
-                    // regardless of which channel it actually lives on.
+                    // SPEC §1.1/§5 (freq_hz's doc comment covers the §1.4
+                    // deviation): seed TrackMeta.freq_hz from this track's
+                    // own centroid EMA (already warm from its
+                    // CANDIDATE-period update_centroid calls above), not the
+                    // pipeline's raw center_freq_hz -- every track otherwise
+                    // reports the same wrong frequency regardless of which
+                    // channel it actually lives on.
                     // Computed before `track.decoder` is touched: `freq_hz`
                     // borrows all of `track`, which would conflict with a
                     // simultaneous `track.decoder.as_mut()` borrow.
