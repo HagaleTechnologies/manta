@@ -171,6 +171,298 @@ impl Lifecycle {
     }
 }
 
+use skimmer_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
+use skimmer_dsp::floor::{FloorBank, Gate};
+use std::collections::BTreeMap;
+
+/// One tracked signal. Owns channels `{round(center)-1, round(center),
+/// round(center)+1}` per SPEC §2.5; `center` is a live, per-hop EMA of the
+/// fine-frequency-interpolated channel position (fast enough to follow
+/// realistic drift, e.g. SPEC §7 V9's 50 Hz/min) -- distinct from the
+/// slower track-*lifetime* power-weighted average used for the final
+/// reported frequency (Task 6).
+// Temporary: no caller yet until Task 6's process_hops wires TrackManager::step_hop into the public API.
+#[allow(dead_code)]
+pub(crate) struct Track {
+    pub(crate) id: u32,
+    lifecycle: Lifecycle,
+    pub(crate) center: f64,
+    pub(crate) current_snr_db: f32,
+    pub(crate) sum_weighted: f64,
+    pub(crate) sum_power: f64,
+    pub(crate) birth_channel: usize,
+}
+
+/// SPEC §2.5: a live centroid EMA responsive enough to follow realistic
+/// drift (V9: 50 Hz/min == ~0.0089 channels/s at 93.75 Hz spacing) with
+/// negligible lag relative to the 375 Hz hop rate; tuned empirically
+/// against V9 in Task 9 and pinned there.
+const CENTER_EMA_ALPHA: f64 = 0.01;
+
+// Temporary: no caller yet until Task 6's process_hops wires TrackManager::step_hop into the public API.
+#[allow(dead_code)]
+impl Track {
+    /// A brand-new track: `Lifecycle` seeded fresh, `center` initialized to
+    /// its birth channel. SPEC §2.4/§2.5.
+    fn new(id: u32, birth_channel: usize, cfg: &DetectorConfig) -> Self {
+        Track {
+            id,
+            lifecycle: Lifecycle::new(cfg),
+            center: birth_channel as f64,
+            current_snr_db: 0.0,
+            sum_weighted: 0.0,
+            sum_power: 0.0,
+            birth_channel,
+        }
+    }
+
+    /// Query the current lifecycle state. SPEC §2.4.
+    pub(crate) fn state(&self) -> LifecycleState {
+        self.lifecycle.state()
+    }
+
+    /// SPEC §2.5: owned channel indices for this hop's ownership checks.
+    /// Wraps modulo `n_channels`: the channelizer's channel index is a
+    /// circular FFT bin ordering over the full complex baseband (SPEC
+    /// §1.1), so channel 0 and channel `n_channels-1` are genuinely
+    /// frequency-adjacent, as are the ±Nyquist bins at the midpoint.
+    fn owned(&self, n_channels: usize) -> [usize; 3] {
+        let c = self.center.round() as i64;
+        let n = n_channels as i64;
+        [
+            ((c - 1).rem_euclid(n)) as usize,
+            (c.rem_euclid(n)) as usize,
+            ((c + 1).rem_euclid(n)) as usize,
+        ]
+    }
+
+    /// Max-power channel among this track's owned set this hop. SPEC §2.5
+    /// ("max-power selection").
+    fn select_channel(&self, power: &[f32], n_channels: usize) -> usize {
+        let owned = self.owned(n_channels);
+        owned
+            .into_iter()
+            .max_by(|&a, &b| power[a].partial_cmp(&power[b]).unwrap())
+            .unwrap()
+    }
+
+    /// Update `center` (live EMA) and the lifetime power-weighted
+    /// accumulator, from this hop's selected channel's fine-frequency
+    /// interpolation. SPEC §1.4/§2.5.
+    fn update_centroid(&mut self, k: usize, power: &[f32], n_channels: usize) {
+        let k_minus = (k + n_channels - 1) % n_channels;
+        let k_plus = (k + 1) % n_channels;
+        if let Some(delta) = interpolate_offset(power[k_minus], power[k], power[k_plus]) {
+            let raw = k as f64 + delta;
+            self.center += CENTER_EMA_ALPHA * (raw - self.center);
+            let w = power[k] as f64;
+            self.sum_weighted += raw * w;
+            self.sum_power += w;
+        }
+    }
+}
+
+/// Orchestrates SPEC §2's real detector across all channels: per-channel
+/// floor + gate (`skimmer-dsp::floor`), per-channel lifecycle state
+/// machines (`Lifecycle`), and §2.5 adjacent-channel ownership. This task's
+/// `step_hop` returns which ACTIVE tracks selected which channel this hop,
+/// without touching `TrackDecoder` -- Task 6 adds the decoder pool.
+pub struct TrackManager {
+    floor: FloorBank,
+    gate: Gate,
+    tracks: BTreeMap<u32, Track>,
+    /// channel -> owning track_id, recomputed each hop. SPEC §2.5.
+    owner_of: Vec<Option<u32>>,
+    next_id: u32,
+    cfg: DetectorConfig,
+    hop_counter: u64,
+}
+
+// Temporary: TrackManager is not yet reachable from the crate's public API
+// (`track` is a private module; only `DetectorConfig` is re-exported) --
+// no caller yet until Task 6's process_hops entry point is added and wired
+// into lib.rs. Only `tests` calls these methods today.
+#[allow(dead_code)]
+impl TrackManager {
+    /// A fresh manager over `n_channels` channels, configured per
+    /// `DetectorConfig`. SPEC §2.
+    pub fn new(n_channels: usize, cfg: DetectorConfig) -> Self {
+        TrackManager {
+            floor: FloorBank::new(n_channels),
+            gate: Gate::new(n_channels, cfg.on_snr_db, cfg.off_snr_db),
+            tracks: BTreeMap::new(),
+            owner_of: vec![None; n_channels],
+            next_id: 1,
+            cfg,
+            hop_counter: 0,
+        }
+    }
+
+    fn n_channels(&self) -> usize {
+        self.owner_of.len()
+    }
+
+    /// Rebuild `owner_of` from scratch against the current `tracks` map.
+    /// SPEC §2.5.
+    fn recompute_ownership(&mut self) {
+        self.owner_of.iter_mut().for_each(|o| *o = None);
+        for (&id, track) in &self.tracks {
+            for ch in track.owned(self.n_channels()) {
+                self.owner_of[ch] = Some(id);
+            }
+        }
+    }
+
+    /// One hop: update floor/gate, drive every track's lifecycle, spawn new
+    /// CANDIDATEs, apply ownership/merge, evict over cap. Returns
+    /// `(track_id, selected_channel, magnitude)` for every currently-ACTIVE
+    /// track this hop -- `char_emitted` (GC timer input) is always `false`
+    /// here since no decoder is wired yet; Task 6 threads the real value
+    /// through once `TrackDecoder` is attached.
+    fn step_hop(&mut self, hop: &HopOutput) -> Vec<(u32, usize, f32)> {
+        assert_eq!(
+            hop.power.len(),
+            self.n_channels(),
+            "TrackManager::step_hop: hop.power length {} does not match n_channels {}",
+            hop.power.len(),
+            self.n_channels()
+        );
+        let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
+        self.floor.update(&power_db_vals);
+        let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
+
+        let past_warmup = self.hop_counter >= self.cfg.warmup_hops;
+        self.hop_counter += 1;
+
+        // Drive existing tracks; collect closures to apply after the loop
+        // (avoids mutating `self.tracks` while iterating it).
+        let mut closed: Vec<u32> = Vec::new();
+        let mut selections: Vec<(u32, usize, f32)> = Vec::new();
+        let ids: Vec<u32> = self.tracks.keys().copied().collect();
+        for id in ids {
+            let n = self.n_channels();
+            let track = self.tracks.get_mut(&id).unwrap();
+            let k = track.select_channel(&hop.power, n);
+            track.update_centroid(k, &hop.power, n);
+            let f = self.floor.effective_floor_db(k);
+            track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
+            let event = track.lifecycle.on_hop(rise[k], drop[k], false);
+            match event {
+                LifecycleEvent::Closed(_) => {
+                    closed.push(id);
+                }
+                _ => {
+                    if track.state() == LifecycleState::Active {
+                        selections.push((id, k, hop.power[k].sqrt()));
+                    }
+                }
+            }
+        }
+        for id in closed {
+            self.tracks.remove(&id);
+        }
+        self.recompute_ownership();
+
+        // Same-hop simultaneous-rise tie-break (SPEC §2.5): scan channels in
+        // ascending order; a rise on an unowned channel spawns a CANDIDATE
+        // unless a higher-power unowned neighbor also rose this hop, in
+        // which case only the higher-power one spawns.
+        if past_warmup {
+            let n = self.n_channels();
+            let mut k = 0;
+            while k < n {
+                if rise[k] && self.owner_of[k].is_none() {
+                    let mut winner = k;
+                    if k + 1 < n && rise[k + 1] && self.owner_of[k + 1].is_none() {
+                        if hop.power[k + 1] > hop.power[winner] {
+                            winner = k + 1;
+                        }
+                        // both channels claimed by this decision; skip past k+1
+                        // next iteration so we don't re-evaluate it as its own birth.
+                        self.spawn(winner);
+                        k += 2;
+                        continue;
+                    }
+                    self.spawn(winner);
+                }
+                k += 1;
+            }
+        }
+        self.recompute_ownership();
+
+        self.merge_converged();
+        self.evict_over_cap();
+
+        selections
+    }
+
+    /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
+    /// is seeded from this hop's live gate/floor state (not left at
+    /// `Track::new`'s placeholder `0.0`) so a track born this same hop is
+    /// not unfairly evicted against a mature incumbent by
+    /// `evict_over_cap`/`merge_converged`, which both compare
+    /// `current_snr_db` and would otherwise always prefer any already-driven
+    /// track over one that (correctly, but only from next hop on) hasn't
+    /// had `current_snr_db` populated yet.
+    fn spawn(&mut self, birth_channel: usize) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut track = Track::new(id, birth_channel, &self.cfg);
+        let f = self.floor.effective_floor_db(birth_channel);
+        track.current_snr_db = (self.gate.smoothed_db(birth_channel) - f) as f32;
+        for ch in track.owned(self.n_channels()) {
+            self.owner_of[ch] = Some(id);
+        }
+        self.tracks.insert(id, track);
+    }
+
+    /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
+    /// the lower-current-SNR one is closed.
+    fn merge_converged(&mut self) {
+        let ids: Vec<u32> = self.tracks.keys().copied().collect();
+        let mut to_close = Vec::new();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let (a, b) = (ids[i], ids[j]);
+                if to_close.contains(&a) || to_close.contains(&b) {
+                    continue;
+                }
+                let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
+                if (ca - cb).abs() < 1.0 {
+                    let loser = if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db
+                    {
+                        a
+                    } else {
+                        b
+                    };
+                    to_close.push(loser);
+                }
+            }
+        }
+        for id in to_close {
+            self.tracks.remove(&id);
+        }
+        if !ids.is_empty() {
+            self.recompute_ownership();
+        }
+    }
+
+    /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
+    /// eviction.
+    fn evict_over_cap(&mut self) {
+        while self.tracks.len() > self.cfg.track_cap {
+            let loser = *self
+                .tracks
+                .iter()
+                .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
+                .map(|(id, _)| id)
+                .unwrap();
+            self.tracks.remove(&loser);
+        }
+        self.recompute_ownership();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +559,99 @@ mod tests {
         for _ in 0..19 {
             assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
         }
+    }
+
+    use skimmer_dsp::channelizer::HopOutput;
+
+    fn hop(m: u64, power: Vec<f32>) -> HopOutput {
+        HopOutput {
+            m,
+            x: vec![],
+            power,
+        }
+    }
+
+    fn quiet_power(n: usize) -> Vec<f32> {
+        vec![1e-9; n] // ~ -90 dBFS
+    }
+
+    fn feed_warmup(tm: &mut TrackManager, n: usize) {
+        let hops_needed = 250u64 * 15; // floor ring fill, same as skimmer-dsp::floor tests
+        for m in 0..hops_needed {
+            tm.step_hop(&hop(m, quiet_power(n)));
+        }
+    }
+
+    #[test]
+    fn spawns_and_promotes_a_track_on_a_strong_channel() {
+        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above the ~-90 dBFS floor
+        let mut promoted = false;
+        for m in (250 * 15)..(250 * 15 + 25) {
+            tm.step_hop(&hop(m, power.clone()));
+            if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
+                promoted = true;
+                break;
+            }
+        }
+        assert!(promoted, "a strong channel should spawn and promote a track");
+        assert_eq!(tm.tracks.len(), 1);
+    }
+
+    #[test]
+    fn adjacent_strong_channel_is_absorbed_not_a_new_track() {
+        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        power[11] = 1e-9 * 10f32.powf(15.0 / 10.0); // weaker neighbor, inside the owned window
+        for m in (250 * 15)..(250 * 15 + 25) {
+            tm.step_hop(&hop(m, power.clone()));
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "channel 11 is inside channel 10's owned window {{9,10,11}} and must be absorbed"
+        );
+    }
+
+    #[test]
+    fn two_well_separated_strong_channels_yield_two_tracks() {
+        let mut tm = TrackManager::new(64, DetectorConfig::default());
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        power[40] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        for m in (250 * 15)..(250 * 15 + 25) {
+            tm.step_hop(&hop(m, power.clone()));
+        }
+        assert_eq!(tm.tracks.len(), 2);
+    }
+
+    #[test]
+    fn track_cap_evicts_lowest_snr() {
+        let cfg = DetectorConfig {
+            track_cap: 1,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, cfg);
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // strong, spawns first
+        for m in (250 * 15)..(250 * 15 + 25) {
+            tm.step_hop(&hop(m, power.clone()));
+        }
+        assert_eq!(tm.tracks.len(), 1);
+        power[40] = 1e-9 * 10f32.powf(25.0 / 10.0); // stronger second signal, over cap
+        for m in (250 * 15 + 25)..(250 * 15 + 50) {
+            tm.step_hop(&hop(m, power.clone()));
+        }
+        assert_eq!(tm.tracks.len(), 1, "cap=1 must hold even with a second strong signal");
+        assert!(
+            tm.tracks.values().next().unwrap().birth_channel == 40,
+            "the lower-SNR (weaker) track must be the one evicted"
+        );
     }
 }
