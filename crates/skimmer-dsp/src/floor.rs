@@ -163,6 +163,10 @@ pub struct Gate {
 }
 
 impl Gate {
+    /// A fresh gate for `n_channels` channels, configured with the SPEC §9
+    /// `detector.on_snr_db`/`detector.off_snr_db` thresholds. All channels
+    /// start uninitialized (the first `update` call seeds each channel's
+    /// smoothed power directly from that hop's raw power, per SPEC §2.3).
     pub fn new(n_channels: usize, on_snr_db: f32, off_snr_db: f32) -> Self {
         Gate {
             smoothed_db: vec![0.0; n_channels],
@@ -176,7 +180,7 @@ impl Gate {
     /// effective floor. SPEC §2.3: rise = S >= F + on_snr_db; drop = S < F
     /// + off_snr_db.
     pub fn update(&mut self, power_db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
-        debug_assert_eq!(power_db.len(), self.smoothed_db.len());
+        assert_eq!(power_db.len(), self.smoothed_db.len(), "Gate::update: power_db length {} does not match n_channels {}", power_db.len(), self.smoothed_db.len());
         let mut rise = vec![false; power_db.len()];
         let mut drop = vec![false; power_db.len()];
         for k in 0..power_db.len() {
@@ -193,6 +197,7 @@ impl Gate {
         (rise, drop)
     }
 
+    /// The current EMA-smoothed power `S[k,m]` for channel `k`. SPEC §2.3.
     pub fn smoothed_db(&self, k: usize) -> f64 {
         self.smoothed_db[k]
     }
@@ -342,5 +347,38 @@ mod tests {
             last = (r[0], d[0]);
         }
         assert_eq!(last, (false, false), "4.5 dB above floor sits in the hysteresis dead band");
+    }
+
+    #[test]
+    fn gate_ema_follows_the_configured_time_constant() {
+        // Verifies S[k,m] genuinely follows the closed-form EMA recurrence
+        // S_n = x - (x - S_0)*(1-alpha)^n, not an instant jump to the input.
+        let bank = warmed_up_bank(1, -90.0);
+        let mut gate = Gate::new(1, 6.0, 3.0);
+        gate.update(&[-90.0], &bank); // hop 1: initializes S_0 = -90.0 exactly
+        assert_eq!(gate.smoothed_db(0), -90.0);
+
+        gate.update(&[-70.0], &bank); // hop 2: one EMA step toward -70.0
+        let expected_s1 = -90.0 + GATE_EMA_ALPHA * (-70.0 - -90.0); // = -90 + alpha*20
+        assert!(
+            (gate.smoothed_db(0) - expected_s1).abs() < 1e-9,
+            "after one EMA step, S={} expected {expected_s1} (must NOT have jumped straight to -70.0)",
+            gate.smoothed_db(0)
+        );
+        assert!(
+            gate.smoothed_db(0) < -85.0,
+            "one EMA step at alpha={GATE_EMA_ALPHA} must still be far from the -70.0 target, got {}",
+            gate.smoothed_db(0)
+        );
+
+        // Many more hops at the same target: should now have converged close to it.
+        for _ in 0..500 {
+            gate.update(&[-70.0], &bank);
+        }
+        assert!(
+            (gate.smoothed_db(0) - -70.0).abs() < 0.01,
+            "after 500 more hops the EMA should have converged near -70.0, got {}",
+            gate.smoothed_db(0)
+        );
     }
 }
