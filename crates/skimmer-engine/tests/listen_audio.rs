@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex};
 /// wider/better Hilbert design or a DC/Nyquist guard band in
 /// `skimmer-dsp::hilbert`. Tracked for follow-up alongside the SPEC §2.1
 /// warmup-floor item already deferred to Task 11's Step 0 (see
-/// `pipeline.rs`'s `v1_lite_decodes_end_to_end`).
+/// `pipeline.rs`'s `v1_lite_decodes_end_to_end`). Tracked as
+/// <https://github.com/HagaleTechnologies/skimmer/issues/21>.
 #[test]
 #[ignore]
 fn listen_decodes_a_clean_real_audio_signal() {
