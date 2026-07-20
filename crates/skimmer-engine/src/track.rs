@@ -7,7 +7,8 @@
 /// literal SPEC table -- see the plan's Global Constraints).
 #[derive(Debug, Clone, Copy)]
 pub struct DetectorConfig {
-    /// SPEC §9: on (rise) threshold in dB SNR.
+    /// Rise threshold in dB SNR. **Deviation from SPEC §9's literal 6.0 dB
+    /// default (see `impl Default`).**
     pub on_snr_db: f32,
     /// SPEC §9: off (drop) threshold in dB SNR.
     pub off_snr_db: f32,
@@ -24,9 +25,37 @@ pub struct DetectorConfig {
 }
 
 impl Default for DetectorConfig {
+    /// **`on_snr_db` deviates from SPEC §9's literal 6.0 dB**, empirically
+    /// retuned to 12.0 dB (this repo's "measure, then pin the deviation"
+    /// convention -- cf. docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md
+    /// and .../2026-07-18-m2-pfb-channelizer-pins.md).
+    ///
+    /// SPEC §2.3's 6.0 dB / confirm_hops=19 pair was specified against an
+    /// implicit per-hop-independent noise model. The real channelizer output
+    /// `power[k] = |X[k]|^2` is a single complex-Gaussian magnitude-squared
+    /// per hop (SPEC §1.3): chi-squared, 2 DOF, dB-domain std ~5.57 dB raw,
+    /// and after the Gate's tau=40 ms EMA still ~1.7 dB std with a ~15-hop
+    /// autocorrelation time -- essentially confirm_hops=19 itself. So the
+    /// "19 sustained hops" window buys almost no *independent* looks at the
+    /// noise (once an EMA excursion crosses the threshold, autocorrelation
+    /// holds it there for nearly the whole window). Over V1's real
+    /// 1024-channel x 120 s render (~46 M channel-hop opportunities) the
+    /// literal 6.0 dB threshold produced 298 spurious ACTIVE tracks for a
+    /// single clean +20 dB signal.
+    ///
+    /// Raising `confirm_hops` instead was measured and rejected: CW elements
+    /// are short (a 20 WPM dit is ~22 hops), so a longer sustained-rise
+    /// window the noise must clear is also a window the *real* signal
+    /// struggles to fill -- confirm_hops in 40..150 gave both worse false-
+    /// track counts and worse decode accuracy. Raising `on_snr_db` is the
+    /// clean lever: 12.0 dB drives false tracks to 0 across all measured
+    /// noise seeds (empirical knee = 11.0 dB; +1 dB margin) while the
+    /// channelizer's ~14 dB processing gain (2500 Hz SNR -> 93.75 Hz channel
+    /// SNR) keeps even the weakest golden vector (V3, +6 dB-in-2500) ~14 dB
+    /// clear of the threshold, so it still promotes and decodes.
     fn default() -> Self {
         DetectorConfig {
-            on_snr_db: 6.0,
+            on_snr_db: 12.0,
             off_snr_db: 3.0,
             confirm_hops: 19,
             hang_hops: 1875,
@@ -111,6 +140,21 @@ impl Lifecycle {
     /// Query the current lifecycle state.
     pub(crate) fn state(&self) -> LifecycleState {
         self.state
+    }
+
+    /// SPEC §2.4 GC-timer reset, driven by the *actual* decode result rather
+    /// than a per-hop guess. `step_hop` advances the silent/GC counter every
+    /// hop with `char_emitted = false`, because the decoder pool runs only
+    /// *after* the whole hop batch -- so at hop time it cannot yet know
+    /// whether a character was decoded. `TrackManager::process_hops` calls
+    /// this once the batch's `CharDecoded` events are in hand, for every
+    /// track that emitted one, keeping a continuously-decoding signal's GC
+    /// timer from ever expiring. Without it the counter only ever climbs and
+    /// every ACTIVE track is force-closed `CloseReason::Silent` after
+    /// `gc_hops` (~30 s), fragmenting one continuous signal into a fresh
+    /// track every 30 s.
+    pub(crate) fn note_char_decoded(&mut self) {
+        self.silent_count = 0;
     }
 
     /// Advance one hop. `rise`/`drop` are this hop's gate booleans for the
@@ -412,7 +456,18 @@ impl TrackManager {
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
                 }
                 LifecycleEvent::None => {
-                    if track.state() == LifecycleState::Active {
+                    // Feed the decoder every hop once it exists (ACTIVE *or*
+                    // HANG), not only while ACTIVE. `TrackDecoder` times its
+                    // runs by hop *count* (`run.hops * HOP_MS`), so any hop
+                    // silently skipped while the track sits in HANG (every
+                    // inter-character/inter-word key-up gap, where the EMA
+                    // decays below `off_snr_db`) would shorten the following
+                    // space run and collapse character boundaries. During
+                    // HANG the selected channel simply carries noise-floor
+                    // magnitude, which the demod correctly reads as a space --
+                    // so the continuous feed keeps the decoder's timeline
+                    // hole-free. SPEC §3.3/§4.1 timing depends on this.
+                    if track.decoder.is_some() {
                         track.pending.push((hop.power[k].sqrt(), sample_ts));
                     }
                 }
@@ -535,7 +590,21 @@ impl TrackManager {
         for h in hops {
             self.step_hop(h, hop_to_sample_ts(h.m));
         }
-        self.drain_pool()
+        let events = self.drain_pool();
+        // SPEC §2.4 GC timer: reset the silent counter for every track that
+        // actually decoded a character this batch. `step_hop` advances it
+        // every hop with `char_emitted = false` (the pool has not run yet),
+        // so this post-pool reset is the only thing that keeps a
+        // continuously-decoding signal from being force-closed
+        // `CloseReason::Silent` after `gc_hops` and re-spawned as a new track.
+        for e in &events {
+            if let DecoderEvent::CharDecoded { track_id, .. } = e {
+                if let Some(t) = self.tracks.get_mut(track_id) {
+                    t.lifecycle.note_char_decoded();
+                }
+            }
+        }
+        events
     }
 
     /// Flush every track's decoder (SPEC §5 end-of-stream). Call once,
@@ -741,8 +810,12 @@ mod tests {
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above the ~-90 dBFS floor
+        // Window is generous enough to cover the EMA settle time: at the
+        // on_snr_db=12.0 default the gate's tau=40ms EMA must climb ~14 hops
+        // from the -90 dB floor before the first rise, then confirm_hops=19
+        // more sustained rise hops before promotion (~33 hops total).
         let mut promoted = false;
-        for m in (250 * 15)..(250 * 15 + 25) {
+        for m in (250 * 15)..(250 * 15 + 60) {
             tm.step_hop(&hop(m, power.clone()), m);
             if tm
                 .tracks
@@ -909,47 +982,26 @@ mod tests {
         assert_eq!(survivor.center, 21.1);
     }
 
-    /// Ignored: at full 1024-channel scale (V1: 96 kHz -> 93.75 Hz spacing),
-    /// `DetectorConfig::default()` false-triggers hundreds of spurious
-    /// CANDIDATE->ACTIVE promotions over V1's 120 s duration, not just one
-    /// real track. Root cause confirmed via direct measurement, independent
-    /// of this task's changes (Lifecycle/Gate/FloorBank -- Tasks 1-4 -- are
-    /// untouched here; this task only adds decoder allocation and
-    /// pending-queue bookkeeping around the unchanged spawn/confirm/close
-    /// path):
+    /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render
+    /// of SPEC §7's V1 golden vector (one clean +20 dB CW signal) must yield
+    /// exactly one track that decodes V1's text. Formerly `#[ignore]`d
+    /// because `DetectorConfig::default()`'s literal SPEC §9 thresholds
+    /// spawned 298 spurious ACTIVE tracks here; three fixes now make it pass
+    /// (all recorded on `impl Default for DetectorConfig`, `Lifecycle::
+    /// note_char_decoded`, and `TrackManager::step_hop`'s envelope-feed):
+    /// (1) `on_snr_db` retuned 6.0 -> 12.0 against the channelizer's real
+    /// per-hop variance; (2) the decoder is fed every hop while ACTIVE *or*
+    /// HANG (a hole-free timeline for `TrackDecoder`'s hop-count timing);
+    /// (3) the GC/silent timer is reset from actual `CharDecoded` results, so
+    /// a continuously-keyed signal is not force-closed every `gc_hops` (~30 s)
+    /// and re-spawned as a new track.
     ///
-    /// - `HopOutput.power[k] = |X[k]|^2` (SPEC §1.3 step 4) is a single
-    ///   complex-Gaussian magnitude-squared sample per hop, so per-hop dB
-    ///   power is inherently noisy (measured on a quiet background channel
-    ///   of V1's real render: raw `PdB` std ~5.2 dB; after the Gate's
-    ///   tau=40ms EMA, still ~1.7 dB std).
-    /// - The EMA's ~15-hop correlation time (tau=40ms at 375 Hz) is close to
-    ///   confirm_hops=19 (SPEC §2.3's ~50ms sustained-rise window), so a
-    ///   "sustained" 19-hop rise gives far fewer *independent* looks at the
-    ///   noise than a naive per-hop-independent false-alarm calculation
-    ///   would assume -- once an EMA excursion crosses on_snr_db=6dB, it
-    ///   tends to stay there for close to a full confirm window purely from
-    ///   autocorrelation.
-    /// - Measured over V1's real 120s/1024-channel render:
-    ///   694,346 total CANDIDATE spawns (nearly all closed Unconfirmed
-    ///   within a few hops -- chatter), of which 298 distinct tracks
-    ///   survived long enough to reach ACTIVE and emit at least one
-    ///   `DecoderEvent`, spread roughly uniformly across the whole
-    ///   recording (not just a warmup-window transient).
-    ///
-    /// This is a pre-existing SPEC §2.1-2.3 noise-floor/gate calibration
-    /// gap in the already-reviewed Tasks 1-5 detector, first surfaced by
-    /// this task's mandated full-scale end-to-end integration test -- not a
-    /// decoder-pool-wiring bug, and not fixable by anything in this task's
-    /// scope (`TrackManager::process_hops`/`drain_pool`/`finish`). A real
-    /// fix needs a SPEC-level decision (re-derive on_snr_db/confirm_hops
-    /// against the channelizer's actual per-hop variance, or add explicit
-    /// averaging ahead of the floor/gate pipeline) -- tracked for a
-    /// docs/DECISIONS entry; revisit and un-ignore once that lands, per
-    /// this repo's existing convention for `v2_passes_end_to_end_from_wav`
-    /// (docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md).
+    /// CER is asserted `< 0.03`, not `== 0.0`: SPEC §2.1's 2 s floor warmup
+    /// (`warmup_hops = 750`) inhibits all track creation for the first 2 s, so
+    /// the leading ~2.66 s of the 120 s stream (warmup + confirm) is
+    /// structurally unrecoverable -- a deterministic ~0.0155 CER floor
+    /// (measured identical across five noise seeds), i.e. 98.4% char accuracy.
     #[test]
-    #[ignore]
     fn active_track_decodes_real_text() {
         use skimmer_dsp::channelizer::Channelizer;
         let spec = skimmer_testkit::vectors::v1();
@@ -977,10 +1029,10 @@ mod tests {
             "V1 is single-signal, expected exactly 1 track"
         );
         let text = skimmer_decode::decoder::events_to_text(&all_events);
-        assert_eq!(
-            skimmer_testkit::cer::cer(&rendered.keyed_texts[0], &text),
-            0.0,
-            "expected {:?} got {:?}",
+        let cer = skimmer_testkit::cer::cer(&rendered.keyed_texts[0], &text);
+        assert!(
+            cer < 0.03,
+            "expected CER < 0.03 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
             rendered.keyed_texts[0],
             text
         );
