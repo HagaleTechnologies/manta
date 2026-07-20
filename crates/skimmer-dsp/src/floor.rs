@@ -103,6 +103,7 @@ pub struct FloorBank {
 }
 
 impl FloorBank {
+    /// A fresh floor bank for `n_channels` channels, all floors starting at the histogram's minimum (-140 dBFS) until the ring warms up. SPEC §2.1.
     pub fn new(n_channels: usize) -> Self {
         let n_blocks = n_channels.div_ceil(BLOCK_CHANNELS);
         FloorBank {
@@ -113,6 +114,7 @@ impl FloorBank {
         }
     }
 
+    /// Number of channels this bank was constructed for.
     pub fn n_channels(&self) -> usize {
         self.channels.len()
     }
@@ -120,7 +122,7 @@ impl FloorBank {
     /// One hop's per-channel dB power. Internally decimates to 25 Hz (every
     /// 15th hop) per SPEC §2.1; cheap to call every hop.
     pub fn update(&mut self, power_db: &[f64]) {
-        debug_assert_eq!(power_db.len(), self.channels.len());
+        assert_eq!(power_db.len(), self.channels.len(), "FloorBank::update: power_db length {} does not match n_channels {}", power_db.len(), self.channels.len());
         if self.hop_counter % DECIMATION_HOPS == 0 {
             for (ch, &p) in self.channels.iter_mut().zip(power_db) {
                 ch.push(p);
