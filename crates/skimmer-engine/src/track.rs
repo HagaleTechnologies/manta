@@ -824,10 +824,10 @@ mod tests {
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above the ~-90 dBFS floor
-        // Window is generous enough to cover the EMA settle time: at the
-        // on_snr_db=12.0 default the gate's tau=40ms EMA must climb ~14 hops
-        // from the -90 dB floor before the first rise, then confirm_hops=19
-        // more sustained rise hops before promotion (~33 hops total).
+                                                    // Window is generous enough to cover the EMA settle time: at the
+                                                    // on_snr_db=12.0 default the gate's tau=40ms EMA must climb ~14 hops
+                                                    // from the -90 dB floor before the first rise, then confirm_hops=19
+                                                    // more sustained rise hops before promotion (~33 hops total).
         let mut promoted = false;
         for m in (250 * 15)..(250 * 15 + 60) {
             tm.step_hop(&hop(m, power.clone()), m);

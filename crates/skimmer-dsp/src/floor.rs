@@ -122,7 +122,13 @@ impl FloorBank {
     /// One hop's per-channel dB power. Internally decimates to 25 Hz (every
     /// 15th hop) per SPEC §2.1; cheap to call every hop.
     pub fn update(&mut self, power_db: &[f64]) {
-        assert_eq!(power_db.len(), self.channels.len(), "FloorBank::update: power_db length {} does not match n_channels {}", power_db.len(), self.channels.len());
+        assert_eq!(
+            power_db.len(),
+            self.channels.len(),
+            "FloorBank::update: power_db length {} does not match n_channels {}",
+            power_db.len(),
+            self.channels.len()
+        );
         if self.hop_counter % DECIMATION_HOPS == 0 {
             for (ch, &p) in self.channels.iter_mut().zip(power_db) {
                 ch.push(p);
@@ -180,7 +186,13 @@ impl Gate {
     /// effective floor. SPEC §2.3: rise = S >= F + on_snr_db; drop = S < F
     /// + off_snr_db.
     pub fn update(&mut self, power_db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
-        assert_eq!(power_db.len(), self.smoothed_db.len(), "Gate::update: power_db length {} does not match n_channels {}", power_db.len(), self.smoothed_db.len());
+        assert_eq!(
+            power_db.len(),
+            self.smoothed_db.len(),
+            "Gate::update: power_db length {} does not match n_channels {}",
+            power_db.len(),
+            self.smoothed_db.len()
+        );
         let mut rise = vec![false; power_db.len()];
         let mut drop = vec![false; power_db.len()];
         for k in 0..power_db.len() {
@@ -318,7 +330,10 @@ mod tests {
             let (r, _) = gate.update(&[-80.0, -90.0, -90.0, -90.0], &bank);
             rise = r;
         }
-        assert!(rise[0], "channel 0 should meet rise (10 dB above -90 floor, on_snr=6)");
+        assert!(
+            rise[0],
+            "channel 0 should meet rise (10 dB above -90 floor, on_snr=6)"
+        );
         assert!(!rise[1], "channel 1 stays at the floor, should not rise");
     }
 
@@ -346,7 +361,11 @@ mod tests {
             let (r, d) = gate.update(&[-85.5], &bank);
             last = (r[0], d[0]);
         }
-        assert_eq!(last, (false, false), "4.5 dB above floor sits in the hysteresis dead band");
+        assert_eq!(
+            last,
+            (false, false),
+            "4.5 dB above floor sits in the hysteresis dead band"
+        );
     }
 
     #[test]
