@@ -41,7 +41,7 @@ pub fn listen(
     }
     let mut calib_ch =
         skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
-    let k0 = crate::detect::calibrate_channel(&mut calib_ch, &calib)
+    let k0 = calibrate_channel(&mut calib_ch, &calib)
         .context("no signal found during startup calibration")?;
     let mut ch =
         skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
@@ -90,4 +90,69 @@ pub fn listen(
         on_event(&ev);
     }
     Ok(())
+}
+
+/// Placeholder-detector calibration helper (design doc §2): run `ch` over
+/// `calib_iq` and return the channel index with the highest average power
+/// across the resulting hops, or `None` if no hops were produced
+/// (calibration window shorter than one filter length). Formerly lived in
+/// `detect.rs` as the M0/M1 shim's only consumer-agnostic piece; `listen()`
+/// above is now its sole caller (`decode_samples`/`decode_wav` moved onto
+/// the real `track::TrackManager` in Task 7) -- kept here only until Task 8
+/// wires `listen()` onto `TrackManager` too, at which point this helper goes
+/// away entirely.
+fn calibrate_channel(
+    ch: &mut skimmer_dsp::channelizer::Channelizer,
+    calib_iq: &[Complex32],
+) -> Option<usize> {
+    let hops = ch.process(calib_iq);
+    if hops.is_empty() {
+        return None;
+    }
+    let n = ch.n_channels();
+    let mut avg_power = vec![0.0f64; n];
+    for hop in &hops {
+        for (k, &p) in hop.power.iter().enumerate() {
+            avg_power[k] += p as f64;
+        }
+    }
+    let mut k0 = 0;
+    for (k, &p) in avg_power.iter().enumerate() {
+        if p > avg_power[k0] {
+            k0 = k;
+        }
+    }
+    Some(k0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skimmer_dsp::channelizer::Channelizer;
+
+    const FS: f64 = 96_000.0;
+
+    fn tone(freq: f64, n: usize, amp: f32, fs: f64) -> Vec<Complex32> {
+        (0..n)
+            .map(|i| {
+                let phi = 2.0 * std::f64::consts::PI * freq * i as f64 / fs;
+                Complex32::new(amp * phi.cos() as f32, amp * phi.sin() as f32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_loudest_channel() {
+        let mut ch = Channelizer::new(FS, 0.0).unwrap();
+        let iq = tone(6_000.0, 96_000, 1.0, FS); // 1 s calibration window
+        let k0 = calibrate_channel(&mut ch, &iq).unwrap();
+        assert_eq!(k0, 64); // 6000 / 93.75 = 64 exactly
+    }
+
+    #[test]
+    fn none_on_too_short_input() {
+        let mut ch = Channelizer::new(FS, 0.0).unwrap();
+        let iq = tone(6_000.0, 10, 1.0, FS); // far shorter than one filter length
+        assert!(calibrate_channel(&mut ch, &iq).is_none());
+    }
 }

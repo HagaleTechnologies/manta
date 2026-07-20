@@ -67,8 +67,6 @@ impl Default for DetectorConfig {
 }
 
 /// SPEC §2.4: track lifecycle state at any given hop.
-// Temporary: no caller yet until Task 5's TrackManager wires this state machine in.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleState {
     /// Initial state: rise threshold crossed, confirmation in progress.
@@ -80,8 +78,6 @@ pub(crate) enum LifecycleState {
 }
 
 /// SPEC §2.4: reason for track closure.
-// Temporary: no caller yet until Task 5's TrackManager drives lifecycle closures.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReason {
     /// Rise never confirmed within `confirm_hops` (SPEC §2.4: CANDIDATE -> IDLE).
@@ -93,8 +89,6 @@ pub(crate) enum CloseReason {
 }
 
 /// SPEC §2.4: event produced by a single-hop state transition.
-// Temporary: no caller yet until Task 5's TrackManager interprets these events.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleEvent {
     /// No state change this hop.
@@ -109,8 +103,6 @@ pub(crate) enum LifecycleEvent {
 /// `Lifecycle` itself has no notion of "channel" or "ownership" -- the
 /// caller (`TrackManager`, Task 5) decides which channel feeds `on_hop`
 /// each cycle.
-// Temporary: no caller yet until Task 5's TrackManager instantiates this struct.
-#[allow(dead_code)]
 pub(crate) struct Lifecycle {
     state: LifecycleState,
     confirm_count: u64,
@@ -121,8 +113,6 @@ pub(crate) struct Lifecycle {
     gc_hops: u64,
 }
 
-// Temporary: no caller yet until Task 5's TrackManager calls these methods.
-#[allow(dead_code)]
 impl Lifecycle {
     /// A brand-new CANDIDATE, just born on a rise hop.
     pub(crate) fn new(cfg: &DetectorConfig) -> Self {
@@ -138,6 +128,10 @@ impl Lifecycle {
     }
 
     /// Query the current lifecycle state.
+    // Temporary: no non-test reader yet -- `Track::state` (the only
+    // present-day caller of this) is itself unused outside tests until a
+    // later task filters/reports tracks by lifecycle state.
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> LifecycleState {
         self.state
     }
@@ -227,18 +221,25 @@ use std::collections::BTreeMap;
 /// realistic drift, e.g. SPEC §7 V9's 50 Hz/min) -- distinct from the
 /// slower track-*lifetime* power-weighted average used for the final
 /// reported frequency (Task 6).
-// Temporary: Track/TrackManager are not yet reachable from the crate's
-// public API (`track` is a private module) -- no caller yet until Task 7
-// wires TrackManager::process_hops/finish into decode_samples/decode_wav/
-// listen.
-#[allow(dead_code)]
 pub(crate) struct Track {
+    /// This track's stable identity (SPEC §5/§6), assigned once at birth by
+    /// `TrackManager::spawn` and carried into every `DecoderEvent` it emits.
+    // Temporary: no non-test reader of the field itself yet -- callers
+    // identify a track by its `BTreeMap` key, not this field, until a later
+    // task needs the id independent of that map.
+    #[allow(dead_code)]
     pub(crate) id: u32,
     lifecycle: Lifecycle,
+    /// Live, per-hop EMA of the fine-frequency channel position (see the
+    /// struct doc above); drives `owned`/`select_channel` ownership.
     pub(crate) center: f64,
+    /// This hop's SNR estimate for the track's selected channel (SPEC
+    /// §2.5), used by `merge_converged`/`evict_over_cap` tie-breaks.
     pub(crate) current_snr_db: f32,
     sum_weighted: f64,
     sum_power: f64,
+    /// The channel index this track first spawned on (SPEC §2.1); the
+    /// anchor for `Track::freq_hz`'s absolute-Hz conversion.
     pub(crate) birth_channel: usize,
     /// The track's leased decoder, allocated on CANDIDATE -> ACTIVE
     /// promotion (SPEC §2.4/§5); `None` before promotion.
@@ -262,9 +263,6 @@ fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
 /// against V9 in Task 9 and pinned there.
 const CENTER_EMA_ALPHA: f64 = 0.01;
 
-// Temporary: no caller yet until Task 7 wires TrackManager::process_hops
-// into decode_samples/decode_wav/listen.
-#[allow(dead_code)]
 impl Track {
     /// A brand-new track: `Lifecycle` seeded fresh, `center` initialized to
     /// its birth channel, decoder unleased. SPEC §2.4/§2.5.
@@ -283,6 +281,9 @@ impl Track {
     }
 
     /// Query the current lifecycle state. SPEC §2.4.
+    // Temporary: no non-test caller yet until a later task filters/reports
+    // tracks by lifecycle state (e.g. spot output limited to ACTIVE tracks).
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> LifecycleState {
         self.lifecycle.state()
     }
@@ -329,6 +330,8 @@ impl Track {
 
     /// SPEC §1.1/§1.4: absolute Hz for this track's current lifetime
     /// power-weighted centroid (not the fast ownership-following EMA).
+    /// `step_hop` calls this every hop a decoder exists to keep
+    /// `TrackDecoder`'s `TrackMeta.freq_hz` live (SPEC §5).
     fn freq_hz(&self, center_freq_hz: f64, channel_spacing_hz: f64, n_channels: usize) -> f64 {
         let centroid = if self.sum_power > 0.0 {
             self.sum_weighted / self.sum_power
@@ -356,17 +359,11 @@ pub struct TrackManager {
     decode_cfg: DecodeConfig,
     hop_counter: u64,
     center_freq_hz: f64,
-    // Temporary: no caller yet until Task 7 wires per-track `freq_hz`
-    // (SPEC §1.1/§1.4) into decode_samples/decode_wav/listen's spot output.
-    #[allow(dead_code)]
+    /// Hz per channel (`fs / n_channels`), the unit `Track::freq_hz` (SPEC
+    /// §1.1/§1.4) converts its channel-index centroid into absolute Hz.
     channel_spacing_hz: f64,
 }
 
-// Temporary: TrackManager is not yet reachable from the crate's public API
-// (`track` is a private module; only `DetectorConfig` is re-exported) --
-// no caller yet until Task 7 wires `process_hops`/`finish` into
-// decode_samples/decode_wav/listen. Only `tests` calls these methods today.
-#[allow(dead_code)]
 impl TrackManager {
     /// A fresh manager over `n_channels` channels, configured per
     /// `DetectorConfig`, with a decoder pool configured per `DecodeConfig`.
@@ -447,12 +444,18 @@ impl TrackManager {
             match event {
                 LifecycleEvent::Closed(_) => closed.push(id),
                 LifecycleEvent::Promoted => {
+                    // SPEC §1.1/§1.4/§5: seed TrackMeta.freq_hz from this
+                    // track's own lifetime power-weighted centroid (already
+                    // warm from its CANDIDATE-period update_centroid calls
+                    // above), not the pipeline's raw center_freq_hz -- every
+                    // track otherwise reports the same wrong frequency
+                    // regardless of which channel it actually lives on.
+                    // Computed before `track.decoder` is touched: `freq_hz`
+                    // borrows all of `track`, which would conflict with a
+                    // simultaneous `track.decoder.as_mut()` borrow.
+                    let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
-                    track
-                        .decoder
-                        .as_mut()
-                        .unwrap()
-                        .set_freq_hz(self.center_freq_hz);
+                    track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
                 }
                 LifecycleEvent::None => {
@@ -468,6 +471,17 @@ impl TrackManager {
                     // so the continuous feed keeps the decoder's timeline
                     // hole-free. SPEC §3.3/§4.1 timing depends on this.
                     if track.decoder.is_some() {
+                        // Keep TrackMeta.freq_hz live (SPEC §5's 1 Hz
+                        // cadence reports the *current* centroid, not a
+                        // frozen promotion-time snapshot) -- cheap, a plain
+                        // field write, no per-hop allocation. Computed
+                        // before the mutable `decoder` borrow, same reason
+                        // as the `Promoted` arm above.
+                        let freq_hz =
+                            track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
+                        if let Some(decoder) = track.decoder.as_mut() {
+                            decoder.set_freq_hz(freq_hz);
+                        }
                         track.pending.push((hop.power[k].sqrt(), sample_ts));
                     }
                 }
@@ -669,7 +683,7 @@ fn event_sample_ts(e: &DecoderEvent) -> u64 {
 
 /// SPEC §6 rule 6 resequencing key: the owning track's id, every
 /// `DecoderEvent` variant carries one.
-fn event_track_id(e: &DecoderEvent) -> u32 {
+pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
     match e {
         DecoderEvent::CharDecoded { track_id, .. }
         | DecoderEvent::WordBoundary { track_id, .. }
