@@ -7,6 +7,8 @@ pub mod soak;
 pub use soak::{soak, soak_passed, SoakReport};
 
 mod detect;
+mod track;
+pub use track::DetectorConfig;
 
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
