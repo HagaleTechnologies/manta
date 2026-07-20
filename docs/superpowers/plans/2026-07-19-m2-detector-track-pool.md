@@ -2406,15 +2406,62 @@ git commit -m "test(testkit): Farnsworth timing support + V10 golden vector (SPE
 
 ---
 
-### Task 11: V2 un-ignore; pins 9/10 tolerance re-measurement
+### Task 11: V2 un-ignore; pins 9/10 tolerance re-measurement; warmup-floor CER fixes
 
 **Files:**
 - Modify: `crates/skimmer-cli/tests/golden_v2_v3.rs`
 - Modify: `crates/skimmer-cli/tests/golden_v1.rs`
 - Modify: `crates/skimmer-engine/tests/pipeline.rs`
 - Modify: `crates/skimmer-engine/tests/roundtrip_iq.rs`
+- Modify: `crates/skimmer-engine/tests/regression_char_gap_high_wpm.rs`
+- Modify: `crates/skimmer-cli/tests/cli.rs`
 
-**Interfaces:** none new — this task only adjusts test assertions against the now-real detector.
+**Interfaces:** none new — this task only adjusts test assertions/scene durations against the now-real detector.
+
+**Scope addition (discovered during Task 7, not known when this task was originally planned):**
+Task 7's wiring exposed that SPEC §2.1's 750-hop (2.0 s) mandatory track-creation warmup —
+absent from the old placeholder detector — deterministically loses a leading prefix of any
+scene's decoded text. This is real, SPEC-compliant, already-precedented behavior (`track.rs`'s
+`active_track_decodes_real_text` asserts `CER < 0.02` for exactly this reason, for a 120 s
+scene), not a bug — but it breaks two different categories of pre-existing test, neither of
+which this task's original scope anticipated:
+
+1. **Exact-equality CER assertions** (`assert_eq!(cer(...), 0.0, ...)`) on scenes that ARE long
+   enough to decode, but lose their opening `"CQ "` or similar to the warmup+confirm window
+   (~2.05 s: 750 warmup hops + ~19 confirm hops + EMA settle). Affects
+   `pipeline.rs::v1_lite_decodes_end_to_end` (20 s scene), `golden_v1.rs::v1_passes_end_to_end_from_wav`
+   (120 s scene), `golden_v2_v3.rs::v2_passes_end_to_end_from_wav` (90 s scene, Step 1 below),
+   `cli.rs::gen_then_decode_prints_text`. Each scene's CER floor is duration-dependent (the same
+   ~2 s absolute loss is a larger fraction of a shorter scene) — do not copy one number across
+   files; measure each independently, same methodology as Steps 2-3 below use for freq/WPM:
+   run the test, read the actual measured CER from the failure output, and set a tolerance with
+   a small margin above the measured floor (matching `track.rs`'s own `< 0.02` precedent's
+   margin-over-floor ratio as a rough guide, not a value to copy verbatim).
+2. **Scenes too short to ever produce output** — a scene whose total duration is under the
+   ~2.05 s warmup+confirm floor never promotes a track at all (`decode_samples` returns an
+   error or empty text, not a CER problem). Affects `regression_char_gap_high_wpm.rs` (its
+   "AB"-at-33WPM scene is `keyed_length + 1.5 s ≈ 2.1 s`, too close to the floor) and
+   `roundtrip_iq.rs`'s proptest generator (scenes are `keyed_length + 1.5 s`, frequently under
+   2.05 s for short generated text — confirmed failing case: `wpm=10, "AO", snr=15,
+   offset=0kHz`). Fix by extending scene duration with margin (e.g. add a fixed lead-in/pad
+   comfortably over 2.05 s, or raise the proptest generator's minimum duration floor) —
+   preserve each test's original intent (char-gap-at-high-WPM regression coverage;
+   WPM/SNR/offset round-trip coverage), don't just pad arbitrarily.
+
+Do this warmup-floor work (both categories, all 6 files) as **Step 0**, before Steps 1-4 below
+(which retain their original freq/WPM scope). Steps 1 and 2 below will need re-running after
+Step 0's CER/duration fixes land, since Step 1's V2 un-ignore and Step 2's freq re-measurement
+both currently assume the old warmup-unaware test bodies.
+
+- [ ] **Step 0: Fix the warmup-floor CER/duration issues across all 6 files above**, per the
+  two categories described above. For each file: run its current test, capture the actual
+  failure (CER value, or "no signal"/error), apply the appropriate fix (tolerance adjustment
+  with measured margin, or duration extension with margin), re-run to confirm it now passes,
+  and leave a short comment citing this exact situation (SPEC §2.1 warmup floor, not a bug) —
+  do not silently loosen without a comment explaining why, matching this project's established
+  convention (see `track.rs`'s own `active_track_decodes_real_text` doc comment for the model
+  to follow). `roundtrip_iq.rs` is a proptest — after adjusting its duration floor, let it run
+  its full default case count, don't reduce it.
 
 - [ ] **Step 1: Un-ignore V2 and measure**
 
