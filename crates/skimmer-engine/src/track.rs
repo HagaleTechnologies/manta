@@ -1031,8 +1031,8 @@ mod tests {
         let text = skimmer_decode::decoder::events_to_text(&all_events);
         let cer = skimmer_testkit::cer::cer(&rendered.keyed_texts[0], &text);
         assert!(
-            cer < 0.03,
-            "expected CER < 0.03 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
+            cer < 0.02,
+            "expected CER < 0.02 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
             rendered.keyed_texts[0],
             text
         );
