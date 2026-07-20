@@ -795,7 +795,7 @@ git commit -m "feat(engine): track lifecycle state machine, single-channel (SPEC
 
 **Interfaces:**
 - Consumes: `skimmer_dsp::floor::{FloorBank, Gate}` (Tasks 2-3), `skimmer_dsp::channelizer::{HopOutput, power_db, interpolate_offset}`, `Lifecycle`/`DetectorConfig` (Task 4).
-- Produces: `pub(crate) struct Track { pub(crate) id: u32, pub(crate) state: LifecycleState, pub(crate) center: f64, pub(crate) current_snr_db: f32, ... }`, `pub struct TrackManager`, `impl TrackManager { pub fn new(fs: f64, n_channels: usize, detector_cfg: DetectorConfig) -> Self; fn step_hop(&mut self, power: &[f32]) -> Vec<(u32, f32, u64 /* sample_ts placeholder, set by caller */)> }` — this task stops at producing, per hop, the set of ACTIVE tracks' owned max-power channel index + magnitude (no `TrackDecoder`/pool dispatch yet; Task 6 adds that and the real public `process_hops` entry point).
+- Produces: `pub(crate) struct Track { pub(crate) id: u32, center: f64, pub(crate) current_snr_db: f32, ... }`, `pub struct TrackManager`, `impl TrackManager { pub fn new(n_channels: usize, cfg: DetectorConfig) -> Self; fn step_hop(&mut self, hop: &HopOutput) -> Vec<(u32, usize, f32)> }` (returns `(track_id, selected_channel, magnitude)` per currently-ACTIVE track) — this task stops there (no `TrackDecoder`/pool dispatch yet; Task 6 changes `new`'s signature again to add `fs`/`center_freq_hz`/`decode_cfg` and adds the real public `process_hops` entry point).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1190,13 +1190,13 @@ git commit -m "feat(engine): TrackManager multi-channel orchestration + ownershi
 
 **Interfaces:**
 - Consumes: `skimmer_decode::decoder::{DecodeConfig, TrackDecoder}`, `skimmer_decode::events::DecoderEvent`, `rayon::prelude::*`.
-- Produces: `impl TrackManager { pub fn new(fs: f64, n_channels: usize, hop_samples: u64, detector_cfg: DetectorConfig, decode_cfg: DecodeConfig, center_freq_hz: f64) -> Self; pub fn process_hops(&mut self, hops: &[HopOutput]) -> Vec<DecoderEvent>; pub fn finish(&mut self) -> Vec<DecoderEvent> }`. This is the entry point Tasks 7-8 wire into `decode_samples`/`decode_wav`/`listen`.
+- Produces: `impl TrackManager { pub fn new(n_channels: usize, fs: f64, center_freq_hz: f64, detector_cfg: DetectorConfig, decode_cfg: DecodeConfig) -> Self; pub fn process_hops(&mut self, hops: &[HopOutput], hop_to_sample_ts: impl Fn(u64) -> u64) -> Vec<DecoderEvent>; pub fn finish(&mut self) -> Vec<DecoderEvent> }`. This is the entry point Tasks 7-8 wire into `decode_samples`/`decode_wav`/`listen`.
 
 - [ ] **Step 1: Write the failing tests**
 
 Modify `TrackManager` in `crates/skimmer-engine/src/track.rs`: add fields and change `new`'s signature, add `pending`/`decoder` to `Track`, add the pool dispatch to `step_hop`, and add `process_hops`/`finish`.
 
-Replace the `Track` struct definition and its `impl Track` block's `fn new` with:
+Two separate replacements inside `impl Track`'s existing block: replace the `struct Track { ... }` definition, and separately replace just its `fn new` method. Leave `owned`, `select_channel`, and `update_centroid` (Task 5) untouched — `freq_hz` is a new method added after them, not a replacement. The struct and `fn new` become:
 
 ```rust
 pub(crate) struct Track {
@@ -1291,7 +1291,7 @@ impl TrackManager {
     }
 ```
 
-Replace `step_hop`'s body (the per-track loop and the promoted-track handling) so newly-ACTIVE tracks lease a decoder, and ACTIVE tracks queue `(mag, sample_ts)` instead of returning selections directly; `step_hop` now takes `hop_to_sample_ts: impl Fn(u64) -> u64` so callers (batch vs. streaming) supply their own hop->sample_ts mapping, matching the existing `lib.rs`/`listen.rs` convention:
+Replace `step_hop`'s signature and body (the per-track loop and the promoted-track handling) so newly-ACTIVE tracks lease a decoder, and ACTIVE tracks queue `(mag, sample_ts)` instead of returning selections directly. `step_hop` now takes a plain `sample_ts: u64` (computed by the caller, `process_hops` below, from its own `hop_to_sample_ts` closure) instead of returning `Vec<(u32, usize, f32)>`:
 
 ```rust
     fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) {
@@ -1376,10 +1376,8 @@ Add `process_hops`/`finish` and the rayon dispatch after `evict_over_cap`:
     pub fn process_hops(
         &mut self,
         hops: &[HopOutput],
-        hop_samples: u64,
         hop_to_sample_ts: impl Fn(u64) -> u64,
     ) -> Vec<DecoderEvent> {
-        let _ = hop_samples; // kept for call-site symmetry with existing pad_hops math; unused here
         for h in hops {
             self.step_hop(h, hop_to_sample_ts(h.m));
         }
@@ -1473,7 +1471,7 @@ Add a new integration-style test proving the pool actually decodes, at the end o
         let mut all_events = Vec::new();
         for chunk in rendered.samples.chunks(4096) {
             let hops = ch.process(chunk);
-            all_events.extend(tm.process_hops(&hops, hop_samples, |m| m * hop_samples));
+            all_events.extend(tm.process_hops(&hops, |m| m * hop_samples));
         }
         all_events.extend(tm.finish());
         let track_ids: std::collections::BTreeSet<u32> =
@@ -1549,7 +1547,7 @@ In `crates/skimmer-engine/src/lib.rs`, replace the whole body of `decode_samples
     if hops.is_empty() {
         bail!("no signal found (input shorter than one filter length or empty)");
     }
-    let mut events = tm.process_hops(&hops, hop, |m| (m.saturating_sub(pad_hops)) * hop);
+    let mut events = tm.process_hops(&hops, |m| (m.saturating_sub(pad_hops)) * hop);
     events.extend(tm.finish());
 
     if events.is_empty() {
@@ -1679,12 +1677,12 @@ Replace `crates/skimmer-engine/src/listen.rs`'s body from the `let mut calib_ch 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
-    for ev in tm.process_hops(&ch.process(&padding), hop, |m| {
+    for ev in tm.process_hops(&ch.process(&padding), |m| {
         m.saturating_sub(pad_hops) * hop
     }) {
         on_event(&ev);
     }
-    for ev in tm.process_hops(&ch.process(&calib), hop, |m| {
+    for ev in tm.process_hops(&ch.process(&calib), |m| {
         m.saturating_sub(pad_hops) * hop
     }) {
         on_event(&ev);
@@ -1699,7 +1697,7 @@ Replace `crates/skimmer-engine/src/listen.rs`'s body from the `let mut calib_ch 
         if n == 0 {
             break;
         }
-        for ev in tm.process_hops(&ch.process(&chunk[..n]), hop, |m| {
+        for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
             m.saturating_sub(pad_hops) * hop
         }) {
             on_event(&ev);
