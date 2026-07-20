@@ -38,6 +38,7 @@ impl Default for DetectorConfig {
 }
 
 /// SPEC §2.4: track lifecycle state at any given hop.
+// Temporary: no caller yet until Task 5's TrackManager wires this state machine in.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleState {
@@ -50,6 +51,7 @@ pub(crate) enum LifecycleState {
 }
 
 /// SPEC §2.4: reason for track closure.
+// Temporary: no caller yet until Task 5's TrackManager drives lifecycle closures.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReason {
@@ -62,6 +64,7 @@ pub(crate) enum CloseReason {
 }
 
 /// SPEC §2.4: event produced by a single-hop state transition.
+// Temporary: no caller yet until Task 5's TrackManager interprets these events.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleEvent {
@@ -77,6 +80,7 @@ pub(crate) enum LifecycleEvent {
 /// `Lifecycle` itself has no notion of "channel" or "ownership" -- the
 /// caller (`TrackManager`, Task 5) decides which channel feeds `on_hop`
 /// each cycle.
+// Temporary: no caller yet until Task 5's TrackManager instantiates this struct.
 #[allow(dead_code)]
 pub(crate) struct Lifecycle {
     state: LifecycleState,
@@ -88,6 +92,7 @@ pub(crate) struct Lifecycle {
     gc_hops: u64,
 }
 
+// Temporary: no caller yet until Task 5's TrackManager calls these methods.
 #[allow(dead_code)]
 impl Lifecycle {
     /// A brand-new CANDIDATE, just born on a rise hop.
