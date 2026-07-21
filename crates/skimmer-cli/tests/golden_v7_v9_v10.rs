@@ -19,9 +19,6 @@ fn decode_report(
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    if std::env::var("TASK10_TRACE").is_ok() {
-        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
-    }
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
