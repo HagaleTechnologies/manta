@@ -364,7 +364,11 @@ mod tests {
         };
         let (env_fast, _) = key_text("E", &fast, FS).unwrap();
         let (env_fw, _) = key_text("E", &farnsworth, FS).unwrap();
-        assert_eq!(env_fast.len(), env_fw.len(), "a lone character's mark duration must be identical");
+        assert_eq!(
+            env_fast.len(),
+            env_fw.len(),
+            "a lone character's mark duration must be identical"
+        );
 
         let (env_fast_pair, _) = key_text("EE", &fast, FS).unwrap();
         let (env_fw_pair, _) = key_text("EE", &farnsworth, FS).unwrap();

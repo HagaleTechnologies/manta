@@ -25,24 +25,24 @@ const DRIFT_OFF_FRAC: f64 = 0.40;
 const CHAR_GAP_DITS: f32 = 1.6;
 const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
 const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
-// SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
-// which is the practical floor for this constant: `ClusterPair::observe`
-// (below) always needs exactly 5 samples to leave its unimodal `init` phase
-// and become `ready()` (a fixed threshold shared with `SpeedTracker`'s
-// mu_dit/mu_dah bootstrap, not specific to Farnsworth), and
-// `farnsworth_active()` requires both `pair.ready()` and `long_seen >=
-// FARNS_MIN_COUNT` -- so any value <= 5 is equivalent (confirmed empirically:
-// 2/3/4/5 all produce identical V10 classification). Values > 5 only add
-// extra confirmation delay past that floor. This does not fully eliminate
-// Farnsworth's activation lag -- seeing this shared 5-sample bootstrap
-// itself takes several inter-character/inter-word gaps on any real
-// Farnsworth signal, which is why V10's golden test tolerates a small,
-// documented "warmup" word-boundary count instead of an exact match (see
-// golden_v7_v9_v10.rs's v10 test and the M2 sub-project 2 close-out pins
-// doc). Reducing the shared 5-sample bootstrap itself was considered and
-// rejected for this task: it also drives mark-speed (mu_dit/mu_dah)
-// estimation for every decode, not just Farnsworth ones, and changing it
-// needs its own full-suite/multi-WPM validation, out of this task's scope.
+                               // SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
+                               // which is the practical floor for this constant: `ClusterPair::observe`
+                               // (below) always needs exactly 5 samples to leave its unimodal `init` phase
+                               // and become `ready()` (a fixed threshold shared with `SpeedTracker`'s
+                               // mu_dit/mu_dah bootstrap, not specific to Farnsworth), and
+                               // `farnsworth_active()` requires both `pair.ready()` and `long_seen >=
+                               // FARNS_MIN_COUNT` -- so any value <= 5 is equivalent (confirmed empirically:
+                               // 2/3/4/5 all produce identical V10 classification). Values > 5 only add
+                               // extra confirmation delay past that floor. This does not fully eliminate
+                               // Farnsworth's activation lag -- seeing this shared 5-sample bootstrap
+                               // itself takes several inter-character/inter-word gaps on any real
+                               // Farnsworth signal, which is why V10's golden test tolerates a small,
+                               // documented "warmup" word-boundary count instead of an exact match (see
+                               // golden_v7_v9_v10.rs's v10 test and the M2 sub-project 2 close-out pins
+                               // doc). Reducing the shared 5-sample bootstrap itself was considered and
+                               // rejected for this task: it also drives mark-speed (mu_dit/mu_dah)
+                               // estimation for every decode, not just Farnsworth ones, and changing it
+                               // needs its own full-suite/multi-WPM validation, out of this task's scope.
 const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
 
