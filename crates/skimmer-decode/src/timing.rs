@@ -25,7 +25,25 @@ const DRIFT_OFF_FRAC: f64 = 0.40;
 const CHAR_GAP_DITS: f32 = 1.6;
 const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
 const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
-const FARNS_MIN_COUNT: u32 = 8; // SPEC §4.2 activation
+// SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
+// which is the practical floor for this constant: `ClusterPair::observe`
+// (below) always needs exactly 5 samples to leave its unimodal `init` phase
+// and become `ready()` (a fixed threshold shared with `SpeedTracker`'s
+// mu_dit/mu_dah bootstrap, not specific to Farnsworth), and
+// `farnsworth_active()` requires both `pair.ready()` and `long_seen >=
+// FARNS_MIN_COUNT` -- so any value <= 5 is equivalent (confirmed empirically:
+// 2/3/4/5 all produce identical V10 classification). Values > 5 only add
+// extra confirmation delay past that floor. This does not fully eliminate
+// Farnsworth's activation lag -- seeing this shared 5-sample bootstrap
+// itself takes several inter-character/inter-word gaps on any real
+// Farnsworth signal, which is why V10's golden test tolerates a small,
+// documented "warmup" word-boundary count instead of an exact match (see
+// golden_v7_v9_v10.rs's v10 test and the M2 sub-project 2 close-out pins
+// doc). Reducing the shared 5-sample bootstrap itself was considered and
+// rejected for this task: it also drives mark-speed (mu_dit/mu_dah)
+// estimation for every decode, not just Farnsworth ones, and changing it
+// needs its own full-suite/multi-WPM validation, out of this task's scope.
+const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
 
 fn mean(xs: &[f32]) -> f32 {
@@ -349,12 +367,63 @@ impl GapClassifier {
             && self.pair.hi / self.pair.lo >= FARNS_MIN_RATIO
     }
 
+    /// Scales decoder.rs's end-of-track safety-net flush multiple
+    /// (`DecodeConfig::flush_gap_dits`, nominally applied as
+    /// `nominal_flush_dits * mu_dit_ms`) to stay Farnsworth-aware. SPEC §4.2
+    /// pins the flush trigger at `7*mu_dit`, sized to sit above the *fixed*
+    /// `WORD_GAP_DITS = 5.0` nominal word-gap threshold -- comfortable
+    /// headroom when `mu_dit` also represents the character/word spacing
+    /// scale (the non-Farnsworth case). Under Farnsworth, `mu_dit` tracks
+    /// only the (fast) content dit while real gaps are stretched by a much
+    /// slower, decoupled spacing unit (SPEC §4.2's Farnsworth decoupling),
+    /// so a flush multiple still anchored to the fixed `WORD_GAP_DITS`
+    /// scale sits *below* real Farnsworth character gaps -- decoder.rs's
+    /// safety net was firing on essentially every inter-character gap
+    /// (confirmed via instrumented trace on the V10 vector:
+    /// `flush_gap_dits * mu_dit_ms` computed to ~365-450ms once `mu_dit`
+    /// stabilized, well under the real ~389-392ms character gap, while
+    /// element gaps ~42ms and the occasional gap seen before Farnsworth
+    /// activation were unaffected).
+    ///
+    /// Deliberately gated *more loosely* than `classify()`'s own
+    /// `farnsworth_active()` (which additionally requires `long_seen >=
+    /// FARNS_MIN_COUNT`): this method only needs `pair.ready() &&
+    /// pair.confirmed() && hi/lo >= FARNS_MIN_RATIO`, dropping the sample-
+    /// count gate. Reusing the stricter gate creates a measured chicken-
+    /// and-egg failure -- while `long_seen < FARNS_MIN_COUNT`, this method
+    /// would keep returning the unscaled nominal multiple, so
+    /// `check_flush` keeps intercepting gaps *before* they ever reach
+    /// `classify()`, which is the only place `long_seen` is incremented;
+    /// `long_seen` can then never climb to `FARNS_MIN_COUNT` (confirmed via
+    /// trace: with the stricter gate the V10 decode stayed in the
+    /// "every-character-is-a-word" failure mode for several repeats of the
+    /// text before happening to self-correct, instead of immediately after
+    /// the pair's initial 5-sample bimodal split). This is directionally
+    /// safe to loosen: this method only ever *raises* the flush threshold
+    /// above `nominal_flush_dits` (see the `.max()` below), so an
+    /// over-eager scale-up off a smaller, ratio-confirmed sample merely
+    /// makes the safety net slower to fire, never incorrect -- unlike
+    /// `classify()`'s own word/char decision, which must stay conservative
+    /// since it's what the golden vectors' character stream depends on.
+    pub fn flush_threshold_dits(&self, nominal_flush_dits: f32) -> f32 {
+        let farnsworth_shaped = self.pair.ready()
+            && self.pair.confirmed()
+            && self.pair.hi / self.pair.lo >= FARNS_MIN_RATIO;
+        if farnsworth_shaped {
+            let ratio = self.pair.boundary() / WORD_GAP_DITS;
+            (nominal_flush_dits * ratio).max(nominal_flush_dits)
+        } else {
+            nominal_flush_dits
+        }
+    }
+
     /// Classify one gap given the current dit estimate, incorporating it into the
     /// Farnsworth long-gap statistics if applicable. SPEC §4.2.
     pub fn classify(&mut self, gap_ms: f32, mu_dit_ms: f32) -> GapClass {
         let u = gap_ms / mu_dit_ms;
         // Thresholds from statistics BEFORE this gap is incorporated.
-        let word_thr = if self.farnsworth_active() {
+        let active = self.farnsworth_active();
+        let word_thr = if active {
             self.pair.boundary() // sqrt(mu_cgap * mu_wgap), in dit units
         } else {
             WORD_GAP_DITS

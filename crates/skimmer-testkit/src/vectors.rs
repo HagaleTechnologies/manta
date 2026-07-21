@@ -38,6 +38,7 @@ pub fn v1() -> VectorSpec {
             jitter: None,
             qsb: None,
             watterson: None,
+            char_wpm: None,
         }],
     }
 }
@@ -62,6 +63,7 @@ pub fn v2() -> VectorSpec {
             }),
             qsb: None,
             watterson: None,
+            char_wpm: None,
         }],
     }
 }
@@ -86,6 +88,7 @@ pub fn v3() -> VectorSpec {
             }),
             qsb: None,
             watterson: None,
+            char_wpm: None,
         }],
     }
 }
@@ -107,6 +110,7 @@ pub fn v6() -> VectorSpec {
             jitter: None,
             qsb: Some(QsbSine { rate_hz: 0.2 }),
             watterson: None,
+            char_wpm: None,
         }],
     }
 }
@@ -131,6 +135,7 @@ pub fn v4() -> VectorSpec {
                 preset: WattersonPreset::Good,
                 seed: 0x5663,
             }),
+            char_wpm: None,
         }],
     }
 }
@@ -155,6 +160,7 @@ pub fn v5() -> VectorSpec {
                 preset: WattersonPreset::Poor,
                 seed: 0x5635,
             }),
+            char_wpm: None,
         }],
     }
 }
@@ -196,6 +202,7 @@ pub fn v7() -> VectorSpec {
                 jitter: None,
                 qsb: None,
                 watterson: None,
+                char_wpm: None,
             },
             SignalSpec {
                 text: "CQ CQ DE N2BB N2BB K".into(),
@@ -206,6 +213,7 @@ pub fn v7() -> VectorSpec {
                 jitter: None,
                 qsb: None,
                 watterson: None,
+                char_wpm: None,
             },
         ],
     }
@@ -237,6 +245,34 @@ pub fn v9() -> VectorSpec {
             jitter: None,
             qsb: None,
             watterson: None,
+            char_wpm: None,
+        }],
+    }
+}
+
+/// SPEC §7 V10 "farnsworth": 15 WPM effective / 25 WPM character speed,
+/// +15 dB, AWGN. Pass: char >= 95%; word boundaries correct in steady
+/// state (golden_v7_v9_v10.rs tolerates a small, documented warmup-floor
+/// word-count drift during the Farnsworth gap-classifier's activation
+/// bootstrap -- see `skimmer_decode::timing::FARNS_MIN_COUNT`'s doc
+/// comment and the M2 sub-project 2 close-out pins doc).
+pub fn v10() -> VectorSpec {
+    VectorSpec {
+        name: "v10",
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x534B_494D_5610, // "SKIMV10" truncated to fit
+        signals: vec![SignalSpec {
+            text: "CQ CQ DE G4XXX G4XXX K".into(),
+            loop_text: true,
+            wpm: 15.0,
+            offset_hz: 8_000.0,
+            snr_2500_db: 15.0,
+            jitter: None,
+            qsb: None,
+            watterson: None,
+            char_wpm: Some(25.0),
         }],
     }
 }

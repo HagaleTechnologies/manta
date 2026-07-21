@@ -40,6 +40,7 @@ fn ab_at_33wpm_does_not_merge_into_one_character() {
         jitter: None,
         qsb: None,
         watterson: None,
+        char_wpm: None,
     };
     let (iq, texts) =
         render_scene(std::slice::from_ref(&sig), fs, duration_s, Some(noise_seed)).unwrap();

@@ -18,7 +18,14 @@ pub struct Jitter {
 /// Keying parameters: speed, edge shape, optional jitter. SPEC §7.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyerSpec {
+    /// Effective/word speed. With `char_wpm: None`, this is also the
+    /// character speed (the pre-Farnsworth behavior). With `char_wpm:
+    /// Some(_)`, this is the *slower* overall pace (SPEC §7 V10).
     pub wpm: f32,
+    /// Farnsworth character speed (SPEC §7 V10: characters keyed faster
+    /// than the overall word-boundary pacing). `None` = no Farnsworth
+    /// stretching; `wpm` alone sets both content and spacing timing.
+    pub char_wpm: Option<f32>,
     /// Raised-cosine rise/fall, contained inside the element. SPEC §7: 5 ms.
     pub rise_ms: f64,
     pub jitter: Option<Jitter>,
@@ -29,10 +36,31 @@ impl KeyerSpec {
     pub fn new(wpm: f32) -> Self {
         KeyerSpec {
             wpm,
+            char_wpm: None,
             rise_ms: 5.0,
             jitter: None,
         }
     }
+}
+
+/// SPEC §7 V10 Farnsworth timing, standard PARIS-reference derivation:
+/// content (dits/dahs + intra-character element gaps) run at `char_wpm`'s
+/// unit; inter-character/inter-word gaps are stretched to a slower
+/// `gap_unit_ms` so the overall pace matches `word_wpm`. The reference word
+/// "PARIS " = 31 content units + 19 spacing units = 50 units total (the
+/// standard definition of WPM in Morse), giving:
+/// `gap_unit = (50 * 1200/word_wpm - 31 * content_unit) / 19`.
+fn units_ms(word_wpm: f32, char_wpm: Option<f32>) -> (f64, f64) {
+    let content_wpm = char_wpm.unwrap_or(word_wpm);
+    let content_unit = 1200.0 / content_wpm as f64;
+    let gap_unit = match char_wpm {
+        None => content_unit,
+        Some(_) => {
+            let target_word_ms = 50.0 * 1200.0 / word_wpm as f64;
+            (target_word_ms - 31.0 * content_unit) / 19.0
+        }
+    };
+    (content_unit, gap_unit)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,8 +102,10 @@ fn normalize(text: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Append one word's segments. `unit` = dit ms. Returns Err on unknown chars.
-fn push_word(b: &mut SegmentBuilder, word: &str, unit: f64) -> Result<()> {
+/// Append one word's segments. `unit` = dit ms (content/char speed).
+/// `gap_unit` = inter-character gap ms (spacing speed; equals `unit` unless
+/// Farnsworth is active). Returns Err on unknown chars.
+fn push_word(b: &mut SegmentBuilder, word: &str, unit: f64, gap_unit: f64) -> Result<()> {
     let chars: Vec<char> = word.chars().collect();
     for (ci, c) in chars.iter().enumerate() {
         let Some(pattern) = pattern_for(*c) else {
@@ -89,7 +119,7 @@ fn push_word(b: &mut SegmentBuilder, word: &str, unit: f64) -> Result<()> {
             }
         }
         if ci < chars.len() - 1 {
-            b.push(false, 3.0 * unit);
+            b.push(false, 3.0 * gap_unit);
         }
     }
     Ok(())
@@ -135,13 +165,13 @@ fn render(segs: &[Segment], rise_ms: f64, fs: f64, total_samples: Option<usize>)
 /// Key `text` once. Returns (envelope at fs, normalized keyed text). SPEC §7.
 pub fn key_text(text: &str, spec: &KeyerSpec, fs: f64) -> Result<(Vec<f32>, String)> {
     let norm = normalize(text);
-    let unit = 1200.0 / spec.wpm as f64;
+    let (unit, gap_unit) = units_ms(spec.wpm, spec.char_wpm);
     let mut b = SegmentBuilder::new(spec.jitter);
     let words: Vec<&str> = norm.split(' ').collect();
     for (wi, w) in words.iter().enumerate() {
-        push_word(&mut b, w, unit)?;
+        push_word(&mut b, w, unit, gap_unit)?;
         if wi < words.len() - 1 {
-            b.push(false, 7.0 * unit);
+            b.push(false, 7.0 * gap_unit);
         }
     }
     let env = render(&b.segs, spec.rise_ms, fs, None);
@@ -157,7 +187,7 @@ pub fn key_text_loop(
     duration_s: f64,
 ) -> Result<(Vec<f32>, String)> {
     let norm = normalize(text);
-    let unit = 1200.0 / spec.wpm as f64;
+    let (unit, gap_unit) = units_ms(spec.wpm, spec.char_wpm);
     let budget_ms = duration_s * 1000.0;
     let mut b = SegmentBuilder::new(spec.jitter);
     let mut keyed = String::new();
@@ -172,7 +202,7 @@ pub fn key_text_loop(
                     segs: Vec::new(),
                     rng: b.rng.take(),
                 };
-                push_word(&mut scratch, &c.to_string(), unit)?;
+                push_word(&mut scratch, &c.to_string(), unit, gap_unit)?;
                 let char_ms: f64 = scratch.segs.iter().map(|s| s.dur_ms).sum();
                 b.rng = scratch.rng.take();
                 if elapsed + char_ms > budget_ms {
@@ -182,17 +212,17 @@ pub fn key_text_loop(
                 elapsed += char_ms;
                 keyed.push(*c);
                 if ci < chars.len() - 1 {
-                    b.push(false, 3.0 * unit);
+                    b.push(false, 3.0 * gap_unit);
                     elapsed += b.segs.last().unwrap().dur_ms;
                 }
             }
             if wi < words.len() - 1 {
-                b.push(false, 7.0 * unit);
+                b.push(false, 7.0 * gap_unit);
                 elapsed += b.segs.last().unwrap().dur_ms;
                 keyed.push(' ');
             }
         }
-        b.push(false, 7.0 * unit);
+        b.push(false, 7.0 * gap_unit);
         elapsed += b.segs.last().unwrap().dur_ms;
         keyed.push(' ');
         if elapsed >= budget_ms {
@@ -289,6 +319,7 @@ mod tests {
     fn jitter_is_deterministic_and_bounded() {
         let spec = KeyerSpec {
             wpm: 20.0,
+            char_wpm: None,
             rise_ms: 5.0,
             jitter: Some(Jitter {
                 sigma: 0.08,
@@ -317,6 +348,30 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a, c, "different seed must differ");
+    }
+
+    #[test]
+    fn farnsworth_stretches_only_gaps_not_marks() {
+        // 25 WPM chars / 15 WPM effective: dit/dah durations must match a
+        // plain 25 WPM keyer; the inter-character gap must be longer than
+        // a plain 25 WPM keyer's 3-unit gap.
+        let fast = KeyerSpec::new(25.0);
+        let farnsworth = KeyerSpec {
+            wpm: 15.0,
+            char_wpm: Some(25.0),
+            rise_ms: 5.0,
+            jitter: None,
+        };
+        let (env_fast, _) = key_text("E", &fast, FS).unwrap();
+        let (env_fw, _) = key_text("E", &farnsworth, FS).unwrap();
+        assert_eq!(env_fast.len(), env_fw.len(), "a lone character's mark duration must be identical");
+
+        let (env_fast_pair, _) = key_text("EE", &fast, FS).unwrap();
+        let (env_fw_pair, _) = key_text("EE", &farnsworth, FS).unwrap();
+        assert!(
+            env_fw_pair.len() > env_fast_pair.len(),
+            "Farnsworth inter-character gap must be longer than plain 25 WPM"
+        );
     }
 
     #[test]
