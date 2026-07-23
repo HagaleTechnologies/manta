@@ -10,9 +10,9 @@ Network currently depends on.
 M1 implemented (live audio decode; manual W1AW live-copy run still
 outstanding). M2 sub-project 1 (PFB channelizer) and sub-project 2
 (detector/track manager + decoder pool, `skimmer-dsp::floor` +
-`skimmer-engine::track`) both implemented; V1/V3/V4/V7/V9/V10 green, V2/V5
-tracked known limitations (`#[ignore]`d), V6 currently fails on an unrelated
-QSB/fading decode-quality issue — see
+`skimmer-engine::track`) both implemented; V1/V3/V4/V7/V9/V10 green, V2/V5/V6
+tracked known limitations (`#[ignore]`d) — V6 regressed to a QSB/fading
+decode-quality issue under the real detector, tracked as issue #25 — see
 docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md,
 docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md, and
 docs/DECISIONS/2026-07-17-m1-implementation-pins.md. `skimmer-dsp::single`/
