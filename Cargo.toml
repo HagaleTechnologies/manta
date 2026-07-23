@@ -42,6 +42,7 @@ rand_chacha = "0.9"
 proptest = "1.5"
 approx = "0.5"
 tempfile = "3"
+rayon = "1"
 
 # DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
 [profile.dev]

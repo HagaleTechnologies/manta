@@ -4,6 +4,15 @@ fn skimmer() -> Command {
     Command::new(env!("CARGO_BIN_EXE_skimmer"))
 }
 
+/// SPEC §2.1's ~2.05 s mandatory warmup(750 hops)+confirm(19 hops) floor
+/// deterministically loses this 15 s scene's leading "CQ " before the real
+/// detector ever promotes a track -- not a bug, same structural cause as
+/// `golden_v1.rs`/`pipeline.rs`'s V1-based tests (see those files' doc
+/// comments). A 15 s scene loses the ~2.05 s absolute prefix as a much
+/// larger fraction than V1's full 120 s gate. Measured empirically (Task 11
+/// Step 0): CER = 0.1304, deterministic (V1's fixed `noise_seed`). 0.17
+/// gives headroom above that floor. See
+/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md.
 #[test]
 fn gen_then_decode_prints_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -25,7 +34,13 @@ fn gen_then_decode_prints_text() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text.trim(), manifest.keyed_texts[0]);
+    let cer_val = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], text.trim());
+    assert!(
+        cer_val < 0.17,
+        "expected CER < 0.17 (measured floor 0.1304), got {cer_val:.4}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        text.trim()
+    );
 }
 
 #[test]

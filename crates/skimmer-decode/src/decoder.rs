@@ -197,7 +197,8 @@ impl TrackDecoder {
             self.demod.open_space_start_ts(),
         ) {
             let gap_ms = hops as f32 * HOP_MS as f32;
-            if gap_ms >= self.cfg.flush_gap_dits * self.tracker.mu_dit_ms() {
+            let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
+            if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
                 // drained space itself is not separately gap-classified —

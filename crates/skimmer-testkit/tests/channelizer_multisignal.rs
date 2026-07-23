@@ -23,6 +23,7 @@ fn signal(offset_hz: f64) -> SignalSpec {
         jitter: None,
         qsb: None,
         watterson: None,
+        char_wpm: None,
     }
 }
 
