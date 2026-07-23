@@ -342,8 +342,8 @@ impl Track {
     /// separately, not to this estimator choice) and 9.9 Hz on V1
     /// (non-drifting; improved from 16.5 Hz under the old lifetime-mean
     /// formula, not a regression). Both are within SPEC §7's ±15 Hz
-    /// criterion. See task-9-remediation-report.md and the M2 sub-project 2
-    /// close-out pins doc for the full comparison table and rationale.
+    /// criterion. See `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`
+    /// (item 5) for the full rationale.
     fn freq_hz(&self, center_freq_hz: f64, channel_spacing_hz: f64, n_channels: usize) -> f64 {
         let k0_freq = center_freq_hz
             + wrapped_channel_offset(self.birth_channel, n_channels) * channel_spacing_hz;

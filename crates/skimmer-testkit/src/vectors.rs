@@ -176,14 +176,14 @@ pub fn v5() -> VectorSpec {
 /// producing dozens of spurious garbled tracks (measured: 27) rather than 2
 /// clean ones — empirically confirmed below this channelizer's ~2.5-channel
 /// separation floor. This is fixture calibration, not a detector bug; see
-/// task-9-remediation-report.md and the M2 sub-project 2 close-out pins doc.
+/// `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` (item 4).
 /// Both offsets are bin-centered (exact channel multiples of 93.75 Hz) and 4
-/// channels apart. A reference offline replica (task-9-remediation-report.md)
-/// measured 0.0 Hz freq error on this exact pair; a real in-pipeline run
-/// measured 11.0/1.5 Hz -- both comfortably under the ±15 Hz criterion, but
-/// the gap vs. the replica's prediction is attributed to the channelizer's
-/// known parabolic-interpolation bias (deferred separately, see
-/// `Track::freq_hz`'s doc comment), not to this fixture's separation.
+/// channels apart. An offline replica measured 0.0 Hz freq error on this
+/// exact pair; a real in-pipeline run measured 11.0/1.5 Hz -- both
+/// comfortably under the ±15 Hz criterion, but the gap vs. the replica's
+/// prediction is attributed to the channelizer's known parabolic-
+/// interpolation bias (deferred separately, see `Track::freq_hz`'s doc
+/// comment), not to this fixture's separation.
 pub fn v7() -> VectorSpec {
     const CHANNEL_SPACING_HZ: f64 = 93.75;
     VectorSpec {
