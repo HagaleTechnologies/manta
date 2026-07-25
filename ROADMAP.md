@@ -58,9 +58,13 @@ see `docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md` and
 (detector/track manager + decoder pool, `skimmer-dsp::floor` +
 `skimmer-engine::track`) is complete — see
 `docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md` and
-`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. Remaining M2
-sub-projects: V8/V8w pileup-scene validation + CPU-budget criterion bench,
-SoapySDR input, KiwiSDR input. M2 itself is not yet complete.
+`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. KiwiSDR input
+(`skimmer-input::kiwi`, websocket IQ client, no feature gate) is complete —
+see `docs/superpowers/plans/2026-07-25-m2-kiwisdr-input.md` and
+`docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md`. Remaining M2
+sub-projects: V8/V8w pileup-scene validation + CPU-budget criterion bench
+(PR #29, open, unmerged) and SoapySDR input (PR #30, open, unmerged). M2
+itself is not yet complete.
 
 ## M3 — Spots: validation + servers + RBN parity benchmark
 

@@ -16,8 +16,13 @@ decode-quality issue under the real detector, tracked as issue #25 — see
 docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md,
 docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md, and
 docs/DECISIONS/2026-07-17-m1-implementation-pins.md. `skimmer-dsp::single`/
-`freqest` deprecated in place. Next: M2's remaining sub-projects (V8/V8w
-pileup validation + CPU-budget bench, SoapySDR input, KiwiSDR input).
+`freqest` deprecated in place. KiwiSDR input (`skimmer-input::kiwi`,
+websocket IQ client, no feature gate) implemented, with genuine live
+integration-test coverage against a real public receiver (not just
+error-path coverage) — see
+docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md. Remaining M2
+sub-projects still unmerged elsewhere: V8/V8w pileup validation +
+CPU-budget bench (PR #29), SoapySDR input (PR #30).
 
 ## Documents (read in this order)
 
