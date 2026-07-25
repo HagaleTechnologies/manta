@@ -91,15 +91,32 @@ mod tests {
     }
 
     #[test]
-    fn open_surfaces_stream_not_supported_as_a_clean_error() {
-        // SoapySDR's built-in `type=null` device opens successfully with no
-        // hardware and no extra module install, but does not support RX
-        // streaming -- open() must still return Err cleanly (confirms error
-        // propagation past device construction, through to rx_stream()).
+    fn open_succeeds_against_the_null_device() {
+        // SoapySDR's built-in `type=null` device opens with no hardware and
+        // no extra module install -- and, when driven through open()'s full
+        // sequence (gain-mode check + query-back reads before rx_stream()),
+        // it succeeds all the way through activate(). Real, hardware-free
+        // coverage of the entire open()/tune/stream/activate happy path.
         let result = SoapySdrIqSource::open("type=null", 96_000.0, 14_025_000.0, None);
         assert!(
+            result.is_ok(),
+            "expected Ok opening type=null, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn read_surfaces_not_supported_as_a_clean_error_on_the_null_device() {
+        // type=null's stream opens/activates but does not actually support
+        // reading samples -- read() fails with a real NotSupported error.
+        // This is real, hardware-free coverage of IqSource::read()'s error
+        // path, previously believed untestable without real hardware.
+        let mut src = SoapySdrIqSource::open("type=null", 96_000.0, 14_025_000.0, None).unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
+        let result = src.read(&mut buf);
+        assert!(
             result.is_err(),
-            "expected an Err from type=null (no RX streaming support)"
+            "expected Err reading from type=null's stream (NotSupported)"
         );
     }
 }
