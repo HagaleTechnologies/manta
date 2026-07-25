@@ -94,9 +94,11 @@ fn main() -> Result<()> {
             source,
             json,
         } => {
-            let src = match source {
-                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
-                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+            let src: Box<dyn skimmer_input::IqSource> = match source {
+                Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
+                None => Box::new(skimmer_input::AudioIqSource::from_device(
+                    device.as_deref(),
+                )?),
             };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
@@ -130,9 +132,11 @@ fn main() -> Result<()> {
             device,
             source,
         } => {
-            let src = match source {
-                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
-                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+            let src: Box<dyn skimmer_input::IqSource> = match source {
+                Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
+                None => Box::new(skimmer_input::AudioIqSource::from_device(
+                    device.as_deref(),
+                )?),
             };
             let report = skimmer_engine::soak(
                 src,
