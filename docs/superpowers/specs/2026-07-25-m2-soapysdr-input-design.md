@@ -191,8 +191,6 @@ path that was previously believed untestable:
 - Calling `.read(&mut buf)` on that `Ok` result fails with a real
   `NotSupported` `Err`, not a panic — the read()-error path, previously
   believed to have no hardware-free coverage available, actually does.
-  this remains genuinely untestable without real hardware, documented as
-  such rather than faked with a mock.
 - Existing `IqSource` conformance is implicit (the trait itself has no
   separate conformance test suite today — matches `AudioIqSource`/
   `WavIqSource`'s existing pattern of just implementing + directly testing the
