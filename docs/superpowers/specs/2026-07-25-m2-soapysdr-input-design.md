@@ -169,19 +169,28 @@ soapy = ["skimmer-input/soapy"]
 
 ## Testing
 
-No hardware, so tests focus on what's genuinely verifiable. Confirmed via spike
-(corrects an earlier assumption in this spec): SoapySDR's built-in `type=null`
-device opens successfully with no hardware and no extra module install, but
-does NOT support RX streaming (`rx_stream()` fails with a real `NotSupported`
-error) — so it cannot be used to test the actual read/streaming path, only a
-second, different device-level error path:
+No hardware, so tests focus on what's genuinely verifiable. Confirmed via two
+rounds of spiking (this corrects the design's own prior correction — `type=null`'s
+behavior turned out to depend on the exact call sequence, not be a fixed
+property): SoapySDR's built-in `type=null` device opens successfully with no
+hardware and no extra module install, and — when driven through `open()`'s
+full sequence (device open, set rate/freq, the gain-mode check, the
+query-back reads) — actually succeeds all the way through `rx_stream()` and
+`activate()` too. It only fails at the first `read()` call, with a real
+`NotSupported` error. (An earlier, simpler spike that skipped the gain-mode
+check and query-back calls got `NotSupported` at `rx_stream()` instead —
+`type=null`'s capabilities are apparently unlocked by those intermediate
+calls; not fully understood, but directly, repeatedly reproduced both ways on
+this machine.) This is better coverage than originally assumed: it exercises
+the ENTIRE `open()` happy path with no hardware, plus a real `read()` error
+path that was previously believed untestable:
 - `open("driver=rtlsdr", ...)` with no RTL-SDR attached: `Device::new()`
   itself fails, `open()` returns `Err` cleanly, not a panic.
-- `open("type=null", ...)`: `Device::new()` succeeds, but the later
-  `rx_stream()` call fails with `NotSupported`; `open()` must still return
-  `Err` cleanly (confirms error propagation from *every* step of `open()`,
-  not just device construction).
-- Streaming/`read()` itself has no hardware-free real coverage available —
+- `open("type=null", ...)`: succeeds — `Ok(SoapySdrIqSource)`. Real,
+  hardware-free coverage of the full open/tune/stream/activate sequence.
+- Calling `.read(&mut buf)` on that `Ok` result fails with a real
+  `NotSupported` `Err`, not a panic — the read()-error path, previously
+  believed to have no hardware-free coverage available, actually does.
   this remains genuinely untestable without real hardware, documented as
   such rather than faked with a mock.
 - Existing `IqSource` conformance is implicit (the trait itself has no
