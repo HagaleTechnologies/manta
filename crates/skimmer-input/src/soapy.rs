@@ -7,6 +7,7 @@ use crate::IqSource;
 use anyhow::Result;
 use num_complex::Complex32;
 use soapysdr::Direction::Rx;
+use soapysdr::ErrorCode;
 
 /// A live SoapySDR device (RTL-SDR/Airspy HF+/SDRplay/...) as an `IqSource`.
 /// ARCHITECTURE §3.
@@ -21,6 +22,17 @@ pub struct SoapySdrIqSource {
 /// in `skimmer-cli`) stays responsive; long enough not to busy-loop on an
 /// idle stream.
 const TIMEOUT_US: i64 = 100_000;
+
+/// Bound on consecutive read-timeout retries before giving up and
+/// propagating an error. TIMEOUT_US * MAX_TIMEOUT_RETRIES = ~2s of
+/// sustained silence tolerated before `read()` gives up -- long enough to
+/// absorb a normal brief signal gap or USB scheduling jitter (the reason
+/// SoapySDR's per-call timeout exists at all), short enough that a genuinely
+/// dead/disconnected device is still reported in a reasonable time, and
+/// bounded so this can't turn into an unbounded retry loop that would break
+/// `listen()`'s Ctrl-C responsiveness (which depends on `read()` returning
+/// promptly, not blocking forever).
+const MAX_TIMEOUT_RETRIES: u32 = 20;
 
 impl SoapySdrIqSource {
     /// Open `driver_args` (e.g. `"driver=rtlsdr"`), tune to `fs`/
@@ -69,9 +81,24 @@ impl IqSource for SoapySdrIqSource {
         self.center_freq_hz
     }
 
+    /// A per-call SoapySDR read timeout (`ErrorCode::Timeout`) is a normal,
+    /// expected event on a live stream -- not end-of-stream and not fatal --
+    /// so it is retried internally (bounded by `MAX_TIMEOUT_RETRIES`) rather
+    /// than surfaced to the caller; any other error still propagates as `Err`
+    /// immediately.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        let n = self.stream.read(&mut [buf], TIMEOUT_US)?;
-        Ok(n)
+        for _ in 0..MAX_TIMEOUT_RETRIES {
+            match self.stream.read(&mut [buf], TIMEOUT_US) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.code == ErrorCode::Timeout => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!(
+            "SoapySDR read timed out after {} consecutive attempts (~{}s of silence)",
+            MAX_TIMEOUT_RETRIES,
+            (MAX_TIMEOUT_RETRIES as i64 * TIMEOUT_US) / 1_000_000
+        )
     }
 }
 

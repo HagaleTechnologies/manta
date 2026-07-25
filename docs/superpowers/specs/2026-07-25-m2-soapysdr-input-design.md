@@ -155,11 +155,17 @@ soapy_rate: Option<f64>,
 soapy_gain: Option<f64>,
 ```
 
-`soapy_freq`/`soapy_rate` are required (via clap validation, not `Option`
-unwrapping) when `soapy_driver` is set — no sensible default center frequency
-or sample rate exists the way it does for file/audio sources reading their own
-metadata. Dispatch: box whichever source was selected as `Box<dyn IqSource>`
-before calling the (now-generalized) `skimmer_engine::listen`/`soak`.
+`soapy_freq`/`soapy_rate` are required when `soapy_driver` is set — no
+sensible default center frequency or sample rate exists the way it does for
+file/audio sources reading their own metadata. clap's `requires` attribute
+only enforces the reverse direction (can't pass `--soapy-freq` without
+`--soapy-driver`, not "must pass `--soapy-freq` if `--soapy-driver` is set"),
+so this is enforced at runtime in `open_source()` via
+`soapy_freq.ok_or_else(|| anyhow!("--soapy-freq is required with
+--soapy-driver"))?` (and the `--soapy-rate` equivalent) — a clean `Err` with
+an informative message, not a panic or a silent default. Dispatch: box
+whichever source was selected as `Box<dyn IqSource>` before calling the
+(now-generalized) `skimmer_engine::listen`/`soak`.
 
 `skimmer-cli/Cargo.toml` gets its own `soapy` feature forwarding:
 ```toml
@@ -201,14 +207,16 @@ path that was previously believed untestable:
 
 ## CI
 
-New job in `.github/workflows/ci.yml`, matrix `[ubuntu-latest, macos-latest]`,
-separate from the existing `test` job:
-- Linux: `sudo apt-get install -y libsoapysdr-dev`
+New job (`test-soapy`) in `.github/workflows/ci.yml`, matrix
+`[ubuntu-latest, macos-latest]`, separate from the existing `test` job:
+- Linux: `sudo apt-get install -y libasound2-dev libsoapysdr-dev`
 - macOS: `brew install soapysdr`
-- `cargo build -p skimmer-input -p skimmer-cli --features soapy`
-- `cargo test -p skimmer-input -p skimmer-cli --features soapy`
-- `cargo clippy -p skimmer-input -p skimmer-cli --features soapy --all-targets
+- `cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy
   -- -D warnings`
+- `cargo test -p skimmer-input -p skimmer-cli --features soapy`
+
+No separate `cargo build` step: both `clippy` and `test` build the crates
+implicitly first, so a standalone build step would be redundant.
 
 Does not touch the existing default `test` job — ROADMAP's "no SoapySDR
 dependency in default features" constraint is about the *default* build/CI
