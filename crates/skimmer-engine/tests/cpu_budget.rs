@@ -35,6 +35,12 @@ fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
     (samples, FS, CENTER_FREQ_HZ, PipelineConfig::default())
 }
 
+/// This test MUST be run with `cargo test --release` for a meaningful result.
+/// Plain `cargo test` (dev profile) measures with `opt-level = 1` for first-party crates per the
+/// workspace root Cargo.toml, producing dev-profile speeds that are ~1.45x slower than release
+/// (0.54x realtime vs. the actual 0.37x under --release). A dev-profile run can show false
+/// failures near/over the 0.5x budget even though the actual (release-profile) pipeline
+/// clears it comfortably.
 #[test]
 #[ignore]
 fn cpu_budget_mac_under_half_core() {
