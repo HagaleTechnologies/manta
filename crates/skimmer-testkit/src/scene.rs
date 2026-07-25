@@ -18,6 +18,9 @@ pub struct SignalSpec {
     pub jitter: Option<Jitter>,
     pub qsb: Option<QsbSine>,
     pub watterson: Option<WattersonFade>,
+    /// SPEC §7 V10 Farnsworth: character speed, if different from `wpm`
+    /// (the effective/word speed). `None` for every existing vector.
+    pub char_wpm: Option<f32>,
 }
 
 /// Sinusoidal QSB envelope multiplier applied on top of the keyed envelope.
@@ -56,6 +59,7 @@ pub fn render_scene(
     for sig in signals {
         let spec = KeyerSpec {
             wpm: sig.wpm,
+            char_wpm: sig.char_wpm,
             rise_ms: 5.0,
             jitter: sig.jitter,
         };
@@ -163,6 +167,7 @@ mod tests {
             jitter: None,
             qsb: None,
             watterson: None,
+            char_wpm: None,
         };
         let (clean, _) = render_scene(std::slice::from_ref(&sig), fs, 10.0, None).unwrap();
         let (noisy_only, _) = render_scene(&[], fs, 10.0, Some(1)).unwrap();
@@ -198,6 +203,7 @@ mod tests {
             }),
             qsb: None,
             watterson: None,
+            char_wpm: None,
         };
         let a = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
         let b = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
@@ -225,6 +231,7 @@ mod tests {
             jitter: None,
             qsb: Some(QsbSine { rate_hz: 0.2 }),
             watterson: None,
+            char_wpm: None,
         };
         let (samples, _) = render_scene(std::slice::from_ref(&sig), fs, 5.0, None).unwrap();
         let global_peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);

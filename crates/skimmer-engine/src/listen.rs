@@ -1,11 +1,11 @@
-//! M1 streaming pipeline: live/replayed audio -> single channel -> decoder,
-//! run continuously until Ctrl-C or EOF. No actor/ring-thread split -- M1
-//! has exactly one track; see design doc §4.
+//! Streaming pipeline: live/replayed audio -> PFB channelizer ->
+//! `TrackManager` (SPEC §2), run continuously until Ctrl-C or EOF, emitting
+//! the merged multi-track decode event stream as it's produced. No actor/
+//! ring-thread split; see design doc §4.
 
 use crate::PipelineConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use num_complex::Complex32;
-use skimmer_decode::decoder::TrackDecoder;
 use skimmer_decode::events::DecoderEvent;
 use skimmer_input::{AudioIqSource, IqSource};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 /// One chunk read per loop iteration, in samples.
 const CHUNK_SAMPLES: usize = 2048;
-/// Seconds of audio buffered to estimate the initial channel offset before
-/// the extractor is built -- a fixed startup calibration, not re-estimated
-/// afterward (M1 has no PFB/track manager to re-tune mid-stream).
+/// Seconds of audio buffered before the channelizer is built and streaming
+/// begins. This buffer is no longer a one-shot channel-pick calibration
+/// (`TrackManager` detects and tracks continuously, SPEC §2) -- it's fed
+/// through `TrackManager::process_hops` like any other chunk, just like the
+/// startup lead-in padding below it.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
 /// Run the streaming decode loop against `src` until `read` returns 0 (EOF,
@@ -39,34 +41,20 @@ pub fn listen(
         }
         filled += n;
     }
-    let mut calib_ch =
-        skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
-    let k0 = crate::detect::calibrate_channel(&mut calib_ch, &calib)
-        .context("no signal found during startup calibration")?;
     let mut ch =
         skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
-    let offset_hz = ch.channel_freq_hz(k0);
     let hop = ch.hop() as u64;
-    let mut decoder = TrackDecoder::new(1, cfg.decode.clone());
-    decoder.set_freq_hz(offset_hz);
+    let mut tm =
+        crate::track::TrackManager::new(ch.n_channels(), fs, 0.0, cfg.detector, cfg.decode.clone());
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
-    let mut m: u64 = 0;
-    for hop_out in ch.process(&padding) {
-        let sample_ts = m.saturating_sub(pad_hops) * hop;
-        for ev in decoder.push_envelope(hop_out.power[k0].sqrt(), sample_ts) {
-            on_event(&ev);
-        }
-        m += 1;
+    for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
+        on_event(&ev);
     }
-    for hop_out in ch.process(&calib) {
-        let sample_ts = m.saturating_sub(pad_hops) * hop;
-        for ev in decoder.push_envelope(hop_out.power[k0].sqrt(), sample_ts) {
-            on_event(&ev);
-        }
-        m += 1;
+    for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
+        on_event(&ev);
     }
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
@@ -78,15 +66,13 @@ pub fn listen(
         if n == 0 {
             break;
         }
-        for hop_out in ch.process(&chunk[..n]) {
-            let sample_ts = m.saturating_sub(pad_hops) * hop;
-            for ev in decoder.push_envelope(hop_out.power[k0].sqrt(), sample_ts) {
-                on_event(&ev);
-            }
-            m += 1;
+        for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
+            m.saturating_sub(pad_hops) * hop
+        }) {
+            on_event(&ev);
         }
     }
-    for ev in decoder.finish() {
+    for ev in tm.finish() {
         on_event(&ev);
     }
     Ok(())
