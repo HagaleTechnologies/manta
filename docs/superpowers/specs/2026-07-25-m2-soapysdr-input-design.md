@@ -123,6 +123,17 @@ signature-only change, no behavioral change to either function's body beyond
 `src.read(...)`/`src.sample_rate()` calls working identically through the trait
 object.
 
+**Real pre-existing bug this surfaces, fixed as part of this task:**
+`listen()` currently hardcodes `0.0` for `center_freq_hz` when constructing
+`Channelizer::new(fs, 0.0)` and `TrackManager::new(.., 0.0, ..)`
+(`listen.rs:45,48`), ignoring `src.center_freq_hz()` entirely. Harmless today
+because `AudioIqSource::center_freq_hz()` always returns `0.0` (audio has no
+RF reference) — the only source that has ever fed `listen()`. Once
+`SoapySdrIqSource` (a source with a real, nonzero RF center frequency) can
+feed `listen()`, this hardcoding would silently report wrong absolute spot
+frequencies. Fix: read `src.center_freq_hz()` once at the top of `listen()`
+(same place `fs` is already captured) and use it in both constructor calls.
+
 ## CLI wiring
 
 `crates/skimmer-cli/src/main.rs`'s `Command::Listen`/`Command::Soak`: add, gated
@@ -158,16 +169,21 @@ soapy = ["skimmer-input/soapy"]
 
 ## Testing
 
-No hardware, so tests focus on what's genuinely verifiable:
-- `SoapySdrIqSource::open("driver=rtlsdr", ...)` with no device attached
-  returns `Err`, not a panic (real, confirmed-reproducible path on this
-  machine).
-- Any additional coverage the implementer finds achievable via
-  `soapysdr::Device::null_device()` (a no-op software device the crate
-  provides) — if `null_device()` supports enough of the `Device` API to open
-  a stream and get zero-filled reads, that's real io-path coverage without
-  hardware; if it doesn't support streaming, this is a documented limitation,
-  not a gap to force-fix.
+No hardware, so tests focus on what's genuinely verifiable. Confirmed via spike
+(corrects an earlier assumption in this spec): SoapySDR's built-in `type=null`
+device opens successfully with no hardware and no extra module install, but
+does NOT support RX streaming (`rx_stream()` fails with a real `NotSupported`
+error) — so it cannot be used to test the actual read/streaming path, only a
+second, different device-level error path:
+- `open("driver=rtlsdr", ...)` with no RTL-SDR attached: `Device::new()`
+  itself fails, `open()` returns `Err` cleanly, not a panic.
+- `open("type=null", ...)`: `Device::new()` succeeds, but the later
+  `rx_stream()` call fails with `NotSupported`; `open()` must still return
+  `Err` cleanly (confirms error propagation from *every* step of `open()`,
+  not just device construction).
+- Streaming/`read()` itself has no hardware-free real coverage available —
+  this remains genuinely untestable without real hardware, documented as
+  such rather than faked with a mock.
 - Existing `IqSource` conformance is implicit (the trait itself has no
   separate conformance test suite today — matches `AudioIqSource`/
   `WavIqSource`'s existing pattern of just implementing + directly testing the
