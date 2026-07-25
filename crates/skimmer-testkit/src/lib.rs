@@ -6,6 +6,7 @@
 
 pub mod cer;
 pub mod keyer;
+mod callsigns;
 pub mod noise;
 pub mod scene;
 pub mod vectors;
