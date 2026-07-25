@@ -16,6 +16,8 @@ num-complex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 skimmer-dsp = { workspace = true }
+tungstenite = { workspace = true }
+rubato = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
