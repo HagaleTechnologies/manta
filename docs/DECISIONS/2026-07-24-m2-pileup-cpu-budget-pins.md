@@ -75,3 +75,20 @@ decided; SPEC and docs/ still win on anything not listed here.
    `cargo test --release -p skimmer-engine --test cpu_budget -- --ignored
    --nocapture` on real Pi4 hardware — same pattern as M1's still-
    outstanding W1AW live-copy run (see CLAUDE.md Status).
+
+7. **CPU-budget test measures wall-clock realtime ratio, not CPU-time; the
+   two are currently equivalent but not guaranteed.** The test
+   `cpu_budget_mac_under_half_core` measures wall-clock realtime ratio
+   (elapsed / audio_duration), not CPU-time as stated in ROADMAP's < 50% of
+   one core criterion. These are currently equivalent: independent
+   measurement found whole-process CPU/wall ratio ≈ 1.13 and decode section
+   ≈ 0.35 core-seconds/audio-second, both consistent with this pipeline
+   being essentially single-core-bound at current track counts (300), so the
+   wall-clock PASS (0.360x realtime) comfortably satisfies the CPU-time
+   budget too. This equivalence is NOT a guarantee: if the decoder pool's
+   parallelism scales up (more simultaneous tracks, heavier per-track
+   computation, or different core counts on other platforms), the wall-clock
+   gate could report a false PASS while the real per-core CPU time exceeds
+   the budget. Worth revisiting with genuine CPU-time measurement (e.g.
+   `getrusage`) if/when the pipeline's parallelism profile changes
+   substantially.

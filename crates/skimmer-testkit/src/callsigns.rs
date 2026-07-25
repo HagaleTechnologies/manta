@@ -17,9 +17,6 @@ const PILEUP_CALLS_SEED: u64 = 0x534B_494D_5638; // "SKIMV8"
 /// V8/V8w). Uses `crate::u01` (lib.rs, already `pub(crate)`) for the same
 /// hand-rolled ChaCha8 conversion every other generator in this crate uses
 /// (pinned decision 2) -- no local reimplementation.
-// Temporary: no non-test caller yet -- the real consumer (the V8/V8w scene
-// generator) lands in a later task.
-#[allow(dead_code)]
 pub(crate) fn pileup_calls() -> Vec<String> {
     let mut rng = ChaCha8Rng::seed_from_u64(PILEUP_CALLS_SEED);
     let mut calls = BTreeSet::new();
