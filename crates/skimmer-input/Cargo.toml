@@ -16,6 +16,10 @@ num-complex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 skimmer-dsp = { workspace = true }
+soapysdr = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+soapy = ["dep:soapysdr"]
