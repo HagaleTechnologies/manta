@@ -16,8 +16,12 @@ decode-quality issue under the real detector, tracked as issue #25 — see
 docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md,
 docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md, and
 docs/DECISIONS/2026-07-17-m1-implementation-pins.md. `skimmer-dsp::single`/
-`freqest` deprecated in place. Next: M2's remaining sub-projects (V8/V8w
-pileup validation + CPU-budget bench, SoapySDR input, KiwiSDR input).
+`freqest` deprecated in place. SoapySDR input (`skimmer-input::soapy`
+`IqSource` + `skimmer-engine`/`skimmer-cli` wiring) is implemented; no RF
+hardware was available, so real streaming/decode-accuracy validation is
+untested and outstanding (same pattern as the W1AW run) — see
+docs/DECISIONS/2026-07-25-m2-soapysdr-input-pins.md. Next: M2's remaining
+sub-projects (V8/V8w pileup validation + CPU-budget bench, KiwiSDR input).
 
 ## Documents (read in this order)
 
