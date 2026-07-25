@@ -153,7 +153,7 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// 0.094 (the only pass), 0.108, 0.144, 0.154, 0.181, 0.187, 0.187, 0.199,
 /// 0.200, 0.205, 0.207, 0.226, 0.232, 0.235, 0.244, 0.271, 0.275, 0.276,
 /// 0.286, 0.298, 0.308, 0.327, 0.337, 0.373, 0.384, 0.393, 0.441, 0.521,
-/// 0.526, 0.654, 0.686, 0.784, 0.844, 0.918 -- median ~0.20, ~2x the gate.
+/// 0.526, 0.654, 0.686, 0.784, 0.844, 0.918 -- median ~0.276, ~2.76x the gate.
 ///
 /// Ruled out as a harness/matching artifact two ways. First, the sibling
 /// AWGN-only V8 test (identical 50-signal scene: same offsets/WPM/SNR/
