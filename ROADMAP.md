@@ -58,9 +58,15 @@ see `docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md` and
 (detector/track manager + decoder pool, `skimmer-dsp::floor` +
 `skimmer-engine::track`) is complete — see
 `docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md` and
-`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. Remaining M2
-sub-projects: V8/V8w pileup-scene validation + CPU-budget criterion bench,
-SoapySDR input, KiwiSDR input. M2 itself is not yet complete.
+`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. M2's V8/V8w
+pileup-scene validation + CPU-budget criterion bench is complete-with-
+documented-`#[ignore]`s (same precedent as V2/V5/V6) — V8 passes (49/50
+callsigns, 0 bogus), V8w is `#[ignore]`d as issue #28 (classical-decoder
+fading-robustness gap, same family as V5/V6), and the CPU-budget Mac leg
+passes at 0.360x realtime (< 0.5x budget); the Pi4 leg remains an
+outstanding manual step — see
+`docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`. Remaining M2
+sub-projects: SoapySDR input, KiwiSDR input. M2 itself is not yet complete.
 
 ## M3 — Spots: validation + servers + RBN parity benchmark
 

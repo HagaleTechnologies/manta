@@ -8,16 +8,20 @@ Network currently depends on.
 ## Status
 
 M1 implemented (live audio decode; manual W1AW live-copy run still
-outstanding). M2 sub-project 1 (PFB channelizer) and sub-project 2
-(detector/track manager + decoder pool, `skimmer-dsp::floor` +
-`skimmer-engine::track`) both implemented; V1/V3/V4/V7/V9/V10 green, V2/V5/V6
+outstanding). M2 sub-project 1 (PFB channelizer), sub-project 2 (detector/
+track manager + decoder pool), and the V8/V8w pileup + CPU-budget
+sub-project all implemented; V1/V3/V4/V7/V8/V9/V10 green, V2/V5/V6/V8w
 tracked known limitations (`#[ignore]`d) — V6 regressed to a QSB/fading
-decode-quality issue under the real detector, tracked as issue #25 — see
+issue under the real detector (issue #25), V8w's 50-signal Watterson pileup
+is the same fading gap demonstrated at scale (issue #28). CPU-budget Mac leg
+passes (0.360x realtime, < 0.5x budget); Pi4 leg still outstanding, same
+precedent as the W1AW run. See
+docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md,
 docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md,
 docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md, and
 docs/DECISIONS/2026-07-17-m1-implementation-pins.md. `skimmer-dsp::single`/
-`freqest` deprecated in place. Next: M2's remaining sub-projects (V8/V8w
-pileup validation + CPU-budget bench, SoapySDR input, KiwiSDR input).
+`freqest` deprecated in place. Next: M2's remaining sub-projects (SoapySDR
+input, KiwiSDR input).
 
 ## Documents (read in this order)
 
