@@ -128,18 +128,32 @@ pub struct KiwiIqSource {
 }
 ```
 
-Resampler construction (per `rubato = "4.0"`'s docs.rs page — **verify this exact API against the real installed crate as Task 1's first step**, the same "compile against reality before trusting a design doc's API sketch" discipline used for `soapysdr` earlier in this plan):
+Resampler construction — verified directly against the real installed
+`rubato = "4.0"` source (`~/.cargo/registry/src/*/rubato-4.0.0/src/synchro.rs`),
+not just a docs.rs summary (a summarized fetch of this same API was tried
+first and got the rate-parameter type wrong — worth recording as another
+real "verify against the actual crate source" catch, same discipline used
+for `soapysdr` earlier in this plan):
 
 ```rust
-rubato::Fft::<f32>::new(
-    rate_in,           // the real, MSG-reported sample_rate (e.g. 11998.937786)
-    96_000.0,          // rate_out: the SPEC §1.1 table rate
+rubato::synchro::Fft::<f32>::new(
+    rate_in_hz,        // usize -- the real, MSG-reported sample_rate, ROUNDED
+                        // to the nearest Hz (e.g. 11998.937786 -> 11999);
+                        // rubato's Fft::new takes usize, not f64 -- the
+                        // sub-Hz fractional part is lost, a few hundred
+                        // ppm of harmless resampling-ratio error
+    96_000,            // usize -- rate_out, the SPEC §1.1 table rate
     512,               // chunk_size: matches KiwiSDR's real, observed per-SND-frame sample count
-    2,                 // channels: I/Q interleaved
-    rubato::FixedSync::Input,
+    2,                 // nbr_channels: I/Q interleaved
+    rubato::synchro::FixedSync::Input,
 )?;
-// per chunk: resampler.process_into_buffer(&input_512_samples, &mut output_buf, None)?
-// returns (frames_read, frames_written); pre-size output_buf via resampler.output_frames_max()
+// process_into_buffer takes &dyn Adapter<T>/&mut dyn AdapterMut<T> from the
+// separate `audioadapter` crate (a real, additional dependency alongside
+// rubato -- e.g. audioadapter::direct::InterleavedSlice wraps a plain
+// &[f32]/&mut [f32]), not raw slices directly:
+//   resampler.process_into_buffer(&input_adapter, &mut output_adapter, None)?
+// returns (frames_read, frames_written); pre-size the output buffer via
+// resampler.output_frames_max()
 
 impl KiwiIqSource {
     pub fn connect(
