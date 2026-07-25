@@ -122,38 +122,64 @@ pub struct KiwiIqSource {
     socket: tungstenite::WebSocket<std::net::TcpStream>,
     fs: f64,             // real, resampled-target rate (96_000.0)
     center_freq_hz: f64,
-    resampler: rubato::Fft<f32>,  // constructed with FixedSync::Input, chunk_size=512, channels=2 (I/Q interleaved)
-    pending: std::collections::VecDeque<Complex32>,  // chunk-assembler buffer
+    resampler: rubato::Fft<f32>,     // FixedSync::Input, channels=2 (I/Q interleaved)
+    raw: Vec<f32>,                   // un-resampled input accumulator (see below)
+    pending: std::collections::VecDeque<Complex32>,  // resampled-output chunk-assembler
     last_keepalive: std::time::Instant,
 }
 ```
 
-Resampler construction — verified directly against the real installed
-`rubato = "4.0"` source (`~/.cargo/registry/src/*/rubato-4.0.0/src/synchro.rs`),
-not just a docs.rs summary (a summarized fetch of this same API was tried
-first and got the rate-parameter type wrong — worth recording as another
-real "verify against the actual crate source" catch, same discipline used
-for `soapysdr` earlier in this plan):
+Resampler construction and integration — verified directly against the real
+installed `rubato = "4.0"` source
+(`~/.cargo/registry/src/*/rubato-4.0.0/src/synchro.rs`) AND a real,
+compiled, executed spike, not just a docs.rs summary (a summarized fetch of
+this same API was tried first and got the rate-parameter type wrong — worth
+recording as another real "verify against the actual crate/a real run, not
+a summary" catch, same discipline used for `soapysdr` earlier in this plan):
 
 ```rust
-rubato::synchro::Fft::<f32>::new(
+rubato::Fft::<f32>::new(
     rate_in_hz,        // usize -- the real, MSG-reported sample_rate, ROUNDED
                         // to the nearest Hz (e.g. 11998.937786 -> 11999);
-                        // rubato's Fft::new takes usize, not f64 -- the
-                        // sub-Hz fractional part is lost, a few hundred
-                        // ppm of harmless resampling-ratio error
+                        // Fft::new takes usize, not f64 -- the sub-Hz
+                        // fractional part is lost, a few hundred ppm of
+                        // harmless resampling-ratio error
     96_000,            // usize -- rate_out, the SPEC §1.1 table rate
-    512,               // chunk_size: matches KiwiSDR's real, observed per-SND-frame sample count
+    RESAMPLER_CHUNK,   // see below -- NOT KiwiSDR's raw 512-sample SND
+                        // frame size
     2,                 // nbr_channels: I/Q interleaved
-    rubato::synchro::FixedSync::Input,
+    rubato::FixedSync::Input,
 )?;
-// process_into_buffer takes &dyn Adapter<T>/&mut dyn AdapterMut<T> from the
-// separate `audioadapter` crate (a real, additional dependency alongside
-// rubato -- e.g. audioadapter::direct::InterleavedSlice wraps a plain
-// &[f32]/&mut [f32]), not raw slices directly:
-//   resampler.process_into_buffer(&input_adapter, &mut output_adapter, None)?
-// returns (frames_read, frames_written); pre-size the output buffer via
-// resampler.output_frames_max()
+```
+
+`rubato` and `audioadapter`/`audioadapter_buffers` (the buffer-wrapper types
+`process_into_buffer` needs — `rubato::audioadapter_buffers::direct::
+InterleavedSlice::new`/`new_mut` wrap a plain `&[f32]`/`&mut [f32]`) do
+**not** need separate `Cargo.toml` entries: `rubato`'s own `lib.rs` does
+`pub use audioadapter; pub use audioadapter_buffers;`, so both are reachable
+as `rubato::audioadapter::*` / `rubato::audioadapter_buffers::*` through the
+one `rubato = "4.0"` dependency. Confirmed by a real compiled spike using
+exactly this path.
+
+**Real finding that changes the buffering design**: feeding the resampler
+in KiwiSDR's native 512-sample SND-frame chunks was tried in the spike and
+produces an `output_delay()` of 48,000 output samples (0.5s at 96kHz) — and
+after 6 consecutive 512-sample chunks fed (all of KiwiSDR's natural
+frame-delivery rate for ~0.26s of audio), **zero** output samples had been
+produced yet. `Fft`'s internal FFT block size is chosen from the chunk size
+and the rate ratio together, not from the chunk size alone, and a small
+chunk size at an 8x ratio produces a large, latency-heavy internal block.
+This means **`RESAMPLER_CHUNK` must be decoupled from the raw 512-sample
+SND frame size**: accumulate several SND frames' worth of raw samples into
+`raw: Vec<f32>` first, and only call `process_into_buffer` once `raw` holds
+a full `RESAMPLER_CHUNK`-sized (a larger, TBD-during-implementation value —
+tune empirically for a reasonable delay/throughput trade-off; the spike
+didn't explore this) block. `resampler.output_delay()` should be checked at
+construction time and logged/documented once a real value is picked, so a
+future reader understands the real startup latency this introduces (a
+real-world consequence: `listen()`'s startup calibration window may need to
+account for it, similar in spirit to the existing `CALIBRATION_SECONDS`
+constant).
 
 impl KiwiIqSource {
     pub fn connect(
