@@ -139,21 +139,76 @@ impl KiwiIqSource {
         // Read frames until the server reports the real, device-specific
         // sample rate. Everything else in the initial parameter batch
         // (rx_chans, chan_no_pwd, load_cfg, ...) is handled by read()'s
-        // ongoing MSG dispatch once streaming begins.
+        // ongoing MSG dispatch once streaming begins -- EXCEPT audio_rate,
+        // which routinely arrives in this same initial batch (order across
+        // real nodes is not guaranteed relative to sample_rate) and, per the
+        // module docs, MUST be ack'd via `SET AR OK` or the server silently
+        // stops streaming a few seconds later. So every MSG frame seen here
+        // is routed through the same `handle_msg` dispatch `read()` uses
+        // later, not just inspected for `sample_rate=`; only that key
+        // additionally ends the loop, once handle_msg has already had a
+        // chance to react to it.
+        //
+        // This loop mirrors read()'s bounded-timeout retry (see
+        // MAX_CONSECUTIVE_TIMEOUTS) rather than propagating a single read
+        // timeout as a hard error: ordinary network jitter during the
+        // handshake shouldn't be fatal on a real node with higher latency
+        // than the ones this was tested against.
+        let mut consecutive_timeouts = 0u32;
         let rate_in_hz = loop {
-            let msg = socket.read().context("read during KiwiSDR handshake")?;
+            let msg = match socket.read() {
+                Ok(m) => {
+                    consecutive_timeouts = 0;
+                    m
+                }
+                Err(tungstenite::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    consecutive_timeouts += 1;
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                        bail!(
+                            "KiwiSDR handshake stalled: no data for {} consecutive read timeouts",
+                            MAX_CONSECUTIVE_TIMEOUTS
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e).context("read during KiwiSDR handshake"),
+            };
             let Message::Binary(b) = msg else {
                 continue;
             };
             if b.len() < 3 || &b[0..3] != b"MSG" {
                 continue;
             }
-            let text = String::from_utf8_lossy(&b[3..]);
+            let text = String::from_utf8_lossy(&b[3..]).into_owned();
+            // `self` doesn't exist yet at this point in connect() (the
+            // resampler/rate aren't known until this loop finds
+            // sample_rate=), so this can't call `self.handle_msg` directly;
+            // both this loop and handle_msg instead delegate to the shared
+            // free function below so the audio_rate-ack logic lives in
+            // exactly one place.
+            ack_audio_rate_if_present(&mut socket, &text)?;
             if let Some(rate) = parse_kv_f64(&text, "sample_rate") {
                 break rate.round() as usize;
             }
         };
 
+        // NOTE: order deliberately differs from the design spec (which has
+        // all four SET commands sent up front, before waiting on
+        // sample_rate=). Live testing against real receivers required
+        // sending `SET auth` alone first and waiting for sample_rate= to
+        // come back before sending the rest -- sending everything up front
+        // was not what was verified working end-to-end, so this order is
+        // kept as-is rather than "corrected" back to the spec's sequence.
+        //
+        // ident_user/squelch/genattn/gen are undocumented in the design
+        // spec; they were copied from the reference `jks-prv/kiwiclient`
+        // client's handshake during live debugging of the audio_rate/SET AR
+        // OK issue (see module docs) to maximize fidelity with a known-
+        // working client while chasing that bug, and left in since removing
+        // them was never verified safe against real nodes.
         for cmd in [
             "SET ident_user=skimmer".to_string(),
             format!(
@@ -164,6 +219,7 @@ impl KiwiIqSource {
             "SET squelch=0 max=0".to_string(),
             "SET genattn=0".to_string(),
             "SET gen=0 mix=-1".to_string(),
+            "SET compression=0".to_string(),
             "SET keepalive".to_string(),
         ] {
             socket
@@ -210,13 +266,7 @@ impl KiwiIqSource {
     /// for the server to ever start streaming `SND`, see module docs) and
     /// otherwise ignore. Real, unknown MSG keys are common and harmless.
     fn handle_msg(&mut self, text: &str) -> Result<()> {
-        if let Some(rate) = parse_kv_f64(text, "audio_rate") {
-            let cmd = format!("SET AR OK in={} out={TARGET_RATE_HZ}", rate as i64);
-            self.socket
-                .send(Message::Text(cmd))
-                .context("send SET AR OK")?;
-        }
-        Ok(())
+        ack_audio_rate_if_present(&mut self.socket, text)
     }
 
     /// Feed newly-parsed raw (un-resampled) samples through the resampler,
@@ -245,6 +295,18 @@ impl KiwiIqSource {
             }
         }
     }
+}
+
+/// Shared by `connect()`'s handshake loop (before a `KiwiIqSource` exists)
+/// and `handle_msg` (after): if `text` carries `audio_rate=`, reply with the
+/// `SET AR OK` ack the server requires before it will ever start streaming
+/// `SND` frames (see module docs). No-op if `audio_rate=` isn't present.
+fn ack_audio_rate_if_present(socket: &mut WebSocket<TcpStream>, text: &str) -> Result<()> {
+    if let Some(rate) = parse_kv_f64(text, "audio_rate") {
+        let cmd = format!("SET AR OK in={} out={TARGET_RATE_HZ}", rate as i64);
+        socket.send(Message::Text(cmd)).context("send SET AR OK")?;
+    }
+    Ok(())
 }
 
 /// Parse `key=value` (whitespace-separated `MSG` parameter text) for `key`,
@@ -301,8 +363,12 @@ impl IqSource for KiwiIqSource {
         loop {
             let n = self.pending.len().min(buf.len());
             if n > 0 {
+                // Safe: `n` is bounded above by `self.pending.len()`, so
+                // every one of these `n` pops has an element to take.
                 for slot in buf.iter_mut().take(n) {
-                    *slot = self.pending.pop_front().unwrap();
+                    if let Some(s) = self.pending.pop_front() {
+                        *slot = s;
+                    }
                 }
                 return Ok(n);
             }
