@@ -5,8 +5,8 @@
 //! pipeline. ARCHITECTURE §3, docs/superpowers/specs/2026-07-25-m2-kiwisdr-input-design.md.
 //!
 //! Protocol notes (real, live-verified against several public receivers
-//! during implementation -- see docs/superpowers/sdd/task-1-report.md for
-//! the full findings and the design spec for the original brainstorming):
+//! during implementation -- see docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md
+//! for the full findings and the design spec for the original brainstorming):
 //!
 //! - Handshake: `ws://<host>:<port>/<timestamp>/SND`, then a sequence of
 //!   `SET ...` **text** frames (`timestamp` is any process-unique value).
@@ -55,8 +55,8 @@ const TARGET_RATE_HZ: usize = 96_000;
 ///
 /// **Real, empirically-verified finding** (not the naive guess of matching
 /// KiwiSDR's native 512-sample SND frame size, and not simply "bigger is
-/// better" -- see docs/superpowers/sdd/task-1-report.md for the full
-/// derivation): with `FixedSync::Input`, `rubato::Fft`'s internal FFT block
+/// better" -- see docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md for the
+/// full derivation): with `FixedSync::Input`, `rubato::Fft`'s internal FFT block
 /// size for the input side is (for the always-integer-Hz KiwiSDR rate,
 /// gcd(rate_in, 96000) == 1 for essentially every real device, since a
 /// crystal-derived rate near 12000 Hz shares no factors with

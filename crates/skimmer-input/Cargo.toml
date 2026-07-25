@@ -1,6 +1,6 @@
 [package]
 name = "skimmer-input"
-description = "IQ sources for skimmer (file playback at M0)"
+description = "IQ sources for skimmer (file, live audio, KiwiSDR network)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
