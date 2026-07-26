@@ -5,6 +5,9 @@
 pub mod audio;
 pub use audio::{AudioIqSource, TARGET_RATE_HZ};
 
+pub mod kiwi;
+pub use kiwi::KiwiIqSource;
+
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]

@@ -74,6 +74,18 @@ fn unknown_vector_errors() {
 }
 
 #[test]
+fn kiwi_host_without_freq_is_a_clean_error() {
+    let out = skimmer()
+        .args(["listen", "--kiwi-host", "example.com"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure without --kiwi-freq"
+    );
+}
+
+#[test]
 fn json_output_is_valid_and_deterministic_across_three_runs() {
     // SPEC §6 CI rule: same binary + same file, 3 runs -> identical output.
     let dir = tempfile::tempdir().unwrap();

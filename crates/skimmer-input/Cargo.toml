@@ -1,6 +1,6 @@
 [package]
 name = "skimmer-input"
-description = "IQ sources for skimmer (file playback at M0)"
+description = "IQ sources for skimmer (file, live audio, KiwiSDR network, SoapySDR)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ num-complex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 skimmer-dsp = { workspace = true }
+tungstenite = { workspace = true }
+rubato = { workspace = true }
 soapysdr = { workspace = true, optional = true }
 
 [dev-dependencies]
