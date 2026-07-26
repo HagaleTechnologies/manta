@@ -54,19 +54,25 @@ fn listen_decodes_a_clean_real_audio_signal() {
     let stop = Arc::new(AtomicBool::new(false));
     let text = Arc::new(Mutex::new(String::new()));
     let text_clone = text.clone();
-    listen(src, &PipelineConfig::default(), stop, move |ev| {
-        if let skimmer_decode::events::DecoderEvent::CharDecoded { glyph, .. } = ev {
-            if let Some(c) = glyph.text_char() {
-                text_clone.lock().unwrap().push(c);
+    listen(
+        src,
+        &PipelineConfig::default(),
+        stop,
+        move |ev| {
+            if let skimmer_decode::events::DecoderEvent::CharDecoded { glyph, .. } = ev {
+                if let Some(c) = glyph.text_char() {
+                    text_clone.lock().unwrap().push(c);
+                }
             }
-        }
-        if matches!(
-            ev,
-            skimmer_decode::events::DecoderEvent::WordBoundary { .. }
-        ) {
-            text_clone.lock().unwrap().push(' ');
-        }
-    })
+            if matches!(
+                ev,
+                skimmer_decode::events::DecoderEvent::WordBoundary { .. }
+            ) {
+                text_clone.lock().unwrap().push(' ');
+            }
+        },
+        |_spot| {},
+    )
     .unwrap();
 
     let decoded = text.lock().unwrap().trim().to_string();

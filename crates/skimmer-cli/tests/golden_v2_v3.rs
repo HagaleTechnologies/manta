@@ -111,6 +111,11 @@ fn v4_passes_end_to_end_from_wav() {
 /// classical baseline under simulated fading"). Tracked in the M1 pinned-
 /// decisions doc; revisit once skimmer-decode gains real fading resilience
 /// (M4) or a different mitigation is found.
+///
+/// Its "callsign validated within 90 s" check below now uses the real
+/// `skimmer-spot::Validator` (`report["spots"]`, M3 engine-wiring
+/// sub-project) instead of the earlier running-decoded-text substring scan
+/// -- see docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md.
 #[test]
 #[ignore]
 fn v5_passes_end_to_end_from_wav() {
@@ -125,25 +130,16 @@ fn v5_passes_end_to_end_from_wav() {
         decoded
     );
 
-    // Callsign validated within 90 s: find the sample_ts at which "ZL2XYZ"
-    // first appears as a contiguous substring of the running decoded text.
-    // M1 doesn't have skimmer-spot's callsign validation yet, so this
-    // approximates ROADMAP's "callsign validated within 90 s" gate.
-    // sample_ts is in raw input samples at manifest.fs (SPEC §1.1).
-    let events = report["events"].as_array().unwrap();
-    let mut running = String::new();
-    let mut validated_ts: Option<f64> = None;
-    for ev in events {
-        if ev["event"].as_str() == Some("CharDecoded") {
-            if let Some(c) = ev["glyph"]["Char"].as_str() {
-                running.push_str(c);
-            }
-            if validated_ts.is_none() && running.contains("ZL2XYZ") {
-                validated_ts = ev["sample_ts"].as_u64().map(|ts| ts as f64);
-            }
-        }
-    }
-    let validated_ts = validated_ts.expect("ZL2XYZ never appeared in decoded output");
+    // Callsign validated within 90 s: the real Validator's first ZL2XYZ
+    // spot's sample_ts. sample_ts is in raw input samples at manifest.fs
+    // (SPEC §1.1).
+    let validated_ts = report["spots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["callsign"].as_str() == Some("ZL2XYZ"))
+        .map(|s| s["sample_ts"].as_u64().unwrap() as f64)
+        .expect("ZL2XYZ never validated as a spot");
     assert!(
         validated_ts <= 90.0 * manifest.fs,
         "ZL2XYZ validated at {:.1} s, expected <= 90 s",

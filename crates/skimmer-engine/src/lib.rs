@@ -4,6 +4,7 @@
 pub mod listen;
 pub use listen::listen;
 pub mod soak;
+pub use skimmer_spot::{Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 
 mod track;
@@ -37,6 +38,9 @@ pub struct DecodeReport {
     pub text: String,
     /// The full decoder event stream, for JSON output.
     pub events: Vec<DecoderEvent>,
+    /// Validated spots (`skimmer-spot::Validator`, ARCHITECTURE §6), run
+    /// over the full multi-track event stream above.
+    pub spots: Vec<Spot>,
 }
 
 /// M0 pipeline: estimate frequency, extract one channel, decode. SPEC
@@ -129,11 +133,17 @@ pub fn decode_samples(
         _ => None,
     });
     let text = events_to_text(&this_track);
+    let mut validator = skimmer_spot::Validator::bundled(fs);
+    let mut spots = Vec::new();
+    for ev in &events {
+        spots.extend(validator.ingest(ev));
+    }
     Ok(DecodeReport {
         freq_hz,
         wpm,
         text,
         events,
+        spots,
     })
 }
 

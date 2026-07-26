@@ -17,3 +17,6 @@ secrets*
 .DS_Store
 .idea/
 .vscode/
+
+# Local worktree scratch space (superpowers:using-git-worktrees).
+.worktrees/

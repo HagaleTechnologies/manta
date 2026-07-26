@@ -73,6 +73,12 @@ impl Validator {
         }
     }
 
+    /// A production `Validator` backed by this crate's bundled `cty.dat`/
+    /// `MASTER.SCP` snapshot (`crate::CTY_DAT`/`crate::MASTER_SCP`).
+    pub fn bundled(fs: f64) -> Self {
+        Self::new(fs, crate::CTY_DAT, Some(crate::MASTER_SCP))
+    }
+
     /// Feeds one decoder event in. Returns zero or more validated spots
     /// (almost always zero -- a spot only comes out on the event that
     /// completes a passing candidate's word).
@@ -302,5 +308,16 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(track.current.text.is_empty());
         assert_eq!(track.words.len(), 1);
         assert_eq!(track.words[0].text, "DE");
+    }
+
+    #[test]
+    fn bundled_validator_spots_a_real_repeated_callsign() {
+        let mut v = Validator::bundled(FS);
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::De);
     }
 }

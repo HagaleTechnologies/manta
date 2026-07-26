@@ -53,8 +53,10 @@ KiwiSDR input.
   simulated fading"), closing that gap is M4's job, not M2's.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
   of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. Mac leg
-  passes (0.36x realtime, `crates/skimmer-engine/benches/cpu_budget.rs`);
-  **Pi4 leg outstanding** — needs real Raspberry Pi 4 hardware.
+  passes (0.360x realtime, now including `skimmer-spot::Validator` cost
+  per M3's engine-wiring sub-project — see
+  `crates/skimmer-engine/benches/cpu_budget.rs`); **Pi4 leg outstanding** —
+  needs real Raspberry Pi 4 hardware.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics. **Outstanding** — needs a real SDR
   and 24 unattended hours.
@@ -92,11 +94,14 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
 `skimmer-spot` (callsign/CQ-DE validation, cty.dat/SCP cross-check,
 repetition gate, dedupe) is complete as a standalone crate -- see
 `docs/superpowers/specs/2026-07-25-m3-skimmer-spot-design.md` and SPEC
--decode-core.md §7.1 (V11-V15). Remaining M3 sub-projects: wiring
-`skimmer-spot` into `skimmer-engine`'s live pipeline, `skimmer-server`
-(telnet + JSON/WebSocket output, TOML config, metrics), and the RBN parity
-benchmark (needs ≥ 2 h of recorded contest-weekend IQ with RBN reference
-spots -- a data dependency not yet resolved).
+-decode-core.md §7.1 (V11-V15). It is now wired into `skimmer-engine`'s
+batch (`decode_samples`/`decode_wav`) and streaming (`listen`) pipelines,
+both emitting real `Spot`s -- see
+`docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`. Remaining
+M3 sub-projects: `skimmer-server` (telnet + JSON/WebSocket output, TOML
+config, metrics), and the RBN parity benchmark (needs ≥ 2 h of recorded
+contest-weekend IQ with RBN reference spots -- a data dependency not yet
+resolved).
 
 ## M4 — ML decoder stage (research-dependent)
 
