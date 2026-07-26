@@ -4,6 +4,7 @@
 pub mod confidence;
 pub mod context;
 pub mod cty;
+pub mod dedupe;
 pub mod gate;
 pub mod grammar;
 pub mod scp;
