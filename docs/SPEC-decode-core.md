@@ -492,6 +492,21 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 (multi-track engine). The RBN-parity corpus benchmark remains the M3 gate
 (ARCHITECTURE §9) and is not redefined here.
 
+### 7.1 `skimmer-spot` validator vectors (M3 sub-project 1)
+
+Unlike V1–V10 (testkit-synthesized IQ), these operate at the
+`DecoderEvent`-stream level -- hand-built event sequences feeding
+`Validator::ingest` directly, no IQ synthesis involved. Implemented as
+crate-level tests in `crates/skimmer-spot/tests/golden_v11_v15.rs`.
+
+| # | Name | Scenario | Pass criteria |
+|---|---|---|---|
+| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>` | Correct `SpotType` assigned per pattern family |
+| V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
+| V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
+| V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s | 1 rep never spots; 2 reps does |
+| V15 | dedupe | Repeat spot inside the 10 min window, then an SNR jump >= 6 dB | Suppressed inside the window; allowed after the SNR jump |
+
 ---
 
 ## 8. Module map (where each section lands)

@@ -89,6 +89,15 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
 - cqdx ingests the JSON stream in a dev environment.
 - 7-day unattended soak feeding spots continuously.
 
+`skimmer-spot` (callsign/CQ-DE validation, cty.dat/SCP cross-check,
+repetition gate, dedupe) is complete as a standalone crate -- see
+`docs/superpowers/specs/2026-07-25-m3-skimmer-spot-design.md` and SPEC
+-decode-core.md §7.1 (V11-V15). Remaining M3 sub-projects: wiring
+`skimmer-spot` into `skimmer-engine`'s live pipeline, `skimmer-server`
+(telnet + JSON/WebSocket output, TOML config, metrics), and the RBN parity
+benchmark (needs ≥ 2 h of recorded contest-weekend IQ with RBN reference
+spots -- a data dependency not yet resolved).
+
 ## M4 — ML decoder stage (research-dependent)
 
 CTC model on channel envelopes, trained on testkit synthesis + on-air recordings
