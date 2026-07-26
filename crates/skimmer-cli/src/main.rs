@@ -304,10 +304,7 @@ fn main() -> Result<()> {
                 // sub-project) defines the real spot wire format.
                 |spot| {
                     if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "spot": spot }).to_string()
-                        );
+                        println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
                     eprintln!(
