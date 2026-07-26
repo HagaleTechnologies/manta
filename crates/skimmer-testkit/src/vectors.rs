@@ -7,6 +7,8 @@ use crate::wav::write_fixture;
 use anyhow::Result;
 use coppa_channel::watterson::WattersonPreset;
 use num_complex::Complex32;
+use rand_chacha::ChaCha8Rng;
+use rand_core::SeedableRng;
 use std::path::Path;
 
 /// A golden test vector's generation parameters. SPEC §7.
@@ -277,6 +279,69 @@ pub fn v10() -> VectorSpec {
     }
 }
 
+/// Shared SPEC §7 V8/V8w scene: 50 signals, WPM 10..35, SNR (2500 Hz)
+/// -2..25 dB, offsets uniform over +/-45 kHz with reject-redraw separation
+/// (clear of the 1-channel/93.75 Hz merge threshold), 8% jitter. `v8w`
+/// passes `Some(WattersonPreset::Poor)` to add CCIR-poor fading to every
+/// signal on top of the identical AWGN-only scene `v8` uses -- same base
+/// seed, so offsets/WPM/SNR/jitter are bit-identical between the two.
+fn pileup_scene(name: &'static str, watterson: Option<WattersonPreset>) -> VectorSpec {
+    const BASE_SEED: u64 = 0x534B_494D_5638; // "SKIMV8" -- shared by v8/v8w
+    const MIN_SEPARATION_HZ: f64 = 300.0;
+    let calls = crate::callsigns::pileup_calls();
+    let mut rng = ChaCha8Rng::seed_from_u64(BASE_SEED);
+
+    let mut offsets: Vec<f64> = Vec::with_capacity(50);
+    'draw: while offsets.len() < 50 {
+        let candidate = -45_000.0 + crate::u01(&mut rng) * 90_000.0;
+        for &existing in &offsets {
+            if (candidate - existing).abs() < MIN_SEPARATION_HZ {
+                continue 'draw;
+            }
+        }
+        offsets.push(candidate);
+    }
+
+    let signals = (0..50)
+        .map(|i| SignalSpec {
+            text: format!("CQ CQ DE {0} {0} K", calls[i]),
+            loop_text: true,
+            wpm: 10.0 + crate::u01(&mut rng) as f32 * 25.0,
+            offset_hz: offsets[i],
+            snr_2500_db: -2.0 + crate::u01(&mut rng) as f32 * 27.0,
+            jitter: Some(Jitter {
+                sigma: 0.08,
+                seed: BASE_SEED ^ (i as u64 + 1),
+            }),
+            qsb: None,
+            watterson: watterson.map(|preset| WattersonFade {
+                preset,
+                seed: BASE_SEED ^ 0xA5A5_0000 ^ (i as u64 + 1),
+            }),
+            char_wpm: None,
+        })
+        .collect();
+
+    VectorSpec {
+        name,
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: BASE_SEED,
+        signals,
+    }
+}
+
+/// SPEC §7 V8 "pileup-50": 50 signals, AWGN, jitter 8%.
+pub fn v8() -> VectorSpec {
+    pileup_scene("v8", None)
+}
+
+/// SPEC §7 V8w "pileup-50-fading": same scene as V8, Watterson CCIR-poor.
+pub fn v8w() -> VectorSpec {
+    pileup_scene("v8w", Some(WattersonPreset::Poor))
+}
+
 /// A rendered vector: samples, ground-truth keyed text per signal, expected
 /// spot frequency. SPEC §7.
 pub struct RenderedVector {
@@ -503,6 +568,45 @@ mod tests {
         assert_eq!(s.wpm, 22.0);
         assert_eq!(s.snr_2500_db, 3.0);
         assert!(s.watterson.is_some());
+    }
+
+    #[test]
+    fn v8_spec_matches_spec_table() {
+        let spec = v8();
+        assert_eq!(spec.fs, 96_000.0);
+        assert_eq!(spec.duration_s, 120.0);
+        assert_eq!(spec.signals.len(), 50);
+        for s in &spec.signals {
+            assert!((10.0..=35.0).contains(&s.wpm), "wpm {} out of range", s.wpm);
+            assert!(
+                (-2.0..=25.0).contains(&s.snr_2500_db),
+                "snr {} out of range",
+                s.snr_2500_db
+            );
+            assert!(
+                (-45_000.0..=45_000.0).contains(&s.offset_hz),
+                "offset {} out of range",
+                s.offset_hz
+            );
+            assert!(s.jitter.is_some(), "V8 must have 8% jitter");
+            assert!(s.watterson.is_none(), "V8 is AWGN-only, no fading");
+        }
+        let unique_offsets: std::collections::BTreeSet<i64> =
+            spec.signals.iter().map(|s| s.offset_hz as i64).collect();
+        assert_eq!(unique_offsets.len(), 50, "all 50 offsets must be distinct");
+    }
+
+    #[test]
+    fn v8w_spec_matches_v8_scene_plus_fading() {
+        let v8 = v8();
+        let v8w = v8w();
+        assert_eq!(v8w.signals.len(), 50);
+        for (a, b) in v8.signals.iter().zip(v8w.signals.iter()) {
+            assert_eq!(a.offset_hz, b.offset_hz, "V8w must reuse V8's offsets");
+            assert_eq!(a.wpm, b.wpm, "V8w must reuse V8's WPM");
+            assert_eq!(a.snr_2500_db, b.snr_2500_db, "V8w must reuse V8's SNR");
+            assert!(b.watterson.is_some(), "V8w must add Watterson fading");
+        }
     }
 
     #[test]

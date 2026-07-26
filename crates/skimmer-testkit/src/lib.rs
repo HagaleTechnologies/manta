@@ -4,6 +4,7 @@
 //! via `next_u64()` with hand-rolled conversions (pinned decision 2), so
 //! fixtures are bit-stable across dependency upgrades and platforms.
 
+mod callsigns;
 pub mod cer;
 pub mod keyer;
 pub mod noise;

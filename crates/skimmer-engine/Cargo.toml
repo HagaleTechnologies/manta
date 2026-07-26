@@ -19,5 +19,10 @@ skimmer-input = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }
+criterion = { workspace = true }
 proptest = { workspace = true }
 skimmer-testkit = { workspace = true }
+
+[[bench]]
+name = "cpu_budget"
+harness = false

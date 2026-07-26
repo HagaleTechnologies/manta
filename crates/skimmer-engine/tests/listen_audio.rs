@@ -47,8 +47,9 @@ fn listen_decodes_a_clean_real_audio_signal() {
         phi += dphi;
     }
 
-    let src =
-        AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap();
+    let src: Box<dyn skimmer_input::IqSource> = Box::new(
+        AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap(),
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let text = Arc::new(Mutex::new(String::new()));

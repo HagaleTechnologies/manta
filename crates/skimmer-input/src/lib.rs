@@ -5,6 +5,14 @@
 pub mod audio;
 pub use audio::{AudioIqSource, TARGET_RATE_HZ};
 
+pub mod kiwi;
+pub use kiwi::KiwiIqSource;
+
+#[cfg(feature = "soapy")]
+pub mod soapy;
+#[cfg(feature = "soapy")]
+pub use soapy::SoapySdrIqSource;
+
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use std::path::Path;

@@ -74,6 +74,18 @@ fn unknown_vector_errors() {
 }
 
 #[test]
+fn kiwi_host_without_freq_is_a_clean_error() {
+    let out = skimmer()
+        .args(["listen", "--kiwi-host", "example.com"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure without --kiwi-freq"
+    );
+}
+
+#[test]
 fn json_output_is_valid_and_deterministic_across_three_runs() {
     // SPEC §6 CI rule: same binary + same file, 3 runs -> identical output.
     let dir = tempfile::tempdir().unwrap();
@@ -96,4 +108,24 @@ fn json_output_is_valid_and_deterministic_across_three_runs() {
     assert!(v["text"].is_string());
     assert!(v["freq_hz"].is_f64());
     assert!(v["events"].is_array());
+}
+
+#[test]
+#[cfg(feature = "soapy")]
+fn soapy_driver_without_freq_and_rate_is_a_clean_error() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skimmer"))
+        .args(["listen", "--soapy-driver", "driver=rtlsdr"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure without --soapy-freq/--soapy-rate"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("soapy-freq")
+            || stderr.contains("soapy-rate")
+            || stderr.contains("required"),
+        "expected an explanatory error, got: {stderr}"
+    );
 }

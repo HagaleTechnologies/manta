@@ -11,6 +11,9 @@ repository.workspace = true
 name = "skimmer"
 path = "src/main.rs"
 
+[features]
+soapy = ["skimmer-input/soapy"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
