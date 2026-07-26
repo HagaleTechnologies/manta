@@ -94,3 +94,32 @@ decided; SPEC and docs/ still win on anything not listed here.
    is untouched — no native SoapySDR dependency, no `soapy` feature flag,
    verified via `cargo build`/`cargo clippy` with no feature flag showing no
    reference to the `soapysdr` crate at all.
+
+7. **`test-soapy (ubuntu-latest)` crashed with `Hash collision!!! Fatal
+   error!!`, root-caused from the live CI log (no local repro needed).**
+   Two compounding causes, both fixed:
+   - `apt-get install libsoapysdr-dev` without `--no-install-recommends`
+     transitively installs `soapysdr0.8-module-all` — every SoapySDR
+     hardware/network module (audio/RtAudio, remote/avahi, uhd, bladerf,
+     hackrf, lms7, mirisdr, osmosdr, redpitaya, rfspace, airspy), not just
+     the `rtlsdr` module this crate needs. Confirmed directly in the apt
+     log's package list.
+   - SoapySDR lazily initializes its plugin registry (loading and running
+     every installed module's registration code) on the *first*
+     `Device::new()` call in a process. `cargo test`'s default thread-per-
+     test concurrency (no `--test-threads=1` set anywhere in this repo)
+     lets `skimmer-input::soapy::tests`' three tests race each other into
+     that one-time init from separate threads; the fatal message is the
+     signature of a hash table corrupted by concurrent unsynchronized
+     writes, not a real collision, and not skimmer's own code. It fired
+     specifically on the third `Device::new()` call in the log, consistent
+     with a race needing enough concurrent traffic to trip.
+   - Fix: `.github/workflows/ci.yml`'s `test-soapy` Linux step now installs
+     `--no-install-recommends libasound2-dev libsoapysdr-dev
+     soapysdr0.8-module-rtlsdr` (removes the unneeded/racy modules
+     entirely). Independently, `crates/skimmer-input/src/soapy.rs`'s three
+     `Device::new()`-calling tests now serialize through a
+     `static SOAPY_TEST_LOCK: Mutex<()>` — cheap insurance against the same
+     class of bug if module packaging changes again, since nothing
+     guarantees SoapySDR's registry init is thread-safe even for modules we
+     do want.

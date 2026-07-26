@@ -105,9 +105,26 @@ impl IqSource for SoapySdrIqSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// SoapySDR lazily loads and initializes every installed plugin module
+    /// on the *first* `Device::new()` call in the process. That one-time
+    /// init isn't verified thread-safe, and `cargo test`'s default
+    /// thread-per-test concurrency lets these tests race each other into
+    /// it -- observed live in CI as a `Hash collision!!! Fatal error!!`
+    /// abort (a corrupted-registry symptom, not skimmer's own code), see
+    /// docs/DECISIONS/2026-07-25-m2-soapysdr-input-pins.md. Serializing the
+    /// tests that call `Device::new()` sidesteps the race regardless of
+    /// which modules happen to be installed.
+    static SOAPY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_soapy() -> std::sync::MutexGuard<'static, ()> {
+        SOAPY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn open_surfaces_device_not_found_as_a_clean_error() {
+        let _guard = lock_soapy();
         // No RTL-SDR hardware is attached in CI or this dev environment --
         // Device::new() itself must fail, not panic.
         let result = SoapySdrIqSource::open("driver=rtlsdr", 96_000.0, 14_025_000.0, None);
@@ -119,6 +136,7 @@ mod tests {
 
     #[test]
     fn open_succeeds_against_the_null_device() {
+        let _guard = lock_soapy();
         // SoapySDR's built-in `type=null` device opens with no hardware and
         // no extra module install -- and, when driven through open()'s full
         // sequence (gain-mode check + query-back reads before rx_stream()),
@@ -134,6 +152,7 @@ mod tests {
 
     #[test]
     fn read_surfaces_not_supported_as_a_clean_error_on_the_null_device() {
+        let _guard = lock_soapy();
         // type=null's stream opens/activates but does not actually support
         // reading samples -- read() fails with a real NotSupported error.
         // This is real, hardware-free coverage of IqSource::read()'s error
