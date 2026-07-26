@@ -73,7 +73,7 @@ pub fn soak(
                 let rss = peak_rss_bytes();
                 worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
             }
-        })
+        }, |_spot| {})
     }));
     let _ = watchdog.join();
 

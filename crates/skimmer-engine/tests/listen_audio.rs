@@ -66,7 +66,7 @@ fn listen_decodes_a_clean_real_audio_signal() {
         ) {
             text_clone.lock().unwrap().push(' ');
         }
-    })
+    }, |_spot| {})
     .unwrap();
 
     let decoded = text.lock().unwrap().trim().to_string();
