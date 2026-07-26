@@ -8,8 +8,8 @@ sources:
   - docs/SPEC-decode-core.md#2-noise-floor-signal-presence-detection
   - ARCHITECTURE.md
 verified:
-  commit: 73f7d23
-  date: 2026-07-21
+  commit: 9802ca5
+  date: 2026-07-24
 links:
   - pfb-channelizer
   - decode-chain
@@ -21,7 +21,7 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 - Floor estimator + neighborhood/effective floor + gate: SPEC §2.1–2.3 (`skimmer-dsp::floor`).
 - Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`skimmer-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`).
 - Adjacent-channel ownership so one signal yields exactly one track (no cross-channel ghost decodes): SPEC §2.5. This invariant is a V7/V8w pass criterion — see [[golden-vector-freeze]].
-- Track cap with lowest-SNR eviction; evictions are counted and surfaced as metrics — **no silent coverage loss** (ARCHITECTURE §4, §8).
+- Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though external exposition as Prometheus metrics is explicit M3 scope (ARCHITECTURE §8), not yet wired.
 
 ## Why it is shaped this way
 

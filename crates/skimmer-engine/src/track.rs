@@ -77,7 +77,7 @@ pub(crate) enum LifecycleState {
     Hang,
 }
 
-/// SPEC §2.4: reason for track closure.
+/// SPEC §2.4/§2.5: reason for track closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReason {
     /// Rise never confirmed within `confirm_hops` (SPEC §2.4: CANDIDATE -> IDLE).
@@ -86,6 +86,38 @@ pub(crate) enum CloseReason {
     HangExpired,
     /// No character emitted for `gc_hops` (SPEC §2.4: garbage collect).
     Silent,
+    /// Converged with another track within 1.0 channel; this was the
+    /// lower-SNR one (SPEC §2.5).
+    Merged,
+    /// Track cap exceeded; this was the lowest-current-SNR track
+    /// (ARCHITECTURE §4).
+    Evicted,
+}
+
+/// Per-`CloseReason` close counters (issue #26: SPEC §2.5 / ARCHITECTURE §4,
+/// §8 both describe merges and evictions as "counted" -- this is that count.
+/// Exposed via `TrackManager::close_counts` for the future M3 metrics
+/// endpoint to read; nothing wires it externally yet, since the Prometheus
+/// text endpoint itself is explicit M3 scope (ROADMAP.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CloseCounts {
+    pub unconfirmed: u64,
+    pub hang_expired: u64,
+    pub silent: u64,
+    pub merged: u64,
+    pub evicted: u64,
+}
+
+impl CloseCounts {
+    fn record(&mut self, reason: CloseReason) {
+        match reason {
+            CloseReason::Unconfirmed => self.unconfirmed += 1,
+            CloseReason::HangExpired => self.hang_expired += 1,
+            CloseReason::Silent => self.silent += 1,
+            CloseReason::Merged => self.merged += 1,
+            CloseReason::Evicted => self.evicted += 1,
+        }
+    }
 }
 
 /// SPEC §2.4: event produced by a single-hop state transition.
@@ -369,6 +401,8 @@ pub struct TrackManager {
     /// Hz per channel (`fs / n_channels`), the unit `Track::freq_hz` (SPEC
     /// §1.1/§1.4) converts its channel-index centroid into absolute Hz.
     channel_spacing_hz: f64,
+    /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
+    close_counts: CloseCounts,
 }
 
 impl TrackManager {
@@ -393,11 +427,25 @@ impl TrackManager {
             hop_counter: 0,
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
+            close_counts: CloseCounts::default(),
         }
     }
 
     fn n_channels(&self) -> usize {
         self.owner_of.len()
+    }
+
+    /// Issue #26: per-`CloseReason` counts of every track closed so far
+    /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
+    /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
+    /// SPEC §2.5 and ARCHITECTURE §4/§8 both describe these closes as
+    /// "counted" -- this is the count. Not yet wired to an external
+    /// exposition (the Prometheus text endpoint is explicit M3 scope).
+    // Temporary: no non-test caller yet -- M3's metrics endpoint is this
+    // count's first real consumer.
+    #[allow(dead_code)]
+    pub fn close_counts(&self) -> CloseCounts {
+        self.close_counts
     }
 
     /// Rebuild `owner_of` from scratch against the current `tracks` map.
@@ -449,7 +497,10 @@ impl TrackManager {
             let char_emitted = false; // GC timer input; refined below once a decoder exists.
             let event = track.lifecycle.on_hop(rise[k], drop[k], char_emitted);
             match event {
-                LifecycleEvent::Closed(_) => closed.push(id),
+                LifecycleEvent::Closed(reason) => {
+                    self.close_counts.record(reason);
+                    closed.push(id);
+                }
                 LifecycleEvent::Promoted => {
                     // SPEC §1.1/§5 (freq_hz's doc comment covers the §1.4
                     // deviation): seed TrackMeta.freq_hz from this track's
@@ -575,6 +626,7 @@ impl TrackManager {
         }
         for id in to_close {
             self.tracks.remove(&id);
+            self.close_counts.record(CloseReason::Merged);
         }
         if !ids.is_empty() {
             self.recompute_ownership();
@@ -592,6 +644,7 @@ impl TrackManager {
                 .map(|(id, _)| id)
                 .unwrap();
             self.tracks.remove(&loser);
+            self.close_counts.record(CloseReason::Evicted);
         }
         self.recompute_ownership();
     }
@@ -924,6 +977,11 @@ mod tests {
             tm.tracks.values().next().unwrap().birth_channel == 40,
             "the lower-SNR (weaker) track must be the one evicted"
         );
+        assert!(
+            tm.close_counts().evicted >= 1,
+            "issue #26: eviction must be counted, got {:?}",
+            tm.close_counts()
+        );
     }
 
     #[test]
@@ -1002,6 +1060,11 @@ mod tests {
             "the higher-SNR track must survive; the lower-SNR one must be closed"
         );
         assert_eq!(survivor.center, 21.1);
+        assert_eq!(
+            tm.close_counts().merged,
+            1,
+            "issue #26: merge must be counted"
+        );
     }
 
     /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render
