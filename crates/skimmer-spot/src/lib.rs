@@ -4,5 +4,6 @@
 pub mod context;
 pub mod cty;
 pub mod grammar;
+pub mod scp;
 
 pub use context::SpotType;
