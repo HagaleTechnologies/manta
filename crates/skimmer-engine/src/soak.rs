@@ -67,13 +67,19 @@ pub fn soak(
     });
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        listen(src, cfg, stop.clone(), |_ev| {
-            event_count += 1;
-            if start.elapsed() >= WARMUP {
-                let rss = peak_rss_bytes();
-                worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
-            }
-        }, |_spot| {})
+        listen(
+            src,
+            cfg,
+            stop.clone(),
+            |_ev| {
+                event_count += 1;
+                if start.elapsed() >= WARMUP {
+                    let rss = peak_rss_bytes();
+                    worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
+                }
+            },
+            |_spot| {},
+        )
     }));
     let _ = watchdog.join();
 

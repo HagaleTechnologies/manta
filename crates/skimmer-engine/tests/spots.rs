@@ -2,8 +2,8 @@
 //! run over the full multi-track event stream. M3 engine-wiring sub-
 //! project, docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md.
 
-use skimmer_engine::{decode_samples, PipelineConfig};
 use skimmer_engine::SpotType;
+use skimmer_engine::{decode_samples, PipelineConfig};
 use skimmer_testkit::scene::{render_scene, SignalSpec};
 
 #[test]
@@ -19,10 +19,8 @@ fn decode_samples_spots_a_repeated_valid_callsign() {
         watterson: None,
         char_wpm: None,
     };
-    let (iq, _texts) =
-        render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
-    let report =
-        decode_samples(&iq, 96_000.0, 14_000_000.0, &PipelineConfig::default()).unwrap();
+    let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
+    let report = decode_samples(&iq, 96_000.0, 14_000_000.0, &PipelineConfig::default()).unwrap();
 
     assert!(
         report.spots.iter().any(|s| s.callsign == "K5ARH"),

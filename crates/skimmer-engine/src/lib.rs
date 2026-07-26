@@ -4,8 +4,8 @@
 pub mod listen;
 pub use listen::listen;
 pub mod soak;
-pub use soak::{soak, soak_passed, SoakReport};
 pub use skimmer_spot::{Spot, SpotType};
+pub use soak::{soak, soak_passed, SoakReport};
 
 mod track;
 pub use track::DetectorConfig;

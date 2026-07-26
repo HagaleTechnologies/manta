@@ -120,7 +120,11 @@ fn decode_json_includes_spots_field() {
         .arg(dir.path().join(format!("{}.wav", spec.name)))
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(
         report.get("spots").is_some_and(|s| s.is_array()),

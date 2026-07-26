@@ -146,11 +146,17 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut last_freq_hz = None;
-        listen(src, &PipelineConfig::default(), stop, |ev| {
-            if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
-                last_freq_hz = Some(*freq_hz);
-            }
-        }, |_spot| {})
+        listen(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            |ev| {
+                if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
+                    last_freq_hz = Some(*freq_hz);
+                }
+            },
+            |_spot| {},
+        )
         .unwrap();
 
         let freq_hz = last_freq_hz.expect("expected at least one TrackMeta event");
