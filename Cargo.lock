@@ -1532,6 +1532,7 @@ dependencies = [
  "skimmer-decode",
  "skimmer-dsp",
  "skimmer-input",
+ "skimmer-spot",
  "skimmer-testkit",
 ]
 

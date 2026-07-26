@@ -16,6 +16,7 @@ serde = { workspace = true }
 skimmer-decode = { workspace = true }
 skimmer-dsp = { workspace = true }
 skimmer-input = { workspace = true }
+skimmer-spot = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }
