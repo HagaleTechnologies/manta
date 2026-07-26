@@ -2,6 +2,7 @@
 //! dedupe. ARCHITECTURE §6.
 
 pub mod context;
+pub mod cty;
 pub mod grammar;
 
 pub use context::SpotType;
