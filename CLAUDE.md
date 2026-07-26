@@ -97,3 +97,8 @@ in other clones, branches, or worktrees.
 - **Flush at the end:** push (`--force-with-lease` only) and open/update your
   PR before finishing. Unpushed work is invisible work.
 - **Main moves only by PR merge.**
+- **Auto-merge is on, repo-wide** (overrides the global "Tony merges"
+  default for this repo specifically): every PR gets `gh pr merge --auto
+  --squash` right after opening; GitHub merges it unattended once required
+  CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green. See
+  docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md.
