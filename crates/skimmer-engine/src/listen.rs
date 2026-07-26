@@ -88,6 +88,10 @@ pub fn listen(
 mod tests {
     use super::*;
 
+    /// A minimal in-memory IqSource for testing, reporting a fixed,
+    /// caller-chosen `center_freq_hz` (unlike `AudioIqSource`, which always
+    /// reports 0.0) -- this is what proves `listen()` actually reads
+    /// `src.center_freq_hz()` instead of hardcoding 0.0.
     struct FixedFreqSource {
         samples: Vec<Complex32>,
         cursor: usize,
@@ -112,6 +116,10 @@ mod tests {
 
     #[test]
     fn listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero() {
+        // A real V1-style golden signal (clean +20 dB tone), but fed through
+        // a source that reports a nonzero center_freq_hz -- if listen() were
+        // still hardcoding 0.0, every TrackMeta.freq_hz would come back as
+        // just the +12.34 kHz baseband offset, not centered on 14 MHz.
         let spec = skimmer_testkit::vectors::v1();
         let rendered = skimmer_testkit::vectors::render(&spec).unwrap();
         let src: Box<dyn skimmer_input::IqSource> = Box::new(FixedFreqSource {
@@ -133,7 +141,8 @@ mod tests {
         let freq_hz = last_freq_hz.expect("expected at least one TrackMeta event");
         assert!(
             (freq_hz - (spec.center_freq_hz + 12_340.0)).abs() < 100.0,
-            "freq_hz {freq_hz} should be near {} (center_freq_hz + V1's known offset), not near 12340",
+            "freq_hz {freq_hz} should be near {} (center_freq_hz + V1's known offset), not near 12340 \
+             (which is what a hardcoded center_freq_hz=0.0 would produce)",
             spec.center_freq_hz + 12_340.0
         );
     }

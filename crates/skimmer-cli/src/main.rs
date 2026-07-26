@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use skimmer_engine::{decode_wav, PipelineConfig};
+use skimmer_input::IqSource;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -55,6 +56,23 @@ enum Command {
         /// Emit DecoderEvents as JSON Lines instead of plain text.
         #[arg(long)]
         json: bool,
+        /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
+        /// Requires --soapy-freq and --soapy-rate.
+        #[cfg(feature = "soapy")]
+        #[arg(long, conflicts_with_all = ["device", "source"])]
+        soapy_driver: Option<String>,
+        /// RF center frequency in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_rate: Option<f64>,
+        /// Gain in dB (omit for AGC, if the device supports it).
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_gain: Option<f64>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -78,30 +96,101 @@ enum Command {
         /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
         #[arg(long, requires = "kiwi_host", default_value = "")]
         kiwi_password: String,
+        /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
+        /// Requires --soapy-freq and --soapy-rate.
+        #[cfg(feature = "soapy")]
+        #[arg(long, conflicts_with_all = ["device", "source"])]
+        soapy_driver: Option<String>,
+        /// RF center frequency in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_rate: Option<f64>,
+        /// Gain in dB (omit for AGC, if the device supports it).
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_gain: Option<f64>,
     },
 }
 
-/// Open a live audio device, WAV replay, or KiwiSDR network source based on
-/// which CLI flags were set. `kiwi_host` takes priority (clap's
-/// `conflicts_with_all` on the flag already rules out `device`/`source`
-/// being set alongside it).
+/// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
+struct KiwiOpts {
+    host: Option<String>,
+    port: u16,
+    freq: Option<f64>,
+    password: String,
+}
+
+/// SoapySDR connection flags (feature `soapy`), grouped for the same reason.
+#[cfg(feature = "soapy")]
+struct SoapyOpts {
+    driver: Option<String>,
+    freq: Option<f64>,
+    rate: Option<f64>,
+    gain: Option<f64>,
+}
+
+/// Open a live audio device, WAV replay, KiwiSDR network source, or
+/// SoapySDR device (feature `soapy`) based on which CLI flags were set.
+/// `kiwi.host` takes priority over `soapy.driver` (clap's
+/// `conflicts_with_all` on each already rules out `device`/`source` being
+/// set alongside either).
+#[cfg(feature = "soapy")]
 fn open_source(
     device: Option<String>,
     source: Option<PathBuf>,
-    kiwi_host: Option<String>,
-    kiwi_port: u16,
-    kiwi_freq: Option<f64>,
-    kiwi_password: String,
-) -> Result<Box<dyn skimmer_input::IqSource>> {
-    if let Some(host) = kiwi_host {
-        let freq = kiwi_freq.ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
+    kiwi: KiwiOpts,
+    soapy: SoapyOpts,
+) -> Result<Box<dyn IqSource>> {
+    if let Some(host) = kiwi.host {
+        let freq = kiwi
+            .freq
+            .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
         return Ok(Box::new(skimmer_input::kiwi::KiwiIqSource::connect(
             &host,
-            kiwi_port,
+            kiwi.port,
             freq,
-            &kiwi_password,
+            &kiwi.password,
         )?));
     }
+    if let Some(driver) = soapy.driver {
+        let freq = soapy
+            .freq
+            .ok_or_else(|| anyhow!("--soapy-freq is required with --soapy-driver"))?;
+        let rate = soapy
+            .rate
+            .ok_or_else(|| anyhow!("--soapy-rate is required with --soapy-driver"))?;
+        return Ok(Box::new(skimmer_input::soapy::SoapySdrIqSource::open(
+            &driver, rate, freq, soapy.gain,
+        )?));
+    }
+    open_audio_source(device, source)
+}
+
+#[cfg(not(feature = "soapy"))]
+fn open_source(
+    device: Option<String>,
+    source: Option<PathBuf>,
+    kiwi: KiwiOpts,
+) -> Result<Box<dyn IqSource>> {
+    if let Some(host) = kiwi.host {
+        let freq = kiwi
+            .freq
+            .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
+        return Ok(Box::new(skimmer_input::kiwi::KiwiIqSource::connect(
+            &host,
+            kiwi.port,
+            freq,
+            &kiwi.password,
+        )?));
+    }
+    open_audio_source(device, source)
+}
+
+fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
         Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
         None => Box::new(skimmer_input::AudioIqSource::from_device(
@@ -150,15 +239,35 @@ fn main() -> Result<()> {
             kiwi_freq,
             kiwi_password,
             json,
+            #[cfg(feature = "soapy")]
+            soapy_driver,
+            #[cfg(feature = "soapy")]
+            soapy_freq,
+            #[cfg(feature = "soapy")]
+            soapy_rate,
+            #[cfg(feature = "soapy")]
+            soapy_gain,
         } => {
+            let kiwi = KiwiOpts {
+                host: kiwi_host,
+                port: kiwi_port,
+                freq: kiwi_freq,
+                password: kiwi_password,
+            };
+            #[cfg(feature = "soapy")]
             let src = open_source(
                 device,
                 source,
-                kiwi_host,
-                kiwi_port,
-                kiwi_freq,
-                kiwi_password,
+                kiwi,
+                SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq,
+                    rate: soapy_rate,
+                    gain: soapy_gain,
+                },
             )?;
+            #[cfg(not(feature = "soapy"))]
+            let src = open_source(device, source, kiwi)?;
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
@@ -194,15 +303,35 @@ fn main() -> Result<()> {
             kiwi_port,
             kiwi_freq,
             kiwi_password,
+            #[cfg(feature = "soapy")]
+            soapy_driver,
+            #[cfg(feature = "soapy")]
+            soapy_freq,
+            #[cfg(feature = "soapy")]
+            soapy_rate,
+            #[cfg(feature = "soapy")]
+            soapy_gain,
         } => {
+            let kiwi = KiwiOpts {
+                host: kiwi_host,
+                port: kiwi_port,
+                freq: kiwi_freq,
+                password: kiwi_password,
+            };
+            #[cfg(feature = "soapy")]
             let src = open_source(
                 device,
                 source,
-                kiwi_host,
-                kiwi_port,
-                kiwi_freq,
-                kiwi_password,
+                kiwi,
+                SoapyOpts {
+                    driver: soapy_driver,
+                    freq: soapy_freq,
+                    rate: soapy_rate,
+                    gain: soapy_gain,
+                },
             )?;
+            #[cfg(not(feature = "soapy"))]
+            let src = open_source(device, source, kiwi)?;
             let report = skimmer_engine::soak(
                 src,
                 &PipelineConfig::default(),
