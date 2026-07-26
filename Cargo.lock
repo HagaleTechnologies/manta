@@ -1554,6 +1554,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "skimmer-spot"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "regex",
+ "serde",
+ "skimmer-decode",
+]
+
+[[package]]
 name = "skimmer-testkit"
 version = "0.1.0"
 dependencies = [
