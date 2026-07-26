@@ -26,7 +26,9 @@ fn soak_survives_a_sustained_run_without_panic_or_unbounded_memory() {
         *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
         phi += dphi;
     }
-    let src = AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap();
+    let src: Box<dyn skimmer_input::IqSource> = Box::new(
+        AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap(),
+    );
     let report = soak(src, &PipelineConfig::default(), Duration::from_secs(120)).unwrap();
     assert!(!report.panicked, "soak panicked: {report:?}");
     assert!(soak_passed(&report), "soak failed: {report:?}");

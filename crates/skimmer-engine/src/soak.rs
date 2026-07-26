@@ -11,7 +11,7 @@
 
 use crate::{listen, PipelineConfig};
 use anyhow::Result;
-use skimmer_input::AudioIqSource;
+use skimmer_input::IqSource;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,7 +46,11 @@ fn peak_rss_bytes() -> u64 {
 /// growth. See module doc for the overrun-tracking deviation. Returns an
 /// error (not a panic report) if `listen()` itself returns `Err` -- e.g. no
 /// signal found during startup calibration.
-pub fn soak(src: AudioIqSource, cfg: &PipelineConfig, duration: Duration) -> Result<SoakReport> {
+pub fn soak(
+    src: Box<dyn IqSource>,
+    cfg: &PipelineConfig,
+    duration: Duration,
+) -> Result<SoakReport> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
     let start = Instant::now();
@@ -94,6 +98,7 @@ pub fn soak_passed(report: &SoakReport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skimmer_input::AudioIqSource;
 
     #[test]
     fn soak_reports_no_panic_on_a_clean_short_signal() {
@@ -109,8 +114,9 @@ mod tests {
             *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
             phi += dphi;
         }
-        let src =
-            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap();
+        let src: Box<dyn skimmer_input::IqSource> = Box::new(
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap(),
+        );
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
         assert!(!report.panicked);
         assert!(soak_passed(&report));

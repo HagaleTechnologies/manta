@@ -43,6 +43,9 @@ proptest = "1.5"
 approx = "0.5"
 tempfile = "3"
 rayon = "1"
+tungstenite = "0.24"
+rubato = "4.0"
+soapysdr = "0.5"
 
 # DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
 [profile.dev]
