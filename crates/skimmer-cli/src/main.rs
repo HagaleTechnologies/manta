@@ -208,6 +208,7 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", report.text);
                 eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
+                eprintln!("spots: {}", report.spots.len());
             }
         }
         Command::Gen { vector, out } => {
@@ -273,27 +274,53 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            skimmer_engine::listen(src, &PipelineConfig::default(), stop, |ev| {
-                if json {
-                    println!("{}", serde_json::to_string(ev).unwrap());
-                    return;
-                }
-                use skimmer_decode::events::DecoderEvent;
-                use std::io::Write as _;
-                match ev {
-                    DecoderEvent::CharDecoded { glyph, .. } => {
-                        if let Some(c) = glyph.text_char() {
-                            print!("{c}");
+            skimmer_engine::listen(
+                src,
+                &PipelineConfig::default(),
+                stop,
+                |ev| {
+                    if json {
+                        println!("{}", serde_json::to_string(ev).unwrap());
+                        return;
+                    }
+                    use skimmer_decode::events::DecoderEvent;
+                    use std::io::Write as _;
+                    match ev {
+                        DecoderEvent::CharDecoded { glyph, .. } => {
+                            if let Some(c) = glyph.text_char() {
+                                print!("{c}");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
+                        DecoderEvent::WordBoundary { .. } => {
+                            print!(" ");
                             let _ = std::io::stdout().flush();
                         }
+                        _ => {}
                     }
-                    DecoderEvent::WordBoundary { .. } => {
-                        print!(" ");
-                        let _ = std::io::stdout().flush();
+                },
+                // Provisional CLI-debugging spot output only -- NOT the
+                // ecosystem JSON contract. skimmer-server (a later M3
+                // sub-project) defines the real spot wire format.
+                |spot| {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "spot": spot }).to_string()
+                        );
+                        return;
                     }
-                    _ => {}
-                }
-            })?;
+                    eprintln!(
+                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
+                        spot.callsign,
+                        spot.spot_type,
+                        spot.freq_hz,
+                        spot.snr_db,
+                        spot.wpm,
+                        spot.confidence
+                    );
+                },
+            )?;
         }
         Command::Soak {
             duration,
