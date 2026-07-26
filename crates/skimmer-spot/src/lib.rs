@@ -8,5 +8,7 @@ pub mod dedupe;
 pub mod gate;
 pub mod grammar;
 pub mod scp;
+pub mod validator;
 
 pub use context::SpotType;
+pub use validator::{Spot, Validator};

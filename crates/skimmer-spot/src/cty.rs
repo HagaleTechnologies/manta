@@ -44,7 +44,11 @@ impl Table {
     /// doesn't matter *which* length matches, only that one does.
     pub fn is_allocated(&self, callsign: &str) -> bool {
         let call = callsign.to_uppercase();
-        (1..=call.len()).any(|len| self.prefixes.binary_search(&call[..len].to_string()).is_ok())
+        (1..=call.len()).any(|len| {
+            self.prefixes
+                .binary_search(&call[..len].to_string())
+                .is_ok()
+        })
     }
 }
 

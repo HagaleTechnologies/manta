@@ -50,14 +50,28 @@ mod tests {
 
     #[test]
     fn accepts_portable_designators() {
-        for call in ["K5ARH/P", "K5ARH/QRP", "K5ARH/MM", "K5ARH/AM", "K5ARH/M", "K5ARH/3"] {
+        for call in [
+            "K5ARH/P",
+            "K5ARH/QRP",
+            "K5ARH/MM",
+            "K5ARH/AM",
+            "K5ARH/M",
+            "K5ARH/3",
+        ] {
             assert!(is_plausible(call), "{call} should be plausible");
         }
     }
 
     #[test]
     fn rejects_garble() {
-        for call in ["", "ZZ", "12345", "ABCDEFG", "K5ARH/BOGUS", "TOOLONGCALLSIGN123"] {
+        for call in [
+            "",
+            "ZZ",
+            "12345",
+            "ABCDEFG",
+            "K5ARH/BOGUS",
+            "TOOLONGCALLSIGN123",
+        ] {
             assert!(!is_plausible(call), "{call} should be rejected");
         }
     }
