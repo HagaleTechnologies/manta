@@ -20,3 +20,15 @@ secrets*
 
 # Local worktree scratch space (superpowers:using-git-worktrees).
 .worktrees/
+
+# Catalyst orchestrator runtime state (worktree-local; never committed — see
+# catalyst's execution-core/worktree-safety.mjs MACHINE_LOCAL_NOISE list)
+.catalyst/.workflow-context.json
+.catalyst/.workflow-context.json.bak
+.catalyst/worktree-provenance.json
+.needs-cleanup
+.orphaned_at
+.trunk
+
+# Catalyst thoughts/ symlink (points outside the repo to the shared diario store)
+thoughts/
