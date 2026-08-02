@@ -1,0 +1,46 @@
+{
+  "catalyst": {
+    "projectKey": "HagaleTechnologies",
+    "repository": {
+      "org": "HagaleTechnologies",
+      "name": "skimmer"
+    },
+    "project": {
+      "ticketPrefix": "SKI",
+      "name": "skimmer"
+    },
+    "linear": {
+      "teamKey": "SKI",
+      "stateMap": {
+        "backlog": "Backlog",
+        "todo": "Todo",
+        "research": "In Progress",
+        "planning": "In Progress",
+        "inProgress": "In Progress",
+        "inReview": "In Review",
+        "done": "Done",
+        "canceled": "Canceled"
+      },
+      "teamId": "26e8448d-19f9-4d7d-bb02-bc0ebc77dc6b"
+    },
+    "thoughts": {
+      "user": null,
+      "directory": "skimmer",
+      "profile": "HagaleTechnologies"
+    },
+    "sweep": {
+      "idleHours": 48,
+      "intervalHours": 1,
+      "salvagePush": false,
+      "maxRemovalsPerRun": 10
+    },
+    "executionCore": {
+      "maxParallel": 3,
+      "minParallel": 1,
+      "maxParallelCeiling": 3
+    },
+    "orchestration": {
+      "executor": "codex-exec"
+    }
+  }
+}
