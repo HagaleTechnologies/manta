@@ -44,25 +44,16 @@ pub fn listen(
     let mut ch =
         skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
-    let mut tm = crate::track::TrackManager::new(
-        ch.n_channels(),
-        fs,
-        0.0,
-        cfg.detector,
-        cfg.decode.clone(),
-    );
+    let mut tm =
+        crate::track::TrackManager::new(ch.n_channels(), fs, 0.0, cfg.detector, cfg.decode.clone());
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
-    for ev in tm.process_hops(&ch.process(&padding), |m| {
-        m.saturating_sub(pad_hops) * hop
-    }) {
+    for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&ev);
     }
-    for ev in tm.process_hops(&ch.process(&calib), |m| {
-        m.saturating_sub(pad_hops) * hop
-    }) {
+    for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&ev);
     }
 
