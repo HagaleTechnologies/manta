@@ -316,7 +316,17 @@ jobs:
           HAS_COMMENT="false"
           [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
           while [ $SECONDS -lt $END ]; do
-            poll=$(gh api graphql -f query='
+            # A transient GraphQL read-after-write gap can make node($commentId)
+            # briefly 404 right after the comment was posted via REST — this
+            # loop's own retry cadence is the right place to absorb that, not
+            # a hard crash. Guarding with `if !` (rather than a bare
+            # assignment) is required under this step's default `bash -e`:
+            # an unguarded failing command here kills the whole step instantly
+            # instead of reaching the next iteration (observed live on
+            # skimmer#45: the very first poll hit "Could not resolve to a
+            # node" for a comment created less than a second earlier, and the
+            # required check failed in 6 seconds instead of retrying).
+            if ! poll=$(gh api graphql -f query='
               query($owner: String!, $name: String!, $pr: Int!, $hasComment: Boolean!, $commentId: ID!) {
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $pr) {
@@ -357,7 +367,11 @@ jobs:
                     reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
                     comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
-                  }')
+                  }'); then
+              echo "::warning::Transient error polling for a Codex signal — retrying in 20s."
+              sleep 20
+              continue
+            fi
             comments=$(echo "$poll" | jq '.comments')
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
