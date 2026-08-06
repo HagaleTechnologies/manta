@@ -25,17 +25,29 @@ cd "$REPO_ROOT"
 # Version of the direct workspace dependency PKG resolved at DIR. Cargo.lock can
 # contain several versions of the same package, so reading the first matching
 # lockfile entry would make `cargo update -p PKG` ambiguous and could false-green.
+#
+# --all-features is required: `cargo metadata` prunes disabled optional
+# dependencies from `.resolve.nodes`, so a default sweep would resolve nothing
+# for feature-gated workspace deps (e.g. `soapysdr` behind `soapy`) and report
+# them as errors.
+#
+# The node dep's `.name` is the *alias* Cargo exposes to the compiler — the
+# normalized library name, with hyphens folded to underscores (`num-complex` is
+# published under `.name == "num_complex"`). Matching on it misses every
+# hyphenated crate, so resolve `.pkg` through `.packages[]` and compare the real
+# package name. That lookup also yields the authoritative `.version`, which
+# avoids parsing it back out of the package id.
 direct_version() {
   local dir="$1" pkg="$2"
-  (cd "$dir" && cargo metadata --format-version 1 --locked) | jq -r --arg pkg "$pkg" '
+  (cd "$dir" && cargo metadata --format-version 1 --locked --all-features) | jq -r --arg pkg "$pkg" '
     .workspace_members as $members
+    | (reduce .packages[] as $p ({}; .[$p.id] = {name: $p.name, version: $p.version})) as $byid
     | [.resolve.nodes[]
        | select(.id as $id | $members | index($id))
        | .deps[]
-       | select(.name == $pkg)
-       | .pkg]
+       | select($byid[.pkg].name == $pkg)
+       | $byid[.pkg].version]
     | unique[]
-    | split("@")[-1]
   '
 }
 
@@ -111,7 +123,10 @@ for pkg in "${crates[@]}"; do
   if [[ "$single" != "$full" ]]; then
     echo "FAIL ${pkg}: single-package unlock reaches ${single:-<none>}, full unlock reaches ${full}"
     echo "     Dependabot will raise \"Failed to update ${pkg}!\" for this crate."
-    echo "     Remedy: cargo update -p ${pkg} --precise ${full}"
+    # Qualify with the resolved version: an unqualified spec is ambiguous when
+    # the lockfile carries several versions of the same crate (rand_core is
+    # present at 0.6.4, 0.9.5 and 0.10.1 here), and Cargo rejects it outright.
+    echo "     Remedy: cargo update -p ${pkg}:${current} --precise ${full}"
     failed=1
   fi
 done
