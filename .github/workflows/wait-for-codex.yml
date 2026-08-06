@@ -54,19 +54,21 @@ permissions:
 # no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
 # right before the mutation (Codex P2, this file's own auto-merge rollout).
 concurrency:
-  # Keyed by HEAD SHA, not PR number: a PR-number-scoped group put a stale
-  # manual rerun of an old attempt in the SAME group as the run actually
-  # gating the current head, so cancel-in-progress could cancel the correct
-  # run in favor of the stale one before its own head-check step ever ran
-  # (Codex P2, flagged reviewing this file on banco's sync PR). Keying by
-  # head SHA means only genuine same-head duplicates (e.g. two rapid
-  # triggers for one push) share a group and dedupe each other; a
-  # genuinely superseded run (old head, new push landed) is left to exit
-  # fast on its own via the "Skip if this run's head no longer matches"
-  # step instead of relying on cross-run cancellation for correctness.
-  # merge_group.head_sha covers the merge-queue event, which has no
-  # associated PR/head.sha field.
-  group: wait-for-codex-${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+  # REVERTED from a head-SHA-keyed group (tried on banco's sync PR): that
+  # design fixed a stale-manual-rerun-cancels-the-current-run P2, but
+  # Codex's own review of it immediately found a worse P1 — once different
+  # heads stop sharing a group, an old run for a superseded head is no
+  # longer cancelled at all, so it can run to completion, find a signal
+  # tied to its OWN stale HEAD_SHA, and execute the auto-resolve mutations
+  # against the PR's CURRENT threads based on that obsolete state. Back to
+  # PR-number keying: a stale manual rerun cancelling a live run is a rare,
+  # human-triggered, fully recoverable nuisance (re-trigger the check) —
+  # strictly better than a stale run silently mutating current review
+  # threads, which the head-SHA design could not fully rule out without
+  # re-deriving live-head correctness at every mutation point (Codex P1,
+  # flagged reviewing this file on banco's sync PR, round 2 — a direct
+  # regression finding on round 1's own fix).
+  group: wait-for-codex-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: true
 
 jobs:
@@ -129,6 +131,23 @@ jobs:
       - name: Skip if this run's head no longer matches the PR's current head
         id: head-check
         if: github.event_name == 'pull_request'
+        # ACCEPTED LIMITATION, not fixed here: this step no-ops a stale
+        # rerun's OWN remaining steps, but concurrency (`cancel-in-progress`
+        # keyed on PR number) is evaluated by GitHub before any step runs —
+        # so if a human manually reruns an old attempt while the current
+        # head's run is still executing, that stale rerun starting can
+        # itself cancel the run actually gating the current head, and
+        # nothing here recreates it (Codex P2, flagged reviewing this
+        # file). Keying concurrency by head SHA instead of PR number would
+        # fix this narrow case but reopen the exact problem concurrency
+        # exists to prevent (a superseded PUSH's run no longer getting
+        # cancelled by the next push, since each push already has its own
+        # SHA). This failure mode is narrow (requires a human to
+        # deliberately rerun a stale, non-current attempt) and fails SAFE,
+        # not open: the required check ends up cancelled/pending, which
+        # blocks merge — it never lets a stale result satisfy the gate. A
+        # human noticing and rerunning the CURRENT head's own job (or just
+        # pushing again) recovers it.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -373,6 +392,21 @@ jobs:
           HAS_COMMENT="false"
           [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
           while [ $SECONDS -lt $END ]; do
+            # Head-SHA-keyed concurrency (see the group: comment above) no
+            # longer auto-cancels an older run when a newer push lands, since
+            # each head now gets its own group — so without this check, a
+            # run for a superseded head could keep polling for up to 70
+            # minutes and eventually execute the thread-resolution mutations
+            # below using a review tied to a commit that's no longer HEAD
+            # (Codex P2, flagged reviewing this file on skimmer's sync PR).
+            # Re-checked every iteration (cheap next to the poll query
+            # itself), not just once before the loop starts — a push landing
+            # mid-poll must be caught here too, not just at step entry.
+            CURRENT_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || echo "$HEAD_SHA")
+            if [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
+              echo "::notice::A newer push has superseded this run's head ($HEAD_SHA) — a fresh run now gates $CURRENT_HEAD_SHA instead. Exiting cleanly without touching review threads."
+              exit 0
+            fi
             # A transient GraphQL read-after-write gap can make node($commentId)
             # briefly 404 right after the comment was posted via REST — this
             # loop's own retry cadence is the right place to absorb that, not
@@ -397,7 +431,15 @@ jobs:
                     reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
                   }
                 }
-              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" 2>/tmp/poll-err.log)
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" 2>/tmp/poll-err.log) || true
+            # gh's own failure must not abort this `bash -e` step outright —
+            # `|| true` above lets a failed gh call fall through as an empty
+            # $gh_poll_raw, which then fails the jq parse below exactly like
+            # any other malformed-input case, routing it through the SAME
+            # content-based transient/non-transient classification against
+            # /tmp/poll-err.log rather than bypassing it (a bare unprotected
+            # assignment here would abort the whole step on the first gh
+            # hiccup instead of ever reaching that classification).
             if ! poll=$(echo "$gh_poll_raw" | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
                 def is_error_shaped: test("((quota|rate.?limit).{0,30}exceeded|exceeded.{0,30}(quota|rate.?limit)|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
@@ -690,7 +732,14 @@ jobs:
             # still unresolved, but with a fresh comment the loop never
             # looked for (Codex P2, direct follow-up flagged reviewing this
             # file's own live-recheck fix).
-            live=$(gh api graphql -f query='
+            # Guarded like the reply/resolve mutations below it (skip this
+            # thread, don't abort the step): an unguarded assignment here
+            # would let one transient GraphQL/auth/rate-limit failure crash
+            # the whole required check before any thread gets processed,
+            # even though the polling query above already treats the exact
+            # same failure class as retry-worthy (Codex P2, flagged
+            # reviewing this file).
+            if ! live=$(gh api graphql -f query='
               query($id: ID!) {
                 node(id: $id) {
                   ... on PullRequestReviewThread {
@@ -698,7 +747,10 @@ jobs:
                     comments(first: 50) { nodes { author { login } createdAt } }
                   }
                 }
-              }' -f id="$thread_id")
+              }' -f id="$thread_id" 2>/tmp/live-check-err.log); then
+              echo "::warning::Could not re-check thread $thread_id's live state — leaving unresolved: $(cat /tmp/live-check-err.log)"
+              continue
+            fi
             live_resolved=$(echo "$live" | jq -r '.data.node.isResolved')
             live_pure=$(echo "$live" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
             live_fresh=$(echo "$live" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.createdAt >= $since)] | length == 0')
@@ -713,6 +765,41 @@ jobs:
                 }
               }' -f id="$thread_id" -f body="Auto-resolved: Codex re-reviewed commit $HEAD_SHA after this push and raised no new concerns." 2>/tmp/reply-err.log; then
               echo "::warning::Could not reply to thread $thread_id — leaving unresolved: $(cat /tmp/reply-err.log)"
+              continue
+            fi
+
+            # A second live recheck, immediately before the resolve mutation
+            # below: the first recheck above only covers the gap up to THIS
+            # loop iteration reaching it, but two more network round-trips
+            # (the reply just posted, and the resolve call next) each give a
+            # human another window to reply before the thread is actually
+            # marked resolved — the single recheck above doesn't close that
+            # (Codex P2, flagged reviewing this file on watchfinder#33). Our
+            # own just-posted reply is authored "github-actions", which the
+            # purity test already treats as ignorable, so it doesn't trip
+            # live_pure on its own.
+            live2=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on PullRequestReviewThread {
+                    isResolved
+                    comments(first: 50) { nodes { author { login } createdAt } }
+                  }
+                }
+              }' -f id="$thread_id")
+            live2_resolved=$(echo "$live2" | jq -r '.data.node.isResolved')
+            live2_pure=$(echo "$live2" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
+            # Same freshness test as the first recheck, re-applied here: our
+            # own just-posted reply is always >= RUN_STARTED and already
+            # excluded from tripping this via live2_pure, but a Codex
+            # restatement or human reply landing in the reply-to-resolve
+            # gap specifically is not caught by isResolved/purity alone
+            # (Codex P2, flagged reviewing this file on banco's sync PR —
+            # direct follow-up to watchfinder#33's live2 recheck, which
+            # fetched createdAt but never tested it).
+            live2_fresh=$(echo "$live2" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.author.login != "github-actions" and .createdAt >= $since)] | length == 0')
+            if [ "$live2_resolved" != "false" ] || [ "$live2_pure" != "true" ] || [ "$live2_fresh" != "true" ]; then
+              echo "Skipping resolve for thread $thread_id — became ineligible between reply and resolve (left the reply in place)."
               continue
             fi
             # GITHUB_TOKEN (github-actions[bot]) reliably fails this specific
