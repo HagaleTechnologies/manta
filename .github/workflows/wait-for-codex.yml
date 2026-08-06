@@ -25,8 +25,11 @@ on:
   # a required "Wait for Codex Review" check would sit permanently pending
   # on the queue SHA and stall the queue (Codex P1, flagged reviewing this
   # file on skimmer, the first repo in this rollout using a merge queue).
-  # Handled by a separate pass-through job below, not by extending the PR
-  # job's own trigger — the merge-group SHA already represents code that
+  # Handled by an event-gated pass-through step in the job below (not a
+  # separate job — an earlier version split this into two jobs sharing the
+  # same check name, which Codex flagged as relying on undocumented
+  # same-name multi-run matching semantics for a REQUIRED check; see the
+  # job-level comment) — the merge-group SHA already represents code that
   # passed a real Codex review during its own PR phase; re-reviewing a
   # synthetic integration commit is neither meaningful nor possible (there
   # is no PR to post a comment on or resolve threads against).
@@ -353,7 +356,7 @@ jobs:
                     error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
                     reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
-                    comment_thumbsup: ([(.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
+                    comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
                   }')
             comments=$(echo "$poll" | jq '.comments')
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
