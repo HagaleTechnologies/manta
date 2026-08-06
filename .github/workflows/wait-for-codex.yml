@@ -600,20 +600,29 @@ jobs:
             # override a human's concern that arrived moments earlier —
             # violating this workflow's own stated invariant that a
             # human-joined thread is never auto-resolved (Codex P2, flagged
-            # reviewing this file).
+            # reviewing this file). Freshness (no comment since RUN_STARTED)
+            # is re-checked here too, not just authorship/resolved-state —
+            # the earlier version of this live recheck only re-verified
+            # authorship purity, so Codex restating a concern IN this same
+            # thread (rather than opening a new one) between the snapshot
+            # and this loop reaching it stayed invisible: same authors,
+            # still unresolved, but with a fresh comment the loop never
+            # looked for (Codex P2, direct follow-up flagged reviewing this
+            # file's own live-recheck fix).
             live=$(gh api graphql -f query='
               query($id: ID!) {
                 node(id: $id) {
                   ... on PullRequestReviewThread {
                     isResolved
-                    comments(first: 50) { nodes { author { login } } }
+                    comments(first: 50) { nodes { author { login } createdAt } }
                   }
                 }
               }' -f id="$thread_id")
             live_resolved=$(echo "$live" | jq -r '.data.node.isResolved')
             live_pure=$(echo "$live" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
-            if [ "$live_resolved" != "false" ] || [ "$live_pure" != "true" ]; then
-              echo "Skipping thread $thread_id — no longer eligible (resolved or human-touched since the snapshot)."
+            live_fresh=$(echo "$live" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.createdAt >= $since)] | length == 0')
+            if [ "$live_resolved" != "false" ] || [ "$live_pure" != "true" ] || [ "$live_fresh" != "true" ]; then
+              echo "Skipping thread $thread_id — no longer eligible (resolved, human-touched, or a fresh comment landed since the snapshot)."
               continue
             fi
             if ! gh api graphql -f query='
