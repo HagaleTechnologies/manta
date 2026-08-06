@@ -43,7 +43,13 @@ permissions:
 # no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
 # right before the mutation (Codex P2, this file's own auto-merge rollout).
 concurrency:
-  group: wait-for-codex-${{ github.event.pull_request.number }}
+  # pull_request.number is absent on a merge_group event — falling back to
+  # merge_group.head_sha keeps concurrent merge-queue entries in DISTINCT
+  # groups. Without this, every merge-group evaluation shared the same
+  # empty-suffixed group, so cancel-in-progress could cancel one queue
+  # entry's required check the moment another one started (Codex P2,
+  # flagged reviewing this file after the merge_group job was added).
+  group: wait-for-codex-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: true
 
 jobs:
@@ -67,11 +73,27 @@ jobs:
     # the PR's original author would wrongly skip Codex review for it
     # (considered and rejected reviewing this file — the suggested
     # pull_request.user.login alternative would be a regression, not a fix).
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    #
+    # Consolidated into ONE job with event-gated steps, not two jobs
+    # sharing this check name (the earlier split): GitHub still creates a
+    # check-run for a job whose `if:` evaluates false and reports it
+    # "skipped" within seconds — with two same-named check-runs per run,
+    # relying on undocumented same-name multi-run matching semantics for a
+    # REQUIRED check is exactly the kind of ambiguity worth avoiding
+    # outright rather than trusting (Codex P1, flagged reviewing this
+    # file). One job publishing exactly one check-run per run removes the
+    # ambiguity entirely.
+    if: github.event_name == 'merge_group' || (github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
+      - name: Pass through for merge-queue evaluation
+        if: github.event_name == 'merge_group'
+        run: |
+          echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
+
       - name: Record run start
+        if: github.event_name == 'pull_request'
         env:
           # Seed from the PR event's OWN updated_at (set by GitHub at dispatch
           # time), not a runner-observed "now". A queued or slow-starting
@@ -88,7 +110,7 @@ jobs:
           echo "$RUN_STARTED" > /tmp/codex-run-started.txt
 
       - name: Request re-review on a re-push
-        if: github.event.action == 'synchronize'
+        if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
         env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
@@ -242,6 +264,7 @@ jobs:
           echo "$request_comment" | jq -r '.created_at' > /tmp/codex-run-started.txt
 
       - name: Poll for a terminal Codex signal on this revision
+        if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Only for the reply+resolve mutations at the end of this step —
@@ -623,20 +646,3 @@ jobs:
             fi
             echo "Auto-resolved thread $thread_id"
           done
-
-  wait-for-codex-merge-group:
-    name: Wait for Codex Review
-    # Same required-check NAME as the PR job above (branch protection
-    # matches by name, not by which job produced it) — but a completely
-    # different, minimal body: a merge-group SHA has no pull_request
-    # context (no PR number, no thread to reply to), and the code it
-    # represents already passed a real Codex review during its own PR
-    # phase before entering the queue. Re-running the PR job's logic here
-    # would be both meaningless (nothing to post @codex review on) and
-    # impossible (every env var above reads github.event.pull_request.*).
-    if: github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Pass through for merge-queue evaluation
-        run: |
-          echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
