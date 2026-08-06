@@ -39,12 +39,14 @@ scratch_copy() {
 crates=("$@")
 if [[ ${#crates[@]} -eq 0 ]]; then
   # Every [workspace.dependencies] entry that is not a path/git dep.
-  mapfile -t crates < <(
-    awk '/^\[workspace\.dependencies\]/ {inblk=1; next}
-         /^\[/ {inblk=0}
-         inblk && /^[a-zA-Z0-9_-]+ *=/ && !/path *=/ && !/git *=/ { print $1 }' Cargo.toml
-  )
+  while IFS= read -r crate; do
+    crates+=("$crate")
+  done < <(awk '/^\[workspace\.dependencies\]/ {inblk=1; next}
+                /^\[/ {inblk=0}
+                inblk && /^[a-zA-Z0-9_-]+ *=/ && !/path *=/ && !/git *=/ { print $1 }' Cargo.toml)
 fi
+
+echo "Checking: ${crates[*]}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
