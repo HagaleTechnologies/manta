@@ -19,6 +19,19 @@ on:
   # P2, flagged reviewing this file).
   pull_request:
     types: [opened, ready_for_review, synchronize]
+  # merge_group: repos using a GitHub merge queue re-evaluate every required
+  # check against a temporary merge-group SHA that has no associated PR
+  # context — this workflow's PR-specific job never matches that event, so
+  # a required "Wait for Codex Review" check would sit permanently pending
+  # on the queue SHA and stall the queue (Codex P1, flagged reviewing this
+  # file on skimmer, the first repo in this rollout using a merge queue).
+  # Handled by a separate pass-through job below, not by extending the PR
+  # job's own trigger — the merge-group SHA already represents code that
+  # passed a real Codex review during its own PR phase; re-reviewing a
+  # synthetic integration commit is neither meaningful nor possible (there
+  # is no PR to post a comment on or resolve threads against).
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -45,7 +58,16 @@ jobs:
     # this repo's own dependabot-auto-merge workflow is supposed to handle
     # (Codex P2, flagged reviewing this file). A skipped required check
     # satisfies branch protection the same as the existing draft-PR no-op.
-    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    #
+    # github.actor (not pull_request.user.login) is the deliberate test: a
+    # maintainer manually pushing to a Dependabot-authored branch makes THAT
+    # actor the triggering identity for the run, and GitHub's secret
+    # withholding is keyed to the triggering actor, not the PR's persistent
+    # author field — so secrets ARE available on that push, and gating on
+    # the PR's original author would wrongly skip Codex review for it
+    # (considered and rejected reviewing this file — the suggested
+    # pull_request.user.login alternative would be a regression, not a fix).
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -543,6 +565,31 @@ jobs:
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue
+            # Re-check this thread's LIVE state immediately before mutating
+            # it — the $result snapshot above is a single point-in-time
+            # query, and a human can reply to (or a maintainer can resolve)
+            # a specific thread in the gap between that snapshot and this
+            # loop iteration reaching it, especially with many threads to
+            # walk. Trusting the stale snapshot would let this loop silently
+            # override a human's concern that arrived moments earlier —
+            # violating this workflow's own stated invariant that a
+            # human-joined thread is never auto-resolved (Codex P2, flagged
+            # reviewing this file).
+            live=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on PullRequestReviewThread {
+                    isResolved
+                    comments(first: 50) { nodes { author { login } } }
+                  }
+                }
+              }' -f id="$thread_id")
+            live_resolved=$(echo "$live" | jq -r '.data.node.isResolved')
+            live_pure=$(echo "$live" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
+            if [ "$live_resolved" != "false" ] || [ "$live_pure" != "true" ]; then
+              echo "Skipping thread $thread_id — no longer eligible (resolved or human-touched since the snapshot)."
+              continue
+            fi
             if ! gh api graphql -f query='
               mutation($id: ID!, $body: String!) {
                 addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
@@ -576,3 +623,20 @@ jobs:
             fi
             echo "Auto-resolved thread $thread_id"
           done
+
+  wait-for-codex-merge-group:
+    name: Wait for Codex Review
+    # Same required-check NAME as the PR job above (branch protection
+    # matches by name, not by which job produced it) — but a completely
+    # different, minimal body: a merge-group SHA has no pull_request
+    # context (no PR number, no thread to reply to), and the code it
+    # represents already passed a real Codex review during its own PR
+    # phase before entering the queue. Re-running the PR job's logic here
+    # would be both meaningless (nothing to post @codex review on) and
+    # impossible (every env var above reads github.event.pull_request.*).
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pass through for merge-queue evaluation
+        run: |
+          echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
