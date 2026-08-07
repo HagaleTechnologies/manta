@@ -22,7 +22,7 @@ pub fn vectorspec_short() -> vectors::VectorSpec {
 }
 
 pub(crate) fn u01(rng: &mut rand_chacha::ChaCha8Rng) -> f64 {
-    use rand_core::RngCore;
+    use rand_core::Rng;
     // 53-bit mantissa, strictly in (0, 1): never 0 (ln-safe), never 1.
     ((rng.next_u64() >> 11) as f64 + 0.5) * (1.0 / 9007199254740992.0)
 }
