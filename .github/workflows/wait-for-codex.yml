@@ -81,7 +81,19 @@ concurrency:
   # re-deriving live-head correctness at every mutation point (Codex P1,
   # flagged reviewing this file on banco's sync PR, round 2 — a direct
   # regression finding on round 1's own fix).
-  group: wait-for-codex-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
+  # Keyed by event_name too (Codex P1, flagged reviewing this file's phase-1
+  # PR): once main carries BOTH pull_request and pull_request_target (this
+  # transitional state), a single PR activity dispatches two independent
+  # workflow runs, one per trigger — they are not deduplicated just because
+  # they represent "the same" PR event. Without this, both runs shared one
+  # PR-number-keyed group, and cancel-in-progress meant whichever run
+  # started second (often the otherwise-inert pull_request_target run) could
+  # cancel the pull_request run actually gating this PR's real work,
+  # stalling the required check. Splitting by event_name gives each trigger
+  # its own group — the pull_request_target run's own pass-through step
+  # below means its group only ever contains harmless no-ops racing
+  # themselves.
+  group: wait-for-codex-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   # Restricted to run_attempt == 1 (a genuinely fresh trigger): a manual
   # rerun of an OLD attempt (e.g. after a transient Codex error) replays the
   # ORIGINAL event and shares this same group — without this restriction it
@@ -133,8 +145,22 @@ jobs:
         run: |
           echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
 
+      - name: Pass through for transitional pull_request_target run (phase 1/2)
+        # This trigger is registered but deliberately inert during phase 1 —
+        # its only job right now is to give main a working pull_request_target
+        # baseline so a phase-2 follow-up PR (which drops pull_request) can
+        # fire its own required check correctly. The still-live pull_request
+        # trigger does the real gating work below; every substantive step
+        # stays gated to `github.event_name == 'pull_request'` specifically,
+        # not both, so this run never does real polling/mutation work (Codex
+        # P1, flagged reviewing this file — the concurrency-group fix above
+        # is the other half of this same finding).
+        if: github.event_name == 'pull_request_target'
+        run: |
+          echo "Transitional pull_request_target registration (phase 1/2) — pull_request still does the real gating work this round. See the on: block comment above."
+
       - name: Record run start
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name)
+        if: github.event_name == 'pull_request'
         env:
           # Seed from the PR event's OWN updated_at (set by GitHub at dispatch
           # time), not a runner-observed "now". A queued or slow-starting
@@ -152,7 +178,7 @@ jobs:
 
       - name: Skip if this run's head no longer matches the PR's current head
         id: head-check
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name)
+        if: github.event_name == 'pull_request'
         # ACCEPTED LIMITATION, not fixed here: this step no-ops a stale
         # rerun's OWN remaining steps, but concurrency (`cancel-in-progress`
         # keyed on PR number) is evaluated by GitHub before any step runs —
@@ -218,7 +244,7 @@ jobs:
         # event and, without this, would reconstruct the same stale cutoff
         # and rediscover the identical old error forever rather than asking
         # Codex to look again (Codex P2, flagged reviewing this file).
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
+        if: github.event_name == 'pull_request' && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
         env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
@@ -372,7 +398,7 @@ jobs:
           echo "$request_comment" | jq -r '.created_at' > /tmp/codex-run-started.txt
 
       - name: Poll for a terminal Codex signal on this revision
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && steps.head-check.outputs.stale != 'true'
+        if: github.event_name == 'pull_request' && steps.head-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Only for the reply+resolve mutations at the end of this step —
