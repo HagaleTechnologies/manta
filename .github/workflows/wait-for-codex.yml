@@ -1,16 +1,21 @@
 name: Wait for Codex
 
-# INTERIM VARIANT — pull_request, not pull_request_target, deliberately.
-# This repo has no wait-for-codex.yml on main yet, and pull_request_target
-# always reads its definition from the BASE branch — switching to it on a
-# branch that's ADDING the file for the first time goes dark (neither
-# trigger type fires: pull_request no longer matches this file's own `on:`,
-# and pull_request_target has nothing on base to match either). Land THIS
-# pull_request-triggered version first so main has a working baseline, then
-# a fast follow-up PR switches to pull_request_target for the real security
-# reason documented in that PR (a same-repo PR modifying the merged file
-# could otherwise exfiltrate CODEX_REVIEW_PAT or self-resolve its own
-# review threads before human review — see HagaleTechnologies/harbor#59/#60).
+# TRANSITIONAL DUAL-TRIGGER STATE (phase 1/2) — pull_request_target is
+# listed alongside pull_request, not in place of it yet. The end goal is
+# pull_request_target only: on plain pull_request, a same-repo PR that
+# edits THIS file runs its OWN modified copy with CODEX_REVIEW_PAT still in
+# scope, before any human reviews it — able to exfiltrate the PAT or
+# self-resolve its own review threads (see HagaleTechnologies/widdershins'
+# history of this exact fix, WID-20, for the full writeup). But a
+# single-step swap can't self-validate: this file's own required check
+# would need to fire under whichever trigger the PR declares, and neither
+# trigger type matches during the swap PR itself (pull_request no longer
+# matches this file's own edited `on:`, pull_request_target has nothing on
+# base yet to match either) — confirmed stuck exactly this way on
+# HagaleTechnologies/widdershins#135. This PR instead ADDS
+# pull_request_target as a second trigger, keeping pull_request live so
+# this required check still runs normally under it. A phase-2 follow-up
+# drops pull_request once main carries this dual-trigger baseline.
 on:
   # `reopened` included, but routed through the explicit re-review request
   # path below (same as synchronize), not treated as an implicit-review
@@ -26,6 +31,14 @@ on:
   # THIS file on cqdx#259). Explicitly requesting a review on reopen (like
   # synchronize does) fixes both gaps at once.
   pull_request:
+    types: [opened, ready_for_review, synchronize, reopened]
+  # Added for phase 2 (dropping pull_request) to have a working baseline to
+  # read from — pull_request_target always reads its definition from the
+  # BASE branch, so this only takes effect for PRs opened/pushed AFTER this
+  # lands on main; harmless no-op alongside pull_request until then, since
+  # a plain pull_request event never also matches a pull_request_target
+  # listener.
+  pull_request_target:
     types: [opened, ready_for_review, synchronize, reopened]
   # merge_group: repos using a GitHub merge queue re-evaluate every required
   # check against a temporary merge-group SHA that has no associated PR
@@ -121,7 +134,7 @@ jobs:
           echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
 
       - name: Record run start
-        if: github.event_name == 'pull_request'
+        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name)
         env:
           # Seed from the PR event's OWN updated_at (set by GitHub at dispatch
           # time), not a runner-observed "now". A queued or slow-starting
@@ -139,7 +152,7 @@ jobs:
 
       - name: Skip if this run's head no longer matches the PR's current head
         id: head-check
-        if: github.event_name == 'pull_request'
+        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name)
         # ACCEPTED LIMITATION, not fixed here: this step no-ops a stale
         # rerun's OWN remaining steps, but concurrency (`cancel-in-progress`
         # keyed on PR number) is evaluated by GitHub before any step runs —
@@ -205,7 +218,7 @@ jobs:
         # event and, without this, would reconstruct the same stale cutoff
         # and rediscover the identical old error forever rather than asking
         # Codex to look again (Codex P2, flagged reviewing this file).
-        if: github.event_name == 'pull_request' && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
+        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
         env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
@@ -359,7 +372,7 @@ jobs:
           echo "$request_comment" | jq -r '.created_at' > /tmp/codex-run-started.txt
 
       - name: Poll for a terminal Codex signal on this revision
-        if: github.event_name == 'pull_request' && steps.head-check.outputs.stale != 'true'
+        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && steps.head-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Only for the reply+resolve mutations at the end of this step —
