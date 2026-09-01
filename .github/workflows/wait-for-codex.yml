@@ -62,7 +62,12 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: read
+  # write, not read: creating the codex-clean label needs Issues:write on
+  # GitHub's Create-a-label endpoint -- read is insufficient, and the
+  # label-create/attach calls below are written fail-open (retry-then-warn,
+  # never abort the step), so an insufficient scope would otherwise fail
+  # completely silently rather than loudly.
+  issues: write
 
 # A newer push must supersede an older run outright rather than let the old
 # run finish and mutate review threads based on a review of a commit that's
@@ -456,6 +461,29 @@ jobs:
           IS_REMEDIATION: ${{ github.event.action == 'synchronize' && github.run_attempt == 1 }}
         run: |
           set -o pipefail
+          # apply_clean_label(): SHA-scoped label name (never a bare toggle
+          # -- a bare toggle needs cross-run add/remove coordination that is
+          # itself a race), 3-attempt retry with 5s backoff, `gh label
+          # create` (idempotent, `|| true`) before the attach POST. Never
+          # deletes a stale/older label -- that's a separate, real race (an
+          # older run's own cleanup step could delete a newer revision's
+          # already-valid label); labels accumulating one per round is
+          # cosmetic clutter, not a bug.
+          apply_clean_label() {
+            local label="codex-clean:${HEAD_SHA:0:12}"
+            for _ in 1 2 3; do
+              gh label create "$label" --color 0e8a16 \
+                --description "This revision's Codex round raised nothing new -- safe to run the gated jobs" \
+                --repo "$REPO" >/dev/null 2>&1 || true
+              if gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$label" >/dev/null 2>&1; then
+                echo "Applied $label -- codex-clean can now unblock ci.yml's gated jobs for this revision."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::warning::Could not apply $label after 3 attempts -- codex-clean will wait out its own timeout instead."
+            return 1
+          }
           # Only count signals created at/after this run started, and reviews
           # submitted against the CURRENT head commit AND after this round
           # started (a small buffer absorbs clock skew between this runner
@@ -722,6 +750,17 @@ jobs:
               echo "::error::Codex's initial review left $unresolved unresolved concern(s) open — resolve them, then push a remediation commit to trigger a fresh re-review."
               exit 1
             fi
+            # `|| true`: GitHub Actions runs run: blocks under `bash -e`
+            # by default -- a bare call as a standalone statement is NOT
+            # exempt from errexit. apply_clean_label()'s own final-failure
+            # path (`return 1`) is deliberately fail-open (retry, then
+            # warn and let the step continue) -- without `|| true` here,
+            # that same return 1 would instead abort this entire step
+            # under -e, failing the whole required check on a transient
+            # label-POST hiccup even though the review itself was
+            # genuinely clean. The opposite of the function's own
+            # documented intent.
+            apply_clean_label || true
             exit 0
           fi
 
@@ -826,6 +865,20 @@ jobs:
             echo "Codex raised $new_count new concern(s) on this revision — leaving all threads as-is for human review."
             exit 0
           fi
+
+          # This exact revision LOOKED genuinely clean at the top of this
+          # step (zero new Codex-raised concerns per the new_count check
+          # above). The label is NOT applied here, though -- it's applied
+          # after the auto-resolve loop below, gated on one more PR-wide
+          # recheck at that point. Applying it here would race the loop:
+          # each iteration below costs 2-3 network round-trips walking
+          # potentially many threads, and Codex can open a fresh concern
+          # in a DIFFERENT thread while the loop is mid-walk; the loop's
+          # own in-loop recheck already detects that and bails out of
+          # auto-resolving further threads, but a label applied before the
+          # loop started would already have unblocked ci.yml's gated jobs
+          # for a revision the loop itself later determined wasn't
+          # actually clean (Codex P2, flagged reviewing this file).
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue
@@ -984,3 +1037,56 @@ jobs:
             fi
             echo "Auto-resolved thread $thread_id"
           done
+
+          # Final PR-wide check, run unconditionally after the loop above
+          # (whether it walked every thread or bailed early on a fresh
+          # concern) -- this is the actual gate for applying the clean
+          # label, not the new_count check at the top of this step. Same
+          # query shape as the in-loop fresh_check above, re-run one more
+          # time as the very last thing before this step exits, to keep
+          # the window between "confirmed clean" and "label applied" as
+          # small as it can be (Codex P2, flagged reviewing this file).
+          # Requests `id` (without it, every `.id` projection below is
+          # null, so subtracting $baselineInitiated -- real thread ID
+          # strings -- never removes anything, and this check reports a
+          # false "new concern" on EVERY round with any lingering
+          # Codex-authored unresolved thread, permanently blocking the
+          # clean label even on a genuinely clean round) and full
+          # `comments` with `createdAt` (without it, Codex restating a
+          # concern as a FRESH comment inside an EXISTING baseline thread,
+          # rather than opening a new thread, goes undetected -- the
+          # thread ID isn't new, so a pure ID-diff against baseline treats
+          # it as already-accounted-for even though this exact revision
+          # just had that concern reconfirmed). Both caught by Codex's own
+          # review of this exact block.
+          if ! final_check=$(gh api graphql -f query='
+            query($owner: String!, $name: String!, $pr: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $pr) {
+                  reviewThreads(first: 100) {
+                    nodes { id isResolved comments(first: 50) { nodes { author { login } createdAt } } }
+                  }
+                }
+              }
+            }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" 2>/tmp/final-check-err.log \
+            | jq --argjson baselineInitiated "$baseline_initiated" --arg since "$RUN_STARTED" '
+              [.data.repository.pullRequest.reviewThreads.nodes[]
+                | select(.isResolved == false)
+                | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+                | select(
+                    (.id as $id | ($baselineInitiated | index($id)) == null)
+                    or ([.comments.nodes[] | select(.createdAt >= $since)] | length > 0)
+                  )
+                | .id
+              ] | length'); then
+            echo "::warning::Could not run the final PR-wide recheck -- not applying the clean label for this revision (fail closed): $(cat /tmp/final-check-err.log)"
+          elif [ "$final_check" -gt 0 ]; then
+            echo "Codex raised a new concern during thread auto-resolution -- not applying the clean label for this revision."
+          else
+            # `|| true`: a bare statement inside an else branch is still a
+            # simple command under `bash -e` (the errexit exemption only
+            # applies to a command used AS the if/while/until test itself,
+            # not to a branch's body) -- same fail-open rationale as the
+            # other call site above.
+            apply_clean_label || true
+          fi

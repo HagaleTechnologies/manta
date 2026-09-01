@@ -1,0 +1,127 @@
+# Self-contained (no `extends:` pulling in a shared/reusable config) --
+# skimmer is a public repo, and an externally-sourced config's real content
+# renders into THIS repo's own public Action logs when it's pulled in,
+# which would leak incident history or other detail embedded in a shared
+# config's own comments (some of which may live in a private repo) straight
+# onto a public log. This file's own comments stay generic for the same
+# reason -- no references to other repos, named or otherwise.
+#
+# Mergify's rule-action only re-fires when a condition transitions from
+# unmatched to matched -- a static condition list (base=main, -draft,
+# -closed alone) that's already true the instant a PR opens fires once,
+# immediately, and never gets a second chance once checks later go green.
+# The check-success/#review-threads-unresolved conditions below give the
+# rule something stateful to re-trigger on.
+#
+# The check-skipped OR-clauses (on both `test` matrix legs and `Wait for
+# Codex Review`) are needed because wait-for-codex.yml and the codex-clean
+# gate both deliberately skip for dependabot[bot] pushes and draft PRs --
+# without them, those PRs would never auto-queue. `test-soapy` is
+# deliberately NOT referenced -- it isn't a required check on this repo, so
+# gating queue admission on it would make this rule MORE restrictive than
+# the actual merge gate the ruleset enforces.
+#
+# `Wait for Codex Review`'s check-skipped acceptance is restricted to
+# `author = dependabot[bot]` specifically, NOT accepted for every PR the
+# way `-draft` alone might suggest is safe: a human-authored PR opened as
+# draft gets a genuinely skipped Wait-for-Codex-Review check-run; when it's
+# later marked ready, `-draft` flips satisfied the instant that event
+# fires, but the check-run itself doesn't reset -- it still shows its OLD
+# "skipped" conclusion until wait-for-codex.yml's own fresh run (triggered
+# by that same ready_for_review event) actually completes. Without this
+# restriction, this rule could fully match and queue the PR in that gap,
+# merging it having never received a real review (Codex P1, flagged
+# reviewing this file). Dependabot PRs don't have this race -- they're
+# never draft, and dependabot-auto-merge.yml's own classification step
+# already gates them before they can reach this rule at all -- so
+# accepting their skip unconditionally is safe.
+#
+# Trusted-author gate (`author = thagale` OR the dependabot branch below):
+# this repo is public, its ruleset has `required_approving_review_count: 0`,
+# and the native auto-merge workflow this queue replaces had NO
+# author-association check of its own to carry forward -- without this
+# condition, any outside contributor's PR that goes green on all required
+# checks would auto-queue and merge with zero human in the loop. Mergify has
+# no direct equivalent of GitHub's `author_association` (no built-in
+# role/collaborator lookup), only an exact-login match, so `author =
+# thagale` is the closest available primitive. This diverges the moment a
+# second trusted collaborator is added -- their PRs won't auto-queue under
+# a single-login condition and will need either a manual `@Mergifyio queue`
+# comment or this file updated with their login.
+#
+# The dependabot branch requires a POSITIVE classification signal
+# (`approved-reviews-by = github-actions[bot]`), not just the ABSENCE of
+# `needs-review`. `needs-review` is applied ASYNCHRONOUSLY by
+# dependabot-auto-merge.yml's own classify step, which runs as a separate
+# workflow after this rule can already be evaluated -- treating the
+# label's mere absence as "safe, queue it" means a genuine major-version
+# bump can match and queue BEFORE that classifier ever gets a chance to
+# apply the label (or if `dependabot/fetch-metadata` itself fails
+# outright, the label never arrives at all), defeating the policy that
+# major bumps need a human (Codex P1, flagged reviewing this file).
+# `approved-reviews-by = github-actions[bot]` is the classifier's own
+# POSITIVE output for the minor/patch path specifically -- it only exists
+# once classification has genuinely run AND determined this is safe to
+# auto-merge, so a PR whose classification hasn't happened yet (or failed)
+# simply never matches this condition, and Mergify's own edge-triggering
+# re-evaluates the rule once that approval does land. `-label =
+# needs-review` stays as defense-in-depth alongside it, not a replacement
+# for it.
+#
+# max_parallel_checks: 1 (required -- confirmed live via a real `@Mergifyio
+# queue` attempt on this repo's own migration PR, which Mergify rejected
+# outright without it): this repo's ruleset has
+# strict_required_status_checks_policy: true, which Mergify refuses to pair
+# with its default draft-PR validation (a synthetic PR re-running checks
+# against a merge-commit preview) -- that mode is fundamentally incompatible
+# with "checks must have run against the exact up-to-date branch tip."
+# max_parallel_checks: 1, combined with batch_size: 1 (already set) and no
+# separate merge_conditions (so queue admission and the final merge check
+# are the same condition set), is what makes Mergify reuse the PR's own
+# already-green checks in place instead of creating a draft PR -- see
+# docs.mergify.com/merge-queue/rules, "in-place checks."
+merge_queue:
+  max_parallel_checks: 1
+
+queue_rules:
+  - name: default
+    merge_method: squash
+    batch_size: 1
+    update_method: rebase
+
+pull_request_rules:
+  - name: queue on green + threads resolved
+    conditions:
+      - base = main
+      - -draft
+      - -closed
+      - -label = needs-review
+      - or:
+          - author = thagale
+          - and:
+              - author = dependabot[bot]
+              - approved-reviews-by = github-actions[bot]
+      - "#review-threads-unresolved = 0"
+      # Plain check-success, no check-skipped OR-clause: unlike `Wait for
+      # Codex Review` above, `test` never legitimately shows `skipped` for
+      # any PR that reaches this rule's evaluation at all -- codex-clean's
+      # job-level skip only fires for draft PRs (already excluded by
+      # -draft above, before this point) or dependabot[bot] (which
+      # deliberately still runs `test` for real, since its own if:
+      # matches `needs.codex-clean.result == 'skipped'`). The ONE case
+      # where `test` genuinely shows skipped is when `codex-clean` itself
+      # FAILED -- and accepting that skip here would let a PR merge
+      # having never actually run its test suite, precisely because the
+      # gate that was supposed to block it hit a problem (Codex-review
+      # follow-up finding, verified against this repo's actual job graph
+      # before applying -- not a blind copy of the suggested fix).
+      - check-success = test (ubuntu-latest)
+      - check-success = test (macos-latest)
+      - or:
+          - check-success = Wait for Codex Review
+          - and:
+              - check-skipped = Wait for Codex Review
+              - author = dependabot[bot]
+    actions:
+      queue:
+        name: default
