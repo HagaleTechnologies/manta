@@ -1,5 +1,23 @@
 # PR auto-merge policy
 
+## AMENDMENT (2026-09-01)
+
+The "every PR, any author" scope below is narrowed by the codex-clean-gate
++ Mergify migration: native `auto-merge.yml` (which had no author check at
+all, matching the "aware that `required_approving_review_count` is
+currently 0" framing below) is retired in favor of Mergify's queue, which
+adds an explicit `author = thagale` (or a vetted `dependabot[bot]`) gate in
+`.mergify.yml`. This was flagged by Codex's own review of that migration
+PR as a real behavior change against this doc's original "every PR"
+language — correct, and intentional: an outside contributor's PR merging
+unattended with zero human in the loop is a real exposure on a public repo
+with 0 required reviews, independent of whether CI is green. This
+restriction was NOT re-litigated per-repo — it's the same fix every other
+public repo in this rollout (coppa, pancetta) already got, for the
+identical reason. Flagged to Tony for confirmation rather than silently
+assumed; revert the `.mergify.yml` author condition if the original
+unrestricted scope was genuinely intended even for non-collaborator PRs.
+
 ## Decision
 
 Repo-wide GitHub auto-merge is enabled (`allow_auto_merge: true`), squash
