@@ -80,8 +80,17 @@ jobs:
           # the PR introducing apply_clean_label() can't produce a label
           # for its own pushes until it merges). Check CONTENT instead.
           err_file="$(mktemp)"
+          # grep -q via a here-string, never `echo "$x" | grep -q` -- grep -q
+          # exits on its FIRST match, which can SIGPIPE a still-writing
+          # producer on the other end of a real pipe (this file is ~66KB
+          # with the match well before EOF); under this job's default
+          # `bash -eo pipefail`, that SIGPIPE can make the whole pipeline
+          # report a false non-zero exit even though grep genuinely matched,
+          # silently mis-detecting a present mechanism as absent (Codex P2,
+          # flagged reviewing this exact step). A here-string has no
+          # separate producer process to SIGPIPE.
           if content=$(gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" -H "Accept: application/vnd.github.raw" 2>"$err_file"); then
-            if echo "$content" | grep -q "apply_clean_label"; then
+            if grep -q "apply_clean_label" <<< "$content"; then
               echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
             else
               echo "::warning::Base branch's wait-for-codex.yml at $BASE_SHA has no apply_clean_label() yet -- this is the bootstrap PR itself. Passing through unconditionally."
@@ -89,7 +98,7 @@ jobs:
             fi
           else
             err="$(cat "$err_file")"
-            if echo "$err" | grep -qiE "HTTP 404|not found"; then
+            if grep -qiE "HTTP 404|not found" <<< "$err"; then
               echo "::warning::Base branch has no wait-for-codex.yml at all at $BASE_SHA -- this is the bootstrap PR itself. Passing through unconditionally."
               echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
             else
@@ -117,12 +126,18 @@ jobs:
           # and error out cleanly before GitHub kills the job outright.
           END=$((SECONDS + 95 * 60 - 420))
           while [ $SECONDS -lt $END ]; do
-            # per_page=100: labels accumulate one per round with no
-            # cleanup (deleting a stale label is itself a race that can
-            # delete a newer revision's already-valid one), so a long
-            # review loop can push the current label past the REST
-            # default page size of 30.
-            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '[.[].name]' 2>/dev/null); then
+            # per_page=100 alone still truncates at page 1: labels
+            # accumulate one per round with no cleanup (deleting a stale
+            # label is itself a race that can delete a newer revision's
+            # already-valid one), so a sufficiently long-lived PR can
+            # exceed 100 total labels, silently hiding the current
+            # revision's valid one past page 1 (Codex P3, flagged
+            # reviewing this step). --paginate fetches every page;
+            # --slurp is required alongside it so multiple pages' JSON
+            # arrays combine into one array of arrays instead of
+            # concatenating as invalid JSON, matching this fleet's own
+            # established --paginate --slurp convention.
+            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --paginate --slurp --jq '[.[][].name]' 2>/dev/null); then
               if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
                 echo "Found $target -- this round raised nothing new, safe to run the gated jobs."
                 exit 0
@@ -140,7 +155,19 @@ jobs:
     # codex-clean's own eligibility `if:` above), which is different from
     # "ran and found the round not clean yet" (that produces `failure`).
     # Both `success` and `skipped` mean "proceed."
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    #
+    # always() is required, not decorative: GitHub Actions auto-skips a job
+    # whenever ANY of its `needs` jobs was itself skipped, regardless of a
+    # custom if: expression -- the implicit success()-only gate still
+    # applies unless always() overrides it. Without this, `test` silently
+    # never ran (confirmed live on a throwaway draft PR: codex-clean
+    # reported skipped, and `test`/`test-soapy` were ALSO skipped rather
+    # than evaluating this condition at all -- a real gap, not a
+    # hypothetical one, caught by Codex's own review of this PR). always()
+    # only lifts the implicit gate; the explicit result check still
+    # excludes `failure`/`cancelled`, so a genuinely non-clean round still
+    # blocks this job.
+    if: always() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -159,7 +186,7 @@ jobs:
       - run: cargo test --workspace
   test-soapy:
     needs: codex-clean
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    if: always() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:

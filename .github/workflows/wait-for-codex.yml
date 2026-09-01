@@ -856,12 +856,19 @@ jobs:
             exit 0
           fi
 
-          # This exact revision is genuinely clean (zero new Codex-raised
-          # concerns this round) -- apply the label now, before deciding
-          # below whether auto-resolving stale baseline threads is safe.
-          # That decision is a DIFFERENT question from "is this SHA clean"
-          # and must not gate the label itself.
-          apply_clean_label
+          # This exact revision LOOKED genuinely clean at the top of this
+          # step (zero new Codex-raised concerns per the new_count check
+          # above). The label is NOT applied here, though -- it's applied
+          # after the auto-resolve loop below, gated on one more PR-wide
+          # recheck at that point. Applying it here would race the loop:
+          # each iteration below costs 2-3 network round-trips walking
+          # potentially many threads, and Codex can open a fresh concern
+          # in a DIFFERENT thread while the loop is mid-walk; the loop's
+          # own in-loop recheck already detects that and bails out of
+          # auto-resolving further threads, but a label applied before the
+          # loop started would already have unblocked ci.yml's gated jobs
+          # for a revision the loop itself later determined wasn't
+          # actually clean (Codex P2, flagged reviewing this file).
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue
@@ -1020,3 +1027,35 @@ jobs:
             fi
             echo "Auto-resolved thread $thread_id"
           done
+
+          # Final PR-wide check, run unconditionally after the loop above
+          # (whether it walked every thread or bailed early on a fresh
+          # concern) -- this is the actual gate for applying the clean
+          # label, not the new_count check at the top of this step. Same
+          # query shape as the in-loop fresh_check above, re-run one more
+          # time as the very last thing before this step exits, to keep
+          # the window between "confirmed clean" and "label applied" as
+          # small as it can be (Codex P2, flagged reviewing this file).
+          if ! final_check=$(gh api graphql -f query='
+            query($owner: String!, $name: String!, $pr: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $pr) {
+                  reviewThreads(first: 100) {
+                    nodes { isResolved comments(first: 1) { nodes { author { login } } } }
+                  }
+                }
+              }
+            }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" 2>/tmp/final-check-err.log \
+            | jq --argjson baselineInitiated "$baseline_initiated" '
+              [.data.repository.pullRequest.reviewThreads.nodes[]
+                | select(.isResolved == false)
+                | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+                | .id
+              ] as $codex_unresolved
+              | ($codex_unresolved - $baselineInitiated) | length'); then
+            echo "::warning::Could not run the final PR-wide recheck -- not applying the clean label for this revision (fail closed): $(cat /tmp/final-check-err.log)"
+          elif [ "$final_check" -gt 0 ]; then
+            echo "Codex raised a new concern during thread auto-resolution -- not applying the clean label for this revision."
+          else
+            apply_clean_label
+          fi

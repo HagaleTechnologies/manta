@@ -21,7 +21,22 @@
 # gating queue admission on it would make this rule MORE restrictive than
 # the actual merge gate the ruleset enforces.
 #
-# Trusted-author gate (`author = thagale` OR `author = dependabot[bot]`):
+# `Wait for Codex Review`'s check-skipped acceptance is restricted to
+# `author = dependabot[bot]` specifically, NOT accepted for every PR the
+# way `-draft` alone might suggest is safe: a human-authored PR opened as
+# draft gets a genuinely skipped Wait-for-Codex-Review check-run; when it's
+# later marked ready, `-draft` flips satisfied the instant that event
+# fires, but the check-run itself doesn't reset -- it still shows its OLD
+# "skipped" conclusion until wait-for-codex.yml's own fresh run (triggered
+# by that same ready_for_review event) actually completes. Without this
+# restriction, this rule could fully match and queue the PR in that gap,
+# merging it having never received a real review (Codex P1, flagged
+# reviewing this file). Dependabot PRs don't have this race -- they're
+# never draft, and dependabot-auto-merge.yml's own classification step
+# already gates them before they can reach this rule at all -- so
+# accepting their skip unconditionally is safe.
+#
+# Trusted-author gate (`author = thagale` OR the dependabot branch below):
 # this repo is public, its ruleset has `required_approving_review_count: 0`,
 # and the native auto-merge workflow this queue replaces had NO
 # author-association check of its own to carry forward -- without this
@@ -34,12 +49,24 @@
 # a single-login condition and will need either a manual `@Mergifyio queue`
 # comment or this file updated with their login.
 #
-# `author = dependabot[bot]` is included alongside the human case, not a
-# loophole in it: dependabot-auto-merge.yml's own classify step already
-# vets every Dependabot PR before it can reach this rule at all --
-# breaking/major bumps get labeled "needs-review" and are excluded outright
-# by the `-label = needs-review` condition below, so only already-vetted
-# minor/patch bumps ever reach this author check.
+# The dependabot branch requires a POSITIVE classification signal
+# (`approved-reviews-by = github-actions[bot]`), not just the ABSENCE of
+# `needs-review`. `needs-review` is applied ASYNCHRONOUSLY by
+# dependabot-auto-merge.yml's own classify step, which runs as a separate
+# workflow after this rule can already be evaluated -- treating the
+# label's mere absence as "safe, queue it" means a genuine major-version
+# bump can match and queue BEFORE that classifier ever gets a chance to
+# apply the label (or if `dependabot/fetch-metadata` itself fails
+# outright, the label never arrives at all), defeating the policy that
+# major bumps need a human (Codex P1, flagged reviewing this file).
+# `approved-reviews-by = github-actions[bot]` is the classifier's own
+# POSITIVE output for the minor/patch path specifically -- it only exists
+# once classification has genuinely run AND determined this is safe to
+# auto-merge, so a PR whose classification hasn't happened yet (or failed)
+# simply never matches this condition, and Mergify's own edge-triggering
+# re-evaluates the rule once that approval does land. `-label =
+# needs-review` stays as defense-in-depth alongside it, not a replacement
+# for it.
 #
 # max_parallel_checks: 1 (required -- confirmed live via a real `@Mergifyio
 # queue` attempt on this repo's own migration PR, which Mergify rejected
@@ -71,7 +98,9 @@ pull_request_rules:
       - -label = needs-review
       - or:
           - author = thagale
-          - author = dependabot[bot]
+          - and:
+              - author = dependabot[bot]
+              - approved-reviews-by = github-actions[bot]
       - "#review-threads-unresolved = 0"
       - or:
           - check-success = test (ubuntu-latest)
@@ -81,7 +110,9 @@ pull_request_rules:
           - check-skipped = test (macos-latest)
       - or:
           - check-success = Wait for Codex Review
-          - check-skipped = Wait for Codex Review
+          - and:
+              - check-skipped = Wait for Codex Review
+              - author = dependabot[bot]
     actions:
       queue:
         name: default
