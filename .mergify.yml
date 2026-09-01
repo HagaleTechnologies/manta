@@ -1,0 +1,71 @@
+# Self-contained (no `extends:` pulling in a shared/reusable config) --
+# skimmer is a public repo, and an externally-sourced config's real content
+# renders into THIS repo's own public Action logs when it's pulled in,
+# which would leak incident history or other detail embedded in a shared
+# config's own comments (some of which may live in a private repo) straight
+# onto a public log. This file's own comments stay generic for the same
+# reason -- no references to other repos, named or otherwise.
+#
+# Mergify's rule-action only re-fires when a condition transitions from
+# unmatched to matched -- a static condition list (base=main, -draft,
+# -closed alone) that's already true the instant a PR opens fires once,
+# immediately, and never gets a second chance once checks later go green.
+# The check-success/#review-threads-unresolved conditions below give the
+# rule something stateful to re-trigger on.
+#
+# The check-skipped OR-clauses (on both `test` matrix legs and `Wait for
+# Codex Review`) are needed because wait-for-codex.yml and the codex-clean
+# gate both deliberately skip for dependabot[bot] pushes and draft PRs --
+# without them, those PRs would never auto-queue. `test-soapy` is
+# deliberately NOT referenced -- it isn't a required check on this repo, so
+# gating queue admission on it would make this rule MORE restrictive than
+# the actual merge gate the ruleset enforces.
+#
+# Trusted-author gate (`author = thagale` OR `author = dependabot[bot]`):
+# this repo is public, its ruleset has `required_approving_review_count: 0`,
+# and the native auto-merge workflow this queue replaces had NO
+# author-association check of its own to carry forward -- without this
+# condition, any outside contributor's PR that goes green on all required
+# checks would auto-queue and merge with zero human in the loop. Mergify has
+# no direct equivalent of GitHub's `author_association` (no built-in
+# role/collaborator lookup), only an exact-login match, so `author =
+# thagale` is the closest available primitive. This diverges the moment a
+# second trusted collaborator is added -- their PRs won't auto-queue under
+# a single-login condition and will need either a manual `@Mergifyio queue`
+# comment or this file updated with their login.
+#
+# `author = dependabot[bot]` is included alongside the human case, not a
+# loophole in it: dependabot-auto-merge.yml's own classify step already
+# vets every Dependabot PR before it can reach this rule at all --
+# breaking/major bumps get labeled "needs-review" and are excluded outright
+# by the `-label = needs-review` condition below, so only already-vetted
+# minor/patch bumps ever reach this author check.
+queue_rules:
+  - name: default
+    merge_method: squash
+    batch_size: 1
+    update_method: rebase
+
+pull_request_rules:
+  - name: queue on green + threads resolved
+    conditions:
+      - base = main
+      - -draft
+      - -closed
+      - -label = needs-review
+      - or:
+          - author = thagale
+          - author = dependabot[bot]
+      - "#review-threads-unresolved = 0"
+      - or:
+          - check-success = test (ubuntu-latest)
+          - check-skipped = test (ubuntu-latest)
+      - or:
+          - check-success = test (macos-latest)
+          - check-skipped = test (macos-latest)
+      - or:
+          - check-success = Wait for Codex Review
+          - check-skipped = Wait for Codex Review
+    actions:
+      queue:
+        name: default
