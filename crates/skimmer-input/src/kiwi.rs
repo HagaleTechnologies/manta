@@ -133,7 +133,7 @@ impl KiwiIqSource {
             tungstenite::client(url, tcp).context("KiwiSDR WebSocket handshake")?;
 
         socket
-            .send(Message::Text(format!("SET auth t=kiwi p={password}")))
+            .send(Message::Text(format!("SET auth t=kiwi p={password}").into()))
             .context("send SET auth")?;
 
         // Read frames until the server reports the real, device-specific
@@ -223,7 +223,7 @@ impl KiwiIqSource {
             "SET keepalive".to_string(),
         ] {
             socket
-                .send(Message::Text(cmd))
+                .send(Message::Text(cmd.into()))
                 .context("send post-handshake SET command")?;
         }
 
@@ -255,7 +255,7 @@ impl KiwiIqSource {
     fn send_keepalive_if_due(&mut self) -> Result<()> {
         if self.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
             self.socket
-                .send(Message::Text("SET keepalive".to_string()))
+                .send(Message::Text("SET keepalive".to_string().into()))
                 .context("send SET keepalive")?;
             self.last_keepalive = Instant::now();
         }
@@ -304,7 +304,7 @@ impl KiwiIqSource {
 fn ack_audio_rate_if_present(socket: &mut WebSocket<TcpStream>, text: &str) -> Result<()> {
     if let Some(rate) = parse_kv_f64(text, "audio_rate") {
         let cmd = format!("SET AR OK in={} out={TARGET_RATE_HZ}", rate as i64);
-        socket.send(Message::Text(cmd)).context("send SET AR OK")?;
+        socket.send(Message::Text(cmd.into())).context("send SET AR OK")?;
     }
     Ok(())
 }
