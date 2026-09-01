@@ -1,9 +1,13 @@
 //! SPEC §7 V8/V8w pileup golden gates. "Callsign validated"/"bogus
-//! callsign"/"ghost decode" approximate the future skimmer-spot validator
-//! (M3) the same way V5/V6 approximate "callsign validated" today -- see
-//! docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
+//! callsign"/"ghost decode" are measured against the real
+//! `skimmer-spot::Validator`'s output (`report["spots"]`), wired into
+//! `decode_samples` in M3's engine-wiring sub-project -- see
+//! docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md. Previously
+//! approximated with text-substring heuristics against raw decoder text,
+//! the same way V5/V6 approximated "callsign validated" before this landed
+//! -- see docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
 
 fn decode_report(
@@ -88,23 +92,19 @@ fn match_tracks_by_freq<'a>(
         .collect()
 }
 
-/// Callsign-shaped, >=2-rep tokens in `decoded_text` that are not in
-/// `known_calls` -- SPEC §7 V8/V8w's "0 bogus callsigns spotted".
-fn bogus_calls(decoded_text: &str, known_calls: &HashSet<&str>) -> Vec<String> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for word in decoded_text.split_whitespace() {
-        if (3..=7).contains(&word.len())
-            && word.chars().all(|c| c.is_ascii_alphanumeric())
-            && word.chars().any(|c| c.is_ascii_digit())
-            && word.chars().any(|c| c.is_ascii_alphabetic())
-        {
-            *counts.entry(word).or_insert(0) += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .filter(|&(word, n)| n >= 2 && !known_calls.contains(word))
-        .map(|(word, _)| word.to_string())
+/// `(callsign, track_id)` pairs from `report["spots"]` -- the real
+/// `skimmer-spot::Validator`'s output, not a text-heuristic approximation.
+fn spotted_calls(report: &serde_json::Value) -> Vec<(String, u64)> {
+    report["spots"]
+        .as_array()
+        .expect("decode --json output must include a 'spots' array")
+        .iter()
+        .map(|s| {
+            (
+                s["callsign"].as_str().unwrap().to_string(),
+                s["track_id"].as_u64().unwrap(),
+            )
+        })
         .collect()
 }
 
@@ -112,7 +112,6 @@ fn bogus_calls(decoded_text: &str, known_calls: &HashSet<&str>) -> Vec<String> {
 fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
     let spec = skimmer_testkit::vectors::v8();
     let (report, manifest) = decode_report(&spec);
-    let tracks = per_track(&report);
     let known_calls: HashSet<&str> = manifest
         .keyed_texts
         .iter()
@@ -124,24 +123,20 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
         "V8 fixture must have 50 unique callsigns"
     );
 
-    let matched = match_tracks_by_freq(&manifest, &tracks);
-    let mut validated = 0;
-    for (i, keyed_text) in manifest.keyed_texts.iter().enumerate() {
-        let call = call_from_keyed_text(keyed_text);
-        let (decoded_text, _freq) = matched[i];
-        if decoded_text.matches(call).count() >= 2 {
-            validated += 1;
-        }
-    }
+    let spots = spotted_calls(&report);
+    let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
+
+    let validated = known_calls.iter().filter(|c| spotted.contains(**c)).count();
     assert!(
         validated >= 45,
-        "V8 must validate >= 45/50 callsigns, got {validated}/50"
+        "V8 must validate >= 45/50 callsigns, got {validated}/50 (spotted: {spotted:?})"
     );
 
-    let mut bogus = Vec::new();
-    for (decoded_text, _freq) in tracks.values() {
-        bogus.extend(bogus_calls(decoded_text, &known_calls));
-    }
+    let bogus: Vec<&str> = spotted
+        .iter()
+        .filter(|c| !known_calls.contains(**c))
+        .copied()
+        .collect();
     assert!(
         bogus.is_empty(),
         "V8 must spot 0 bogus callsigns, got {bogus:?}"
@@ -223,25 +218,30 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
         pct * 100.0
     );
 
-    let mut bogus = Vec::new();
-    for (decoded_text, _freq) in tracks.values() {
-        bogus.extend(bogus_calls(decoded_text, &known_calls));
-    }
+    let spots = spotted_calls(&report);
+    let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
+    let bogus: Vec<&str> = spotted
+        .iter()
+        .filter(|c| !known_calls.contains(**c))
+        .copied()
+        .collect();
     assert!(
         bogus.is_empty(),
         "V8w must spot 0 bogus callsigns, got {bogus:?}"
     );
 
-    // 0 cross-channel ghost decodes: no fixture call's >=2-rep substring
-    // appears in more than one distinct track.
+    // 0 cross-channel ghost decodes: no known call's spots span more than
+    // one distinct track_id.
     for call in &known_calls {
-        let hits = tracks
-            .values()
-            .filter(|(text, _)| text.matches(call).count() >= 2)
-            .count();
+        let track_ids: HashSet<u64> = spots
+            .iter()
+            .filter(|(c, _)| c == call)
+            .map(|(_, tid)| *tid)
+            .collect();
         assert!(
-            hits <= 1,
-            "callsign {call} decoded (>=2 reps) in {hits} distinct tracks, expected <= 1 (ghost decode)"
+            track_ids.len() <= 1,
+            "callsign {call} spotted from {} distinct tracks, expected <= 1 (ghost decode)",
+            track_ids.len()
         );
     }
 }

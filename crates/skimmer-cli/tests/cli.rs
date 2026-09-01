@@ -111,6 +111,28 @@ fn json_output_is_valid_and_deterministic_across_three_runs() {
 }
 
 #[test]
+fn decode_json_includes_spots_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = skimmer_testkit::vectors::v1();
+    skimmer_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skimmer"))
+        .args(["decode", "--json"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        report.get("spots").is_some_and(|s| s.is_array()),
+        "expected a 'spots' array field in decode --json output, got: {report}"
+    );
+}
+
+#[test]
 #[cfg(feature = "soapy")]
 fn soapy_driver_without_freq_and_rate_is_a_clean_error() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_skimmer"))

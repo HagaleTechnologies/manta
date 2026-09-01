@@ -66,7 +66,7 @@ Dependency graph (arrows = depends on):
 skimmer-cli ──▶ skimmer-engine ──▶ skimmer-input ──▶ skimmer-dsp
                      │        ├──▶ skimmer-dsp ──────▶ coppa-dsp
                      │        ├──▶ skimmer-decode
-                     │        └──▶ skimmer-spot
+                     │        └──▶ skimmer-spot ──────▶ skimmer-decode
                      └──▶ skimmer-server
 skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
 ```

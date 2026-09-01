@@ -6,6 +6,7 @@ members = [
     "crates/skimmer-input",
     "crates/skimmer-testkit",
     "crates/skimmer-engine",
+    "crates/skimmer-spot",
     "crates/skimmer-cli",
 ]
 
@@ -22,6 +23,7 @@ skimmer-dsp = { path = "crates/skimmer-dsp" }
 skimmer-input = { path = "crates/skimmer-input" }
 skimmer-testkit = { path = "crates/skimmer-testkit" }
 skimmer-engine = { path = "crates/skimmer-engine" }
+skimmer-spot = { path = "crates/skimmer-spot" }
 
 coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 coppa-audio = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
@@ -38,8 +40,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 criterion = "0.8"
-rand_core = "0.9"
-rand_chacha = "0.9"
+rand_core = "0.10"
+rand_chacha = "0.10"
 proptest = "1.5"
 approx = "0.5"
 tempfile = "3"
@@ -47,6 +49,7 @@ rayon = "1"
 tungstenite = "0.24"
 rubato = "4.0"
 soapysdr = "0.5"
+regex = "1"
 
 # DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
 [profile.dev]
