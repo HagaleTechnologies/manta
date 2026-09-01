@@ -96,3 +96,13 @@ in other clones, branches, or worktrees.
   --squash` right after opening; GitHub merges it unattended once required
   CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green. See
   docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md.
+
+
+## Code review convergence
+
+Every review round fixes P1 findings inline. From round 2 onward, P2-and-
+lower findings are not fixed inline — they're captured verbatim into a
+follow-up ticket instead, so the PR converges instead of chasing
+progressively finer findings across rounds. Round 1 is unrestricted (fix
+everything reasonable). Full policy:
+docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md.
