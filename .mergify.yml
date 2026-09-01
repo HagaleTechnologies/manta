@@ -102,12 +102,21 @@ pull_request_rules:
               - author = dependabot[bot]
               - approved-reviews-by = github-actions[bot]
       - "#review-threads-unresolved = 0"
-      - or:
-          - check-success = test (ubuntu-latest)
-          - check-skipped = test (ubuntu-latest)
-      - or:
-          - check-success = test (macos-latest)
-          - check-skipped = test (macos-latest)
+      # Plain check-success, no check-skipped OR-clause: unlike `Wait for
+      # Codex Review` above, `test` never legitimately shows `skipped` for
+      # any PR that reaches this rule's evaluation at all -- codex-clean's
+      # job-level skip only fires for draft PRs (already excluded by
+      # -draft above, before this point) or dependabot[bot] (which
+      # deliberately still runs `test` for real, since its own if:
+      # matches `needs.codex-clean.result == 'skipped'`). The ONE case
+      # where `test` genuinely shows skipped is when `codex-clean` itself
+      # FAILED -- and accepting that skip here would let a PR merge
+      # having never actually run its test suite, precisely because the
+      # gate that was supposed to block it hit a problem (Codex-review
+      # follow-up finding, verified against this repo's actual job graph
+      # before applying -- not a blind copy of the suggested fix).
+      - check-success = test (ubuntu-latest)
+      - check-success = test (macos-latest)
       - or:
           - check-success = Wait for Codex Review
           - and:

@@ -750,7 +750,17 @@ jobs:
               echo "::error::Codex's initial review left $unresolved unresolved concern(s) open — resolve them, then push a remediation commit to trigger a fresh re-review."
               exit 1
             fi
-            apply_clean_label
+            # `|| true`: GitHub Actions runs run: blocks under `bash -e`
+            # by default -- a bare call as a standalone statement is NOT
+            # exempt from errexit. apply_clean_label()'s own final-failure
+            # path (`return 1`) is deliberately fail-open (retry, then
+            # warn and let the step continue) -- without `|| true` here,
+            # that same return 1 would instead abort this entire step
+            # under -e, failing the whole required check on a transient
+            # label-POST hiccup even though the review itself was
+            # genuinely clean. The opposite of the function's own
+            # documented intent.
+            apply_clean_label || true
             exit 0
           fi
 
@@ -1057,5 +1067,10 @@ jobs:
           elif [ "$final_check" -gt 0 ]; then
             echo "Codex raised a new concern during thread auto-resolution -- not applying the clean label for this revision."
           else
-            apply_clean_label
+            # `|| true`: a bare statement inside an else branch is still a
+            # simple command under `bash -e` (the errexit exemption only
+            # applies to a command used AS the if/while/until test itself,
+            # not to a branch's body) -- same fail-open rationale as the
+            # other call site above.
+            apply_clean_label || true
           fi

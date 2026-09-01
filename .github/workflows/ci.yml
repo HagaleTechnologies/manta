@@ -156,18 +156,24 @@ jobs:
     # "ran and found the round not clean yet" (that produces `failure`).
     # Both `success` and `skipped` mean "proceed."
     #
-    # always() is required, not decorative: GitHub Actions auto-skips a job
-    # whenever ANY of its `needs` jobs was itself skipped, regardless of a
-    # custom if: expression -- the implicit success()-only gate still
-    # applies unless always() overrides it. Without this, `test` silently
-    # never ran (confirmed live on a throwaway draft PR: codex-clean
-    # reported skipped, and `test`/`test-soapy` were ALSO skipped rather
-    # than evaluating this condition at all -- a real gap, not a
-    # hypothetical one, caught by Codex's own review of this PR). always()
-    # only lifts the implicit gate; the explicit result check still
-    # excludes `failure`/`cancelled`, so a genuinely non-clean round still
-    # blocks this job.
-    if: always() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
+    # !cancelled() (not always()) is required, not decorative: GitHub
+    # Actions auto-skips a job whenever ANY of its `needs` jobs was itself
+    # skipped, regardless of a custom if: expression -- the implicit
+    # success()-only gate still applies unless overridden. Without this,
+    # `test` silently never ran (confirmed live on a throwaway draft PR:
+    # codex-clean reported skipped, and `test`/`test-soapy` were ALSO
+    # skipped rather than evaluating this condition at all -- a real gap,
+    # not a hypothetical one, caught by Codex's own review of this PR).
+    # `!cancelled()` lifts the same implicit gate `always()` would, but
+    # additionally stays false when the WHOLE workflow run was cancelled
+    # (e.g. by this file's own concurrency block superseding an older
+    # push) -- `always()` would let this job start anyway in that case,
+    # wasting compute on a run nothing will ever read and surfacing a
+    # spurious cancelled/failing conclusion on a required check for a
+    # revision that was never the real HEAD. The explicit result check
+    # still excludes `failure`, so a genuinely non-clean round still
+    # blocks this job either way.
+    if: "!cancelled() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')"
     strategy:
       fail-fast: false
       matrix:
@@ -186,7 +192,7 @@ jobs:
       - run: cargo test --workspace
   test-soapy:
     needs: codex-clean
-    if: always() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
+    if: "!cancelled() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')"
     strategy:
       fail-fast: false
       matrix:
