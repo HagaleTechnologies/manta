@@ -133,7 +133,9 @@ impl KiwiIqSource {
             tungstenite::client(url, tcp).context("KiwiSDR WebSocket handshake")?;
 
         socket
-            .send(Message::Text(format!("SET auth t=kiwi p={password}").into()))
+            .send(Message::Text(
+                format!("SET auth t=kiwi p={password}").into(),
+            ))
             .context("send SET auth")?;
 
         // Read frames until the server reports the real, device-specific
@@ -304,7 +306,9 @@ impl KiwiIqSource {
 fn ack_audio_rate_if_present(socket: &mut WebSocket<TcpStream>, text: &str) -> Result<()> {
     if let Some(rate) = parse_kv_f64(text, "audio_rate") {
         let cmd = format!("SET AR OK in={} out={TARGET_RATE_HZ}", rate as i64);
-        socket.send(Message::Text(cmd.into())).context("send SET AR OK")?;
+        socket
+            .send(Message::Text(cmd.into()))
+            .context("send SET AR OK")?;
     }
     Ok(())
 }
