@@ -8,11 +8,139 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# wait-for-codex.yml's own concurrency group (keyed on PR number,
+# cancel-in-progress conditional on run_attempt == 1) cancels an earlier
+# push's "Wait for Codex Review" run once a later push supersedes it --
+# meaning the earlier push's codex-clean:<sha12> label can never be
+# produced. Without a concurrency block here too, THIS workflow's own run
+# (including the codex-clean job below, which polls for exactly that
+# label) would keep running for its full 95-minute timeout as a zombie
+# even though its only possible label producer was just cancelled.
+#
+# This workflow also runs on push:main and merge_group, neither of which
+# has a PR number to key on and must never cancel a different such run
+# mid-flight -- falling back to github.run_id for that case makes
+# cancellation a no-op there (each such run gets its own group).
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+  # pull-requests: read and issues: read are narrowed further at the
+  # codex-clean job level below -- a job's own permissions: block can only
+  # be a SUBSET of what's granted here, never wider. Without these scopes
+  # present at this top level, GitHub rejects the whole workflow file at
+  # parse time (zero jobs created, no per-job error) the moment codex-clean
+  # requests a scope this block doesn't grant.
+  pull-requests: read
+  # codex-clean's poll step calls `gh api repos/$REPO/issues/$PR/labels`
+  # (GET) -- that endpoint family is scoped under Issues in GitHub's token
+  # model, not Pull Requests, regardless of the fact that the target is a
+  # PR (PRs are issues for labeling purposes).
+  issues: read
 
 jobs:
+  # codex-clean gate: defers `test`/`test-soapy` until wait-for-codex.yml
+  # signals this exact revision's Codex round raised nothing new.
+  # Self-contained (no `uses:` call) since this repo is public.
+  # gate_timeout_minutes is fixed at 95, derived from this repo's OWN
+  # wait-for-codex job (75min timeout / 70min in-script poll bound, see
+  # wait-for-codex.yml).
+  codex-clean:
+    name: Codex review clean (gate before test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    # dependabot[bot] and draft-PR exclusion mirrors wait-for-codex.yml's
+    # own eligibility check -- belt-and-suspenders against that
+    # producer-side skip ever drifting from this consumer-side one. Scoped
+    # to pull_request only -- merge_group and push:main events never reach
+    # this job at all, matching wait-for-codex.yml's own merge_group
+    # pass-through (that event has no PR to gate and no label to wait for).
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false
+    steps:
+      - name: "Bootstrap check: does the base branch's wait-for-codex.yml have the codex-clean label mechanism yet?"
+        id: bootstrap-check
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # skimmer's wait-for-codex.yml PRE-DATES this migration -- it
+          # already exists at every reachable base.sha, so a mere-existence
+          # check (a bare 404-vs-200 on the file path) can NEVER resolve to
+          # "absent" and would provide zero protection against the
+          # bootstrap gap (pull_request_target always evaluates the BASE
+          # branch's copy of wait-for-codex.yml, never this PR's own -- so
+          # the PR introducing apply_clean_label() can't produce a label
+          # for its own pushes until it merges). Check CONTENT instead.
+          err_file="$(mktemp)"
+          if content=$(gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" -H "Accept: application/vnd.github.raw" 2>"$err_file"); then
+            if echo "$content" | grep -q "apply_clean_label"; then
+              echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Base branch's wait-for-codex.yml at $BASE_SHA has no apply_clean_label() yet -- this is the bootstrap PR itself. Passing through unconditionally."
+              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            err="$(cat "$err_file")"
+            if echo "$err" | grep -qiE "HTTP 404|not found"; then
+              echo "::warning::Base branch has no wait-for-codex.yml at all at $BASE_SHA -- this is the bootstrap PR itself. Passing through unconditionally."
+              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
+            else
+              echo "bootstrap_status=fetch-failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not determine whether base branch's wait-for-codex.yml has the label mechanism (non-404 failure fetching $BASE_SHA, failing closed): $err"
+              exit 1
+            fi
+          fi
+
+      - name: Pass through -- not a synchronize event, or bootstrap not yet live on the base branch
+        if: github.event.action != 'synchronize' || steps.bootstrap-check.outputs.bootstrap_status == 'absent'
+        run: echo "Passing through (event action=${{ github.event.action }}, bootstrap_status=${{ steps.bootstrap-check.outputs.bootstrap_status }}) -- no prior round to converge on, or this is the bootstrap PR itself."
+
+      - name: Poll for the codex-clean label on this exact revision
+        if: github.event.action == 'synchronize' && steps.bootstrap-check.outputs.bootstrap_status == 'ready'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          target="codex-clean:${HEAD_SHA:0:12}"
+          # In-script deadline runs a 7-minute margin under this job's own
+          # 95-minute timeout-minutes, leaving slack for the loop to notice
+          # and error out cleanly before GitHub kills the job outright.
+          END=$((SECONDS + 95 * 60 - 420))
+          while [ $SECONDS -lt $END ]; do
+            # per_page=100: labels accumulate one per round with no
+            # cleanup (deleting a stale label is itself a race that can
+            # delete a newer revision's already-valid one), so a long
+            # review loop can push the current label past the REST
+            # default page size of 30.
+            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '[.[].name]' 2>/dev/null); then
+              if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
+                echo "Found $target -- this round raised nothing new, safe to run the gated jobs."
+                exit 0
+              fi
+            fi
+            echo "Still waiting for $target..."
+            sleep 20
+          done
+          echo "::error::$target never appeared within the gate's timeout budget -- this revision's Codex round either hasn't converged or the label failed to apply. See wait-for-codex.yml's own run for this SHA."
+          exit 1
   test:
+    needs: codex-clean
+    # codex-clean can legitimately report `skipped` (a draft PR,
+    # dependabot[bot] PR, or a push:main/merge_group event -- see
+    # codex-clean's own eligibility `if:` above), which is different from
+    # "ran and found the round not clean yet" (that produces `failure`).
+    # Both `success` and `skipped` mean "proceed."
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +158,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
   test-soapy:
+    needs: codex-clean
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
     strategy:
       fail-fast: false
       matrix:
