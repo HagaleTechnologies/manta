@@ -40,6 +40,22 @@
 # breaking/major bumps get labeled "needs-review" and are excluded outright
 # by the `-label = needs-review` condition below, so only already-vetted
 # minor/patch bumps ever reach this author check.
+#
+# max_parallel_checks: 1 (required -- confirmed live via a real `@Mergifyio
+# queue` attempt on this repo's own migration PR, which Mergify rejected
+# outright without it): this repo's ruleset has
+# strict_required_status_checks_policy: true, which Mergify refuses to pair
+# with its default draft-PR validation (a synthetic PR re-running checks
+# against a merge-commit preview) -- that mode is fundamentally incompatible
+# with "checks must have run against the exact up-to-date branch tip."
+# max_parallel_checks: 1, combined with batch_size: 1 (already set) and no
+# separate merge_conditions (so queue admission and the final merge check
+# are the same condition set), is what makes Mergify reuse the PR's own
+# already-green checks in place instead of creating a draft PR -- see
+# docs.mergify.com/merge-queue/rules, "in-place checks."
+merge_queue:
+  max_parallel_checks: 1
+
 queue_rules:
   - name: default
     merge_method: squash
