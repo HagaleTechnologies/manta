@@ -1046,23 +1046,39 @@ jobs:
           # time as the very last thing before this step exits, to keep
           # the window between "confirmed clean" and "label applied" as
           # small as it can be (Codex P2, flagged reviewing this file).
+          # Requests `id` (without it, every `.id` projection below is
+          # null, so subtracting $baselineInitiated -- real thread ID
+          # strings -- never removes anything, and this check reports a
+          # false "new concern" on EVERY round with any lingering
+          # Codex-authored unresolved thread, permanently blocking the
+          # clean label even on a genuinely clean round) and full
+          # `comments` with `createdAt` (without it, Codex restating a
+          # concern as a FRESH comment inside an EXISTING baseline thread,
+          # rather than opening a new thread, goes undetected -- the
+          # thread ID isn't new, so a pure ID-diff against baseline treats
+          # it as already-accounted-for even though this exact revision
+          # just had that concern reconfirmed). Both caught by Codex's own
+          # review of this exact block.
           if ! final_check=$(gh api graphql -f query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $pr) {
                   reviewThreads(first: 100) {
-                    nodes { isResolved comments(first: 1) { nodes { author { login } } } }
+                    nodes { id isResolved comments(first: 50) { nodes { author { login } createdAt } } }
                   }
                 }
               }
             }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" 2>/tmp/final-check-err.log \
-            | jq --argjson baselineInitiated "$baseline_initiated" '
+            | jq --argjson baselineInitiated "$baseline_initiated" --arg since "$RUN_STARTED" '
               [.data.repository.pullRequest.reviewThreads.nodes[]
                 | select(.isResolved == false)
                 | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+                | select(
+                    (.id as $id | ($baselineInitiated | index($id)) == null)
+                    or ([.comments.nodes[] | select(.createdAt >= $since)] | length > 0)
+                  )
                 | .id
-              ] as $codex_unresolved
-              | ($codex_unresolved - $baselineInitiated) | length'); then
+              ] | length'); then
             echo "::warning::Could not run the final PR-wide recheck -- not applying the clean label for this revision (fail closed): $(cat /tmp/final-check-err.log)"
           elif [ "$final_check" -gt 0 ]; then
             echo "Codex raised a new concern during thread auto-resolution -- not applying the clean label for this revision."
