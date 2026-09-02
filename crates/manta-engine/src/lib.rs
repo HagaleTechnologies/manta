@@ -192,14 +192,18 @@ pub fn decode_samples(
     for ev in &events {
         spots.extend(validator.ingest(ev));
     }
-    // Calibrated from the same (still-uncorrected) `events` the validator
-    // above just ingested -- validator.ingest() already applied its own
-    // correction to its internal spot output, so this must not run before
-    // that loop (MAN-29 review round 3).
-    let events: Vec<DecoderEvent> = events
-        .iter()
-        .map(|ev| calibrate_track_meta(ev, calibration_factor))
-        .collect();
+    // Mutated in place, after the validator above has already ingested the
+    // raw values (validator.ingest() applied its own correction to its
+    // internal spot output, so this must not run before that loop) --
+    // collecting into a second `Vec` here would clone every event while
+    // Rust keeps the original alive until this function returns, doubling
+    // peak memory on a long/dense offline decode for no reason (MAN-29
+    // review round 4).
+    for ev in events.iter_mut() {
+        if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
+            *freq_hz *= calibration_factor;
+        }
+    }
     Ok(DecodeReport {
         freq_hz,
         wpm,

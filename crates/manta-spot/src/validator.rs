@@ -150,8 +150,10 @@ impl Validator {
     /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key, though
     /// that key is a raw multiplier -- this crate's contract is ppm, per
     /// the spec). Applied to a spot's reported frequency before emission
-    /// (MAN-29). Errors if `ppm` doesn't yield a finite, positive
-    /// correction factor (NaN, infinite, or ppm ≤ -1e6).
+    /// (MAN-29). Errors if `ppm` is outside the supported range
+    /// `[-1000, 1000]` (any physically-plausible oscillator drift; see
+    /// `MAX_ABS_PPM`), or doesn't yield a finite, positive correction
+    /// factor within that range.
     pub fn with_freq_correction_ppm(mut self, ppm: f64) -> Result<Self, InvalidCalibration> {
         self.freq_calibration = calibration_factor_from_ppm(ppm)?;
         Ok(self)
