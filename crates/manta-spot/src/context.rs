@@ -42,8 +42,18 @@ static UP_RE: LazyLock<Regex> =
 /// source of false-positive `Beacon` tags (see MAN-37 decision notes) --
 /// bounded blast radius since `Beacon` only lifts the repetition-gate
 /// requirement (ARCHITECTURE §6 step 4), it doesn't bypass grammar/cty.
+/// Never fires when a bare `CQ` or `DE` token appears anywhere in `text`,
+/// even if the adjacency-strict `CQ_CALL_RE`/`DE_RE` patterns themselves
+/// failed to match (e.g. filler-word forms like "CQ DX <call>") -- an
+/// explicit framing keyword must never be reinterpreted as Beacon just
+/// because its own restricted pattern didn't fire (Codex review on PR #65).
 static POWER_STEP_BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+T\b").unwrap());
+/// Bare `DE` token, analogous to `CQ_TOKEN_RE` -- used only to keep the
+/// power-step fallback from firing over explicit `DE` framing that
+/// `DE_RE` itself failed to match due to filler words (mirrors the
+/// `CQ_TOKEN_RE` guard below; MAN-37 review).
+static DE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDE\b").unwrap());
 
 /// Scans `text` for the first CQ/DE/beacon context pattern, returning the
 /// callsign candidate (uppercased), its spot type, and the byte range in
@@ -86,9 +96,17 @@ pub fn parse(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
         let m = caps.get(0).unwrap();
         return Some((caps[1].to_uppercase(), SpotType::De, m.range()));
     }
-    if let Some(caps) = POWER_STEP_BEACON_RE.captures(text) {
-        let m = caps.get(0).unwrap();
-        return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
+    if !CQ_TOKEN_RE.is_match(text) && !DE_TOKEN_RE.is_match(text) {
+        // `captures` alone only ever returns the FIRST "<call> T" match in
+        // `text`; with the 16-word rolling window this fallback actually
+        // runs against, an older, already-attempted occurrence sitting
+        // earlier in the window must not starve a newer, genuinely valid
+        // one -- take the last (newest) match instead (Codex review on
+        // PR #65).
+        if let Some(caps) = POWER_STEP_BEACON_RE.captures_iter(text).last() {
+            let m = caps.get(0).unwrap();
+            return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
+        }
     }
     None
 }
@@ -191,5 +209,38 @@ mod tests {
             parse_type("CQ K5ARH K5ARH T"),
             Some(("K5ARH".to_string(), SpotType::Cq))
         );
+    }
+
+    #[test]
+    fn power_step_fallback_picks_the_newest_call_t_occurrence() {
+        // Codex review on PR #65: `captures` on its own only ever returns
+        // the FIRST "<call> T" match in the window. Once an older one
+        // (already attempted/rejected) is sitting earlier in the window,
+        // a newer, genuinely valid beacon occurrence must not be starved
+        // by it -- the fallback has to pick the newest match, not the
+        // oldest.
+        assert_eq!(
+            parse_type("W1AW T K5ARH T"),
+            Some(("K5ARH".to_string(), SpotType::Beacon))
+        );
+    }
+
+    #[test]
+    fn cq_dx_filler_call_followed_by_lone_t_is_not_beacon() {
+        // Codex review on PR #65: "CQ DX <call>" doesn't match CQ_CALL_RE
+        // (the "DX" filler breaks the tight adjacency pattern -- a known,
+        // documented gap), but that must never let the power-step
+        // fallback pick it up as Beacon just because the restricted CQ
+        // pattern failed to match -- that would turn a merely-unrecognized
+        // CQ call into one that wrongly bypasses the repetition gate.
+        assert_eq!(parse_type("CQ DX K5ARH T"), None);
+    }
+
+    #[test]
+    fn de_dx_filler_call_followed_by_lone_t_is_not_beacon() {
+        // Same class of gap as the CQ case above, applied symmetrically:
+        // "DE DX <call>" doesn't match DE_RE's tight adjacency pattern
+        // either, and must not fall through to the power-step fallback.
+        assert_eq!(parse_type("DE DX K5ARH T"), None);
     }
 }
