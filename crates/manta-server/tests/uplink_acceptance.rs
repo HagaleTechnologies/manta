@@ -63,7 +63,7 @@ struct Harness {
 /// handles the test drives.
 fn spawn_uplink(target_port: u16, dry_run: bool) -> Harness {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch));
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -232,7 +232,7 @@ async fn disabled_uplink_makes_no_connection_attempt() {
     let addr = listener.local_addr().unwrap();
 
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch));
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
