@@ -25,52 +25,113 @@ MAN-30's fate.
    below if the Pi4 itself is too slow to build from source in reasonable
    time (it isn't, in practice; a from-scratch `manta-engine` release build
    takes a few minutes on Pi4, not hours).
-2. `cargo test --release -p manta-engine --test cpu_budget -- --ignored --nocapture`
+2. Record throttling/clock state *before* the first run, so a throttled
+   or overclocked Pi doesn't get silently misread as a CPU-budget result:
+   ```
+   vcgencmd get_throttled
+   vcgencmd measure_clock arm
+   ```
+   `get_throttled`'s bitmask: any of bits 0-3 set means it's throttled or
+   under-voltage *right now*; bits 16-19 mean it happened at some point
+   since boot. `0x0` is the clean baseline you want before you start.
+   Record the raw hex value, and whether the board is running stock or
+   overclocked config (`/boot/firmware/config.txt`'s `arm_freq`/`over_voltage`,
+   if set).
+3. `cargo test --release -p manta-engine --test cpu_budget -- --ignored --nocapture`
    **Must be `--release`.** Plain `cargo test` measures dev-profile speed
    (~1.45x slower per this workspace's `opt-level = 1` first-party dev
    profile — see `docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`
    item 5) and will produce a misleadingly pessimistic number.
-3. Read the printed ratio:
+4. Read the printed output:
    ```
-   cpu_budget: <N>s wall / 15.00s audio = <ratio>x realtime (Mac budget: < 0.5x)
+   cpu_budget: 300 unique tracks decoded (scene has 300 signals)
+   cpu_budget: <N>s wall / 15.00s audio = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
+   cpu_budget: <N>s (user+sys) CPU / 15.00s audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
    ```
-   The printed "Mac budget" label is a leftover from the Mac-only assertion
-   in this same test file — the Pi4 accept threshold per ROADMAP.md M2 is
-   **< 1.0x realtime** (< 1 full core), not < 0.5x. The test's own
-   `assert!` only checks the 0.5x Mac bar and will `panic` on Pi4 even for
-   a passing Pi4 result — that's expected; read the printed ratio yourself
-   rather than trusting the test's pass/fail exit code on Pi4. (If this
-   becomes a recurring manual step, consider adding a Pi4-specific
-   `#[ignore]`d test with its own 1.0x assertion instead of overloading
-   this one — out of scope for a measurement-only change.)
-4. Also capture real vs. user CPU time, not just wall clock, so a future
-   reader can tell whether the pipeline stayed close to single-core-bound
-   on Pi4 the way it does on Mac (see pins doc item 7 — the wall-clock and
-   CPU-time budgets are only known to be equivalent on Mac-class hardware;
-   confirm the same holds on Pi4 rather than assuming it):
-   ```
-   /usr/bin/time -v cargo test --release -p manta-engine --test cpu_budget -- --ignored --nocapture
-   ```
-   (`-v` is the GNU coreutils `time` verbose flag, standard on Raspberry Pi
-   OS; note this is *not* the same flag as macOS's BSD `/usr/bin/time -l`.)
-   Record wall, user, and sys seconds.
+   - **The track count line must read close to 300** (the test itself
+     asserts >= 285, but read the real number). A materially lower count
+     means the detector promoted fewer simultaneous tracks than the
+     scene intends, and the run below it is benchmarking a cheaper
+     workload than the ROADMAP.md criterion actually specifies — don't
+     trust the timing numbers if this failed.
+   - **The `(user+sys) CPU / audio` line — not the wall-clock line — is
+     the number to compare against the Pi4 budget (< 1.0x).** ROADMAP.md's
+     criterion is a CPU-time budget ("< 1 full core"), and wall-clock only
+     equals CPU time when the pipeline is single-core-bound. That's true
+     on Mac today (confirmed by direct measurement — see the pins doc and
+     the 2026-09-02 decision doc) but has not been separately confirmed on
+     Pi4's 4 weaker, differently-scheduled cores; the test now measures
+     both so you don't have to assume they still match on Pi4. If the two
+     ratios diverge noticeably (CPU-time ratio much higher than
+     wall-clock), that divergence *is* the finding — record it, it means
+     the pipeline used more aggregate core-time than the wall-clock number
+     alone would suggest.
+   - The test's own `assert!` only checks the Mac 0.5x wall-clock bar and
+     will `panic` on Pi4 even for a passing Pi4 CPU-time result — expected;
+     judge Pi4 pass/fail from the printed `core-seconds` line yourself
+     rather than the test's exit code. (If this becomes a recurring manual
+     step, consider adding a Pi4-specific `#[ignore]`d test with its own
+     1.0x assertion on the CPU-time ratio instead of overloading this one
+     — out of scope for this measurement-only change.)
 5. Run it 3+ times back to back — SBC thermal throttling under sustained
-   load is a real and common Pi4 failure mode that a single short run can
-   miss. Watch for the ratio drifting upward across runs (a sign of
-   throttling) rather than staying flat.
-6. Record the result (date, Pi4 revision/RAM size, OS version, ratio,
-   whether it throttled, pass/fail against the 1.0x bar) in this file's
-   "Runs" section below.
+   load is a real and common Pi4 failure mode. Re-check `vcgencmd
+   get_throttled` and `measure_clock arm` after the last run, not just
+   before the first: a Pi already throttled at the start, or throttled
+   uniformly across all three runs, produces *flat* ratios and would look
+   unthrottled by drift alone — the throttling flags are the direct
+   signal, an upward drift across runs is only a secondary corroborating
+   one.
+6. Record the result (date, Pi4 revision/RAM size, OS version, stock vs.
+   overclocked config, throttling flags before/after, track count, both
+   ratios, pass/fail against the 1.0x CPU-time bar) in this file's "Runs"
+   section below.
 
 ## Cross-compiling (only if native build is impractical)
 
+Cross-compiling for aarch64 needs a linker and glibc sysroot for that
+target, not just Rust's own target libraries — `rustup target add` alone
+does not provide either, and this repo has no `.cargo/config.toml`
+supplying one (checked 2026-09-02), so a bare `cargo build --target
+aarch64-unknown-linux-gnu` will fail at the link step on a non-aarch64
+host. Two ways to get a working cross toolchain:
+
+**Option A — `cross` (Docker-based, simplest):**
 ```
-rustup target add aarch64-unknown-linux-gnu
-cargo test --release --target aarch64-unknown-linux-gnu -p manta-engine \
+cargo install cross --git https://github.com/cross-rs/cross
+cross test --release --target aarch64-unknown-linux-gnu -p manta-engine \
   --test cpu_budget --no-run -- --ignored --nocapture
-# copy the resulting target/aarch64-unknown-linux-gnu/release/deps/cpu_budget-<hash>
-# binary to the Pi4 and run it directly there.
 ```
+`cross` runs the build inside a container that already has the
+`aarch64-linux-gnu` toolchain and a matching sysroot configured — no
+manual linker setup needed. Requires Docker (or Podman) on the build host.
+
+**Option B — native cross-linker package + explicit Cargo linker config:**
+```
+# Debian/Ubuntu build host:
+sudo apt install gcc-aarch64-linux-gnu
+
+# Either set this for one invocation:
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  cargo test --release --target aarch64-unknown-linux-gnu -p manta-engine \
+  --test cpu_budget --no-run -- --ignored --nocapture
+
+# ...or add to .cargo/config.toml (not committed to this repo — local only,
+# since the fleet's other build hosts aren't all cross-compiling for Pi4):
+#   [target.aarch64-unknown-linux-gnu]
+#   linker = "aarch64-linux-gnu-gcc"
+```
+
+Either way, `--no-run` only *builds* the test binary — it does not embed
+`--ignored --nocapture` into it (those are libtest flags interpreted at
+*run* time, not compile time, and `--no-run` skips the run entirely). Copy
+the resulting binary over and invoke it directly with those same flags on
+the Pi4 itself, or the `#[ignore]`d test silently no-ops:
+
+```
+scp target/aarch64-unknown-linux-gnu/release/deps/cpu_budget-<hash> pi4:~/cpu_budget
+ssh pi4 './cpu_budget --ignored --nocapture'
+```
+
 Nothing in `manta-engine`'s own `Cargo.toml` pulls in SoapySDR or another
 native SDR library (checked 2026-09-02) — this bench only needs
 `manta-testkit`'s synthetic scene generator, no hardware-specific features
