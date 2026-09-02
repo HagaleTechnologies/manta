@@ -8,6 +8,7 @@ members = [
     "crates/manta-engine",
     "crates/manta-spot",
     "crates/manta-cli",
+    "crates/manta-soak-harness",
 ]
 
 [workspace.package]

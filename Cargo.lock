@@ -867,6 +867,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "manta-soak-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hound",
+ "libc",
+ "manta-dsp",
+ "manta-engine",
+ "manta-input",
+ "manta-testkit",
+ "num-complex",
+ "serde_json",
+]
+
+[[package]]
 name = "manta-spot"
 version = "0.1.0"
 dependencies = [

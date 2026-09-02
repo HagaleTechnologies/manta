@@ -6,6 +6,10 @@ pub use listen::listen;
 pub mod soak;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
+pub mod soak_metrics;
+pub use soak_metrics::{
+    soak_metrics_passed, soak_with_metrics, SoakCloseCounts, SoakMetricsReport, SoakMetricsSample,
+};
 
 mod track;
 pub use track::DetectorConfig;

@@ -439,13 +439,18 @@ impl TrackManager {
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
     /// SPEC §2.5 and ARCHITECTURE §4/§8 both describe these closes as
-    /// "counted" -- this is the count. Not yet wired to an external
-    /// exposition (the Prometheus text endpoint is explicit M3 scope).
-    // Temporary: no non-test caller yet -- M3's metrics endpoint is this
-    // count's first real consumer.
-    #[allow(dead_code)]
+    /// "counted" -- this is the count. Wired into `soak_metrics::soak_with_metrics`
+    /// (MAN-19) ahead of the real M3 Prometheus endpoint.
     pub fn close_counts(&self) -> CloseCounts {
         self.close_counts
+    }
+
+    /// Count of tracks currently open (`self.tracks`, SPEC §2.5). Alongside
+    /// `close_counts`, this is what MAN-19's 24h soak needs visible at
+    /// every sample interval -- ROADMAP.md's M2 accept criterion ("track
+    /// count and evictions visible in metrics").
+    pub fn active_track_count(&self) -> usize {
+        self.tracks.len()
     }
 
     /// Rebuild `owner_of` from scratch against the current `tracks` map.
