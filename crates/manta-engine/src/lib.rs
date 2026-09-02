@@ -17,13 +17,54 @@ use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
 
+/// Applies the calibration factor to a `TrackMeta` event's `freq_hz`,
+/// leaving every other event variant untouched. Used to calibrate the
+/// public-facing event stream (`DecodeReport::events`, `listen()`'s
+/// `on_event` callback) -- both consumed directly by `decode --json`/
+/// `listen --json` -- WITHOUT touching the copy fed to
+/// `manta_spot::Validator::ingest`, which already applies its own
+/// calibration internally; applying it here too would double-correct the
+/// validator's spot output (MAN-29 review round 3).
+pub(crate) fn calibrate_track_meta(ev: &DecoderEvent, factor: f64) -> DecoderEvent {
+    match ev {
+        DecoderEvent::TrackMeta {
+            track_id,
+            snr_2500_db,
+            freq_hz,
+        } => DecoderEvent::TrackMeta {
+            track_id: *track_id,
+            snr_2500_db: *snr_2500_db,
+            freq_hz: freq_hz * factor,
+        },
+        other => other.clone(),
+    }
+}
+
 /// M0 pipeline tunables. SPEC §5.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Classical decoder tunables. SPEC §5.
     pub decode: DecodeConfig,
     /// Real multi-track detector tunables. SPEC §9 `[detector]` table.
     pub detector: track::DetectorConfig,
+    /// Per-source frequency-calibration correction, in ppm (config key
+    /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0.0 = no
+    /// correction). Applied to both the top-level `DecodeReport::freq_hz`
+    /// and every emitted spot's `freq_hz`, so the two never disagree.
+    /// Corrects a drifted source clock/LO -- distinct from
+    /// `manta-spot`'s ~10 Hz decode-accuracy figure (ARCHITECTURE §6 step
+    /// 5), which is decode precision (MAN-29).
+    pub freq_correction_ppm: f64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            decode: DecodeConfig::default(),
+            detector: track::DetectorConfig::default(),
+            freq_correction_ppm: 0.0,
+        }
+    }
 }
 
 /// Result of decoding one signal from an IQ scene. SPEC §5.
@@ -51,6 +92,12 @@ pub fn decode_samples(
     center_freq_hz: f64,
     cfg: &PipelineConfig,
 ) -> Result<DecodeReport> {
+    // Validated up front so a bad config value (NaN, infinite, or ppm so
+    // negative it flips the factor negative/zero) fails fast rather than
+    // after the channelizer/decoder work below (MAN-29).
+    let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     if iq.iter().all(|s| s.re == 0.0 && s.im == 0.0) {
         bail!("input is digital silence");
     }
@@ -127,16 +174,35 @@ pub fn decode_samples(
             DecoderEvent::TrackMeta { freq_hz, .. } => Some(*freq_hz),
             _ => None,
         })
-        .unwrap_or(center_freq_hz);
+        .unwrap_or(center_freq_hz)
+        * calibration_factor;
     let wpm = this_track.iter().rev().find_map(|e| match e {
         DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
         _ => None,
     });
     let text = events_to_text(&this_track);
-    let mut validator = manta_spot::Validator::bundled(fs);
+    // Re-derives the same factor already validated above -- kept behind
+    // the ppm-based constructor rather than a raw-factor setter so no
+    // caller of manta-spot's public API can smuggle in an unchecked
+    // factor (MAN-29 review: validate before construction, not after).
+    let mut validator = manta_spot::Validator::bundled(fs)
+        .with_freq_correction_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));
+    }
+    // Mutated in place, after the validator above has already ingested the
+    // raw values (validator.ingest() applied its own correction to its
+    // internal spot output, so this must not run before that loop) --
+    // collecting into a second `Vec` here would clone every event while
+    // Rust keeps the original alive until this function returns, doubling
+    // peak memory on a long/dense offline decode for no reason (MAN-29
+    // review round 4).
+    for ev in events.iter_mut() {
+        if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
+            *freq_hz *= calibration_factor;
+        }
     }
     Ok(DecodeReport {
         freq_hz,

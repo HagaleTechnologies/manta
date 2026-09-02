@@ -806,6 +806,7 @@ dependencies = [
  "manta-decode",
  "manta-engine",
  "manta-input",
+ "manta-spot",
  "manta-testkit",
  "serde_json",
  "tempfile",

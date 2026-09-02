@@ -11,7 +11,7 @@ pub mod scp;
 pub mod validator;
 
 pub use context::SpotType;
-pub use validator::{Spot, Validator};
+pub use validator::{calibration_factor_from_ppm, InvalidCalibration, Spot, Validator};
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see
 /// `data/SOURCES.md` for provenance and refresh instructions.

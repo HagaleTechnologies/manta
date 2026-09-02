@@ -27,6 +27,19 @@ enum Command {
         /// Emit the full DecodeReport as one JSON object on stdout.
         #[arg(long)]
         json: bool,
+        /// Per-source frequency-calibration correction, in ppm (config key
+        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
+        /// correction). Applied to `freq_hz` and every spot's `freq_hz`.
+        /// Corrects a drifted source clock/LO -- legacy precedent: CW
+        /// Skimmer/SkimSrv's `FreqCalibration=` .ini key (a raw
+        /// multiplier; this flag is ppm, per the spec's contract).
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
+        freq_correction_ppm: f64,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
@@ -60,6 +73,19 @@ enum Command {
         /// Emit DecoderEvents as JSON Lines instead of plain text.
         #[arg(long)]
         json: bool,
+        /// Per-source frequency-calibration correction, in ppm (config key
+        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
+        /// correction). Applied to a spot's reported frequency before
+        /// emission. Corrects a drifted source clock/LO -- legacy
+        /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
+        /// (a raw multiplier; this flag is ppm, per the spec's contract).
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
+        freq_correction_ppm: f64,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -100,6 +126,19 @@ enum Command {
         /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
         #[arg(long, requires = "kiwi_host", default_value = "")]
         kiwi_password: String,
+        /// Per-source frequency-calibration correction, in ppm (config key
+        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
+        /// correction). Applied to a spot's reported frequency before
+        /// emission. Corrects a drifted source clock/LO -- legacy
+        /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
+        /// (a raw multiplier; this flag is ppm, per the spec's contract).
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
+        freq_correction_ppm: f64,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -201,10 +240,30 @@ fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<
     })
 }
 
+/// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
+/// (before opening any source) rather than deep in the pipeline, using the
+/// same validation `manta_spot::calibration_factor_from_ppm` applies
+/// (MAN-29 review).
+fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
+    let ppm: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+    manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| e.to_string())?;
+    Ok(ppm)
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Decode { path, json } => {
-            let report = decode_wav(&path, &PipelineConfig::default())?;
+        Command::Decode {
+            path,
+            json,
+            freq_correction_ppm,
+        } => {
+            let cfg = PipelineConfig {
+                freq_correction_ppm,
+                ..Default::default()
+            };
+            let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
@@ -242,6 +301,7 @@ fn main() -> Result<()> {
             kiwi_freq,
             kiwi_password,
             json,
+            freq_correction_ppm,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -276,9 +336,13 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            let cfg = PipelineConfig {
+                freq_correction_ppm,
+                ..Default::default()
+            };
             manta_engine::listen(
                 src,
-                &PipelineConfig::default(),
+                &cfg,
                 stop,
                 |ev| {
                     if json {
@@ -329,6 +393,7 @@ fn main() -> Result<()> {
             kiwi_port,
             kiwi_freq,
             kiwi_password,
+            freq_correction_ppm,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -358,11 +423,11 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "soapy"))]
             let src = open_source(device, source, kiwi)?;
-            let report = manta_engine::soak(
-                src,
-                &PipelineConfig::default(),
-                std::time::Duration::from_secs(duration),
-            )?;
+            let cfg = PipelineConfig {
+                freq_correction_ppm,
+                ..Default::default()
+            };
+            let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {
                 std::process::exit(1);
