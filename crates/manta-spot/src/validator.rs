@@ -387,14 +387,24 @@ impl Validator {
         let (char_confidences, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
-            // A prior attempt with the SAME type is a genuine re-attempt
-            // (nothing new to evaluate). A prior attempt with a
-            // DIFFERENT type means trailing context has since completed
-            // a real pattern -- a reclassification, not a re-attempt;
-            // let it through so dedupe's type-changed override (below)
-            // can decide whether to emit the corrected spot.
-            if word.attempted && word.last_spot_type == Some(spot_type) {
-                return None;
+            if word.attempted {
+                // A prior attempt with the SAME type is a genuine
+                // re-attempt (nothing new to evaluate). A prior attempt
+                // with a DIFFERENT, non-Unknown-losing type means
+                // trailing context has since completed a real pattern --
+                // a reclassification, not a re-attempt; let it through so
+                // dedupe's type-changed override (below) can decide
+                // whether to emit the corrected spot. Reclassification
+                // only ever promotes (e.g. Unknown -> De, or De -> a
+                // still-more-specific type): a transition INTO Unknown
+                // must never be accepted -- that isn't newly-arrived
+                // context, it's an already-contextualized word's framing
+                // word aging out of the window, which must not erase the
+                // classification it already earned (MAN-28 round 11
+                // review).
+                if word.last_spot_type == Some(spot_type) || spot_type == SpotType::Unknown {
+                    return None;
+                }
             }
             let reclassifying = word.attempted;
             word.attempted = true;

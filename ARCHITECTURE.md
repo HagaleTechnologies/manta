@@ -257,8 +257,12 @@ gathers both per event). An immediate `Unknown`-typed spot is not final: if
 a trailing word later completes a real context pattern for the same word
 (e.g. `<call> UP` -> `De`), that reclassification is emitted as a second
 spot via dedupe's existing type-changed override (step 5) -- an
-already-processed word is not permanently locked to its first type. Legacy
-precedent: CW Skimmer's Watch List (Aggregator manual Appendix A2), which
+already-processed word is not permanently locked to its first type.
+Reclassification is one-way, promotion only: a word that already earned a
+contextual type is never downgraded back to `Unknown` just because its
+framing word ages out of the rolling window -- that's context lost to
+window size, not new information arriving. Legacy precedent: CW Skimmer's
+Watch List (Aggregator manual Appendix A2), which
 exists specifically for calls that wouldn't otherwise pass automatic
 validation (MAN-28). Dedupe (step 5) still applies.
 

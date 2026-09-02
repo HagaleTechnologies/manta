@@ -504,7 +504,7 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V25
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V26
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
@@ -526,6 +526,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V23 | allowlist-reclassification | An allowlisted call spots immediately with no context (type `Unknown`), then a trailing word completes a real context pattern (e.g. `<call> UP` -> `De`) | A second, corrected spot is emitted with the new type -- an already-attempted word is not permanently locked to its first type |
 | V24 | reclassification-reps-reuse | "DE K5ARH" decodes once (reps=1, held back by the repetition gate), then a trailing `CQ` token reclassifies the same word from `De` to `Cq` | Still 0 spots -- the reclassification reuses the word's existing rep count rather than recording a second decode |
 | V25 | metadata-retries-pending-candidate | A `TrackMeta` event arrives for a track with a pending exempt candidate (held back by V22) and no further word ever completes | The candidate is retried and spots as part of the `TrackMeta` ingest itself, not left waiting on a `WordBoundary` that may never come |
+| V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 
 ---
 

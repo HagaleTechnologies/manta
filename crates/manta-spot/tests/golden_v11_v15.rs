@@ -373,3 +373,35 @@ fn v25_pending_candidate_retried_when_metadata_arrives_with_no_further_words() {
          even with no further words, got {spots:?}"
     );
 }
+
+/// V26: reclassification must only ever promote a word's type (e.g.
+/// `Unknown` -> a real context type, V23), never downgrade an
+/// already-contextualized word back to `Unknown` just because its framing
+/// word aged out of the 16-word window. "DE K5ARH" spots as `De`; once
+/// 15 more words push "DE" out of the window while "K5ARH" remains, the
+/// allowlist fallback would otherwise reclassify it to `Unknown` and
+/// dedupe's type-changed override would wrongly re-emit it.
+#[test]
+fn v26_reclassification_never_downgrades_a_contextual_type_to_unknown() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    v.allowlist("K5ARH");
+
+    let first = run(&transmission_events(1, &["DE", "K5ARH"], 0), &mut v);
+    assert_eq!(first.len(), 1, "got {first:?}");
+    assert_eq!(first[0].spot_type, SpotType::De);
+
+    // Push 15 more words so "DE" ages out of the 16-word window while
+    // "K5ARH" remains.
+    let filler: Vec<String> = (1..=15).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    let spots = run(&transmission_events(1, &filler_refs, 300_000), &mut v);
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Unknown),
+        "K5ARH must not revert to Unknown just because its framing word \
+         aged out of the window, got {spots:?}"
+    );
+}
