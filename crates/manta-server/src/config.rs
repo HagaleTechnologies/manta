@@ -88,16 +88,20 @@ pub struct ServerConfig {
     pub metrics_port: u16,
 }
 
-/// `[rbn_uplink]` TOML table -- MAN-32. Outbound telnet client that logs
-/// into RBN's own spot-collection endpoint and forwards manta's spots
-/// there. Absent from a config file entirely (`None`) means the uplink is
-/// off; existing single-node operators see no behavior change. Scoped
-/// `deny_unknown_fields` the same way `ServerConfig` is (see
+/// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
+/// Outbound telnet client that logs into an RBN spot-collection endpoint
+/// and forwards manta's spots there. `DaemonConfigFile.rbn_uplink` holds
+/// zero or more of these -- MAN-42 extended the original MAN-32 single
+/// optional table to a `Vec` so operators can forward to more than one
+/// target; a config with the table omitted entirely still means the
+/// uplink is off, so existing single-node operators see no behavior
+/// change. Scoped `deny_unknown_fields` the same way `ServerConfig` is (see
 /// `DaemonConfigFile`'s doc comment on why the wrapper itself is NOT):
-/// this only needs to reject a typo INSIDE `[rbn_uplink]`, and doing so is
-/// specifically safety-relevant here -- an operator typo like `dry-run`
-/// instead of `dry_run` would otherwise silently parse as the untouched
-/// `dry_run = false` default and start transmitting real spots to RBN.
+/// this only needs to reject a typo INSIDE one `[[rbn_uplink]]` block, and
+/// doing so is specifically safety-relevant here -- an operator typo like
+/// `dry-run` instead of `dry_run` would otherwise silently parse as the
+/// untouched `dry_run = false` default and start transmitting real spots
+/// to RBN.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RbnUplinkConfig {
@@ -133,7 +137,7 @@ impl RbnUplinkConfig {
 /// `[spot]` and other tables this crate doesn't model (SPEC §9) --
 /// deliberately NOT `deny_unknown_fields` here, unlike `ServerConfig`/
 /// `RbnUplinkConfig` themselves: this wrapper only needs to reject a typo
-/// INSIDE `[server]`/`[rbn_uplink]`, which those structs' own
+/// INSIDE `[server]`/`[[rbn_uplink]]`, which those structs' own
 /// `deny_unknown_fields` already does. Denying unknown fields at THIS
 /// level too (an earlier version did) rejected every other real, valid
 /// table in the unified config, making `--server-config` unusable with
@@ -142,7 +146,12 @@ impl RbnUplinkConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DaemonConfigFile {
     pub server: ServerConfig,
-    pub rbn_uplink: Option<RbnUplinkConfig>,
+    /// MAN-42: zero or more `[[rbn_uplink]]` array-of-tables entries --
+    /// changed from MAN-32's single optional `[rbn_uplink]` table. No real
+    /// deployed config used the old single-table syntax, so this is a
+    /// direct breaking change to the TOML shape rather than a migration.
+    #[serde(default)]
+    pub rbn_uplink: Vec<RbnUplinkConfig>,
 }
 
 #[cfg(test)]
@@ -276,10 +285,10 @@ mod tests {
         );
     }
 
-    // MAN-32: [rbn_uplink] table.
+    // MAN-32/MAN-42: [[rbn_uplink]] array-of-tables.
 
     #[test]
-    fn uplink_disabled_by_default_when_table_omitted() {
+    fn uplink_table_omitted_parses_as_empty_vec() {
         let file: DaemonConfigFile = toml::from_str(
             r#"
             [server]
@@ -287,7 +296,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(file.rbn_uplink.is_none());
+        assert!(file.rbn_uplink.is_empty());
     }
 
     #[test]
@@ -296,7 +305,7 @@ mod tests {
             r#"
             [server]
             station_callsign = "W3XYZ"
-            [rbn_uplink]
+            [[rbn_uplink]]
             enabled = true
             "#,
         );
@@ -312,19 +321,60 @@ mod tests {
             r#"
             [server]
             station_callsign = "W3XYZ"
-            [rbn_uplink]
+            [[rbn_uplink]]
             enabled = true
             target_host = "example.invalid"
             target_port = 7300
             "#,
         )
         .unwrap();
-        let uplink = file.rbn_uplink.unwrap();
+        assert_eq!(file.rbn_uplink.len(), 1);
+        let uplink = &file.rbn_uplink[0];
         assert!(uplink.enabled);
         assert_eq!(uplink.target_host, "example.invalid");
         assert_eq!(uplink.target_port, 7300);
         assert!(!uplink.dry_run);
         assert_eq!(uplink.login_callsign, None);
+    }
+
+    #[test]
+    fn two_rbn_uplink_tables_parse_into_a_vec_of_two() {
+        let file: DaemonConfigFile = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "rbn1.example"
+            target_port = 7300
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "rbn2.example"
+            target_port = 7301
+            "#,
+        )
+        .unwrap();
+        assert_eq!(file.rbn_uplink.len(), 2);
+        assert_eq!(file.rbn_uplink[0].target_host, "rbn1.example");
+        assert_eq!(file.rbn_uplink[1].target_host, "rbn2.example");
+    }
+
+    #[test]
+    fn single_bracket_rbn_uplink_table_is_a_parse_error() {
+        // The old MAN-32 single-table syntax no longer parses -- a
+        // `Vec<RbnUplinkConfig>` field can't deserialize from a bare
+        // `[rbn_uplink]` table, only from `[[rbn_uplink]]` array-of-tables.
+        let result: Result<DaemonConfigFile, _> = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [rbn_uplink]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            "#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -339,7 +389,7 @@ mod tests {
             r#"
             [server]
             station_callsign = "W3XYZ"
-            [rbn_uplink]
+            [[rbn_uplink]]
             enabled = true
             target_host = "example.invalid"
             target_port = 7300
@@ -355,7 +405,7 @@ mod tests {
             r#"
             [server]
             station_callsign = "W3XYZ"
-            [rbn_uplink]
+            [[rbn_uplink]]
             enabled = true
             target_host = "example.invalid"
             target_port = 7300

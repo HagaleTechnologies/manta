@@ -25,9 +25,16 @@ pub struct Metrics {
     uplink_suppressed_total: AtomicU64,
     uplink_lagged_total: AtomicU64,
     uplink_reconnects_total: AtomicU64,
-    /// 0/1 rather than a bool -- mirrors `telnet_clients`'s style so it
-    /// renders as a normal Prometheus gauge.
-    uplink_connected: AtomicI64,
+    /// Count of currently-connected uplink targets, not a single 0/1 flag
+    /// -- MAN-42 can spawn multiple independent `uplink::serve` tasks
+    /// sharing this one `Metrics`, and each only increments/decrements its
+    /// own connect/disconnect transition (see `mark_uplink_connected`/
+    /// `mark_uplink_disconnected`). A shared last-writer-wins boolean would
+    /// let one target's failed reconnect attempt clear the gauge while
+    /// another target is genuinely, unrelatedly connected (round-1 review
+    /// finding on MAN-42/PR). For the common single-target case this is
+    /// still exactly 0 or 1, same as before MAN-42.
+    uplink_connected_count: AtomicI64,
 }
 
 impl Metrics {
@@ -148,13 +155,22 @@ impl Metrics {
         self.uplink_reconnects_total.load(Ordering::Relaxed)
     }
 
-    pub fn set_uplink_connected(&self, connected: bool) {
-        self.uplink_connected
-            .store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    /// Call exactly once per `uplink::serve` task each time IT transitions
+    /// from disconnected to connected -- pair with exactly one
+    /// `mark_uplink_disconnected` when that same task's connection ends.
+    /// Unbalanced calls would desync the shared count across tasks.
+    pub fn mark_uplink_connected(&self) {
+        self.uplink_connected_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// See `mark_uplink_connected` -- call only to undo a prior
+    /// `mark_uplink_connected` from the same task's same connection.
+    pub fn mark_uplink_disconnected(&self) {
+        self.uplink_connected_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn uplink_connected(&self) -> bool {
-        self.uplink_connected.load(Ordering::Relaxed) != 0
+        self.uplink_connected_count.load(Ordering::Relaxed) > 0
     }
 
     pub fn render_prometheus_text(&self) -> String {
@@ -274,12 +290,12 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_uplink_connected Whether the RBN uplink is currently connected (1) or not (0).\n",
+            "# HELP manta_uplink_connected Count of configured RBN uplink targets currently connected.\n",
         );
         out.push_str("# TYPE manta_uplink_connected gauge\n");
         out.push_str(&format!(
             "manta_uplink_connected {}\n",
-            self.uplink_connected.load(Ordering::Relaxed)
+            self.uplink_connected_count.load(Ordering::Relaxed)
         ));
 
         out
@@ -384,9 +400,9 @@ mod tests {
         assert_eq!(m.uplink_reconnects_total(), 1);
 
         assert!(!m.uplink_connected());
-        m.set_uplink_connected(true);
+        m.mark_uplink_connected();
         assert!(m.uplink_connected());
-        m.set_uplink_connected(false);
+        m.mark_uplink_disconnected();
         assert!(!m.uplink_connected());
     }
 
@@ -397,11 +413,43 @@ mod tests {
         m.record_uplink_sent();
         m.record_uplink_suppressed();
         m.record_uplink_reconnect();
-        m.set_uplink_connected(true);
+        m.mark_uplink_connected();
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_uplink_sent_total 2"));
         assert!(text.contains("manta_uplink_suppressed_total 1"));
         assert!(text.contains("manta_uplink_reconnects_total 1"));
         assert!(text.contains("manta_uplink_connected 1"));
+    }
+
+    // MAN-42: multiple uplink::serve tasks share one Metrics, so
+    // uplink_connected must reflect how many are currently connected, not
+    // a single last-writer-wins boolean -- otherwise one target's failed
+    // reconnect attempt can flip the gauge to "disconnected" while another
+    // target is genuinely, unrelatedly connected (round-1 review finding
+    // on MAN-42/PR).
+    #[test]
+    fn uplink_connected_reflects_multiple_independently_tracked_targets() {
+        let m = Metrics::new();
+        assert!(!m.uplink_connected());
+
+        // Target A connects.
+        m.mark_uplink_connected();
+        assert!(m.uplink_connected());
+
+        // Target B repeatedly fails to connect/reconnect. It was never
+        // itself marked connected, so its failures must not touch the
+        // shared gauge -- A's connection must still read as connected.
+        m.record_uplink_reconnect();
+        m.record_uplink_reconnect();
+        m.record_uplink_reconnect();
+        assert!(
+            m.uplink_connected(),
+            "an unrelated target's failed reconnects must not clear the gauge \
+             while another target is genuinely connected"
+        );
+
+        // A itself drops -- now nothing is connected.
+        m.mark_uplink_disconnected();
+        assert!(!m.uplink_connected());
     }
 }
