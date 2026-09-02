@@ -21,6 +21,20 @@ pub struct Metrics {
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
+    uplink_sent_total: AtomicU64,
+    uplink_suppressed_total: AtomicU64,
+    uplink_lagged_total: AtomicU64,
+    uplink_reconnects_total: AtomicU64,
+    /// Count of currently-connected uplink targets, not a single 0/1 flag
+    /// -- MAN-42 can spawn multiple independent `uplink::serve` tasks
+    /// sharing this one `Metrics`, and each only increments/decrements its
+    /// own connect/disconnect transition (see `mark_uplink_connected`/
+    /// `mark_uplink_disconnected`). A shared last-writer-wins boolean would
+    /// let one target's failed reconnect attempt clear the gauge while
+    /// another target is genuinely, unrelatedly connected (round-1 review
+    /// finding on MAN-42/PR). For the common single-target case this is
+    /// still exactly 0 or 1, same as before MAN-42.
+    uplink_connected_count: AtomicI64,
 }
 
 impl Metrics {
@@ -102,6 +116,61 @@ impl Metrics {
             .write()
             .expect("source_health lock poisoned")
             .insert(source.to_string(), healthy);
+    }
+
+    // MAN-32: RBN uplink counters. ARCHITECTURE §8's "every
+    // dropped/evicted/suppressed item is counted" invariant applies here
+    // too -- a dry-run-suppressed or lag-dropped spot must be visible,
+    // not silent.
+
+    pub fn record_uplink_sent(&self) {
+        self.uplink_sent_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_sent_total(&self) -> u64 {
+        self.uplink_sent_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_uplink_suppressed(&self) {
+        self.uplink_suppressed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_suppressed_total(&self) -> u64 {
+        self.uplink_suppressed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_uplink_lagged(&self, n: u64) {
+        self.uplink_lagged_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn uplink_lagged_total(&self) -> u64 {
+        self.uplink_lagged_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_uplink_reconnect(&self) {
+        self.uplink_reconnects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_reconnects_total(&self) -> u64 {
+        self.uplink_reconnects_total.load(Ordering::Relaxed)
+    }
+
+    /// Call exactly once per `uplink::serve` task each time IT transitions
+    /// from disconnected to connected -- pair with exactly one
+    /// `mark_uplink_disconnected` when that same task's connection ends.
+    /// Unbalanced calls would desync the shared count across tasks.
+    pub fn mark_uplink_connected(&self) {
+        self.uplink_connected_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// See `mark_uplink_connected` -- call only to undo a prior
+    /// `mark_uplink_connected` from the same task's same connection.
+    pub fn mark_uplink_disconnected(&self) {
+        self.uplink_connected_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_connected(&self) -> bool {
+        self.uplink_connected_count.load(Ordering::Relaxed) > 0
     }
 
     pub fn render_prometheus_text(&self) -> String {
@@ -188,6 +257,47 @@ impl Metrics {
             ));
         }
 
+        out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
+        out.push_str("# TYPE manta_uplink_sent_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_sent_total {}\n",
+            self.uplink_sent_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_suppressed_total Spots suppressed by dry-run instead of sent to the RBN uplink target.\n",
+        );
+        out.push_str("# TYPE manta_uplink_suppressed_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_suppressed_total {}\n",
+            self.uplink_suppressed_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_dropped_lagged_total Spots the uplink fell behind on and lost before its next reconnect.\n",
+        );
+        out.push_str("# TYPE manta_uplink_dropped_lagged_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_dropped_lagged_total {}\n",
+            self.uplink_lagged_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.\n");
+        out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_reconnects_total {}\n",
+            self.uplink_reconnects_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_connected Count of configured RBN uplink targets currently connected.\n",
+        );
+        out.push_str("# TYPE manta_uplink_connected gauge\n");
+        out.push_str(&format!(
+            "manta_uplink_connected {}\n",
+            self.uplink_connected_count.load(Ordering::Relaxed)
+        ));
+
         out
     }
 }
@@ -266,5 +376,80 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    // MAN-32: RBN uplink counters.
+
+    #[test]
+    fn uplink_counters_start_at_zero_and_increment() {
+        let m = Metrics::new();
+        assert_eq!(m.uplink_sent_total(), 0);
+        m.record_uplink_sent();
+        assert_eq!(m.uplink_sent_total(), 1);
+
+        assert_eq!(m.uplink_suppressed_total(), 0);
+        m.record_uplink_suppressed();
+        assert_eq!(m.uplink_suppressed_total(), 1);
+
+        assert_eq!(m.uplink_lagged_total(), 0);
+        m.record_uplink_lagged(3);
+        assert_eq!(m.uplink_lagged_total(), 3);
+
+        assert_eq!(m.uplink_reconnects_total(), 0);
+        m.record_uplink_reconnect();
+        assert_eq!(m.uplink_reconnects_total(), 1);
+
+        assert!(!m.uplink_connected());
+        m.mark_uplink_connected();
+        assert!(m.uplink_connected());
+        m.mark_uplink_disconnected();
+        assert!(!m.uplink_connected());
+    }
+
+    #[test]
+    fn renders_uplink_counters_as_prometheus_metrics() {
+        let m = Metrics::new();
+        m.record_uplink_sent();
+        m.record_uplink_sent();
+        m.record_uplink_suppressed();
+        m.record_uplink_reconnect();
+        m.mark_uplink_connected();
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_uplink_sent_total 2"));
+        assert!(text.contains("manta_uplink_suppressed_total 1"));
+        assert!(text.contains("manta_uplink_reconnects_total 1"));
+        assert!(text.contains("manta_uplink_connected 1"));
+    }
+
+    // MAN-42: multiple uplink::serve tasks share one Metrics, so
+    // uplink_connected must reflect how many are currently connected, not
+    // a single last-writer-wins boolean -- otherwise one target's failed
+    // reconnect attempt can flip the gauge to "disconnected" while another
+    // target is genuinely, unrelatedly connected (round-1 review finding
+    // on MAN-42/PR).
+    #[test]
+    fn uplink_connected_reflects_multiple_independently_tracked_targets() {
+        let m = Metrics::new();
+        assert!(!m.uplink_connected());
+
+        // Target A connects.
+        m.mark_uplink_connected();
+        assert!(m.uplink_connected());
+
+        // Target B repeatedly fails to connect/reconnect. It was never
+        // itself marked connected, so its failures must not touch the
+        // shared gauge -- A's connection must still read as connected.
+        m.record_uplink_reconnect();
+        m.record_uplink_reconnect();
+        m.record_uplink_reconnect();
+        assert!(
+            m.uplink_connected(),
+            "an unrelated target's failed reconnects must not clear the gauge \
+             while another target is genuinely connected"
+        );
+
+        // A itself drops -- now nothing is connected.
+        m.mark_uplink_disconnected();
+        assert!(!m.uplink_connected());
     }
 }

@@ -25,4 +25,14 @@ pub enum DecoderEvent {
         snr_2500_db: f32,
         freq_hz: f64,
     },
+    /// A track has closed (any `CloseReason`: Unconfirmed/HangExpired/
+    /// Silent/Merged/Evicted) and will never emit another event under
+    /// this `track_id` -- `TrackManager::next_id` never reuses one.
+    /// MAN-19: added so per-track_id state downstream (`manta-spot`'s
+    /// `Validator::tracks`, `RepetitionGate::seen`) has a signal to free
+    /// it; without this neither had one, so both grew unboundedly for the
+    /// life of the process under sustained track churn.
+    TrackClosed {
+        track_id: u32,
+    },
 }
