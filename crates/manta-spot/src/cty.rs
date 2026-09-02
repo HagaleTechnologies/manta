@@ -11,14 +11,19 @@
 //! filtered out explicitly.
 
 pub struct Table {
-    /// Sorted, deduplicated prefixes/exact calls, ascending.
+    /// Sorted, deduplicated ordinary prefixes, ascending.
     prefixes: Vec<String>,
+    /// Exact-call overrides (`=`-prefixed in cty.dat, e.g. `=4U1UN`) --
+    /// these match the full callsign only, never as a prefix of a longer
+    /// string, so they're kept out of `prefixes`.
+    exact_calls: std::collections::HashSet<String>,
 }
 
 impl Table {
     /// Parses a `cty.dat` file's full contents.
     pub fn parse(cty_dat: &str) -> Self {
         let mut prefixes = Vec::new();
+        let mut exact_calls = std::collections::HashSet::new();
         for entry in cty_dat.split(';') {
             let entry = entry.trim();
             if entry.is_empty() {
@@ -28,22 +33,34 @@ impl Table {
                 continue; // malformed entry, skip
             };
             for alias in entry[alias_start + 1..].split(',') {
-                if let Some(prefix) = clean_alias(alias) {
-                    prefixes.push(prefix);
+                if let Some((prefix, is_exact)) = clean_alias(alias) {
+                    if is_exact {
+                        exact_calls.insert(prefix);
+                    } else {
+                        prefixes.push(prefix);
+                    }
                 }
             }
         }
         prefixes.sort();
         prefixes.dedup();
-        Self { prefixes }
+        Self {
+            prefixes,
+            exact_calls,
+        }
     }
 
-    /// True if any prefix-length slice of `callsign` (from 1 character up
-    /// to the whole string) is an allocated prefix or exact-call override.
-    /// This is a boolean allocation gate, not a country lookup, so it
-    /// doesn't matter *which* length matches, only that one does.
+    /// True if `callsign` is itself an exact-call override, or if any
+    /// prefix-length slice of it (from 1 character up to the whole string)
+    /// is an allocated ordinary prefix. This is a boolean allocation gate,
+    /// not a country lookup, so it doesn't matter *which* length matches,
+    /// only that one does -- but an exact-call override only ever matches
+    /// the full callsign, never a callsign that merely extends it.
     pub fn is_allocated(&self, callsign: &str) -> bool {
         let call = callsign.to_uppercase();
+        if self.exact_calls.contains(&call) {
+            return true;
+        }
         (1..=call.len()).any(|len| {
             self.prefixes
                 .binary_search(&call[..len].to_string())
@@ -53,16 +70,19 @@ impl Table {
 }
 
 /// Strips a leading `=` (exact-call marker) and any trailing
-/// `(zone)`/`[itu]`/`<coords>`/`{continent}` override annotation. Returns
+/// `(zone)`/`[itu]`/`<coords>`/`{continent}` override annotation, returning
+/// the cleaned prefix and whether it was an exact-call override. Returns
 /// `None` for the file's embedded `=VERSION` metadata marker.
-fn clean_alias(raw: &str) -> Option<String> {
-    let raw = raw.trim().trim_start_matches('=');
+fn clean_alias(raw: &str) -> Option<(String, bool)> {
+    let raw = raw.trim();
+    let is_exact = raw.starts_with('=');
+    let raw = raw.trim_start_matches('=');
     let end = raw.find(['(', '[', '<', '{']).unwrap_or(raw.len());
     let prefix = raw[..end].trim().to_uppercase();
     if prefix.is_empty() || prefix.starts_with("VERSION") {
         return None;
     }
-    Some(prefix)
+    Some((prefix, is_exact))
 }
 
 #[cfg(test)]
@@ -116,5 +136,19 @@ Equatorial Guinea:36: 47: AF:   1.7:  10.3: -1.0: 3C:
         let table = Table::parse(FIXTURE);
         // "KL7(1)[65]" must register as prefix "KL7", not "KL7(1)[65]".
         assert!(table.is_allocated("KL7XY"));
+    }
+
+    #[test]
+    fn exact_call_override_does_not_allocate_extensions() {
+        // "=4U1UN" (United Nations HQ) is an exact-call override, not a
+        // prefix -- MAN-35: a bogus callsign that merely extends it (e.g.
+        // "4U1UNA") must not pass the allocation gate.
+        let fixture = "\
+United Nations HQ:5: 4: NA:  40.7: 74.0: 5.0: 4U:
+    =4U1UN;
+";
+        let table = Table::parse(fixture);
+        assert!(table.is_allocated("4U1UN"));
+        assert!(!table.is_allocated("4U1UNA"));
     }
 }
