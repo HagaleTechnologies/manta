@@ -429,6 +429,7 @@ fn start_spot_server(
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let cfg_text = std::fs::read_to_string(config_path)?;
     let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
+    let rbn_uplink_cfg = file.rbn_uplink.clone();
     let cfg = file.server;
 
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(sample_rate_hz, epoch));
@@ -460,12 +461,27 @@ fn start_spot_server(
             cty,
             cfg.station_callsign.clone(),
             decoder_version,
-            shutdown_rx,
+            shutdown_rx.clone(),
         ));
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
             metrics.clone(),
         ));
+        // MAN-32: only spawned when the table is present at all -- the
+        // common case for existing single-node operators is no
+        // [rbn_uplink] table, and uplink::serve itself also no-ops when
+        // `enabled = false` (belt-and-suspenders, not a duplicate check:
+        // this `if let` additionally avoids spawning a task at all for
+        // the common "table absent" case).
+        if let Some(uplink_cfg) = rbn_uplink_cfg {
+            tokio::spawn(manta_server::uplink::serve(
+                uplink_cfg,
+                cfg.station_callsign.clone(),
+                bus.clone(),
+                metrics.clone(),
+                shutdown_rx,
+            ));
+        }
 
         anyhow::Ok(())
     })?;
@@ -789,6 +805,101 @@ mod tests {
         assert_ne!(
             a, b,
             "two different recordings must not collide on the same replay epoch"
+        );
+    }
+
+    // MAN-32: start_spot_server spawns the RBN uplink only when configured
+    // and enabled.
+
+    #[test]
+    fn disabled_uplink_makes_no_connection_attempt_from_the_daemon() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+
+        let cfg_file = write_temp_file(
+            format!(
+                r#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+
+                [rbn_uplink]
+                enabled = false
+                target_host = "127.0.0.1"
+                target_port = {target_port}
+                "#
+            )
+            .as_bytes(),
+        );
+
+        let (rt, _server) =
+            start_spot_server(cfg_file.path(), 96_000.0, std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+
+        let accepted = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                loop {
+                    if target.accept().is_ok() {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        });
+        assert!(
+            accepted.is_err(),
+            "enabled=false must never attempt a connection"
+        );
+    }
+
+    #[test]
+    fn enabled_uplink_connects_to_its_configured_target() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+
+        let cfg_file = write_temp_file(
+            format!(
+                r#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+
+                [rbn_uplink]
+                enabled = true
+                target_host = "127.0.0.1"
+                target_port = {target_port}
+                "#
+            )
+            .as_bytes(),
+        );
+
+        let (rt, _server) =
+            start_spot_server(cfg_file.path(), 96_000.0, std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+
+        let accepted = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if target.accept().is_ok() {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        });
+        assert!(
+            accepted.unwrap_or(false),
+            "enabled=true must connect to the configured target"
         );
     }
 }

@@ -205,7 +205,10 @@ mod tests {
             Duration::from_secs(2)
         );
         assert_eq!(
-            next_backoff(Duration::from_secs(45), &ConnectAttemptError::NeverConnected),
+            next_backoff(
+                Duration::from_secs(45),
+                &ConnectAttemptError::NeverConnected
+            ),
             MAX_BACKOFF
         );
     }
