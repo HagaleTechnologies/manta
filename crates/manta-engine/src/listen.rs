@@ -31,6 +31,11 @@ pub fn listen(
     mut on_event: impl FnMut(&DecoderEvent),
     mut on_spot: impl FnMut(&crate::Spot),
 ) -> Result<()> {
+    // Validated up front so a bad config value fails fast, before spending
+    // CALIBRATION_SECONDS reading from a live device (MAN-29).
+    manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
@@ -54,7 +59,9 @@ pub fn listen(
         cfg.detector,
         cfg.decode.clone(),
     );
-    let mut validator = Validator::bundled(fs).with_freq_calibration(cfg.freq_calibration);
+    let mut validator = Validator::bundled(fs)
+        .with_freq_correction_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
@@ -168,12 +175,13 @@ mod tests {
         );
     }
 
-    /// MAN-29: `PipelineConfig::freq_calibration` reaches the emitted spot's
-    /// `freq_hz`, corrected by the configured factor -- end-to-end through
-    /// `listen()`, not just the `manta-spot::Validator` unit.
+    /// MAN-29: `PipelineConfig::freq_correction_ppm` reaches the emitted
+    /// spot's `freq_hz`, corrected by the configured ppm -- end-to-end
+    /// through `listen()`, not just the `manta-spot::Validator` unit.
     #[test]
-    fn listen_applies_freq_calibration_to_emitted_spot_freq_hz() {
-        const FACTOR: f64 = 1.000_01; // +~140 Hz at 14 MHz.
+    fn listen_applies_freq_correction_ppm_to_emitted_spot_freq_hz() {
+        const PPM: f64 = 10.0; // ~140 Hz at 14 MHz.
+        let factor = 1.0 + PPM * 1e-6;
 
         let spec = manta_testkit::vectors::v1();
         let rendered = manta_testkit::vectors::render(&spec).unwrap();
@@ -185,7 +193,7 @@ mod tests {
         });
 
         let cfg = PipelineConfig {
-            freq_calibration: FACTOR,
+            freq_correction_ppm: PPM,
             ..Default::default()
         };
 
@@ -195,14 +203,34 @@ mod tests {
 
         assert!(!spots.is_empty(), "V1's repeated W1AW should have spotted");
         for spot in &spots {
-            let uncorrected = spot.freq_hz / FACTOR;
+            let uncorrected = spot.freq_hz / factor;
             assert!(
                 (uncorrected - (spec.center_freq_hz + 12_340.0)).abs() < 100.0,
                 "spot.freq_hz {} divided back by the calibration factor should land near the \
-                 raw decoded frequency {}, proving the factor was applied once, multiplicatively",
+                 raw decoded frequency {}, proving the correction was applied once, multiplicatively",
                 spot.freq_hz,
                 spec.center_freq_hz + 12_340.0
             );
         }
+    }
+
+    /// MAN-29 review: an invalid `freq_correction_ppm` must fail `listen()`
+    /// up front rather than silently poisoning spot output.
+    #[test]
+    fn listen_rejects_an_invalid_freq_correction_ppm() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig {
+            freq_correction_ppm: f64::NAN,
+            ..Default::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(listen(src, &cfg, stop, |_ev| {}, |_spot| {}).is_err());
     }
 }

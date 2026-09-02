@@ -54,6 +54,42 @@ struct TrackState {
     wpm: f32,
 }
 
+/// A `freq_correction_ppm` value that doesn't yield a finite, positive
+/// calibration factor. Rejected before construction so an invalid config
+/// value (NaN, infinity, or a ppm so negative it flips the correction
+/// negative or zero) can never poison an emitted spot's frequency or its
+/// dedupe bucket (MAN-29).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InvalidCalibration {
+    pub ppm: f64,
+    pub factor: f64,
+}
+
+impl std::fmt::Display for InvalidCalibration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "freq_correction_ppm {} yields calibration factor {}, which must be finite and positive",
+            self.ppm, self.factor
+        )
+    }
+}
+
+impl std::error::Error for InvalidCalibration {}
+
+/// Converts a ppm frequency-correction setting (config key
+/// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4) into the
+/// multiplicative factor applied to a spot's reported frequency:
+/// `factor = 1.0 + ppm * 1e-6`. Errors if the result isn't finite and
+/// positive (MAN-29).
+pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> {
+    let factor = 1.0 + ppm * 1e-6;
+    if !factor.is_finite() || factor <= 0.0 {
+        return Err(InvalidCalibration { ppm, factor });
+    }
+    Ok(factor)
+}
+
 pub struct Validator {
     cty: cty::Table,
     scp: Option<scp::Set>,
@@ -81,16 +117,19 @@ impl Validator {
         Self::new(fs, crate::CTY_DAT, Some(crate::MASTER_SCP))
     }
 
-    /// Sets the per-source frequency-calibration correction factor
-    /// (multiplicative, 1.0 = no correction). Corrects a systematically
-    /// drifted source clock/LO (legacy precedent: CW Skimmer/SkimSrv's
-    /// `FreqCalibration=` .ini key) -- distinct from this crate's ~10 Hz
-    /// decode-accuracy figure (ARCHITECTURE §6 step 5), which is decode
-    /// precision, not source calibration. Applied to a spot's reported
-    /// frequency before emission (MAN-29).
-    pub fn with_freq_calibration(mut self, factor: f64) -> Self {
-        self.freq_calibration = factor;
-        self
+    /// Sets the per-source frequency-calibration correction (config key
+    /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4 -- the
+    /// oscillator-accuracy setting that section names as out of scope for
+    /// the ±10 Hz decode-accuracy figure it defines, ARCHITECTURE §6 step
+    /// 5). Corrects a systematically drifted source clock/LO (legacy
+    /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key, though
+    /// that key is a raw multiplier -- this crate's contract is ppm, per
+    /// the spec). Applied to a spot's reported frequency before emission
+    /// (MAN-29). Errors if `ppm` doesn't yield a finite, positive
+    /// correction factor (NaN, infinite, or ppm ≤ -1e6).
+    pub fn with_freq_correction_ppm(mut self, ppm: f64) -> Result<Self, InvalidCalibration> {
+        self.freq_calibration = calibration_factor_from_ppm(ppm)?;
+        Ok(self)
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -339,16 +378,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots[0].spot_type, SpotType::De);
     }
 
-    /// MAN-29: a configured per-source frequency-calibration factor
+    /// MAN-29: a configured per-source frequency-calibration correction
+    /// (config key `input.freq_correction_ppm`, SPEC-decode-core.md §1.4)
     /// corrects a spot's reported frequency before emission -- distinct
     /// from the ~10 Hz decode-accuracy figure (ARCHITECTURE §6 step 5),
     /// which is decode precision, not a drifted source clock/LO.
     #[test]
-    fn calibration_factor_corrects_emitted_spot_frequency() {
+    fn calibration_ppm_corrects_emitted_spot_frequency() {
         const RAW_FREQ_HZ: f64 = 14_027_000.0;
-        const FACTOR: f64 = 1.000_002_3; // e.g. +32 Hz at 14 MHz, LO drift scale.
+        const PPM: f64 = 10.0; // SPEC's own worked example (§1.4).
 
-        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_freq_calibration(FACTOR);
+        let mut v = Validator::new(FS, CTY_FIXTURE, None)
+            .with_freq_correction_ppm(PPM)
+            .unwrap();
         v.ingest(&DecoderEvent::TrackMeta {
             track_id: 1,
             snr_2500_db: 20.0,
@@ -359,16 +401,16 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
 
         assert_eq!(spots.len(), 1);
-        let expected = RAW_FREQ_HZ * FACTOR;
+        let expected = RAW_FREQ_HZ * (1.0 + PPM * 1e-6);
         assert!(
             (spots[0].freq_hz - expected).abs() < 1e-6,
-            "spot freq_hz {} should equal raw {RAW_FREQ_HZ} * factor {FACTOR} = {expected}",
+            "spot freq_hz {} should equal raw {RAW_FREQ_HZ} * (1 + {PPM}ppm) = {expected}",
             spots[0].freq_hz
         );
     }
 
     #[test]
-    fn default_calibration_factor_is_identity() {
+    fn default_calibration_is_identity() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         v.ingest(&DecoderEvent::TrackMeta {
             track_id: 1,
@@ -381,5 +423,37 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].freq_hz, 14_027_000.0);
+    }
+
+    #[test]
+    fn calibration_factor_from_ppm_zero_is_identity() {
+        assert_eq!(calibration_factor_from_ppm(0.0), Ok(1.0));
+    }
+
+    #[test]
+    fn calibration_factor_from_ppm_rejects_nan() {
+        assert!(calibration_factor_from_ppm(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn calibration_factor_from_ppm_rejects_infinity() {
+        assert!(calibration_factor_from_ppm(f64::INFINITY).is_err());
+        assert!(calibration_factor_from_ppm(f64::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn calibration_factor_from_ppm_rejects_a_factor_that_hits_zero_or_goes_negative() {
+        // ppm = -1_000_000 drives factor to exactly 0.0; anything more
+        // negative flips it negative.
+        assert!(calibration_factor_from_ppm(-1_000_000.0).is_err());
+        assert!(calibration_factor_from_ppm(-2_000_000.0).is_err());
+    }
+
+    #[test]
+    fn with_freq_correction_ppm_rejects_an_invalid_factor_before_use() {
+        match Validator::new(FS, CTY_FIXTURE, None).with_freq_correction_ppm(f64::NAN) {
+            Ok(_) => panic!("expected NaN ppm to be rejected"),
+            Err(err) => assert!(err.ppm.is_nan()),
+        }
     }
 }

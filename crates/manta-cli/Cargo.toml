@@ -22,6 +22,7 @@ serde_json = { workspace = true }
 manta-decode = { workspace = true }
 manta-engine = { workspace = true }
 manta-input = { workspace = true }
+manta-spot = { workspace = true }
 manta-testkit = { workspace = true }
 
 [dev-dependencies]
