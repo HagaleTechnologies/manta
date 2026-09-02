@@ -406,7 +406,11 @@ Geometric mean (one garbled character tanks it, correctly) times a
 repetition factor: `r=1 → 0.5`, `r=2 → 0.75`, `r=3 → 0.875`. The validator's
 own adjustments (cty/SCP hits, per ARCHITECTURE §6) multiply on top of this
 and are specified in `manta-spot`, not here. The ≥ 2-repetition gate for
-first spot is unchanged.
+first spot is unchanged for non-beacon spot types; a message already
+type-tagged `BEACON` by the context parse (ARCHITECTURE §6 step 1) is
+exempt from this gate and may spot on its first decode (MAN-28) — `r`
+still feeds `c_call` above unchanged, so a single-decode beacon spot still
+carries the `r=1` confidence penalty.
 
 ---
 
@@ -504,7 +508,8 @@ crate-level tests in `crates/manta-spot/tests/golden_v11_v15.rs`.
 | V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>` | Correct `SpotType` assigned per pattern family |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
-| V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s | 1 rep never spots; 2 reps does |
+| V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s, non-beacon spot type | 1 rep never spots; 2 reps does |
+| V16 | beacon-repetition-exemption | 1 decode of a `V V V <call>` beacon pattern | `BEACON`-tagged spot emits on the first decode, gate not applied (MAN-28) |
 | V15 | dedupe | Repeat spot inside the 10 min window, then an SNR jump >= 6 dB | Suppressed inside the window; allowed after the SNR jump |
 
 ---

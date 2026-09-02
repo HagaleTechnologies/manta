@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15: manta-spot validator vectors.
+//! SPEC-decode-core.md §7.1 V11-V16: manta-spot validator vectors.
 
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::Glyph;
@@ -150,4 +150,14 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
         !allowed.is_empty(),
         "an SNR jump >= 6 dB must override dedupe suppression"
     );
+}
+
+#[test]
+fn v16_beacon_pattern_exempt_from_repetition_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    let words = ["V", "V", "V", "K5ARH"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(spots.len(), 1, "a BEACON-tagged spot must emit on the first decode");
+    assert_eq!(spots[0].callsign, "K5ARH");
+    assert_eq!(spots[0].spot_type, SpotType::Beacon);
 }

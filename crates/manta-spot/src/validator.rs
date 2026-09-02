@@ -314,16 +314,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
-    fn beacon_pattern_emits_spot_after_single_decode() {
-        let mut v = Validator::new(FS, CTY_FIXTURE, None);
-        let words = ["V", "V", "V", "K5ARH"];
-        let spots = run(&transmission_events(1, &words, 0), &mut v);
-        assert_eq!(spots.len(), 1);
-        assert_eq!(spots[0].callsign, "K5ARH");
-        assert_eq!(spots[0].spot_type, SpotType::Beacon);
-    }
-
-    #[test]
     fn bundled_validator_spots_a_real_repeated_callsign() {
         let mut v = Validator::bundled(FS);
         let words = ["DE", "K5ARH", "K"];
