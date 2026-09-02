@@ -117,6 +117,12 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver")]
         soapy_gain: Option<f64>,
+        /// TOML config with a `[server]`-shaped `ServerConfig` (station
+        /// callsign + ports). When given, also starts the telnet cluster
+        /// server, JSON Lines/WebSocket stream, and metrics endpoint
+        /// (ARCHITECTURE §7-§8) alongside the decode loop.
+        #[arg(long)]
+        server_config: Option<PathBuf>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -307,6 +313,74 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
+/// Handles the `Listen` on-spot closure needs to feed a running spot server.
+struct SpotServer {
+    bus: std::sync::Arc<manta_server::bus::SpotBus>,
+    metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+}
+
+/// Starts the telnet/JSON-Lines/WebSocket/metrics servers on their own
+/// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
+/// alive for the servers to keep running -- dropping it stops them.
+fn start_spot_server(
+    config_path: &std::path::Path,
+    sample_rate_hz: f64,
+) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    let cfg_text = std::fs::read_to_string(config_path)?;
+    let cfg: manta_server::config::ServerConfig = toml::from_str(&cfg_text)?;
+
+    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
+        sample_rate_hz,
+        std::time::SystemTime::now(),
+    ));
+    let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
+    let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
+    let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let telnet_listener =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
+        let json_listener =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
+        let ws_listener =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.ws_port)).await?;
+        let metrics_listener =
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
+
+        tokio::spawn(manta_server::telnet::serve(
+            telnet_listener,
+            bus.clone(),
+            metrics.clone(),
+            cfg.station_callsign.clone(),
+        ));
+        tokio::spawn(manta_server::json_stream::serve_tcp(
+            json_listener,
+            bus.clone(),
+            metrics.clone(),
+            cty.clone(),
+            cfg.station_callsign.clone(),
+            decoder_version.clone(),
+        ));
+        tokio::spawn(manta_server::json_stream::serve_ws(
+            ws_listener,
+            bus.clone(),
+            metrics.clone(),
+            cty,
+            cfg.station_callsign.clone(),
+            decoder_version,
+        ));
+        tokio::spawn(manta_server::metrics_http::serve(
+            metrics_listener,
+            metrics.clone(),
+        ));
+
+        anyhow::Ok(())
+    })?;
+
+    Ok((rt, SpotServer { bus, metrics }))
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Decode {
@@ -366,6 +440,7 @@ fn main() -> Result<()> {
             soapy_rate,
             #[cfg(feature = "soapy")]
             soapy_gain,
+            server_config,
         } => {
             let kiwi = KiwiOpts {
                 host: kiwi_host,
@@ -388,6 +463,18 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "soapy"))]
             let src = open_source(device, source, kiwi)?;
+
+            // Kept alive for the process lifetime: dropping it would stop
+            // the spawned server tasks. `None` when --server-config wasn't
+            // given, in which case `spot_server` stays None too.
+            let (_server_runtime, spot_server) = match server_config {
+                Some(path) => {
+                    let (rt, server) = start_spot_server(&path, src.sample_rate())?;
+                    (Some(rt), Some(server))
+                }
+                None => (None, None),
+            };
+
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
@@ -418,10 +505,15 @@ fn main() -> Result<()> {
                         _ => {}
                     }
                 },
-                // Provisional CLI-debugging spot output only -- NOT the
-                // ecosystem JSON contract. manta-server (a later M3
-                // sub-project) defines the real spot wire format.
+                // Provisional CLI-debugging text/JSON printed below is NOT
+                // the ecosystem wire contract -- that's `spot_server`
+                // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
+                // ARCHITECTURE §7), fed here when --server-config is set.
                 |spot| {
+                    if let Some(server) = &spot_server {
+                        server.bus.publish(spot.clone());
+                        server.metrics.record_spot();
+                    }
                     if json {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;

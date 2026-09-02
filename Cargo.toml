@@ -7,6 +7,7 @@ members = [
     "crates/manta-testkit",
     "crates/manta-engine",
     "crates/manta-spot",
+    "crates/manta-server",
     "crates/manta-cli",
 ]
 
@@ -24,6 +25,7 @@ manta-input = { path = "crates/manta-input" }
 manta-testkit = { path = "crates/manta-testkit" }
 manta-engine = { path = "crates/manta-engine" }
 manta-spot = { path = "crates/manta-spot" }
+manta-server = { path = "crates/manta-server" }
 
 coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 coppa-audio = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
@@ -50,6 +52,10 @@ tungstenite = "0.30"
 rubato = "5.0"
 soapysdr = "0.5"
 regex = "1"
+tokio = "1"
+tokio-tungstenite = "0.26"
+toml = "0.8"
+futures-util = "0.3"
 
 # DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
 [profile.dev]

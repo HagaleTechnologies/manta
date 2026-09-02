@@ -1,0 +1,127 @@
+//! MAN-12 acceptance scenario 1:
+//!   Given manta has decoded and validated a CW spot
+//!   When a telnet DX-cluster client connects to manta's cluster port and logs in
+//!   Then it receives the spot in standard "DX de" RBN format
+
+use manta_server::bus::SpotBus;
+use manta_server::metrics::Metrics;
+use manta_server::rbn;
+use manta_spot::{Spot, SpotType};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+const SAMPLE_RATE_HZ: f64 = 96_000.0;
+const STATION_CALL: &str = "W3XYZ";
+
+async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>, Arc<Metrics>) {
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch));
+    let metrics = Arc::new(Metrics::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let bus2 = bus.clone();
+    let metrics2 = metrics.clone();
+    tokio::spawn(async move {
+        manta_server::telnet::serve(listener, bus2, metrics2, STATION_CALL.to_string()).await;
+    });
+
+    (addr, bus, metrics)
+}
+
+fn sample_spot() -> Spot {
+    Spot {
+        callsign: "JA1ABC".to_string(),
+        freq_hz: 14_027_100.0,
+        snr_db: 23.0,
+        wpm: 28.0,
+        spot_type: SpotType::Cq,
+        confidence: 0.9,
+        track_id: 1,
+        sample_ts: 0,
+    }
+}
+
+async fn connect_and_login(
+    addr: std::net::SocketAddr,
+) -> (
+    BufReader<tokio::net::tcp::OwnedReadHalf>,
+    tokio::net::tcp::OwnedWriteHalf,
+) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+    assert!(
+        prompt.to_lowercase().contains("login") || prompt.to_lowercase().contains("call"),
+        "expected a login prompt, got: {prompt:?}"
+    );
+
+    wr.write_all(b"N0CALL\r\n").await.unwrap();
+
+    // Consume the post-login greeting line(s) up through the station's
+    // own prompt (`de W3XYZ-# >`) before the spot stream starts.
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        if line.contains(STATION_CALL) {
+            break;
+        }
+    }
+
+    (reader, wr)
+}
+
+#[tokio::test]
+async fn standard_client_receives_spot_in_rbn_format_after_login() {
+    let (addr, bus, _metrics) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for spot line")
+        .unwrap();
+
+    assert_eq!(line.trim_end(), expected);
+}
+
+#[tokio::test]
+async fn sh_dx_command_does_not_disconnect_the_client() {
+    let (addr, bus, _metrics) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    wr.write_all(b"sh/dx\r\n").await.unwrap();
+
+    // The connection must survive an unrecognized/read-only command --
+    // a spot published afterward must still arrive.
+    let spot = sample_spot();
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("connection did not survive sh/dx")
+        .unwrap();
+    assert!(line.contains("DX de"), "line was: {line:?}");
+}
+
+#[tokio::test]
+async fn connecting_client_is_counted_in_metrics() {
+    let (addr, _bus, metrics) = spawn_server().await;
+    let (_reader, _wr) = connect_and_login(addr).await;
+
+    // Give the accept/login task a moment to run and increment the gauge.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(metrics
+        .render_prometheus_text()
+        .contains("manta_telnet_clients_connected 1"));
+}

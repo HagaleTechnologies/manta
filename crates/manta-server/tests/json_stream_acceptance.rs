@@ -1,0 +1,133 @@
+//! MAN-12 acceptance scenario 2:
+//!   Given manta has decoded and validated a CW spot
+//!   When a client connects to manta's JSON/WebSocket stream
+//!   Then it receives the same spot as a JSON Lines message matching the
+//!   agreed cqdx contract (spots.v1.schema.json)
+
+use futures_util::StreamExt;
+use manta_server::bus::SpotBus;
+use manta_server::metrics::Metrics;
+use manta_spot::cty::Table;
+use manta_spot::{Spot, SpotType};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+const SAMPLE_RATE_HZ: f64 = 96_000.0;
+const STATION_CALL: &str = "W3XYZ";
+const CTY_FIXTURE: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N,AA,AB,AC;
+Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
+    JA,JD,JE,JF,JG,JH,JI,JJ,JK,JL,JM,JN,JO,JP,JQ,JR,JS;
+";
+
+async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>) {
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
+    let metrics = Arc::new(Metrics::new());
+    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let bus2 = bus.clone();
+    tokio::spawn(async move {
+        manta_server::json_stream::serve_tcp(
+            listener,
+            bus2,
+            metrics,
+            cty,
+            STATION_CALL.to_string(),
+            "manta-test".to_string(),
+        )
+        .await;
+    });
+
+    (addr, bus)
+}
+
+fn sample_spot() -> Spot {
+    Spot {
+        callsign: "JA1ABC".to_string(),
+        freq_hz: 14_027_100.0,
+        snr_db: 23.0,
+        wpm: 28.0,
+        spot_type: SpotType::Cq,
+        confidence: 0.9,
+        track_id: 1,
+        sample_ts: 0,
+    }
+}
+
+#[tokio::test]
+async fn tcp_client_receives_spot_as_json_lines_message() {
+    let (addr, bus) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+
+    // Give the server task a moment to accept + subscribe before the
+    // spot is published (see the telnet server's subscribe-before-login
+    // ordering fix for why this matters with a broadcast channel).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(sample_spot());
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for JSON line")
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+    assert_eq!(value["source"], "skimmer");
+    assert_eq!(value["mode"], "CW");
+    assert_eq!(value["dxCall"], "JA1ABC");
+    assert_eq!(value["deCall"], "W3XYZ");
+    assert_eq!(value["band"], "20m");
+    assert_eq!(value["frequency"], 14_027_100);
+    assert_eq!(value["dxContinent"], "AS");
+    assert_eq!(value["dxCqZone"], 25);
+    assert!(value["dxDxcc"].is_null());
+}
+
+#[tokio::test]
+async fn websocket_client_receives_spot_as_json_message() {
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
+    let metrics = Arc::new(Metrics::new());
+    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let bus2 = bus.clone();
+    tokio::spawn(async move {
+        manta_server::json_stream::serve_ws(
+            listener,
+            bus2,
+            metrics,
+            cty,
+            STATION_CALL.to_string(),
+            "manta-test".to_string(),
+        )
+        .await;
+    });
+
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(sample_spot());
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timed out waiting for ws message")
+        .expect("stream ended")
+        .expect("ws error");
+
+    let text = msg.into_text().expect("expected a text frame");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON message");
+    assert_eq!(value["source"], "skimmer");
+    assert_eq!(value["dxCall"], "JA1ABC");
+
+    let _ = ws.close(None).await;
+}
