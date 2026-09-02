@@ -400,6 +400,80 @@ impl Validator {
         candidates
     }
 
+    /// Every power-step match `context::parse` currently withholds because
+    /// of its CQ/DE guard (MAN-37), paired with the highest `Word::seq`
+    /// involved -- same computation `candidates` does for accepted
+    /// matches. Not filtered against `accepted`: a word can be BOTH an
+    /// accepted candidate through a different, narrower-ranged match (e.g.
+    /// "CQ K5ARH T" -- CQ_CALL_RE resolves "CQ K5ARH" with no filler at
+    /// all, but that match's own range doesn't cover the trailing "T")
+    /// AND have its power-step candidacy on the SAME word suppressed by
+    /// the whole-window CQ/DE guard; burning must still record that the
+    /// trailing word was already considered, or the accepted match's own,
+    /// narrower `classified_max_seq` won't account for it (MAN-37 review).
+    fn suppressed_power_step_candidates(&self, track_id: u32) -> Vec<(String, u64)> {
+        let Some(track) = self.tracks.get(&track_id) else {
+            return Vec::new();
+        };
+        let mut joined = String::new();
+        let mut word_spans = Vec::with_capacity(track.words.len());
+        for word in &track.words {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            let start = joined.len();
+            joined.push_str(&word.text);
+            word_spans.push((start, joined.len(), word.seq));
+        }
+        if !context::power_step_framing_is_unresolved(&joined) {
+            return Vec::new();
+        }
+        context::power_step_candidates(&joined)
+            .into_iter()
+            .map(|(call, range)| {
+                let involved_max_seq = word_spans
+                    .iter()
+                    .filter(|(start, end, _)| *start < range.end && range.start < *end)
+                    .map(|(_, _, seq)| *seq)
+                    .max()
+                    .unwrap_or(0);
+                (call, involved_max_seq)
+            })
+            .collect()
+    }
+
+    /// Marks a suppressed power-step candidate's decoded word as
+    /// `attempted`, with `classified_max_seq` raised to cover it -- with
+    /// no spot -- so the CQ/DE guard's suppression survives the word aging
+    /// out of the 16-word window. Without this, a withheld candidate never
+    /// reaches `evaluate_candidate` at all, so its word's `attempted`/
+    /// `classified_max_seq` never account for it; once the CQ/DE token
+    /// that triggered the guard ages out, the SAME occurrence -- no newer
+    /// evidence, nothing new decoded -- looks like fresh evidence to the
+    /// aging-out guard and passes it, spotting as if freshly seen (Codex
+    /// review on PR #65, round 7). `classified_max_seq` is only ever
+    /// raised (`max`), never lowered, so an accepted classification from
+    /// `evaluate_candidate` -- evaluated separately, in either order --
+    /// is never weakened, only ever given a fuller picture of what's
+    /// already been considered. A genuinely newer word arriving later
+    /// still gets a fair, real reclassification, exactly as before.
+    fn burn_suppressed_power_step_candidate(
+        &mut self,
+        track_id: u32,
+        call: &str,
+        involved_max_seq: u64,
+    ) {
+        let Some(track) = self.tracks.get_mut(&track_id) else {
+            return;
+        };
+        let Some(word) = track.words.iter_mut().rev().find(|w| w.text == call) else {
+            return;
+        };
+        let involved_max_seq = involved_max_seq.max(word.seq);
+        word.attempted = true;
+        word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
+    }
+
     fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
         // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
         // defaults. Bail without marking anything attempted, so pending
@@ -407,12 +481,25 @@ impl Validator {
         if !self.tracks.get(&track_id).is_some_and(|t| t.has_meta) {
             return Vec::new();
         }
-        self.candidates(track_id)
+        let candidates = self.candidates(track_id);
+        // Suppressed candidates must be computed before evaluating the
+        // accepted list below (which can mutate track.words), but burned
+        // only after: evaluate_candidate assigns classified_max_seq
+        // directly (not via max), so burning first would let an accepted
+        // evaluation of the SAME word silently overwrite it back down.
+        // Burning's own max()-merge afterward is what makes the order
+        // safe -- it only ever raises the bar, never lowers it.
+        let suppressed = self.suppressed_power_step_candidates(track_id);
+        let spots = candidates
             .into_iter()
             .filter_map(|(candidate, spot_type, involved_max_seq)| {
                 self.evaluate_candidate(track_id, sample_ts, candidate, spot_type, involved_max_seq)
             })
-            .collect()
+            .collect();
+        for (call, involved_max_seq) in suppressed {
+            self.burn_suppressed_power_step_candidate(track_id, &call, involved_max_seq);
+        }
+        spots
     }
 
     fn evaluate_candidate(

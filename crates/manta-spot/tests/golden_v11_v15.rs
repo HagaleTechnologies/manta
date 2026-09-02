@@ -709,3 +709,40 @@ fn power_step_beacon_blocked_when_unresolved_cq_precedes_a_later_resolved_de() {
          window suppresses the power-step fallback entirely, got {spots:?}"
     );
 }
+
+/// MAN-37 (Codex review round 7): the CQ/DE guard is recomputed solely
+/// from the current window, so a withheld candidate that never reaches
+/// `Validator` never marks its word `attempted` -- once the CQ/DE token
+/// that triggered the guard ages out of the 16-word window, the SAME
+/// occurrence (no newer evidence, nothing new decoded) would otherwise
+/// pass the guard and spot as if freshly seen. `Validator` must burn a
+/// suppressed candidate's word itself so the suppression survives.
+#[test]
+fn power_step_beacon_suppression_survives_the_triggering_cq_aging_out() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "K5ARH", "T"];
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon while CQ is still in the window, \
+         got {spots:?}"
+    );
+
+    // Push 14 more words so CQ (and only CQ) ages out of the 16-word
+    // window, leaving K5ARH and T still present with no new evidence.
+    let filler: Vec<String> = (1..=14).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 100_000), &mut v));
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must still not spot as Beacon once CQ ages out -- no new \
+         evidence arrived, so the original suppression must hold, got \
+         {spots:?}"
+    );
+}

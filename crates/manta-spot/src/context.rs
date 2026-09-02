@@ -156,10 +156,33 @@ pub fn parse(text: &str) -> Vec<(String, SpotType, Range<usize>)> {
     if let Some(n) = parse_named_pattern(text) {
         candidates.push(n);
     }
-    if !CQ_TOKEN_RE.is_match(text) && !DE_TOKEN_RE.is_match(text) {
+    if !power_step_framing_is_unresolved(text) {
         candidates.extend(parse_power_step_beacons(text));
     }
     candidates
+}
+
+/// Whether a bare `CQ` or `DE` token anywhere in `text` would currently
+/// suppress the power-step fallback (see `parse`'s own docs).
+pub fn power_step_framing_is_unresolved(text: &str) -> bool {
+    CQ_TOKEN_RE.is_match(text) || DE_TOKEN_RE.is_match(text)
+}
+
+/// Every power-step match in `text`, ignoring the CQ/DE guard entirely --
+/// i.e. exactly what `parse` would have returned from this family had the
+/// guard not suppressed it. `Validator::candidates` uses this, gated on
+/// `power_step_framing_is_unresolved`, to "burn" a suppressed candidate's
+/// decoded word (mark it attempted, with no spot) even though `parse`
+/// itself withheld it: without this, the suppression is silently undone
+/// the moment the CQ/DE token ages out of the 16-word window, since a
+/// withheld candidate never reaches `Validator` and so never marks
+/// anything attempted -- letting the SAME, no-newer-evidence occurrence
+/// spot later as if newly decoded (Codex review on PR #65, round 7).
+pub fn power_step_candidates(text: &str) -> Vec<(String, Range<usize>)> {
+    parse_power_step_beacons(text)
+        .into_iter()
+        .map(|(call, _, range)| (call, range))
+        .collect()
 }
 
 #[cfg(test)]
@@ -325,5 +348,20 @@ mod tests {
         // portable-designator suffix glued onto the same decoded word) --
         // not a lone "T" word as the pattern is documented to require.
         assert_eq!(parse_types("K5ARH T/QRP"), vec![]);
+    }
+
+    #[test]
+    fn power_step_candidates_ignores_the_cq_de_guard() {
+        // Codex review on PR #65, round 7: Validator needs the raw match
+        // even when `parse` itself withholds it, so it can burn the
+        // suppressed word's attempted state and stop the guard's
+        // suppression from being silently undone once the CQ/DE token
+        // ages out of the window.
+        assert!(power_step_framing_is_unresolved("CQ DX K5ARH T"));
+        assert_eq!(
+            power_step_candidates("CQ DX K5ARH T"),
+            vec![("K5ARH".to_string(), 6..13)]
+        );
+        assert!(!power_step_framing_is_unresolved("K5ARH T"));
     }
 }
