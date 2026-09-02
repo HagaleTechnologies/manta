@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15, V18-V28: manta-spot validator
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V29: manta-spot validator
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
@@ -462,5 +462,45 @@ fn v28_reclassification_still_accepted_when_driven_by_a_new_word() {
             .iter()
             .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
         "a genuinely new trailing CQ token must still promote De to Cq, got {second:?}"
+    );
+}
+
+/// V29: provenance must bind to the exact `Word` occurrence being
+/// evaluated, not whichever occurrence `context::parse`'s regex happened
+/// to match first. "CQ DE K5ARH DE K5ARH" repeats "DE K5ARH" -- the
+/// second, newest K5ARH is the one `evaluate_candidate` selects (its
+/// word-lookup always picks the newest matching word), but
+/// `context::parse`'s first-match regex describes the FIRST "DE K5ARH"
+/// occurrence's span. If that mismatch stores the wrong (lower)
+/// `classified_max_seq` on the newest word, then once "CQ" (and the first
+/// "DE") age out, the remaining "DE K5ARH" looks like new context even
+/// though it produced the original spot -- reproducing V27's bug shape
+/// through a normal (non-allowlisted) repeated call.
+#[test]
+fn v29_provenance_bound_to_exact_word_occurrence_across_repetitions() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let words = ["CQ", "DE", "K5ARH", "DE", "K5ARH"];
+    let first = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        first
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "K5ARH must spot as Cq after 2 reps, got {first:?}"
+    );
+
+    // Push enough filler so "CQ" and the first "DE" age out of the
+    // 16-word window while the second "DE K5ARH" occurrence remains.
+    let filler: Vec<String> = (1..=13).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    let spots = run(&transmission_events(1, &filler_refs, 300_000), &mut v);
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::De),
+        "K5ARH must not be reclassified to De just because CQ aged out, \
+         even across a repeated DE K5ARH occurrence, got {spots:?}"
     );
 }

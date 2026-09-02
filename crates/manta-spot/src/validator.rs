@@ -425,6 +425,19 @@ impl Validator {
         let (char_confidences, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
+            // context::parse's regex matches the FIRST occurrence of a
+            // repeated pattern in the joined text, but this lookup always
+            // selects the NEWEST word with matching text -- when the same
+            // callsign has decoded more than once, those can be two
+            // different Word occurrences. Clamping to the selected word's
+            // own seq guarantees involved_max_seq is never understated
+            // relative to the occurrence actually being evaluated (a
+            // word's own seq is always a valid lower bound on its true
+            // provenance), closing the mismatch that let a stale,
+            // first-occurrence-derived seq pass the aging-out guard above
+            // as if it were genuinely new context (MAN-28 round 13
+            // review).
+            let involved_max_seq = involved_max_seq.max(word.seq);
             if word.attempted {
                 // A prior attempt is only a genuine reclassification --
                 // not a re-attempt of stale information -- if a word
