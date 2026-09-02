@@ -34,6 +34,25 @@ impl RepetitionGate {
         entry.retain(|&ts| ts >= cutoff);
         entry.len()
     }
+
+    /// Drops every recorded decode for `track_id`. MAN-19: without this,
+    /// `seen`'s key space grows forever under sustained track churn --
+    /// `record`'s own `retain` only prunes an entry's *timestamps*, and
+    /// only when that same key is recorded again; a track that goes
+    /// silent for good leaves its now-stale key sitting in the map with
+    /// no further `record` call ever revisiting it to notice. Call once a
+    /// track closes (any `CloseReason` -- `DecoderEvent::TrackClosed`).
+    pub fn forget_track(&mut self, track_id: u32) {
+        let keys: Vec<(u32, String)> = self
+            .seen
+            .range((track_id, String::new())..)
+            .take_while(|(k, _)| k.0 == track_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            self.seen.remove(&k);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -69,5 +88,45 @@ mod tests {
         gate.record(1, "K5ARH", 0);
         assert_eq!(gate.record(2, "K5ARH", 0), 1);
         assert_eq!(gate.record(1, "W1AW", 0), 1);
+    }
+
+    /// MAN-19: `forget_track` must remove every `(track_id, *)` key --
+    /// otherwise `seen` grows one entry per distinct (track_id, callsign)
+    /// pair ever recorded, forever, since `track_id`s are never reused and
+    /// nothing else ever revisits an abandoned key to prune it.
+    #[test]
+    fn forget_track_removes_every_entry_for_that_track_only() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(1, "K5ARH", 0);
+        gate.record(1, "W1AW", 0);
+        gate.record(2, "K5ARH", 0);
+        assert_eq!(gate.seen.len(), 3);
+
+        gate.forget_track(1);
+        assert_eq!(gate.seen.len(), 1, "only track 2's entry should remain");
+        assert!(gate.seen.contains_key(&(2, "K5ARH".to_string())));
+
+        // A track with no recorded decodes at all is a no-op, not an error.
+        gate.forget_track(99);
+        assert_eq!(gate.seen.len(), 1);
+    }
+
+    /// MAN-19: reproduces the soak's actual failure mode -- many distinct,
+    /// never-reused track_ids each recording once and closing. Without
+    /// `forget_track` wired in (this test calls it explicitly, the way
+    /// `Validator::ingest`'s `TrackClosed` arm does in production), `seen`
+    /// would have 10,000 entries here instead of 0.
+    #[test]
+    fn sustained_track_churn_stays_bounded_when_each_track_is_forgotten_on_close() {
+        let mut gate = RepetitionGate::new(FS);
+        for track_id in 0..10_000u32 {
+            gate.record(track_id, "K5ARH", 0);
+            gate.forget_track(track_id);
+        }
+        assert_eq!(
+            gate.seen.len(),
+            0,
+            "seen must not accumulate one entry per historical track_id"
+        );
     }
 }

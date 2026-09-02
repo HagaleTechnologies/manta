@@ -472,7 +472,7 @@ impl TrackManager {
     /// input) is always `false` here; the decoder pool runs after this
     /// whole batch, so no per-hop decode result is available yet to feed
     /// back into the same hop's lifecycle bookkeeping.
-    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) {
+    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> Vec<u32> {
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -551,9 +551,23 @@ impl TrackManager {
                 }
             }
         }
-        for id in closed {
-            self.tracks.remove(&id);
-        }
+        // MAN-19: only report a close as `TrackClosed`-worthy if the track
+        // was ever promoted (had a decoder, so could have produced a real
+        // event `manta-spot`'s `Validator`/`RepetitionGate` might have
+        // recorded state against). A CANDIDATE that closes Unconfirmed
+        // without ever being promoted never emitted a CharDecoded/
+        // WordBoundary/SpeedUpdate/TrackMeta and so never created any
+        // downstream state to free -- and critically, it never appeared
+        // in the event stream at all before this change; surfacing a
+        // `TrackClosed` for it anyway would introduce a track_id into the
+        // stream that callers like `decode_samples` (which picks the
+        // *lowest* track_id present as its single-track report) never
+        // used to see, silently changing which track gets reported.
+        closed.retain(|id| {
+            self.tracks
+                .remove(id)
+                .is_some_and(|track| track.decoder.is_some())
+        });
         self.recompute_ownership();
 
         // Same-hop simultaneous-rise tie-break (SPEC §2.5): scan channels in
@@ -582,8 +596,9 @@ impl TrackManager {
             }
         }
         self.recompute_ownership();
-        self.merge_converged();
-        self.evict_over_cap();
+        closed.extend(self.merge_converged());
+        closed.extend(self.evict_over_cap());
+        closed
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -608,7 +623,7 @@ impl TrackManager {
 
     /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
     /// the lower-current-SNR one is closed.
-    fn merge_converged(&mut self) {
+    fn merge_converged(&mut self) -> Vec<u32> {
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         let mut to_close = Vec::new();
         for i in 0..ids.len() {
@@ -629,18 +644,27 @@ impl TrackManager {
                 }
             }
         }
-        for id in to_close {
-            self.tracks.remove(&id);
-            self.close_counts.record(CloseReason::Merged);
-        }
+        // MAN-19: only report a merge-loser as `TrackClosed`-worthy if it
+        // was ever promoted -- see the matching comment in `step_hop`.
+        let ever_promoted_closed = to_close
+            .into_iter()
+            .filter(|id| {
+                self.close_counts.record(CloseReason::Merged);
+                self.tracks
+                    .remove(id)
+                    .is_some_and(|track| track.decoder.is_some())
+            })
+            .collect();
         if !ids.is_empty() {
             self.recompute_ownership();
         }
+        ever_promoted_closed
     }
 
     /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
     /// eviction.
-    fn evict_over_cap(&mut self) {
+    fn evict_over_cap(&mut self) -> Vec<u32> {
+        let mut evicted = Vec::new();
         while self.tracks.len() > self.cfg.track_cap {
             let loser = *self
                 .tracks
@@ -648,10 +672,18 @@ impl TrackManager {
                 .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
                 .map(|(id, _)| id)
                 .unwrap();
-            self.tracks.remove(&loser);
             self.close_counts.record(CloseReason::Evicted);
+            // MAN-19: only report as `TrackClosed`-worthy if ever promoted.
+            if self
+                .tracks
+                .remove(&loser)
+                .is_some_and(|track| track.decoder.is_some())
+            {
+                evicted.push(loser);
+            }
         }
         self.recompute_ownership();
+        evicted
     }
 
     /// Process one `Channelizer::process()` slice: sequential per-hop
@@ -667,10 +699,11 @@ impl TrackManager {
         hops: &[HopOutput],
         hop_to_sample_ts: impl Fn(u64) -> u64,
     ) -> Vec<DecoderEvent> {
+        let mut closed_ids: Vec<u32> = Vec::new();
         for h in hops {
-            self.step_hop(h, hop_to_sample_ts(h.m));
+            closed_ids.extend(self.step_hop(h, hop_to_sample_ts(h.m)));
         }
-        let events = self.drain_pool();
+        let mut events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
         // actually decoded a character this batch. `step_hop` advances it
         // every hop with `char_emitted = false` (the pool has not run yet),
@@ -684,6 +717,19 @@ impl TrackManager {
                 }
             }
         }
+        // MAN-19: emit one `TrackClosed` per track closed this batch (any
+        // CloseReason) so downstream per-track_id state (`manta-spot`'s
+        // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
+        // free it -- see events.rs's TrackClosed doc for the unbounded-
+        // growth bug this fixes. Re-sorted with the rest per SPEC §6 rule
+        // 6; `event_sample_ts` gives these no ordering claim (ties at 0,
+        // same as SpeedUpdate/TrackMeta).
+        events.extend(
+            closed_ids
+                .into_iter()
+                .map(|track_id| DecoderEvent::TrackClosed { track_id }),
+        );
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         events
     }
 
@@ -743,7 +789,9 @@ fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
-        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
+        DecoderEvent::SpeedUpdate { .. }
+        | DecoderEvent::TrackMeta { .. }
+        | DecoderEvent::TrackClosed { .. } => 0,
     }
 }
 
@@ -754,7 +802,8 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         DecoderEvent::CharDecoded { track_id, .. }
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
-        | DecoderEvent::TrackMeta { track_id, .. } => *track_id,
+        | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TrackClosed { track_id } => *track_id,
     }
 }
 

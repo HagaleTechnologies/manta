@@ -327,6 +327,18 @@ impl Validator {
                     self.try_spot(*track_id, sample_ts)
                 }
             }
+            DecoderEvent::TrackClosed { track_id } => {
+                // MAN-19: without this, `self.tracks` and `self.gate`'s
+                // per-track_id state both grow forever -- `TrackManager`
+                // never reuses a `track_id`, and until `TrackClosed`
+                // existed neither structure had any signal that one would
+                // never be seen again. Confirmed as the soak's actual
+                // unbounded-RSS-growth root cause under sustained track
+                // churn.
+                self.tracks.remove(track_id);
+                self.gate.forget_track(*track_id);
+                Vec::new()
+            }
         }
     }
 
@@ -802,5 +814,58 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn invalid_calibration_display_reports_non_finite_ppm() {
         let err = calibration_factor_from_ppm(f64::NAN).unwrap_err();
         assert!(err.to_string().contains("finite"));
+    }
+
+    /// MAN-19: `TrackClosed` must remove the track's `TrackState` from
+    /// `self.tracks` (and its `RepetitionGate` state) -- before this event
+    /// existed, nothing ever did, and `tracks` grew one entry per
+    /// historical track_id for the life of the process.
+    #[test]
+    fn track_closed_removes_the_track_from_state() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        assert!(
+            v.tracks.contains_key(&1),
+            "TrackMeta should have created an entry"
+        );
+
+        v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        assert!(
+            !v.tracks.contains_key(&1),
+            "TrackClosed must remove the track's state"
+        );
+    }
+
+    /// A `TrackClosed` for a track_id `Validator` never saw (e.g. a
+    /// CANDIDATE that closed Unconfirmed without ever being promoted, so
+    /// it never emitted any other event) must be a harmless no-op, not a
+    /// panic or a spurious insertion.
+    #[test]
+    fn track_closed_for_an_unknown_track_id_is_a_harmless_noop() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        assert_eq!(
+            v.ingest(&DecoderEvent::TrackClosed { track_id: 42 }),
+            vec![]
+        );
+        assert!(!v.tracks.contains_key(&42));
+    }
+
+    /// MAN-19: reproduces the soak's actual failure mode at unit-test
+    /// scale -- many distinct, never-reused track_ids, each getting real
+    /// activity (TrackMeta) then closing. Without `TrackClosed` wired
+    /// through to `self.tracks.remove`/`self.gate.forget_track`, `tracks`
+    /// would have 10,000 entries here instead of 0.
+    #[test]
+    fn sustained_track_churn_stays_bounded() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        for track_id in 0..10_000u32 {
+            seed_meta(&mut v, track_id);
+            v.ingest(&DecoderEvent::TrackClosed { track_id });
+        }
+        assert_eq!(
+            v.tracks.len(),
+            0,
+            "Validator.tracks must not accumulate one entry per historical track_id"
+        );
     }
 }
