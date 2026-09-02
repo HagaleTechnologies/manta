@@ -52,11 +52,26 @@ KiwiSDR input.
   ML fusion only at M4, gated on beating the classical baseline under
   simulated fading"), closing that gap is M4's job, not M2's.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
-  of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. Mac leg
-  passes (0.360x realtime, now including `manta-spot::Validator` cost
-  per M3's engine-wiring sub-project — see
-  `crates/manta-engine/benches/cpu_budget.rs`); **Pi4 leg outstanding** —
-  needs real Raspberry Pi 4 hardware.
+  of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. **Neither
+  leg is currently a resolved pass** — see
+  `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` and the run
+  procedure in `docs/RUNBOOKS/m2-pi4-cpu-budget.md`.
+  - **Mac leg: unresolved, not passing.** A 0.360x realtime figure was
+    recorded as a pass on 2026-07-24 (per M3's engine-wiring sub-project,
+    including `manta-spot::Validator` cost — see
+    `crates/manta-engine/benches/cpu_budget.rs`), and this session
+    initially reconfirmed ~0.457x-0.472x. Both numbers turned out to omit
+    the detector's 2s warmup from the timing, diluting the ratio by
+    ~13%; corrected, this session measured ≈0.53x-0.58x against the <
+    0.5x budget — i.e. likely failing, not the comfortable pass on
+    record. Both the original 0.360x and this session's corrected numbers
+    are superseded, historical measurements now, not a settled result —
+    a clean rerun of the now-fixed `crates/manta-engine/tests/cpu_budget.rs`
+    on a quiet, dedicated machine is needed to resolve this leg.
+  - **Pi4 leg: outstanding** — needs real Raspberry Pi 4 hardware, tracked
+    as MAN-18. A cross-architecture estimate (not a measurement — no Pi4
+    was reachable to measure against) puts it at ~5.3x realtime CPU-time,
+    well over the < 1.0x budget.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics. **Outstanding** — needs a real SDR
   and 24 unattended hours.
