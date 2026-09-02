@@ -22,6 +22,7 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 - Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`manta-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`).
 - Adjacent-channel ownership so one signal yields exactly one track (no cross-channel ghost decodes): SPEC §2.5. This invariant is a V7/V8w pass criterion — see [[golden-vector-freeze]].
 - Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though external exposition as Prometheus metrics is explicit M3 scope (ARCHITECTURE §8), not yet wired.
+- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id }` (`process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
 
 ## Why it is shaped this way
 
