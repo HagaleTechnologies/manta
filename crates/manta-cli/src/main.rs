@@ -40,6 +40,12 @@ enum Command {
             allow_negative_numbers = true
         )]
         freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
+        /// bypasses grammar/cty validation and the repetition gate
+        /// entirely -- legacy precedent: CW Skimmer's Watch List
+        /// (Aggregator manual Appendix A2). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
@@ -86,6 +92,12 @@ enum Command {
             allow_negative_numbers = true
         )]
         freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
+        /// bypasses grammar/cty validation and the repetition gate
+        /// entirely -- legacy precedent: CW Skimmer's Watch List
+        /// (Aggregator manual Appendix A2). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -139,6 +151,12 @@ enum Command {
             allow_negative_numbers = true
         )]
         freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
+        /// bypasses grammar/cty validation and the repetition gate
+        /// entirely -- legacy precedent: CW Skimmer's Watch List
+        /// (Aggregator manual Appendix A2). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -258,9 +276,11 @@ fn main() -> Result<()> {
             path,
             json,
             freq_correction_ppm,
+            allowlist,
         } => {
             let cfg = PipelineConfig {
                 freq_correction_ppm,
+                allowlist,
                 ..Default::default()
             };
             let report = decode_wav(&path, &cfg)?;
@@ -302,6 +322,7 @@ fn main() -> Result<()> {
             kiwi_password,
             json,
             freq_correction_ppm,
+            allowlist,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -338,6 +359,7 @@ fn main() -> Result<()> {
             })?;
             let cfg = PipelineConfig {
                 freq_correction_ppm,
+                allowlist,
                 ..Default::default()
             };
             manta_engine::listen(
@@ -394,6 +416,7 @@ fn main() -> Result<()> {
             kiwi_freq,
             kiwi_password,
             freq_correction_ppm,
+            allowlist,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -425,6 +448,7 @@ fn main() -> Result<()> {
             let src = open_source(device, source, kiwi)?;
             let cfg = PipelineConfig {
                 freq_correction_ppm,
+                allowlist,
                 ..Default::default()
             };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
