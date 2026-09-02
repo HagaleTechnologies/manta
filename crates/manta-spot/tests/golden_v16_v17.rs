@@ -107,6 +107,36 @@ fn v17_notched_frequency_never_spots() {
     );
 }
 
+/// ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
+/// silent loss anywhere in the pipeline." A blocklist/notch hit must be
+/// distinguishable from an ordinary validation failure.
+#[test]
+fn suppressed_spots_are_counted_by_reason() {
+    let blocklist = Blocklist::parse("K5ARH\n");
+    let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(blocklist);
+    let words = ["DE", "K5ARH", "K"];
+    // One transmission attempt -> one blocklist hit (the check runs on
+    // every candidate word, ahead of the repetition gate).
+    run(&transmission_events(1, &words, 0), &mut v);
+
+    let counts = v.suppression_counts();
+    assert_eq!(counts.blocklist, 1, "one blocklist hit should be counted");
+    assert_eq!(counts.notch, 0);
+
+    let notch = NotchList::parse("14025000-14025100\n");
+    let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
+    v.ingest(&DecoderEvent::TrackMeta {
+        track_id: 1,
+        snr_2500_db: 20.0,
+        freq_hz: 14_025_050.0,
+    });
+    run(&transmission_events(1, &words, 0), &mut v);
+
+    let counts = v.suppression_counts();
+    assert_eq!(counts.notch, 1, "one notch hit should be counted");
+    assert_eq!(counts.blocklist, 0);
+}
+
 #[test]
 fn v17_frequency_outside_notch_still_spots() {
     let notch = NotchList::parse("14025000-14025100\n");

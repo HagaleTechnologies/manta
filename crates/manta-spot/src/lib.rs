@@ -17,7 +17,9 @@ pub mod validator;
 pub use blocklist::Blocklist;
 pub use context::SpotType;
 pub use notch::{FreqRange, NotchList};
-pub use validator::{calibration_factor_from_ppm, InvalidCalibration, Spot, Validator};
+pub use validator::{
+    calibration_factor_from_ppm, InvalidCalibration, Spot, SuppressionCounts, Validator,
+};
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see
 /// `data/SOURCES.md` for provenance and refresh instructions.

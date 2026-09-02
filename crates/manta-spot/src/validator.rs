@@ -117,6 +117,19 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
     Ok(factor)
 }
 
+/// Per-reason counts of spots suppressed by an operator override (MAN-31).
+/// ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
+/// silent loss anywhere in the pipeline." Exposed via
+/// `Validator::suppression_counts` for the future M3 metrics endpoint to
+/// read, mirroring `manta_engine::track::CloseCounts` -- nothing wires it
+/// externally yet, since the Prometheus text endpoint itself is explicit
+/// M3 scope (ROADMAP.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuppressionCounts {
+    pub blocklist: u64,
+    pub notch: u64,
+}
+
 pub struct Validator {
     cty: cty::Table,
     scp: Option<scp::Set>,
@@ -126,6 +139,7 @@ pub struct Validator {
     freq_calibration: f64,
     blocklist: Blocklist,
     notch: NotchList,
+    suppression_counts: SuppressionCounts,
 }
 
 impl Validator {
@@ -139,6 +153,7 @@ impl Validator {
             freq_calibration: 1.0,
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
+            suppression_counts: SuppressionCounts::default(),
         }
     }
 
@@ -177,6 +192,12 @@ impl Validator {
     pub fn with_notch(mut self, notch: NotchList) -> Self {
         self.notch = notch;
         self
+    }
+
+    /// Per-reason counts of operator-suppressed spots so far (MAN-31,
+    /// ARCHITECTURE §8).
+    pub fn suppression_counts(&self) -> SuppressionCounts {
+        self.suppression_counts
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -271,11 +292,15 @@ impl Validator {
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
-        // checked ahead of, the automatic validation pipeline below.
+        // checked ahead of, the automatic validation pipeline below. Each
+        // hit is counted (ARCHITECTURE §8) so it reads as a deliberate
+        // suppression, not silent coverage loss.
         if self.blocklist.contains(&candidate) {
+            self.suppression_counts.blocklist += 1;
             return Vec::new();
         }
         if self.notch.contains(freq_hz) {
+            self.suppression_counts.notch += 1;
             return Vec::new();
         }
 
