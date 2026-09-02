@@ -13,6 +13,11 @@ pub mod soapy;
 #[cfg(feature = "soapy")]
 pub use soapy::SoapySdrIqSource;
 
+#[cfg(feature = "hpsdr")]
+pub mod hpsdr;
+#[cfg(feature = "hpsdr")]
+pub use hpsdr::{HpsdrConfig, HpsdrDevice, HpsdrIqSource};
+
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use std::path::Path;
