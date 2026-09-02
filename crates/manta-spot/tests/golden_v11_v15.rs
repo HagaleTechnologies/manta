@@ -292,3 +292,33 @@ fn v22_exempt_spot_waits_for_track_metadata_before_emitting() {
         "once metadata arrives, a later word boundary must spot with real telemetry, got {more_spots:?}"
     );
 }
+
+/// V23: an allowlisted word spotted immediately with no context yet
+/// (type `Unknown`) must be reclassified when a trailing word completes a
+/// real context pattern afterward -- "K5ARH" alone spots as `Unknown`,
+/// then "UP" arrives completing `<call> UP` (type `De`). The correction
+/// must not be permanently blocked by the word already being attempted;
+/// dedupe's existing type-changed override lets the corrected spot
+/// through.
+#[test]
+fn v23_allowlisted_call_is_reclassified_when_trailing_context_completes() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    v.allowlist("K5ARH");
+
+    let first = run(&transmission_events(1, &["K5ARH"], 0), &mut v);
+    assert_eq!(
+        first.len(),
+        1,
+        "the allowlisted call must spot immediately with no context, got {first:?}"
+    );
+    assert_eq!(first[0].spot_type, SpotType::Unknown);
+
+    let second = run(&transmission_events(1, &["UP"], 300_000), &mut v);
+    assert!(
+        second
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::De),
+        "K5ARH UP completing afterward must produce a reclassified De spot, got {second:?}"
+    );
+}

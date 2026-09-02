@@ -45,6 +45,14 @@ struct Word {
     /// context-match candidate, so a later, unrelated word boundary that
     /// re-scans a growing window doesn't re-process it.
     attempted: bool,
+    /// The `SpotType` this word was last processed as, if any. An
+    /// allowlisted word can spot immediately with no context yet (type
+    /// `Unknown`); if a trailing word later completes a real context
+    /// pattern (e.g. "K5ARH" then "UP" completing `<call> UP` -> `De`),
+    /// that's a genuinely new type worth a reclassification, not a
+    /// re-attempt of the same evaluation -- `attempted` alone must not
+    /// permanently block it (MAN-28 round 8 review).
+    last_spot_type: Option<SpotType>,
 }
 
 #[derive(Default)]
@@ -354,10 +362,17 @@ impl Validator {
         let char_confidences = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
-            if word.attempted {
+            // A prior attempt with the SAME type is a genuine re-attempt
+            // (nothing new to evaluate). A prior attempt with a
+            // DIFFERENT type means trailing context has since completed
+            // a real pattern -- a reclassification, not a re-attempt;
+            // let it through so dedupe's type-changed override (below)
+            // can decide whether to emit the corrected spot.
+            if word.attempted && word.last_spot_type == Some(spot_type) {
                 return None;
             }
             word.attempted = true;
+            word.last_spot_type = Some(spot_type);
             word.confidences.clone()
         };
 
