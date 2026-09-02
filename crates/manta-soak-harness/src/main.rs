@@ -108,9 +108,13 @@ fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
 /// Clap value parser for `--scene-seconds`: rejects non-finite/
 /// non-positive values before they reach `render_scene`/`key_text_loop`
 /// (round 4 review: NaN makes `key_text_loop`'s budget comparison
-/// permanently false, growing the scene buffer unbounded; a
-/// too-small/negative value produces an empty buffer that trips
-/// `LoopingAudioIqSource::new`'s assertion instead of a normal error).
+/// permanently false, growing the scene buffer unbounded), AND rejects
+/// any positive value too small to round to at least one sample at
+/// `FS_HZ` (round 5 review: `secs <= 0.0` alone still let e.g.
+/// `0.000001` through, which `render_scene`'s own `(duration_s *
+/// fs).round() as usize` computation -- mirrored here -- turns into an
+/// empty buffer, tripping `LoopingAudioIqSource::new`'s assertion
+/// instead of a normal CLI error).
 fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, String> {
     let secs: f64 = s
         .parse()
@@ -118,6 +122,11 @@ fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, Stri
     if !secs.is_finite() || secs <= 0.0 {
         return Err(format!(
             "--scene-seconds must be finite and positive, got {secs}"
+        ));
+    }
+    if (secs * FS_HZ).round() < 1.0 {
+        return Err(format!(
+            "--scene-seconds {secs} is too small to produce even one sample at {FS_HZ} Hz"
         ));
     }
     Ok(secs)
