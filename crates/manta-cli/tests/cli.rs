@@ -198,6 +198,65 @@ fn decode_json_includes_spots_field() {
     );
 }
 
+/// MAN-31: an operator must be able to supply the suppression lists from
+/// the CLI, not just via the library API -- this is the end-to-end proof
+/// the wiring reaches production, not just `PipelineConfig` in isolation.
+#[test]
+fn decode_blocklist_flag_suppresses_a_callsign() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let blocklist_path = dir.path().join("bad-calls.txt");
+    std::fs::write(&blocklist_path, "W1AW\n").unwrap();
+
+    let out = manta()
+        .args(["decode", "--json", "--blocklist"])
+        .arg(&blocklist_path)
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["spots"].as_array().unwrap().len(),
+        0,
+        "blocklisted callsign must never be spotted, got: {report}"
+    );
+}
+
+/// A Windows-authored suppression file commonly starts with a UTF-8 BOM
+/// (`\u{feff}`); it must not defeat the first entry's match.
+#[test]
+fn decode_blocklist_flag_tolerates_a_leading_bom() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let blocklist_path = dir.path().join("bad-calls.txt");
+    std::fs::write(&blocklist_path, "\u{feff}W1AW\n").unwrap();
+
+    let out = manta()
+        .args(["decode", "--json", "--blocklist"])
+        .arg(&blocklist_path)
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["spots"].as_array().unwrap().len(),
+        0,
+        "a BOM-prefixed blocklist's first entry must still match, got: {report}"
+    );
+}
+
 #[test]
 #[cfg(feature = "soapy")]
 fn soapy_driver_without_freq_and_rate_is_a_clean_error() {

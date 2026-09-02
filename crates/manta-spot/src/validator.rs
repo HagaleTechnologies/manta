@@ -1,12 +1,14 @@
 //! Ties `grammar`/`context`/`cty`/`scp`/`confidence`/`gate`/`dedupe`
 //! together into one `Validator::ingest` entry point. ARCHITECTURE §6.
 
+use crate::blocklist::Blocklist;
 use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::dedupe::Dedupe;
 use crate::gate::RepetitionGate;
 use crate::grammar;
+use crate::notch::NotchList;
 use crate::scp;
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::{Glyph, Prosign};
@@ -115,6 +117,19 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
     Ok(factor)
 }
 
+/// Per-reason counts of spots suppressed by an operator override (MAN-31).
+/// ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
+/// silent loss anywhere in the pipeline." Exposed via
+/// `Validator::suppression_counts` for the future M3 metrics endpoint to
+/// read, mirroring `manta_engine::track::CloseCounts` -- nothing wires it
+/// externally yet, since the Prometheus text endpoint itself is explicit
+/// M3 scope (ROADMAP.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuppressionCounts {
+    pub blocklist: u64,
+    pub notch: u64,
+}
+
 pub struct Validator {
     cty: cty::Table,
     scp: Option<scp::Set>,
@@ -122,6 +137,9 @@ pub struct Validator {
     gate: RepetitionGate,
     dedupe: Dedupe,
     freq_calibration: f64,
+    blocklist: Blocklist,
+    notch: NotchList,
+    suppression_counts: SuppressionCounts,
 }
 
 impl Validator {
@@ -133,6 +151,9 @@ impl Validator {
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
             freq_calibration: 1.0,
+            blocklist: Blocklist::default(),
+            notch: NotchList::default(),
+            suppression_counts: SuppressionCounts::default(),
         }
     }
 
@@ -157,6 +178,26 @@ impl Validator {
     pub fn with_freq_correction_ppm(mut self, ppm: f64) -> Result<Self, InvalidCalibration> {
         self.freq_calibration = calibration_factor_from_ppm(ppm)?;
         Ok(self)
+    }
+
+    /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
+    /// default -- no suppression until the operator supplies one.
+    pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {
+        self.blocklist = blocklist;
+        self
+    }
+
+    /// Sets the operator's notched-frequency list (MAN-31). Empty by
+    /// default -- no suppression until the operator supplies one.
+    pub fn with_notch(mut self, notch: NotchList) -> Self {
+        self.notch = notch;
+        self
+    }
+
+    /// Per-reason counts of operator-suppressed spots so far (MAN-31,
+    /// ARCHITECTURE §8).
+    pub fn suppression_counts(&self) -> SuppressionCounts {
+        self.suppression_counts
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -249,6 +290,19 @@ impl Validator {
             word.attempted = true;
             word.confidences.clone()
         };
+
+        // Operator suppression overrides (MAN-31) -- orthogonal to, and
+        // checked ahead of, the automatic validation pipeline below. Each
+        // hit is counted (ARCHITECTURE §8) so it reads as a deliberate
+        // suppression, not silent coverage loss.
+        if self.blocklist.contains(&candidate) {
+            self.suppression_counts.blocklist += 1;
+            return Vec::new();
+        }
+        if self.notch.contains(freq_hz) {
+            self.suppression_counts.notch += 1;
+            return Vec::new();
+        }
 
         if !grammar::is_plausible(&candidate) {
             return Vec::new();

@@ -496,8 +496,10 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. Implemented as
-crate-level tests in `crates/manta-spot/tests/golden_v11_v15.rs`.
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15 are
+implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
+(operator suppression, MAN-31 -- orthogonal to this pipeline, see
+ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
@@ -506,6 +508,8 @@ crate-level tests in `crates/manta-spot/tests/golden_v11_v15.rs`.
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
 | V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s | 1 rep never spots; 2 reps does |
 | V15 | dedupe | Repeat spot inside the 10 min window, then an SNR jump >= 6 dB | Suppressed inside the window; allowed after the SNR jump |
+| V16 | bad-call blocklist | Callsign present vs. absent from the operator's bad-call list | Present → 0 spots; absent → spots normally |
+| V17 | notched frequency | Track frequency inside vs. outside a notched range | Inside → 0 spots; outside → spots normally |
 
 ---
 
