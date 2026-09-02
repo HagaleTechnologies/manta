@@ -19,7 +19,7 @@ pub fn is_plausible(call: &str) -> bool {
     is_valid_base(base)
 }
 
-fn is_valid_portable(p: &str) -> bool {
+pub(crate) fn is_valid_portable(p: &str) -> bool {
     matches!(p, "P" | "QRP" | "MM" | "AM" | "M")
         || (p.len() == 1 && p.chars().next().unwrap().is_ascii_digit())
 }
