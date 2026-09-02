@@ -129,31 +129,36 @@ fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
 /// (0.54x realtime vs. the actual 0.360x under --release). A dev-profile run can show false
 /// failures near/over the 0.5x budget even though the actual (release-profile) pipeline
 /// clears it comfortably.
-/// `PipelineConfig::default()`'s `DetectorConfig::warmup_hops` (see
-/// `track.rs`) inhibits ALL track creation for this many hops -- no
-/// decoder-pool work happens in that window, only channelizer +
-/// noise-floor-estimator cost. At the default 750 hops / `FO_HZ` (375 Hz
-/// hop rate), that's exactly 2.0s. Dividing a ratio by the FULL scene
-/// duration therefore dilutes the steady-state (all-300-tracks-active)
-/// cost by warmup/duration -- 2s of 15s, ~13% -- understating the ratio
-/// relative to what ROADMAP.md's "< X% of one core" criterion means
-/// (found via Codex review on this PR). `decode_samples` has no public
-/// API to time only the post-warmup portion of a single call (adding one
-/// would be a `manta-engine` production API change, out of scope for this
-/// measurement-only ticket), so this normalizes the denominator instead of
-/// pre-rolling: divide by `(audio_duration - warmup)`, not raw
-/// `audio_duration`. That leaves the warmup window's own small real cost
-/// folded into the numerator, i.e. slightly *over*-corrects toward a
-/// stricter ratio -- the safer direction to be wrong in for an accept gate.
-const WARMUP_HOPS: f64 = 750.0;
-const WARMUP_S: f64 = WARMUP_HOPS / manta_decode::FO_HZ;
+/// `cfg.detector.warmup_hops` (see `track.rs`'s `DetectorConfig`) inhibits
+/// ALL track creation for this many hops -- no decoder-pool work happens
+/// in that window, only channelizer + noise-floor-estimator cost. At the
+/// default 750 hops / `FO_HZ` (375 Hz hop rate), that's exactly 2.0s.
+/// Dividing a ratio by the FULL scene duration therefore dilutes the
+/// steady-state (all-300-tracks-active) cost by warmup/duration -- 2s of
+/// 15s, ~13% -- understating the ratio relative to what ROADMAP.md's
+/// "< X% of one core" criterion means (found via Codex review on this
+/// PR). `decode_samples` has no public API to time only the post-warmup
+/// portion of a single call (adding one would be a `manta-engine`
+/// production API change, out of scope for this measurement-only ticket),
+/// so this normalizes the denominator instead of pre-rolling: divide by
+/// `(audio_duration - warmup)`, not raw `audio_duration`. That leaves the
+/// warmup window's own small real cost folded into the numerator, i.e.
+/// slightly *over*-corrects toward a stricter ratio -- the safer
+/// direction to be wrong in for an accept gate. Derived from `cfg` at
+/// runtime, not a hard-coded 750, so a future retune of
+/// `DetectorConfig::default()` can't silently desync this from the
+/// workload it's actually measuring (Codex review, this PR).
+fn warmup_s(cfg: &PipelineConfig) -> f64 {
+    cfg.detector.warmup_hops as f64 / manta_decode::FO_HZ
+}
 
 #[test]
 #[ignore]
 fn cpu_budget_mac_under_half_core() {
     let (iq, fs, center_freq_hz, cfg) = cpu_budget_scene();
     let audio_duration_s = iq.len() as f64 / fs;
-    let steady_state_s = audio_duration_s - WARMUP_S;
+    let warmup = warmup_s(&cfg);
+    let steady_state_s = audio_duration_s - warmup;
     let cpu_before = cpu_seconds();
     let start = std::time::Instant::now();
     let report = manta_engine::decode_samples(&iq, fs, center_freq_hz, &cfg);
@@ -188,8 +193,8 @@ fn cpu_budget_mac_under_half_core() {
          more than 300 short-lived track IDs) would silently cheapen this benchmark"
     );
 
-    // Both ratios divide by steady_state_s (audio_duration_s minus the 2s
-    // detector warmup), not raw audio_duration_s -- see WARMUP_S's doc
+    // Both ratios divide by steady_state_s (audio_duration_s minus the
+    // detector warmup), not raw audio_duration_s -- see warmup_s's doc
     // comment above for why.
     let wall_ratio = elapsed / steady_state_s;
     // (user + sys) / audio_duration is the criterion ROADMAP.md actually
@@ -209,7 +214,7 @@ fn cpu_budget_mac_under_half_core() {
     // instructed "read the core-seconds line" step with nothing to read
     // in exactly the slow-Pi scenario it exists for.
     println!(
-        "cpu_budget: {elapsed:.2}s wall / {steady_state_s:.2}s steady-state audio ({audio_duration_s:.2}s scene minus {WARMUP_S:.1}s detector warmup) = {wall_ratio:.3}x realtime wall-clock (Mac budget: < 0.5x)"
+        "cpu_budget: {elapsed:.2}s wall / {steady_state_s:.2}s steady-state audio ({audio_duration_s:.2}s scene minus {warmup:.1}s detector warmup) = {wall_ratio:.3}x realtime wall-clock (Mac budget: < 0.5x)"
     );
     // Unix-only -- see cpu_seconds' doc comment. cfg!(unix) rather than
     // #[cfg(unix)] on the block: both branches are ordinary std macro

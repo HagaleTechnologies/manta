@@ -201,8 +201,12 @@ generator, no additional hardware-specific features to disable.
   was reachable from the environment this MAN-18 session ran in — checked
   `~/.ssh/config` and known hosts across the fleet (aldebaran, rigel,
   sophon, vega, pandora); the only aarch64 hosts found are Apple Silicon
-  Macs (M-series), which are the *other*, already-passing leg of this
-  gate, not a Pi4 substitute. See
-  `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` for a
-  cross-architecture *estimate* (not a measurement) and why it should not
-  be treated as satisfying this gate.
+  Macs (M-series), which are the *other* leg of this gate, not a Pi4
+  substitute. **That other leg's own pass/fail status is unresolved too**
+  — a warmup-dilution bug found on this same PR invalidates the Mac
+  numbers recorded before 2026-09-02 (including the 0.360x on record since
+  2026-07-24); a clean rerun of the now-fixed test on a quiet, uncontended
+  machine is needed before either leg of this M2 criterion can be called
+  settled. See `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md`
+  for the full history, a cross-architecture Pi4 *estimate* (not a
+  measurement), and why neither should be treated as satisfying this gate.
