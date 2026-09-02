@@ -166,3 +166,13 @@ whole runbook exists to run) — adding the `getrusage`-based CPU-time
 measurement and the active-track-count assertion described above, both in
 response to review findings on this PR. That's the harness MAN-18 was
 asked to run and write up, not the pipeline it measures.
+
+One thing found but explicitly *not* fixed here: cross-checking the
+`#[cfg(unix)]` fix against a Windows target (`cargo check --target
+x86_64-pc-windows-gnu -p manta-engine --tests`) surfaced a pre-existing,
+unrelated bug in production code — `peak_rss_bytes()` in
+`crates/manta-engine/src/soak.rs` has the identical unguarded
+`libc::rusage`/`getrusage`/`RUSAGE_SELF` pattern, breaking Windows
+compilation of `manta-engine`'s lib itself (this repo's own AGENTS.md
+states it's cross-platform). That's production pipeline code, out of this
+ticket's scope — filed as MAN-46 rather than fixed inline here.

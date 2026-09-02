@@ -24,7 +24,14 @@ MAN-30's fate.
    built binary over if you cross-compiled instead — see "Cross-compiling"
    below if the Pi4 itself is too slow to build from source in reasonable
    time (it isn't, in practice; a from-scratch `manta-engine` release build
-   takes a few minutes on Pi4, not hours).
+   takes a few minutes on Pi4, not hours). **Before building natively on
+   the Pi4**, install the ALSA dev headers and `pkg-config` — a fresh
+   Raspberry Pi OS install has neither, and `manta-engine` pulls in
+   `manta-input` → `cpal` → `alsa-sys`, which needs both to build. This
+   mirrors the repo's own Linux CI step (`.github/workflows/ci.yml`):
+   ```
+   sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+   ```
 2. Record throttling/clock state *before* the first run, so a throttled
    or overclocked Pi doesn't get silently misread as a CPU-budget result:
    ```
@@ -104,28 +111,43 @@ supplying one (checked 2026-09-02), so a bare `cargo build --target
 aarch64-unknown-linux-gnu` will fail at the link step on a non-aarch64
 host. Two ways to get a working cross toolchain:
 
+`manta-engine` pulls in `manta-input` → `cpal` → `alsa-sys`, a native
+dependency needing ALSA's dev headers for whichever target you're building
+— not just a Rust-level cross toolchain. Two ways to get a working setup:
+
 **Option A — `cross` (Docker-based, simplest):**
 ```
 cargo install cross --git https://github.com/cross-rs/cross
 cross test --release --target aarch64-unknown-linux-gnu -p manta-engine \
   --test cpu_budget --no-run -- --ignored --nocapture
 ```
-`cross` runs the build inside a container that already has the
-`aarch64-linux-gnu` toolchain and a matching sysroot configured — no
-manual linker setup needed. Requires Docker (or Podman) on the build host.
+`cross`'s stock `aarch64-unknown-linux-gnu` image bundles the
+`aarch64-linux-gnu` toolchain and sysroot, but has not been confirmed here
+to include the aarch64 ALSA dev headers `alsa-sys`'s build script needs —
+verify this actually links before relying on it (unverified as of
+2026-09-02: no Docker available in the environment this runbook was
+written in); if it fails on the `alsa-sys` build script, a custom `cross`
+image (`Cross.toml` + `RUN apt-get install -y libasound2-dev:arm64`, or
+equivalent) or Option B is the fallback. Requires Docker (or Podman) on
+the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
 ```
-# Debian/Ubuntu build host:
-sudo apt install gcc-aarch64-linux-gnu
+# Debian/Ubuntu build host — add the arm64 architecture, then both the
+# linker toolchain and arm64 ALSA dev headers:
+sudo dpkg --add-architecture arm64
+sudo apt update
+sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 
 # Either set this for one invocation:
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  PKG_CONFIG_ALLOW_CROSS=1 \
   cargo test --release --target aarch64-unknown-linux-gnu -p manta-engine \
   --test cpu_budget --no-run -- --ignored --nocapture
 
-# ...or add to .cargo/config.toml (not committed to this repo — local only,
-# since the fleet's other build hosts aren't all cross-compiling for Pi4):
+# ...or add the linker line to .cargo/config.toml (not committed to this
+# repo — local only, since the fleet's other build hosts aren't all
+# cross-compiling for Pi4):
 #   [target.aarch64-unknown-linux-gnu]
 #   linker = "aarch64-linux-gnu-gcc"
 ```
@@ -142,9 +164,9 @@ ssh pi4 './cpu_budget --ignored --nocapture'
 ```
 
 Nothing in `manta-engine`'s own `Cargo.toml` pulls in SoapySDR or another
-native SDR library (checked 2026-09-02) — this bench only needs
-`manta-testkit`'s synthetic scene generator, no hardware-specific features
-to disable.
+native SDR library beyond `manta-input`'s ALSA dependency above (checked
+2026-09-02) — this bench only needs `manta-testkit`'s synthetic scene
+generator, no additional hardware-specific features to disable.
 
 ## Runs
 

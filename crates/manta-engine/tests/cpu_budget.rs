@@ -21,12 +21,25 @@ use std::collections::HashMap;
 /// threads" -- see docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md.
 /// The Pi4 accept criterion (< 1 full core, ROADMAP.md M2) is a CPU-time
 /// budget, not a wall-clock one; this is what actually answers it.
+///
+/// Unix-only: `getrusage`/`RUSAGE_SELF` aren't in Windows' `libc` surface,
+/// and this repo is explicitly cross-platform (AGENTS.md) -- the Mac/Pi4
+/// gate this test measures is inherently Unix-hardware-only anyway (there's
+/// no Windows leg of this ROADMAP criterion), so the Windows build just
+/// skips the CPU-time checks below rather than pulling in an extra crate
+/// (e.g. `windows-sys`'s `GetProcessTimes`) for a number nothing needs.
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
     assert_eq!(rc, 0, "getrusage failed");
     let to_secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1_000_000.0;
     to_secs(usage.ru_utime) + to_secs(usage.ru_stime)
+}
+
+#[cfg(not(unix))]
+fn cpu_seconds() -> f64 {
+    f64::NAN
 }
 
 fn track_id(e: &DecoderEvent) -> u32 {
@@ -141,12 +154,18 @@ fn cpu_budget_mac_under_half_core() {
     println!(
         "cpu_budget: {sustained} tracks sustained across most of the run (scene has 300 signals)"
     );
-    assert!(
-        sustained >= 285,
+    // Exact 300, not a tolerance band: this scene is fully deterministic
+    // (fixed seed, uniform 15 dB SNR, no fading/QSB, every signal
+    // continuous for the whole 15s) and has produced exactly 300 on every
+    // run measured so far -- a tolerance band here would let a workload up
+    // to several percent cheaper than ROADMAP.md's 300-active-track
+    // criterion silently pass, which matters given the Mac CPU-time margin
+    // is only ~6-9% (see the decision doc).
+    assert_eq!(
+        sustained, 300,
         "only {sustained} of 300 scene signals produced a track sustained across most of the \
-         run (>=285, 95%, required) -- detector/config regression (fewer tracks held \
-         concurrently, or churn through more than 300 short-lived track IDs) would silently \
-         cheapen this benchmark"
+         run -- detector/config regression (fewer tracks held concurrently, or churn through \
+         more than 300 short-lived track IDs) would silently cheapen this benchmark"
     );
 
     let wall_ratio = elapsed / audio_duration_s;
@@ -162,17 +181,28 @@ fn cpu_budget_mac_under_half_core() {
     println!(
         "cpu_budget: {elapsed:.2}s wall / {audio_duration_s:.2}s audio = {wall_ratio:.3}x realtime wall-clock (Mac budget: < 0.5x)"
     );
-    println!(
-        "cpu_budget: {cpu_elapsed:.2}s (user+sys) CPU / {audio_duration_s:.2}s audio = {cpu_ratio:.3}x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)"
-    );
     assert!(
         wall_ratio < 0.5,
         "192 kS/s / 300-track pipeline used {wall_ratio:.3}x realtime, Mac budget is < 0.5x (< 50% of one core)"
     );
-    assert!(
-        cpu_ratio < 0.5,
-        "192 kS/s / 300-track pipeline used {cpu_ratio:.3}x (user+sys) core-seconds per audio-second, \
-         Mac budget is < 0.5x (< 50% of one core) -- a run can pass on wall-clock alone by \
-         spreading the same work across more cores than the budget allows"
-    );
+    // Unix-only -- see cpu_seconds' doc comment. cfg!(unix) rather than
+    // #[cfg(unix)] on the block: both branches are ordinary std macro
+    // calls (no platform-specific API), so gating at runtime keeps this
+    // one block's control flow visible instead of duplicating the whole
+    // tail of the function behind two #[cfg] copies.
+    if cfg!(unix) {
+        println!(
+            "cpu_budget: {cpu_elapsed:.2}s (user+sys) CPU / {audio_duration_s:.2}s audio = {cpu_ratio:.3}x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)"
+        );
+        assert!(
+            cpu_ratio < 0.5,
+            "192 kS/s / 300-track pipeline used {cpu_ratio:.3}x (user+sys) core-seconds per \
+             audio-second, Mac budget is < 0.5x (< 50% of one core) -- a run can pass on \
+             wall-clock alone by spreading the same work across more cores than the budget allows"
+        );
+    } else {
+        println!(
+            "cpu_budget: (user+sys) CPU-time ratio not measured on this platform (Unix-only, see cpu_seconds' doc comment)"
+        );
+    }
 }
