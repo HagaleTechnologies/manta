@@ -1,17 +1,17 @@
-# skimmer — Roadmap
+# manta — Roadmap
 
 Milestones are strictly ordered; each has hard acceptance criteria. "Accuracy"
-always means character error rate (CER) on `skimmer-testkit` scenes unless
+always means character error rate (CER) on `manta-testkit` scenes unless
 stated otherwise.
 
 ## M0 — One clean signal from a file
 
-Workspace scaffolding, `skimmer-testkit` synthetic CW generator, `skimmer-input`
+Workspace scaffolding, `manta-testkit` synthetic CW generator, `manta-input`
 file playback, single hardwired channel (no PFB), classical decoder chain
 (envelope → keying → speed tracking → beam-search Morse decode).
 
 **Accept when:**
-- `skimmer decode fixture.wav` (WAV input, per SPEC-decode-core §7's M0
+- `manta decode fixture.wav` (WAV input, per SPEC-decode-core §7's M0
   definition) prints the correct text for a synthetic
   20 WPM / +20 dB SNR / AWGN-only single-signal IQ file (SPEC §7 V1).
 - Proptest round-trip (text → testkit CW → decoder) passes for 10–40 WPM at
@@ -53,19 +53,19 @@ KiwiSDR input.
   simulated fading"), closing that gap is M4's job, not M2's.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
   of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. Mac leg
-  passes (0.360x realtime, now including `skimmer-spot::Validator` cost
+  passes (0.360x realtime, now including `manta-spot::Validator` cost
   per M3's engine-wiring sub-project — see
-  `crates/skimmer-engine/benches/cpu_budget.rs`); **Pi4 leg outstanding** —
+  `crates/manta-engine/benches/cpu_budget.rs`); **Pi4 leg outstanding** —
   needs real Raspberry Pi 4 hardware.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics. **Outstanding** — needs a real SDR
   and 24 unattended hours.
 
-M2 sub-project 1 (PFB channelizer, `skimmer-dsp::channelizer`) is complete —
+M2 sub-project 1 (PFB channelizer, `manta-dsp::channelizer`) is complete —
 see `docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md` and
 `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`. M2 sub-project 2
-(detector/track manager + decoder pool, `skimmer-dsp::floor` +
-`skimmer-engine::track`) is complete — see
+(detector/track manager + decoder pool, `manta-dsp::floor` +
+`manta-engine::track`) is complete — see
 `docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md` and
 `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. All remaining M2
 sub-projects (V8/V8w pileup-scene validation + CPU-budget criterion bench,
@@ -78,27 +78,27 @@ unmet acceptance gates, not sub-project work.
 
 ## M3 — Spots: validation + servers + RBN parity benchmark
 
-`skimmer-spot` (cty.dat, SCP, CQ/DE parse, repetition gate, dedupe),
-`skimmer-server` (telnet cluster protocol + JSON Lines/WebSocket), TOML config,
+`manta-spot` (cty.dat, SCP, CQ/DE parse, repetition gate, dedupe),
+`manta-server` (telnet cluster protocol + JSON Lines/WebSocket), TOML config,
 metrics endpoint, spot JSON Schema contributed to `dispensa`.
 
 **Accept when:**
 - A stock DX cluster client (e.g. `telnet`, N1MM) connects, logs in, and
   receives well-formed RBN-format spots.
-- **Parity benchmark**: on ≥ 2 h of recorded contest-weekend IQ, skimmer achieves
+- **Parity benchmark**: on ≥ 2 h of recorded contest-weekend IQ, manta achieves
   ≥ 80 % recall of RBN's spots for the same slice with ≤ 5 % false (bogus-call)
   spots. Numbers published in the repo, whatever they are.
 - cqdx ingests the JSON stream in a dev environment.
 - 7-day unattended soak feeding spots continuously.
 
-`skimmer-spot` (callsign/CQ-DE validation, cty.dat/SCP cross-check,
+`manta-spot` (callsign/CQ-DE validation, cty.dat/SCP cross-check,
 repetition gate, dedupe) is complete as a standalone crate -- see
-`docs/superpowers/specs/2026-07-25-m3-skimmer-spot-design.md` and SPEC
--decode-core.md §7.1 (V11-V15). It is now wired into `skimmer-engine`'s
+`docs/superpowers/specs/2026-07-25-m3-manta-spot-design.md` and SPEC
+-decode-core.md §7.1 (V11-V15). It is now wired into `manta-engine`'s
 batch (`decode_samples`/`decode_wav`) and streaming (`listen`) pipelines,
 both emitting real `Spot`s -- see
 `docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`. Remaining
-M3 sub-projects: `skimmer-server` (telnet + JSON/WebSocket output, TOML
+M3 sub-projects: `manta-server` (telnet + JSON/WebSocket output, TOML
 config, metrics), and the RBN parity benchmark (needs ≥ 2 h of recorded
 contest-weekend IQ with RBN reference spots -- a data dependency not yet
 resolved).
@@ -120,6 +120,6 @@ confidence weighting. ONNX/candle inference, feature-gated.
 
 - RTTY/FT4-adjacent modes on the same channelizer.
 - Multi-SDR single-daemon orchestration.
-- Upstream conversation with RBN operators about accepting skimmer nodes.
+- Upstream conversation with RBN operators about accepting manta nodes.
 - Spot quality feedback loop: cqdx-side confirmation (same call spotted by other
   nodes) fed back to tune validation thresholds.

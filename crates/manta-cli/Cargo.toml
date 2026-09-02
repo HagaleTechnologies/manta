@@ -1,0 +1,31 @@
+[package]
+name = "manta-cli"
+description = "manta daemon and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "manta"
+path = "src/main.rs"
+
+[features]
+soapy = ["manta-input/soapy"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+ctrlc = { workspace = true }
+serde_json = { workspace = true }
+manta-decode = { workspace = true }
+manta-engine = { workspace = true }
+manta-input = { workspace = true }
+manta-testkit = { workspace = true }
+
+[dev-dependencies]
+coppa-audio = { workspace = true }
+serde_json = { workspace = true }
+manta-testkit = { workspace = true }
+tempfile = { workspace = true }

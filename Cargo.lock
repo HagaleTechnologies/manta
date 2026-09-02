@@ -796,6 +796,105 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "manta-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "coppa-audio",
+ "ctrlc",
+ "manta-decode",
+ "manta-engine",
+ "manta-input",
+ "manta-testkit",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "manta-decode"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "serde",
+]
+
+[[package]]
+name = "manta-dsp"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "coppa-dsp",
+ "num-complex",
+]
+
+[[package]]
+name = "manta-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "coppa-audio",
+ "criterion",
+ "libc",
+ "manta-decode",
+ "manta-dsp",
+ "manta-input",
+ "manta-spot",
+ "manta-testkit",
+ "num-complex",
+ "proptest",
+ "rayon",
+ "serde",
+]
+
+[[package]]
+name = "manta-input"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "coppa-audio",
+ "cpal",
+ "hound",
+ "manta-dsp",
+ "num-complex",
+ "rubato",
+ "serde",
+ "serde_json",
+ "soapysdr",
+ "tempfile",
+ "tungstenite",
+]
+
+[[package]]
+name = "manta-spot"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "manta-decode",
+ "regex",
+ "serde",
+]
+
+[[package]]
+name = "manta-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "coppa-channel",
+ "hound",
+ "manta-decode",
+ "manta-dsp",
+ "manta-input",
+ "num-complex",
+ "proptest",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1431,105 +1530,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "skimmer-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "coppa-audio",
- "ctrlc",
- "serde_json",
- "skimmer-decode",
- "skimmer-engine",
- "skimmer-input",
- "skimmer-testkit",
- "tempfile",
-]
-
-[[package]]
-name = "skimmer-decode"
-version = "0.1.0"
-dependencies = [
- "approx",
- "serde",
-]
-
-[[package]]
-name = "skimmer-dsp"
-version = "0.1.0"
-dependencies = [
- "approx",
- "coppa-dsp",
- "num-complex",
-]
-
-[[package]]
-name = "skimmer-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "coppa-audio",
- "criterion",
- "libc",
- "num-complex",
- "proptest",
- "rayon",
- "serde",
- "skimmer-decode",
- "skimmer-dsp",
- "skimmer-input",
- "skimmer-spot",
- "skimmer-testkit",
-]
-
-[[package]]
-name = "skimmer-input"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "coppa-audio",
- "cpal",
- "hound",
- "num-complex",
- "rubato",
- "serde",
- "serde_json",
- "skimmer-dsp",
- "soapysdr",
- "tempfile",
- "tungstenite",
-]
-
-[[package]]
-name = "skimmer-spot"
-version = "0.1.0"
-dependencies = [
- "approx",
- "regex",
- "serde",
- "skimmer-decode",
-]
-
-[[package]]
-name = "skimmer-testkit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "coppa-channel",
- "hound",
- "num-complex",
- "proptest",
- "rand_chacha 0.10.0",
- "rand_core 0.10.1",
- "serde",
- "serde_json",
- "skimmer-decode",
- "skimmer-dsp",
- "skimmer-input",
- "tempfile",
-]
 
 [[package]]
 name = "slab"

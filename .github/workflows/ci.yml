@@ -208,5 +208,5 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-      - run: cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy -- -D warnings
-      - run: cargo test -p skimmer-input -p skimmer-cli --features soapy
+      - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
+      - run: cargo test -p manta-input -p manta-cli --features soapy

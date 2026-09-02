@@ -20,7 +20,7 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "What does skimmer reuse from coppa, and what is deliberately new code?",
+      "title": "What does manta reuse from coppa, and what is deliberately new code?",
       "verified_commit": "e68b106",
       "verified_date": "2026-07-07",
       "visibility": "private"
@@ -127,7 +127,7 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "skimmer \u2014 what is this and where do things live?",
+      "title": "manta \u2014 what is this and where do things live?",
       "verified_commit": "e68b106",
       "verified_date": "2026-07-07",
       "visibility": "private"
@@ -170,7 +170,7 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "What spot-output contracts does skimmer expose (telnet RBN + JSON)?",
+      "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
       "verified_commit": "e68b106",
       "verified_date": "2026-07-07",
       "visibility": "private"
@@ -190,7 +190,7 @@
         "ARCHITECTURE.md"
       ],
       "status": "current",
-      "title": "How does skimmer decide a decoded call is trustworthy enough to spot?",
+      "title": "How does manta decide a decoded call is trustworthy enough to spot?",
       "verified_commit": "e68b106",
       "verified_date": "2026-07-07",
       "visibility": "private"
@@ -217,7 +217,7 @@
       "visibility": "private"
     }
   ],
-  "repo": "skimmer",
+  "repo": "manta",
   "schema": "wiki-manifest/v1",
   "visibility": "private"
 }

@@ -2,24 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace `skimmer-engine::detect::calibrate_channel` (sub-project 1's one-shot single-channel-argmax placeholder) with SPEC-decode-core.md §2's real order-statistic noise-floor detector and track-lifecycle state machine, and fold in the decoder-pool mechanism from ARCHITECTURE.md §10 (rayon-style, `Send` per-track decoders) — both `decode_samples`/`decode_wav` and `listen()` gain real multi-track detection.
+**Goal:** Replace `manta-engine::detect::calibrate_channel` (sub-project 1's one-shot single-channel-argmax placeholder) with SPEC-decode-core.md §2's real order-statistic noise-floor detector and track-lifecycle state machine, and fold in the decoder-pool mechanism from ARCHITECTURE.md §10 (rayon-style, `Send` per-track decoders) — both `decode_samples`/`decode_wav` and `listen()` gain real multi-track detection.
 
-**Architecture:** New `skimmer-dsp::floor` module computes per-channel order-statistic noise floor + EMA-smoothed power + rise/drop hysteresis booleans (SPEC §2.1–2.3), pure and stateful-per-channel. New `skimmer-engine::track` module drives the SPEC §2.4 lifecycle state machine and §2.5 adjacent-channel ownership across all channels sequentially, hop by hop; at the end of each hop-batch it dispatches queued per-track samples to `rayon` across all ACTIVE tracks' own `TrackDecoder`s (unmodified from sub-project 1), then resequences the merged event stream by `(sample_ts, track_id)` per SPEC §6 rule 6.
+**Architecture:** New `manta-dsp::floor` module computes per-channel order-statistic noise floor + EMA-smoothed power + rise/drop hysteresis booleans (SPEC §2.1–2.3), pure and stateful-per-channel. New `manta-engine::track` module drives the SPEC §2.4 lifecycle state machine and §2.5 adjacent-channel ownership across all channels sequentially, hop by hop; at the end of each hop-batch it dispatches queued per-track samples to `rayon` across all ACTIVE tracks' own `TrackDecoder`s (unmodified from sub-project 1), then resequences the merged event stream by `(sample_ts, track_id)` per SPEC §6 rule 6.
 
-**Tech Stack:** Rust (edition 2021, rust-version 1.85.0), adds `rayon` as a new workspace dependency; reuses `skimmer-dsp::channelizer` and `skimmer-decode::decoder::TrackDecoder` unchanged.
+**Tech Stack:** Rust (edition 2021, rust-version 1.85.0), adds `rayon` as a new workspace dependency; reuses `manta-dsp::channelizer` and `manta-decode::decoder::TrackDecoder` unchanged.
 
 **Design doc:** `docs/superpowers/specs/2026-07-19-m2-detector-track-pool-design.md` — read it first; this plan implements it section by section.
 
 ## Global Constraints
 
-- **Determinism (SPEC §6):** no RNG, no wall clock anywhere in `skimmer-dsp`/`skimmer-engine`. All lifecycle timers are hop counters, never `ms`/wall-clock, at runtime (config still stores `_ms` fields for documentation parity with SPEC §9's table; they are converted to hop counts once, at `DetectorConfig` construction). Tracks live in a `BTreeMap<u32, Track>` (never `HashMap`) keyed by monotonic `track_id`, ascending birth order. `rayon` parallelizes only the per-track *decode* step (§6 rule 6 explicitly permits decoder workers to run in any order); the per-hop state-machine bookkeeping in `TrackManager` stays single-threaded and hop-ordered. Emitted events are resequenced by `(sample_ts, track_id)` before returning to the caller.
+- **Determinism (SPEC §6):** no RNG, no wall clock anywhere in `manta-dsp`/`manta-engine`. All lifecycle timers are hop counters, never `ms`/wall-clock, at runtime (config still stores `_ms` fields for documentation parity with SPEC §9's table; they are converted to hop counts once, at `DetectorConfig` construction). Tracks live in a `BTreeMap<u32, Track>` (never `HashMap`) keyed by monotonic `track_id`, ascending birth order. `rayon` parallelizes only the per-track *decode* step (§6 rule 6 explicitly permits decoder workers to run in any order); the per-hop state-machine bookkeeping in `TrackManager` stays single-threaded and hop-ordered. Emitted events are resequenced by `(sample_ts, track_id)` before returning to the caller.
 - **SPEC §2.1 floor estimator:** 250-entry ring (10 s at 25 Hz decimation — push every 15th hop), 280-bin `u8`-count histogram (0.5 dB bins, −140..0 dBFS), floor = 25th percentile, O(1) amortized per update via cumulative histogram scan, no sorting.
 - **SPEC §2.2 neighborhood floor:** 32-channel blocks, `F_blk[b]` = median of the block's `F_ch` values, `F[k] = min(F_ch[k], F_blk[⌊k/32⌋] + 3 dB)`.
-- **SPEC §2.3 gate:** EMA-smoothed power, τ = 40 ms → `α = 1 − e^{−2.667/40} ≈ 0.0645` at the channelizer's fixed 375 Hz hop rate (`skimmer_decode::FO_HZ`). Rise: `S ≥ F + 6 dB` (`on_snr_db`). Drop: `S < F + 3 dB` (`off_snr_db`).
+- **SPEC §2.3 gate:** EMA-smoothed power, τ = 40 ms → `α = 1 − e^{−2.667/40} ≈ 0.0645` at the channelizer's fixed 375 Hz hop rate (`manta_decode::FO_HZ`). Rise: `S ≥ F + 6 dB` (`on_snr_db`). Drop: `S < F + 3 dB` (`off_snr_db`).
 - **SPEC §2.4 lifecycle hop counts** (derived once from SPEC §9's ms defaults at the fixed 375 Hz hop rate, then used as integer hop counts everywhere — never re-derived per-hop): confirm = 19 hops (≈50 ms), hang = 1875 hops (5000 ms), gc = 11250 hops (30000 ms), warmup = 750 hops (2000 ms).
 - **SPEC §2.5 ownership:** a track owns `{round(c)−1, round(c), round(c)+1}`; `c` is initialized to the birth channel and is the fractional channel center. CANDIDATE-in-owned-channel is absorbed (no new track). Same-hop simultaneous rise on two unowned channels: one CANDIDATE at the higher-power channel. Two tracks converging within 1.0 channel merge; the lower-current-SNR one is CLOSED with reason `merged`.
 - **Track cap:** ARCHITECTURE §4 default 500 (not in SPEC §9's literal `[detector]` table — `DetectorConfig.track_cap` is a documented, deliberate addition beyond the SPEC table; note this as a candidate pin at close-out, same as sub-project 1's pins 4 and 6).
-- **No TOML config loader exists anywhere in this repo.** `DetectorConfig` is a plain struct + `Default` impl (same pattern as `skimmer_decode::decoder::DecodeConfig`) — do not add file loading.
+- **No TOML config loader exists anywhere in this repo.** `DetectorConfig` is a plain struct + `Default` impl (same pattern as `manta_decode::decoder::DecodeConfig`) — do not add file loading.
 - **CI:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` (full workspace, not per-crate — sub-project 1 hit this mistake twice), `cargo test --workspace` all clean.
 - **Multi-agent hygiene (CLAUDE.md):** branch `feat/m2-pfb-channelizer` (already reset onto current `origin/main`), draft PR #20 already open as the claim, `--force-with-lease` only, main moves only by PR merge.
 - Rustdoc comments on every public item cite the SPEC/ARCHITECTURE section they implement.
@@ -30,10 +30,10 @@
 
 **Files:**
 - Modify: `Cargo.toml` (workspace root)
-- Modify: `crates/skimmer-engine/Cargo.toml`
+- Modify: `crates/manta-engine/Cargo.toml`
 
 **Interfaces:**
-- Produces: `rayon` available to `skimmer-engine` (and transitively anything it re-exports from) for Task 6's parallel decode dispatch.
+- Produces: `rayon` available to `manta-engine` (and transitively anything it re-exports from) for Task 6's parallel decode dispatch.
 
 - [ ] **Step 1: Add to workspace dependencies**
 
@@ -43,9 +43,9 @@ In `Cargo.toml`, in the `[workspace.dependencies]` block, add alongside the othe
 rayon = "1"
 ```
 
-- [ ] **Step 2: Add to skimmer-engine's dependencies**
+- [ ] **Step 2: Add to manta-engine's dependencies**
 
-In `crates/skimmer-engine/Cargo.toml`, in `[dependencies]`, add:
+In `crates/manta-engine/Cargo.toml`, in `[dependencies]`, add:
 
 ```toml
 rayon = { workspace = true }
@@ -59,17 +59,17 @@ Expected: succeeds, `Cargo.lock` gains `rayon` and its transitive deps.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/skimmer-engine/Cargo.toml
+git add Cargo.toml Cargo.lock crates/manta-engine/Cargo.toml
 git commit -m "build: add rayon for the decoder-pool parallel dispatch"
 ```
 
 ---
 
-### Task 2: `skimmer-dsp::floor` — order-statistic floor estimator
+### Task 2: `manta-dsp::floor` — order-statistic floor estimator
 
 **Files:**
-- Create: `crates/skimmer-dsp/src/floor.rs`
-- Modify: `crates/skimmer-dsp/src/lib.rs`
+- Create: `crates/manta-dsp/src/floor.rs`
+- Modify: `crates/manta-dsp/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing new (plain per-channel dB power pushes).
@@ -77,12 +77,12 @@ git commit -m "build: add rayon for the decoder-pool parallel dispatch"
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/skimmer-dsp/src/floor.rs`:
+Create `crates/manta-dsp/src/floor.rs`:
 
 ```rust
 //! Per-channel order-statistic noise floor + neighborhood floor. SPEC
 //! §2.1-2.2. Pure, stateful-per-channel — no track lifecycle here (that's
-//! `skimmer-engine::track`).
+//! `manta-engine::track`).
 
 /// SPEC §2.1: 250-entry ring = 10 s at 25 Hz decimation (push every 15th hop
 /// at the channelizer's fixed 375 Hz hop rate).
@@ -175,7 +175,7 @@ fn median(vals: &[f64]) -> f64 {
 
 /// Per-channel noise floor across the whole channelizer output. SPEC
 /// §2.1-2.2. Call `update` once per hop with that hop's per-channel dB
-/// power (`skimmer_dsp::channelizer::power_db` applied to each
+/// power (`manta_dsp::channelizer::power_db` applied to each
 /// `HopOutput.power[k]`); query `effective_floor_db` any time.
 pub struct FloorBank {
     channels: Vec<ChannelFloor>,
@@ -326,7 +326,7 @@ mod tests {
 
 - [ ] **Step 2: Register the module**
 
-In `crates/skimmer-dsp/src/lib.rs`, add alongside the existing `pub mod` declarations:
+In `crates/manta-dsp/src/lib.rs`, add alongside the existing `pub mod` declarations:
 
 ```rust
 pub mod floor;
@@ -334,7 +334,7 @@ pub mod floor;
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p skimmer-dsp floor:: -- --nocapture`
+Run: `cargo test -p manta-dsp floor:: -- --nocapture`
 Expected: all 6 tests pass.
 
 - [ ] **Step 4: Run workspace clippy**
@@ -345,16 +345,16 @@ Expected: clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-dsp/src/floor.rs crates/skimmer-dsp/src/lib.rs
+git add crates/manta-dsp/src/floor.rs crates/manta-dsp/src/lib.rs
 git commit -m "feat(dsp): order-statistic floor estimator + neighborhood floor (SPEC §2.1-2.2)"
 ```
 
 ---
 
-### Task 3: `skimmer-dsp::floor` — EMA gate (rise/drop booleans)
+### Task 3: `manta-dsp::floor` — EMA gate (rise/drop booleans)
 
 **Files:**
-- Modify: `crates/skimmer-dsp/src/floor.rs`
+- Modify: `crates/manta-dsp/src/floor.rs`
 
 **Interfaces:**
 - Consumes: `FloorBank::effective_floor_db` (Task 2).
@@ -362,7 +362,7 @@ git commit -m "feat(dsp): order-statistic floor estimator + neighborhood floor (
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/skimmer-dsp/src/floor.rs` (before the existing `#[cfg(test)] mod tests` block's closing brace, as new items in the same test module, plus the new pub struct above the test module):
+Append to `crates/manta-dsp/src/floor.rs` (before the existing `#[cfg(test)] mod tests` block's closing brace, as new items in the same test module, plus the new pub struct above the test module):
 
 Add above `#[cfg(test)] mod tests {`:
 
@@ -374,7 +374,7 @@ const GATE_EMA_ALPHA: f64 = 0.0645;
 /// Per-channel EMA-smoothed power + rise/drop hysteresis booleans. SPEC
 /// §2.3. Carries **no** persistence/timing state (confirm-hop-counting,
 /// hang-ms-counting) -- that's the track lifecycle's job
-/// (`skimmer-engine::track`). This struct is a pure function of its own
+/// (`manta-engine::track`). This struct is a pure function of its own
 /// per-channel EMA state.
 pub struct Gate {
     smoothed_db: Vec<f64>,
@@ -476,7 +476,7 @@ Add inside `mod tests`:
 
 - [ ] **Step 2: Run the tests**
 
-Run: `cargo test -p skimmer-dsp floor:: -- --nocapture`
+Run: `cargo test -p manta-dsp floor:: -- --nocapture`
 Expected: 9 tests pass (6 from Task 2 + 3 new).
 
 - [ ] **Step 3: Run workspace clippy**
@@ -487,17 +487,17 @@ Expected: clean.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-dsp/src/floor.rs
+git add crates/manta-dsp/src/floor.rs
 git commit -m "feat(dsp): EMA-smoothed power + rise/drop hysteresis gate (SPEC §2.3)"
 ```
 
 ---
 
-### Task 4: `skimmer-engine::track` — single-channel lifecycle state machine
+### Task 4: `manta-engine::track` — single-channel lifecycle state machine
 
 **Files:**
-- Create: `crates/skimmer-engine/src/track.rs`
-- Modify: `crates/skimmer-engine/src/lib.rs`
+- Create: `crates/manta-engine/src/track.rs`
+- Modify: `crates/manta-engine/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing from `floor` yet — this task tests the FSM in isolation against a synthetic `(rise, drop)` boolean sequence, deferring real channel wiring to Task 5.
@@ -505,7 +505,7 @@ git commit -m "feat(dsp): EMA-smoothed power + rise/drop hysteresis gate (SPEC �
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/skimmer-engine/src/track.rs`:
+Create `crates/manta-engine/src/track.rs`:
 
 ```rust
 //! Track lifecycle state machine (SPEC §2.4) and adjacent-channel ownership
@@ -762,7 +762,7 @@ mod tests {
 
 - [ ] **Step 2: Register the module**
 
-In `crates/skimmer-engine/src/lib.rs`, add alongside the existing `mod detect;` declaration:
+In `crates/manta-engine/src/lib.rs`, add alongside the existing `mod detect;` declaration:
 
 ```rust
 mod track;
@@ -771,7 +771,7 @@ pub use track::DetectorConfig;
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p skimmer-engine track:: -- --nocapture`
+Run: `cargo test -p manta-engine track:: -- --nocapture`
 Expected: all 6 tests pass.
 
 - [ ] **Step 4: Run workspace clippy**
@@ -782,28 +782,28 @@ Expected: clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/track.rs crates/skimmer-engine/src/lib.rs
+git add crates/manta-engine/src/track.rs crates/manta-engine/src/lib.rs
 git commit -m "feat(engine): track lifecycle state machine, single-channel (SPEC §2.4)"
 ```
 
 ---
 
-### Task 5: `skimmer-engine::track` — `TrackManager`: multi-channel orchestration + ownership
+### Task 5: `manta-engine::track` — `TrackManager`: multi-channel orchestration + ownership
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/track.rs`
+- Modify: `crates/manta-engine/src/track.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::floor::{FloorBank, Gate}` (Tasks 2-3), `skimmer_dsp::channelizer::{HopOutput, power_db, interpolate_offset}`, `Lifecycle`/`DetectorConfig` (Task 4).
+- Consumes: `manta_dsp::floor::{FloorBank, Gate}` (Tasks 2-3), `manta_dsp::channelizer::{HopOutput, power_db, interpolate_offset}`, `Lifecycle`/`DetectorConfig` (Task 4).
 - Produces: `pub(crate) struct Track { pub(crate) id: u32, center: f64, pub(crate) current_snr_db: f32, ... }`, `pub struct TrackManager`, `impl TrackManager { pub fn new(n_channels: usize, cfg: DetectorConfig) -> Self; fn step_hop(&mut self, hop: &HopOutput) -> Vec<(u32, usize, f32)> }` (returns `(track_id, selected_channel, magnitude)` per currently-ACTIVE track) — this task stops there (no `TrackDecoder`/pool dispatch yet; Task 6 changes `new`'s signature again to add `fs`/`center_freq_hz`/`decode_cfg` and adds the real public `process_hops` entry point).
 
 - [ ] **Step 1: Write the failing tests**
 
-Insert into `crates/skimmer-engine/src/track.rs`, after the `Lifecycle` impl block and before `#[cfg(test)] mod tests`:
+Insert into `crates/manta-engine/src/track.rs`, after the `Lifecycle` impl block and before `#[cfg(test)] mod tests`:
 
 ```rust
-use skimmer_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
-use skimmer_dsp::floor::{FloorBank, Gate};
+use manta_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
+use manta_dsp::floor::{FloorBank, Gate};
 use std::collections::BTreeMap;
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
@@ -882,7 +882,7 @@ impl Track {
 }
 
 /// Orchestrates SPEC §2's real detector across all channels: per-channel
-/// floor + gate (`skimmer-dsp::floor`), per-channel lifecycle state
+/// floor + gate (`manta-dsp::floor`), per-channel lifecycle state
 /// machines (`Lifecycle`), and §2.5 adjacent-channel ownership. This task's
 /// `step_hop` returns which ACTIVE tracks selected which channel this hop,
 /// without touching `TrackDecoder` -- Task 6 adds the decoder pool.
@@ -1059,10 +1059,10 @@ impl TrackManager {
 
 - [ ] **Step 2: Write the tests**
 
-Add to `#[cfg(test)] mod tests` in `crates/skimmer-engine/src/track.rs`:
+Add to `#[cfg(test)] mod tests` in `crates/manta-engine/src/track.rs`:
 
 ```rust
-    use skimmer_dsp::channelizer::HopOutput;
+    use manta_dsp::channelizer::HopOutput;
 
     fn hop(m: u64, power: Vec<f32>) -> HopOutput {
         HopOutput {
@@ -1077,7 +1077,7 @@ Add to `#[cfg(test)] mod tests` in `crates/skimmer-engine/src/track.rs`:
     }
 
     fn feed_warmup(tm: &mut TrackManager, n: usize) {
-        let hops_needed = 250u64 * 15; // floor ring fill, same as skimmer-dsp::floor tests
+        let hops_needed = 250u64 * 15; // floor ring fill, same as manta-dsp::floor tests
         for m in 0..hops_needed {
             tm.step_hop(&hop(m, quiet_power(n)));
         }
@@ -1166,7 +1166,7 @@ Add to `#[cfg(test)] mod tests` in `crates/skimmer-engine/src/track.rs`:
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p skimmer-engine track:: -- --nocapture`
+Run: `cargo test -p manta-engine track:: -- --nocapture`
 Expected: all 10 tests pass (6 from Task 4 + 4 new). This is a slow test module (each test feeds ~3750+ warmup hops) — expect several seconds, not instant.
 
 - [ ] **Step 4: Run workspace clippy**
@@ -1177,24 +1177,24 @@ Expected: clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/track.rs
+git add crates/manta-engine/src/track.rs
 git commit -m "feat(engine): TrackManager multi-channel orchestration + ownership (SPEC §2.5)"
 ```
 
 ---
 
-### Task 6: `skimmer-engine::track` — decoder pool + `process_hops` public entry point
+### Task 6: `manta-engine::track` — decoder pool + `process_hops` public entry point
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/track.rs`
+- Modify: `crates/manta-engine/src/track.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_decode::decoder::{DecodeConfig, TrackDecoder}`, `skimmer_decode::events::DecoderEvent`, `rayon::prelude::*`.
+- Consumes: `manta_decode::decoder::{DecodeConfig, TrackDecoder}`, `manta_decode::events::DecoderEvent`, `rayon::prelude::*`.
 - Produces: `impl TrackManager { pub fn new(n_channels: usize, fs: f64, center_freq_hz: f64, detector_cfg: DetectorConfig, decode_cfg: DecodeConfig) -> Self; pub fn process_hops(&mut self, hops: &[HopOutput], hop_to_sample_ts: impl Fn(u64) -> u64) -> Vec<DecoderEvent>; pub fn finish(&mut self) -> Vec<DecoderEvent> }`. This is the entry point Tasks 7-8 wire into `decode_samples`/`decode_wav`/`listen`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Modify `TrackManager` in `crates/skimmer-engine/src/track.rs`: add fields and change `new`'s signature, add `pending`/`decoder` to `Track`, add the pool dispatch to `step_hop`, and add `process_hops`/`finish`.
+Modify `TrackManager` in `crates/manta-engine/src/track.rs`: add fields and change `new`'s signature, add `pending`/`decoder` to `Track`, add the pool dispatch to `step_hop`, and add `process_hops`/`finish`.
 
 Two separate replacements inside `impl Track`'s existing block: replace the `struct Track { ... }` definition, and separately replace just its `fn new` method. Leave `owned`, `select_channel`, and `update_centroid` (Task 5) untouched — `freq_hz` is a new method added after them, not a replacement. The struct and `fn new` become:
 
@@ -1447,18 +1447,18 @@ fn event_track_id(e: &DecoderEvent) -> u32 {
 }
 ```
 
-Add `use skimmer_decode::decoder::{DecodeConfig, TrackDecoder};` and `use skimmer_decode::events::DecoderEvent;` to the top of `crates/skimmer-engine/src/track.rs`.
+Add `use manta_decode::decoder::{DecodeConfig, TrackDecoder};` and `use manta_decode::events::DecoderEvent;` to the top of `crates/manta-engine/src/track.rs`.
 
-Update the existing Task-5 tests: `TrackManager::new` and `step_hop` calls in `mod tests` now need the new signature. Replace every `TrackManager::new(64, DetectorConfig::default())` (and the cap-test's `TrackManager::new(64, cfg)`) with `TrackManager::new(64, 96_000.0, 14_000_000.0, DetectorConfig::default(), DecodeConfig::default())` (or `cfg` in place of the default), and every `tm.step_hop(&hop(m, power.clone()))` with `tm.step_hop(&hop(m, power.clone()), m)` (identity sample_ts mapping is fine for these unit tests, which don't assert on decoded text/timing). Add `use skimmer_decode::decoder::DecodeConfig;` to the test module's imports.
+Update the existing Task-5 tests: `TrackManager::new` and `step_hop` calls in `mod tests` now need the new signature. Replace every `TrackManager::new(64, DetectorConfig::default())` (and the cap-test's `TrackManager::new(64, cfg)`) with `TrackManager::new(64, 96_000.0, 14_000_000.0, DetectorConfig::default(), DecodeConfig::default())` (or `cfg` in place of the default), and every `tm.step_hop(&hop(m, power.clone()))` with `tm.step_hop(&hop(m, power.clone()), m)` (identity sample_ts mapping is fine for these unit tests, which don't assert on decoded text/timing). Add `use manta_decode::decoder::DecodeConfig;` to the test module's imports.
 
 Add a new integration-style test proving the pool actually decodes, at the end of `mod tests`:
 
 ```rust
     #[test]
     fn active_track_decodes_real_text() {
-        use skimmer_dsp::channelizer::Channelizer;
-        let spec = skimmer_testkit::vectors::v1();
-        let rendered = skimmer_testkit::vectors::render(&spec).unwrap();
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
         let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
         let hop_samples = ch.hop() as u64;
         let mut tm = TrackManager::new(
@@ -1477,9 +1477,9 @@ Add a new integration-style test proving the pool actually decodes, at the end o
         let track_ids: std::collections::BTreeSet<u32> =
             all_events.iter().map(event_track_id).collect();
         assert_eq!(track_ids.len(), 1, "V1 is single-signal, expected exactly 1 track");
-        let text = skimmer_decode::decoder::events_to_text(&all_events);
+        let text = manta_decode::decoder::events_to_text(&all_events);
         assert_eq!(
-            skimmer_testkit::cer::cer(&rendered.keyed_texts[0], &text),
+            manta_testkit::cer::cer(&rendered.keyed_texts[0], &text),
             0.0,
             "expected {:?} got {:?}",
             rendered.keyed_texts[0],
@@ -1488,11 +1488,11 @@ Add a new integration-style test proving the pool actually decodes, at the end o
     }
 ```
 
-Add `skimmer-testkit = { workspace = true }` to `crates/skimmer-engine/Cargo.toml`'s `[dev-dependencies]` if not already present (it already is, per Task 4's read of that file — no change needed).
+Add `manta-testkit = { workspace = true }` to `crates/manta-engine/Cargo.toml`'s `[dev-dependencies]` if not already present (it already is, per Task 4's read of that file — no change needed).
 
 - [ ] **Step 2: Run the tests**
 
-Run: `cargo test -p skimmer-engine track:: -- --nocapture`
+Run: `cargo test -p manta-engine track:: -- --nocapture`
 Expected: all 11 tests pass (10 from Tasks 4-5 + 1 new). The new `active_track_decodes_real_text` test takes several seconds (real V1 decode).
 
 - [ ] **Step 3: Run workspace clippy**
@@ -1503,7 +1503,7 @@ Expected: clean.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/track.rs crates/skimmer-engine/Cargo.toml
+git add crates/manta-engine/src/track.rs crates/manta-engine/Cargo.toml
 git commit -m "feat(engine): decoder pool (rayon) + TrackManager::process_hops (ARCHITECTURE §10)"
 ```
 
@@ -1512,8 +1512,8 @@ git commit -m "feat(engine): decoder pool (rayon) + TrackManager::process_hops (
 ### Task 7: Wire `decode_samples`/`decode_wav` onto `TrackManager`
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/lib.rs`
-- Delete: `crates/skimmer-engine/src/detect.rs`
+- Modify: `crates/manta-engine/src/lib.rs`
+- Delete: `crates/manta-engine/src/detect.rs`
 
 **Interfaces:**
 - Consumes: `TrackManager::{new, process_hops, finish}` (Task 6).
@@ -1521,19 +1521,19 @@ git commit -m "feat(engine): decoder pool (rayon) + TrackManager::process_hops (
 
 - [ ] **Step 1: Update `decode_samples`**
 
-In `crates/skimmer-engine/src/lib.rs`, replace the whole body of `decode_samples` (from the `let mut ch = ...` line through `Ok(DecodeReport { ... })`) with:
+In `crates/manta-engine/src/lib.rs`, replace the whole body of `decode_samples` (from the `let mut ch = ...` line through `Ok(DecodeReport { ... })`) with:
 
 ```rust
-    let mut ch = skimmer_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))
         .context("channelizer")?;
     let hop = ch.hop() as u64;
 
     debug_assert!(
-        (fs / hop as f64 - skimmer_decode::FO_HZ).abs() < 0.01,
-        "channelizer hop rate {} Hz diverges from skimmer_decode::FO_HZ {}",
+        (fs / hop as f64 - manta_decode::FO_HZ).abs() < 0.01,
+        "channelizer hop rate {} Hz diverges from manta_decode::FO_HZ {}",
         fs / hop as f64,
-        skimmer_decode::FO_HZ
+        manta_decode::FO_HZ
     );
 
     let pad_samples = ch.filter_len();
@@ -1542,7 +1542,7 @@ In `crates/skimmer-engine/src/lib.rs`, replace the whole body of `decode_samples
     padded_iq.resize(pad_samples, Complex32::new(0.0, 0.0));
     padded_iq.extend_from_slice(iq);
 
-    let mut tm = skimmer_engine_track_manager(fs, ch.n_channels(), center_freq_hz, cfg);
+    let mut tm = manta_engine_track_manager(fs, ch.n_channels(), center_freq_hz, cfg);
     let hops = ch.process(&padded_iq);
     if hops.is_empty() {
         bail!("no signal found (input shorter than one filter length or empty)");
@@ -1580,9 +1580,9 @@ In `crates/skimmer-engine/src/lib.rs`, replace the whole body of `decode_samples
     })
 ```
 
-This drops the SPEC §1.4 centroid loop that used to live directly in `decode_samples` (`k0`, `k_minus`, `k_plus`, `sum_weighted`, `sum_power`) — that logic now lives per-track inside `Track::update_centroid` (Task 5) and is reflected via `TrackMeta.freq_hz`. `freq_hz` here is read from the lowest-track_id track's most recent `TrackMeta` event instead of being computed inline; this only fires once every 375 hops (`META_INTERVAL_HOPS` in `skimmer_decode::decoder`), so it's the freshest available estimate at report time, not necessarily the very-last-hop value — call out this precision difference in Task 10's tolerance re-measurement.
+This drops the SPEC §1.4 centroid loop that used to live directly in `decode_samples` (`k0`, `k_minus`, `k_plus`, `sum_weighted`, `sum_power`) — that logic now lives per-track inside `Track::update_centroid` (Task 5) and is reflected via `TrackMeta.freq_hz`. `freq_hz` here is read from the lowest-track_id track's most recent `TrackMeta` event instead of being computed inline; this only fires once every 375 hops (`META_INTERVAL_HOPS` in `manta_decode::decoder`), so it's the freshest available estimate at report time, not necessarily the very-last-hop value — call out this precision difference in Task 10's tolerance re-measurement.
 
-`TrackManager` needs a `fs`-and-`n_channels`-and-`center_freq_hz`-and-config constructor helper visible to `lib.rs`; add this small free function to `crates/skimmer-engine/src/track.rs` (it just forwards to `TrackManager::new`, existing purely so `lib.rs` doesn't need to import `DecodeConfig`/`DetectorConfig` construction details — actually simplest: just call `track::TrackManager::new` directly). Replace the `skimmer_engine_track_manager(...)` call above with:
+`TrackManager` needs a `fs`-and-`n_channels`-and-`center_freq_hz`-and-config constructor helper visible to `lib.rs`; add this small free function to `crates/manta-engine/src/track.rs` (it just forwards to `TrackManager::new`, existing purely so `lib.rs` doesn't need to import `DecodeConfig`/`DetectorConfig` construction details — actually simplest: just call `track::TrackManager::new` directly). Replace the `manta_engine_track_manager(...)` call above with:
 
 ```rust
     let mut tm = track::TrackManager::new(
@@ -1600,7 +1600,7 @@ Add `mod track;` is already present from Task 4; add `use crate::track;` is unne
 
 - [ ] **Step 2: Add `detector` to `PipelineConfig`**
 
-In `crates/skimmer-engine/src/lib.rs`, update `PipelineConfig`:
+In `crates/manta-engine/src/lib.rs`, update `PipelineConfig`:
 
 ```rust
 /// M0 pipeline tunables. SPEC §5.
@@ -1616,22 +1616,22 @@ pub struct PipelineConfig {
 - [ ] **Step 3: Remove the placeholder detector**
 
 ```bash
-git rm crates/skimmer-engine/src/detect.rs
+git rm crates/manta-engine/src/detect.rs
 ```
 
-Remove `mod detect;` from `crates/skimmer-engine/src/lib.rs`.
+Remove `mod detect;` from `crates/manta-engine/src/lib.rs`.
 
 - [ ] **Step 4: Remove now-dead imports/debug_assert duplication**
 
-In `crates/skimmer-engine/src/lib.rs`, confirm `use skimmer_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};` — `TrackDecoder` is no longer used directly in `lib.rs` (it's constructed inside `track.rs` now); change the import to `use skimmer_decode::decoder::{events_to_text, DecodeConfig};` and `use skimmer_decode::events::DecoderEvent;` stays (used in the new report-building code above).
+In `crates/manta-engine/src/lib.rs`, confirm `use manta_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};` — `TrackDecoder` is no longer used directly in `lib.rs` (it's constructed inside `track.rs` now); change the import to `use manta_decode::decoder::{events_to_text, DecodeConfig};` and `use manta_decode::events::DecoderEvent;` stays (used in the new report-building code above).
 
 - [ ] **Step 5: Update `channelizer_chunking_determinism.rs` and `chunking_determinism.rs`**
 
-These tests construct `Channelizer` + `TrackDecoder` directly, bypassing `decode_samples`/`detect.rs` entirely — re-read both files first to confirm neither imports `skimmer_engine::detect` (they don't; Task 4/6's earlier read confirmed `channelizer_chunking_determinism.rs` only imports `skimmer_decode::decoder::{DecodeConfig, TrackDecoder}` and `skimmer_dsp::channelizer::Channelizer`). No changes needed to either file.
+These tests construct `Channelizer` + `TrackDecoder` directly, bypassing `decode_samples`/`detect.rs` entirely — re-read both files first to confirm neither imports `manta_engine::detect` (they don't; Task 4/6's earlier read confirmed `channelizer_chunking_determinism.rs` only imports `manta_decode::decoder::{DecodeConfig, TrackDecoder}` and `manta_dsp::channelizer::Channelizer`). No changes needed to either file.
 
 - [ ] **Step 6: Run the existing regression suite**
 
-Run: `cargo test -p skimmer-engine`
+Run: `cargo test -p manta-engine`
 Expected: `pipeline.rs`'s `v1_lite_decodes_end_to_end` and `silence_errors_cleanly`, `listen_audio.rs` (unaffected until Task 8), `channelizer_chunking_determinism.rs`, `chunking_determinism.rs`, `roundtrip_iq.rs`, and `regression_char_gap_high_wpm.rs` all pass. If `v1_lite_decodes_end_to_end`'s freq/WPM assertions fail against the current ±25 Hz/±3 WPM tolerances, that's expected to investigate now (don't defer silently) — the whole point of this sub-project is these should tighten, not loosen further; if they now fail even at the *current* widened tolerance, stop and diagnose before proceeding (likely a bug in the ownership/centroid wiring, not a real tolerance regression).
 
 - [ ] **Step 7: Run workspace build + clippy**
@@ -1642,8 +1642,8 @@ Expected: clean. Fix any leftover unused-import/dead-code warnings from removing
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/lib.rs
-git rm crates/skimmer-engine/src/detect.rs
+git add crates/manta-engine/src/lib.rs
+git rm crates/manta-engine/src/detect.rs
 git commit -m "feat(engine): wire TrackManager into decode_samples/decode_wav, remove placeholder detector"
 ```
 
@@ -1652,7 +1652,7 @@ git commit -m "feat(engine): wire TrackManager into decode_samples/decode_wav, r
 ### Task 8: Wire `listen()` onto `TrackManager`
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/listen.rs`
+- Modify: `crates/manta-engine/src/listen.rs`
 
 **Interfaces:**
 - Consumes: `TrackManager::{new, process_hops, finish}` (Task 6), same as Task 7.
@@ -1660,11 +1660,11 @@ git commit -m "feat(engine): wire TrackManager into decode_samples/decode_wav, r
 
 - [ ] **Step 1: Rewrite `listen`**
 
-Replace `crates/skimmer-engine/src/listen.rs`'s body from the `let mut calib_ch = ...` line through the end of the function with:
+Replace `crates/manta-engine/src/listen.rs`'s body from the `let mut calib_ch = ...` line through the end of the function with:
 
 ```rust
     let mut ch =
-        skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
+        manta_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
     let mut tm = crate::track::TrackManager::new(
         ch.n_channels(),
@@ -1715,7 +1715,7 @@ Remove the now-unused `use anyhow::Context;` if `.context(...)` is no longer cal
 
 - [ ] **Step 2: Run `listen_audio.rs`**
 
-Run: `cargo test -p skimmer-engine --test listen_audio`
+Run: `cargo test -p manta-engine --test listen_audio`
 Expected: `listen_decodes_a_clean_real_audio_signal` passes (decoded text still contains "W1AW"; the test doesn't assert on `track_id`).
 
 - [ ] **Step 3: Run `channelizer_chunking_determinism.rs`-style chunk invariance for `listen`**
@@ -1730,7 +1730,7 @@ Expected: clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/listen.rs
+git add crates/manta-engine/src/listen.rs
 git commit -m "feat(engine): wire TrackManager into listen(), drop one-shot startup calibration"
 ```
 
@@ -1739,8 +1739,8 @@ git commit -m "feat(engine): wire TrackManager into listen(), drop one-shot star
 ### Task 9: Golden vectors V7 (adjacent) and V9 (drift)
 
 **Files:**
-- Modify: `crates/skimmer-testkit/src/vectors.rs`
-- Create: `crates/skimmer-cli/tests/golden_v7_v9_v10.rs`
+- Modify: `crates/manta-testkit/src/vectors.rs`
+- Create: `crates/manta-cli/tests/golden_v7_v9_v10.rs`
 
 **Interfaces:**
 - Consumes: `SignalSpec`/`render_scene` (existing, unchanged — already multi-signal-generic per sub-project 1).
@@ -1748,7 +1748,7 @@ git commit -m "feat(engine): wire TrackManager into listen(), drop one-shot star
 
 - [ ] **Step 1: Add V7/V9 VectorSpecs and extend `Manifest`**
 
-In `crates/skimmer-testkit/src/vectors.rs`, add after `v6()`:
+In `crates/manta-testkit/src/vectors.rs`, add after `v6()`:
 
 ```rust
 /// SPEC §7 V7 "adjacent": 24 WPM @ +10.000 kHz and 28 WPM @ +10.150 kHz,
@@ -1906,7 +1906,7 @@ pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
         expected_freq_hz: rendered.expected_freq_hz,
         expected_freqs_hz,
         keyed_texts: rendered.keyed_texts,
-        generator: concat!("skimmer-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
+        generator: concat!("manta-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
     };
     std::fs::write(
         dir.join(format!("{}.manifest.json", spec.name)),
@@ -1939,7 +1939,7 @@ pub fn write_v9_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
         expected_freq_hz: rendered.expected_freq_hz,
         expected_freqs_hz: vec![rendered.expected_freq_hz],
         keyed_texts: rendered.keyed_texts,
-        generator: concat!("skimmer-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
+        generator: concat!("manta-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
     };
     std::fs::write(
         dir.join(format!("{}.manifest.json", spec.name)),
@@ -1951,7 +1951,7 @@ pub fn write_v9_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
 
 - [ ] **Step 2: Write the golden tests**
 
-Create `crates/skimmer-cli/tests/golden_v7_v9_v10.rs`:
+Create `crates/manta-cli/tests/golden_v7_v9_v10.rs`:
 
 ```rust
 //! SPEC §7 V7/V9/V10 golden gates (M2 sub-project 2: real multi-track
@@ -1961,11 +1961,11 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 fn decode_report(
-    spec: &skimmer_testkit::vectors::VectorSpec,
-) -> (serde_json::Value, skimmer_testkit::vectors::Manifest) {
+    spec: &manta_testkit::vectors::VectorSpec,
+) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = skimmer_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let manifest = manta_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", "--json"])
         .arg(dir.path().join(format!("{}.wav", spec.name)))
         .output()
@@ -2007,7 +2007,7 @@ fn per_track(report: &serde_json::Value) -> BTreeMap<u64, (String, Option<f64>)>
 
 #[test]
 fn v7_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v7();
+    let spec = manta_testkit::vectors::v7();
     let (report, manifest) = decode_report(&spec);
     let tracks = per_track(&report);
     assert_eq!(tracks.len(), 2, "V7 must produce exactly 2 tracks, got {}", tracks.len());
@@ -2023,7 +2023,7 @@ fn v7_passes_end_to_end_from_wav() {
                 da.partial_cmp(&db).unwrap()
             })
             .unwrap();
-        let cer = skimmer_testkit::cer::cer(expected_text, decoded_text);
+        let cer = manta_testkit::cer::cer(expected_text, decoded_text);
         assert!(
             cer <= 0.05,
             "signal {i} ({expected_text:?}) char accuracy must be >= 95%, got CER {cer} (decoded {decoded_text:?})"
@@ -2041,10 +2041,10 @@ fn v7_passes_end_to_end_from_wav() {
 
 #[test]
 fn v9_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v9();
+    let spec = manta_testkit::vectors::v9();
     let dir = tempfile::tempdir().unwrap();
-    let manifest = skimmer_testkit::vectors::write_v9_fixture_set(&spec, dir.path()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let manifest = manta_testkit::vectors::write_v9_fixture_set(&spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", "--json"])
         .arg(dir.path().join("v9.wav"))
         .output()
@@ -2055,7 +2055,7 @@ fn v9_passes_end_to_end_from_wav() {
     let tracks = per_track(&report);
     assert_eq!(tracks.len(), 1, "V9 must not split into multiple tracks under drift");
     let (_, (decoded_text, freq)) = tracks.iter().next().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded_text);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded_text);
     assert!(cer <= 0.10, "V9 char accuracy must be >= 90%, got CER {cer}");
     let freq = freq.expect("TrackMeta freq_hz must have fired at least once");
     assert!(
@@ -2070,7 +2070,7 @@ fn v9_passes_end_to_end_from_wav() {
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test -p skimmer-testkit -p skimmer-cli v7_ v9_ -- --nocapture`
+Run: `cargo test -p manta-testkit -p manta-cli v7_ v9_ -- --nocapture`
 Expected: both pass. If `v7`'s exactly-2-tracks or freq-error assertion fails, or `v9` splits into >1 track, treat it as a real bug in ownership/centroid tracking (Task 5/6) to fix — not a tolerance to loosen; only V2/pins-9-10 (Task 11) are pre-authorized to have their tolerances adjusted, and only after measurement.
 
 If `CENTER_EMA_ALPHA` (Task 5) is too slow to keep V9's track from being evicted/re-spawned as drift carries it out of its current owned window before the EMA catches up, tune it here empirically (try values in `[0.005, 0.05]`) and update its doc comment with the measured reasoning, same as `CHAR_GAP_DITS`'s empirical-tuning precedent (`docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md`).
@@ -2083,7 +2083,7 @@ Expected: clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-testkit/src/vectors.rs crates/skimmer-cli/tests/golden_v7_v9_v10.rs
+git add crates/manta-testkit/src/vectors.rs crates/manta-cli/tests/golden_v7_v9_v10.rs
 git commit -m "test: V7 (adjacent-channel) and V9 (drift) golden vectors (SPEC §7)"
 ```
 
@@ -2092,10 +2092,10 @@ git commit -m "test: V7 (adjacent-channel) and V9 (drift) golden vectors (SPEC �
 ### Task 10: Farnsworth timing support + golden vector V10
 
 **Files:**
-- Modify: `crates/skimmer-testkit/src/keyer.rs`
-- Modify: `crates/skimmer-testkit/src/scene.rs`
-- Modify: `crates/skimmer-testkit/src/vectors.rs`
-- Modify: `crates/skimmer-cli/tests/golden_v7_v9_v10.rs`
+- Modify: `crates/manta-testkit/src/keyer.rs`
+- Modify: `crates/manta-testkit/src/scene.rs`
+- Modify: `crates/manta-testkit/src/vectors.rs`
+- Modify: `crates/manta-cli/tests/golden_v7_v9_v10.rs`
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -2103,7 +2103,7 @@ git commit -m "test: V7 (adjacent-channel) and V9 (drift) golden vectors (SPEC �
 
 - [ ] **Step 1: Add Farnsworth timing to `KeyerSpec`**
 
-In `crates/skimmer-testkit/src/keyer.rs`, update `KeyerSpec`:
+In `crates/manta-testkit/src/keyer.rs`, update `KeyerSpec`:
 
 ```rust
 /// Keying parameters: speed, edge shape, optional jitter. SPEC §7.
@@ -2289,7 +2289,7 @@ Add a test to `keyer.rs`'s `mod tests`:
 
 - [ ] **Step 2: Thread `char_wpm` through `SignalSpec`/`render_scene`**
 
-In `crates/skimmer-testkit/src/scene.rs`, add `pub char_wpm: Option<f32>` to `SignalSpec` (as the new last field, after `watterson`):
+In `crates/manta-testkit/src/scene.rs`, add `pub char_wpm: Option<f32>` to `SignalSpec` (as the new last field, after `watterson`):
 
 ```rust
 #[derive(Debug, Clone)]
@@ -2323,14 +2323,14 @@ In `render_scene`, update the `KeyerSpec` construction:
 
 Run: `cargo build --workspace 2>&1 | grep -B2 "missing field"`
 
-This enumerates every `SignalSpec { ... }` literal that doesn't yet set `char_wpm` (expected: the 15 sites found across `crates/skimmer-engine/tests/{pipeline,regression_char_gap_high_wpm,roundtrip_iq}.rs`, `crates/skimmer-testkit/src/{scene,vectors}.rs`, `crates/skimmer-testkit/tests/channelizer_multisignal.rs`). For each reported site, add `char_wpm: None,` as the literal's last field. Re-run the build after each file until the grep for `missing field` returns nothing.
+This enumerates every `SignalSpec { ... }` literal that doesn't yet set `char_wpm` (expected: the 15 sites found across `crates/manta-engine/tests/{pipeline,regression_char_gap_high_wpm,roundtrip_iq}.rs`, `crates/manta-testkit/src/{scene,vectors}.rs`, `crates/manta-testkit/tests/channelizer_multisignal.rs`). For each reported site, add `char_wpm: None,` as the literal's last field. Re-run the build after each file until the grep for `missing field` returns nothing.
 
 Run: `cargo build --workspace`
 Expected: clean (no missing-field errors).
 
 - [ ] **Step 4: Add V10 to `vectors.rs`**
 
-In `crates/skimmer-testkit/src/vectors.rs`, add after `v9()`:
+In `crates/manta-testkit/src/vectors.rs`, add after `v9()`:
 
 ```rust
 /// SPEC §7 V10 "farnsworth": 15 WPM effective / 25 WPM character speed,
@@ -2361,15 +2361,15 @@ Update the earlier `v1()` through `v9()` (and any other pre-existing `SignalSpec
 
 - [ ] **Step 5: Add the V10 golden test**
 
-Append to `crates/skimmer-cli/tests/golden_v7_v9_v10.rs`:
+Append to `crates/manta-cli/tests/golden_v7_v9_v10.rs`:
 
 ```rust
 #[test]
 fn v10_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v10();
+    let spec = manta_testkit::vectors::v10();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
         cer <= 0.05,
         "V10 char accuracy must be >= 95%, got CER {cer}\nexpected: {}\ndecoded:  {}",
@@ -2389,7 +2389,7 @@ fn v10_passes_end_to_end_from_wav() {
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cargo test -p skimmer-testkit -p skimmer-cli farnsworth v10_ -- --nocapture`
+Run: `cargo test -p manta-testkit -p manta-cli farnsworth v10_ -- --nocapture`
 Expected: `farnsworth_stretches_only_gaps_not_marks` and `v10_passes_end_to_end_from_wav` both pass.
 
 - [ ] **Step 7: Run full workspace test + clippy**
@@ -2400,7 +2400,7 @@ Expected: clean, everything still passes (this is the first full-workspace run s
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/skimmer-testkit/src/keyer.rs crates/skimmer-testkit/src/scene.rs crates/skimmer-testkit/src/vectors.rs crates/skimmer-cli/tests/golden_v7_v9_v10.rs
+git add crates/manta-testkit/src/keyer.rs crates/manta-testkit/src/scene.rs crates/manta-testkit/src/vectors.rs crates/manta-cli/tests/golden_v7_v9_v10.rs
 git commit -m "test(testkit): Farnsworth timing support + V10 golden vector (SPEC §7)"
 ```
 
@@ -2409,12 +2409,12 @@ git commit -m "test(testkit): Farnsworth timing support + V10 golden vector (SPE
 ### Task 11: V2 un-ignore; pins 9/10 tolerance re-measurement; warmup-floor CER fixes
 
 **Files:**
-- Modify: `crates/skimmer-cli/tests/golden_v2_v3.rs`
-- Modify: `crates/skimmer-cli/tests/golden_v1.rs`
-- Modify: `crates/skimmer-engine/tests/pipeline.rs`
-- Modify: `crates/skimmer-engine/tests/roundtrip_iq.rs`
-- Modify: `crates/skimmer-engine/tests/regression_char_gap_high_wpm.rs`
-- Modify: `crates/skimmer-cli/tests/cli.rs`
+- Modify: `crates/manta-cli/tests/golden_v2_v3.rs`
+- Modify: `crates/manta-cli/tests/golden_v1.rs`
+- Modify: `crates/manta-engine/tests/pipeline.rs`
+- Modify: `crates/manta-engine/tests/roundtrip_iq.rs`
+- Modify: `crates/manta-engine/tests/regression_char_gap_high_wpm.rs`
+- Modify: `crates/manta-cli/tests/cli.rs`
 
 **Interfaces:** none new — this task only adjusts test assertions/scene durations against the now-real detector.
 
@@ -2465,25 +2465,25 @@ both currently assume the old warmup-unaware test bodies.
 
 - [ ] **Step 1: Un-ignore V2 and measure**
 
-In `crates/skimmer-cli/tests/golden_v2_v3.rs`, remove the `#[ignore]` attribute and the long doc comment above `v2_passes_end_to_end_from_wav` (both were pinned specifically to the placeholder-detector limitation this sub-project fixes — pin 8 in `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`). Replace with a short comment: `// Un-ignored: SPEC §2's real hysteresis-gated detector (M2 sub-project 2) fixes the near-channel-edge decode degradation pin 7/8 tracked. See docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md.`
+In `crates/manta-cli/tests/golden_v2_v3.rs`, remove the `#[ignore]` attribute and the long doc comment above `v2_passes_end_to_end_from_wav` (both were pinned specifically to the placeholder-detector limitation this sub-project fixes — pin 8 in `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`). Replace with a short comment: `// Un-ignored: SPEC §2's real hysteresis-gated detector (M2 sub-project 2) fixes the near-channel-edge decode degradation pin 7/8 tracked. See docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md.`
 
-Run: `cargo test -p skimmer-cli v2_passes_end_to_end_from_wav -- --nocapture`
+Run: `cargo test -p manta-cli v2_passes_end_to_end_from_wav -- --nocapture`
 
 If it passes: leave it un-ignored, done. If it still fails: do not re-add `#[ignore]` silently — this is a real, expected-to-be-fixed regression per the design doc's premise; treat a continued failure as a bug in Tasks 4-8 to diagnose (likely the gate hysteresis isn't actually filtering the near-edge transient the way pin 7's diagnosis predicted), not a new tolerance to widen. Stop and report if it doesn't resolve after investigation.
 
 - [ ] **Step 2: Re-measure V1's freq/WPM tolerances**
 
-In `crates/skimmer-cli/tests/golden_v1.rs`, temporarily tighten the two M2-sub-project-1 tolerances back to SPEC's original values to measure current behavior:
+In `crates/manta-cli/tests/golden_v1.rs`, temporarily tighten the two M2-sub-project-1 tolerances back to SPEC's original values to measure current behavior:
 - Freq error: change `<= 25.0` to `<= 10.0` (SPEC's original).
 - WPM: change `< 3.0` to `< 2.0` (the "free" sanity check's original margin, pin 10).
 
-Run: `cargo test -p skimmer-cli v1_passes_end_to_end_from_wav -- --nocapture` and note the actual measured error/WPM-delta from the assertion failure message (if it fails).
+Run: `cargo test -p manta-cli v1_passes_end_to_end_from_wav -- --nocapture` and note the actual measured error/WPM-delta from the assertion failure message (if it fails).
 
 - [ ] **Step 3: Repeat for `pipeline.rs` and `roundtrip_iq.rs`**
 
-In `crates/skimmer-engine/tests/pipeline.rs`'s `v1_lite_decodes_end_to_end`, tighten `<= 25.0` to `<= 10.0` and `< 3.0` to `< 2.0`, same as Step 2. Run: `cargo test -p skimmer-engine --test pipeline -- --nocapture`.
+In `crates/manta-engine/tests/pipeline.rs`'s `v1_lite_decodes_end_to_end`, tighten `<= 25.0` to `<= 10.0` and `< 3.0` to `< 2.0`, same as Step 2. Run: `cargo test -p manta-engine --test pipeline -- --nocapture`.
 
-In `crates/skimmer-engine/tests/roundtrip_iq.rs`'s `prop_assert!((report.freq_hz - offset_khz as f64 * 1000.0).abs() <= 25.0)`, tighten to `<= 10.0`. Run: `cargo test -p skimmer-engine --test roundtrip_iq -- --nocapture` (this is a proptest over 10-40 WPM / offsets — let it run its full default case count, do not reduce it).
+In `crates/manta-engine/tests/roundtrip_iq.rs`'s `prop_assert!((report.freq_hz - offset_khz as f64 * 1000.0).abs() <= 25.0)`, tighten to `<= 10.0`. Run: `cargo test -p manta-engine --test roundtrip_iq -- --nocapture` (this is a proptest over 10-40 WPM / offsets — let it run its full default case count, do not reduce it).
 
 - [ ] **Step 4: Record the outcome**
 
@@ -2497,7 +2497,7 @@ Expected: clean.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/skimmer-cli/tests/golden_v2_v3.rs crates/skimmer-cli/tests/golden_v1.rs crates/skimmer-engine/tests/pipeline.rs crates/skimmer-engine/tests/roundtrip_iq.rs
+git add crates/manta-cli/tests/golden_v2_v3.rs crates/manta-cli/tests/golden_v1.rs crates/manta-engine/tests/pipeline.rs crates/manta-engine/tests/roundtrip_iq.rs
 git commit -m "test: un-ignore V2, re-measure and tighten freq/WPM tolerances under the real detector"
 ```
 
@@ -2535,7 +2535,7 @@ Create `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`, following the
 
 - [ ] **Step 3: Update ROADMAP.md**
 
-In `ROADMAP.md`'s M2 section, replace the "Remaining M2 sub-projects: detector/track manager..., decoder pool, SoapySDR input, KiwiSDR input" sentence with something reflecting the merge, e.g.: "M2 sub-project 2 (detector/track manager + decoder pool, `skimmer-dsp::floor` + `skimmer-engine::track`) is complete — see `docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md` and `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. Remaining M2 sub-projects: V8/V8w pileup-scene validation + CPU-budget criterion bench, SoapySDR input, KiwiSDR input. M2 itself is not yet complete."
+In `ROADMAP.md`'s M2 section, replace the "Remaining M2 sub-projects: detector/track manager..., decoder pool, SoapySDR input, KiwiSDR input" sentence with something reflecting the merge, e.g.: "M2 sub-project 2 (detector/track manager + decoder pool, `manta-dsp::floor` + `manta-engine::track`) is complete — see `docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md` and `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`. Remaining M2 sub-projects: V8/V8w pileup-scene validation + CPU-budget criterion bench, SoapySDR input, KiwiSDR input. M2 itself is not yet complete."
 
 - [ ] **Step 4: Update CLAUDE.md's Status section**
 

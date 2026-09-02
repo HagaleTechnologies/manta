@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `skimmer listen` decodes a live off-air CW signal from real audio (rig RX audio or a replayed WAV) end-to-end, continuously, gated on golden vectors V1–V6 (SPEC-decode-core §7) plus a manual W1AW copy run.
+**Goal:** `manta listen` decodes a live off-air CW signal from real audio (rig RX audio or a replayed WAV) end-to-end, continuously, gated on golden vectors V1–V6 (SPEC-decode-core §7) plus a manual W1AW copy run.
 
-**Architecture:** New `AudioIqSource` (skimmer-input) converts real audio (via `coppa-audio`, live device or file replay) to analytic `Complex32` through a new FIR Hilbert transformer (skimmer-dsp), then feeds M0's already-streaming-capable `SingleChannelExtractor`/`TrackDecoder` pair through a new single-threaded loop (`skimmer-engine::listen`) — no PFB, no track pool, no actor/thread split (M1 has exactly one track). The same Hilbert transformer, applied in reverse (complex → real → coppa Watterson → real → complex), lets V4/V5's golden vectors use coppa's real, currently-shipped `watterson_preset()` API instead of the never-built streaming `WattersonChannel` proposal.
+**Architecture:** New `AudioIqSource` (manta-input) converts real audio (via `coppa-audio`, live device or file replay) to analytic `Complex32` through a new FIR Hilbert transformer (manta-dsp), then feeds M0's already-streaming-capable `SingleChannelExtractor`/`TrackDecoder` pair through a new single-threaded loop (`manta-engine::listen`) — no PFB, no track pool, no actor/thread split (M1 has exactly one track). The same Hilbert transformer, applied in reverse (complex → real → coppa Watterson → real → complex), lets V4/V5's golden vectors use coppa's real, currently-shipped `watterson_preset()` API instead of the never-built streaming `WattersonChannel` proposal.
 
 **Tech Stack:** Rust (edition 2021, rust-version 1.85.0), new git deps `coppa-audio`/`coppa-channel` (pinned alongside the existing `coppa-dsp` pin), `cpal` 0.18 (device I/O), `ctrlc` (graceful shutdown), `libc` (soak RSS sampling).
 
@@ -14,9 +14,9 @@
 
 Copied from SPEC-decode-core.md, ARCHITECTURE.md, ROADMAP.md, CLAUDE.md, and the M1 design doc. Every task's requirements implicitly include this section.
 
-- **Determinism (SPEC §6):** NO RNG and NO wall clock anywhere in the decode path (`skimmer-dsp`/`skimmer-decode`/`skimmer-engine`'s `listen`/`soak` decode loop). Per-sample state is `f32`; long accumulations (FIR dot products) run **sequentially in `f64`** — this applies to the new Hilbert FIR exactly as it already applies to the PFB prototype.
-- **Timing constants:** channel output rate `fo = 375 Hz`; hop period `HOP_MS = 8/3 ms` (`skimmer_decode::{FO_HZ, HOP_MS}`). Unchanged by M1 — the extractor's rate math already generalizes to any `fs` with `fs/93.75` a power of two, and 48000/93.75 = 512 satisfies this exactly.
-- **coppa reuse boundary (ARCHITECTURE §2):** `coppa-audio` (cpal-backed device I/O, file replay, resampling) is reused as-is. `coppa-channel::watterson_preset()` is reused for V4/V5 (real, one-shot API — see Task 9's deviation note). The Hilbert transformer is **new** code (`skimmer-dsp::hilbert`) — neither crate ships one.
+- **Determinism (SPEC §6):** NO RNG and NO wall clock anywhere in the decode path (`manta-dsp`/`manta-decode`/`manta-engine`'s `listen`/`soak` decode loop). Per-sample state is `f32`; long accumulations (FIR dot products) run **sequentially in `f64`** — this applies to the new Hilbert FIR exactly as it already applies to the PFB prototype.
+- **Timing constants:** channel output rate `fo = 375 Hz`; hop period `HOP_MS = 8/3 ms` (`manta_decode::{FO_HZ, HOP_MS}`). Unchanged by M1 — the extractor's rate math already generalizes to any `fs` with `fs/93.75` a power of two, and 48000/93.75 = 512 satisfies this exactly.
+- **coppa reuse boundary (ARCHITECTURE §2):** `coppa-audio` (cpal-backed device I/O, file replay, resampling) is reused as-is. `coppa-channel::watterson_preset()` is reused for V4/V5 (real, one-shot API — see Task 9's deviation note). The Hilbert transformer is **new** code (`manta-dsp::hilbert`) — neither crate ships one.
 - **Dependency pin:** bump the existing `coppa-dsp` git pin and add `coppa-audio`/`coppa-channel` pinned to the **same** rev, `f8a4d16df7e5776a0756943c05712038774e6c70` (coppa `origin/main` HEAD as of 2026-07-15, a descendant of the M0 pin and of the 2026-07-07 Watterson bug-fix commits `9ab1547`/`34aec5f`/`fc35895`). Record the bump in `docs/DECISIONS/` (Task 11).
 - **No SoapySDR anywhere** (unchanged from M0; M1 doesn't touch this).
 - **Licensing/metadata:** every new crate item inherits workspace `license = "MIT OR Apache-2.0"`, `edition = "2021"`, `rust-version = "1.85.0"`.
@@ -36,10 +36,10 @@ Copied from SPEC-decode-core.md, ARCHITECTURE.md, ROADMAP.md, CLAUDE.md, and the
 
 **Files:**
 - Modify: `Cargo.toml` (workspace root)
-- Modify: `crates/skimmer-input/Cargo.toml`
-- Modify: `crates/skimmer-engine/Cargo.toml`
-- Modify: `crates/skimmer-cli/Cargo.toml`
-- Modify: `crates/skimmer-testkit/Cargo.toml`
+- Modify: `crates/manta-input/Cargo.toml`
+- Modify: `crates/manta-engine/Cargo.toml`
+- Modify: `crates/manta-cli/Cargo.toml`
+- Modify: `crates/manta-testkit/Cargo.toml`
 
 **Interfaces:**
 - Produces: `coppa_audio::{AudioSource, AudioSink, CpalSource, ResamplingSource, WavSource, find_input_device_by_name}` and `coppa_channel::watterson::{watterson_preset, WattersonPreset}`, available to every crate that declares the new workspace deps below.
@@ -58,39 +58,39 @@ ctrlc = "3"
 libc = "0.2"
 ```
 
-- [ ] **Step 2: Add coppa-audio, cpal, and skimmer-dsp to skimmer-input**
+- [ ] **Step 2: Add coppa-audio, cpal, and manta-dsp to manta-input**
 
-Edit `crates/skimmer-input/Cargo.toml`'s `[dependencies]` block, adding:
+Edit `crates/manta-input/Cargo.toml`'s `[dependencies]` block, adding:
 
 ```toml
 coppa-audio = { workspace = true }
 cpal = { workspace = true }
-skimmer-dsp = { workspace = true }
+manta-dsp = { workspace = true }
 ```
 
-(This adds the `skimmer-input → skimmer-dsp` edge for the shared Hilbert transformer — not in ARCHITECTURE.md's current diagram, whose prose already assigns Hilbert-to-analytic conversion to the input layer §3. Task 11 updates the diagram.)
+(This adds the `manta-input → manta-dsp` edge for the shared Hilbert transformer — not in ARCHITECTURE.md's current diagram, whose prose already assigns Hilbert-to-analytic conversion to the input layer §3. Task 11 updates the diagram.)
 
-- [ ] **Step 3: Add libc to skimmer-engine**
+- [ ] **Step 3: Add libc to manta-engine**
 
-Edit `crates/skimmer-engine/Cargo.toml`'s `[dependencies]` block, adding:
+Edit `crates/manta-engine/Cargo.toml`'s `[dependencies]` block, adding:
 
 ```toml
 libc = { workspace = true }
 ```
 
-- [ ] **Step 4: Add skimmer-input, skimmer-decode, and ctrlc to skimmer-cli**
+- [ ] **Step 4: Add manta-input, manta-decode, and ctrlc to manta-cli**
 
-Edit `crates/skimmer-cli/Cargo.toml`'s `[dependencies]` block, adding:
+Edit `crates/manta-cli/Cargo.toml`'s `[dependencies]` block, adding:
 
 ```toml
 ctrlc = { workspace = true }
-skimmer-decode = { workspace = true }
-skimmer-input = { workspace = true }
+manta-decode = { workspace = true }
+manta-input = { workspace = true }
 ```
 
-- [ ] **Step 5: Add coppa-channel to skimmer-testkit**
+- [ ] **Step 5: Add coppa-channel to manta-testkit**
 
-Edit `crates/skimmer-testkit/Cargo.toml`'s `[dependencies]` block, adding:
+Edit `crates/manta-testkit/Cargo.toml`'s `[dependencies]` block, adding:
 
 ```toml
 coppa-channel = { workspace = true }
@@ -102,7 +102,7 @@ Run: `cargo build --workspace 2>&1 | tail -30`
 Expected: clean build (no code uses the new deps yet, so this only proves resolution/compilation of the dependency graph itself).
 
 ```bash
-git add Cargo.toml Cargo.lock crates/skimmer-input/Cargo.toml crates/skimmer-engine/Cargo.toml crates/skimmer-cli/Cargo.toml crates/skimmer-testkit/Cargo.toml
+git add Cargo.toml Cargo.lock crates/manta-input/Cargo.toml crates/manta-engine/Cargo.toml crates/manta-cli/Cargo.toml crates/manta-testkit/Cargo.toml
 git commit -m "chore: bump coppa pin, add coppa-audio/coppa-channel/cpal/ctrlc/libc deps"
 ```
 
@@ -111,8 +111,8 @@ git commit -m "chore: bump coppa pin, add coppa-audio/coppa-channel/cpal/ctrlc/l
 ### Task 2: Fix all-dah opener decode bug (pinned decision 20)
 
 **Files:**
-- Modify: `crates/skimmer-decode/src/timing.rs`
-- Modify: `crates/skimmer-decode/src/decoder.rs` (regression test only)
+- Modify: `crates/manta-decode/src/timing.rs`
+- Modify: `crates/manta-decode/src/decoder.rs` (regression test only)
 
 **Interfaces:**
 - Consumes: nothing new — this is a self-contained fix inside `ClusterPair`, already private to `timing.rs`.
@@ -120,7 +120,7 @@ git commit -m "chore: bump coppa pin, add coppa-audio/coppa-channel/cpal/ctrlc/l
 
 - [ ] **Step 1: Write the failing unit tests**
 
-In `crates/skimmer-decode/src/timing.rs`, inside `mod tests`, add:
+In `crates/manta-decode/src/timing.rs`, inside `mod tests`, add:
 
 ```rust
 #[test]
@@ -154,12 +154,12 @@ fn unimodal_dah_init_reanchors_on_first_real_dit() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-decode unimodal_dah_init -- --nocapture`
+Run: `cargo test -p manta-decode unimodal_dah_init -- --nocapture`
 Expected: FAIL — with the current code, the unimodal branch always assumes dits, so `mu_dah_ms()` after step 1's feed is `3 * mean ≈ 540.6`, not `≈180.2`.
 
 - [ ] **Step 3: Implement the fix in `ClusterPair`**
 
-In `crates/skimmer-decode/src/timing.rs`, replace the `ClusterPair` struct definition:
+In `crates/manta-decode/src/timing.rs`, replace the `ClusterPair` struct definition:
 
 ```rust
 #[derive(Debug, Clone)]
@@ -289,12 +289,12 @@ Replace `ClusterPair::initialize()` (including its doc comment):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-decode timing:: -- --nocapture`
+Run: `cargo test -p manta-decode timing:: -- --nocapture`
 Expected: PASS — all existing `timing.rs` tests (`initializes_bimodal_after_five_marks`, `unimodal_init_provisional_then_reanchors`, `ratio_constraint_reanchors_dah`, `dit_clamp_bounds_speed`, `step_speed_change_reinitializes`, `gap_classification_nominal`, `farnsworth_moves_word_threshold`) plus the two new tests all pass.
 
 - [ ] **Step 5: Add the end-to-end regression test**
 
-In `crates/skimmer-decode/src/decoder.rs`, inside `mod tests`, add:
+In `crates/manta-decode/src/decoder.rs`, inside `mod tests`, add:
 
 ```rust
     #[test]
@@ -315,30 +315,30 @@ In `crates/skimmer-decode/src/decoder.rs`, inside `mod tests`, add:
     }
 ```
 
-- [ ] **Step 6: Run the full skimmer-decode test suite**
+- [ ] **Step 6: Run the full manta-decode test suite**
 
-Run: `cargo test -p skimmer-decode`
+Run: `cargo test -p manta-decode`
 Expected: PASS, including `all_dah_opener_decodes_correctly`.
 
 - [ ] **Step 7: Verify V1 is unaffected**
 
-Run: `cargo test -p skimmer-cli --test golden_v1`
+Run: `cargo test -p manta-cli --test golden_v1`
 Expected: PASS (V1 opens with "CQ CQ DE W1AW..." — a mixed opener, not homogeneous — this fix's unimodal branch never even triggers for it, but the ratio constraints and re-anchor paths are shared code, so a regression here would be a real signal).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/skimmer-decode/src/timing.rs crates/skimmer-decode/src/decoder.rs
+git add crates/manta-decode/src/timing.rs crates/manta-decode/src/decoder.rs
 git commit -m "fix(decode): all-dah opener uses absolute-ms prior, not always-assume-dits (pinned decision 20)"
 ```
 
 ---
 
-### Task 3: Hilbert transformer (`skimmer-dsp::hilbert`)
+### Task 3: Hilbert transformer (`manta-dsp::hilbert`)
 
 **Files:**
-- Create: `crates/skimmer-dsp/src/hilbert.rs`
-- Modify: `crates/skimmer-dsp/src/lib.rs`
+- Create: `crates/manta-dsp/src/hilbert.rs`
+- Modify: `crates/manta-dsp/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `crate::proto::{bessel_i0, KAISER_BETA}` (both already `pub`/`pub(crate)` in `proto.rs`, visible crate-wide).
@@ -346,13 +346,13 @@ git commit -m "fix(decode): all-dah opener uses absolute-ms prior, not always-as
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/skimmer-dsp/src/hilbert.rs`:
+Create `crates/manta-dsp/src/hilbert.rs`:
 
 ```rust
 //! Real-to-analytic (Hilbert) conversion: odd-length windowed-sinc FIR,
 //! Kaiser-windowed identically to the PFB prototype (proto.rs). Used both
-//! for live audio input (skimmer-input::AudioIqSource) and offline
-//! Watterson vector rendering (skimmer-testkit). Design doc §3.
+//! for live audio input (manta-input::AudioIqSource) and offline
+//! Watterson vector rendering (manta-testkit). Design doc §3.
 
 use crate::proto::{bessel_i0, KAISER_BETA};
 use num_complex::Complex32;
@@ -526,7 +526,7 @@ mod tests {
 
 - [ ] **Step 2: Register the module**
 
-In `crates/skimmer-dsp/src/lib.rs`, add:
+In `crates/manta-dsp/src/lib.rs`, add:
 
 ```rust
 pub mod hilbert;
@@ -536,36 +536,36 @@ pub mod hilbert;
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-dsp hilbert:: 2>&1 | head -20`
+Run: `cargo test -p manta-dsp hilbert:: 2>&1 | head -20`
 Expected: FAIL to compile (module doesn't exist yet) — this is expected; Step 1 already wrote the full implementation inline with the tests (Hilbert transformer design is not separable from its test-driving math the way a simple function is), so compiling should immediately get you to Step 4.
 
 - [ ] **Step 4: Build and run tests**
 
-Run: `cargo test -p skimmer-dsp hilbert:: -- --nocapture`
+Run: `cargo test -p manta-dsp hilbert:: -- --nocapture`
 Expected: PASS on all five tests. If `analytic_signal_of_positive_tone_rotates_forward` fails on the sign of `dphi`, the FIR sign convention is inverted (h[n] should be `2/(π·n)`, not `-2/(π·n)`) — fix the sign in `design_hilbert_fir` and re-run.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-dsp/src/hilbert.rs crates/skimmer-dsp/src/lib.rs
+git add crates/manta-dsp/src/hilbert.rs crates/manta-dsp/src/lib.rs
 git commit -m "feat(dsp): FIR Hilbert transformer for real-to-analytic conversion"
 ```
 
 ---
 
-### Task 4: `AudioIqSource` (skimmer-input)
+### Task 4: `AudioIqSource` (manta-input)
 
 **Files:**
-- Create: `crates/skimmer-input/src/audio.rs`
-- Modify: `crates/skimmer-input/src/lib.rs`
+- Create: `crates/manta-input/src/audio.rs`
+- Modify: `crates/manta-input/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::hilbert::HilbertTransformer` (Task 3); `coppa_audio::{AudioSource, CpalSource, ResamplingSource, WavSource, find_input_device_by_name}` (Task 1); `crate::IqSource` (existing trait, `skimmer-input/src/lib.rs`).
-- Produces: `pub struct AudioIqSource`, `pub const TARGET_RATE_HZ: u32 = 48_000`, `impl AudioIqSource { pub fn new(src: Box<dyn coppa_audio::AudioSource>) -> Result<Self>; pub fn from_device(name: Option<&str>) -> Result<Self>; pub fn from_wav_file(path: &Path) -> Result<Self> }`, `impl IqSource for AudioIqSource`. Used by Task 5 (`skimmer-engine::listen`) and Task 6 (CLI).
+- Consumes: `manta_dsp::hilbert::HilbertTransformer` (Task 3); `coppa_audio::{AudioSource, CpalSource, ResamplingSource, WavSource, find_input_device_by_name}` (Task 1); `crate::IqSource` (existing trait, `manta-input/src/lib.rs`).
+- Produces: `pub struct AudioIqSource`, `pub const TARGET_RATE_HZ: u32 = 48_000`, `impl AudioIqSource { pub fn new(src: Box<dyn coppa_audio::AudioSource>) -> Result<Self>; pub fn from_device(name: Option<&str>) -> Result<Self>; pub fn from_wav_file(path: &Path) -> Result<Self> }`, `impl IqSource for AudioIqSource`. Used by Task 5 (`manta-engine::listen`) and Task 6 (CLI).
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/skimmer-input/src/audio.rs`:
+Create `crates/manta-input/src/audio.rs`:
 
 ```rust
 //! Live/replayed real-audio IQ source: coppa-audio AudioSource -> Hilbert
@@ -576,7 +576,7 @@ use crate::IqSource;
 use anyhow::{anyhow, Context, Result};
 use coppa_audio::{AudioSource, ResamplingSource};
 use num_complex::Complex32;
-use skimmer_dsp::hilbert::HilbertTransformer;
+use manta_dsp::hilbert::HilbertTransformer;
 use std::path::Path;
 
 /// Fixed target sample rate for M1 audio decode: 48000 / 93.75 = 512 (a
@@ -713,7 +713,7 @@ mod tests {
 
 - [ ] **Step 2: Register the module**
 
-In `crates/skimmer-input/src/lib.rs`, add near the top (after the existing module doc comment):
+In `crates/manta-input/src/lib.rs`, add near the top (after the existing module doc comment):
 
 ```rust
 pub mod audio;
@@ -722,46 +722,46 @@ pub use audio::{AudioIqSource, TARGET_RATE_HZ};
 
 - [ ] **Step 3: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-input audio:: -- --nocapture`
+Run: `cargo test -p manta-input audio:: -- --nocapture`
 Expected: PASS on all three tests.
 
-- [ ] **Step 4: Run the full skimmer-input suite**
+- [ ] **Step 4: Run the full manta-input suite**
 
-Run: `cargo test -p skimmer-input`
+Run: `cargo test -p manta-input`
 Expected: PASS, including the existing WAV-IQ tests (unaffected by this change).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-input/src/audio.rs crates/skimmer-input/src/lib.rs
+git add crates/manta-input/src/audio.rs crates/manta-input/src/lib.rs
 git commit -m "feat(input): AudioIqSource - real audio to analytic Complex32 via coppa-audio + Hilbert"
 ```
 
 ---
 
-### Task 5: Streaming engine (`skimmer-engine::listen`) + CLI `listen` subcommand
+### Task 5: Streaming engine (`manta-engine::listen`) + CLI `listen` subcommand
 
 **Files:**
-- Create: `crates/skimmer-engine/src/listen.rs`
-- Modify: `crates/skimmer-engine/src/lib.rs`
-- Modify: `crates/skimmer-cli/src/main.rs`
+- Create: `crates/manta-engine/src/listen.rs`
+- Modify: `crates/manta-engine/src/lib.rs`
+- Modify: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_input::{AudioIqSource, IqSource}` (Task 4); `skimmer_dsp::{freqest::estimate_peak_hz, single::SingleChannelExtractor}` (existing); `skimmer_decode::decoder::TrackDecoder`, `skimmer_decode::events::DecoderEvent` (existing); `crate::PipelineConfig` (existing, `skimmer-engine/src/lib.rs`).
-- Produces: `pub fn listen(src: AudioIqSource, cfg: &PipelineConfig, stop: Arc<AtomicBool>, on_event: impl FnMut(&DecoderEvent)) -> Result<()>`, re-exported as `skimmer_engine::listen`. Used by Task 6 (CLI `listen`) and Task 10 (`soak`).
+- Consumes: `manta_input::{AudioIqSource, IqSource}` (Task 4); `manta_dsp::{freqest::estimate_peak_hz, single::SingleChannelExtractor}` (existing); `manta_decode::decoder::TrackDecoder`, `manta_decode::events::DecoderEvent` (existing); `crate::PipelineConfig` (existing, `manta-engine/src/lib.rs`).
+- Produces: `pub fn listen(src: AudioIqSource, cfg: &PipelineConfig, stop: Arc<AtomicBool>, on_event: impl FnMut(&DecoderEvent)) -> Result<()>`, re-exported as `manta_engine::listen`. Used by Task 6 (CLI `listen`) and Task 10 (`soak`).
 
 - [ ] **Step 1: Write the failing integration test**
 
-Create `crates/skimmer-engine/tests/listen_audio.rs`:
+Create `crates/manta-engine/tests/listen_audio.rs`:
 
 ```rust
 //! Integration test: a clean real-audio WAV fixture, decoded end-to-end
 //! through the AudioIqSource -> listen streaming pipeline. Design doc §4.
 
 use num_complex::Complex32;
-use skimmer_engine::{listen, PipelineConfig};
-use skimmer_input::AudioIqSource;
-use skimmer_testkit::keyer::{key_text_loop, KeyerSpec};
+use manta_engine::{listen, PipelineConfig};
+use manta_input::AudioIqSource;
+use manta_testkit::keyer::{key_text_loop, KeyerSpec};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -789,14 +789,14 @@ fn listen_decodes_a_clean_real_audio_signal() {
     let text = Arc::new(Mutex::new(String::new()));
     let text_clone = text.clone();
     listen(src, &PipelineConfig::default(), stop, move |ev| {
-        if let skimmer_decode::events::DecoderEvent::CharDecoded { glyph, .. } = ev {
+        if let manta_decode::events::DecoderEvent::CharDecoded { glyph, .. } = ev {
             if let Some(c) = glyph.text_char() {
                 text_clone.lock().unwrap().push(c);
             }
         }
         if matches!(
             ev,
-            skimmer_decode::events::DecoderEvent::WordBoundary { .. }
+            manta_decode::events::DecoderEvent::WordBoundary { .. }
         ) {
             text_clone.lock().unwrap().push(' ');
         }
@@ -811,7 +811,7 @@ fn listen_decodes_a_clean_real_audio_signal() {
 }
 ```
 
-Add `[dev-dependencies]` entries to `crates/skimmer-engine/Cargo.toml` if not already present: `num-complex` is already a normal dependency; add:
+Add `[dev-dependencies]` entries to `crates/manta-engine/Cargo.toml` if not already present: `num-complex` is already a normal dependency; add:
 
 ```toml
 coppa-audio = { workspace = true }
@@ -821,12 +821,12 @@ to `[dev-dependencies]` (this test only, not the crate's public API).
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p skimmer-engine --test listen_audio 2>&1 | head -20`
-Expected: FAIL to compile — `skimmer_engine::listen` doesn't exist yet.
+Run: `cargo test -p manta-engine --test listen_audio 2>&1 | head -20`
+Expected: FAIL to compile — `manta_engine::listen` doesn't exist yet.
 
-- [ ] **Step 3: Implement `skimmer-engine::listen`**
+- [ ] **Step 3: Implement `manta-engine::listen`**
 
-Create `crates/skimmer-engine/src/listen.rs`:
+Create `crates/manta-engine/src/listen.rs`:
 
 ```rust
 //! M1 streaming pipeline: live/replayed audio -> single channel -> decoder,
@@ -836,11 +836,11 @@ Create `crates/skimmer-engine/src/listen.rs`:
 use crate::PipelineConfig;
 use anyhow::{Context, Result};
 use num_complex::Complex32;
-use skimmer_decode::decoder::TrackDecoder;
-use skimmer_decode::events::DecoderEvent;
-use skimmer_dsp::freqest::estimate_peak_hz;
-use skimmer_dsp::single::SingleChannelExtractor;
-use skimmer_input::{AudioIqSource, IqSource};
+use manta_decode::decoder::TrackDecoder;
+use manta_decode::events::DecoderEvent;
+use manta_dsp::freqest::estimate_peak_hz;
+use manta_dsp::single::SingleChannelExtractor;
+use manta_input::{AudioIqSource, IqSource};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -932,7 +932,7 @@ pub fn listen(
 
 - [ ] **Step 4: Register the module**
 
-In `crates/skimmer-engine/src/lib.rs`, add near the top:
+In `crates/manta-engine/src/lib.rs`, add near the top:
 
 ```rust
 pub mod listen;
@@ -941,12 +941,12 @@ pub use listen::listen;
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `cargo test -p skimmer-engine --test listen_audio -- --nocapture`
+Run: `cargo test -p manta-engine --test listen_audio -- --nocapture`
 Expected: PASS. If the decoded text doesn't contain "W1AW", check: (a) the tone frequency (700 Hz) is within `estimate_peak_hz`'s and the extractor's valid range for `fs=48000`; (b) `key_text_loop`'s 15-second duration is enough for at least one full "CQ CQ DE W1AW W1AW K" cycle at 20 WPM plus the calibration + lead-in overhead to still leave real signal.
 
 - [ ] **Step 6: Add the CLI `listen` subcommand**
 
-Read `crates/skimmer-cli/src/main.rs` in full before editing (already read during planning — the `Command` enum and `main()` match are small). Add to the `Command` enum:
+Read `crates/manta-cli/src/main.rs` in full before editing (already read during planning — the `Command` enum and `main()` match are small). Add to the `Command` enum:
 
 ```rust
     /// Decode a live off-air CW signal continuously from real audio.
@@ -973,20 +973,20 @@ Add to `main()`'s match, alongside `Command::Decode`/`Command::Gen`:
             json,
         } => {
             let src = match source {
-                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
-                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+                Some(path) => manta_input::AudioIqSource::from_wav_file(&path)?,
+                None => manta_input::AudioIqSource::from_device(device.as_deref())?,
             };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            skimmer_engine::listen(src, &PipelineConfig::default(), stop, |ev| {
+            manta_engine::listen(src, &PipelineConfig::default(), stop, |ev| {
                 if json {
                     println!("{}", serde_json::to_string(ev).unwrap());
                     return;
                 }
-                use skimmer_decode::events::DecoderEvent;
+                use manta_decode::events::DecoderEvent;
                 use std::io::Write as _;
                 match ev {
                     DecoderEvent::CharDecoded { glyph, .. } => {
@@ -1007,19 +1007,19 @@ Add to `main()`'s match, alongside `Command::Decode`/`Command::Gen`:
 
 - [ ] **Step 7: Build the CLI**
 
-Run: `cargo build -p skimmer-cli 2>&1 | tail -30`
+Run: `cargo build -p manta-cli 2>&1 | tail -30`
 Expected: clean build. If `ctrlc::set_handler` returns a `Result` whose error type doesn't satisfy `?`'s conversion to `anyhow::Error`, wrap it: `ctrlc::set_handler(...).map_err(|e| anyhow::anyhow!("{e}"))?;`.
 
 - [ ] **Step 8: Manual smoke test (not automated -- confirms the CLI wiring, not decode accuracy)**
 
-Run: `cargo run -p skimmer-cli -- listen --source crates/skimmer-testkit/fixtures/v1.wav` (generate `v1.wav` first via `cargo run -p skimmer-cli -- gen v1 --out crates/skimmer-testkit/fixtures` if it doesn't exist — note V1 is a complex IQ WAV, not real audio, so this specific smoke test is expected to either error cleanly (2-channel WAV rejected by `coppa_audio::WavSource`, which reads channel 0 only and silently treats channel 1 as absent) or decode garbage; its purpose is only to confirm the binary runs without panicking end-to-end, not to validate output).
+Run: `cargo run -p manta-cli -- listen --source crates/manta-testkit/fixtures/v1.wav` (generate `v1.wav` first via `cargo run -p manta-cli -- gen v1 --out crates/manta-testkit/fixtures` if it doesn't exist — note V1 is a complex IQ WAV, not real audio, so this specific smoke test is expected to either error cleanly (2-channel WAV rejected by `coppa_audio::WavSource`, which reads channel 0 only and silently treats channel 1 as absent) or decode garbage; its purpose is only to confirm the binary runs without panicking end-to-end, not to validate output).
 Expected: process starts, reads to EOF, exits 0, no panic.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/listen.rs crates/skimmer-engine/src/lib.rs crates/skimmer-engine/tests/listen_audio.rs crates/skimmer-engine/Cargo.toml crates/skimmer-cli/src/main.rs
-git commit -m "feat(engine,cli): streaming listen pipeline + skimmer listen subcommand"
+git add crates/manta-engine/src/listen.rs crates/manta-engine/src/lib.rs crates/manta-engine/tests/listen_audio.rs crates/manta-engine/Cargo.toml crates/manta-cli/src/main.rs
+git commit -m "feat(engine,cli): streaming listen pipeline + manta listen subcommand"
 ```
 
 ---
@@ -1027,15 +1027,15 @@ git commit -m "feat(engine,cli): streaming listen pipeline + skimmer listen subc
 ### Task 6: Determinism test — chunked streaming vs. whole-buffer batch decode
 
 **Files:**
-- Create: `crates/skimmer-engine/tests/chunking_determinism.rs`
+- Create: `crates/manta-engine/tests/chunking_determinism.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::single::SingleChannelExtractor`, `skimmer_decode::decoder::TrackDecoder` (existing, unchanged); `skimmer_testkit::vectors::v1` (existing).
+- Consumes: `manta_dsp::single::SingleChannelExtractor`, `manta_decode::decoder::TrackDecoder` (existing, unchanged); `manta_testkit::vectors::v1` (existing).
 - Produces: nothing new — this test proves a property design doc §4 asserts ("the incremental extractor/decoder API was already built streaming-capable"), entirely within the existing complex-IQ domain (V1's fixture), independent of Tasks 3-5's real-audio path.
 
 - [ ] **Step 1: Write the test**
 
-Create `crates/skimmer-engine/tests/chunking_determinism.rs`:
+Create `crates/manta-engine/tests/chunking_determinism.rs`:
 
 ```rust
 //! Proves the M1 streaming design's core claim (design doc §4): feeding
@@ -1044,11 +1044,11 @@ Create `crates/skimmer-engine/tests/chunking_determinism.rs`:
 //! lets `listen`'s per-chunk loop reuse the M0 decode chain unchanged.
 
 use num_complex::Complex32;
-use skimmer_decode::decoder::{DecodeConfig, TrackDecoder};
-use skimmer_decode::events::DecoderEvent;
-use skimmer_dsp::freqest::estimate_peak_hz;
-use skimmer_dsp::single::SingleChannelExtractor;
-use skimmer_testkit::vectors::{render, v1};
+use manta_decode::decoder::{DecodeConfig, TrackDecoder};
+use manta_decode::events::DecoderEvent;
+use manta_dsp::freqest::estimate_peak_hz;
+use manta_dsp::single::SingleChannelExtractor;
+use manta_testkit::vectors::{render, v1};
 
 fn decode_all_at_once(iq: &[Complex32], fs: f64, offset_hz: f64) -> Vec<DecoderEvent> {
     let mut extractor = SingleChannelExtractor::new(fs, offset_hz).unwrap();
@@ -1103,13 +1103,13 @@ fn chunked_feeding_matches_whole_buffer_feeding() {
 
 - [ ] **Step 2: Run test to verify it fails or passes**
 
-Run: `cargo test -p skimmer-engine --test chunking_determinism -- --nocapture`
+Run: `cargo test -p manta-engine --test chunking_determinism -- --nocapture`
 Expected: PASS immediately — this task adds no new production code, only a test proving an existing property. If it FAILS, that's a real bug in `SingleChannelExtractor`'s or `TrackDecoder`'s incremental-call handling (both were designed to support this, per their existing internal `buf`/`read`/`n_in` state, but this is the first test to actually exercise multiple `process()` calls against a real golden vector rather than one whole-buffer call) — stop and investigate before proceeding; do not weaken the assertion.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/skimmer-engine/tests/chunking_determinism.rs
+git add crates/manta-engine/tests/chunking_determinism.rs
 git commit -m "test(engine): prove chunked streaming feeding matches whole-buffer batch decode"
 ```
 
@@ -1118,16 +1118,16 @@ git commit -m "test(engine): prove chunked streaming feeding matches whole-buffe
 ### Task 7: V2/V3 golden vectors (AWGN + jitter, no new machinery)
 
 **Files:**
-- Modify: `crates/skimmer-testkit/src/vectors.rs`
-- Modify: `crates/skimmer-cli/src/main.rs`
+- Modify: `crates/manta-testkit/src/vectors.rs`
+- Modify: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
 - Consumes: existing `VectorSpec`, `SignalSpec`, `render`, `write_fixture_set` (unchanged by this task).
-- Produces: `pub fn v2() -> VectorSpec`, `pub fn v3() -> VectorSpec` in `skimmer_testkit::vectors`.
+- Produces: `pub fn v2() -> VectorSpec`, `pub fn v3() -> VectorSpec` in `manta_testkit::vectors`.
 
 - [ ] **Step 1: Add v2/v3 to vectors.rs**
 
-In `crates/skimmer-testkit/src/vectors.rs`, add `use crate::keyer::Jitter;` to the imports, then add after `v1()`:
+In `crates/manta-testkit/src/vectors.rs`, add `use crate::keyer::Jitter;` to the imports, then add after `v1()`:
 
 ```rust
 /// SPEC §7 V2 "fast-35": 35 WPM, +15 dB, JA1ABC, AWGN + 8% jitter.
@@ -1203,22 +1203,22 @@ In `vectors.rs`'s `mod tests`, add:
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p skimmer-testkit vectors:: -- --nocapture`
+Run: `cargo test -p manta-testkit vectors:: -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 4: Wire into CLI `gen` and add golden-decode test**
 
-In `crates/skimmer-cli/src/main.rs`, extend the `Gen` match arm:
+In `crates/manta-cli/src/main.rs`, extend the `Gen` match arm:
 
 ```rust
-                "v1" => skimmer_testkit::vectors::v1(),
-                "v2" => skimmer_testkit::vectors::v2(),
-                "v3" => skimmer_testkit::vectors::v3(),
+                "v1" => manta_testkit::vectors::v1(),
+                "v2" => manta_testkit::vectors::v2(),
+                "v3" => manta_testkit::vectors::v3(),
 ```
 
 (V4-V6 are added by Tasks 8-9 to the same match arm and will widen the `bail!` message; leave it as `bail!("unknown vector {other:?} (available: v1-v3)")` for now.)
 
-Create `crates/skimmer-cli/tests/golden_v2_v3.rs`, following `golden_v1.rs`'s exact pattern (spawn the built `skimmer` binary via `Command::new(env!("CARGO_BIN_EXE_skimmer"))`, `decode --json` the fixture, compare via `skimmer_testkit::cer::cer`):
+Create `crates/manta-cli/tests/golden_v2_v3.rs`, following `golden_v1.rs`'s exact pattern (spawn the built `manta` binary via `Command::new(env!("CARGO_BIN_EXE_manta"))`, `decode --json` the fixture, compare via `manta_testkit::cer::cer`):
 
 ```rust
 //! SPEC §7 V2/V3 golden gates.
@@ -1227,10 +1227,10 @@ Create `crates/skimmer-cli/tests/golden_v2_v3.rs`, following `golden_v1.rs`'s ex
 
 use std::process::Command;
 
-fn decode_report(spec: &skimmer_testkit::vectors::VectorSpec) -> (serde_json::Value, skimmer_testkit::vectors::Manifest) {
+fn decode_report(spec: &manta_testkit::vectors::VectorSpec) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = skimmer_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let manifest = manta_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", "--json"])
         .arg(dir.path().join(format!("{}.wav", spec.name)))
         .output()
@@ -1245,10 +1245,10 @@ fn decode_report(spec: &skimmer_testkit::vectors::VectorSpec) -> (serde_json::Va
 
 #[test]
 fn v2_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v2();
+    let spec = manta_testkit::vectors::v2();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
         cer <= 0.01,
         "V2 char accuracy must be >= 99 % (CER <= 0.01), got CER {cer}\nexpected: {}\ndecoded:  {}",
@@ -1261,10 +1261,10 @@ fn v2_passes_end_to_end_from_wav() {
 
 #[test]
 fn v3_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v3();
+    let spec = manta_testkit::vectors::v3();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
         cer <= 0.05,
         "V3 char accuracy must be >= 95 % (CER <= 0.05), got CER {cer}\nexpected: {}\ndecoded:  {}",
@@ -1276,13 +1276,13 @@ fn v3_passes_end_to_end_from_wav() {
 
 - [ ] **Step 5: Run the golden tests**
 
-Run: `cargo test -p skimmer-cli golden 2>&1 | tail -40`
+Run: `cargo test -p manta-cli golden 2>&1 | tail -40`
 Expected: PASS. If accuracy falls short, this is real signal about the decode chain at 35 WPM/12 WPM — do not lower the threshold to make it pass; investigate (likely candidates: `DIT_CLAMP_MS` bounds at the speed extremes, or `MAX_SECONDS`/`FFT_SIZE` in `freqest.rs` not resolving the frequency cleanly at 90s/12WPM's slower keying rate).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/skimmer-testkit/src/vectors.rs crates/skimmer-cli/src/main.rs crates/skimmer-cli/tests/
+git add crates/manta-testkit/src/vectors.rs crates/manta-cli/src/main.rs crates/manta-cli/tests/
 git commit -m "test(testkit): V2 (fast-35) and V3 (slow-weak) golden vectors"
 ```
 
@@ -1291,16 +1291,16 @@ git commit -m "test(testkit): V2 (fast-35) and V3 (slow-weak) golden vectors"
 ### Task 8: V6 golden vector (sinusoidal QSB envelope)
 
 **Files:**
-- Modify: `crates/skimmer-testkit/src/scene.rs`
-- Modify: `crates/skimmer-testkit/src/vectors.rs`
-- Modify: `crates/skimmer-cli/src/main.rs`
+- Modify: `crates/manta-testkit/src/scene.rs`
+- Modify: `crates/manta-testkit/src/vectors.rs`
+- Modify: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
 - Produces: `pub struct QsbSine { pub rate_hz: f32 }` added to `scene.rs`; `SignalSpec` gains `pub qsb: Option<QsbSine>`; `pub fn v6() -> VectorSpec` in `vectors.rs`.
 
 - [ ] **Step 1: Add `QsbSine` and the `qsb` field**
 
-In `crates/skimmer-testkit/src/scene.rs`, add after the `SignalSpec` struct:
+In `crates/manta-testkit/src/scene.rs`, add after the `SignalSpec` struct:
 
 ```rust
 /// Sinusoidal QSB envelope multiplier applied on top of the keyed envelope.
@@ -1316,8 +1316,8 @@ Add `pub qsb: Option<QsbSine>,` as a new field on `SignalSpec`, immediately afte
 - [ ] **Step 2: Update every existing `SignalSpec` literal**
 
 Every place a `SignalSpec { .. }` is constructed by name (not via `..spec` update syntax) needs `qsb: None,` added:
-- `crates/skimmer-testkit/src/vectors.rs`: `v1()` (and `v2()`/`v3()` from Task 7).
-- `crates/skimmer-testkit/src/scene.rs`'s `mod tests`: `achieved_snr_matches_request`, `scene_is_deterministic`.
+- `crates/manta-testkit/src/vectors.rs`: `v1()` (and `v2()`/`v3()` from Task 7).
+- `crates/manta-testkit/src/scene.rs`'s `mod tests`: `achieved_snr_matches_request`, `scene_is_deterministic`.
 
 Add `qsb: None,` to each. (Task 9 will similarly need `watterson: None,` added to all of these plus this task's own `v6()` and Task 7's v2/v3 — do that in Task 9, not here, to keep this task's diff focused.)
 
@@ -1420,22 +1420,22 @@ Add a `scene.rs`-level test proving the multiplier actually varies amplitude ove
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p skimmer-testkit scene:: vectors:: -- --nocapture`
+Run: `cargo test -p manta-testkit scene:: vectors:: -- --nocapture`
 Expected: PASS. `qsb_sine_modulates_envelope_amplitude`'s trough-window index (`samples.len()/2`) is a rough guess at where the 0.2 Hz sine dips — if it doesn't land near a trough, adjust the window index using the known sine phase (`sin(2π·0.2·t)` is at its minimum at `t = 2.5s` within a 5s render, i.e. sample index `2.5*fs`) rather than loosening the assertion.
 
 - [ ] **Step 7: Wire v6 into CLI `gen`, add golden test**
 
-In `crates/skimmer-cli/src/main.rs`'s `Gen` match arm, add `"v6" => skimmer_testkit::vectors::v6(),` and widen the `bail!` message to `"available: v1-v3, v6"`.
+In `crates/manta-cli/src/main.rs`'s `Gen` match arm, add `"v6" => manta_testkit::vectors::v6(),` and widen the `bail!` message to `"available: v1-v3, v6"`.
 
-Add to `crates/skimmer-cli/tests/golden_v2_v3.rs` (or a same-pattern new file `golden_v6.rs` — either is fine, keep the `decode_report` helper accessible to whichever file uses it, duplicating it if using a separate file):
+Add to `crates/manta-cli/tests/golden_v2_v3.rs` (or a same-pattern new file `golden_v6.rs` — either is fine, keep the `decode_report` helper accessible to whichever file uses it, duplicating it if using a separate file):
 
 ```rust
 #[test]
 fn v6_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v6();
+    let spec = manta_testkit::vectors::v6();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
         cer <= 0.10,
         "V6 char accuracy must be >= 90 % (CER <= 0.10), got CER {cer}\nexpected: {}\ndecoded:  {}",
@@ -1460,11 +1460,11 @@ fn v6_passes_end_to_end_from_wav() {
 
 - [ ] **Step 8: Run and commit**
 
-Run: `cargo test -p skimmer-cli golden 2>&1 | tail -40`
+Run: `cargo test -p manta-cli golden 2>&1 | tail -40`
 Expected: PASS.
 
 ```bash
-git add crates/skimmer-testkit/src/scene.rs crates/skimmer-testkit/src/vectors.rs crates/skimmer-cli/src/main.rs crates/skimmer-cli/tests/
+git add crates/manta-testkit/src/scene.rs crates/manta-testkit/src/vectors.rs crates/manta-cli/src/main.rs crates/manta-cli/tests/
 git commit -m "test(testkit): V6 (qsb-sine) golden vector"
 ```
 
@@ -1473,17 +1473,17 @@ git commit -m "test(testkit): V6 (qsb-sine) golden vector"
 ### Task 9: V4/V5 golden vectors (Watterson fading via coppa's one-shot API + Hilbert)
 
 **Files:**
-- Modify: `crates/skimmer-testkit/src/scene.rs`
-- Modify: `crates/skimmer-testkit/src/vectors.rs`
-- Modify: `crates/skimmer-cli/src/main.rs`
+- Modify: `crates/manta-testkit/src/scene.rs`
+- Modify: `crates/manta-testkit/src/vectors.rs`
+- Modify: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
-- Consumes: `coppa_channel::watterson::{watterson_preset, WattersonPreset}` (Task 1); `skimmer_dsp::hilbert::HilbertTransformer` (Task 3).
+- Consumes: `coppa_channel::watterson::{watterson_preset, WattersonPreset}` (Task 1); `manta_dsp::hilbert::HilbertTransformer` (Task 3).
 - Produces: `pub struct WattersonFade { pub preset: WattersonPreset, pub seed: u64 }`; `SignalSpec` gains `pub watterson: Option<WattersonFade>`; `pub fn v4() -> VectorSpec`, `pub fn v5() -> VectorSpec`.
 
 - [ ] **Step 1: Add `WattersonFade` and the `watterson` field**
 
-In `crates/skimmer-testkit/src/scene.rs`, add:
+In `crates/manta-testkit/src/scene.rs`, add:
 
 ```rust
 /// Watterson HF fading applied to this signal only, via coppa's real,
@@ -1546,7 +1546,7 @@ In `render_scene`, restructure the per-signal loop to branch on `sig.watterson`:
                 fade.preset,
                 fade.seed,
             );
-            let analytic = skimmer_dsp::hilbert::HilbertTransformer::new().process(&faded);
+            let analytic = manta_dsp::hilbert::HilbertTransformer::new().process(&faded);
             for (out, a) in acc.iter_mut().zip(analytic.iter()) {
                 *out += a;
             }
@@ -1658,32 +1658,32 @@ pub fn v5() -> VectorSpec {
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p skimmer-testkit -- --nocapture`
+Run: `cargo test -p manta-testkit -- --nocapture`
 Expected: PASS across the full crate (this touches shared code in `scene.rs`, so run the whole crate, not just `vectors::`).
 
 - [ ] **Step 7: Wire v4/v5 into CLI `gen`, widen the bail message**
 
 ```rust
-                "v1" => skimmer_testkit::vectors::v1(),
-                "v2" => skimmer_testkit::vectors::v2(),
-                "v3" => skimmer_testkit::vectors::v3(),
-                "v4" => skimmer_testkit::vectors::v4(),
-                "v5" => skimmer_testkit::vectors::v5(),
-                "v6" => skimmer_testkit::vectors::v6(),
+                "v1" => manta_testkit::vectors::v1(),
+                "v2" => manta_testkit::vectors::v2(),
+                "v3" => manta_testkit::vectors::v3(),
+                "v4" => manta_testkit::vectors::v4(),
+                "v5" => manta_testkit::vectors::v5(),
+                "v6" => manta_testkit::vectors::v6(),
                 other => bail!("unknown vector {other:?} (available: v1-v6)"),
 ```
 
 - [ ] **Step 8: Add golden tests, run, and commit**
 
-Add to `crates/skimmer-cli/tests/golden_v2_v3.rs` (reusing its `decode_report` helper):
+Add to `crates/manta-cli/tests/golden_v2_v3.rs` (reusing its `decode_report` helper):
 
 ```rust
 #[test]
 fn v4_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v4();
+    let spec = manta_testkit::vectors::v4();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
         cer <= 0.05,
         "V4 char accuracy must be >= 95 % (CER <= 0.05), got CER {cer}\nexpected: {}\ndecoded:  {}",
@@ -1694,10 +1694,10 @@ fn v4_passes_end_to_end_from_wav() {
 
 #[test]
 fn v5_passes_end_to_end_from_wav() {
-    let spec = skimmer_testkit::vectors::v5();
+    let spec = manta_testkit::vectors::v5();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
-    let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
         cer <= 0.20,
         "V5 char accuracy must be >= 80 % (CER <= 0.20), got CER {cer}\nexpected: {}\ndecoded:  {}",
@@ -1707,7 +1707,7 @@ fn v5_passes_end_to_end_from_wav() {
 
     // Callsign validated within 90 s: find the sample_ts at which "ZL2XYZ"
     // first appears as a contiguous substring of the running decoded text.
-    // M1 doesn't have skimmer-spot's callsign validation yet, so this
+    // M1 doesn't have manta-spot's callsign validation yet, so this
     // approximates ROADMAP's "callsign validated within 90 s" gate.
     // sample_ts is in raw input samples at manifest.fs (SPEC §1.1).
     let events = report["events"].as_array().unwrap();
@@ -1732,23 +1732,23 @@ fn v5_passes_end_to_end_from_wav() {
 }
 ```
 
-Run: `cargo test -p skimmer-cli golden 2>&1 | tail -60`
+Run: `cargo test -p manta-cli golden 2>&1 | tail -60`
 Expected: PASS. If V5 (CCIR-poor, +3 dB) falls short of 80%, this is real signal about decode robustness under fading — do not lower the threshold; if it's a rendering bug (e.g. Hilbert delay misalignment corrupting the very start of the message), re-check Step 3's real-domain construction against Task 3's Hilbert transformer tests.
 
 ```bash
-git add crates/skimmer-testkit/src/scene.rs crates/skimmer-testkit/src/vectors.rs crates/skimmer-cli/src/main.rs crates/skimmer-cli/tests/
+git add crates/manta-testkit/src/scene.rs crates/manta-testkit/src/vectors.rs crates/manta-cli/src/main.rs crates/manta-cli/tests/
 git commit -m "test(testkit): V4 (fade-good) and V5 (fade-poor) golden vectors via coppa watterson_preset + Hilbert"
 ```
 
 ---
 
-### Task 10: Soak harness (`skimmer-engine::soak`) + CLI `soak` subcommand
+### Task 10: Soak harness (`manta-engine::soak`) + CLI `soak` subcommand
 
 **Files:**
-- Create: `crates/skimmer-engine/src/soak.rs`
-- Modify: `crates/skimmer-engine/src/lib.rs`
-- Modify: `crates/skimmer-cli/src/main.rs`
-- Create: `crates/skimmer-cli/tests/soak_ci.rs`
+- Create: `crates/manta-engine/src/soak.rs`
+- Modify: `crates/manta-engine/src/lib.rs`
+- Modify: `crates/manta-cli/src/main.rs`
+- Create: `crates/manta-cli/tests/soak_ci.rs`
 
 **Interfaces:**
 - Consumes: `crate::listen` (Task 5); `crate::PipelineConfig`.
@@ -1756,7 +1756,7 @@ git commit -m "test(testkit): V4 (fade-good) and V5 (fade-poor) golden vectors v
 
 - [ ] **Step 1: Implement the soak harness**
 
-Create `crates/skimmer-engine/src/soak.rs`. Note up front: `listen()` returns
+Create `crates/manta-engine/src/soak.rs`. Note up front: `listen()` returns
 `Result<()>`, so `catch_unwind`'s closure returns `Result<()>` and
 `result: std::thread::Result<Result<()>>` — `Err(_)` at the outer level is a
 genuine panic; `Ok(Err(e))` is `listen()` returning cleanly with an error
@@ -1777,7 +1777,7 @@ be surfaced as an error, not silently folded into `panicked`.
 
 use crate::{listen, PipelineConfig};
 use anyhow::Result;
-use skimmer_input::AudioIqSource;
+use manta_input::AudioIqSource;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1863,9 +1863,9 @@ mod tests {
 
     #[test]
     fn soak_reports_no_panic_on_a_clean_short_signal() {
-        let fs = skimmer_input::TARGET_RATE_HZ;
-        let spec = skimmer_testkit::keyer::KeyerSpec::new(20.0);
-        let (env, _) = skimmer_testkit::keyer::key_text_loop(
+        let fs = manta_input::TARGET_RATE_HZ;
+        let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
+        let (env, _) = manta_testkit::keyer::key_text_loop(
             "CQ CQ DE W1AW W1AW K",
             &spec,
             fs as f64,
@@ -1890,23 +1890,23 @@ mod tests {
 }
 ```
 
-Add `skimmer-testkit` to `crates/skimmer-engine/Cargo.toml`'s `[dev-dependencies]` (check first — it may already be there for other tests; `coppa-audio` was already added there in Task 5 Step 1).
+Add `manta-testkit` to `crates/manta-engine/Cargo.toml`'s `[dev-dependencies]` (check first — it may already be there for other tests; `coppa-audio` was already added there in Task 5 Step 1).
 
 - [ ] **Step 2: Register the module, run tests**
 
-In `crates/skimmer-engine/src/lib.rs`, add:
+In `crates/manta-engine/src/lib.rs`, add:
 
 ```rust
 pub mod soak;
 pub use soak::{soak, soak_passed, SoakReport};
 ```
 
-Run: `cargo test -p skimmer-engine soak:: -- --nocapture`
+Run: `cargo test -p manta-engine soak:: -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 3: Add the CLI `soak` subcommand**
 
-In `crates/skimmer-cli/src/main.rs`'s `Command` enum:
+In `crates/manta-cli/src/main.rs`'s `Command` enum:
 
 ```rust
     /// Run the listen pipeline for a fixed duration, checking for panics
@@ -1931,16 +1931,16 @@ In `main()`'s match:
             source,
         } => {
             let src = match source {
-                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
-                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+                Some(path) => manta_input::AudioIqSource::from_wav_file(&path)?,
+                None => manta_input::AudioIqSource::from_device(device.as_deref())?,
             };
-            let report = skimmer_engine::soak(
+            let report = manta_engine::soak(
                 src,
                 &PipelineConfig::default(),
                 std::time::Duration::from_secs(duration),
             )?;
             eprintln!("{report:?}");
-            if !skimmer_engine::soak_passed(&report) {
+            if !manta_engine::soak_passed(&report) {
                 std::process::exit(1);
             }
         }
@@ -1948,7 +1948,7 @@ In `main()`'s match:
 
 - [ ] **Step 4: Add a CI-scoped soak test**
 
-Create `crates/skimmer-cli/tests/soak_ci.rs` — this is the automated proxy for ROADMAP's "≥1 hour" gate, scaled to fit CI time: not a literal hour, but long enough (and against a long enough synthetic scene) to exercise the same code path for a sustained run without the actual wall-clock cost. Add `coppa-audio = { workspace = true }` to `crates/skimmer-cli/Cargo.toml`'s `[dev-dependencies]` if not already present (`skimmer-testkit` should already be there).
+Create `crates/manta-cli/tests/soak_ci.rs` — this is the automated proxy for ROADMAP's "≥1 hour" gate, scaled to fit CI time: not a literal hour, but long enough (and against a long enough synthetic scene) to exercise the same code path for a sustained run without the actual wall-clock cost. Add `coppa-audio = { workspace = true }` to `crates/manta-cli/Cargo.toml`'s `[dev-dependencies]` if not already present (`manta-testkit` should already be there).
 
 ```rust
 //! CI-scoped soak test: a genuinely automated proxy for ROADMAP's "runs >= 1
@@ -1956,14 +1956,14 @@ Create `crates/skimmer-cli/tests/soak_ci.rs` — this is the automated proxy for
 //! synthetic scene at file-replay pace rather than a literal wall-clock
 //! hour. A real-hardware, real-duration soak is the manual runbook's job
 //! (design doc §8), not CI's.
-use skimmer_engine::{soak, soak_passed, PipelineConfig};
-use skimmer_input::AudioIqSource;
-use skimmer_testkit::keyer::{key_text_loop, KeyerSpec};
+use manta_engine::{soak, soak_passed, PipelineConfig};
+use manta_input::AudioIqSource;
+use manta_testkit::keyer::{key_text_loop, KeyerSpec};
 use std::time::Duration;
 
 #[test]
 fn soak_survives_a_sustained_run_without_panic_or_unbounded_memory() {
-    let fs = skimmer_input::TARGET_RATE_HZ;
+    let fs = manta_input::TARGET_RATE_HZ;
     let spec = KeyerSpec::new(25.0);
     let (env, _) = key_text_loop(
         "CQ CQ DE W1AW W1AW K CQ CQ DE VK9DX VK9DX K",
@@ -1987,14 +1987,14 @@ fn soak_survives_a_sustained_run_without_panic_or_unbounded_memory() {
 }
 ```
 
-Run: `cargo test -p skimmer-cli --test soak_ci -- --nocapture`
+Run: `cargo test -p manta-cli --test soak_ci -- --nocapture`
 Expected: PASS, taking roughly 120 seconds (this is a real-time-scale soak of the streaming loop, not a wall-clock hour — proportionate for CI while still exercising sustained operation, per this task's framing).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/soak.rs crates/skimmer-engine/src/lib.rs crates/skimmer-engine/Cargo.toml crates/skimmer-cli/src/main.rs crates/skimmer-cli/tests/soak_ci.rs crates/skimmer-cli/Cargo.toml
-git commit -m "feat(engine,cli): soak harness (panic + RSS growth) and skimmer soak subcommand"
+git add crates/manta-engine/src/soak.rs crates/manta-engine/src/lib.rs crates/manta-engine/Cargo.toml crates/manta-cli/src/main.rs crates/manta-cli/tests/soak_ci.rs crates/manta-cli/Cargo.toml
+git commit -m "feat(engine,cli): soak harness (panic + RSS growth) and manta soak subcommand"
 ```
 
 ---
@@ -2022,18 +2022,18 @@ M1 implemented (live audio decode, V1-V6 green); next is M2 in ROADMAP.md.
 
 - [ ] **Step 2: Update ARCHITECTURE.md's dependency graph**
 
-In §2's dependency graph code block, add the new `skimmer-input → skimmer-dsp` edge:
+In §2's dependency graph code block, add the new `manta-input → manta-dsp` edge:
 
 ```
-skimmer-cli ──▶ skimmer-engine ──▶ skimmer-input ──▶ skimmer-dsp
-                     │        ├──▶ skimmer-dsp ──────▶ coppa-dsp
-                     │        ├──▶ skimmer-decode
-                     │        └──▶ skimmer-spot
-                     └──▶ skimmer-server
-skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
+manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp
+                     │        ├──▶ manta-dsp ──────▶ coppa-dsp
+                     │        ├──▶ manta-decode
+                     │        └──▶ manta-spot
+                     └──▶ manta-server
+manta-testkit ──▶ manta-dsp, manta-decode, coppa-channel
 ```
 
-Add a one-line note directly below the diagram: "M1 added `skimmer-input → skimmer-dsp` (the shared Hilbert transformer, used by both `AudioIqSource` and `skimmer-testkit`'s Watterson vector rendering) and `skimmer-testkit → coppa-channel` (Watterson fading, see the M1 pinned-decisions doc)."
+Add a one-line note directly below the diagram: "M1 added `manta-input → manta-dsp` (the shared Hilbert transformer, used by both `AudioIqSource` and `manta-testkit`'s Watterson vector rendering) and `manta-testkit → coppa-channel` (Watterson fading, see the M1 pinned-decisions doc)."
 
 - [ ] **Step 3: Update ARCHITECTURE.md's "Reused from coppa vs. new" table**
 
@@ -2041,7 +2041,7 @@ Add two rows:
 
 ```
 | Audio-device capture, resampling, file replay | **reuse** `coppa-audio` |
-| Real-to-analytic Hilbert conversion | **new** (`skimmer-dsp::hilbert`) — used by both live audio input and offline Watterson vector rendering |
+| Real-to-analytic Hilbert conversion | **new** (`manta-dsp::hilbert`) — used by both live audio input and offline Watterson vector rendering |
 ```
 
 - [ ] **Step 4: Write the M1 pinned-decisions doc**
@@ -2062,20 +2062,20 @@ decided; SPEC and docs/ still win on anything not listed here.
    file-replay sources (what the CI soak test runs against) have no ring and
    cannot overrun by construction. Live-hardware overrun observability needs
    a `coppa-audio` API addition -- out of scope for M1, tracked as a
-   follow-up. `skimmer-engine::soak` checks panics and RSS growth only.
+   follow-up. `manta-engine::soak` checks panics and RSS growth only.
 2. **The coppa commit pin lives in `Cargo.toml`/`Cargo.lock` + this doc, not
    per-vector `.manifest.json`** -- following M0's actual established
    convention (see the M0 pins doc's "coppa dependency pin" section), not
    the M1 design doc's phrasing.
 3. **Pinned decision 20 (all-dah opener) is fixed, not just documented.**
-   `crates/skimmer-decode/src/timing.rs`'s `ClusterPair::initialize()` now
+   `crates/manta-decode/src/timing.rs`'s `ClusterPair::initialize()` now
    uses an absolute-ms prior (SPEC §4.1's `[20, 150]` ms dit clamp) instead
    of unconditionally assuming a lone unimodal cluster is dits. See that
    function's doc comment for the full fix rationale and the still-ambiguous
    60-150 ms middle band it does not (and cannot, from duration alone)
    resolve.
 4. **CI's soak test is not a literal wall-clock hour.** It runs
-   `skimmer-engine::soak` against a 120 s synthetic scene for a 120 s
+   `manta-engine::soak` against a 120 s synthetic scene for a 120 s
    duration, proving the streaming loop survives sustained operation without
    panic/unbounded memory. ROADMAP's literal "≥1 hour" real-hardware gate is
    satisfied by the manual runbook (`docs/RUNBOOKS/m1-w1aw-live-copy.md`),
@@ -2115,9 +2115,9 @@ copying speed for a first pass.
    audio CODEC).
 2. Tune to a W1AW code-practice frequency/time slot, confirm you can hear
    clean CW in your normal audio monitoring path first.
-3. `cargo run --release -p skimmer-cli -- listen --device <your interface name>`
+3. `cargo run --release -p manta-cli -- listen --device <your interface name>`
    (omit `--device` to use the system default input; run
-   `cargo run -p skimmer-cli -- listen --device nonexistent` first if
+   `cargo run -p manta-cli -- listen --device nonexistent` first if
    unsure what device names are visible -- the error message won't list
    them today, so cross-check via your OS's audio settings panel).
 4. Watch stdout. Expected: readable text tracking the code practice

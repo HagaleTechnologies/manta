@@ -4,9 +4,9 @@
 
 **Goal:** Implement SPEC-decode-core.md §7's V8/V8w pileup golden vectors and ROADMAP.md's M2 CPU-budget criterion bench (192 kS/s, 300 active tracks, < 50% of one core on an M-series Mac).
 
-**Architecture:** Reuse the existing `skimmer-testkit::scene`/`vectors` generic multi-signal scene infra (already supports arbitrary-N `SignalSpec` scenes and per-signal `Manifest.expected_freqs_hz`/`keyed_texts`) to build a 50-signal pileup vector pair (V8 AWGN, V8w Watterson CCIR-poor). Golden tests match each decoded track back to its originating signal by nearest `TrackMeta.freq_hz`, giving precise per-signal CER instead of a loose substring guess. The CPU-budget bench drives `skimmer_engine::decode_samples` (the crate's actual public full-pipeline entry point — `TrackManager` itself is private) with a synthetic 300-tone 192 kS/s scene, via both a `criterion` profiling target and a separate `#[ignore]`d wall-clock `#[test]` that does the real budget assertion (perf assertions don't belong in CI; benches aren't run by `cargo test` by default).
+**Architecture:** Reuse the existing `manta-testkit::scene`/`vectors` generic multi-signal scene infra (already supports arbitrary-N `SignalSpec` scenes and per-signal `Manifest.expected_freqs_hz`/`keyed_texts`) to build a 50-signal pileup vector pair (V8 AWGN, V8w Watterson CCIR-poor). Golden tests match each decoded track back to its originating signal by nearest `TrackMeta.freq_hz`, giving precise per-signal CER instead of a loose substring guess. The CPU-budget bench drives `manta_engine::decode_samples` (the crate's actual public full-pipeline entry point — `TrackManager` itself is private) with a synthetic 300-tone 192 kS/s scene, via both a `criterion` profiling target and a separate `#[ignore]`d wall-clock `#[test]` that does the real budget assertion (perf assertions don't belong in CI; benches aren't run by `cargo test` by default).
 
-**Tech Stack:** Rust, `criterion` (new dev-dependency), existing `skimmer-testkit`/`skimmer-engine`/`skimmer-cli` crates.
+**Tech Stack:** Rust, `criterion` (new dev-dependency), existing `manta-testkit`/`manta-engine`/`manta-cli` crates.
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - SPEC-decode-core.md §7 V8: 50 signals, 10–35 WPM, −2..+25 dB, uniform over ±45 kHz, unique calls; AWGN, jitter 8%; pass = ≥45/50 callsigns validated, 0 bogus callsigns.
 - SPEC-decode-core.md §7 V8w: same scene, Watterson CCIR-poor, jitter 8%; pass = ≥90% of signals with mean SNR ≥ +6 dB decoded CER < 10%, 0 bogus callsigns, 0 cross-channel ghost decodes.
 - ROADMAP.md M2 accept: criterion bench, full pipeline at 192 kS/s with 300 active tracks, < 50% of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4 (Pi4 leg explicitly deferred per the approved design — Tony runs it later on real hardware).
-- All `skimmer-testkit` randomness is ChaCha8-seeded, hand-rolled via `next_u64()` (pinned decision 2) — no new RNG crate, no `rand::Rng::gen_range`.
+- All `manta-testkit` randomness is ChaCha8-seeded, hand-rolled via `next_u64()` (pinned decision 2) — no new RNG crate, no `rand::Rng::gen_range`.
 - If V8/V8w fail their first real run: diagnose as a real bug first (per this repo's escalation policy). Only fall back to `#[ignore]` + a documented reason + a filed GitHub issue if investigation shows it's a genuine, already-known classical-decoder limitation (the same family as V5/V6's fading-robustness gap) — never silently widen a threshold to force a pass.
 - Full spec: `docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md`.
 
@@ -23,15 +23,15 @@
 ### Task 1: Deterministic pileup callsign fixture list
 
 **Files:**
-- Create: `crates/skimmer-testkit/src/callsigns.rs`
-- Modify: `crates/skimmer-testkit/src/lib.rs` (add `mod callsigns;`)
+- Create: `crates/manta-testkit/src/callsigns.rs`
+- Modify: `crates/manta-testkit/src/lib.rs` (add `mod callsigns;`)
 
 **Interfaces:**
 - Produces: `pub(crate) fn pileup_calls() -> Vec<String>` — 50 unique, deterministic ham-style callsigns, ChaCha8-seeded.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/skimmer-testkit/src/callsigns.rs`:
+Create `crates/manta-testkit/src/callsigns.rs`:
 
 ```rust
 //! Deterministic fixture callsigns for SPEC §7 V8/V8w pileup scenes.
@@ -86,7 +86,7 @@ mod tests {
 
 - [ ] **Step 2: Wire the module into the crate**
 
-In `crates/skimmer-testkit/src/lib.rs`, add `mod callsigns;` alongside the existing `pub mod` list (this one stays private — only `vectors.rs` uses it):
+In `crates/manta-testkit/src/lib.rs`, add `mod callsigns;` alongside the existing `pub mod` list (this one stays private — only `vectors.rs` uses it):
 
 ```rust
 pub mod cer;
@@ -100,13 +100,13 @@ pub mod wav;
 
 - [ ] **Step 3: Run the test to verify it passes**
 
-Run: `cargo test -p skimmer-testkit callsigns:: -- --nocapture`
+Run: `cargo test -p manta-testkit callsigns:: -- --nocapture`
 Expected: `produces_50_unique_deterministic_calls ... ok`
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-testkit/src/callsigns.rs crates/skimmer-testkit/src/lib.rs
+git add crates/manta-testkit/src/callsigns.rs crates/manta-testkit/src/lib.rs
 git commit -m "feat(testkit): deterministic 50-call pileup fixture list"
 ```
 
@@ -115,7 +115,7 @@ git commit -m "feat(testkit): deterministic 50-call pileup fixture list"
 ### Task 2: V8/V8w VectorSpec generators
 
 **Files:**
-- Modify: `crates/skimmer-testkit/src/vectors.rs`
+- Modify: `crates/manta-testkit/src/vectors.rs`
 
 **Interfaces:**
 - Consumes: `crate::callsigns::pileup_calls() -> Vec<String>` (Task 1), `crate::u01(&mut ChaCha8Rng) -> f64` (existing, `pub(crate)` in `lib.rs`), `SignalSpec`/`Jitter`/`WattersonFade`/`WattersonPreset` (existing).
@@ -123,7 +123,7 @@ git commit -m "feat(testkit): deterministic 50-call pileup fixture list"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `crates/skimmer-testkit/src/vectors.rs`'s `#[cfg(test)] mod tests` block (near the other `*_spec_matches_spec_table` tests):
+Add to `crates/manta-testkit/src/vectors.rs`'s `#[cfg(test)] mod tests` block (near the other `*_spec_matches_spec_table` tests):
 
 ```rust
 #[test]
@@ -168,12 +168,12 @@ fn v8w_spec_matches_v8_scene_plus_fading() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p skimmer-testkit v8 -- --nocapture`
+Run: `cargo test -p manta-testkit v8 -- --nocapture`
 Expected: FAIL with "cannot find function `v8` in this scope" (and `v8w`)
 
 - [ ] **Step 3: Implement `pileup_scene`/`v8`/`v8w`**
 
-Add near the top of `crates/skimmer-testkit/src/vectors.rs`, alongside the existing imports:
+Add near the top of `crates/manta-testkit/src/vectors.rs`, alongside the existing imports:
 
 ```rust
 use rand_chacha::ChaCha8Rng;
@@ -251,18 +251,18 @@ Note: `pileup_scene`'s per-signal WPM/SNR draw order means iteration order matte
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p skimmer-testkit v8 -- --nocapture`
+Run: `cargo test -p manta-testkit v8 -- --nocapture`
 Expected: both `v8_spec_matches_spec_table` and `v8w_spec_matches_v8_scene_plus_fading` pass.
 
-- [ ] **Step 5: Run the full skimmer-testkit test suite**
+- [ ] **Step 5: Run the full manta-testkit test suite**
 
-Run: `cargo test -p skimmer-testkit`
+Run: `cargo test -p manta-testkit`
 Expected: all pass, no regressions.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/skimmer-testkit/src/vectors.rs
+git add crates/manta-testkit/src/vectors.rs
 git commit -m "feat(testkit): V8/V8w pileup-50 vector generators"
 ```
 
@@ -271,19 +271,19 @@ git commit -m "feat(testkit): V8/V8w pileup-50 vector generators"
 ### Task 3: V8 golden test
 
 **Files:**
-- Create: `crates/skimmer-cli/tests/golden_v8_v8w.rs`
+- Create: `crates/manta-cli/tests/golden_v8_v8w.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_testkit::vectors::{v8, v8w, write_fixture_set, VectorSpec, Manifest}` (Task 2), `skimmer_testkit::cer::cer`, the `skimmer` CLI binary's `decode --json` output shape (`report["events"]`, `report["text"]`, event fields `track_id`/`sample_ts`/`event`/`glyph`/`freq_hz`, same shape `golden_v7_v9_v10.rs` already parses).
+- Consumes: `manta_testkit::vectors::{v8, v8w, write_fixture_set, VectorSpec, Manifest}` (Task 2), `manta_testkit::cer::cer`, the `manta` CLI binary's `decode --json` output shape (`report["events"]`, `report["text"]`, event fields `track_id`/`sample_ts`/`event`/`glyph`/`freq_hz`, same shape `golden_v7_v9_v10.rs` already parses).
 - Produces (for Task 4, same file): `decode_report`, `per_track`, `call_from_keyed_text`, `match_tracks_by_freq`, `bogus_calls` helper functions.
 
 - [ ] **Step 1: Write the test file with all shared helpers + the V8 test**
 
-Create `crates/skimmer-cli/tests/golden_v8_v8w.rs`:
+Create `crates/manta-cli/tests/golden_v8_v8w.rs`:
 
 ```rust
 //! SPEC §7 V8/V8w pileup golden gates. "Callsign validated"/"bogus
-//! callsign"/"ghost decode" approximate the future skimmer-spot validator
+//! callsign"/"ghost decode" approximate the future manta-spot validator
 //! (M3) the same way V5/V6 approximate "callsign validated" today -- see
 //! docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
 
@@ -291,11 +291,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Command;
 
 fn decode_report(
-    spec: &skimmer_testkit::vectors::VectorSpec,
-) -> (serde_json::Value, skimmer_testkit::vectors::Manifest) {
+    spec: &manta_testkit::vectors::VectorSpec,
+) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = skimmer_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let manifest = manta_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", "--json"])
         .arg(dir.path().join(format!("{}.wav", spec.name)))
         .output()
@@ -352,7 +352,7 @@ fn call_from_keyed_text(text: &str) -> &str {
 /// decoded track whose last-reported freq_hz is closest to that signal's
 /// expected absolute frequency.
 fn match_tracks_by_freq<'a>(
-    manifest: &skimmer_testkit::vectors::Manifest,
+    manifest: &manta_testkit::vectors::Manifest,
     tracks: &'a BTreeMap<u64, (String, Option<f64>)>,
 ) -> Vec<(&'a str, Option<f64>)> {
     manifest
@@ -394,7 +394,7 @@ fn bogus_calls(decoded_text: &str, known_calls: &HashSet<&str>) -> Vec<String> {
 
 #[test]
 fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
-    let spec = skimmer_testkit::vectors::v8();
+    let spec = manta_testkit::vectors::v8();
     let (report, manifest) = decode_report(&spec);
     let tracks = per_track(&report);
     let known_calls: HashSet<&str> = manifest
@@ -435,19 +435,19 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 
 - [ ] **Step 2: Run the test**
 
-Run: `cargo test -p skimmer-cli --test golden_v8_v8w v8_pileup -- --nocapture`
+Run: `cargo test -p manta-cli --test golden_v8_v8w v8_pileup -- --nocapture`
 
 This is a real 120 s / 50-signal scene decode, expect it to take tens of seconds to a few minutes. Report the actual result (pass, or the actual `validated`/`bogus` numbers on failure) — do not assume it passes.
 
 - [ ] **Step 3: Handle the result**
 
 - If it passes: proceed to Step 4.
-- If it fails: this is a real measurement, not a bug in the test. Investigate per this plan's Global Constraints escalation policy — check whether the shortfall is scattered (real decode-quality gap) or concentrated in specific SNR/offset ranges (possible channelizer edge effect, cf. the V2 near-channel-edge bug). Do NOT mark `#[ignore]` without a documented root-cause finding, matching how V2/V5/V6 were escalated (see `crates/skimmer-cli/tests/golden_v2_v3.rs`'s doc comments for the required style: a paragraph explaining what was measured, what was ruled out, and why the remaining gap is accepted as a known limitation, plus a filed GitHub issue if it's a new finding). Report back with the real numbers and your diagnosis before deciding whether to `#[ignore]` it.
+- If it fails: this is a real measurement, not a bug in the test. Investigate per this plan's Global Constraints escalation policy — check whether the shortfall is scattered (real decode-quality gap) or concentrated in specific SNR/offset ranges (possible channelizer edge effect, cf. the V2 near-channel-edge bug). Do NOT mark `#[ignore]` without a documented root-cause finding, matching how V2/V5/V6 were escalated (see `crates/manta-cli/tests/golden_v2_v3.rs`'s doc comments for the required style: a paragraph explaining what was measured, what was ruled out, and why the remaining gap is accepted as a known limitation, plus a filed GitHub issue if it's a new finding). Report back with the real numbers and your diagnosis before deciding whether to `#[ignore]` it.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-cli/tests/golden_v8_v8w.rs
+git add crates/manta-cli/tests/golden_v8_v8w.rs
 git commit -m "test(cli): V8 pileup-50 golden gate"
 ```
 
@@ -458,19 +458,19 @@ git commit -m "test(cli): V8 pileup-50 golden gate"
 ### Task 4: V8w golden test
 
 **Files:**
-- Modify: `crates/skimmer-cli/tests/golden_v8_v8w.rs`
+- Modify: `crates/manta-cli/tests/golden_v8_v8w.rs`
 
 **Interfaces:**
 - Consumes: all helpers from Task 3 (same file).
 
 - [ ] **Step 1: Add the V8w test**
 
-Append to `crates/skimmer-cli/tests/golden_v8_v8w.rs`:
+Append to `crates/manta-cli/tests/golden_v8_v8w.rs`:
 
 ```rust
 #[test]
 fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
-    let spec = skimmer_testkit::vectors::v8w();
+    let spec = manta_testkit::vectors::v8w();
     let (report, manifest) = decode_report(&spec);
     let tracks = per_track(&report);
     let known_calls: HashSet<&str> = manifest
@@ -495,7 +495,7 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
     let mut good = 0;
     for &i in &strong {
         let (decoded_text, _freq) = matched[i];
-        let cer = skimmer_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text);
+        let cer = manta_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text);
         if cer < 0.10 {
             good += 1;
         }
@@ -534,7 +534,7 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
 
 - [ ] **Step 2: Run the test**
 
-Run: `cargo test -p skimmer-cli --test golden_v8_v8w v8w_pileup -- --nocapture`
+Run: `cargo test -p manta-cli --test golden_v8_v8w v8w_pileup -- --nocapture`
 
 Real Watterson-faded 120 s / 50-signal decode — expect a few minutes. Report the actual numbers.
 
@@ -542,15 +542,15 @@ Real Watterson-faded 120 s / 50-signal decode — expect a few minutes. Report t
 
 Same escalation policy as Task 3 Step 3. V8w is the more likely of the two to hit this repo's known classical-decoder fading-robustness gap (same family as V5/V6, both already `#[ignore]`d for exactly this reason) — if so, that's an expected, not surprising, outcome; document it the same way, with a filed issue.
 
-- [ ] **Step 4: Run the full skimmer-cli test suite (excluding other known-ignored tests)**
+- [ ] **Step 4: Run the full manta-cli test suite (excluding other known-ignored tests)**
 
-Run: `cargo test -p skimmer-cli`
+Run: `cargo test -p manta-cli`
 Expected: no regressions in the existing V1/V3/V4/V7/V9/V10 golden tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-cli/tests/golden_v8_v8w.rs
+git add crates/manta-cli/tests/golden_v8_v8w.rs
 git commit -m "test(cli): V8w pileup-50-fading golden gate"
 ```
 
@@ -562,11 +562,11 @@ git commit -m "test(cli): V8w pileup-50-fading golden gate"
 
 **Files:**
 - Modify: `Cargo.toml` (workspace root — add `criterion` to `[workspace.dependencies]`)
-- Modify: `crates/skimmer-engine/Cargo.toml` (add `criterion` dev-dependency + `[[bench]]`)
-- Create: `crates/skimmer-engine/benches/cpu_budget.rs`
+- Modify: `crates/manta-engine/Cargo.toml` (add `criterion` dev-dependency + `[[bench]]`)
+- Create: `crates/manta-engine/benches/cpu_budget.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_engine::{decode_samples, PipelineConfig}` (existing public API — `TrackManager` itself is private, so the bench must go through this entry point), `skimmer_testkit::scene::{render_scene, SignalSpec}` (existing, already a dev-dependency of `skimmer-engine`).
+- Consumes: `manta_engine::{decode_samples, PipelineConfig}` (existing public API — `TrackManager` itself is private, so the bench must go through this entry point), `manta_testkit::scene::{render_scene, SignalSpec}` (existing, already a dev-dependency of `manta-engine`).
 - Produces: `cpu_budget_scene()` (duplicated into Task 6's test file, same convention as this repo's other per-file test-helper duplication).
 
 - [ ] **Step 1: Add the `criterion` dependency**
@@ -577,14 +577,14 @@ In `Cargo.toml` (workspace root), add to `[workspace.dependencies]` (alphabetica
 criterion = "0.8"
 ```
 
-In `crates/skimmer-engine/Cargo.toml`, add to `[dev-dependencies]` and a new `[[bench]]` section:
+In `crates/manta-engine/Cargo.toml`, add to `[dev-dependencies]` and a new `[[bench]]` section:
 
 ```toml
 [dev-dependencies]
 coppa-audio = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
-skimmer-testkit = { workspace = true }
+manta-testkit = { workspace = true }
 
 [[bench]]
 name = "cpu_budget"
@@ -593,7 +593,7 @@ harness = false
 
 - [ ] **Step 2: Write the bench**
 
-Create `crates/skimmer-engine/benches/cpu_budget.rs`:
+Create `crates/manta-engine/benches/cpu_budget.rs`:
 
 ```rust
 //! ROADMAP.md M2 accept criterion: full pipeline at 192 kS/s with 300
@@ -608,8 +608,8 @@ Create `crates/skimmer-engine/benches/cpu_budget.rs`:
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use num_complex::Complex32;
-use skimmer_engine::PipelineConfig;
-use skimmer_testkit::scene::{render_scene, SignalSpec};
+use manta_engine::PipelineConfig;
+use manta_testkit::scene::{render_scene, SignalSpec};
 use std::time::Duration;
 
 /// 300 simultaneous keyed tones spread across a 192 kS/s passband, evenly
@@ -653,7 +653,7 @@ fn bench_cpu_budget(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.bench_function("192khz_300tracks", |b| {
         b.iter(|| {
-            skimmer_engine::decode_samples(
+            manta_engine::decode_samples(
                 black_box(&iq),
                 black_box(fs),
                 black_box(center_freq_hz),
@@ -671,14 +671,14 @@ criterion_main!(benches);
 
 - [ ] **Step 3: Run the bench**
 
-Run: `cargo bench -p skimmer-engine --bench cpu_budget`
+Run: `cargo bench -p manta-engine --bench cpu_budget`
 
 This runs 10 iterations of a 192 kHz / 15 s / 300-track full decode each — likely several minutes total. Run it with `run_in_background` if your tool supports it, or expect to wait. Report the printed mean time per iteration.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add Cargo.toml crates/skimmer-engine/Cargo.toml crates/skimmer-engine/benches/cpu_budget.rs
+git add Cargo.toml crates/manta-engine/Cargo.toml crates/manta-engine/benches/cpu_budget.rs
 git commit -m "perf(engine): 192 kS/s / 300-track CPU-budget criterion bench"
 ```
 
@@ -687,14 +687,14 @@ git commit -m "perf(engine): 192 kS/s / 300-track CPU-budget criterion bench"
 ### Task 6: CPU-budget wall-clock assertion test
 
 **Files:**
-- Create: `crates/skimmer-engine/tests/cpu_budget.rs`
+- Create: `crates/manta-engine/tests/cpu_budget.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_engine::{decode_samples, PipelineConfig}`, `skimmer_testkit::scene::{render_scene, SignalSpec}` (same as Task 5; this is a separate binary target so the scene helper is duplicated, matching this repo's existing per-test-file helper duplication convention — see `golden_v2_v3.rs` vs `golden_v7_v9_v10.rs` each having their own `decode_report`).
+- Consumes: `manta_engine::{decode_samples, PipelineConfig}`, `manta_testkit::scene::{render_scene, SignalSpec}` (same as Task 5; this is a separate binary target so the scene helper is duplicated, matching this repo's existing per-test-file helper duplication convention — see `golden_v2_v3.rs` vs `golden_v7_v9_v10.rs` each having their own `decode_report`).
 
 - [ ] **Step 1: Write the test**
 
-Create `crates/skimmer-engine/tests/cpu_budget.rs`:
+Create `crates/manta-engine/tests/cpu_budget.rs`:
 
 ```rust
 //! ROADMAP.md M2 CPU-budget accept criterion, Mac leg only (see
@@ -704,8 +704,8 @@ Create `crates/skimmer-engine/tests/cpu_budget.rs`:
 //! still-outstanding W1AW live-copy run (see CLAUDE.md Status).
 
 use num_complex::Complex32;
-use skimmer_engine::PipelineConfig;
-use skimmer_testkit::scene::{render_scene, SignalSpec};
+use manta_engine::PipelineConfig;
+use manta_testkit::scene::{render_scene, SignalSpec};
 
 fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
     const FS: f64 = 192_000.0;
@@ -740,7 +740,7 @@ fn cpu_budget_mac_under_half_core() {
     let (iq, fs, center_freq_hz, cfg) = cpu_budget_scene();
     let audio_duration_s = iq.len() as f64 / fs;
     let start = std::time::Instant::now();
-    let report = skimmer_engine::decode_samples(&iq, fs, center_freq_hz, &cfg);
+    let report = manta_engine::decode_samples(&iq, fs, center_freq_hz, &cfg);
     let elapsed = start.elapsed().as_secs_f64();
     assert!(report.is_ok(), "decode_samples failed: {:?}", report.err());
     let ratio = elapsed / audio_duration_s;
@@ -756,7 +756,7 @@ fn cpu_budget_mac_under_half_core() {
 
 - [ ] **Step 2: Run the test**
 
-Run: `cargo test -p skimmer-engine --test cpu_budget -- --ignored --nocapture`
+Run: `cargo test -p manta-engine --test cpu_budget -- --ignored --nocapture`
 
 - [ ] **Step 3: Report the real number**
 
@@ -769,7 +769,7 @@ If the ratio is >= 0.5 (over budget) on this Mac: this is a real perf finding, n
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-engine/tests/cpu_budget.rs
+git add crates/manta-engine/tests/cpu_budget.rs
 git commit -m "test(engine): CPU-budget wall-clock assertion (Mac leg)"
 ```
 
@@ -790,11 +790,11 @@ git commit -m "test(engine): CPU-budget wall-clock assertion (Mac leg)"
 Create `docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`, following the existing style of `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` (numbered pinned decisions, each with a one-line summary and rationale). Must include, using the REAL values from Tasks 3/4/6 (not placeholders):
 
 1. Pileup fixture callsigns are synthetic/deterministic (ChaCha8-seeded prefix+suffix composition), not real operator calls.
-2. V8/V8w "callsign validated"/"bogus"/"ghost decode" are approximated via decoded-text substring/token heuristics (no real `skimmer-spot` validator exists yet — M3 scope), same convention as V5/V6, but upgraded to match tracks to signals by nearest `TrackMeta.freq_hz` rather than a bare substring search.
+2. V8/V8w "callsign validated"/"bogus"/"ghost decode" are approximated via decoded-text substring/token heuristics (no real `manta-spot` validator exists yet — M3 scope), same convention as V5/V6, but upgraded to match tracks to signals by nearest `TrackMeta.freq_hz` rather than a bare substring search.
 3. V8 result: pass/fail, and if `#[ignore]`d, the issue number and root-cause summary.
 4. V8w result: same.
 5. CPU-budget Mac measurement: the actual `cpu_budget: X.XXs wall / 15.00s audio = X.XXXx realtime` line from Task 6, and whether it cleared the < 0.5x budget.
-6. Raspberry Pi 4 leg (< 1 core / 1.0x realtime): explicitly flagged outstanding, pending Tony running `cargo test -p skimmer-engine --test cpu_budget -- --ignored --nocapture` on real Pi4 hardware — same pattern as M1's still-outstanding W1AW live-copy run.
+6. Raspberry Pi 4 leg (< 1 core / 1.0x realtime): explicitly flagged outstanding, pending Tony running `cargo test -p manta-engine --test cpu_budget -- --ignored --nocapture` on real Pi4 hardware — same pattern as M1's still-outstanding W1AW live-copy run.
 
 - [ ] **Step 2: Update ROADMAP.md**
 

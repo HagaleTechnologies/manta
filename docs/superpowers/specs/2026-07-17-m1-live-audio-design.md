@@ -9,14 +9,14 @@ is SPEC-decode-core.md §7 vectors V1–V6, plus a manual live-copy run.
 Three work-streams, one milestone:
 
 1. A streaming live-audio decode pipeline (new).
-2. Golden vectors V2–V6 (`skimmer-testkit`).
+2. Golden vectors V2–V6 (`manta-testkit`).
 3. A fix for the M0 all-dah-opener decode bug, which M0's pinned decision
    #20 explicitly gates on M1 (see §9).
 
 Explicitly out of scope (ROADMAP defers to M2/M3): PFB channelizer, decoder
 pool, multi-track, SoapySDR/KiwiSDR input, TOML config, spot server.
 
-## 2. Input layer — `skimmer-input::AudioIqSource`
+## 2. Input layer — `manta-input::AudioIqSource`
 
 A new `IqSource` impl wrapping a `coppa_audio::AudioSource`:
 
@@ -37,11 +37,11 @@ the post-resample rate; `center_freq_hz()` returns 0.0 (audio has no RF
 reference — SPEC's `freq_hz` reporting for audio-sourced tracks is
 offset-only, center 0).
 
-## 3. `skimmer-dsp::hilbert` — analytic-signal FIR
+## 3. `manta-dsp::hilbert` — analytic-signal FIR
 
 New component: an odd-length windowed-sinc Hilbert transformer
 (`h[n] = 2/(πn)` for odd n, 0 for even n), Kaiser-windowed the same way
-`skimmer-dsp::proto` designs the PFB prototype. Causal, fixed group delay,
+`manta-dsp::proto` designs the PFB prototype. Causal, fixed group delay,
 processes samples incrementally (no whole-buffer requirement) — usable both
 for live chunks and one-shot vector rendering.
 
@@ -64,7 +64,7 @@ Hilbert filter but adds two mixers and two lowpass filters for no gain here —
 we don't need SSB-grade image rejection, just a decent analytic signal for
 the existing extractor. FIR Hilbert wins on "one component, both consumers."
 
-## 4. Streaming engine — `skimmer-engine::listen`
+## 4. Streaming engine — `manta-engine::listen`
 
 M0's `decode_samples`/`decode_wav` (whole-buffer batch) are untouched — a new
 module, not a refactor. Single-threaded loop:
@@ -107,8 +107,8 @@ end-of-file handling.
 ## 5. CLI
 
 ```
-skimmer listen [--device NAME] [--source file:PATH] [--json]
-skimmer soak --duration SECS [--device NAME] [--source file:PATH]
+manta listen [--device NAME] [--source file:PATH] [--json]
+manta soak --duration SECS [--device NAME] [--source file:PATH]
 ```
 
 `listen` prints decoded characters/spot-relevant events to stdout as they
@@ -118,7 +118,7 @@ mutually exclusive; default is the system default input device.
 
 ## 6. Golden vectors V2–V6
 
-Added to `skimmer-testkit::vectors` and `Gen`'s CLI match arm (`"v2".."v6"`).
+Added to `manta-testkit::vectors` and `Gen`'s CLI match arm (`"v2".."v6"`).
 
 - **V2 (fast-35), V3 (slow-weak):** AWGN + jitter, same machinery as V1. New
   `VectorSpec` entries only, no new code.
@@ -137,7 +137,7 @@ Added to `skimmer-testkit::vectors` and `Gen`'s CLI match arm (`"v2".."v6"`).
   states outputs will differ from today's — V4/V5 will need regeneration at
   that point; this is accepted, not a blocker.
 
-## 7. Soak harness — `skimmer soak`
+## 7. Soak harness — `manta soak`
 
 Reuses the `listen` engine (§4) against either a real device or a paced file
 replay, for a configurable duration. Tracks and asserts:
@@ -160,14 +160,14 @@ soak) without redesign.
 ## 8. Manual acceptance: live W1AW copy
 
 Not CI. A short runbook (in the implementation plan): run
-`skimmer listen --device <rig audio>` during a scheduled W1AW code-practice
+`manta listen --device <rig audio>` during a scheduled W1AW code-practice
 transmission, confirm the printed text is recognizable copy. Documented as a
 manual step you run yourself before declaring M1 done.
 
 ## 9. Decoder fix: all-dah opener prior
 
 M0 pinned decision #20 (`docs/DECISIONS/2026-07-11-m0-implementation-pins.md`)
-found `ClusterPair::initialize()` (`skimmer-decode/src/timing.rs`) always
+found `ClusterPair::initialize()` (`manta-decode/src/timing.rs`) always
 assumes a lone unimodal 5-mark cluster is dits, never dahs — an all-dah
 opener (message starting T/M/O, or mid-message strings like "TU", "OM", "73")
 fails 12/12 in a stress sweep ("TTTTT"→"5", "MMM"→"", "OO"→""), silently
@@ -178,7 +178,7 @@ code, where dah-heavy openers are realistic."
 Fix direction (per the pin): replace the unconditional "assume dits" default
 with an absolute-ms prior using the existing SPEC §4.1 `[20, 150]` ms dit
 clamp — a lone ~180 ms cluster is far likelier dahs than dits than a lone
-~60 ms cluster is. Implemented in `skimmer-decode`, verified by a regression
+~60 ms cluster is. Implemented in `manta-decode`, verified by a regression
 test sweeping all-dah and all-dit openers (the same stress sweep that found
 the bug), and re-verified against V1 (must stay CER=0).
 
@@ -187,11 +187,11 @@ the bug), and re-verified against V1 (must stay CER=0).
 - Unit: Hilbert transformer round-trip/frequency-response tests (mirroring
   `proto.rs`'s stopband-margin test style); `AudioIqSource` tests against
   `coppa_audio`'s file/loopback backends (no real hardware needed in CI).
-- Golden: V1–V6 all green via `skimmer decode` (batch) — `listen`'s streaming
+- Golden: V1–V6 all green via `manta decode` (batch) — `listen`'s streaming
   loop is validated against the same vectors via file replay, asserting
   byte-identical decoded text to the batch path (determinism requirement,
   ARCHITECTURE §9).
-- Soak: `skimmer soak --duration 3600 --source file:<long-synthetic-scene>`
+- Soak: `manta soak --duration 3600 --source file:<long-synthetic-scene>`
   in CI (bounded runtime via a script-generated long clean scene, not real
   wall-clock hardware time) as an automated proxy for the 1 h gate; a
   real-hardware soak is the manual runbook's job, not CI's.

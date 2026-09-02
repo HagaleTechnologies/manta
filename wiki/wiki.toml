@@ -1,5 +1,5 @@
 schema = "wiki-config/v1"
-repo = "skimmer"
+repo = "manta"
 visibility = "private"
 # public | private
 # optional overrides:

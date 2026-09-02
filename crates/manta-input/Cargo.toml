@@ -1,0 +1,27 @@
+[package]
+name = "manta-input"
+description = "IQ sources for manta (file, live audio, KiwiSDR network, SoapySDR)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+coppa-audio = { workspace = true }
+cpal = { workspace = true }
+hound = { workspace = true }
+num-complex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+manta-dsp = { workspace = true }
+tungstenite = { workspace = true }
+rubato = { workspace = true }
+soapysdr = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+soapy = ["dep:soapysdr"]

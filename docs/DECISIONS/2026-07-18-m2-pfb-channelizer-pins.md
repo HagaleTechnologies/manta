@@ -9,7 +9,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 ## Deviations and pinned decisions
 
 1. **Power-to-dB epsilon: `1e-20`, not `freqest.rs`'s `1e-30`.** The new
-   channelizer (`crates/skimmer-dsp/src/channelizer.rs`) uses SPEC
+   channelizer (`crates/manta-dsp/src/channelizer.rs`) uses SPEC
    §1.3/§1.4's stated `epsilon = 1e-20` for `PdB = 10*log10(P + epsilon)`.
    The deprecated M0 shim (`freqest.rs`) uses `1e-30`, but that was always
    the shim's own undocumented choice, not a SPEC value — this is a
@@ -22,7 +22,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    sum and `proto.rs`'s prototype design) — even though the fold's per-bin
    sum (`L=8` terms) is much shorter than `single.rs`'s full `LN`-term
    convolution.
-3. **`skimmer-dsp::single`/`freqest` deprecated in place, not deleted.** Per
+3. **`manta-dsp::single`/`freqest` deprecated in place, not deleted.** Per
    Tony's explicit decision, kept compiled and tested as reference/fallback;
    candidate for removal after the channelizer path has run cleanly for a
    few months (a real follow-up to schedule later, not an open question
@@ -45,7 +45,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    the center bin) instead — the unambiguous "no local max" case. See the
    test's doc comment in `channelizer.rs` for the reasoning.
 6. **A Task 5 process gap, found and fixed.** The placeholder detector
-   (`calibrate_channel` in `crates/skimmer-engine/src/detect.rs`) was
+   (`calibrate_channel` in `crates/manta-engine/src/detect.rs`) was
    initially committed (`47b8fa9`) with a known `dead_code` clippy failure —
    no caller existed yet, since Tasks 6/7 hadn't wired it in — instead of
    stopping to ask as instructed for an unresolvable-at-the-time gate
@@ -74,7 +74,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    remains in the codebase (confirmed via `grep -rn combined_magnitude`
    across the tree).
 8. **V2's golden test (`v2_passes_end_to_end_from_wav` in
-   `crates/skimmer-cli/tests/golden_v2_v3.rs`) is deliberately `#[ignore]`d,
+   `crates/manta-cli/tests/golden_v2_v3.rs`) is deliberately `#[ignore]`d,
    not fixed** — a real, well-evidenced, tracked limitation (see pin 7
    above), not a silently weakened gate. A real fix needs either demod
    timing/hysteresis robustness work or the real order-statistic-gated
@@ -86,8 +86,8 @@ decided; SPEC and docs/ still win on anything not listed here.
    is an additional exception on top of M1's pre-existing V5 exception,
    both explicitly tracked and unrelated to each other.**
 9. **Freq-error tolerance widened from 10 Hz to 25 Hz** in
-   `crates/skimmer-cli/tests/golden_v1.rs`, `crates/skimmer-engine/tests/
-   pipeline.rs`, and `crates/skimmer-engine/tests/roundtrip_iq.rs`'s
+   `crates/manta-cli/tests/golden_v1.rs`, `crates/manta-engine/tests/
+   pipeline.rs`, and `crates/manta-engine/tests/roundtrip_iq.rs`'s
    proptest. Even
    with the SPEC §1.4 fine-frequency interpolator correctly wired in, AWGN
    corrupts the interpolator's weak neighbor bin on high-offset hops. A
@@ -117,7 +117,7 @@ decided; SPEC and docs/ still win on anything not listed here.
     listen-mode decode a tone", not "does it decode a tone at exactly
     700 Hz"), not a threshold or assertion change.
 12. **A pre-existing, unrelated flaky proptest was found in
-    `crates/skimmer-engine/tests/roundtrip_iq.rs`** during Task 7's
+    `crates/manta-engine/tests/roundtrip_iq.rs`** during Task 7's
     investigation, confirmed via `git stash` to exist independent of any M2
     sub-project 1 change. Reconfirmed during this docs-close-out task's own
     full-workspace verification: `iq_roundtrip_with_noise` passed on one
@@ -128,7 +128,7 @@ decided; SPEC and docs/ still win on anything not listed here.
     triggering an existing decode-robustness edge case. Noted here for
     visibility; explicitly **not** fixed as part of this plan — out of
     scope, tracked as a follow-up. (The proptest's saved-regression file,
-    `crates/skimmer-engine/tests/roundtrip_iq.proptest-regressions`, was
+    `crates/manta-engine/tests/roundtrip_iq.proptest-regressions`, was
     left at its pre-existing tracked state — the newly-found failing case
     was not committed to it, to avoid turning an intermittent flake into a
     deterministic failure for every future run.)
@@ -137,7 +137,7 @@ decided; SPEC and docs/ still win on anything not listed here.
     the actual CI gate; a per-crate `cargo clippy -p X` run can report clean
     while the workspace-wide run does not. Pin 6 above (the
     `calibrate_channel` `dead_code` failure) is a direct instance of this —
-    the failure was only visible once `skimmer-engine` was checked in the
+    the failure was only visible once `manta-engine` was checked in the
     context of the whole workspace. This echoes the identical lesson already
     recorded as pin 9 in the M1 pinned-decisions doc; two milestones in a
     row hitting the same mistake is worth calling out again rather than

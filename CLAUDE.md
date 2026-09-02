@@ -1,4 +1,4 @@
-# skimmer
+# manta
 
 Open-source, cross-platform, wideband multi-signal CW skimmer in Rust. Decodes
 every CW signal across an SDR passband and emits RBN-compatible spots — an open
@@ -16,7 +16,7 @@ known classical-decoder fading-robustness limitations (`#[ignore]`d,
 issues #25/#28), deferred to M4 ML fusion by design, not M2 blockers. **M2
 acceptance is still open**: Pi4 CPU-budget leg and 24 h live-SDR soak are
 unmet — both need physical hardware not reachable from this environment.
-`skimmer-dsp::single`/`freqest` deprecated in place.
+`manta-dsp::single`/`freqest` deprecated in place.
 
 ## Documents (read in this order)
 
@@ -42,7 +42,7 @@ descriptive and always loses conflicts with code and docs/.
 
 - Reuses `coppa-dsp` (FFT) from the sibling coppa repo. Note: coppa has NO
   Kaiser filter designer — the PFB prototype designer is new code here
-  (`skimmer-dsp::proto`).
+  (`manta-dsp::proto`).
 - **Watterson upstream fixes landed** (`coppa` main 2026-07-07, commits
   `9ab1547`, `34aec5f`, `fc35895`): the two bugs identified in the
   SPEC-watterson audit (Doppler spread ~41% too fast vs ITU-R F.1487;
@@ -50,12 +50,12 @@ descriptive and always loses conflicts with code and docs/.
   vector freeze for V4/V5/V8w is **unblocked** — pin the exact coppa
   commit used when the vectors are generated.
   - **Convention verified against coppa's current `watterson.rs`:** the
-    fixed convention matches what skimmer's spec expects — `doppler_spread_hz`
+    fixed convention matches what manta's spec expects — `doppler_spread_hz`
     is the **2σ width** of the Gaussian Doppler PSD (sigma = spread / 2,
     via `doppler_sigma_hz()`), and normalization is **ensemble-only**
     (E|g|² = 1 across realizations; per-realization normalization is
     explicitly rejected in the module doc and code comment). No divergence
-    from skimmer's expected convention.
+    from manta's expected convention.
   - **SNR convention (still live):** this repo's spec froze SNR-in-2500-Hz;
     the shared `awgn_ref_bw()` design in SPEC-watterson reconciles it with
     the benchmark harness's 3 kHz convention.

@@ -18,9 +18,9 @@ copying speed for a first pass.
    audio CODEC).
 2. Tune to a W1AW code-practice frequency/time slot, confirm you can hear
    clean CW in your normal audio monitoring path first.
-3. `cargo run --release -p skimmer-cli -- listen --device <your interface name>`
+3. `cargo run --release -p manta-cli -- listen --device <your interface name>`
    (omit `--device` to use the system default input; run
-   `cargo run -p skimmer-cli -- listen --device nonexistent` first if
+   `cargo run -p manta-cli -- listen --device nonexistent` first if
    unsure what device names are visible -- the error message won't list
    them today, so cross-check via your OS's audio settings panel).
 4. Watch stdout. Expected: readable text tracking the code practice

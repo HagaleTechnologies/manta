@@ -1,4 +1,4 @@
-# skimmer — Architecture
+# manta — Architecture
 
 Headless wideband CW skimmer: SDR IQ in, RBN-compatible spots out.
 
@@ -10,7 +10,7 @@ marked **(research-dependent)** are the only intentionally open questions.
 
 ```
                 ┌─────────────────────────────────────────────────────────────┐
-                │                        skimmer daemon                        │
+                │                         manta daemon                         │
                 │                                                              │
  RTL-SDR ──┐    │  ┌──────────┐   ┌─────────────┐   ┌───────────────────────┐  │
  Airspy  ──┼─▶  │  │  input   │──▶│ channelizer │──▶│  detector             │  │
@@ -47,33 +47,33 @@ workspace-level dependency table, `criterion` benches, `proptest` where invarian
 allow).
 
 ```
-skimmer/
+manta/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── skimmer-input          # IQ sources: SoapySDR, KiwiSDR client, file, audio
-│   ├── skimmer-dsp            # PFB channelizer, noise-floor estimation, envelope
-│   ├── skimmer-decode         # CW keying state machine, timing, Morse decode
-│   ├── skimmer-spot           # callsign validation, CQ/DE parse, dedupe, scoring
-│   ├── skimmer-server         # telnet cluster server + JSON/WebSocket stream
-│   ├── skimmer-engine         # orchestration: track lifecycle, decoder pool
-│   ├── skimmer-testkit        # synthetic CW generator, golden-IQ harness
-│   └── skimmer-cli            # `skimmer` binary: daemon + subcommands
+│   ├── manta-input          # IQ sources: SoapySDR, KiwiSDR client, file, audio
+│   ├── manta-dsp            # PFB channelizer, noise-floor estimation, envelope
+│   ├── manta-decode         # CW keying state machine, timing, Morse decode
+│   ├── manta-spot           # callsign validation, CQ/DE parse, dedupe, scoring
+│   ├── manta-server         # telnet cluster server + JSON/WebSocket stream
+│   ├── manta-engine         # orchestration: track lifecycle, decoder pool
+│   ├── manta-testkit        # synthetic CW generator, golden-IQ harness
+│   └── manta-cli            # `manta` binary: daemon + subcommands
 ```
 
 Dependency graph (arrows = depends on):
 
 ```
-skimmer-cli ──▶ skimmer-engine ──▶ skimmer-input ──▶ skimmer-dsp
-                     │        ├──▶ skimmer-dsp ──────▶ coppa-dsp
-                     │        ├──▶ skimmer-decode
-                     │        └──▶ skimmer-spot ──────▶ skimmer-decode
-                     └──▶ skimmer-server
-skimmer-testkit ──▶ skimmer-dsp, skimmer-decode, coppa-channel
+manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp
+                     │        ├──▶ manta-dsp ──────▶ coppa-dsp
+                     │        ├──▶ manta-decode
+                     │        └──▶ manta-spot ──────▶ manta-decode
+                     └──▶ manta-server
+manta-testkit ──▶ manta-dsp, manta-decode, coppa-channel
 ```
 
-M1 added `skimmer-input → skimmer-dsp` (the shared Hilbert transformer, used
-by both `AudioIqSource` and `skimmer-testkit`'s Watterson vector rendering)
-and `skimmer-testkit → coppa-channel` (Watterson fading, see the M1
+M1 added `manta-input → manta-dsp` (the shared Hilbert transformer, used
+by both `AudioIqSource` and `manta-testkit`'s Watterson vector rendering)
+and `manta-testkit → coppa-channel` (Watterson fading, see the M1
 pinned-decisions doc).
 
 ### Reused from coppa vs. new
@@ -81,22 +81,22 @@ pinned-decisions doc).
 | Capability | Source |
 |---|---|
 | FFT (`FftProcessor`) | **reuse** `coppa-dsp::fft` |
-| FIR design (PFB prototype) | **new** (`skimmer-dsp::proto`) — `coppa-dsp::filter` ships only `RrcFilter` (SPEC §10.1) |
+| FIR design (PFB prototype) | **new** (`manta-dsp::proto`) — `coppa-dsp::filter` ships only `RrcFilter` (SPEC §10.1) |
 | Envelope normalization | **new** — per-track fixed reference scale; `coppa-dsp::agc` not used in the decode path (SPEC §10.2) |
 | Channel impairments for tests (AWGN, freq offset, fading, **Watterson HF**) | **reuse** `coppa-channel` |
 | Audio-device input (single-channel mode) | **reuse** `coppa-audio` (cpal) — no automatic resampling; source must run natively at exactly 48000 Hz (M1 pinned decisions doc) |
-| Real-to-analytic Hilbert conversion | **new** (`skimmer-dsp::hilbert`) — used by both live audio input and offline Watterson vector rendering |
-| Polyphase filterbank channelizer | **new** (`skimmer-dsp`) — coppa has no channelizer |
-| Order-statistic noise-floor estimator | **new** (`skimmer-dsp`) |
-| CW keying/timing/Morse decode | **new** (`skimmer-decode`) — dit's algorithms, ported & headless |
-| Callsign/spot validation | **new** (`skimmer-spot`) |
-| DX cluster telnet protocol | **new** (`skimmer-server`) |
+| Real-to-analytic Hilbert conversion | **new** (`manta-dsp::hilbert`) — used by both live audio input and offline Watterson vector rendering |
+| Polyphase filterbank channelizer | **new** (`manta-dsp`) — coppa has no channelizer |
+| Order-statistic noise-floor estimator | **new** (`manta-dsp`) |
+| CW keying/timing/Morse decode | **new** (`manta-decode`) — dit's algorithms, ported & headless |
+| Callsign/spot validation | **new** (`manta-spot`) |
+| DX cluster telnet protocol | **new** (`manta-server`) |
 
 coppa crates are consumed as git dependencies (path deps during co-development in
 this workspace-of-workspaces). If coppa publishes to crates.io first, switch to
 versioned deps.
 
-## 3. Input layer (`skimmer-input`)
+## 3. Input layer (`manta-input`)
 
 One trait, four implementations:
 
@@ -116,7 +116,7 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   test strategy; the daemon must run identically from file and live SDR.
 - **Audio passband** (via `coppa-audio`): 48 kHz real audio from a rig's RX audio,
   Hilbert-transformed to analytic. Degenerate ~3 kHz "wideband" mode; exists
-  because it makes skimmer useful to people with zero SDR hardware, and it is the
+  because it makes manta useful to people with zero SDR hardware, and it is the
   M1 bring-up path.
 
 **Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
@@ -128,9 +128,9 @@ instances, not one instance retuning — simpler, and SDRs are cheap.
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
 
-## 4. Channelizer (`skimmer-dsp`)
+## 4. Channelizer (`manta-dsp`)
 
-**Implemented** as of M2 sub-project 1 (`skimmer-dsp::channelizer`) -- the
+**Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
 design below is now built, not just decided.
 
 **Decision: 4×-oversampled polyphase filterbank (PFB), ~100 Hz channel spacing,
@@ -138,7 +138,7 @@ detection on channel powers, decoders attached only to active channels.**
 
 - N = input_rate / ~93.75 Hz, rounded to a power of two: N=1024 at 96 kS/s,
   N=2048 at 192 kS/s, N=8192 at 768 kS/s. Channel spacing = rate/N ≈ 94 Hz.
-- Prototype lowpass: Kaiser-designed FIR (new code, `skimmer-dsp::proto` — see
+- Prototype lowpass: Kaiser-designed FIR (new code, `manta-dsp::proto` — see
   SPEC §1.2), 8 taps/branch,
   passband ~140 Hz — each channel fully contains a CW signal up to ~45 WPM
   (occupied BW ≈ 4·WPM Hz ≈ 180 Hz at 45 WPM spans ≤ 2 channels; the decoder reads
@@ -173,7 +173,7 @@ reported (no silent coverage loss).
 Even at 768 kS/s the pipeline stays under half a core; the machine's job is I/O,
 not math. This budget is enforced by `criterion` benches in CI (M2 acceptance).
 
-## 5. Per-channel decoder (`skimmer-decode`)
+## 5. Per-channel decoder (`manta-decode`)
 
 The wideband, headless port of dit's proven single-channel chain. Classical
 first; ML is a fusion stage later (M4), exactly as dit evolved.
@@ -201,13 +201,13 @@ Per track, operating on the ~375 Hz complex channel stream:
    envelope, fused with the classical decoder by adaptive confidence weighting —
    a direct port of dit's fusion-engine design (sliding-window accuracy
    tracking, EMA-smoothed weights, weight floor). Training corpus comes from
-   `skimmer-testkit` synthesis + RBN-validated on-air recordings. The classical
+   `manta-testkit` synthesis + RBN-validated on-air recordings. The classical
    decoder must ship first and defines the accuracy baseline the ML stage has to
    beat under QRM/QSB (measured, not assumed).
 
 Decoder output: timestamped character stream + WPM + SNR + confidence per track.
 
-## 6. Spot validation (`skimmer-spot`)
+## 6. Spot validation (`manta-spot`)
 
 Decoded text is noisy; validation is what makes spots trustworthy. Pipeline per
 track, over a rolling text window:
@@ -230,7 +230,7 @@ track, over a rolling text window:
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
    WPM, type, confidence.
 
-## 7. Output layer (`skimmer-server`)
+## 7. Output layer (`manta-server`)
 
 - **Telnet DX cluster server** (default :7300): standard login prompt, emits
   RBN-format spots —
@@ -249,14 +249,14 @@ track, over a rolling text window:
 - Single TOML config (coppa convention): device, center freq, band plan
   (CW segment limits — don't decode/spot outside them), thresholds, track cap,
   server ports, cty/scp paths, station callsign (spotter ID).
-- `tracing` throughout with `EnvFilter`; `skimmer --status` hits a local control
+- `tracing` throughout with `EnvFilter`; `manta --status` hits a local control
   socket for live stats. Prometheus text endpoint (feature `metrics`): input
   overruns, active tracks, evictions, decode rate, spots/min, per-stage queue
   depths, spot confidence histogram.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
-## 9. Test strategy (`skimmer-testkit`)
+## 9. Test strategy (`manta-testkit`)
 
 The decisive advantage of building this in this ecosystem: **synthetic ground
 truth with realistic HF impairment already exists.**
@@ -267,7 +267,7 @@ truth with realistic HF impairment already exists.**
   10–35 WPM, −5 to +30 dB SNR, 200 Hz–96 kHz spread").
 - **Impairments from `coppa-channel`**: AWGN, frequency offset/drift, and the
   **Watterson HF model** (the standard ionospheric fading/multipath model) —
-  reused, not rebuilt. Skimmer accuracy is quoted *under Watterson CCIR-poor*,
+  reused, not rebuilt. manta accuracy is quoted *under Watterson CCIR-poor*,
   not just clean AWGN.
 - **Golden IQ corpus**: recorded band segments (contest weekends = dense QRM;
   quiet weekdays = weak-signal) with RBN's own spots for the same time/frequency

@@ -1,0 +1,29 @@
+[package]
+name = "manta-engine"
+description = "Pipeline orchestration: input -> channel -> decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+num-complex = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+manta-decode = { workspace = true }
+manta-dsp = { workspace = true }
+manta-input = { workspace = true }
+manta-spot = { workspace = true }
+
+[dev-dependencies]
+coppa-audio = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+manta-testkit = { workspace = true }
+
+[[bench]]
+name = "cpu_budget"
+harness = false

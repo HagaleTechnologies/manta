@@ -8,7 +8,7 @@ Date: 2026-07-25
 M2's remaining sub-projects (ROADMAP.md) are: SoapySDR input, KiwiSDR input. This
 spec covers the first: ARCHITECTURE.md §3's SoapySDR `IqSource` (RTL-SDR, Airspy
 HF+, SDRplay via the `soapysdr` crate, feature-gated `soapy`), plus the engine/CLI
-wiring needed to actually drive `skimmer listen`/`skimmer soak` from a real SDR.
+wiring needed to actually drive `manta listen`/`manta soak` from a real SDR.
 
 ## Environment finding (changes the risk profile from "blind code")
 
@@ -19,7 +19,7 @@ confirmed via a real spike:
 - `soapysdr::Device::new("driver=rtlsdr")` with no hardware attached returns a
   real, catchable error (`Other: No RTL-SDR devices found!`), not a panic or
   build failure.
-- `num_complex::Complex<f32>` (skimmer's `Complex32`) directly implements the
+- `num_complex::Complex<f32>` (manta's `Complex32`) directly implements the
   crate's `StreamSample` trait as `Format::CF32` — no sample-format conversion
   layer needed between SoapySDR and `IqSource`.
 
@@ -31,13 +31,13 @@ run.
 
 ## Scope
 
-1. **`skimmer-input::soapy::SoapySdrIqSource`** — the crate-level `IqSource` impl.
-2. **Engine generalization** — `skimmer_engine::listen`/`soak` are currently
+1. **`manta-input::soapy::SoapySdrIqSource`** — the crate-level `IqSource` impl.
+2. **Engine generalization** — `manta_engine::listen`/`soak` are currently
    hard-coded to `AudioIqSource`; generalize both to accept `Box<dyn IqSource>`
    (the trait is already object-safe: no generics, no `Self`-returning methods)
    so the CLI can select among audio/file/SoapySDR sources at runtime.
 3. **CLI wiring** — new `--soapy-driver`/`--soapy-freq`/`--soapy-rate`/
-   `--soapy-gain` flags on `listen`/`soak`, so `skimmer listen --soapy-driver
+   `--soapy-gain` flags on `listen`/`soak`, so `manta listen --soapy-driver
    "driver=rtlsdr" --soapy-freq 14025000 --soapy-rate 96000` actually works
    end-to-end against real hardware (untested here, but the code path is real).
 4. **CI** — a new, separate job building/testing `--features soapy` on both
@@ -50,7 +50,7 @@ KiwiSDR input is explicitly out of scope — separate sub-project, separate spec
 
 ## `SoapySdrIqSource`
 
-`crates/skimmer-input/src/soapy.rs`, gated `#[cfg(feature = "soapy")]` at the
+`crates/manta-input/src/soapy.rs`, gated `#[cfg(feature = "soapy")]` at the
 module level in `lib.rs` (`#[cfg(feature = "soapy")] pub mod soapy;`).
 
 ```rust
@@ -104,7 +104,7 @@ closes the stream.
 
 ## Engine generalization
 
-`crates/skimmer-engine/src/listen.rs` and `soak.rs`: change
+`crates/manta-engine/src/listen.rs` and `soak.rs`: change
 
 ```rust
 pub fn listen(mut src: AudioIqSource, ...) -> Result<()>
@@ -118,7 +118,7 @@ pub fn listen(mut src: Box<dyn IqSource>, ...) -> Result<()>
 pub fn soak(src: Box<dyn IqSource>, ...) -> Result<SoakReport>
 ```
 
-`IqSource` (defined in `skimmer-input`) is already dyn-compatible; this is a
+`IqSource` (defined in `manta-input`) is already dyn-compatible; this is a
 signature-only change, no behavioral change to either function's body beyond
 `src.read(...)`/`src.sample_rate()` calls working identically through the trait
 object.
@@ -136,7 +136,7 @@ frequencies. Fix: read `src.center_freq_hz()` once at the top of `listen()`
 
 ## CLI wiring
 
-`crates/skimmer-cli/src/main.rs`'s `Command::Listen`/`Command::Soak`: add, gated
+`crates/manta-cli/src/main.rs`'s `Command::Listen`/`Command::Soak`: add, gated
 `#[cfg(feature = "soapy")]` on the fields themselves (so `--help` on a
 non-`soapy` build doesn't show flags that can't work):
 
@@ -165,12 +165,12 @@ so this is enforced at runtime in `open_source()` via
 --soapy-driver"))?` (and the `--soapy-rate` equivalent) — a clean `Err` with
 an informative message, not a panic or a silent default. Dispatch: box
 whichever source was selected as `Box<dyn IqSource>` before calling the
-(now-generalized) `skimmer_engine::listen`/`soak`.
+(now-generalized) `manta_engine::listen`/`soak`.
 
-`skimmer-cli/Cargo.toml` gets its own `soapy` feature forwarding:
+`manta-cli/Cargo.toml` gets its own `soapy` feature forwarding:
 ```toml
 [features]
-soapy = ["skimmer-input/soapy"]
+soapy = ["manta-input/soapy"]
 ```
 
 ## Testing
@@ -201,7 +201,7 @@ path that was previously believed untestable:
   separate conformance test suite today — matches `AudioIqSource`/
   `WavIqSource`'s existing pattern of just implementing + directly testing the
   concrete type).
-- `cargo build`/`cargo test -p skimmer-input -p skimmer-cli --features soapy`
+- `cargo build`/`cargo test -p manta-input -p manta-cli --features soapy`
   must succeed locally (confirmed achievable — native lib now installed) and
   in the new CI job.
 
@@ -211,9 +211,9 @@ New job (`test-soapy`) in `.github/workflows/ci.yml`, matrix
 `[ubuntu-latest, macos-latest]`, separate from the existing `test` job:
 - Linux: `sudo apt-get install -y libasound2-dev libsoapysdr-dev`
 - macOS: `brew install soapysdr`
-- `cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy
+- `cargo clippy -p manta-input -p manta-cli --all-targets --features soapy
   -- -D warnings`
-- `cargo test -p skimmer-input -p skimmer-cli --features soapy`
+- `cargo test -p manta-input -p manta-cli --features soapy`
 
 No separate `cargo build` step: both `clippy` and `test` build the crates
 implicitly first, so a standalone build step would be redundant.

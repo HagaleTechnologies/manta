@@ -2,19 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A real N-channel WOLA polyphase filterbank (SPEC-decode-core.md §1) replaces the M0/M1 single-channel shim (`SingleChannelExtractor`/`estimate_peak_hz`) in `skimmer-engine`'s batch and streaming paths, with V1–V6 passing unchanged and new multi-signal tests proving the channelizer actually separates simultaneous signals for the first time in this codebase.
+**Goal:** A real N-channel WOLA polyphase filterbank (SPEC-decode-core.md §1) replaces the M0/M1 single-channel shim (`SingleChannelExtractor`/`estimate_peak_hz`) in `manta-engine`'s batch and streaming paths, with V1–V6 passing unchanged and new multi-signal tests proving the channelizer actually separates simultaneous signals for the first time in this codebase.
 
-**Architecture:** New `skimmer-dsp::channelizer` module implements the WOLA fold + circular phase-correction + FFT + power pipeline over all N channels every hop, reusing `proto::design_prototype` (already channel-count-generic) and `coppa_dsp::fft::FftProcessor` unchanged. A minimal placeholder detector (one-time calibration-window argmax over real per-channel power) picks a single channel `k0`; `TrackDecoder` is untouched — it just receives channel `k0`'s magnitude stream instead of the old extractor's output. `skimmer-dsp::single`/`freqest` are deprecated in place (doc comments only), not deleted.
+**Architecture:** New `manta-dsp::channelizer` module implements the WOLA fold + circular phase-correction + FFT + power pipeline over all N channels every hop, reusing `proto::design_prototype` (already channel-count-generic) and `coppa_dsp::fft::FftProcessor` unchanged. A minimal placeholder detector (one-time calibration-window argmax over real per-channel power) picks a single channel `k0`; `TrackDecoder` is untouched — it just receives channel `k0`'s magnitude stream instead of the old extractor's output. `manta-dsp::single`/`freqest` are deprecated in place (doc comments only), not deleted.
 
-**Tech Stack:** Rust (edition 2021, rust-version 1.85.0), reuses `coppa-dsp::fft::FftProcessor` and `skimmer-dsp::proto` unchanged, no new dependencies.
+**Tech Stack:** Rust (edition 2021, rust-version 1.85.0), reuses `coppa-dsp::fft::FftProcessor` and `manta-dsp::proto` unchanged, no new dependencies.
 
 **Design doc:** `docs/superpowers/specs/2026-07-18-m2-pfb-channelizer-design.md` — read it first; this plan implements it section by section.
 
 ## Global Constraints
 
 - **Determinism (SPEC §6):** NO RNG, NO wall clock in the channelizer or placeholder detector. Long accumulations run **sequentially in `f64`** — this applies to the WOLA fold sum (8 terms per bin, accumulated via `f64` intermediates before the FFT) exactly as it already applies to `single.rs`'s direct FIR sum and `proto.rs`'s prototype design.
-- **Dimensions (SPEC §1.1):** `N = fs / 93.75` must be a power of two for all supported table rates (1024@96k, 2048@192k, 4096@384k, 8192@768k). `hop = N/4`. Output rate `fo = 375 Hz` is invariant across input rates — nothing downstream (including `skimmer-decode`) depends on `fs`.
-- **Prototype filter (SPEC §1.2):** reuse `skimmer_dsp::proto::design_prototype(n_channels, taps_per_branch)` unchanged — it was already written generically at M0. Do not duplicate or modify the Kaiser/windowed-sinc design.
+- **Dimensions (SPEC §1.1):** `N = fs / 93.75` must be a power of two for all supported table rates (1024@96k, 2048@192k, 4096@384k, 8192@768k). `hop = N/4`. Output rate `fo = 375 Hz` is invariant across input rates — nothing downstream (including `manta-decode`) depends on `fs`.
+- **Prototype filter (SPEC §1.2):** reuse `manta_dsp::proto::design_prototype(n_channels, taps_per_branch)` unchanged — it was already written generically at M0. Do not duplicate or modify the Kaiser/windowed-sinc design.
 - **Power-to-dB epsilon (SPEC §1.3/§1.4):** `PdB = 10·log10(P + ε)`, **ε = 1e-20** exactly (not `freqest.rs`'s `1e-30` — that was the M0 shim's own choice; the new channelizer follows SPEC's stated value).
 - **coppa reuse boundary:** `coppa_dsp::fft::FftProcessor` is reused exactly as-is (`new(size)`, `forward(&[Complex32]) -> Vec<Complex32>`, unnormalized, panics if `input.len() != size`). No new FFT code.
 - **CI:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all clean — run the **full workspace** command for clippy, not a per-crate scope (M1's plan hit this exact mistake twice; a per-crate clean run does not guarantee the real CI gate passes).
@@ -23,11 +23,11 @@
 
 ---
 
-### Task 1: Channelizer core (`skimmer-dsp::channelizer`)
+### Task 1: Channelizer core (`manta-dsp::channelizer`)
 
 **Files:**
-- Create: `crates/skimmer-dsp/src/channelizer.rs`
-- Modify: `crates/skimmer-dsp/src/lib.rs`
+- Create: `crates/manta-dsp/src/channelizer.rs`
+- Modify: `crates/manta-dsp/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `crate::proto::{design_prototype, TAPS_PER_BRANCH}` (existing, unchanged), `coppa_dsp::fft::FftProcessor` (existing, unchanged).
@@ -35,7 +35,7 @@
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/skimmer-dsp/src/channelizer.rs`:
+Create `crates/manta-dsp/src/channelizer.rs`:
 
 ```rust
 //! WOLA polyphase filterbank channelizer (SPEC §1.1-1.3): the full
@@ -124,7 +124,7 @@ impl Channelizer {
 
     /// Prototype filter length in taps (L*N). Same causal-filter blind-zone
     /// property as `single.rs`'s extractor -- see the M0 lead-in-padding
-    /// fix in `skimmer-engine`, which Task 6/7 apply here too.
+    /// fix in `manta-engine`, which Task 6/7 apply here too.
     pub fn filter_len(&self) -> usize {
         self.taps.len()
     }
@@ -329,7 +329,7 @@ mod tests {
 
 - [ ] **Step 2: Register the module**
 
-In `crates/skimmer-dsp/src/lib.rs`, add `channelizer` to the module list (alongside the existing `freqest`, `hilbert`, `proto`, `single`):
+In `crates/manta-dsp/src/lib.rs`, add `channelizer` to the module list (alongside the existing `freqest`, `hilbert`, `proto`, `single`):
 
 ```rust
 pub mod channelizer;
@@ -339,18 +339,18 @@ Update the crate-level doc comment at the top of `lib.rs` to mention the channel
 
 - [ ] **Step 3: Run tests to verify they fail, then build**
 
-Run: `cargo test -p skimmer-dsp channelizer:: 2>&1 | tail -30`
+Run: `cargo test -p manta-dsp channelizer:: 2>&1 | tail -30`
 Expected: FAIL to compile until Step 1's file exists (it does, since Step 1 wrote the full implementation inline with its tests — same pattern M1's Task 3 used for the Hilbert transformer). Build and get to Step 4.
 
 - [ ] **Step 4: Run tests, verify all pass**
 
-Run: `cargo test -p skimmer-dsp channelizer:: -- --nocapture`
+Run: `cargo test -p manta-dsp channelizer:: -- --nocapture`
 Expected: PASS on all 9 tests. If `channel_freq_hz_matches_spec_f_of_k` or `channel_for_offset` disagree on sign conventions, re-check against `freqest.rs`'s existing, already-correct `estimate_peak_hz` (lines 71-78) — it implements the same SPEC §1.1 formula and its sign convention (`>=` not `>` at the Nyquist wrap) is the proven reference.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-dsp/src/channelizer.rs crates/skimmer-dsp/src/lib.rs
+git add crates/manta-dsp/src/channelizer.rs crates/manta-dsp/src/lib.rs
 git commit -m "feat(dsp): WOLA polyphase filterbank channelizer (SPEC §1.1-1.3)"
 ```
 
@@ -359,7 +359,7 @@ git commit -m "feat(dsp): WOLA polyphase filterbank channelizer (SPEC §1.1-1.3)
 ### Task 2: Fine-frequency interpolator (SPEC §1.4)
 
 **Files:**
-- Modify: `crates/skimmer-dsp/src/channelizer.rs`
+- Modify: `crates/manta-dsp/src/channelizer.rs`
 
 **Interfaces:**
 - Consumes: `power_db` (Task 1, same file).
@@ -402,7 +402,7 @@ Add to `channelizer.rs`'s `#[cfg(test)] mod tests`:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-dsp channelizer::tests::interpolate 2>&1 | tail -20`
+Run: `cargo test -p manta-dsp channelizer::tests::interpolate 2>&1 | tail -20`
 Expected: FAIL to compile (`interpolate_offset` doesn't exist yet).
 
 - [ ] **Step 3: Implement `interpolate_offset`**
@@ -429,13 +429,13 @@ pub fn interpolate_offset(p_minus: f32, p_zero: f32, p_plus: f32) -> Option<f64>
 
 - [ ] **Step 4: Run tests, verify all pass**
 
-Run: `cargo test -p skimmer-dsp channelizer:: -- --nocapture`
+Run: `cargo test -p manta-dsp channelizer:: -- --nocapture`
 Expected: PASS on all 13 tests (9 from Task 1 + 4 new).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/skimmer-dsp/src/channelizer.rs
+git add crates/manta-dsp/src/channelizer.rs
 git commit -m "feat(dsp): fine-frequency quadratic interpolation (SPEC §1.4)"
 ```
 
@@ -444,15 +444,15 @@ git commit -m "feat(dsp): fine-frequency quadratic interpolation (SPEC §1.4)"
 ### Task 3: Multi-signal wideband tests + second sample rate
 
 **Files:**
-- Create: `crates/skimmer-testkit/tests/channelizer_multisignal.rs`
+- Create: `crates/manta-testkit/tests/channelizer_multisignal.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::channelizer::Channelizer` (Task 1), `skimmer_testkit::scene::{render_scene, SignalSpec}` (existing).
+- Consumes: `manta_dsp::channelizer::Channelizer` (Task 1), `manta_testkit::scene::{render_scene, SignalSpec}` (existing).
 - Produces: nothing new — this test proves the design doc's core claim (§4: "the first real proof the PFB actually separates simultaneous signals"), entirely via existing public APIs.
 
 - [ ] **Step 1: Write the tests**
 
-Create `crates/skimmer-testkit/tests/channelizer_multisignal.rs`:
+Create `crates/manta-testkit/tests/channelizer_multisignal.rs`:
 
 ```rust
 //! Proves the M2 channelizer design's core claim (design doc §4): the WOLA
@@ -461,8 +461,8 @@ Create `crates/skimmer-testkit/tests/channelizer_multisignal.rs`:
 //! single-signal scenes.
 
 use num_complex::Complex32;
-use skimmer_dsp::channelizer::Channelizer;
-use skimmer_testkit::scene::{render_scene, SignalSpec};
+use manta_dsp::channelizer::Channelizer;
+use manta_testkit::scene::{render_scene, SignalSpec};
 
 fn channel_for_offset(offset_hz: f64, n: usize, fs: f64) -> usize {
     let delta = fs / n as f64;
@@ -552,7 +552,7 @@ fn resolves_signals_with_different_snrs() {
 
 - [ ] **Step 2: Run tests, verify all pass**
 
-Run: `cargo test -p skimmer-testkit --test channelizer_multisignal -- --nocapture`
+Run: `cargo test -p manta-testkit --test channelizer_multisignal -- --nocapture`
 Expected: PASS on all 3 tests. If a channel fails to clearly separate, check: (a) the offsets are far enough apart (several channel-spacings, not adjacent bins — adjacent-bin behavior is already covered by Task 1's edge test, not this one's job); (b) `assert_channels_resolved`'s `median * 10.0` margin isn't too tight for the chosen SNRs — prefer widening the offset separation or SNR over loosening this margin, since the point is proving clean separation, not a borderline pass.
 
 - [ ] **Step 3: Run clippy**
@@ -563,17 +563,17 @@ Expected: clean.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-testkit/tests/channelizer_multisignal.rs
+git add crates/manta-testkit/tests/channelizer_multisignal.rs
 git commit -m "test(testkit): prove channelizer separates simultaneous signals (2 sample rates)"
 ```
 
 ---
 
-### Task 4: Deprecate `skimmer-dsp::single`/`freqest`
+### Task 4: Deprecate `manta-dsp::single`/`freqest`
 
 **Files:**
-- Modify: `crates/skimmer-dsp/src/single.rs`
-- Modify: `crates/skimmer-dsp/src/freqest.rs`
+- Modify: `crates/manta-dsp/src/single.rs`
+- Modify: `crates/manta-dsp/src/freqest.rs`
 
 **Interfaces:** none changed — doc comments only, no behavior change, no test change.
 
@@ -590,10 +590,10 @@ Replace the file's top doc comment:
 with:
 
 ```rust
-//! **Deprecated** as of M2 sub-project 1 (`skimmer-dsp::channelizer`
+//! **Deprecated** as of M2 sub-project 1 (`manta-dsp::channelizer`
 //! implements the real WOLA polyphase filterbank, SPEC §1.3). Kept
 //! compiled and tested for now as a reference/fallback -- not wired into
-//! `skimmer-engine` anymore as of that sub-project. Candidate for removal
+//! `manta-engine` anymore as of that sub-project. Candidate for removal
 //! once the channelizer path has run cleanly for a few months; see
 //! `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`.
 //!
@@ -614,10 +614,10 @@ Replace:
 with:
 
 ```rust
-//! **Deprecated** as of M2 sub-project 1 -- `skimmer-dsp::channelizer`'s
+//! **Deprecated** as of M2 sub-project 1 -- `manta-dsp::channelizer`'s
 //! real per-channel power output plus its `interpolate_offset` (SPEC §1.4)
 //! replace this periodogram-based estimator. Kept compiled and tested for
-//! now as a reference/fallback; not wired into `skimmer-engine` anymore as
+//! now as a reference/fallback; not wired into `manta-engine` anymore as
 //! of that sub-project. Candidate for removal once the channelizer path has
 //! run cleanly for a few months; see
 //! `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`.
@@ -628,31 +628,31 @@ with:
 
 - [ ] **Step 3: Run tests, verify unchanged**
 
-Run: `cargo test -p skimmer-dsp single:: freqest:: -- --nocapture`
+Run: `cargo test -p manta-dsp single:: freqest:: -- --nocapture`
 Expected: PASS, identical to before (doc-comment-only change).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-dsp/src/single.rs crates/skimmer-dsp/src/freqest.rs
+git add crates/manta-dsp/src/single.rs crates/manta-dsp/src/freqest.rs
 git commit -m "docs(dsp): mark single.rs/freqest.rs deprecated, superseded by channelizer.rs"
 ```
 
 ---
 
-### Task 5: Placeholder detector (`skimmer-engine`)
+### Task 5: Placeholder detector (`manta-engine`)
 
 **Files:**
-- Create: `crates/skimmer-engine/src/detect.rs`
-- Modify: `crates/skimmer-engine/src/lib.rs`
+- Create: `crates/manta-engine/src/detect.rs`
+- Modify: `crates/manta-engine/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::channelizer::Channelizer` (Task 1).
+- Consumes: `manta_dsp::channelizer::Channelizer` (Task 1).
 - Produces: `pub(crate) fn calibrate_channel(ch: &mut Channelizer, calib_iq: &[num_complex::Complex32]) -> Option<usize>` — deliberately crate-private (design doc §2: "not SPEC §2's real detector... a later sub-project's job"), so it doesn't read as permanent public API.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/skimmer-engine/src/detect.rs`:
+Create `crates/manta-engine/src/detect.rs`:
 
 ```rust
 //! Placeholder detector (design doc §2): a deliberately minimal stand-in
@@ -662,7 +662,7 @@ Create `crates/skimmer-engine/src/detect.rs`:
 //! single-track decode path working through the new channelizer.
 
 use num_complex::Complex32;
-use skimmer_dsp::channelizer::Channelizer;
+use manta_dsp::channelizer::Channelizer;
 
 /// Run `ch` over `calib_iq`, return the channel index with the highest
 /// average power across the resulting hops, or `None` if no hops were
@@ -722,7 +722,7 @@ mod tests {
 
 - [ ] **Step 2: Register the module**
 
-In `crates/skimmer-engine/src/lib.rs`, add near the top:
+In `crates/manta-engine/src/lib.rs`, add near the top:
 
 ```rust
 mod detect;
@@ -732,13 +732,13 @@ mod detect;
 
 - [ ] **Step 3: Run tests, verify pass**
 
-Run: `cargo test -p skimmer-engine detect:: -- --nocapture`
+Run: `cargo test -p manta-engine detect:: -- --nocapture`
 Expected: PASS on both tests.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/detect.rs crates/skimmer-engine/src/lib.rs
+git add crates/manta-engine/src/detect.rs crates/manta-engine/src/lib.rs
 git commit -m "feat(engine): placeholder single-channel detector over the new channelizer"
 ```
 
@@ -747,15 +747,15 @@ git commit -m "feat(engine): placeholder single-channel detector over the new ch
 ### Task 6: Wire the batch path (`decode_samples`/`decode_wav`)
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/lib.rs`
+- Modify: `crates/manta-engine/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::channelizer::Channelizer` (Task 1), `crate::detect::calibrate_channel` (Task 5).
+- Consumes: `manta_dsp::channelizer::Channelizer` (Task 1), `crate::detect::calibrate_channel` (Task 5).
 - Produces: `decode_samples`/`decode_wav`'s public signatures are unchanged; only their internals swap extractor.
 
 - [ ] **Step 1: Read the current `decode_samples` in full**
 
-Read `crates/skimmer-engine/src/lib.rs`'s current `decode_samples` (the M0 batch pipeline: `estimate_peak_hz` → `SingleChannelExtractor` → lead-in padding → `TrackDecoder`) before editing, to confirm this plan's replacement code lines up exactly with what's there now.
+Read `crates/manta-engine/src/lib.rs`'s current `decode_samples` (the M0 batch pipeline: `estimate_peak_hz` → `SingleChannelExtractor` → lead-in padding → `TrackDecoder`) before editing, to confirm this plan's replacement code lines up exactly with what's there now.
 
 - [ ] **Step 2: Replace the extractor construction and processing**
 
@@ -772,16 +772,16 @@ pub fn decode_samples(
         bail!("input is digital silence");
     }
 
-    let mut ch = skimmer_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))
         .context("channelizer")?;
     let hop = ch.hop() as u64;
 
     debug_assert!(
-        (fs / hop as f64 - skimmer_decode::FO_HZ).abs() < 0.01,
-        "channelizer hop rate {} Hz diverges from skimmer_decode::FO_HZ {}",
+        (fs / hop as f64 - manta_decode::FO_HZ).abs() < 0.01,
+        "channelizer hop rate {} Hz diverges from manta_decode::FO_HZ {}",
         fs / hop as f64,
-        skimmer_decode::FO_HZ
+        manta_decode::FO_HZ
     );
 
     // Calibration pass (design doc §2): find the loudest channel over a
@@ -801,7 +801,7 @@ pub fn decode_samples(
     // decoder -- calibrate_channel already consumed `iq` once above just to
     // pick k0; that channelizer instance is discarded, not reused, so this
     // second pass starts from a clean internal buffer.
-    let mut ch = skimmer_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))?;
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
@@ -835,11 +835,11 @@ pub fn decode_samples(
 }
 ```
 
-Remove the now-unused `use skimmer_dsp::freqest::estimate_peak_hz;` and `use skimmer_dsp::single::SingleChannelExtractor;` imports from this file's top (they were the M0 shim's imports; `skimmer_dsp::channelizer` and `crate::detect` replace them).
+Remove the now-unused `use manta_dsp::freqest::estimate_peak_hz;` and `use manta_dsp::single::SingleChannelExtractor;` imports from this file's top (they were the M0 shim's imports; `manta_dsp::channelizer` and `crate::detect` replace them).
 
 - [ ] **Step 3: Run the golden regression suite**
 
-Run: `cargo test -p skimmer-cli 2>&1 | tail -100`
+Run: `cargo test -p manta-cli 2>&1 | tail -100`
 Expected: V1, V2, V3, V4, V6 pass; V5 shows `ignored` (unchanged from M1 — this task doesn't touch decode accuracy under fading, only the channel-selection mechanism). If any of V1-V4/V6 regress, this is real signal about the swap's correctness — likely candidates: `k0`'s power at index `hop_out.power[k0]` using the wrong channel after the second (padded) channelizer's own internal calibration state differs from the first pass's (it shouldn't, since both instances process the same underlying real signal, just one is padded) -- double check `ch.channel_freq_hz(k0) - center_freq_hz` computes the same `offset_hz` the old `estimate_peak_hz` would have for these fixtures (SPEC §1.1's channel granularity is 93.75 Hz, coarser than the old periodogram's continuous estimate -- V1-V6's fixture offsets were not necessarily chosen to land on exact channel centers, so `TrackDecoder`'s reported `freq_hz` may shift slightly; this affects `report.freq_hz` in golden tests, not `report.text`, so text-based CER assertions should be unaffected, but check `golden_v1.rs`'s explicit `freq error <= 10 Hz` assertion carefully -- SPEC's channel spacing (93.75 Hz) means a channel-quantized offset alone could exceed 10 Hz error; this is *expected* to need SPEC §1.4's fine-frequency interpolation to recover accuracy, which is not yet wired in this task (Task 1/2 built `interpolate_offset` as a pure function, but no caller in this task feeds it real hop data yet) -- if `golden_v1.rs`'s freq-error assertion fails for exactly this reason, that is a real, expected gap this task's escalation criteria should catch, not something to route around.
 
 - [ ] **Step 4: If the freq-error assertion fails, wire in the fine-frequency interpolator**
@@ -854,7 +854,7 @@ Expected: clean.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/lib.rs
+git add crates/manta-engine/src/lib.rs
 git commit -m "feat(engine): wire the channelizer + placeholder detector into decode_samples/decode_wav"
 ```
 
@@ -863,16 +863,16 @@ git commit -m "feat(engine): wire the channelizer + placeholder detector into de
 ### Task 7: Wire the streaming path (`listen`) + new chunking-determinism test
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/listen.rs`
-- Create: `crates/skimmer-engine/tests/channelizer_chunking_determinism.rs`
+- Modify: `crates/manta-engine/src/listen.rs`
+- Create: `crates/manta-engine/tests/channelizer_chunking_determinism.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::channelizer::Channelizer` (Task 1), `crate::detect::calibrate_channel` (Task 5).
+- Consumes: `manta_dsp::channelizer::Channelizer` (Task 1), `crate::detect::calibrate_channel` (Task 5).
 - Produces: `listen`'s public signature is unchanged.
 
 - [ ] **Step 1: Read the current `listen` in full**
 
-Read `crates/skimmer-engine/src/listen.rs`'s current implementation (calibration window → `estimate_peak_hz` → `SingleChannelExtractor` → lead-in padding → main read loop → `decoder.finish()`) before editing.
+Read `crates/manta-engine/src/listen.rs`'s current implementation (calibration window → `estimate_peak_hz` → `SingleChannelExtractor` → lead-in padding → main read loop → `decoder.finish()`) before editing.
 
 - [ ] **Step 2: Replace the extractor construction and per-chunk processing**
 
@@ -898,11 +898,11 @@ pub fn listen(
         filled += n;
     }
 
-    let mut calib_ch = skimmer_dsp::channelizer::Channelizer::new(fs, 0.0)
+    let mut calib_ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0)
         .map_err(|e| anyhow::anyhow!(e))?;
     let k0 = crate::detect::calibrate_channel(&mut calib_ch, &calib)
         .context("no signal found during startup calibration")?;
-    let mut ch = skimmer_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0).map_err(|e| anyhow::anyhow!(e))?;
     let offset_hz = ch.channel_freq_hz(k0);
     let hop = ch.hop() as u64;
     let mut decoder = TrackDecoder::new(1, cfg.decode.clone());
@@ -951,33 +951,33 @@ pub fn listen(
 }
 ```
 
-Remove the now-unused `use skimmer_dsp::freqest::estimate_peak_hz;` and `use skimmer_dsp::single::SingleChannelExtractor;` imports from this file's top.
+Remove the now-unused `use manta_dsp::freqest::estimate_peak_hz;` and `use manta_dsp::single::SingleChannelExtractor;` imports from this file's top.
 
 Note: `calib_ch` (used only for calibration) and `ch` (used for the real padded run) are two separate `Channelizer` instances, exactly mirroring Task 6's batch-path pattern (a fresh instance for the real, padded processing run, since the calibration instance's internal buffer already consumed `calib` unpadded).
 
 - [ ] **Step 3: Run the M1 regression tests**
 
-Run: `cargo test -p skimmer-engine --test listen_audio -- --nocapture`
+Run: `cargo test -p manta-engine --test listen_audio -- --nocapture`
 Expected: PASS (`listen_decodes_a_clean_real_audio_signal` still finds "W1AW" in the decoded text).
 
-Run: `cargo test -p skimmer-engine soak:: -- --nocapture` and `cargo test -p skimmer-cli --test soak_ci -- --nocapture`
+Run: `cargo test -p manta-engine soak:: -- --nocapture` and `cargo test -p manta-cli --test soak_ci -- --nocapture`
 Expected: PASS (both exercise `listen()` under sustained operation; confirm no panic/hang from the channelizer swap).
 
 - [ ] **Step 4: Add a channelizer-specific chunking-determinism test**
 
-M1's Task 6 (`crates/skimmer-engine/tests/chunking_determinism.rs`) proves the OLD `SingleChannelExtractor`/`TrackDecoder` pairing gives identical output whether fed in one call or many small chunks -- leave that test as-is (it still validates the deprecated path, which is still compiled and tested per Task 4). Add the same proof for the NEW channelizer + placeholder-detector pairing:
+M1's Task 6 (`crates/manta-engine/tests/chunking_determinism.rs`) proves the OLD `SingleChannelExtractor`/`TrackDecoder` pairing gives identical output whether fed in one call or many small chunks -- leave that test as-is (it still validates the deprecated path, which is still compiled and tested per Task 4). Add the same proof for the NEW channelizer + placeholder-detector pairing:
 
-Create `crates/skimmer-engine/tests/channelizer_chunking_determinism.rs`:
+Create `crates/manta-engine/tests/channelizer_chunking_determinism.rs`:
 
 ```rust
 //! Proves the channelizer + placeholder-detector pairing (Tasks 1-6) is
 //! chunk-size-invariant, the same property M1's chunking_determinism.rs
 //! proved for the deprecated SingleChannelExtractor path.
 
-use skimmer_decode::decoder::{DecodeConfig, TrackDecoder};
-use skimmer_decode::events::DecoderEvent;
-use skimmer_dsp::channelizer::Channelizer;
-use skimmer_testkit::vectors::{render, v1};
+use manta_decode::decoder::{DecodeConfig, TrackDecoder};
+use manta_decode::events::DecoderEvent;
+use manta_dsp::channelizer::Channelizer;
+use manta_testkit::vectors::{render, v1};
 
 fn decode_all_at_once(iq: &[num_complex::Complex32], fs: f64, k0: usize) -> Vec<DecoderEvent> {
     let mut ch = Channelizer::new(fs, 0.0).unwrap();
@@ -1043,19 +1043,19 @@ fn chunked_channelizer_feeding_matches_whole_buffer_feeding() {
 
 - [ ] **Step 5: Run the new test**
 
-Run: `cargo test -p skimmer-engine --test channelizer_chunking_determinism -- --nocapture`
+Run: `cargo test -p manta-engine --test channelizer_chunking_determinism -- --nocapture`
 Expected: PASS. If it fails, this is a real bug in `Channelizer::process`'s incremental-call handling (its `buf`/`read`/`m` state should behave identically to `SingleChannelExtractor`'s equivalent fields across multiple calls) -- do not weaken the assertion; investigate the buffer/compaction logic in Task 1's `process` method.
 
 - [ ] **Step 6: Run clippy and full engine suite**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -40`
-Run: `cargo test -p skimmer-engine 2>&1 | tail -60` (confirm no regressions across `listen_audio.rs`, both `chunking_determinism.rs` files, `pipeline.rs`, `roundtrip_iq.rs`, `soak::`)
+Run: `cargo test -p manta-engine 2>&1 | tail -60` (confirm no regressions across `listen_audio.rs`, both `chunking_determinism.rs` files, `pipeline.rs`, `roundtrip_iq.rs`, `soak::`)
 Expected: both clean.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/listen.rs crates/skimmer-engine/tests/channelizer_chunking_determinism.rs
+git add crates/manta-engine/src/listen.rs crates/manta-engine/tests/channelizer_chunking_determinism.rs
 git commit -m "feat(engine): wire the channelizer + placeholder detector into listen; prove chunk-size invariance"
 ```
 
@@ -1071,9 +1071,9 @@ git commit -m "feat(engine): wire the channelizer + placeholder detector into li
 
 - [ ] **Step 1: Update ARCHITECTURE.md §4**
 
-§4 ("Channelizer") currently describes the PFB as a design decision not yet built. Add a one-line status note at the top of §4 (matching the style already used elsewhere in this doc for implemented-vs-planned sections): "**Implemented** as of M2 sub-project 1 (`skimmer-dsp::channelizer`) -- the design below is now built, not just decided." Do not otherwise rewrite §4's content; it already accurately describes what was built (this plan implements the design doc's §2, which is itself a direct application of ARCHITECTURE §4 / SPEC §1).
+§4 ("Channelizer") currently describes the PFB as a design decision not yet built. Add a one-line status note at the top of §4 (matching the style already used elsewhere in this doc for implemented-vs-planned sections): "**Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the design below is now built, not just decided." Do not otherwise rewrite §4's content; it already accurately describes what was built (this plan implements the design doc's §2, which is itself a direct application of ARCHITECTURE §4 / SPEC §1).
 
-Update the dependency graph / "Reused from coppa vs. new" table if needed -- check whether `skimmer-dsp::channelizer` introduces any new edge (it doesn't: it depends only on `crate::proto` and `coppa_dsp::fft`, both already-drawn edges).
+Update the dependency graph / "Reused from coppa vs. new" table if needed -- check whether `manta-dsp::channelizer` introduces any new edge (it doesn't: it depends only on `crate::proto` and `coppa_dsp::fft`, both already-drawn edges).
 
 - [ ] **Step 2: Update ROADMAP.md**
 
@@ -1081,7 +1081,7 @@ Under M2's bullet list, note that the PFB channelizer sub-project is complete (l
 
 - [ ] **Step 3: Update CLAUDE.md's Status line**
 
-Reflect that M2's first sub-project (PFB channelizer) is complete, `skimmer-dsp::single`/`freqest` are deprecated-in-place, and the remaining M2 sub-projects (detector/track manager, decoder pool, SoapySDR/KiwiSDR input) are next. Keep it to the existing one-line style.
+Reflect that M2's first sub-project (PFB channelizer) is complete, `manta-dsp::single`/`freqest` are deprecated-in-place, and the remaining M2 sub-projects (detector/track manager, decoder pool, SoapySDR/KiwiSDR input) are next. Keep it to the existing one-line style.
 
 - [ ] **Step 4: Write the pinned-decisions doc**
 
@@ -1089,7 +1089,7 @@ Create `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md`, following `docs/D
 
 1. **Power-to-dB epsilon**: the channelizer uses SPEC §1.3/§1.4's stated `ε = 1e-20`, not `freqest.rs`'s `1e-30` (the M0 shim's own undocumented choice) -- a deliberate, spec-driven divergence from the deprecated code, not an inconsistency to fix.
 2. **WOLA fold accumulation**: implemented in `f64` (via `Complex64` intermediates, cast to `Complex32` only after the fold sum completes), matching the project's existing "long accumulations run sequentially in f64" convention (same as `single.rs`'s direct-FIR sum and `proto.rs`'s prototype design) even though the fold's per-bin sum (`L=8` terms) is much shorter than `single.rs`'s full `LN`-term convolution.
-3. **`skimmer-dsp::single`/`freqest` deprecated in place, not deleted** -- per Tony's explicit decision, kept compiled/tested as reference/fallback; candidate for removal after the channelizer path has run cleanly for a few months (this is a real follow-up to schedule later, not an open question here).
+3. **`manta-dsp::single`/`freqest` deprecated in place, not deleted** -- per Tony's explicit decision, kept compiled/tested as reference/fallback; candidate for removal after the channelizer path has run cleanly for a few months (this is a real follow-up to schedule later, not an open question here).
 4. **Two `Channelizer` instances per calibration+decode run** (one consumed by `calibrate_channel`, a fresh one for the real padded processing pass) in both `decode_samples` and `listen` -- mirrors the existing M0/M1 pattern of a fresh extractor for the padded run; document this rather than trying to "rewind" a single instance's internal buffer state.
 5. Note whatever Task 6 Step 4's actual outcome was (fine-frequency interpolator wired in for `freq_hz` reporting, or not needed) -- record the real result, not the plan's contingency language.
 
@@ -1104,7 +1104,7 @@ Expected: clean on all three (V5 golden test correctly shows `ignored`, not fail
 git add ARCHITECTURE.md ROADMAP.md CLAUDE.md docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md
 git commit -m "docs: M2 sub-project 1 close-out - PFB channelizer implemented, pinned decisions"
 git push -u origin feat/m2-pfb-channelizer
-gh pr create --draft --title "M2 sub-project 1: PFB channelizer" --body "Implements docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md (design: docs/superpowers/specs/2026-07-18-m2-pfb-channelizer-design.md). V1-V4/V6 pass through the new channelizer + placeholder detector; V5 unaffected (still #[ignore]d per M1). skimmer-dsp::single/freqest deprecated in place, not deleted. Detector/track manager, decoder pool, and SoapySDR/KiwiSDR input remain as separate M2 sub-projects."
+gh pr create --draft --title "M2 sub-project 1: PFB channelizer" --body "Implements docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md (design: docs/superpowers/specs/2026-07-18-m2-pfb-channelizer-design.md). V1-V4/V6 pass through the new channelizer + placeholder detector; V5 unaffected (still #[ignore]d per M1). manta-dsp::single/freqest deprecated in place, not deleted. Detector/track manager, decoder pool, and SoapySDR/KiwiSDR input remain as separate M2 sub-projects."
 ```
 
 ---

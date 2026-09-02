@@ -6,7 +6,7 @@ Date: 2026-07-25
 ## Purpose
 
 The last of M2's remaining sub-projects (ROADMAP.md): ARCHITECTURE.md §3's
-KiwiSDR client (`skimmer-input::kiwi`), the network-based IQ source that
+KiwiSDR client (`manta-input::kiwi`), the network-based IQ source that
 "gives instant worldwide receiver access for development and lets
 low-budget nodes contribute spots." Same scope pattern as the SoapySDR
 sub-project (PR #30, not yet merged): crate-level `IqSource` + engine
@@ -87,11 +87,11 @@ available and should be used to validate byte-for-byte.
 
 ## Scope
 
-1. **`skimmer-input::kiwi::KiwiIqSource`** — the crate-level `IqSource` impl.
+1. **`manta-input::kiwi::KiwiIqSource`** — the crate-level `IqSource` impl.
    No feature gate (unlike `soapy`): this is pure WebSocket + TCP, no native
    library dependency, so it's always available in a default build. This
    does mean `tungstenite` becomes an unconditional dependency of
-   `skimmer-input` (small, no native/system library requirement, unlike
+   `manta-input` (small, no native/system library requirement, unlike
    SoapySDR) — not gated because there's nothing to gate against
    (ROADMAP.md's "no SoapySDR dependency in default features" constraint is
    specifically about SoapySDR's native C library, not about this).
@@ -99,8 +99,8 @@ available and should be used to validate byte-for-byte.
    rate (~12 kHz, but not exactly, and device-specific) rational-resampled
    to 96000 Hz (the nearest SPEC §1.1 table rate) before reaching the
    channelizer, per `docs/SPEC-decode-core.md`'s explicit "non-power-of-two
-   input rates... are rational-resampled in `skimmer-input`" requirement.
-3. **Engine generalization** — `skimmer_engine::listen`/`soak`: same
+   input rates... are rational-resampled in `manta-input`" requirement.
+3. **Engine generalization** — `manta_engine::listen`/`soak`: same
    `AudioIqSource` → `Box<dyn IqSource>` change as the (unmerged) SoapySDR
    PR #30, redone independently here per Tony's explicit choice (branch
    fresh from `origin/main`, accept the future small merge conflict when
@@ -114,7 +114,7 @@ available and should be used to validate byte-for-byte.
 
 ## `KiwiIqSource`
 
-`crates/skimmer-input/src/kiwi.rs`, unconditional module (`pub mod kiwi;` in
+`crates/manta-input/src/kiwi.rs`, unconditional module (`pub mod kiwi;` in
 `lib.rs`, no `#[cfg(feature = ...)]`).
 
 ```rust

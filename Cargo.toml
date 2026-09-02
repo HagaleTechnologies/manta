@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/skimmer-decode",
-    "crates/skimmer-dsp",
-    "crates/skimmer-input",
-    "crates/skimmer-testkit",
-    "crates/skimmer-engine",
-    "crates/skimmer-spot",
-    "crates/skimmer-cli",
+    "crates/manta-decode",
+    "crates/manta-dsp",
+    "crates/manta-input",
+    "crates/manta-testkit",
+    "crates/manta-engine",
+    "crates/manta-spot",
+    "crates/manta-cli",
 ]
 
 [workspace.package]
@@ -15,15 +15,15 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
-repository = "https://github.com/HagaleTechnologies/skimmer"
+repository = "https://github.com/HagaleTechnologies/manta"
 
 [workspace.dependencies]
-skimmer-decode = { path = "crates/skimmer-decode" }
-skimmer-dsp = { path = "crates/skimmer-dsp" }
-skimmer-input = { path = "crates/skimmer-input" }
-skimmer-testkit = { path = "crates/skimmer-testkit" }
-skimmer-engine = { path = "crates/skimmer-engine" }
-skimmer-spot = { path = "crates/skimmer-spot" }
+manta-decode = { path = "crates/manta-decode" }
+manta-dsp = { path = "crates/manta-dsp" }
+manta-input = { path = "crates/manta-input" }
+manta-testkit = { path = "crates/manta-testkit" }
+manta-engine = { path = "crates/manta-engine" }
+manta-spot = { path = "crates/manta-spot" }
 
 coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 coppa-audio = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }

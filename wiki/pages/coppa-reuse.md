@@ -1,6 +1,6 @@
 ---
 id: coppa-reuse
-title: What does skimmer reuse from coppa, and what is deliberately new code?
+title: What does manta reuse from coppa, and what is deliberately new code?
 kind: interface
 status: current
 maintainer: agent
@@ -16,12 +16,12 @@ links:
   - decode-chain
   - watterson-dependency
 ---
-skimmer consumes DSP building blocks from the sibling coppa repo rather than reimplementing them — but the reuse boundary is narrower than it first looks, and getting it wrong is a documented footgun. skimmer **reuses** `coppa-dsp::fft` (FFT), `coppa-channel` (AWGN/Watterson impairments for tests), and `coppa-audio` (cpal device input). It writes **new code** for the PFB channelizer, the Kaiser prototype designer, the order-statistic noise floor, envelope normalization, and the whole decode/validation/server stack. The authoritative reuse-vs-new table is ARCHITECTURE §2; the corrections are SPEC §10.
+manta consumes DSP building blocks from the sibling coppa repo rather than reimplementing them — but the reuse boundary is narrower than it first looks, and getting it wrong is a documented footgun. manta **reuses** `coppa-dsp::fft` (FFT), `coppa-channel` (AWGN/Watterson impairments for tests), and `coppa-audio` (cpal device input). It writes **new code** for the PFB channelizer, the Kaiser prototype designer, the order-statistic noise floor, envelope normalization, and the whole decode/validation/server stack. The authoritative reuse-vs-new table is ARCHITECTURE §2; the corrections are SPEC §10.
 
 ## Pointers
 
 - Reuse/new table: ARCHITECTURE §2 ("Reused from coppa vs. new").
-- Deviations that override that table: SPEC §10 — most importantly, **FIR design is NOT reused**. coppa-dsp ships only `RrcFilter`, so the PFB Kaiser prototype is new code (`skimmer-dsp::proto`), and coppa's block AGC (`AdaptiveAgc`) is dropped from the decode path in favor of a per-track fixed reference scale.
+- Deviations that override that table: SPEC §10 — most importantly, **FIR design is NOT reused**. coppa-dsp ships only `RrcFilter`, so the PFB Kaiser prototype is new code (`manta-dsp::proto`), and coppa's block AGC (`AdaptiveAgc`) is dropped from the decode path in favor of a per-track fixed reference scale.
 - Watterson reuse has its own caveats — see [[watterson-dependency]] and [[golden-vector-freeze]].
 - coppa is consumed as a path/git dependency during co-development (a workspace-of-workspaces); switch to versioned deps if coppa publishes to crates.io first (ARCHITECTURE §2).
 
