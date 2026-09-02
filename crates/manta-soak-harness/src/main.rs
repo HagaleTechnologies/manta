@@ -257,6 +257,12 @@ fn main() -> Result<()> {
     // is `FnMut(&SoakMetricsSample)`, not fallible) and checked once the
     // run completes.
     let io_error: RefCell<Option<std::io::Error>> = RefCell::new(None);
+    // MAN-19 review round 2: catches the write-side failure the counter
+    // above can't -- `on_sample` never being called at all (e.g.
+    // `--sample-interval-secs` >= the requested duration). Without this,
+    // `metrics_visible` stayed hardcoded true even for an empty
+    // metrics.jsonl on an otherwise-healthy run.
+    let sample_count: RefCell<usize> = RefCell::new(0);
 
     let on_sample = |s: &SoakMetricsSample| {
         if io_error.borrow().is_some() {
@@ -294,6 +300,7 @@ fn main() -> Result<()> {
             *io_error.borrow_mut() = Some(e);
             return;
         }
+        *sample_count.borrow_mut() += 1;
         eprintln!(
             "t={:>8.0}s rss={:>7.1}MiB active_tracks={:>4} evicted={:>5} merged={:>5} events={} spots={}",
             s.elapsed_s,
@@ -325,26 +332,25 @@ fn main() -> Result<()> {
     // measurement.
     let no_input_overrun = true;
     let no_unbounded_growth = soak_metrics_passed(&report);
-    // Satisfied structurally: every metrics.jsonl line carries
-    // active_tracks + close_counts throughout the run.
-    let metrics_visible = true;
-    // MAN-19 review round 1: without this, a regression that keeps the
-    // detector from opening any usable track (or the decoder pool from
-    // producing any output) would still satisfy every criterion above --
-    // zero events, zero growth, no crash -- and report success despite
-    // never having exercised the per-track `Validator`/`RepetitionGate`
-    // state whose leak motivated this harness in the first place. Require
-    // concrete evidence of real pipeline activity: at least one promoted
-    // (ever-emitting) track opened AND closed, plus the raw event volume
-    // that implies.
+    // MAN-19 review round 2: `on_sample` never firing at all (e.g.
+    // `--sample-interval-secs` >= the requested duration) previously left
+    // this hardcoded true against an empty metrics.jsonl.
+    let metrics_visible = sample_count.into_inner() > 0;
+    // MAN-19 review round 2: round 1's version only required *some*
+    // events and *some* closes to exist, not that they came from the
+    // SAME track -- one stable long-lived track can supply
+    // `events_emitted`/`peak_active_tracks` while an unrelated flood of
+    // never-promoted CANDIDATEs (which never touch `Validator`/
+    // `RepetitionGate` at all -- see track.rs's `has_emitted` gate)
+    // supplies `final_close_counts`, satisfying the old check with the
+    // actual teardown path never exercised. `track_closed_events` is
+    // exactly "how many tracks were promoted, emitted real output, AND
+    // then closed" -- the only population that could have created
+    // Validator/RepetitionGate per-track_id state, so it's the only
+    // meaningful evidence the leak-motivated path ran at all.
     let workload_exercised = report.events_emitted > 0
         && report.peak_active_tracks > 0
-        && (report.final_close_counts.unconfirmed
-            + report.final_close_counts.hang_expired
-            + report.final_close_counts.silent
-            + report.final_close_counts.merged
-            + report.final_close_counts.evicted)
-            > 0;
+        && report.track_closed_events > 0;
     // MAN-19 review round 1: a smoke invocation (e.g. `--duration-hours
     // 0.001` for local iteration) must not report the same "PASSED" this
     // harness uses for a genuine acceptance run -- and a run whose
@@ -354,20 +360,32 @@ fn main() -> Result<()> {
     // jitter around the watchdog's 1s poll granularity.
     let requested_duration_reached =
         report.duration_actual.as_secs_f64() >= cli.duration_hours * 3600.0 * 0.99;
-    let is_full_24h_acceptance_run = cli.duration_hours >= MAN19_ACCEPT_HOURS;
+    let is_full_24h_run = cli.duration_hours >= MAN19_ACCEPT_HOURS;
     let overall_pass = no_crash
         && no_input_overrun
         && no_unbounded_growth
         && metrics_visible
         && workload_exercised
         && requested_duration_reached;
-    let man19_acceptance_gate_met = overall_pass && is_full_24h_acceptance_run;
+    // MAN-19 review round 2: this binary always replays a synthetic,
+    // looped, in-memory scene through `LoopingAudioIqSource` -- it can
+    // never be the live-SDR run ROADMAP.md's M2 gate literally specifies,
+    // and `no_input_overrun` is `true` only because a file/loop replay
+    // has no ring buffer to overrun *by construction*, not because
+    // overrun was actually observed against real hardware. Naming this
+    // "the MAN-19 acceptance gate" would overclaim what a healthy result
+    // here actually proves. Per MAN-20's decision, a synthetic run is the
+    // accepted INTERIM substitute while no real recording/hardware
+    // exists -- so this is reported as exactly that: a synthetic-soak
+    // result, never as literally satisfying the ROADMAP text.
+    let synthetic_soak_passed = overall_pass && is_full_24h_run;
 
     let summary = serde_json::json!({
         "duration_requested_hours": cli.duration_hours,
         "duration_actual_secs": report.duration_actual.as_secs_f64(),
         "events_emitted": report.events_emitted,
         "spots_emitted": report.spots_emitted,
+        "track_closed_events": report.track_closed_events,
         "rss_growth_bytes": report.rss_growth_bytes,
         "rss_growth_mib": rss_growth_mib,
         "panicked": report.panicked,
@@ -381,15 +399,16 @@ fn main() -> Result<()> {
         },
         "man19_criteria": {
             "no_crash": no_crash,
-            "no_input_overrun": no_input_overrun,
+            "no_input_overrun_by_construction": no_input_overrun,
             "no_unbounded_memory_growth": no_unbounded_growth,
             "track_count_and_evictions_visible_in_metrics": metrics_visible,
             "workload_exercised": workload_exercised,
             "requested_duration_reached": requested_duration_reached,
         },
         "overall_pass": overall_pass,
-        "is_full_24h_acceptance_run": is_full_24h_acceptance_run,
-        "man19_acceptance_gate_met": man19_acceptance_gate_met,
+        "is_full_24h_run": is_full_24h_run,
+        "synthetic_soak_passed": synthetic_soak_passed,
+        "note": "This is a synthetic, looped-scene proxy result (MAN-20's accepted interim substitute), not a literal live-SDR run of ROADMAP.md's M2 24h soak gate -- no_input_overrun holds only by construction (a file/loop replay has no ring buffer to overrun), not from real-hardware observation.",
     });
     std::fs::write(
         out_dir.join("report.json"),
@@ -399,11 +418,11 @@ fn main() -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&summary)?);
     eprintln!(
-        "MAN-19 soak {}: {}",
-        if man19_acceptance_gate_met {
-            "PASSED"
+        "MAN-19 synthetic soak {}: {}",
+        if synthetic_soak_passed {
+            "PASSED (synthetic proxy per MAN-20 -- not a live-SDR run)"
         } else if overall_pass {
-            "OK (healthy, but not a full 24h MAN-19 acceptance run -- see is_full_24h_acceptance_run)"
+            "OK (healthy, but not a full 24h run -- see is_full_24h_run)"
         } else {
             "FAILED"
         },

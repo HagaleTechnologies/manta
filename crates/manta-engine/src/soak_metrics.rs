@@ -14,6 +14,7 @@
 use crate::track::{CloseCounts, TrackManager};
 use crate::PipelineConfig;
 use anyhow::Result;
+use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
 use manta_spot::Validator;
 use num_complex::Complex32;
@@ -51,6 +52,16 @@ pub struct SoakMetricsReport {
     pub panicked: bool,
     pub peak_active_tracks: usize,
     pub final_close_counts: CloseCounts,
+    /// Count of `DecoderEvent::TrackClosed` actually emitted -- distinct
+    /// from `final_close_counts`'s total (which counts every close,
+    /// including never-promoted CANDIDATEs that closed Unconfirmed
+    /// without ever emitting anything real). This is specifically "how
+    /// many tracks were promoted, emitted output, AND then closed" -- the
+    /// only population that could have created `Validator`/
+    /// `RepetitionGate` per-track_id state, and so the only meaningful
+    /// evidence that the teardown path MAN-19 exists to soak-test was
+    /// actually exercised (round 2 review).
+    pub track_closed_events: usize,
 }
 
 fn peak_rss_bytes() -> u64 {
@@ -100,6 +111,7 @@ pub fn soak_with_metrics(
     let mut worst_growth = 0u64;
     let mut event_count = 0usize;
     let mut spot_count = 0usize;
+    let mut track_closed_count = 0usize;
     let mut peak_active_tracks = 0usize;
     let mut final_close_counts = CloseCounts::default();
     let mut last_sample = Instant::now();
@@ -167,10 +179,16 @@ pub fn soak_with_metrics(
         let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
         for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
             event_count += 1;
+            if matches!(ev, DecoderEvent::TrackClosed { .. }) {
+                track_closed_count += 1;
+            }
             spot_count += validator.ingest(&ev).len();
         }
         for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
             event_count += 1;
+            if matches!(ev, DecoderEvent::TrackClosed { .. }) {
+                track_closed_count += 1;
+            }
             spot_count += validator.ingest(&ev).len();
         }
 
@@ -187,6 +205,9 @@ pub fn soak_with_metrics(
                 m.saturating_sub(pad_hops) * hop
             }) {
                 event_count += 1;
+                if matches!(ev, DecoderEvent::TrackClosed { .. }) {
+                    track_closed_count += 1;
+                }
                 spot_count += validator.ingest(&ev).len();
             }
 
@@ -252,6 +273,7 @@ pub fn soak_with_metrics(
         panicked,
         peak_active_tracks,
         final_close_counts,
+        track_closed_events: track_closed_count,
     })
 }
 
