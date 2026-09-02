@@ -2,11 +2,11 @@
 //!
 //! Deliberately lightweight: matches the exact pattern families
 //! ARCHITECTURE §6.1 lists (`CQ <call>`, `CQ TEST <call>`, `DE <call>`,
-//! `<call> UP`, `V V V <call>`). Filler words between the keyword and the
-//! call (e.g. "CQ DX CQ DX DE ...", "CQ CONTEST ...") are a known gap, not
-//! handled by this first pass -- same "tracked, not blocking" treatment
-//! this project gives other classical-parsing limitations (see the known
-//! decode bugs tracked as GitHub issues).
+//! `<call> UP`, `V V V <call>`, `<call> T`). Filler words between the
+//! keyword and the call (e.g. "CQ DX CQ DX DE ...", "CQ CONTEST ...") are a
+//! known gap, not handled by this first pass -- same "tracked, not
+//! blocking" treatment this project gives other classical-parsing
+//! limitations (see the known decode bugs tracked as GitHub issues).
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -30,6 +30,20 @@ static CQ_CALL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bCQ(?:\s+TEST)?\s+([A-Z0-9/]{3,15})\b").unwrap());
 static UP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+UP\b").unwrap());
+/// NCDXF/IARU-style beacon ID: a callsign followed by four unmodulated
+/// power-step dashes (100W/10W/1W/100mW), no spoken "V V V" preamble
+/// (MAN-37). The decoder's on/off-keying detector can't resolve the
+/// individual power steps out of what is, to it, one unbroken carrier --
+/// there's no inter-element keying gap to split the four dashes on -- so
+/// this decodes as the callsign followed by a single trailing "T" (one
+/// dash), not "TTTT". Checked only as a last-resort fallback, after every
+/// other named-keyword pattern: a lone "T" is also the single most common
+/// garbled/noise decode in CW, so this pattern is a known, accepted
+/// source of false-positive `Beacon` tags (see MAN-37 decision notes) --
+/// bounded blast radius since `Beacon` only lifts the repetition-gate
+/// requirement (ARCHITECTURE §6 step 4), it doesn't bypass grammar/cty.
+static POWER_STEP_BEACON_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+T\b").unwrap());
 
 /// Scans `text` for the first CQ/DE/beacon context pattern, returning the
 /// callsign candidate (uppercased), its spot type, and the byte range in
@@ -71,6 +85,10 @@ pub fn parse(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
     if let Some(caps) = UP_RE.captures(text) {
         let m = caps.get(0).unwrap();
         return Some((caps[1].to_uppercase(), SpotType::De, m.range()));
+    }
+    if let Some(caps) = POWER_STEP_BEACON_RE.captures(text) {
+        let m = caps.get(0).unwrap();
+        return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
     }
     None
 }
@@ -148,5 +166,30 @@ mod tests {
         let (_, ty, range) = parse(text).unwrap();
         assert_eq!(ty, SpotType::Cq);
         assert_eq!(&text[range], "DE K5ARH CQ");
+    }
+
+    #[test]
+    fn call_followed_by_lone_t_is_beacon_type() {
+        // MAN-37: NCDXF/IARU beacons ID via a callsign followed by four
+        // unmodulated power-step dashes, not a spoken "V V V" preamble.
+        // The decoder can't resolve the individual power steps out of an
+        // unbroken carrier (no inter-element keying gap to split on), so
+        // the transmission decodes as the callsign followed by a single
+        // trailing "T" word (one dash) -- not "TTTT".
+        assert_eq!(
+            parse_type("K5ARH T"),
+            Some(("K5ARH".to_string(), SpotType::Beacon))
+        );
+    }
+
+    #[test]
+    fn cq_call_followed_by_lone_t_stays_cq_type() {
+        // The power-step fallback must not override an explicit CQ/DE/UP
+        // framing keyword just because a trailing "T" also happens to
+        // follow the callsign somewhere in the window.
+        assert_eq!(
+            parse_type("CQ K5ARH K5ARH T"),
+            Some(("K5ARH".to_string(), SpotType::Cq))
+        );
     }
 }
