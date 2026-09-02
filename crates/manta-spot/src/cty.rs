@@ -130,9 +130,13 @@ impl Table {
     }
 
     /// Looks up `call[..len]`, but an exact-call alias (`is_exact`) only
-    /// counts as a match when `len == call.len()` -- i.e. the callsign IS
-    /// that alias, not merely prefixed by it (`=K5AGC` must not make
-    /// `K5AGCA` resolve through it instead of the generic `K` prefix).
+    /// counts as a match when `len` reaches the callsign's BASE length --
+    /// i.e. the callsign IS that alias, or is that alias plus a valid
+    /// portable designator (`=4U1UN` must still resolve `4U1UN/P`, not
+    /// just bare `4U1UN`) -- not merely prefixed by it (`=K5AGC` must not
+    /// make `K5AGCA` resolve through it instead of the generic `K`
+    /// prefix). cty.dat carries no separate alias for portable variants,
+    /// so an exact alias has to mean "this call, portable suffix or not."
     fn prefix_entry(&self, call: &str, len: usize) -> Option<&Entry> {
         let slice = &call[..len];
         let idx = self
@@ -140,10 +144,24 @@ impl Table {
             .binary_search_by(|row| row.prefix.as_str().cmp(slice))
             .ok()?;
         let row = &self.entries[idx];
-        if row.is_exact && len != call.len() {
+        if row.is_exact && len != exact_match_base_len(call) {
             return None;
         }
         Some(&row.entry)
+    }
+}
+
+/// The callsign length an exact-call alias must match against: the whole
+/// call, or -- if `call` carries a valid portable designator (`/P`,
+/// `/QRP`, `/MM`, `/AM`, `/M`, `/<digit>`; see `grammar::is_valid_portable`
+/// for the exact set) -- just the base, so `4U1UN/P` still matches an
+/// `=4U1UN`-only alias. An invalid/unrecognized suffix after `/` (garbage,
+/// or a second callsign glued on) is NOT stripped -- the full string must
+/// match, same as before.
+fn exact_match_base_len(call: &str) -> usize {
+    match call.split_once('/') {
+        Some((base, portable)) if crate::grammar::is_valid_portable(portable) => base.len(),
+        _ => call.len(),
     }
 }
 
@@ -314,6 +332,45 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             table.lookup("K5AGCA").expect("K5AGCA should resolve").cq_zone,
             5,
             "a longer call must fall through to the generic K prefix, not match =K5AGC as a substring prefix"
+        );
+    }
+
+    #[test]
+    fn exact_call_alias_still_resolves_a_portable_variant_of_the_same_call() {
+        // Regression (round-5 review): cty.dat never lists a separate
+        // alias for a portable variant -- =K5AGC(3) covers K5AGC AND
+        // K5AGC/P, K5AGC/QRP, etc. The round-4 fix above (exact aliases
+        // don't match as a substring prefix of a LONGER call) initially
+        // over-corrected by comparing against the whole input including
+        // any portable suffix, which wrongly rejected K5AGC/P entirely
+        // (falling through to the generic K prefix's zone 5 instead of
+        // K5AGC's own zone-3 override).
+        let fixture = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,=K5AGC(3);
+";
+        let table = Table::parse(fixture);
+        assert_eq!(
+            table.lookup("K5AGC/P").expect("K5AGC/P should resolve").cq_zone,
+            3,
+            "a valid portable suffix on an exact-alias call must still resolve the alias's own zone"
+        );
+        assert_eq!(
+            table
+                .lookup("K5AGC/QRP")
+                .expect("K5AGC/QRP should resolve")
+                .cq_zone,
+            3
+        );
+        // Still must not regress the original round-4 fix: a genuinely
+        // longer call (not a portable suffix at all) must NOT match.
+        assert_eq!(
+            table
+                .lookup("K5AGCA")
+                .expect("K5AGCA should resolve")
+                .cq_zone,
+            5,
+            "a longer call must still fall through to the generic K prefix"
         );
     }
 

@@ -42,6 +42,7 @@ pub struct BusSpot {
 pub struct SpotBus {
     tx: broadcast::Sender<BusSpot>,
     epoch: SystemTime,
+    session_nonce: u128,
     sample_rate_hz: f64,
     recent: Mutex<VecDeque<Spot>>,
     occurrence_counts: Mutex<HashMap<String, u32>>,
@@ -51,11 +52,23 @@ impl SpotBus {
     /// `epoch` is the wall-clock instant corresponding to `sample_ts == 0`
     /// in the decode pipeline (session start); `sample_rate_hz` converts a
     /// spot's sample-count timestamp to elapsed seconds since `epoch`.
-    pub fn new(sample_rate_hz: f64, epoch: SystemTime) -> Self {
+    /// `epoch` must always be a genuine wall-clock instant -- it feeds
+    /// `unix_ts_for`, which becomes the JSON stream's `timestamp` and the
+    /// telnet stream's RBN Zulu time, both observed by real clients as
+    /// "when this was heard." `session_nonce` is a SEPARATE concern: an
+    /// opaque value used only for spot-`id` uniqueness (see
+    /// `session_nonce()`). Deliberately two parameters, not one derived
+    /// from the other -- an earlier version derived both from the same
+    /// value (a content hash of the replayed file, for deterministic
+    /// reruns), which produced a technically-unique but *fabricated*
+    /// wall-clock timestamp with no relation to real time. Don't
+    /// reconflate them.
+    pub fn new(sample_rate_hz: f64, epoch: SystemTime, session_nonce: u128) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             tx,
             epoch,
+            session_nonce,
             sample_rate_hz,
             recent: Mutex::new(VecDeque::with_capacity(RECENT_HISTORY_CAP)),
             occurrence_counts: Mutex::new(HashMap::new()),
@@ -95,20 +108,16 @@ impl SpotBus {
         self.tx.subscribe()
     }
 
-    /// Full nanosecond-precision session identity -- combined (alongside
-    /// `track_id`/`sample_ts`) into JSON spot `id`s to keep them unique
-    /// across stations and restarts, not just within one session (see
-    /// `spot_message::SpotMessage::from_spot`). Deliberately NOT
-    /// second-truncated: a whole-second epoch lets the same station
-    /// starting two live sessions within one wall-clock second collide on
-    /// early spot ids, since `id` otherwise only varies by
-    /// `track_id`/`sample_ts`, both small session-relative counters that
-    /// naturally restart near zero.
+    /// Opaque session identity -- combined (alongside `track_id`/
+    /// `sample_ts`) into JSON spot `id`s to keep them unique across
+    /// stations and restarts, not just within one session (see
+    /// `spot_message::SpotMessage::from_spot`). Deliberately independent
+    /// of `epoch`/`unix_ts_for` -- this value need only be unlikely to
+    /// repeat, never truthful as a point in time, so callers are free to
+    /// derive it from something with no wall-clock meaning at all (e.g. a
+    /// content hash of a replayed file, for deterministic reruns).
     pub fn session_nonce(&self) -> u128 {
-        self.epoch
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("epoch predates the Unix epoch")
-            .as_nanos()
+        self.session_nonce
     }
 
     /// The last `n` published spots, oldest first (`sh/dx` backing store).
@@ -149,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_subscriber_receives_a_published_spot() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         let mut rx = bus.subscribe();
 
         bus.publish(sample_spot(0));
@@ -160,13 +169,13 @@ mod tests {
 
     #[tokio::test]
     async fn publishing_with_no_subscribers_does_not_panic_or_block() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         bus.publish(sample_spot(0));
     }
 
     #[tokio::test]
     async fn each_subscriber_gets_its_own_copy() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         let mut rx1 = bus.subscribe();
         let mut rx2 = bus.subscribe();
 
@@ -178,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lagging_subscriber_is_told_to_disconnect_instead_of_stalling_the_sender() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         let mut rx = bus.subscribe();
 
         // Publish well past the channel capacity without the subscriber
@@ -195,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn recent_returns_the_last_n_published_spots_oldest_first() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         for i in 0..5u64 {
             let mut spot = sample_spot(i);
             spot.track_id = i as u32;
@@ -212,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn recent_caps_at_the_available_history() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         bus.publish(sample_spot(0));
         bus.publish(sample_spot(1));
 
@@ -221,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn published_spot_carries_its_occurrence_count_at_publish_time() {
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         let mut rx = bus.subscribe();
 
         bus.publish(sample_spot(0));
@@ -238,7 +247,7 @@ mod tests {
         // subscriber that was momentarily behind. Each must still carry
         // the count it actually had *when published*, not the running
         // total by the time the subscriber gets to it.
-        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
         let mut rx = bus.subscribe();
 
         bus.publish(sample_spot(0));
@@ -251,31 +260,31 @@ mod tests {
     #[test]
     fn unix_ts_for_converts_sample_count_using_sample_rate_and_epoch() {
         let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let bus = SpotBus::new(1000.0, epoch); // 1000 Hz -> 1 sample = 1 ms
-                                               // 5000 samples at 1000 Hz = 5 seconds past epoch.
+        let bus = SpotBus::new(1000.0, epoch, 0); // 1000 Hz -> 1 sample = 1 ms
+                                                  // 5000 samples at 1000 Hz = 5 seconds past epoch.
         assert_eq!(bus.unix_ts_for(5000), 1_700_000_005);
     }
 
     #[test]
-    fn session_nonce_returns_full_nanosecond_precision() {
-        let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let bus = SpotBus::new(1000.0, epoch);
-        assert_eq!(bus.session_nonce(), 1_700_000_000_000_000_000);
+    fn session_nonce_returns_exactly_what_the_caller_supplied() {
+        // session_nonce is opaque and independent of epoch/unix_ts_for --
+        // a caller may derive it from anything (a content hash, a random
+        // value, nanoseconds-since-epoch for a live session), and SpotBus
+        // must never reinterpret or recompute it.
+        let bus = SpotBus::new(1000.0, SystemTime::now(), 0xDEAD_BEEF_u128);
+        assert_eq!(bus.session_nonce(), 0xDEAD_BEEF_u128);
     }
 
     #[test]
-    fn session_nonce_differs_for_epochs_within_the_same_second() {
-        // The exact bug this precision exists to prevent: two epochs a
-        // few hundred milliseconds apart, both `UNIX_EPOCH + 1 whole
-        // second` if truncated -- session_nonce must still tell them apart.
-        let a = SpotBus::new(
-            1000.0,
-            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_100),
-        );
-        let b = SpotBus::new(
-            1000.0,
-            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_900),
-        );
+    fn unix_ts_for_is_unaffected_by_session_nonce() {
+        // Regression: an earlier version derived session_nonce FROM epoch,
+        // so the two could never vary independently. A caller replaying a
+        // file must be able to hold epoch fixed (real wall-clock time)
+        // while session_nonce varies (content-derived), or vice versa.
+        let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let a = SpotBus::new(1000.0, epoch, 111);
+        let b = SpotBus::new(1000.0, epoch, 222);
         assert_ne!(a.session_nonce(), b.session_nonce());
+        assert_eq!(a.unix_ts_for(0), b.unix_ts_for(0));
     }
 }

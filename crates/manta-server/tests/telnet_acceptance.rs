@@ -22,7 +22,7 @@ async fn spawn_server() -> (
     tokio::sync::watch::Sender<bool>,
 ) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch));
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -324,4 +324,39 @@ async fn connecting_client_is_counted_in_metrics() {
     assert!(metrics
         .render_prometheus_text()
         .contains("manta_telnet_clients_connected 1"));
+}
+
+#[tokio::test]
+async fn a_logged_in_client_that_sends_no_commands_survives_past_the_login_idle_timeout() {
+    // Regression test (round-5 review, telnet.rs:117): a real telnet
+    // client is read-mostly -- it may sit logged in for minutes with
+    // nothing to say while just watching spots. The idle-read timeout must
+    // guard login (a client that never sends a callsign) and an
+    // in-progress partial command, NOT the steady-state "waiting for the
+    // next command" state -- disconnecting a quiet-but-healthy client
+    // after `bounded_io::IDLE_READ_TIMEOUT` was the bug.
+    //
+    // This needs a genuine wall-clock wait past that deadline: mixing
+    // `tokio::time::pause`/`advance` with this test's real TCP sockets
+    // (tried first) made the server reset every connection outright --
+    // paused-time auto-advance doesn't coexist safely with real socket
+    // I/O on this runtime, so a real (if slow) wait is the trustworthy
+    // option here.
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    tokio::time::sleep(manta_server::bounded_io::IDLE_READ_TIMEOUT + Duration::from_secs(1)).await;
+
+    // The connection must still be alive: a spot published after crossing
+    // the old timeout threshold must still be delivered, not met with a
+    // connection the server already closed out from under the client.
+    let spot = sample_spot();
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("client must still be connected past the old login-only idle timeout")
+        .unwrap();
+    assert!(line.contains("DX de"), "line was: {line:?}");
 }

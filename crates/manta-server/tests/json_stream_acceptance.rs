@@ -29,7 +29,7 @@ async fn spawn_server() -> (
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
 ) {
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -162,6 +162,43 @@ async fn tcp_client_close_during_a_quiet_period_is_detected() {
 }
 
 #[tokio::test]
+async fn tcp_client_sending_data_is_disconnected_not_looped_on() {
+    // Regression test (round-5 review): this protocol is pure server push
+    // -- a raw TCP client is never expected to send anything. The old
+    // behavior discarded any client data and looped back to read again,
+    // which under a client that keeps streaming data makes the read
+    // branch of `handle_tcp_client`'s select! perpetually ready, burning
+    // CPU in a tight loop instead of ever disconnecting. Any non-EOF data
+    // must now close the connection outright.
+    use tokio::io::AsyncWriteExt;
+
+    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Past PEEK_TIMEOUT (500ms) so this is classified as plain TCP, not
+    // still mid-WS-detection when the disconnect happens.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    stream
+        .write_all(b"unexpected client data\r\n")
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if metrics
+                .render_prometheus_text()
+                .contains("manta_json_clients_connected 0")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("client that sent data was never disconnected");
+}
+
+#[tokio::test]
 async fn a_websocket_handshake_split_across_tcp_writes_is_still_detected() {
     // Regression test: the classifying peek must not misjudge a genuine
     // WebSocket client as plain TCP just because its "GET" arrived in
@@ -240,7 +277,7 @@ async fn tcp_and_websocket_clients_share_the_same_port() {
 
 #[tokio::test]
 async fn websocket_client_receives_spot_as_json_message() {
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -281,4 +318,55 @@ async fn websocket_client_receives_spot_as_json_message() {
     assert_eq!(value["dxCall"], "JA1ABC");
 
     let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn websocket_client_sending_an_oversized_message_is_disconnected() {
+    // Regression test (round-5 review): the WS handshake used to accept
+    // tungstenite's default 64 MiB max-message-size, letting a client
+    // force a large per-connection buffer allocation before a frame is
+    // even inspected -- a memory-exhaustion DoS multiplied across
+    // connections. `handle_ws_client` now configures a small explicit
+    // limit; a client that exceeds it must be disconnected, not served.
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
+    let metrics = Arc::new(Metrics::new());
+    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        manta_server::json_stream::serve(
+            listener,
+            bus,
+            metrics,
+            cty,
+            STATION_CALL.to_string(),
+            "manta-test".to_string(),
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+
+    // Comfortably past MAX_INBOUND_WS_MESSAGE_BYTES (16 KiB).
+    let oversized = "a".repeat(64 * 1024);
+    let _ = ws.send(Message::Text(oversized.into())).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("server never responded to the oversized message");
+    match outcome {
+        None => {}                        // connection closed
+        Some(Err(_)) => {}                // protocol error surfaced to the client
+        Some(Ok(Message::Close(_))) => {} // clean close frame
+        other => panic!("expected the oversized message to end the connection, got {other:?}"),
+    }
 }

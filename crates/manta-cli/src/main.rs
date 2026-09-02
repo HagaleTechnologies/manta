@@ -312,19 +312,31 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
-/// Derives a stable, recording-specific replay epoch from a WAV file's
-/// CONTENT (not its path): same bytes -> same epoch on every run
-/// (deterministic reruns) *regardless of where the file lives* -- a
-/// different checkout, mount point, rename, or machine must not change
-/// it, since it's the same recording. Two different recordings hash to
-/// (almost certainly) different epochs, so their spots don't collide in
-/// JSON `id`/`timestamp` even at the same track/sample position.
+/// Derives a stable, recording-specific session nonce from a WAV file's
+/// CONTENT (not its path): same bytes -> same nonce on every run
+/// (deterministic spot `id`s across reruns) *regardless of where the file
+/// lives* -- a different checkout, mount point, rename, or machine must
+/// not change it, since it's the same recording. Two different recordings
+/// hash to (almost certainly) different nonces, so their spots don't
+/// collide in JSON `id` even at the same track/sample position.
 /// `DefaultHasher`'s output isn't guaranteed stable across Rust compiler
 /// versions, but this only needs to be consistent within one build -- the
 /// same determinism guarantee this repo's own "3 runs, same binary ->
-/// identical output" CI rule already relies on, not cross-version
-/// stability.
-fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
+/// identical output" CI rule already relies on (that rule covers `manta
+/// decode --json`'s sample-relative Spot output, which never carries a
+/// wall-clock field at all -- see wiki/pages/determinism.md; it does not
+/// extend to manta-server's live wall-clock `timestamp`/RBN Zulu fields,
+/// which SpotBus's `epoch` -- always real `SystemTime::now()`, see
+/// `start_spot_server` -- covers separately and deliberately does NOT
+/// reproduce across reruns).
+///
+/// This value is ONLY a session nonce (`SpotBus::session_nonce`), never
+/// fed into `SpotBus::epoch`/`unix_ts_for` -- an earlier version derived
+/// both from this same hash, which meant a replayed file's JSON
+/// `timestamp`/RBN Zulu time was a fabricated date with no relation to
+/// real time (nanoseconds-since-Unix-epoch reinterpreted as a wall clock).
+/// A network client's `timestamp` must always be truthful.
+fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
     use std::hash::Hasher;
     use std::io::Read;
 
@@ -341,11 +353,7 @@ fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime
         }
         hasher.write(&buf[..n]);
     }
-    // Nanosecond-granularity offset (not just whole seconds): the same
-    // hash value also flows into SpotBus::session_nonce for spot-id
-    // uniqueness, which wants real sub-second entropy, not just a
-    // plausible-looking date.
-    Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(hasher.finish()))
+    Ok(hasher.finish() as u128)
 }
 
 /// Clap value parser for `--dial-freq-hz`: rejects non-finite (NaN/infinity)
@@ -418,20 +426,28 @@ struct SpotServer {
 /// get a chance to drain (e.g. spots from `TrackManager::finish()`), THEN
 /// call `Runtime::shutdown_timeout` as the bounded safety net.
 ///
-/// `epoch` is the bus's session epoch (see `SpotBus::new`) -- pass a fixed
-/// value (not `SystemTime::now()`) when replaying a file, or two runs of
-/// the same fixture emit different JSON `timestamp`s and spot `id`s,
-/// breaking this repo's file-input-is-deterministic requirement.
+/// `epoch` is the bus's real wall-clock session start (see `SpotBus::new`)
+/// -- always pass `SystemTime::now()` (this daemon's actual start time),
+/// live or replay: it feeds every client-observed `timestamp`/RBN Zulu
+/// field, which must stay truthful. `session_nonce` is the separate,
+/// spot-`id`-uniqueness-only value -- pass a fixed one (e.g.
+/// `session_nonce_for_replay_path`) when replaying a file, or two runs of
+/// the same fixture emit colliding spot `id`s.
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
     epoch: std::time::SystemTime,
+    session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let cfg_text = std::fs::read_to_string(config_path)?;
     let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
     let cfg = file.server;
 
-    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(sample_rate_hz, epoch));
+    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
+        sample_rate_hz,
+        epoch,
+        session_nonce,
+    ));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
     let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
@@ -599,16 +615,25 @@ fn main() -> Result<()> {
                 None => src,
             };
 
-            // A recording-specific-but-deterministic epoch for file replay
-            // keeps JSON timestamps/ids byte-identical across reruns of
-            // the SAME file (this repo's determinism requirement) while
-            // still telling two DIFFERENT recordings apart -- a single
-            // fixed epoch (e.g. always UNIX_EPOCH) would let spots at the
-            // same track/sample position from unrelated files collide on
-            // the same id. A live source gets a real wall-clock epoch.
-            let epoch = match &replay_path {
-                Some(path) => epoch_for_replay_path(path)?,
-                None => std::time::SystemTime::now(),
+            // `epoch` is always this process's real wall-clock start --
+            // truthful for both live and replay sessions, since a network
+            // client's `timestamp`/RBN Zulu time means "when this daemon
+            // observed it," not "when the original recording happened."
+            // `session_nonce` is the separate, spot-id-uniqueness-only
+            // value: recording-content-derived (but deterministic) for
+            // file replay, so reruns of the SAME file emit identical spot
+            // `id`s while two DIFFERENT recordings don't collide on the
+            // same id at the same track/sample position; nanosecond-
+            // precision-now for a live session, so two live sessions
+            // started within the same wall-clock second still don't
+            // collide.
+            let epoch = std::time::SystemTime::now();
+            let session_nonce: u128 = match &replay_path {
+                Some(path) => session_nonce_for_replay_path(path)?,
+                None => epoch
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .expect("epoch predates the Unix epoch")
+                    .as_nanos(),
             };
 
             // Kept alive for the process lifetime: dropping it would stop
@@ -616,7 +641,8 @@ fn main() -> Result<()> {
             // given, in which case `spot_server` stays None too.
             let (server_runtime, spot_server) = match server_config {
                 Some(path) => {
-                    let (rt, server) = start_spot_server(&path, src.sample_rate(), epoch)?;
+                    let (rt, server) =
+                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
                     // Real, if coarse, health signal: this source opened
                     // and is running. `active_tracks` has no equivalent
                     // hook yet -- manta-engine exposes no live track-count
@@ -760,35 +786,37 @@ mod tests {
     }
 
     #[test]
-    fn epoch_for_replay_path_is_deterministic_for_the_same_content() {
+    fn session_nonce_for_replay_path_is_deterministic_for_the_same_content() {
         let f = write_temp_file(b"same recording bytes");
         assert_eq!(
-            epoch_for_replay_path(f.path()).unwrap(),
-            epoch_for_replay_path(f.path()).unwrap()
+            session_nonce_for_replay_path(f.path()).unwrap(),
+            session_nonce_for_replay_path(f.path()).unwrap()
         );
     }
 
     #[test]
-    fn epoch_for_replay_path_is_stable_across_different_paths_for_the_same_content() {
+    fn session_nonce_for_replay_path_is_stable_across_different_paths_for_the_same_content() {
         // The exact bug this fix exists to prevent: the same recording,
         // re-read from a different path (a rename, a different mount, a
-        // different checkout) must derive the SAME replay epoch.
+        // different checkout) must derive the SAME replay session nonce.
         let a = write_temp_file(b"identical recording bytes");
         let b = write_temp_file(b"identical recording bytes");
         assert_eq!(
-            epoch_for_replay_path(a.path()).unwrap(),
-            epoch_for_replay_path(b.path()).unwrap(),
-            "the same content at two different paths must derive the same epoch"
+            session_nonce_for_replay_path(a.path()).unwrap(),
+            session_nonce_for_replay_path(b.path()).unwrap(),
+            "the same content at two different paths must derive the same nonce"
         );
     }
 
     #[test]
-    fn epoch_for_replay_path_differs_across_different_recordings() {
-        let a = epoch_for_replay_path(write_temp_file(b"contest-weekend bytes").path()).unwrap();
-        let b = epoch_for_replay_path(write_temp_file(b"quiet-weeknight bytes").path()).unwrap();
+    fn session_nonce_for_replay_path_differs_across_different_recordings() {
+        let a = session_nonce_for_replay_path(write_temp_file(b"contest-weekend bytes").path())
+            .unwrap();
+        let b = session_nonce_for_replay_path(write_temp_file(b"quiet-weeknight bytes").path())
+            .unwrap();
         assert_ne!(
             a, b,
-            "two different recordings must not collide on the same replay epoch"
+            "two different recordings must not collide on the same replay session nonce"
         );
     }
 }

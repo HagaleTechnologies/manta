@@ -64,6 +64,13 @@ impl SpotMessage {
         // spots for callsigns that already passed `cty.is_allocated()`.
         let dx = cty.lookup(&spot.callsign);
         let de = cty.lookup(station_call);
+        // `band` must be derived from the SAME rounded value reported as
+        // `frequency` -- computing it from the unrounded `spot.freq_hz`
+        // separately (round-5 review finding) could disagree with
+        // `frequency` near a band edge, e.g. 13_999_999.6 Hz rounds up
+        // into 20m's `frequency` while the unrounded value alone still
+        // reads as 40m's `band`.
+        let frequency_hz = spot.freq_hz.round();
 
         Self {
             id: format!(
@@ -74,8 +81,8 @@ impl SpotMessage {
             timestamp: unix_ts_secs,
             // cqdx overwrites this on receipt; see the field's schema doc.
             ingested_at: unix_ts_secs,
-            frequency: spot.freq_hz.round() as i64,
-            band: crate::band::band_for_freq_hz(spot.freq_hz).to_string(),
+            frequency: frequency_hz as i64,
+            band: crate::band::band_for_freq_hz(frequency_hz).to_string(),
             mode: "CW",
             dx_call: spot.callsign.clone(),
             dx_grid: None,
@@ -122,6 +129,25 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             track_id: 7,
             sample_ts: 12_345,
         }
+    }
+
+    #[test]
+    fn frequency_and_band_never_disagree_near_a_band_edge() {
+        // Regression (round-5 review): `frequency` used to round
+        // `spot.freq_hz` while `band` classified the UNROUNDED value
+        // separately. 13_999_999.6 Hz rounds up to 14_000_000 (inside
+        // 20m's lower edge), but the unrounded value alone falls in the
+        // unassigned gap just below 20m -- so `band` used to read
+        // "unknown" while `frequency` read exactly 14_000_000, a visibly
+        // self-contradictory pair. Both fields must now agree, derived
+        // from the same rounded value.
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.freq_hz = 13_999_999.6;
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+
+        assert_eq!(msg.frequency, 14_000_000);
+        assert_eq!(msg.band, "20m");
     }
 
     #[test]

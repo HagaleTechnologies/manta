@@ -25,6 +25,15 @@ use tokio::sync::{broadcast, watch};
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a WebSocket client has to complete its opening handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Caps inbound WebSocket message/frame size. This stream is pure server
+/// push -- a client is only ever expected to send tiny control frames
+/// (Ping/Close, see `handle_ws_client`) -- so tungstenite's 64 MiB/16 MiB
+/// defaults are far larger than legitimate traffic ever needs and would
+/// let a client force a per-connection buffer allocation up to that
+/// default before the frame is even inspected (round-5 review finding: a
+/// memory-exhaustion DoS multiplied across connections). 16 KiB is
+/// generous headroom over any real control frame.
+const MAX_INBOUND_WS_MESSAGE_BYTES: usize = 16 * 1024;
 /// How long `serve` waits for a connection's first bytes before assuming
 /// it's a raw JSON Lines client (which may never send anything).
 const PEEK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -173,8 +182,15 @@ async fn handle_tcp_client(
             // until the next spot's write happened to fail.
             read_result = socket.read(&mut scratch) => {
                 match read_result {
-                    Ok(0) => return Ok(()),  // client closed the connection
-                    Ok(_) => {}              // unexpected client data; ignore
+                    Ok(0) => return Ok(()), // client closed the connection
+                    // Any non-EOF data is a protocol violation on this
+                    // pure-server-push stream -- close instead of looping
+                    // back to read again. Looping (the prior behavior)
+                    // made this branch perpetually ready under a client
+                    // that keeps sending data, starving the spot-write
+                    // branch and burning CPU in a tight select! loop
+                    // (round-5 review finding).
+                    Ok(_) => return Ok(()),
                     Err(_) => return Ok(()),
                 }
             }
@@ -201,10 +217,16 @@ async fn handle_ws_client(
     mut ctx: ClientCtx,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 
-    let mut ws =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::accept_async(socket)).await??;
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES));
+    let mut ws = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
+    )
+    .await??;
     loop {
         tokio::select! {
             spot = rx.recv() => {

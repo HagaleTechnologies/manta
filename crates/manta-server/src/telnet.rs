@@ -5,7 +5,7 @@
 //! plain line-oriented text, and skipping IAC keeps this a small,
 //! auditable text protocol (MAN-22/23 harden it further).
 
-use crate::bounded_io::read_line_bounded_with_timeout;
+use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
@@ -112,7 +112,17 @@ async fn handle_client(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            n = read_line_bounded_with_timeout(&mut reader, &mut cmd_line) => {
+            // Deliberately the UNTIMED variant: this branch is polled every
+            // trip through the loop, including while the client is
+            // legitimately just listening for spots with nothing to say
+            // for minutes at a time (a read-mostly protocol -- see
+            // ARCHITECTURE §7). `IDLE_READ_TIMEOUT` only guards login
+            // (above, via the timed variant) and an in-progress partial
+            // command line -- an established, quietly-listening client
+            // must never be disconnected just for staying quiet. (Round-5
+            // review finding: this branch used to reuse the timed variant
+            // here too, which cut off exactly that client after 30s.)
+            n = read_line_bounded(&mut reader, &mut cmd_line) => {
                 if n? == 0 {
                     return Ok(()); // client disconnected
                 }
