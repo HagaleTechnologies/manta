@@ -44,31 +44,40 @@ MAN-30's fate.
    item 5) and will produce a misleadingly pessimistic number.
 4. Read the printed output:
    ```
-   cpu_budget: 300 unique tracks decoded (scene has 300 signals)
+   cpu_budget: 300 tracks sustained across most of the run (scene has 300 signals)
    cpu_budget: <N>s wall / 15.00s audio = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
    cpu_budget: <N>s (user+sys) CPU / 15.00s audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
    ```
-   - **The track count line must read close to 300** (the test itself
-     asserts >= 285, but read the real number). A materially lower count
-     means the detector promoted fewer simultaneous tracks than the
-     scene intends, and the run below it is benchmarking a cheaper
-     workload than the ROADMAP.md criterion actually specifies — don't
-     trust the timing numbers if this failed.
+   - **The "tracks sustained" line must read close to 300** (the test
+     itself asserts >= 285, but read the real number). It counts tracks
+     whose decode events span most of the file, not just distinct
+     `track_id`s seen anywhere — a detector that promotes fewer tracks at
+     once, or one that churns through more than 300 short-lived IDs
+     without ever holding close to 300 concurrently, both show up as a low
+     count here. It's a proxy for "held ~300 tracks concurrently", not an
+     exact instantaneous count (`decode_samples`'s public event stream has
+     no track-opened/closed events to count that directly — see the
+     function's doc comment in `tests/cpu_budget.rs`). A materially lower
+     count than 300 means the run below is benchmarking a cheaper workload
+     than ROADMAP.md's criterion — don't trust the timing numbers if this
+     failed.
    - **The `(user+sys) CPU / audio` line — not the wall-clock line — is
      the number to compare against the Pi4 budget (< 1.0x).** ROADMAP.md's
      criterion is a CPU-time budget ("< 1 full core"), and wall-clock only
-     equals CPU time when the pipeline is single-core-bound. That's true
-     on Mac today (confirmed by direct measurement — see the pins doc and
-     the 2026-09-02 decision doc) but has not been separately confirmed on
-     Pi4's 4 weaker, differently-scheduled cores; the test now measures
-     both so you don't have to assume they still match on Pi4. If the two
-     ratios diverge noticeably (CPU-time ratio much higher than
-     wall-clock), that divergence *is* the finding — record it, it means
-     the pipeline used more aggregate core-time than the wall-clock number
-     alone would suggest.
-   - The test's own `assert!` only checks the Mac 0.5x wall-clock bar and
-     will `panic` on Pi4 even for a passing Pi4 CPU-time result — expected;
-     judge Pi4 pass/fail from the printed `core-seconds` line yourself
+     equals CPU time when the pipeline is single-core-bound. Measured
+     2026-09-02: on Mac it isn't quite — `decode_samples` shows ~1.2x-1.25x
+     parallelism (CPU-time ratio noticeably higher than wall-clock), which
+     is why the test now asserts *both* ratios against the Mac 0.5x budget,
+     not just wall-clock. Whether Pi4's 4 weaker, differently-scheduled
+     cores show a similar, larger, or smaller parallelism factor is
+     unconfirmed — this is exactly what running this test on real hardware
+     answers. If the two ratios diverge noticeably, that divergence *is*
+     part of the finding — record both, not just whichever one looks
+     better.
+   - The test's own `assert!`s check the Mac budget (< 0.5x, both ratios)
+     and will `panic` on Pi4 even for a passing Pi4 CPU-time result (Pi4's
+     budget is < 1.0x, a different number) — expected; judge Pi4 pass/fail
+     from the printed `core-seconds` line yourself
      rather than the test's exit code. (If this becomes a recurring manual
      step, consider adding a Pi4-specific `#[ignore]`d test with its own
      1.0x assertion on the CPU-time ratio instead of overloading this one

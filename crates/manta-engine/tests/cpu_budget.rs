@@ -1,9 +1,10 @@
 //! ROADMAP.md M2 CPU-budget accept criterion (see
 //! docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md and
-//! benches/cpu_budget.rs's module doc). This test's own `assert!`s only
-//! check the < 0.5x Mac wall-clock bar; it also prints a CPU-time ratio
-//! (the criterion Pi4's < 1.0x budget actually is) and an active-track
-//! count for a human to judge on Pi4 hardware, per
+//! benches/cpu_budget.rs's module doc). This test's own `assert!`s check
+//! the Mac budget (< 0.5x of one core) against both wall-clock and
+//! (user+sys) CPU-time ratios -- see 2026-09-02 pins for why both, not
+//! just wall-clock. Pi4's budget is a different number (< 1.0x) that a
+//! human judges from the printed CPU-time line on real hardware, per
 //! docs/RUNBOOKS/m2-pi4-cpu-budget.md -- that manual Pi4 run is an
 //! explicitly flagged outstanding step, same pattern as M1's still-
 //! outstanding W1AW live-copy run (see CLAUDE.md Status).
@@ -12,7 +13,7 @@ use manta_decode::events::DecoderEvent;
 use manta_engine::PipelineConfig;
 use manta_testkit::scene::{render_scene, SignalSpec};
 use num_complex::Complex32;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// `(user + sys)` CPU seconds consumed by this process so far, per
 /// `getrusage(RUSAGE_SELF)`. Wall clock alone can't distinguish "cheap,
@@ -35,6 +36,51 @@ fn track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. } => *track_id,
     }
+}
+
+/// `sample_ts` for the two `DecoderEvent` variants that carry one --
+/// `SpeedUpdate`/`TrackMeta` don't, so `None` for those.
+fn event_sample_ts(e: &DecoderEvent) -> Option<u64> {
+    match e {
+        DecoderEvent::CharDecoded { sample_ts, .. }
+        | DecoderEvent::WordBoundary { sample_ts, .. } => Some(*sample_ts),
+        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => None,
+    }
+}
+
+/// Count of tracks whose decode events span most of the file (first event
+/// in the opening 30%, last event in the closing 30%) -- a proxy for
+/// "concurrently active for nearly the whole run", not exact instantaneous
+/// concurrency. `decode_samples`'s public event stream has no
+/// track-opened/track-closed events, only per-character/word timestamps,
+/// so there's no way to reconstruct the true simultaneous-ACTIVE-track
+/// count from outside `TrackManager` without adding one (a
+/// `manta-engine`/`manta-dsp` production API change, out of scope for this
+/// measurement-only ticket -- see the scope note in
+/// docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md). This scene's
+/// signals are all continuous for the full 15s (`loop_text: true`, no
+/// QSB/silence), so a track that's genuinely alive throughout should show
+/// activity near both ends of the file; a track that churned open/closed
+/// through part of the run should not. Materially stronger than counting
+/// raw distinct `track_id`s (which a churning detector could inflate past
+/// 300 without ever holding anywhere near 300 open at once), though still
+/// not proof of exact simultaneity.
+fn sustained_track_count(events: &[DecoderEvent], total_samples: u64) -> usize {
+    let mut spans: HashMap<u32, (u64, u64)> = HashMap::new();
+    for e in events {
+        let Some(ts) = event_sample_ts(e) else {
+            continue;
+        };
+        let entry = spans.entry(track_id(e)).or_insert((ts, ts));
+        entry.0 = entry.0.min(ts);
+        entry.1 = entry.1.max(ts);
+    }
+    let opens_early = total_samples / 10 * 3; // first 30%
+    let closes_late = total_samples / 10 * 7; // last 30% starts here
+    spans
+        .values()
+        .filter(|&&(min_ts, max_ts)| min_ts <= opens_early && max_ts >= closes_late)
+        .count()
 }
 
 fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
@@ -83,28 +129,35 @@ fn cpu_budget_mac_under_half_core() {
     let report = report.expect("decode_samples failed");
 
     // ROADMAP.md's 300-active-tracks scene only does its job if the
-    // detector actually promoted ~300 tracks -- a detector/config
-    // regression that promotes fewer tracks would silently benchmark a
-    // cheaper workload and could pass this gate for the wrong reason.
-    let active_tracks: HashSet<u32> = report.events.iter().map(track_id).collect();
+    // detector actually held ~300 tracks concurrently -- a detector/
+    // config regression that churns through track IDs (opening and
+    // closing far more than 300 over the run, none held for long) or
+    // promotes fewer tracks at once would silently benchmark a cheaper
+    // workload and could pass this gate for the wrong reason. See
+    // `sustained_track_count`'s doc comment for why this is a proxy, not
+    // an exact concurrent count.
+    let total_samples = iq.len() as u64;
+    let sustained = sustained_track_count(&report.events, total_samples);
     println!(
-        "cpu_budget: {} unique tracks decoded (scene has 300 signals)",
-        active_tracks.len()
+        "cpu_budget: {sustained} tracks sustained across most of the run (scene has 300 signals)"
     );
     assert!(
-        active_tracks.len() >= 285,
-        "only {} of 300 scene signals produced a track (>=285, 95%, required) -- \
-         detector/config regression would silently cheapen this benchmark",
-        active_tracks.len()
+        sustained >= 285,
+        "only {sustained} of 300 scene signals produced a track sustained across most of the \
+         run (>=285, 95%, required) -- detector/config regression (fewer tracks held \
+         concurrently, or churn through more than 300 short-lived track IDs) would silently \
+         cheapen this benchmark"
     );
 
     let wall_ratio = elapsed / audio_duration_s;
     // (user + sys) / audio_duration is the criterion ROADMAP.md actually
     // states ("< 1 full core" / "< 50% of one core") -- wall-clock alone
-    // only equals it when the pipeline is single-core-bound, which is
-    // true on Mac today (see the pins doc) but not guaranteed on Pi4's
-    // weaker/differently-scheduled cores. Report both; the Pi4 runbook's
-    // pass/fail check is this cpu_ratio line, not the wall-clock one.
+    // only equals it when the pipeline is single-core-bound. Measured
+    // 2026-09-02: it isn't, quite -- decode_samples shows ~1.2x-1.25x
+    // parallelism on this hardware (cpu_ratio > wall_ratio below), so both
+    // ratios are asserted, not just wall-clock; a run that's fast in wall
+    // time by spreading work across more cores than the budget allows
+    // must still fail.
     let cpu_ratio = cpu_elapsed / audio_duration_s;
     println!(
         "cpu_budget: {elapsed:.2}s wall / {audio_duration_s:.2}s audio = {wall_ratio:.3}x realtime wall-clock (Mac budget: < 0.5x)"
@@ -115,5 +168,11 @@ fn cpu_budget_mac_under_half_core() {
     assert!(
         wall_ratio < 0.5,
         "192 kS/s / 300-track pipeline used {wall_ratio:.3}x realtime, Mac budget is < 0.5x (< 50% of one core)"
+    );
+    assert!(
+        cpu_ratio < 0.5,
+        "192 kS/s / 300-track pipeline used {cpu_ratio:.3}x (user+sys) core-seconds per audio-second, \
+         Mac budget is < 0.5x (< 50% of one core) -- a run can pass on wall-clock alone by \
+         spreading the same work across more cores than the budget allows"
     );
 }
