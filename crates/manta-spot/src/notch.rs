@@ -58,7 +58,10 @@ impl NotchList {
             if !line.is_char_boundary(i) {
                 continue;
             }
-            let (Ok(lo), Ok(hi)) = (line[..i].parse::<f64>(), line[i + 1..].parse::<f64>()) else {
+            let (Ok(lo), Ok(hi)) = (
+                line[..i].trim().parse::<f64>(),
+                line[i + 1..].trim().parse::<f64>(),
+            ) else {
                 continue;
             };
             if !lo.is_finite() || !hi.is_finite() {
@@ -150,6 +153,13 @@ mod tests {
         assert!(notch.contains(-1000.0));
         assert!(!notch.contains(-1201.0));
         assert!(!notch.contains(-799.0));
+    }
+
+    #[test]
+    fn whitespace_around_the_separator_is_tolerated() {
+        let notch = NotchList::parse("14025000 - 14025100\n");
+        assert!(notch.contains(14_025_050.0));
+        assert!(!notch.contains(14_025_200.0));
     }
 
     #[test]
