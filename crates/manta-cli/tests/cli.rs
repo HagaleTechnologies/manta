@@ -150,6 +150,32 @@ fn decode_freq_correction_ppm_shifts_the_reported_freq_hz() {
     );
 }
 
+/// MAN-29 review round 5: a downward correction (negative ppm) is a normal
+/// case the public validation contract explicitly supports
+/// (`[-1000, 1000]`), but clap treats a leading-hyphen value as another
+/// argument unless `allow_negative_numbers` is set -- so `decode`,
+/// `listen`, and `soak` all rejected `--freq-correction-ppm -10` before it
+/// ever reached the validator. `decode` is the only one testable without a
+/// live device/file, so it stands in for all three.
+#[test]
+fn decode_accepts_a_negative_freq_correction_ppm() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join(format!("{}.wav", spec.name));
+
+    let out = manta()
+        .args(["decode", "--json", "--freq-correction-ppm", "-10"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--freq-correction-ppm -10 should be accepted, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn decode_json_includes_spots_field() {
     let dir = tempfile::tempdir().unwrap();

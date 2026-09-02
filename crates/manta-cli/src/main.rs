@@ -33,7 +33,12 @@ enum Command {
         /// Corrects a drifted source clock/LO -- legacy precedent: CW
         /// Skimmer/SkimSrv's `FreqCalibration=` .ini key (a raw
         /// multiplier; this flag is ppm, per the spec's contract).
-        #[arg(long, default_value_t = 0.0, value_parser = parse_freq_correction_ppm)]
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
         freq_correction_ppm: f64,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
@@ -74,7 +79,12 @@ enum Command {
         /// emission. Corrects a drifted source clock/LO -- legacy
         /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
         /// (a raw multiplier; this flag is ppm, per the spec's contract).
-        #[arg(long, default_value_t = 0.0, value_parser = parse_freq_correction_ppm)]
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
         freq_correction_ppm: f64,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
@@ -122,7 +132,12 @@ enum Command {
         /// emission. Corrects a drifted source clock/LO -- legacy
         /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
         /// (a raw multiplier; this flag is ppm, per the spec's contract).
-        #[arg(long, default_value_t = 0.0, value_parser = parse_freq_correction_ppm)]
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
         freq_correction_ppm: f64,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
