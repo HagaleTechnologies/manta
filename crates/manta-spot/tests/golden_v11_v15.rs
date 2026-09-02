@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15, V18-V29: manta-spot validator
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V30: manta-spot validator
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
@@ -66,6 +66,7 @@ fn v11_context_parse_sets_spot_type() {
         (&["CQ", "TEST", "K5ARH", "K5ARH"], SpotType::Cq),
         (&["K5ARH", "UP", "UP"], SpotType::De),
         (&["V", "V", "V", "K5ARH", "K5ARH"], SpotType::Beacon),
+        (&["K5ARH", "T"], SpotType::Beacon),
     ];
     for (words, expected_type) in cases {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -503,4 +504,22 @@ fn v29_provenance_bound_to_exact_word_occurrence_across_repetitions() {
         "K5ARH must not be reclassified to De just because CQ aged out, \
          even across a repeated DE K5ARH occurrence, got {spots:?}"
     );
+}
+
+/// MAN-37: the same first-decode repetition-gate exemption V18 proves for
+/// the textual `V V V <call>` beacon preamble, extended to the power-step
+/// pattern (`<call> T`) that real NCDXF/IARU beacons actually decode as.
+#[test]
+fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(
+        spots.len(),
+        1,
+        "a power-step BEACON-tagged spot must emit on the first decode"
+    );
+    assert_eq!(spots[0].callsign, "K5ARH");
+    assert_eq!(spots[0].spot_type, SpotType::Beacon);
 }

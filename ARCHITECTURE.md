@@ -224,10 +224,12 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 transmission may never produce again).
 
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
-   `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and — as a
-   last-resort fallback, MAN-37 — `<call> T` for NCDXF-style power-step
-   beacons the decoder can't resolve past a single trailing dash). Context
-   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+   `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
+   for NCDXF-style power-step beacons the decoder can't resolve past a
+   single trailing dash, MAN-37 — reconciled against the other patterns by
+   recency when both match, rather than one unconditionally winning).
+   Context determines spot type (CQ / DE / BEACON) — RBN spots carry this
+   flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
    refreshable) — a call with an unallocated prefix is rejected.

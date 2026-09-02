@@ -36,45 +36,28 @@ static UP_RE: LazyLock<Regex> =
 /// individual power steps out of what is, to it, one unbroken carrier --
 /// there's no inter-element keying gap to split the four dashes on -- so
 /// this decodes as the callsign followed by a single trailing "T" (one
-/// dash), not "TTTT". Checked only as a last-resort fallback, after every
-/// other named-keyword pattern: a lone "T" is also the single most common
+/// dash), not "TTTT". A lone "T" is also the single most common
 /// garbled/noise decode in CW, so this pattern is a known, accepted
 /// source of false-positive `Beacon` tags (see MAN-37 decision notes) --
 /// bounded blast radius since `Beacon` only lifts the repetition-gate
 /// requirement (ARCHITECTURE §6 step 4), it doesn't bypass grammar/cty.
-/// Never fires when a bare `CQ` or `DE` token appears anywhere in `text`,
-/// even if the adjacency-strict `CQ_CALL_RE`/`DE_RE` patterns themselves
-/// failed to match (e.g. filler-word forms like "CQ DX <call>") -- an
-/// explicit framing keyword must never be reinterpreted as Beacon just
-/// because its own restricted pattern didn't fire (Codex review on PR #65).
+/// The trailing `T` must be a complete decoded word (end-of-text or
+/// followed by whitespace), not just a word-boundary transition -- a bare
+/// `\b` also matched a portable-designator suffix glued onto the same
+/// word, e.g. "K5ARH T/QRP" (Codex review on PR #65).
 static POWER_STEP_BEACON_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+T\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+T(?:\s|$)").unwrap());
 /// Bare `DE` token, analogous to `CQ_TOKEN_RE` -- used only to keep the
 /// power-step fallback from firing over explicit `DE` framing that
 /// `DE_RE` itself failed to match due to filler words (mirrors the
-/// `CQ_TOKEN_RE` guard below; MAN-37 review).
+/// `CQ_TOKEN_RE` guard used in `parse` below; MAN-37 review).
 static DE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDE\b").unwrap());
 
-/// Scans `text` for the first CQ/DE/beacon context pattern, returning the
-/// callsign candidate (uppercased), its spot type, and the byte range in
-/// `text` of every token that determined that type (not just the capture
-/// group -- the full pattern match, plus the `CQ` token's own span when it
-/// decides the `De`-vs-`Cq` ambiguity below). `None` if no pattern matches
-/// at all -- the caller decides whether to fall back to grammar-only,
-/// type-`Unknown` validation.
-///
-/// The range lets a caller distinguish a genuine reclassification (driven
-/// by a newly-arrived word) from a type merely changing because an older
-/// framing word aged out of its own rolling window -- MAN-28 round 12
-/// review: `manta-spot::Validator` maps this range back to word identities
-/// and only accepts a reclassification when it covers a word younger than
-/// any that produced the previous classification.
-///
-/// A `DE <call>` match is classified `Cq` (not `De`) when a bare `CQ` token
-/// also appears anywhere in `text` -- the common "CQ CQ DE <call>"
-/// transmission shape, where the callsign always follows `DE` but the
-/// operator is calling CQ, not answering one.
-pub fn parse(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
+/// The `BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`UP_RE` family: the first (in that
+/// priority order) named-keyword pattern that matches anywhere in `text`.
+/// Returns the callsign candidate (uppercased), spot type, and match byte
+/// range -- see `parse`'s own docs for what the range is for.
+fn parse_named_pattern(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
     if let Some(caps) = BEACON_RE.captures(text) {
         let m = caps.get(0).unwrap();
         return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
@@ -96,19 +79,82 @@ pub fn parse(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
         let m = caps.get(0).unwrap();
         return Some((caps[1].to_uppercase(), SpotType::De, m.range()));
     }
-    if !CQ_TOKEN_RE.is_match(text) && !DE_TOKEN_RE.is_match(text) {
-        // `captures` alone only ever returns the FIRST "<call> T" match in
-        // `text`; with the 16-word rolling window this fallback actually
-        // runs against, an older, already-attempted occurrence sitting
-        // earlier in the window must not starve a newer, genuinely valid
-        // one -- take the last (newest) match instead (Codex review on
-        // PR #65).
-        if let Some(caps) = POWER_STEP_BEACON_RE.captures_iter(text).last() {
-            let m = caps.get(0).unwrap();
-            return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
+    None
+}
+
+/// The power-step fallback (see `POWER_STEP_BEACON_RE`) on its own, with
+/// no CQ/DE-framing guard applied yet -- `parse` decides whether to accept
+/// it. `captures` alone only ever returns the FIRST match in `text`; with
+/// the 16-word rolling window this fallback actually runs against, an
+/// older, already-attempted occurrence sitting earlier in the window must
+/// not starve a newer, genuinely valid one -- take the last (newest)
+/// match instead (Codex review on PR #65).
+fn parse_power_step_beacon(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
+    let caps = POWER_STEP_BEACON_RE.captures_iter(text).last()?;
+    let m = caps.get(0).unwrap();
+    Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()))
+}
+
+/// Scans `text` for the CQ/DE/beacon context pattern that best explains
+/// its newest evidence, returning the callsign candidate (uppercased),
+/// its spot type, and the byte range in `text` of every token that
+/// determined that type (not just the capture group -- the full pattern
+/// match, plus the `CQ` token's own span when it decides the `De`-vs-`Cq`
+/// ambiguity below). `None` if no pattern matches at all -- the caller
+/// decides whether to fall back to grammar-only, type-`Unknown`
+/// validation.
+///
+/// The range lets a caller distinguish a genuine reclassification (driven
+/// by a newly-arrived word) from a type merely changing because an older
+/// framing word aged out of its own rolling window -- MAN-28 round 12
+/// review: `manta-spot::Validator` maps this range back to word identities
+/// and only accepts a reclassification when it covers a word younger than
+/// any that produced the previous classification.
+///
+/// A `DE <call>` match is classified `Cq` (not `De`) when a bare `CQ` token
+/// also appears anywhere in `text` -- the common "CQ CQ DE <call>"
+/// transmission shape, where the callsign always follows `DE` but the
+/// operator is calling CQ, not answering one.
+///
+/// The named-keyword family (`parse_named_pattern`) and the power-step
+/// fallback (`parse_power_step_beacon`) are reconciled rather than one
+/// simply taking priority (Codex review on PR #65, round 2): a
+/// `BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`UP_RE` match earlier in the window
+/// must not permanently block a genuinely newer power-step occurrence for
+/// a DIFFERENT callsign -- that's a separate, later transmission, and the
+/// newest evidence wins. But when both name the SAME callsign, the
+/// trailing "T" is most plausibly garble on the very transmission the
+/// named pattern already explains, so the established type is kept
+/// (matches the existing "CQ K5ARH K5ARH T" contract: stays `Cq`, not
+/// reclassified to `Beacon`). When no named pattern matched at all, an
+/// explicit CQ/DE framing keyword anywhere in `text` -- even one whose
+/// own adjacency-strict pattern failed to match due to filler words, e.g.
+/// "CQ DX <call>" -- still blocks the fallback: an unrecognized CQ/DE
+/// call must never be reinterpreted as Beacon just because its own
+/// restricted pattern didn't fire.
+pub fn parse(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
+    let named = parse_named_pattern(text);
+    let beacon = parse_power_step_beacon(text);
+    match (named, beacon) {
+        (None, None) => None,
+        (Some(n), None) => Some(n),
+        (None, Some(b)) => {
+            if CQ_TOKEN_RE.is_match(text) || DE_TOKEN_RE.is_match(text) {
+                None
+            } else {
+                Some(b)
+            }
+        }
+        (Some(n), Some(b)) => {
+            if n.0 == b.0 {
+                Some(n)
+            } else if b.2.end > n.2.end {
+                Some(b)
+            } else {
+                Some(n)
+            }
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -242,5 +288,29 @@ mod tests {
         // "DE DX <call>" doesn't match DE_RE's tight adjacency pattern
         // either, and must not fall through to the power-step fallback.
         assert_eq!(parse_type("DE DX K5ARH T"), None);
+    }
+
+    #[test]
+    fn newer_power_step_beacon_supersedes_a_different_older_named_match() {
+        // Codex review (round 2) on PR #65: a stale named match earlier in
+        // the window (here "DE W1AW") must not preempt the whole function
+        // before a genuinely newer, DIFFERENT station's power-step
+        // evidence ("K5ARH T") ever gets considered -- unlike the
+        // same-callsign case above, this is a different callsign, so it's
+        // unambiguously a separate, later transmission, and the newest
+        // evidence wins.
+        assert_eq!(
+            parse_type("DE W1AW K5ARH T"),
+            Some(("K5ARH".to_string(), SpotType::Beacon))
+        );
+    }
+
+    #[test]
+    fn power_step_requires_t_to_be_a_complete_word() {
+        // Codex review (round 2) on PR #65: the trailing `\b` only demands
+        // a word/non-word transition, so it also matched "T/QRP" (a
+        // portable-designator suffix glued onto the same decoded word) --
+        // not a lone "T" word as the pattern is documented to require.
+        assert_eq!(parse_type("K5ARH T/QRP"), None);
     }
 }
