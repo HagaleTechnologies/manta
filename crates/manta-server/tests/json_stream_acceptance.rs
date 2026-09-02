@@ -32,7 +32,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>) {
 
     let bus2 = bus.clone();
     tokio::spawn(async move {
-        manta_server::json_stream::serve_tcp(
+        manta_server::json_stream::serve(
             listener,
             bus2,
             metrics,
@@ -90,6 +90,44 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
 }
 
 #[tokio::test]
+async fn tcp_and_websocket_clients_share_the_same_port() {
+    // ARCHITECTURE §7 documents one shared "tcp/ws :7301" port -- prove a
+    // raw TCP client and a WebSocket client can both connect to the exact
+    // same listener and each get correctly classified.
+    let (addr, bus) = spawn_server().await;
+
+    let tcp_stream = TcpStream::connect(addr).await.unwrap();
+    let mut tcp_reader = BufReader::new(tcp_stream);
+
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(sample_spot());
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp_reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for TCP JSON line")
+        .unwrap();
+    let tcp_value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+    assert_eq!(tcp_value["dxCall"], "JA1ABC");
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("timed out waiting for ws message")
+        .expect("stream ended")
+        .expect("ws error");
+    let ws_value: serde_json::Value =
+        serde_json::from_str(&msg.into_text().unwrap()).expect("valid JSON message");
+    assert_eq!(ws_value["dxCall"], "JA1ABC");
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
 async fn websocket_client_receives_spot_as_json_message() {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
     let metrics = Arc::new(Metrics::new());
@@ -99,7 +137,7 @@ async fn websocket_client_receives_spot_as_json_message() {
 
     let bus2 = bus.clone();
     tokio::spawn(async move {
-        manta_server::json_stream::serve_ws(
+        manta_server::json_stream::serve(
             listener,
             bus2,
             metrics,

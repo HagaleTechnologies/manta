@@ -45,12 +45,18 @@ impl SpotMessage {
     /// Builds the wire message for one validated spot. `unix_ts_secs` is
     /// the spot's wall-clock time (see `rbn::format_line`'s doc comment on
     /// why that conversion happens here, not on `Spot` itself).
+    /// `session_epoch_unix` is the producing bus's session epoch
+    /// (`SpotBus::epoch_unix_secs`) -- `track_id`/`sample_ts` alone are
+    /// only unique within one decode session, so two manta stations (or
+    /// the same station restarted) could otherwise emit colliding `id`s
+    /// that a shared cqdx ingest keyed on `id` would overwrite or drop.
     pub fn from_spot(
         spot: &Spot,
         station_call: &str,
         cty: &cty::Table,
         decoder_version: &str,
         unix_ts_secs: i64,
+        session_epoch_unix: i64,
     ) -> Self {
         // Falls back to empty/zero only if `dx_call` isn't cty-allocated --
         // should be unreachable in practice, since `Validator` only emits
@@ -59,7 +65,10 @@ impl SpotMessage {
         let de = cty.lookup(station_call);
 
         Self {
-            id: format!("{}:{}", spot.track_id, spot.sample_ts),
+            id: format!(
+                "{station_call}:{session_epoch_unix}:{}:{}",
+                spot.track_id, spot.sample_ts
+            ),
             source: "skimmer",
             timestamp: unix_ts_secs,
             // cqdx overwrites this on receipt; see the field's schema doc.
@@ -117,8 +126,14 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn populates_required_fields_from_the_spot() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg =
-            SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 1_700_000_000);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            &cty,
+            "manta-0.1.0",
+            1_700_000_000,
+            1_699_999_000,
+        );
 
         assert_eq!(msg.source, "skimmer");
         assert_eq!(msg.mode, "CW");
@@ -134,7 +149,14 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn resolves_dx_and_de_continent_and_cq_zone_from_cty_table() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 0);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            &cty,
+            "manta-0.1.0",
+            0,
+            1_699_999_000,
+        );
 
         assert_eq!(msg.dx_continent, "AS");
         assert_eq!(msg.dx_cq_zone, 25);
@@ -144,7 +166,14 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn dxcc_entity_numbers_are_null_not_fabricated() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 0);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            &cty,
+            "manta-0.1.0",
+            0,
+            1_699_999_000,
+        );
 
         assert_eq!(msg.dx_dxcc, None);
         assert_eq!(msg.de_dxcc, None);
@@ -153,16 +182,49 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     #[test]
     fn optional_decoder_metadata_fields_are_populated() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 0);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            &cty,
+            "manta-0.1.0",
+            0,
+            1_699_999_000,
+        );
 
         assert_eq!(msg.decode_confidence, Some(0.9));
         assert_eq!(msg.decoder_version.as_deref(), Some("manta-0.1.0"));
     }
 
     #[test]
+    fn id_differs_across_stations_and_sessions_for_the_same_track_and_sample() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let spot = sample_spot();
+
+        let station_a = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
+        let station_b = SpotMessage::from_spot(&spot, "N0CALL", &cty, "manta-0.1.0", 0, 1_000);
+        let restarted = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 2_000);
+
+        assert_ne!(
+            station_a.id, station_b.id,
+            "different stations must not collide"
+        );
+        assert_ne!(
+            station_a.id, restarted.id,
+            "a restart must not collide with the prior session"
+        );
+    }
+
+    #[test]
     fn serializes_with_schema_camel_case_field_names() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 0);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            &cty,
+            "manta-0.1.0",
+            0,
+            1_699_999_000,
+        );
         let json = serde_json::to_value(&msg).unwrap();
 
         for key in [

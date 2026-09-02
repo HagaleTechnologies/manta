@@ -5,14 +5,22 @@
 //! plain line-oriented text, and skipping IAC keeps this a small,
 //! auditable text protocol (MAN-22/23 harden it further).
 
+use crate::bounded_io::read_line_bounded_with_timeout;
 use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
 use crate::rbn;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+
+/// Every outbound write gets this long before the client is treated as
+/// stalled and disconnected -- ARCHITECTURE §7's "slow clients are
+/// disconnected, never back-pressured" policy applies to a client that
+/// stops reading, not just one that falls behind the broadcast channel.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
@@ -51,14 +59,13 @@ async fn handle_client(
     // the broadcast channel's no-history-for-late-subscribers semantics.
     let mut rx = bus.subscribe();
 
-    wr.write_all(b"login: \r\n").await?;
+    write_with_timeout(&mut wr, b"login: \r\n").await?;
     let mut login_line = String::new();
-    if reader.read_line(&mut login_line).await? == 0 {
+    if read_line_bounded_with_timeout(&mut reader, &mut login_line).await? == 0 {
         return Ok(()); // client hung up before logging in
     }
 
-    wr.write_all(format!("de {station_call}-# >\r\n").as_bytes())
-        .await?;
+    write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
 
     // `sh/dx` default when the client didn't specify a count.
     const DEFAULT_SHOW_DX_COUNT: usize = 10;
@@ -85,7 +92,7 @@ async fn handle_client(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            n = reader.read_line(&mut cmd_line) => {
+            n = read_line_bounded_with_timeout(&mut reader, &mut cmd_line) => {
                 if n? == 0 {
                     return Ok(()); // client disconnected
                 }
@@ -98,7 +105,7 @@ async fn handle_client(
                     }
                     Command::SetFilterUnique { min } => {
                         min_unique = Some(min);
-                        wr.write_all(format!("Filter set: unique > {min}\r\n").as_bytes())
+                        write_with_timeout(&mut wr, format!("Filter set: unique > {min}\r\n").as_bytes())
                             .await?;
                     }
                     // Read-mostly protocol: any other line (unrecognized
@@ -119,6 +126,15 @@ async fn write_spot_line(
 ) -> std::io::Result<()> {
     let unix_ts = bus.unix_ts_for(spot.sample_ts);
     let line = rbn::format_line(spot, station_call, unix_ts);
-    wr.write_all(line.as_bytes()).await?;
-    wr.write_all(b"\r\n").await
+    write_with_timeout(wr, line.as_bytes()).await?;
+    write_with_timeout(wr, b"\r\n").await
+}
+
+async fn write_with_timeout(
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    buf: &[u8],
+) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))?
 }

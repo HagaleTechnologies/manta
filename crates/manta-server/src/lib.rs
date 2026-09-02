@@ -2,6 +2,7 @@
 //! ARCHITECTURE §7-§8.
 
 pub mod band;
+pub mod bounded_io;
 pub mod bus;
 pub mod command;
 pub mod config;

@@ -123,6 +123,15 @@ enum Command {
         /// (ARCHITECTURE §7-§8) alongside the decode loop.
         #[arg(long)]
         server_config: Option<PathBuf>,
+        /// RF dial frequency in Hz, overriding the source's own
+        /// `center_freq_hz()`. Required with --server-config when the
+        /// source is a plain audio device or --source WAV file, since
+        /// neither reports a real RF frequency (KiwiSDR/SoapySDR already
+        /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
+        /// would publish an audio-tone offset (e.g. 700 Hz) as if it were
+        /// the actual DX frequency.
+        #[arg(long)]
+        dial_freq_hz: Option<f64>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -267,6 +276,30 @@ fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<
     })
 }
 
+/// Overrides an inner source's `center_freq_hz()` with a fixed value --
+/// `AudioIqSource` always reports `0.0` (audio-passband mode has no real
+/// RF dial frequency of its own), so without this a spot's `freq_hz` would
+/// publish a bare audio-tone offset (e.g. 700 Hz) as if it were the actual
+/// DX frequency. See `--dial-freq-hz`.
+struct FixedCenterFreqSource {
+    inner: Box<dyn IqSource>,
+    freq_hz: f64,
+}
+
+impl IqSource for FixedCenterFreqSource {
+    fn sample_rate(&self) -> f64 {
+        self.inner.sample_rate()
+    }
+
+    fn center_freq_hz(&self) -> f64 {
+        self.freq_hz
+    }
+
+    fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
 /// (before opening any source) rather than deep in the pipeline, using the
 /// same validation `manta_spot::calibration_factor_from_ppm` applies
@@ -319,20 +352,26 @@ struct SpotServer {
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
 }
 
-/// Starts the telnet/JSON-Lines/WebSocket/metrics servers on their own
+/// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
 /// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
-/// alive for the servers to keep running -- dropping it stops them.
+/// alive for the servers to keep running -- dropping it stops them; call
+/// `Runtime::shutdown_timeout` on it before exit to let in-flight writes
+/// (e.g. spots from `TrackManager::finish()`) drain instead of vanishing.
+///
+/// `epoch` is the bus's session epoch (see `SpotBus::new`) -- pass a fixed
+/// value (not `SystemTime::now()`) when replaying a file, or two runs of
+/// the same fixture emit different JSON `timestamp`s and spot `id`s,
+/// breaking this repo's file-input-is-deterministic requirement.
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
+    epoch: std::time::SystemTime,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let cfg_text = std::fs::read_to_string(config_path)?;
-    let cfg: manta_server::config::ServerConfig = toml::from_str(&cfg_text)?;
+    let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
+    let cfg = file.server;
 
-    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
-        sample_rate_hz,
-        std::time::SystemTime::now(),
-    ));
+    let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(sample_rate_hz, epoch));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
     let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
@@ -343,8 +382,6 @@ fn start_spot_server(
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
         let json_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
-        let ws_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.ws_port)).await?;
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
 
@@ -354,16 +391,8 @@ fn start_spot_server(
             metrics.clone(),
             cfg.station_callsign.clone(),
         ));
-        tokio::spawn(manta_server::json_stream::serve_tcp(
+        tokio::spawn(manta_server::json_stream::serve(
             json_listener,
-            bus.clone(),
-            metrics.clone(),
-            cty.clone(),
-            cfg.station_callsign.clone(),
-            decoder_version.clone(),
-        ));
-        tokio::spawn(manta_server::json_stream::serve_ws(
-            ws_listener,
             bus.clone(),
             metrics.clone(),
             cty,
@@ -441,7 +470,33 @@ fn main() -> Result<()> {
             #[cfg(feature = "soapy")]
             soapy_gain,
             server_config,
+            dial_freq_hz,
         } => {
+            let is_file_replay = source.is_some();
+            #[cfg(feature = "soapy")]
+            let has_soapy_source = soapy_driver.is_some();
+            #[cfg(not(feature = "soapy"))]
+            let has_soapy_source = false;
+            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source;
+            let source_name = if kiwi_host.is_some() {
+                "kiwi"
+            } else if has_soapy_source {
+                "soapy"
+            } else if is_file_replay {
+                "file"
+            } else {
+                "audio"
+            };
+
+            if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+                bail!(
+                    "--dial-freq-hz is required with --server-config when using a plain \
+                     audio device or --source WAV file -- neither reports a real RF \
+                     frequency (KiwiSDR/SoapySDR already know theirs from \
+                     --kiwi-freq/--soapy-freq)"
+                );
+            }
+
             let kiwi = KiwiOpts {
                 host: kiwi_host,
                 port: kiwi_port,
@@ -463,13 +518,35 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "soapy"))]
             let src = open_source(device, source, kiwi)?;
+            let src: Box<dyn IqSource> = match dial_freq_hz {
+                Some(freq_hz) => Box::new(FixedCenterFreqSource {
+                    inner: src,
+                    freq_hz,
+                }),
+                None => src,
+            };
+
+            // A fixed epoch for file replay keeps JSON timestamps/ids
+            // byte-identical across runs (this repo's determinism
+            // requirement); a live source gets a real wall-clock epoch.
+            let epoch = if is_file_replay {
+                std::time::SystemTime::UNIX_EPOCH
+            } else {
+                std::time::SystemTime::now()
+            };
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --server-config wasn't
             // given, in which case `spot_server` stays None too.
-            let (_server_runtime, spot_server) = match server_config {
+            let (server_runtime, spot_server) = match server_config {
                 Some(path) => {
-                    let (rt, server) = start_spot_server(&path, src.sample_rate())?;
+                    let (rt, server) = start_spot_server(&path, src.sample_rate(), epoch)?;
+                    // Real, if coarse, health signal: this source opened
+                    // and is running. `active_tracks` has no equivalent
+                    // hook yet -- manta-engine exposes no live track-count
+                    // API for `listen()`'s callbacks to read, so it stays
+                    // at Metrics::default()'s 0 until that surface exists.
+                    server.metrics.set_source_health(source_name, true);
                     (Some(rt), Some(server))
                 }
                 None => (None, None),
@@ -529,6 +606,13 @@ fn main() -> Result<()> {
                     );
                 },
             )?;
+
+            // Let in-flight writes (e.g. spots from TrackManager::finish()
+            // just before `listen` returned) drain instead of vanishing
+            // when the runtime and its spawned client tasks are dropped.
+            if let Some(rt) = server_runtime {
+                rt.shutdown_timeout(std::time::Duration::from_secs(2));
+            }
         }
         Command::Soak {
             duration,

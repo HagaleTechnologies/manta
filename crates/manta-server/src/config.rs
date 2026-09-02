@@ -13,10 +13,6 @@ fn default_json_port() -> u16 {
     7301
 }
 
-fn default_ws_port() -> u16 {
-    7303
-}
-
 fn default_metrics_port() -> u16 {
     7302
 }
@@ -35,17 +31,26 @@ pub struct ServerConfig {
     pub bind_addr: String,
     #[serde(default = "default_telnet_port")]
     pub telnet_port: u16,
-    /// TCP JSON Lines port. ARCHITECTURE §7's diagram labels this "tcp/ws
-    /// :7301" as one shared port; this implementation gives WebSocket its
-    /// own `ws_port` (default 7303) instead of protocol-sniffing a shared
-    /// socket -- simpler and avoids the failure modes of guessing whether
-    /// the first bytes on a connection are an HTTP upgrade or raw JSON.
+    /// Shared TCP JSON Lines / WebSocket port, per ARCHITECTURE §7's "tcp/ws
+    /// :7301" -- one listener accepts both; `manta_server::json_stream`
+    /// distinguishes a WebSocket client from a raw JSON Lines client by
+    /// peeking the connection's first bytes for an HTTP `GET` upgrade
+    /// request before either side has sent anything.
     #[serde(default = "default_json_port")]
     pub json_port: u16,
-    #[serde(default = "default_ws_port")]
-    pub ws_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+}
+
+/// The real on-disk daemon config file's shape: a `[server]` TOML table
+/// (this is the file `manta listen --server-config <path>` reads) --
+/// distinct from `ServerConfig` itself so that struct can stay a plain,
+/// directly-deserializable value everywhere else (tests, future in-process
+/// construction) without every caller needing to know about the table
+/// wrapper. ARCHITECTURE §8: "Single TOML config... server ports."
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DaemonConfigFile {
+    pub server: ServerConfig,
 }
 
 #[cfg(test)]
@@ -64,7 +69,6 @@ mod tests {
         assert_eq!(cfg.station_callsign, "W3XYZ");
         assert_eq!(cfg.telnet_port, 7300);
         assert_eq!(cfg.json_port, 7301);
-        assert_eq!(cfg.ws_port, 7303);
         assert_eq!(cfg.metrics_port, 7302);
         assert_eq!(cfg.bind_addr, "0.0.0.0");
     }
@@ -76,7 +80,6 @@ mod tests {
             station_callsign = "W3XYZ"
             telnet_port = 17300
             json_port = 17301
-            ws_port = 17303
             metrics_port = 17302
             bind_addr = "127.0.0.1"
             "#,
@@ -85,7 +88,6 @@ mod tests {
 
         assert_eq!(cfg.telnet_port, 17300);
         assert_eq!(cfg.json_port, 17301);
-        assert_eq!(cfg.ws_port, 17303);
         assert_eq!(cfg.metrics_port, 17302);
         assert_eq!(cfg.bind_addr, "127.0.0.1");
     }
@@ -94,5 +96,21 @@ mod tests {
     fn missing_station_callsign_is_a_parse_error() {
         let result: Result<ServerConfig, _> = toml::from_str("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn daemon_config_file_parses_the_real_server_table() {
+        let file: DaemonConfigFile = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            telnet_port = 17300
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(file.server.station_callsign, "W3XYZ");
+        assert_eq!(file.server.telnet_port, 17300);
+        assert_eq!(file.server.json_port, 7301);
     }
 }

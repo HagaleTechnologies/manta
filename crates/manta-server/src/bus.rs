@@ -70,6 +70,17 @@ impl SpotBus {
         self.tx.subscribe()
     }
 
+    /// This bus's session epoch as a Unix timestamp -- a stable per-session
+    /// identity used (alongside `track_id`/`sample_ts`) to keep JSON spot
+    /// IDs unique across stations and restarts, not just within one
+    /// session (see `spot_message::SpotMessage::from_spot`).
+    pub fn epoch_unix_secs(&self) -> i64 {
+        self.epoch
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("epoch predates the Unix epoch")
+            .as_secs() as i64
+    }
+
     /// The last `n` published spots, oldest first (`sh/dx` backing store).
     pub fn recent(&self, n: usize) -> Vec<Spot> {
         let recent = self.recent.lock().expect("recent lock poisoned");
@@ -208,5 +219,12 @@ mod tests {
         let bus = SpotBus::new(1000.0, epoch); // 1000 Hz -> 1 sample = 1 ms
                                                // 5000 samples at 1000 Hz = 5 seconds past epoch.
         assert_eq!(bus.unix_ts_for(5000), 1_700_000_005);
+    }
+
+    #[test]
+    fn epoch_unix_secs_returns_the_session_epoch() {
+        let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let bus = SpotBus::new(1000.0, epoch);
+        assert_eq!(bus.epoch_unix_secs(), 1_700_000_000);
     }
 }

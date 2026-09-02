@@ -3,10 +3,18 @@
 //! `metrics`)." Hand-rolled rather than pulling in a full HTTP framework --
 //! one static text response to one path is the entire surface.
 
+use crate::bounded_io::read_line_bounded_with_timeout;
 use crate::metrics::Metrics;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+
+/// Publicly bound (ARCHITECTURE §7), so both bounds below matter: an
+/// unauthenticated client must not be able to hold this connection's task
+/// open by trickling headers, one every few seconds, forever.
+const MAX_HEADER_LINES: usize = 100;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
     loop {
@@ -29,13 +37,14 @@ async fn handle_request(
     let mut reader = BufReader::new(rd);
 
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).await? == 0 {
+    if read_line_bounded_with_timeout(&mut reader, &mut request_line).await? == 0 {
         return Ok(());
     }
     // Drain the rest of the request headers; we don't need them.
-    loop {
+    for _ in 0..MAX_HEADER_LINES {
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 || line == "\r\n" {
+        let n = read_line_bounded_with_timeout(&mut reader, &mut line).await?;
+        if n == 0 || line == "\r\n" {
             break;
         }
     }
@@ -55,7 +64,11 @@ async fn handle_request(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    wr.write_all(response.as_bytes()).await?;
-    wr.shutdown().await?;
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        wr.write_all(response.as_bytes()).await?;
+        wr.shutdown().await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))??;
     Ok(())
 }

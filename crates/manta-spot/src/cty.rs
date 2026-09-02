@@ -5,10 +5,18 @@
 //! followed by a comma-separated alias list terminated by `;` (the alias
 //! list may span multiple lines). Only the alias list matters here --
 //! country metadata isn't needed for a boolean allocation gate. Aliases may
-//! carry a leading `=` (exact-call override, e.g. `=W3LPL`) or trailing
-//! `(zone)[itu]`-style annotations; both are stripped. One entry embeds a
-//! non-callsign `=VERSION` marker (the file's own version stamp) -- it's
-//! filtered out explicitly.
+//! carry a leading `=` (exact-call override, e.g. `=W3LPL`) or a trailing
+//! `(zone)[itu]`-style annotation overriding that *specific alias*'s CQ/ITU
+//! zone away from the entity header's default (e.g. China's `B0(23)` spots
+//! as zone 23, not the header's zone 24) -- the zone override is parsed out
+//! and applied per-alias; `[itu]`/`<coords>`/`{continent}` annotations are
+//! still stripped, not modeled. One entry embeds a non-callsign `=VERSION`
+//! marker (the file's own version stamp) -- it's filtered out explicitly.
+//! `lon` is negated from the file's raw value: AD1C stores longitude
+//! **west-positive** (e.g. the United States entry reads `91.87`), while
+//! this module's `Entry::lon` uses the ordinary east-positive convention
+//! (GeoJSON, most mapping libraries) that `manta-server`'s JSON stream
+//! (`dxLon`/`deLon`) is expected to emit.
 
 /// Per-entity metadata carried alongside a prefix, from the `cty.dat`
 /// header line's `cq-zone`/`continent`/`lat`/`lon` fields (see the module
@@ -47,8 +55,12 @@ impl Table {
                 continue; // malformed header, skip
             };
             for alias in raw_entry[alias_start + 1..].split(',') {
-                if let Some(prefix) = clean_alias(alias) {
-                    entries.push((prefix, entry.clone()));
+                if let Some((prefix, zone_override)) = clean_alias(alias) {
+                    let mut entry = entry.clone();
+                    if let Some(zone) = zone_override {
+                        entry.cq_zone = zone;
+                    }
+                    entries.push((prefix, entry));
                 }
             }
         }
@@ -93,25 +105,32 @@ fn parse_header(header: &str) -> Option<Entry> {
     if fields.len() != 8 {
         return None;
     }
+    let raw_lon: f64 = fields[5].parse().ok()?;
     Some(Entry {
         cq_zone: fields[1].parse().ok()?,
         continent: fields[3].to_uppercase(),
         lat: fields[4].parse().ok()?,
-        lon: fields[5].parse().ok()?,
+        lon: -raw_lon, // west-positive (AD1C) -> east-positive; see module doc.
     })
 }
 
 /// Strips a leading `=` (exact-call marker) and any trailing
-/// `(zone)`/`[itu]`/`<coords>`/`{continent}` override annotation. Returns
-/// `None` for the file's embedded `=VERSION` metadata marker.
-fn clean_alias(raw: &str) -> Option<String> {
+/// `(zone)`/`[itu]`/`<coords>`/`{continent}` annotation, returning the
+/// cleaned prefix plus that alias's CQ-zone override, if the `(zone)`
+/// annotation is present and parses as one. Returns `None` for the file's
+/// embedded `=VERSION` metadata marker.
+fn clean_alias(raw: &str) -> Option<(String, Option<u16>)> {
     let raw = raw.trim().trim_start_matches('=');
     let end = raw.find(['(', '[', '<', '{']).unwrap_or(raw.len());
     let prefix = raw[..end].trim().to_uppercase();
     if prefix.is_empty() || prefix.starts_with("VERSION") {
         return None;
     }
-    Some(prefix)
+    let zone_override = raw[end..]
+        .strip_prefix('(')
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|zone_str| zone_str.parse().ok());
+    Some((prefix, zone_override))
 }
 
 #[cfg(test)]
@@ -174,7 +193,43 @@ Equatorial Guinea:36: 47: AF:   1.7:  10.3: -1.0: 3C:
         assert_eq!(entry.continent, "NA");
         assert_eq!(entry.cq_zone, 5);
         assert_eq!(entry.lat, 40.0);
-        assert_eq!(entry.lon, 75.0);
+        // cty.dat's raw 75.0 is west-positive (AD1C convention); the United
+        // States sits west of Greenwich, so the east-positive `Entry::lon`
+        // must come out negative.
+        assert_eq!(entry.lon, -75.0);
+    }
+
+    #[test]
+    fn lon_sign_is_flipped_for_an_eastern_hemisphere_entity_too() {
+        // Japan is east of Greenwich; cty.dat's west-positive raw value is
+        // negative (-138.38 in the real vendored file), so the corrected
+        // east-positive `Entry::lon` must come out positive.
+        let fixture = "\
+Japan:            25: 45: AS:  36.0: -138.0:  9.0:  JA:
+    JA;
+";
+        let table = Table::parse(fixture);
+        let entry = table.lookup("JA1ABC").expect("JA1ABC should resolve");
+        assert_eq!(entry.lon, 138.0);
+    }
+
+    #[test]
+    fn per_alias_zone_override_wins_over_the_entity_header_default() {
+        let fixture = "\
+China:            24: 44: AS:  35.0: -103.0: -8.0: BY:
+    BY,B0(23);
+";
+        let table = Table::parse(fixture);
+        assert_eq!(
+            table.lookup("B0ABC").expect("B0ABC should resolve").cq_zone,
+            23,
+            "B0's (23) annotation must override the header's zone 24"
+        );
+        assert_eq!(
+            table.lookup("BYABC").expect("BYABC should resolve").cq_zone,
+            24,
+            "BY has no override annotation, so the header's zone 24 stands"
+        );
     }
 
     #[test]

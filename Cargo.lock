@@ -883,6 +883,7 @@ dependencies = [
  "manta-server",
  "manta-spot",
  "manta-testkit",
+ "num-complex",
  "serde_json",
  "tempfile",
  "tokio",

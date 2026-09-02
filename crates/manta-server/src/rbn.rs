@@ -26,7 +26,7 @@ pub fn format_line(spot: &Spot, spotter_call: &str, unix_ts_secs: i64) -> String
     let minute = (secs_of_day % 3600) / 60;
 
     format!(
-        "DX de {spotter}-#:{freq:>9.1}  {call:<9}CW  {snr:>2} dB  {wpm:>2} WPM  {ctx}  {hour:02}{minute:02}Z",
+        "DX de {spotter}-#:{freq:>9.1}  {call:<8} CW  {snr:>2} dB  {wpm:>2} WPM  {ctx}  {hour:02}{minute:02}Z",
         spotter = spotter_call,
         freq = freq_khz,
         call = spot.callsign,
@@ -75,5 +75,16 @@ mod tests {
     fn midnight_wraps_to_zero_zulu() {
         let line = format_line(&sample_spot(), "W3XYZ", 0);
         assert!(line.ends_with("0000Z"), "line was: {line}");
+    }
+
+    #[test]
+    fn a_long_portable_call_is_separated_from_the_mode_field() {
+        let mut spot = sample_spot();
+        spot.callsign = "K5ARH/QRP".to_string(); // 9 chars, exceeds the 8-wide call column
+        let line = format_line(&spot, "W3XYZ", 11_520);
+        assert!(
+            line.contains("K5ARH/QRP CW"),
+            "call and mode ran together: {line}"
+        );
     }
 }
