@@ -129,6 +129,24 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver")]
         soapy_gain: Option<f64>,
+        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
+        /// Requires --hpsdr-freq and --hpsdr-rate.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, conflicts_with_all = ["device", "source"])]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port (default 1024, the standard Metis
+        /// discovery/control port).
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        hpsdr_port: u16,
+        /// RF center frequency in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host")]
+        hpsdr_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host")]
+        hpsdr_rate: Option<f64>,
         /// TOML config with a `[server]`-shaped `ServerConfig` (station
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
@@ -222,6 +240,24 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver")]
         soapy_gain: Option<f64>,
+        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
+        /// Requires --hpsdr-freq and --hpsdr-rate.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, conflicts_with_all = ["device", "source"])]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port (default 1024, the standard Metis
+        /// discovery/control port).
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        hpsdr_port: u16,
+        /// RF center frequency in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host")]
+        hpsdr_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host")]
+        hpsdr_rate: Option<f64>,
     },
 }
 
@@ -240,6 +276,44 @@ struct SoapyOpts {
     freq: Option<f64>,
     rate: Option<f64>,
     gain: Option<f64>,
+}
+
+/// HPSDR/Hermes connection flags (feature `hpsdr`), grouped for the same reason.
+#[cfg(feature = "hpsdr")]
+struct HpsdrOpts {
+    host: Option<String>,
+    port: u16,
+    freq: Option<f64>,
+    rate: Option<f64>,
+}
+
+/// Open a single-DDC HPSDR/Hermes device (feature `hpsdr`) as an
+/// `IqSource`, or `None` if `--hpsdr-host` wasn't given. Checked ahead of
+/// `open_source`'s kiwi/soapy/audio chain, so `--hpsdr-host` takes priority
+/// over those the same way `kiwi.host` already takes priority over
+/// `soapy.driver` inside that chain -- in practice only one of
+/// kiwi/soapy/hpsdr is ever set, since each already `conflicts_with_all`
+/// `device`/`source`.
+#[cfg(feature = "hpsdr")]
+fn open_hpsdr_source(hpsdr: HpsdrOpts) -> Result<Option<Box<dyn IqSource>>> {
+    let Some(host) = hpsdr.host else {
+        return Ok(None);
+    };
+    let freq = hpsdr
+        .freq
+        .ok_or_else(|| anyhow!("--hpsdr-freq is required with --hpsdr-host"))?;
+    let rate = hpsdr
+        .rate
+        .ok_or_else(|| anyhow!("--hpsdr-rate is required with --hpsdr-host"))?;
+    let cfg = manta_input::hpsdr::HpsdrConfig {
+        host,
+        port: hpsdr.port,
+        ddc_count: 1,
+        sample_rate_hz: rate,
+        center_freq_hz: vec![freq],
+    };
+    let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
+    Ok(Some(Box::new(sources.remove(0))))
 }
 
 /// Open a live audio device, WAV replay, KiwiSDR network source, or
@@ -776,6 +850,14 @@ fn main() -> Result<()> {
             soapy_rate,
             #[cfg(feature = "soapy")]
             soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate,
             server_config,
             dial_freq_hz,
             replay_epoch,
@@ -788,11 +870,17 @@ fn main() -> Result<()> {
             let has_soapy_source = soapy_driver.is_some();
             #[cfg(not(feature = "soapy"))]
             let has_soapy_source = false;
-            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source;
+            #[cfg(feature = "hpsdr")]
+            let has_hpsdr_source = hpsdr_host.is_some();
+            #[cfg(not(feature = "hpsdr"))]
+            let has_hpsdr_source = false;
+            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
             let source_name = if kiwi_host.is_some() {
                 "kiwi"
             } else if has_soapy_source {
                 "soapy"
+            } else if has_hpsdr_source {
+                "hpsdr"
             } else if is_file_replay {
                 "file"
             } else {
@@ -815,20 +903,38 @@ fn main() -> Result<()> {
                 password: kiwi_password,
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
-            #[cfg(feature = "soapy")]
-            let src = open_source(
-                device,
-                source,
-                kiwi,
-                SoapyOpts {
-                    driver: soapy_driver,
-                    freq: soapy_freq,
-                    rate: soapy_rate,
-                    gain: soapy_gain,
-                },
-            )?;
-            #[cfg(not(feature = "soapy"))]
-            let src = open_source(device, source, kiwi)?;
+            #[cfg(feature = "hpsdr")]
+            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                host: hpsdr_host,
+                port: hpsdr_port,
+                freq: hpsdr_freq,
+                rate: hpsdr_rate,
+            })?;
+            #[cfg(not(feature = "hpsdr"))]
+            let hpsdr_source: Option<Box<dyn IqSource>> = None;
+            let src = match hpsdr_source {
+                Some(src) => src,
+                None => {
+                    #[cfg(feature = "soapy")]
+                    {
+                        open_source(
+                            device,
+                            source,
+                            kiwi,
+                            SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            },
+                        )?
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        open_source(device, source, kiwi)?
+                    }
+                }
+            };
             let src: Box<dyn IqSource> = match dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
@@ -988,6 +1094,14 @@ fn main() -> Result<()> {
             soapy_rate,
             #[cfg(feature = "soapy")]
             soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate,
         } => {
             let kiwi = KiwiOpts {
                 host: kiwi_host,
@@ -996,20 +1110,38 @@ fn main() -> Result<()> {
                 password: kiwi_password,
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
-            #[cfg(feature = "soapy")]
-            let src = open_source(
-                device,
-                source,
-                kiwi,
-                SoapyOpts {
-                    driver: soapy_driver,
-                    freq: soapy_freq,
-                    rate: soapy_rate,
-                    gain: soapy_gain,
-                },
-            )?;
-            #[cfg(not(feature = "soapy"))]
-            let src = open_source(device, source, kiwi)?;
+            #[cfg(feature = "hpsdr")]
+            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                host: hpsdr_host,
+                port: hpsdr_port,
+                freq: hpsdr_freq,
+                rate: hpsdr_rate,
+            })?;
+            #[cfg(not(feature = "hpsdr"))]
+            let hpsdr_source: Option<Box<dyn IqSource>> = None;
+            let src = match hpsdr_source {
+                Some(src) => src,
+                None => {
+                    #[cfg(feature = "soapy")]
+                    {
+                        open_source(
+                            device,
+                            source,
+                            kiwi,
+                            SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            },
+                        )?
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        open_source(device, source, kiwi)?
+                    }
+                }
+            };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {

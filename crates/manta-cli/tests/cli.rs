@@ -369,3 +369,57 @@ fn soapy_driver_without_freq_and_rate_is_a_clean_error() {
         "expected an explanatory error, got: {stderr}"
     );
 }
+
+#[test]
+#[cfg(feature = "hpsdr")]
+fn hpsdr_host_without_freq_and_rate_is_a_clean_error() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["listen", "--hpsdr-host", "192.168.1.100"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure without --hpsdr-freq/--hpsdr-rate"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("hpsdr-freq")
+            || stderr.contains("hpsdr-rate")
+            || stderr.contains("required"),
+        "expected an explanatory error, got: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(feature = "hpsdr")]
+fn hpsdr_host_is_accepted_by_listen_and_soak() {
+    // Flag-recognition smoke test (MAN-51 acceptance): confirms
+    // --hpsdr-host/--hpsdr-port/--hpsdr-freq/--hpsdr-rate exist on both
+    // subcommands per the ticket's Gherkin -- clap must not reject them as
+    // unknown arguments. Connecting to a real device is MAN-52's job.
+    for sub in ["listen", "soak"] {
+        let mut args = vec![
+            sub,
+            "--hpsdr-host",
+            "192.168.1.100",
+            "--hpsdr-port",
+            "1024",
+            "--hpsdr-freq",
+            "14000000",
+            "--hpsdr-rate",
+            "192000",
+        ];
+        if sub == "soak" {
+            args.extend(["--duration", "1"]);
+        }
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args(&args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
+            "{sub}: --hpsdr-* flags must be recognized, got: {stderr}"
+        );
+    }
+}
