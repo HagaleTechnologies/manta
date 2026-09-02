@@ -120,11 +120,13 @@ real validation bug (MAN-35, not a disposition error) surfaced along the
 way. Each was re-verified against `manta-spot`/`manta-input` source before
 filing or updating.
 
-## Non-goals not yet in README.md
+## Non-goals added to README.md
 
-Two capability classes are Non-goal dispositions above but don't fit any of
-README's four existing bullets. Recommend folding these in if this doc is
-accepted:
+Two capability classes are Non-goal dispositions above that didn't fit any of
+README's four original bullets. Added to README's Non-goals section in this
+same PR (corrected 2026-09-02, PR #57 review round 4 — this section
+previously read as a pending recommendation; the edit already landed in this
+PR's first commit):
 
 - Not a multi-process Windows orchestrator — manta is a single Rust binary;
   there is no companion-program sprawl to sequence-launch.
