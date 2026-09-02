@@ -18,6 +18,26 @@ use tokio::sync::{broadcast, watch};
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Whether a connection attempt got far enough to matter for backoff:
+/// a connection that completed login before dropping was healthy, so the
+/// *next* attempt should retry quickly rather than inherit backoff state
+/// from an unrelated earlier outage. A connection that never got past
+/// `TcpStream::connect`/login (target down, refusing, wrong port) hasn't
+/// demonstrated that, so backoff keeps growing.
+enum ConnectAttemptError {
+    NeverConnected,
+    Disconnected,
+}
+
+/// Pure backoff-transition function, split out so this policy is
+/// unit-testable without any real sleeping/timing.
+fn next_backoff(current: Duration, outcome: &ConnectAttemptError) -> Duration {
+    match outcome {
+        ConnectAttemptError::Disconnected => INITIAL_BACKOFF,
+        ConnectAttemptError::NeverConnected => (current * 2).min(MAX_BACKOFF),
+    }
+}
+
 /// Reconnect-with-backoff loop around one uplink connection. Never
 /// returns while `config.enabled` and the shutdown signal hasn't fired --
 /// a dropped connection must not permanently silence the uplink, since
@@ -45,18 +65,19 @@ pub async fn serve(
 
         match connect_and_forward(&config, &login_callsign, &bus, &metrics, &mut shutdown).await {
             Ok(()) => return, // clean shutdown-signaled exit
-            Err(_) => {
+            Err(outcome) => {
                 metrics.set_uplink_connected(false);
                 metrics.record_uplink_reconnect();
+                let sleep_for = backoff;
+                backoff = next_backoff(backoff, &outcome);
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
+                    _ = tokio::time::sleep(sleep_for) => {}
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             return;
                         }
                     }
                 }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
     }
@@ -68,8 +89,10 @@ async fn connect_and_forward(
     bus: &Arc<SpotBus>,
     metrics: &Arc<Metrics>,
     shutdown: &mut watch::Receiver<bool>,
-) -> std::io::Result<()> {
-    let stream = TcpStream::connect((config.target_host.as_str(), config.target_port)).await?;
+) -> Result<(), ConnectAttemptError> {
+    let stream = TcpStream::connect((config.target_host.as_str(), config.target_port))
+        .await
+        .map_err(|_| ConnectAttemptError::NeverConnected)?;
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
 
@@ -79,13 +102,15 @@ async fn connect_and_forward(
     let mut rx = bus.subscribe();
 
     let mut prompt_line = String::new();
-    reader.read_line(&mut prompt_line).await?;
+    reader
+        .read_line(&mut prompt_line)
+        .await
+        .map_err(|_| ConnectAttemptError::NeverConnected)?;
     wr.write_all(format!("{login_callsign}\r\n").as_bytes())
-        .await?;
+        .await
+        .map_err(|_| ConnectAttemptError::NeverConnected)?;
 
     metrics.set_uplink_connected(true);
-    // A connection that gets this far is healthy -- a later drop should
-    // retry quickly, not inherit backoff state from an earlier outage.
     let result = forward_loop(
         &mut reader,
         &mut wr,
@@ -98,7 +123,7 @@ async fn connect_and_forward(
     )
     .await;
     metrics.set_uplink_connected(false);
-    result
+    result.map_err(|_| ConnectAttemptError::Disconnected)
 }
 
 /// RBN's collection server isn't expected to send anything meaningful
@@ -163,6 +188,27 @@ async fn forward_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_resets_after_a_connection_that_reached_login() {
+        let grown = Duration::from_secs(16);
+        assert_eq!(
+            next_backoff(grown, &ConnectAttemptError::Disconnected),
+            INITIAL_BACKOFF
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps_when_never_connected() {
+        assert_eq!(
+            next_backoff(Duration::from_secs(1), &ConnectAttemptError::NeverConnected),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(45), &ConnectAttemptError::NeverConnected),
+            MAX_BACKOFF
+        );
+    }
 
     #[test]
     fn effective_login_callsign_reflected_in_config() {
