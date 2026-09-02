@@ -41,6 +41,11 @@ pub struct Spot {
 struct Word {
     text: String,
     confidences: Vec<f32>,
+    /// Assigned from `TrackState::next_word_seq` when this word is pushed
+    /// to `TrackState::words` -- a per-track, strictly-increasing "age"
+    /// used to tell a genuinely new supporting word apart from an older
+    /// one merely still being present (MAN-28 round 12 review).
+    seq: u64,
     /// Set once this word has been offered to the validation pipeline as a
     /// context-match candidate, so a later, unrelated word boundary that
     /// re-scans a growing window doesn't re-process it.
@@ -53,6 +58,15 @@ struct Word {
     /// re-attempt of the same evaluation -- `attempted` alone must not
     /// permanently block it (MAN-28 round 8 review).
     last_spot_type: Option<SpotType>,
+    /// The highest `seq` among the words that produced `last_spot_type`
+    /// (this word's own `seq`, for a context-free allowlist match). A
+    /// later re-evaluation is only a genuine reclassification -- driven by
+    /// a newly-arrived word -- if its own max involved `seq` is strictly
+    /// greater than this. Re-deriving a word's type from whatever
+    /// currently sits in the window, with no way to tell "gained new
+    /// context" from "lost old context" as it ages out, produced two
+    /// separate downgrade bugs (rounds 11 and 12) before this was added.
+    classified_max_seq: u64,
     /// The repetition count computed the first time this word was
     /// evaluated. A reclassification (see `last_spot_type`) reuses this
     /// rather than calling `RepetitionGate::record` again -- the word was
@@ -81,6 +95,9 @@ struct TrackState {
     /// metadata arrives even if no further word ever completes -- this is
     /// the timestamp that retry uses (MAN-28 round 9 review).
     last_sample_ts: u64,
+    /// Source of `Word::seq`; incremented each time a word is pushed to
+    /// `words` (MAN-28 round 12 review).
+    next_word_seq: u64,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -273,7 +290,9 @@ impl Validator {
             } => {
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
-                    let word = std::mem::take(&mut track.current);
+                    let mut word = std::mem::take(&mut track.current);
+                    word.seq = track.next_word_seq;
+                    track.next_word_seq += 1;
                     track.words.push_back(word);
                     if track.words.len() > WORD_WINDOW {
                         track.words.pop_front();
@@ -321,20 +340,38 @@ impl Validator {
     /// word is found the moment it's allowlisted, `word.attempted`
     /// (checked in `evaluate_candidate`) prevents re-processing one this
     /// already spotted or rejected.
-    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType)> {
+    ///
+    /// Each candidate carries the highest `Word::seq` among the words that
+    /// produced it, so `evaluate_candidate` can tell a genuine
+    /// reclassification (a newer word contributed) from a type merely
+    /// changing because an older one aged out (MAN-28 round 12 review).
+    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType, u64)> {
         let Some(track) = self.tracks.get(&track_id) else {
             return Vec::new();
         };
         let mut candidates = Vec::new();
 
-        let joined: String = track
-            .words
-            .iter()
-            .map(|w| w.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if let Some(context_match) = context::parse(&joined) {
-            candidates.push(context_match);
+        // Byte range of each word within `joined`, in the same order as
+        // `track.words`, to map a context match's span back to the
+        // word(s) that produced it.
+        let mut joined = String::new();
+        let mut word_spans = Vec::with_capacity(track.words.len());
+        for word in &track.words {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            let start = joined.len();
+            joined.push_str(&word.text);
+            word_spans.push((start, joined.len(), word.seq));
+        }
+        if let Some((candidate, spot_type, range)) = context::parse(&joined) {
+            let involved_max_seq = word_spans
+                .iter()
+                .filter(|(start, end, _)| *start < range.end && range.start < *end)
+                .map(|(_, _, seq)| *seq)
+                .max()
+                .unwrap_or(0);
+            candidates.push((candidate, spot_type, involved_max_seq));
         }
 
         // MAN-28 Watch List: an allowlisted word is found independently of
@@ -345,9 +382,9 @@ impl Validator {
         // documented fallback for exactly this case.
         for word in &track.words {
             if self.allowlist.contains(&word.text)
-                && !candidates.iter().any(|(c, _)| *c == word.text)
+                && !candidates.iter().any(|(c, _, _)| *c == word.text)
             {
-                candidates.push((word.text.clone(), SpotType::Unknown));
+                candidates.push((word.text.clone(), SpotType::Unknown, word.seq));
             }
         }
 
@@ -363,8 +400,8 @@ impl Validator {
         }
         self.candidates(track_id)
             .into_iter()
-            .filter_map(|(candidate, spot_type)| {
-                self.evaluate_candidate(track_id, sample_ts, candidate, spot_type)
+            .filter_map(|(candidate, spot_type, involved_max_seq)| {
+                self.evaluate_candidate(track_id, sample_ts, candidate, spot_type, involved_max_seq)
             })
             .collect()
     }
@@ -375,6 +412,7 @@ impl Validator {
         sample_ts: u64,
         candidate: String,
         spot_type: SpotType,
+        involved_max_seq: u64,
     ) -> Option<Spot> {
         let (freq_hz, snr_db, wpm) = {
             let track = self.tracks.get(&track_id)?;
@@ -388,27 +426,28 @@ impl Validator {
             let track = self.tracks.get_mut(&track_id)?;
             let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
             if word.attempted {
-                // A prior attempt with the SAME type is a genuine
-                // re-attempt (nothing new to evaluate). A prior attempt
-                // with a DIFFERENT, non-Unknown-losing type means
-                // trailing context has since completed a real pattern --
-                // a reclassification, not a re-attempt; let it through so
-                // dedupe's type-changed override (below) can decide
-                // whether to emit the corrected spot. Reclassification
-                // only ever promotes (e.g. Unknown -> De, or De -> a
-                // still-more-specific type): a transition INTO Unknown
-                // must never be accepted -- that isn't newly-arrived
-                // context, it's an already-contextualized word's framing
-                // word aging out of the window, which must not erase the
-                // classification it already earned (MAN-28 round 11
-                // review).
-                if word.last_spot_type == Some(spot_type) || spot_type == SpotType::Unknown {
+                // A prior attempt is only a genuine reclassification --
+                // not a re-attempt of stale information -- if a word
+                // strictly younger than any that produced the previous
+                // classification is involved this time. Re-deriving a
+                // word's type from whatever currently sits in the window,
+                // with no way to tell "gained new context" from "lost old
+                // context" as it ages out, produced two separate downgrade
+                // bugs before this check existed: a type reverting to
+                // Unknown (round 11) and a type changing between two real
+                // context types (round 12), both merely because an older
+                // framing word (DE, CQ) fell out of the 16-word window,
+                // not because anything new arrived.
+                if word.last_spot_type == Some(spot_type)
+                    || involved_max_seq <= word.classified_max_seq
+                {
                     return None;
                 }
             }
             let reclassifying = word.attempted;
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
+            word.classified_max_seq = involved_max_seq;
             (word.confidences.clone(), reclassifying)
         };
 

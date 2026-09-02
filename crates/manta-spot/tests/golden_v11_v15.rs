@@ -405,3 +405,58 @@ fn v26_reclassification_never_downgrades_a_contextual_type_to_unknown() {
          aged out of the window, got {spots:?}"
     );
 }
+
+/// V27: reclassification must never downgrade BETWEEN two contextual
+/// types either, not just to/from `Unknown` (V26) -- the same aging-out
+/// bug shape recurs for any pair of pattern types. "CQ DE K5ARH" spots as
+/// `Cq` (DE_RE matches, and a bare CQ token is present in the window);
+/// once 15 more words push both "CQ" and "DE" out while "K5ARH" remains,
+/// the window re-scan would otherwise reclassify it to `De`.
+#[test]
+fn v27_reclassification_never_downgrades_between_contextual_types_via_aging() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    v.allowlist("K5ARH");
+
+    let first = run(&transmission_events(1, &["CQ", "DE", "K5ARH"], 0), &mut v);
+    assert_eq!(first.len(), 1, "got {first:?}");
+    assert_eq!(first[0].spot_type, SpotType::Cq);
+
+    // Push enough filler words so both "CQ" and "DE" age out of the
+    // 16-word window while "K5ARH" remains.
+    let filler: Vec<String> = (1..=15).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    let spots = run(&transmission_events(1, &filler_refs, 300_000), &mut v);
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::De),
+        "K5ARH must not be reclassified from Cq to De just because CQ/DE \
+         aged out of the window, got {spots:?}"
+    );
+}
+
+/// V28: the flip side of V26/V27 -- a genuine reclassification driven by a
+/// newly-arrived trailing word must still be accepted, not just rejected
+/// wholesale. "DE K5ARH" spots as `De`; a `CQ` token arriving immediately
+/// afterward (not via window aging) is real new information and must
+/// promote the spot to `Cq`.
+#[test]
+fn v28_reclassification_still_accepted_when_driven_by_a_new_word() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    v.allowlist("K5ARH");
+
+    let first = run(&transmission_events(1, &["DE", "K5ARH"], 0), &mut v);
+    assert_eq!(first.len(), 1, "got {first:?}");
+    assert_eq!(first[0].spot_type, SpotType::De);
+
+    let second = run(&transmission_events(1, &["CQ"], 300_000), &mut v);
+    assert!(
+        second
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "a genuinely new trailing CQ token must still promote De to Cq, got {second:?}"
+    );
+}

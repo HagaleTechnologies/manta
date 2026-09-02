@@ -504,7 +504,7 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V26
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V28
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
@@ -527,6 +527,8 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V24 | reclassification-reps-reuse | "DE K5ARH" decodes once (reps=1, held back by the repetition gate), then a trailing `CQ` token reclassifies the same word from `De` to `Cq` | Still 0 spots -- the reclassification reuses the word's existing rep count rather than recording a second decode |
 | V25 | metadata-retries-pending-candidate | A `TrackMeta` event arrives for a track with a pending exempt candidate (held back by V22) and no further word ever completes | The candidate is retried and spots as part of the `TrackMeta` ingest itself, not left waiting on a `WordBoundary` that may never come |
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
+| V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
+| V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
 
 ---
 
