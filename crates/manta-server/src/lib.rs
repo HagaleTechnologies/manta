@@ -12,3 +12,4 @@ pub mod metrics_http;
 pub mod rbn;
 pub mod spot_message;
 pub mod telnet;
+pub mod uplink;
