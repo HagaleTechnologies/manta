@@ -206,7 +206,20 @@ async fn handle_client(
                                     continue;
                                 }
                             }
-                            write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
+                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                                .await
+                                .is_err()
+                            {
+                                // The client's socket is presumably dead --
+                                // further writes would just fail too. A
+                                // bare `?` here (the prior behavior)
+                                // propagated the error out of the whole
+                                // handler, abandoning the rest of the
+                                // drain loop uncounted (round-12 review
+                                // finding).
+                                metrics.record_write_failed(1 + rx.len() as u64);
+                                return Ok(());
+                            }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
                             metrics.record_lagged(n);

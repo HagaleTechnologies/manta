@@ -235,11 +235,23 @@ async fn handle_tcp_client(
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             let line = ctx.render(&bus_spot);
-                            let _ = tokio::time::timeout(WRITE_TIMEOUT, async {
+                            let write_result = tokio::time::timeout(WRITE_TIMEOUT, async {
                                 socket.write_all(line.as_bytes()).await?;
                                 socket.write_all(b"\n").await
                             })
                             .await;
+                            if !matches!(write_result, Ok(Ok(()))) {
+                                // The client's socket is presumably dead --
+                                // further writes would just fail too, so
+                                // stop draining and count what's abandoned
+                                // (this failed spot plus anything still
+                                // retained), rather than silently
+                                // discarding the error and continuing to
+                                // burn the write timeout on every remaining
+                                // queued spot (round-12 review finding).
+                                ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                                return Ok(());
+                            }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
                             ctx.metrics.record_lagged(n);
@@ -336,7 +348,20 @@ async fn handle_ws_client(
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             let text = ctx.render(&bus_spot);
-                            let _ = tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))).await;
+                            let write_result = tokio::time::timeout(
+                                WRITE_TIMEOUT,
+                                ws.send(Message::Text(text.into())),
+                            )
+                            .await;
+                            if !matches!(write_result, Ok(Ok(()))) {
+                                // See the TCP handler's identical
+                                // shutdown-drain branch for why a failed
+                                // write stops the drain instead of
+                                // silently continuing (round-12 review
+                                // finding).
+                                ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                                return Ok(());
+                            }
                         }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
                             ctx.metrics.record_lagged(n);

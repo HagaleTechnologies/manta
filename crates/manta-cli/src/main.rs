@@ -419,10 +419,16 @@ fn resolve_epoch(
 /// lives* -- a different checkout, mount point, rename, or machine must
 /// not change it, since it's the same recording. Two different recordings
 /// hash to (almost certainly) different nonces, so their spots don't
-/// collide in JSON `id` even at the same track/sample position.
-/// `DefaultHasher`'s output isn't guaranteed stable across Rust compiler
-/// versions, but this only needs to be consistent within one build -- the
-/// same determinism guarantee this repo's own "3 runs, same binary ->
+/// collide in JSON `id` even at the same track/sample position. Uses
+/// FNV-1a-64 (`hash = (hash XOR byte) * FNV_PRIME`, from the published
+/// offset basis) -- a small, independently specified, versioned algorithm
+/// with no dependency on any std or compiler internals -- NOT `std`'s
+/// `DefaultHasher`, whose own docs disclaim any stability guarantee across
+/// Rust releases (round-12 review finding: the same replay file could
+/// hash differently across builds/toolchains, and this value feeds every
+/// JSON spot `id`). This keeps the nonce stable across different
+/// builds/toolchains too, not just within one binary -- the same
+/// determinism guarantee this repo's own "3 runs, same binary ->
 /// identical output" CI rule already relies on (that rule covers `manta
 /// decode --json`'s sample-relative Spot output, which never carries a
 /// wall-clock field at all -- see wiki/pages/determinism.md; it does not
@@ -438,12 +444,13 @@ fn resolve_epoch(
 /// real time (nanoseconds-since-Unix-epoch reinterpreted as a wall clock).
 /// A network client's `timestamp` must always be truthful.
 fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
-    use std::hash::Hasher;
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening {} to derive its replay identity", path.display()))?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file
@@ -452,9 +459,12 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
         if n == 0 {
             break;
         }
-        hasher.write(&buf[..n]);
+        for &byte in &buf[..n] {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
     }
-    Ok(hasher.finish() as u128)
+    Ok(hash as u128)
 }
 
 /// Clap value parser for `--dial-freq-hz`: rejects non-finite (NaN/infinity)
@@ -1168,6 +1178,41 @@ mod tests {
         assert!(
             drift < std::time::Duration::from_secs(60),
             "must be a genuine near-present timestamp, not a fabricated far date; drift was {drift:?}"
+        );
+    }
+
+    #[test]
+    fn session_nonce_for_replay_path_matches_the_published_fnv_1a_algorithm() {
+        // Regression (round-12 review): std::collections::hash_map::
+        // DefaultHasher's algorithm is explicitly documented as
+        // UNSPECIFIED across Rust releases, so the same replay file could
+        // hash differently across builds/toolchains -- and this value
+        // feeds every JSON spot `id`. FNV-1a-64 is a small, independently
+        // published, versioned algorithm with no dependency on any std or
+        // compiler internals: `hash = (hash XOR byte) * FNV_PRIME`,
+        // starting from the published offset basis. Recomputed here from
+        // the same published constants via a separate expression (not
+        // just self-consistency) to pin the implementation against the
+        // actual formula, catching e.g. an accidentally swapped
+        // XOR/multiply order or wrong constant.
+        const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let expected_empty = OFFSET_BASIS as u128;
+        let expected_a = (OFFSET_BASIS ^ 0x61u64).wrapping_mul(PRIME) as u128;
+        let expected_ab =
+            (((OFFSET_BASIS ^ 0x61u64).wrapping_mul(PRIME) ^ 0x62u64).wrapping_mul(PRIME)) as u128;
+
+        assert_eq!(
+            session_nonce_for_replay_path(write_temp_file(b"").path()).unwrap(),
+            expected_empty
+        );
+        assert_eq!(
+            session_nonce_for_replay_path(write_temp_file(b"a").path()).unwrap(),
+            expected_a
+        );
+        assert_eq!(
+            session_nonce_for_replay_path(write_temp_file(b"ab").path()).unwrap(),
+            expected_ab
         );
     }
 
