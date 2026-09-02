@@ -6,15 +6,25 @@ This doc records what this session could and couldn't do about it, and
 should not be read as closing the gate — the gate stays open until someone
 runs `docs/RUNBOOKS/m2-pi4-cpu-budget.md` on an actual Pi4.
 
+**Headline, read this first:** what started as "no Pi4 available, here's an
+estimate" turned into something more consequential over several rounds of
+review on this PR — a real bug in how the existing bench measured the Mac
+leg (see "Correction: the Mac leg does not actually pass" below) means the
+Mac side of this gate, previously recorded as a comfortable pass
+(`docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`), is now in doubt
+too, not just the never-measured Pi4 side. Nothing here is a settled
+pass/fail for either leg — both need a clean re-measurement.
+
 ## No Pi4-class hardware was reachable this session
 
 Checked `~/.ssh/config` and `~/.ssh/known_hosts` across the fleet
 (aldebaran, rigel, sophon, vega, pandora, plus the network-appliance hosts).
 Result: no Raspberry Pi or other Linux/aarch64 SBC. The only aarch64 hosts
 in reach are Apple Silicon Macs (sophon, vega — both M-series, same class
-as aldebaran) — those are the *other*, already-passing leg of this gate,
-not a substitute for it. Per MAN-18's own instructions, this is reported
-explicitly rather than silently substituted.
+as aldebaran) — those are the *other* leg of this gate (see below for why
+"already-passing" turned out not to be a safe assumption), not a
+substitute for a real Pi4 either way. Per MAN-18's own instructions, this
+is reported explicitly rather than silently substituted.
 
 No cloud ARM instance was provisioned either — that would cost money
 (guardrail: ask before spending) and, more importantly, server-class ARM
@@ -87,19 +97,69 @@ roughly **1.2x-1.25x parallelism** inside `decode_samples` itself, not the
    Wall-clock stayed flat (~0.39x-0.40x) throughout; only the CPU-time
    ratio moved, consistent with contention adding real scheduling/cache
    overhead to `decode_samples`'s own work rather than just "the machine
-   felt slower." Two implications: this session's Mac-leg numbers
-   throughout are noisier than a single "0.46x, passes" headline suggests
-   — re-measure on a quiet/dedicated machine before treating the Mac leg
-   as a settled pass — and if a margin this thin can flip on a busy
-   laptop-class host, that's one more reason not to expect the much larger
-   Pi4 gap (~4.5x vs. a 1.0x budget) to close on real hardware.
+   felt slower."
+
+## Correction: the Mac leg does not actually pass (warmup dilution)
+
+Everything above still had a methodology bug, caught by a later Codex
+review round on this same PR: `PipelineConfig::default()`'s
+`DetectorConfig::warmup_hops` (750 hops @ `manta_decode::FO_HZ` = 375 Hz)
+inhibits **all** track creation for the first 2.0s of the 15s scene — no
+decoder-pool work happens in that window, only channelizer/noise-floor
+cost. Every ratio above divided by the full 15s, which folds in 2s of
+near-free warmup and dilutes the steady-state (all-300-tracks-active) cost
+by ~13% (2s of 15s). Fixed in `tests/cpu_budget.rs` by dividing by
+`(audio_duration - warmup)` = 13.0s instead — see `WARMUP_S`'s doc comment
+in that file for why this direction of correction (leaving warmup's own
+small real cost folded into the numerator) is conservative, not exact.
+
+Re-measured with the fix (same machine, same continued heavy load — 12
+users, load average 16-18 — so this specific set of numbers conflates the
+warmup fix with the contention finding above; see below for what that
+means for a quiet-machine estimate):
+
+```
+cpu_budget: 300 tracks sustained across most of the run (scene has 300 signals)
+cpu_budget: 5.87s wall / 13.00s steady-state audio (15.00s scene minus 2.0s detector warmup) = 0.452x realtime wall-clock (Mac budget: < 0.5x)
+cpu_budget: 7.51s (user+sys) CPU / 13.00s steady-state audio = 0.578x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
+```
+
+Three runs: CPU-time ratio 0.577x-0.583x, consistently and clearly *over*
+the 0.5x Mac budget. Wall-clock (0.451x-0.455x) still clears its own
+budget, but wall-clock was never the actual ROADMAP criterion.
+
+**This is not just today's contention.** Applying the same 15/13 ≈ 1.154x
+correction factor to this session's *earlier, quiet-machine* readings
+(0.457x-0.472x, taken before contention picked up) gives an estimated
+quiet-machine, warmup-corrected ratio of **≈0.527x-0.545x** — still over
+0.5x. In other words, the warmup-dilution bug alone, independent of
+today's contention, looks sufficient to flip this session's Mac
+measurements from "passes with 6-9% margin" to "fails, or is right at the
+edge." The honest state of the evidence: **this session did not produce a
+clean, high-confidence reading of whether the Mac leg passes or fails** —
+contention and the warmup fix both push the same direction (worse), and
+disentangling exactly how much margin (if any) remains needs a rerun on a
+quiet, dedicated machine using the now-fixed test. What's no longer
+tenable is the earlier "Mac leg passes comfortably" framing from the pins
+doc (`docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`) — that
+measurement had the same warmup-dilution bug (it also divided by the full
+scene duration) and was never re-checked before landing.
+
+   For Pi4, the practical implication is that this correction pushes in
+   the same direction as the contention finding: if a margin this thin (or
+   negative) shows up on Mac once measured correctly, that's one more
+   reason not to expect the much larger Pi4 gap (below) to close on real
+   hardware.
 
 ## A cross-architecture estimate for the Pi4 leg (NOT a measurement)
 
 To make this ticket's finding actionable rather than a bare "couldn't run
 it," here is an order-of-magnitude estimate, clearly not a substitute for
-runbook data. It uses the **CPU-time ratio** (0.457x-0.472x, mean ≈ 0.463x)
-as the baseline, not the wall-clock ratio — CPU-seconds-of-work-per-
+runbook data. It uses the **warmup-corrected CPU-time ratio, estimated for
+a quiet machine** (≈0.527x-0.545x — this session's quiet-machine readings
+adjusted by the 15/13 warmup correction, since the only *directly
+measured* warmup-corrected numbers came from a heavily-loaded run; see
+above) as the baseline, not the wall-clock ratio — CPU-seconds-of-work-per-
 audio-second is the quantity that should scale with single-core throughput
 roughly independent of how many cores execute it, whereas a wall-clock
 ratio's scaling also depends on how much parallelism is available to
@@ -111,26 +171,33 @@ unknown this estimate has no data to pin down.
   Cortex-A72) ≈ 340 (raspberrypi.com's own Pi5-launch benchmarking post,
   comparing stock Pi4 against Pi5). Ratio ≈ **9.8x** single-core throughput
   in the Mac's favor.
-- Applying that ratio to the measured CPU-time ratio (0.463x mean):
-  **estimated Pi4 CPU-time ratio ≈ 4.5x** (core-seconds consumed per
-  audio-second) — i.e. roughly 4.5 Pi4 cores' worth of continuous work to
-  keep up with 1 audio-second, on a board that only has 4.
+- Applying that ratio to the estimated quiet-machine CPU-time ratio
+  (≈0.536x mean): **estimated Pi4 CPU-time ratio ≈ 5.3x** (core-seconds
+  consumed per audio-second) — i.e. roughly 5.3 Pi4 cores' worth of
+  continuous work to keep up with 1 audio-second, on a board that only has
+  4. (Using this session's actual *measured* — but heavily loaded —
+  warmup-corrected reading of ≈0.58x instead gives ≈5.7x; either way lands
+  in the same ballpark.)
 - Budget is < 1.0x. The estimate misses by a wide margin, not a narrow one
-  — sensitivity-checked down to a per-core ratio as low as ~2.2x (well
+  — sensitivity-checked down to a per-core ratio as low as ~1.9x (well
   below every published Apple-Silicon-vs-Cortex-A72 comparison, including
   the older, weaker M1) still projects a Pi4 fail. Geekbench 6 is a mixed
   synthetic suite, not manta's actual DSP workload (channelizer FFTs,
   envelope detection, decoder-pool logic), so the true ratio could
   plausibly run higher (worse for Pi4) or somewhat lower, but there's no
-  plausible reading of public cross-architecture data that closes a 4.5x
+  plausible reading of public cross-architecture data that closes a ~5x
   gap down to under 1.0x.
 
-**Working conclusion: the Pi4 leg of the M2 CPU-budget gate is likely to
-fail on real hardware, probably not marginally.** This is an estimate, held
-with moderate-not-high confidence, and MAN-18 should stay open (not closed
-as "gate passes") until `docs/RUNBOOKS/m2-pi4-cpu-budget.md` produces a
-real number. But it's confident enough to act on for the one decision that
-was actually time-sensitive here:
+**Working conclusion: the Pi4 leg of the M2 CPU-budget gate is very likely
+to fail on real hardware, and not marginally — and there is now real doubt
+about whether the Mac leg itself passes its own (tighter, 0.5x) budget
+once measured correctly.** This is an estimate, held with moderate-not-high
+confidence for the Pi4 multiplier specifically, but the Mac-side doubt is
+closer to a direct (if contention-confounded) measurement. MAN-18 should
+stay open (not closed as "gate passes") until `docs/RUNBOOKS/m2-pi4-cpu-budget.md`
+produces a real Pi4 number **and** someone re-runs the now-fixed Mac test
+on a quiet, dedicated machine. But it's confident enough to act on for the
+one decision that was actually time-sensitive here:
 
 ## MAN-30 recommendation: do not close it on this basis
 
@@ -143,13 +210,13 @@ restriction, MAN-30's scope) may not even be sufficient on its own.
 number; closing it now on the unverified assumption that the gate passes
 would be the ticket's own stated failure mode.
 
-## If it does fail on real Pi4 hardware: what to try, roughly in order of leverage
+## If it does fail on real Pi4 hardware (and possibly on a quiet Mac too): what to try, roughly in order of leverage
 
 1. **MAN-30 (band sub-segment restriction)** — cuts the number of
    simultaneously-tracked signals directly, which is the dominant cost
    driver (300 active tracks is the whole point of this bench scene).
    Likely necessary but per the estimate's margin, possibly not sufficient
-   alone if the real gap is anywhere near 4x.
+   alone if the real gap is anywhere near 5x.
 2. **Lower the channelizer sample rate for Pi4 deployments** (96 kS/s
    instead of 192 kS/s — ROADMAP already lists 96/192 kS/s as the PFB
    channelizer's supported rates) — halves the passband and therefore the

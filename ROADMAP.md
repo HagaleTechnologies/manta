@@ -58,9 +58,13 @@ KiwiSDR input.
   `crates/manta-engine/benches/cpu_budget.rs`); **Pi4 leg outstanding** —
   needs real Raspberry Pi 4 hardware, tracked as MAN-18. A cross-architecture
   estimate (not a measurement — no Pi4 was reachable to measure against) puts
-  it at ~4.5x realtime CPU-time, well over the < 1.0x budget; see
-  `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` and the run
-  procedure in `docs/RUNBOOKS/m2-pi4-cpu-budget.md`.
+  it at ~5.3x realtime CPU-time, well over the < 1.0x budget. **The Mac leg's
+  own "passes" status is now in doubt too** — 0.360x/0.457x-0.472x recorded
+  above (and in the 2026-07-24 pins doc) omitted the detector's 2s warmup
+  from the timing, diluting the ratio by ~13%; corrected, it's ≈0.53x-0.58x
+  against the < 0.5x Mac budget, i.e. likely failing, not comfortably
+  passing. See `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` and
+  the run procedure in `docs/RUNBOOKS/m2-pi4-cpu-budget.md`.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics. **Outstanding** — needs a real SDR
   and 24 unattended hours.
