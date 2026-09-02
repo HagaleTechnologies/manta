@@ -1,12 +1,14 @@
 //! Ties `grammar`/`context`/`cty`/`scp`/`confidence`/`gate`/`dedupe`
 //! together into one `Validator::ingest` entry point. ARCHITECTURE §6.
 
+use crate::blocklist::Blocklist;
 use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::dedupe::Dedupe;
 use crate::gate::RepetitionGate;
 use crate::grammar;
+use crate::notch::NotchList;
 use crate::scp;
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::{Glyph, Prosign};
@@ -122,6 +124,8 @@ pub struct Validator {
     gate: RepetitionGate,
     dedupe: Dedupe,
     freq_calibration: f64,
+    blocklist: Blocklist,
+    notch: NotchList,
 }
 
 impl Validator {
@@ -133,6 +137,8 @@ impl Validator {
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
             freq_calibration: 1.0,
+            blocklist: Blocklist::default(),
+            notch: NotchList::default(),
         }
     }
 
@@ -157,6 +163,20 @@ impl Validator {
     pub fn with_freq_correction_ppm(mut self, ppm: f64) -> Result<Self, InvalidCalibration> {
         self.freq_calibration = calibration_factor_from_ppm(ppm)?;
         Ok(self)
+    }
+
+    /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
+    /// default -- no suppression until the operator supplies one.
+    pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {
+        self.blocklist = blocklist;
+        self
+    }
+
+    /// Sets the operator's notched-frequency list (MAN-31). Empty by
+    /// default -- no suppression until the operator supplies one.
+    pub fn with_notch(mut self, notch: NotchList) -> Self {
+        self.notch = notch;
+        self
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -249,6 +269,15 @@ impl Validator {
             word.attempted = true;
             word.confidences.clone()
         };
+
+        // Operator suppression overrides (MAN-31) -- orthogonal to, and
+        // checked ahead of, the automatic validation pipeline below.
+        if self.blocklist.contains(&candidate) {
+            return Vec::new();
+        }
+        if self.notch.contains(freq_hz) {
+            return Vec::new();
+        }
 
         if !grammar::is_plausible(&candidate) {
             return Vec::new();
