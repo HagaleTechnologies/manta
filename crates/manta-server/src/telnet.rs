@@ -112,8 +112,11 @@ async fn handle_client(
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // ARCHITECTURE §7: slow clients are disconnected,
                         // never back-pressured -- and ARCHITECTURE §8:
-                        // every dropped item is counted, not silent.
-                        metrics.record_lagged(n);
+                        // every dropped item is counted, not silent. `n`
+                        // alone under-counts what's still retained in
+                        // `rx`'s own buffer that this disconnect abandons
+                        // too (round-9 review finding).
+                        metrics.record_lagged(crate::bus::total_lag_loss(n, &rx));
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),

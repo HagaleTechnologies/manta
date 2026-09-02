@@ -138,6 +138,19 @@ impl SpotBus {
     }
 }
 
+/// Total spots a subscriber will never receive once disconnected right
+/// after a `Lagged(n)` error: `n` (already evicted from the channel) plus
+/// whatever's still retained in `rx`'s own buffer (`rx.len()`) that a
+/// caller choosing to disconnect (ARCHITECTURE §7: slow clients are
+/// disconnected, never back-pressured) will never drain. Recording only
+/// `n` under-counts real loss -- ARCHITECTURE §8 requires every dropped
+/// item counted, not just the evicted portion (round-9 review finding).
+/// Shared by the telnet, JSON/TCP, and WebSocket handlers so all three
+/// count loss the same way.
+pub fn total_lag_loss(n: u64, rx: &broadcast::Receiver<BusSpot>) -> u64 {
+    n + rx.len() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +213,36 @@ mod tests {
             Err(broadcast::error::RecvError::Lagged(_)) => {}
             other => panic!("expected Lagged, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn total_lag_loss_includes_spots_still_retained_after_a_lagged_disconnect() {
+        // Regression (round-9 review): `Lagged(n)` only reports the count
+        // already EVICTED past the broadcast channel's capacity -- a
+        // subscriber this far behind can still have up to
+        // (CHANNEL_CAPACITY - n) more spots retained in the buffer that
+        // it will never see once the caller disconnects it (ARCHITECTURE
+        // §7: slow clients are disconnected, never back-pressured).
+        // Recording only `n` under-counts total loss; ARCHITECTURE §8
+        // requires every dropped item counted, not just the evicted
+        // portion.
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe();
+
+        // Publish exactly 10 past capacity: 10 evicted, CHANNEL_CAPACITY
+        // (1024) still retained -- total loss for a client about to be
+        // disconnected without ever having read anything is exactly the
+        // 1034 spots published.
+        let total_published = CHANNEL_CAPACITY as u64 + 10;
+        for i in 0..total_published {
+            bus.publish(sample_spot(i));
+        }
+
+        let n = match rx.recv().await {
+            Err(broadcast::error::RecvError::Lagged(n)) => n,
+            other => panic!("expected Lagged, got {other:?}"),
+        };
+        assert_eq!(total_lag_loss(n, &rx), total_published);
     }
 
     #[tokio::test]

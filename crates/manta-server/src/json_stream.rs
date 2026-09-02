@@ -173,7 +173,12 @@ async fn handle_tcp_client(
                         .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "write timed out"))??;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        ctx.metrics.record_lagged(n);
+                        // `n` alone under-counts: this receiver is about
+                        // to be disconnected (never drained further), so
+                        // whatever it still has retained is lost too, not
+                        // just what the channel already evicted (round-9
+                        // review finding).
+                        ctx.metrics.record_lagged(crate::bus::total_lag_loss(n, &rx));
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -255,7 +260,9 @@ async fn handle_ws_client(
                             .map_err(|_| anyhow::anyhow!("write timed out"))??;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        ctx.metrics.record_lagged(n);
+                        // See the TCP handler's identical Lagged branch
+                        // above for why `n` alone under-counts.
+                        ctx.metrics.record_lagged(crate::bus::total_lag_loss(n, &rx));
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),

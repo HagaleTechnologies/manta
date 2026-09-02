@@ -474,20 +474,33 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     Ok(hz)
 }
 
-/// Clap value parser for `--replay-epoch`: Unix seconds, non-negative
-/// (a `SystemTime` before `UNIX_EPOCH` isn't representable via the
-/// `UNIX_EPOCH + Duration` construction this flag feeds). Deliberately a
-/// plain integer, not RFC3339 or similar -- avoids pulling in a
-/// date/time-parsing dependency for one CLI flag; any real timestamp
-/// source (a recording tool's own metadata, `date +%s`) can produce Unix
-/// seconds directly.
+/// Upper bound for `--replay-epoch`: 2100-01-01T00:00:00Z in Unix seconds.
+/// No real recording needs an epoch beyond this; the bound exists purely
+/// to keep `secs` far away from the range where `SpotBus::unix_ts_for`'s
+/// `epoch + elapsed` (`SystemTime` arithmetic) could overflow and panic on
+/// the first spot delivered to any client (round-9 review finding) --
+/// generous, not tight, since the actual overflow point depends on the
+/// platform's `SystemTime` representation and isn't worth pinning exactly.
+const MAX_REPLAY_EPOCH_SECS: i64 = 4_102_444_800;
+
+/// Clap value parser for `--replay-epoch`: Unix seconds, bounded to a
+/// plausible calendar range (non-negative, before `MAX_REPLAY_EPOCH_SECS`)
+/// -- a `SystemTime` before `UNIX_EPOCH` isn't representable via the
+/// `UNIX_EPOCH + Duration` construction this flag feeds, and an
+/// unrealistically large value risks overflowing later `SystemTime`
+/// arithmetic instead of failing cleanly here. Deliberately a plain
+/// integer, not RFC3339 or similar -- avoids pulling in a date/time-
+/// parsing dependency for one CLI flag; any real timestamp source (a
+/// recording tool's own metadata, `date +%s`) can produce Unix seconds
+/// directly.
 fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
     let secs: i64 = s
         .parse()
         .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
-    if secs < 0 {
+    if !(0..=MAX_REPLAY_EPOCH_SECS).contains(&secs) {
         return Err(format!(
-            "--replay-epoch must be non-negative Unix seconds, got {secs}"
+            "--replay-epoch must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
+             (2100-01-01), got {secs}"
         ));
     }
     Ok(secs)
@@ -556,6 +569,40 @@ struct SpotServer {
 /// spot-`id`-uniqueness-only value -- pass a fixed one (e.g.
 /// `session_nonce_for_replay_path`) when replaying a file, or two runs of
 /// the same fixture emit colliding spot `id`s.
+/// How long `shutdown_runtime_with_drain_grace` blocks the current thread
+/// giving spawned client-connection tasks a chance to observe the shutdown
+/// signal and finish writing their already-queued spots. Always fully
+/// consumed (this function doesn't detect early completion), so shutdown
+/// with zero connected clients pays this cost too -- deliberately kept
+/// short since the drain work itself is just a handful of small,
+/// WRITE_TIMEOUT-bounded socket writes in the common case.
+const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Shuts down `rt`, first giving its spawned tasks `SHUTDOWN_DRAIN_GRACE`
+/// of REAL scheduler time to run. `Runtime::shutdown_timeout`'s `duration`
+/// parameter does NOT do this on its own -- verified against tokio
+/// 1.53.1's source (`runtime/runtime.rs`): `shutdown_timeout` calls
+/// `self.handle.inner.shutdown()` synchronously and IMMEDIATELY, which
+/// tears down the async executor and drops in-flight tasks the moment they
+/// next yield; the `duration` argument is passed only to
+/// `self.blocking_pool.shutdown(Some(duration))`, bounding the SEPARATE
+/// blocking-thread-pool's shutdown, not spawned `tokio::spawn` tasks. A
+/// caller that sends a shutdown signal (e.g. `SpotServer::shutdown_tx`)
+/// and immediately calls `shutdown_timeout` therefore has no guarantee the
+/// signaled tasks are ever polled again, let alone finish their drain
+/// write (round-9 review finding). `rt.block_on(sleep(..))`, by contrast,
+/// genuinely drives the runtime's workers forward for that duration,
+/// letting every other spawned task make real progress concurrently.
+fn shutdown_runtime_with_drain_grace(rt: tokio::runtime::Runtime) {
+    // `tokio::time::sleep(..)` must be constructed INSIDE a runtime
+    // context -- it registers with the timer driver at construction time,
+    // not first-poll time -- so it's built inside the async block passed
+    // to `block_on`, not as a bare argument evaluated in this sync
+    // function's own (runtime-less) context.
+    rt.block_on(async { tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await });
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+}
+
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
@@ -859,16 +906,12 @@ fn main() -> Result<()> {
             // a bare `listen(...)?` before this block used to do on any
             // error (round-7 review finding). Explicitly signal the client
             // tasks to drain (e.g. spots from TrackManager::finish() just
-            // before `listen` returned) before tearing the runtime down --
-            // shutdown_timeout's raw deadline alone doesn't guarantee a task
-            // ever gets scheduled to observe and act on already-queued
-            // spots; it just bounds how long shutdown waits before forcibly
-            // aborting.
+            // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
                 let _ = server.shutdown_tx.send(true);
             }
             if let Some(rt) = server_runtime {
-                rt.shutdown_timeout(std::time::Duration::from_secs(2));
+                shutdown_runtime_with_drain_grace(rt);
             }
             listen_result?;
         }
@@ -934,6 +977,46 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn shutdown_runtime_with_drain_grace_lets_a_spawned_task_finish() {
+        // Regression (round-9 review, verified against tokio 1.53's own
+        // source): `Runtime::shutdown_timeout`'s `duration` parameter only
+        // bounds the BLOCKING thread pool's shutdown
+        // (`self.blocking_pool.shutdown(Some(duration))`) -- the async
+        // executor itself is torn down synchronously and immediately via
+        // `self.handle.inner.shutdown()`, called before that duration is
+        // ever consulted. Calling `shutdown_timeout` right after signaling
+        // spawned client-connection tasks to drain therefore does NOT
+        // guarantee they get scheduled at all, let alone finish writing
+        // their already-queued spots. This test spawns a task that only
+        // sets a flag after being signaled AND doing a small amount of
+        // real async work (a short sleep, standing in for a socket write)
+        // -- proving the fix's `rt.block_on(sleep(...))` step actually
+        // drives the runtime forward long enough for that to happen,
+        // which a bare `shutdown_timeout` call would not.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_task = drained.clone();
+
+        rt.spawn(async move {
+            let _ = rx.changed().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drained_task.store(true, Ordering::SeqCst);
+        });
+
+        let _ = tx.send(true);
+        shutdown_runtime_with_drain_grace(rt);
+
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "the spawned task must have been given real scheduler time to finish draining before the runtime shut down"
+        );
     }
 
     #[test]
@@ -1019,6 +1102,19 @@ mod tests {
         assert!(parse_replay_epoch("-1").is_err());
         assert!(parse_replay_epoch("not-a-number").is_err());
         assert!(parse_replay_epoch("2026-07-04T12:00:00Z").is_err());
+    }
+
+    #[test]
+    fn parse_replay_epoch_rejects_unrealistic_far_future_values() {
+        // Regression (round-9 review): an unbounded upper end let
+        // i64::MAX (or anything close to it) through, which later
+        // overflows SystemTime arithmetic in SpotBus::unix_ts_for
+        // (`epoch + elapsed`) and panics on the very first spot delivered
+        // to any client -- reject it here, at CLI-parse time, with a
+        // clear error instead.
+        assert!(parse_replay_epoch(&i64::MAX.to_string()).is_err());
+        // A plausible near-future value must still be accepted.
+        assert!(parse_replay_epoch("2000000000").is_ok());
     }
 
     #[test]
