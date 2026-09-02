@@ -76,6 +76,23 @@ roughly **1.2x-1.25x parallelism** inside `decode_samples` itself, not the
    different parallelism factor is unknown; the runbook now has the
    instrumented test so that's answered directly on real hardware instead
    of assumed.
+3. **That ~6-9% headroom is not robust to realistic contention.** aldebaran
+   (this session's machine) is a shared, multi-tenant dev host, not a
+   dedicated benchmark box — `uptime` showed 12 logged-in users and a load
+   average of 10-14 on its 12 cores while re-running this test later in
+   the same session. Under that load, the CPU-time ratio measured
+   consistently at 0.504x-0.506x across 5 repeated runs (including one
+   `nice -n -5`'d) — *over* the 0.5x Mac budget, where the earlier
+   0.457x-0.472x readings came from quieter moments on the same machine.
+   Wall-clock stayed flat (~0.39x-0.40x) throughout; only the CPU-time
+   ratio moved, consistent with contention adding real scheduling/cache
+   overhead to `decode_samples`'s own work rather than just "the machine
+   felt slower." Two implications: this session's Mac-leg numbers
+   throughout are noisier than a single "0.46x, passes" headline suggests
+   — re-measure on a quiet/dedicated machine before treating the Mac leg
+   as a settled pass — and if a margin this thin can flip on a busy
+   laptop-class host, that's one more reason not to expect the much larger
+   Pi4 gap (~4.5x vs. a 1.0x budget) to close on real hardware.
 
 ## A cross-architecture estimate for the Pi4 leg (NOT a measurement)
 
