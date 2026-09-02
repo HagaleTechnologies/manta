@@ -6,8 +6,13 @@
 
 The project, GitHub repository, binary, and all workspace crates are renamed
 from `skimmer` to `manta`. Crates are `manta-{decode,dsp,input,testkit,engine,
-spot,cli}`; the future server crate is `manta-server`. The Linear team key and
-ticket prefix stay `SKI`.
+spot,cli}`; the future server crate is `manta-server`.
+
+**Update (MAN-24, 2026-09-02):** the Linear team key and ticket prefix were
+originally kept as `SKI` per this decision, but Linear's own team key was
+separately renamed to `MAN` shortly after (confirmed live via the API — same
+team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
+`project.ticketPrefix` now say `MAN` to match; see MAN-24.
 
 ## Why
 
@@ -30,8 +35,10 @@ ticket prefix stay `SKI`.
 - Prose in `README.md`, `ARCHITECTURE.md`, `ROADMAP.md`, `CLAUDE.md`,
   `SECURITY.md`, `docs/`, `wiki/`. The generic phrase "CW skimmer" is kept
   wherever it means the category.
-- `.catalyst/config.json` repository and project names. `thoughts.directory`
-  stays `skimmer` until the thoughts checkout is moved.
+- `.catalyst/config.json` repository, project, and `thoughts.directory`
+  values. The thoughts checkout itself (`repos/skimmer` in the
+  `HagaleTechnologies/thoughts` repo) was moved to `repos/manta` separately
+  in MAN-24, once `thoughts.directory` here already said `manta`.
 - Historical DECISIONS and plan documents keep their original filenames.
 - Comments inside the fleet-synced workflow files (`.github/workflows/
   wait-for-codex.yml`, `ci.yml`) and `.mergify.yml` are left as they are to

@@ -31,6 +31,11 @@ pub fn listen(
     mut on_event: impl FnMut(&DecoderEvent),
     mut on_spot: impl FnMut(&crate::Spot),
 ) -> Result<()> {
+    // Validated up front so a bad config value fails fast, before spending
+    // CALIBRATION_SECONDS reading from a live device (MAN-29).
+    let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
@@ -54,19 +59,21 @@ pub fn listen(
         cfg.detector,
         cfg.decode.clone(),
     );
-    let mut validator = Validator::bundled(fs);
+    let mut validator = Validator::bundled(fs)
+        .with_freq_correction_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
     for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&ev);
+        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&ev);
+        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
@@ -84,14 +91,14 @@ pub fn listen(
         for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
             m.saturating_sub(pad_hops) * hop
         }) {
-            on_event(&ev);
+            on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
             for spot in validator.ingest(&ev) {
                 on_spot(&spot);
             }
         }
     }
     for ev in tm.finish() {
-        on_event(&ev);
+        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
@@ -166,5 +173,109 @@ mod tests {
              (which is what a hardcoded center_freq_hz=0.0 would produce)",
             spec.center_freq_hz + 12_340.0
         );
+    }
+
+    /// MAN-29: `PipelineConfig::freq_correction_ppm` reaches the emitted
+    /// spot's `freq_hz`, corrected by the configured ppm -- end-to-end
+    /// through `listen()`, not just the `manta-spot::Validator` unit.
+    #[test]
+    fn listen_applies_freq_correction_ppm_to_emitted_spot_freq_hz() {
+        const PPM: f64 = 10.0; // ~140 Hz at 14 MHz.
+        let factor = 1.0 + PPM * 1e-6;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let cfg = PipelineConfig {
+            freq_correction_ppm: PPM,
+            ..Default::default()
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        listen(src, &cfg, stop, |_ev| {}, |spot| spots.push(spot.clone())).unwrap();
+
+        assert!(!spots.is_empty(), "V1's repeated W1AW should have spotted");
+        for spot in &spots {
+            let uncorrected = spot.freq_hz / factor;
+            assert!(
+                (uncorrected - (spec.center_freq_hz + 12_340.0)).abs() < 100.0,
+                "spot.freq_hz {} divided back by the calibration factor should land near the \
+                 raw decoded frequency {}, proving the correction was applied once, multiplicatively",
+                spot.freq_hz,
+                spec.center_freq_hz + 12_340.0
+            );
+        }
+    }
+
+    /// MAN-29 review round 3: the `TrackMeta` events `listen()` passes to
+    /// `on_event` (consumed directly by `listen --json`) must be
+    /// calibrated too, not just the emitted spots.
+    #[test]
+    fn listen_calibrates_track_meta_events_passed_to_on_event() {
+        const PPM: f64 = 10.0;
+        let factor = 1.0 + PPM * 1e-6;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig {
+            freq_correction_ppm: PPM,
+            ..Default::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut last_freq_hz = None;
+        listen(
+            src,
+            &cfg,
+            stop,
+            |ev| {
+                if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
+                    last_freq_hz = Some(*freq_hz);
+                }
+            },
+            |_spot| {},
+        )
+        .unwrap();
+
+        let freq_hz = last_freq_hz.expect("expected at least one TrackMeta event");
+        let uncorrected = freq_hz / factor;
+        assert!(
+            (uncorrected - (spec.center_freq_hz + 12_340.0)).abs() < 100.0,
+            "on_event's TrackMeta.freq_hz {freq_hz} divided back by the calibration factor \
+             should land near the raw decoded frequency {}",
+            spec.center_freq_hz + 12_340.0
+        );
+    }
+
+    /// MAN-29 review: an invalid `freq_correction_ppm` must fail `listen()`
+    /// up front rather than silently poisoning spot output.
+    #[test]
+    fn listen_rejects_an_invalid_freq_correction_ppm() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig {
+            freq_correction_ppm: f64::NAN,
+            ..Default::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(listen(src, &cfg, stop, |_ev| {}, |_spot| {}).is_err());
     }
 }
