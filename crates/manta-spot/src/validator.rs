@@ -60,6 +60,7 @@ pub struct Validator {
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
+    freq_calibration: f64,
 }
 
 impl Validator {
@@ -70,6 +71,7 @@ impl Validator {
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
+            freq_calibration: 1.0,
         }
     }
 
@@ -77,6 +79,18 @@ impl Validator {
     /// `MASTER.SCP` snapshot (`crate::CTY_DAT`/`crate::MASTER_SCP`).
     pub fn bundled(fs: f64) -> Self {
         Self::new(fs, crate::CTY_DAT, Some(crate::MASTER_SCP))
+    }
+
+    /// Sets the per-source frequency-calibration correction factor
+    /// (multiplicative, 1.0 = no correction). Corrects a systematically
+    /// drifted source clock/LO (legacy precedent: CW Skimmer/SkimSrv's
+    /// `FreqCalibration=` .ini key) -- distinct from this crate's ~10 Hz
+    /// decode-accuracy figure (ARCHITECTURE §6 step 5), which is decode
+    /// precision, not source calibration. Applied to a spot's reported
+    /// frequency before emission (MAN-29).
+    pub fn with_freq_calibration(mut self, factor: f64) -> Self {
+        self.freq_calibration = factor;
+        self
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -152,7 +166,11 @@ impl Validator {
 
         let (freq_hz, snr_db, wpm) = {
             let track = self.tracks.get(&track_id).unwrap();
-            (track.freq_hz, track.snr_db, track.wpm)
+            (
+                track.freq_hz * self.freq_calibration,
+                track.snr_db,
+                track.wpm,
+            )
         };
         let char_confidences = {
             let track = self.tracks.get_mut(&track_id).unwrap();
@@ -319,5 +337,49 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::De);
+    }
+
+    /// MAN-29: a configured per-source frequency-calibration factor
+    /// corrects a spot's reported frequency before emission -- distinct
+    /// from the ~10 Hz decode-accuracy figure (ARCHITECTURE §6 step 5),
+    /// which is decode precision, not a drifted source clock/LO.
+    #[test]
+    fn calibration_factor_corrects_emitted_spot_frequency() {
+        const RAW_FREQ_HZ: f64 = 14_027_000.0;
+        const FACTOR: f64 = 1.000_002_3; // e.g. +32 Hz at 14 MHz, LO drift scale.
+
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_freq_calibration(FACTOR);
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 1,
+            snr_2500_db: 20.0,
+            freq_hz: RAW_FREQ_HZ,
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+
+        assert_eq!(spots.len(), 1);
+        let expected = RAW_FREQ_HZ * FACTOR;
+        assert!(
+            (spots[0].freq_hz - expected).abs() < 1e-6,
+            "spot freq_hz {} should equal raw {RAW_FREQ_HZ} * factor {FACTOR} = {expected}",
+            spots[0].freq_hz
+        );
+    }
+
+    #[test]
+    fn default_calibration_factor_is_identity() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 1,
+            snr_2500_db: 20.0,
+            freq_hz: 14_027_000.0,
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].freq_hz, 14_027_000.0);
     }
 }

@@ -54,7 +54,7 @@ pub fn listen(
         cfg.detector,
         cfg.decode.clone(),
     );
-    let mut validator = Validator::bundled(fs);
+    let mut validator = Validator::bundled(fs).with_freq_calibration(cfg.freq_calibration);
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
@@ -166,5 +166,43 @@ mod tests {
              (which is what a hardcoded center_freq_hz=0.0 would produce)",
             spec.center_freq_hz + 12_340.0
         );
+    }
+
+    /// MAN-29: `PipelineConfig::freq_calibration` reaches the emitted spot's
+    /// `freq_hz`, corrected by the configured factor -- end-to-end through
+    /// `listen()`, not just the `manta-spot::Validator` unit.
+    #[test]
+    fn listen_applies_freq_calibration_to_emitted_spot_freq_hz() {
+        const FACTOR: f64 = 1.000_01; // +~140 Hz at 14 MHz.
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let cfg = PipelineConfig {
+            freq_calibration: FACTOR,
+            ..Default::default()
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        listen(src, &cfg, stop, |_ev| {}, |spot| spots.push(spot.clone())).unwrap();
+
+        assert!(!spots.is_empty(), "V1's repeated W1AW should have spotted");
+        for spot in &spots {
+            let uncorrected = spot.freq_hz / FACTOR;
+            assert!(
+                (uncorrected - (spec.center_freq_hz + 12_340.0)).abs() < 100.0,
+                "spot.freq_hz {} divided back by the calibration factor should land near the \
+                 raw decoded frequency {}, proving the factor was applied once, multiplicatively",
+                spot.freq_hz,
+                spec.center_freq_hz + 12_340.0
+            );
+        }
     }
 }

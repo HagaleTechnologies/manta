@@ -60,6 +60,13 @@ enum Command {
         /// Emit DecoderEvents as JSON Lines instead of plain text.
         #[arg(long)]
         json: bool,
+        /// Per-source frequency-calibration correction factor
+        /// (multiplicative, 1.0 = no correction), applied to a spot's
+        /// reported frequency before emission. Corrects a drifted source
+        /// clock/LO -- legacy precedent: CW Skimmer/SkimSrv's
+        /// `FreqCalibration=` .ini key.
+        #[arg(long, default_value_t = 1.0)]
+        freq_calibration: f64,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -100,6 +107,13 @@ enum Command {
         /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
         #[arg(long, requires = "kiwi_host", default_value = "")]
         kiwi_password: String,
+        /// Per-source frequency-calibration correction factor
+        /// (multiplicative, 1.0 = no correction), applied to a spot's
+        /// reported frequency before emission. Corrects a drifted source
+        /// clock/LO -- legacy precedent: CW Skimmer/SkimSrv's
+        /// `FreqCalibration=` .ini key.
+        #[arg(long, default_value_t = 1.0)]
+        freq_calibration: f64,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -242,6 +256,7 @@ fn main() -> Result<()> {
             kiwi_freq,
             kiwi_password,
             json,
+            freq_calibration,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -276,9 +291,13 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            let cfg = PipelineConfig {
+                freq_calibration,
+                ..Default::default()
+            };
             manta_engine::listen(
                 src,
-                &PipelineConfig::default(),
+                &cfg,
                 stop,
                 |ev| {
                     if json {
@@ -329,6 +348,7 @@ fn main() -> Result<()> {
             kiwi_port,
             kiwi_freq,
             kiwi_password,
+            freq_calibration,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -358,11 +378,11 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "soapy"))]
             let src = open_source(device, source, kiwi)?;
-            let report = manta_engine::soak(
-                src,
-                &PipelineConfig::default(),
-                std::time::Duration::from_secs(duration),
-            )?;
+            let cfg = PipelineConfig {
+                freq_calibration,
+                ..Default::default()
+            };
+            let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {
                 std::process::exit(1);

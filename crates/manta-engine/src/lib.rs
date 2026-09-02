@@ -18,12 +18,28 @@ use num_complex::Complex32;
 use std::path::Path;
 
 /// M0 pipeline tunables. SPEC §5.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Classical decoder tunables. SPEC §5.
     pub decode: DecodeConfig,
     /// Real multi-track detector tunables. SPEC §9 `[detector]` table.
     pub detector: track::DetectorConfig,
+    /// Per-source frequency-calibration correction factor (multiplicative,
+    /// 1.0 = no correction), applied to a spot's reported frequency before
+    /// emission. Corrects a drifted source clock/LO -- distinct from
+    /// `manta-spot`'s ~10 Hz decode-accuracy figure (ARCHITECTURE §6 step
+    /// 5), which is decode precision (MAN-29).
+    pub freq_calibration: f64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            decode: DecodeConfig::default(),
+            detector: track::DetectorConfig::default(),
+            freq_calibration: 1.0,
+        }
+    }
 }
 
 /// Result of decoding one signal from an IQ scene. SPEC §5.
@@ -133,7 +149,8 @@ pub fn decode_samples(
         _ => None,
     });
     let text = events_to_text(&this_track);
-    let mut validator = manta_spot::Validator::bundled(fs);
+    let mut validator =
+        manta_spot::Validator::bundled(fs).with_freq_calibration(cfg.freq_calibration);
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));
