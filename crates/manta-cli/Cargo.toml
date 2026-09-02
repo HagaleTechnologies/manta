@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [features]
 soapy = ["manta-input/soapy"]
+hpsdr = ["manta-input/hpsdr"]
 
 [dependencies]
 anyhow = { workspace = true }
