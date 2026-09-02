@@ -56,7 +56,11 @@ KiwiSDR input.
   passes (0.360x realtime, now including `manta-spot::Validator` cost
   per M3's engine-wiring sub-project — see
   `crates/manta-engine/benches/cpu_budget.rs`); **Pi4 leg outstanding** —
-  needs real Raspberry Pi 4 hardware.
+  needs real Raspberry Pi 4 hardware, tracked as MAN-18. A cross-architecture
+  estimate (not a measurement — no Pi4 was reachable to measure against) puts
+  it at ~3.6x–3.8x realtime, well over the < 1.0x budget; see
+  `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` and the run
+  procedure in `docs/RUNBOOKS/m2-pi4-cpu-budget.md`.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics. **Outstanding** — needs a real SDR
   and 24 unattended hours.
