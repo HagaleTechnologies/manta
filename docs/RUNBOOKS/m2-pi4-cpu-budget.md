@@ -10,13 +10,22 @@ MAN-30's fate.
 
 - A physical Raspberry Pi 4 (any RAM size; this is a CPU, not a memory,
   gate), running Raspberry Pi OS **Bookworm** (2023-10+) or another
-  glibc >= 2.35 aarch64 Linux — same baseline `pancetta`'s aarch64 target
-  already assumes (see `pancetta/README.md`).
+  glibc >= 2.35 aarch64 Linux — same baseline the sibling `pancetta`
+  repo's aarch64 target assumes (not present in a standalone manta
+  checkout — see
+  [pancetta's README](https://github.com/HagaleTechnologies/pancetta#readme),
+  a public repo, for that baseline's own rationale).
 - Nothing else competing for the Pi4's cores during the run (no desktop
   environment doing real work, no other soak/benchmark process).
-- A Rust toolchain on the Pi4 itself (native build — cross-compiling and
-  copying a binary over works too, but native `cargo test` is simpler and
-  removes a class of "did the cross build actually match" doubt).
+- A Rust toolchain on the Pi4 itself, **1.85.0 or newer** (this
+  workspace's root `Cargo.toml` sets `rust-version = "1.85.0"`; check with
+  `rustc --version` before the native build below — a fresh Raspberry Pi
+  OS install's distro-packaged `rustc` is commonly older than this and
+  will fail partway through an otherwise lengthy build. Install/update via
+  [rustup](https://rustup.rs) if so). Cross-compiling and copying a binary
+  over works too (same version requirement on the build host), but native
+  `cargo test` is simpler and removes a class of "did the cross build
+  actually match" doubt.
 
 ## Steps
 
@@ -55,12 +64,20 @@ MAN-30's fate.
    cpu_budget: <N>s wall / 58.00s steady-state audio (60.00s scene minus 2.0s detector warmup) = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
    cpu_budget: <N>s (user+sys) CPU / 58.00s steady-state audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
    ```
-   Both ratios divide by 13.0s (the 15s scene minus its 2s detector
+   Both ratios divide by 58.0s (the 60s scene minus its 2s detector
    warmup window, during which no tracks are active yet), not the full
-   15s -- dividing by the full scene duration understates the ratio by
-   diluting the steady-state cost with ~13% of near-free warmup time (a
+   60s -- dividing by the full scene duration understates the ratio by
+   diluting the steady-state cost with warmup's share of near-free time (a
    bug in earlier versions of this bench, including the 0.360x number on
    record in `docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`).
+   Warmup's share was ~13% (2s of 15s) when the scene was still 15s long;
+   the scene was later lengthened to 60s specifically to shrink that share
+   to ~3.3% (2s of 60s) and empirically confirm the correction itself was
+   accurate — both the 15s and 60s methodologies are historical at this
+   point, only the current 58.0s-denominator behavior in
+   `tests/cpu_budget.rs` is live; see
+   `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` for the full
+   history.
    - **The "tracks sustained" line must read exactly 300** (the test
      asserts `== 300`, not a tolerance band — see
      `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md`'s
