@@ -233,6 +233,13 @@ track, over a rolling text window:
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
    WPM, type, confidence.
 
+**Operator allowlist (Watch List)**: a callsign the operator explicitly lists
+bypasses steps 2 (grammar/cty) and 4 (repetition) entirely — legacy
+precedent: CW Skimmer's Watch List (Aggregator manual Appendix A2), which
+exists specifically for calls (e.g. low-repetition NCDXF beacons) that
+wouldn't otherwise pass automatic validation (MAN-28). Dedupe (step 5) still
+applies.
+
 ## 7. Output layer (`manta-server`)
 
 - **Telnet DX cluster server** (default :7300): standard login prompt, emits

@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V16: manta-spot validator vectors.
+//! SPEC-decode-core.md §7.1 V11-V17: manta-spot validator vectors.
 
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::Glyph;
@@ -160,4 +160,18 @@ fn v16_beacon_pattern_exempt_from_repetition_gate() {
     assert_eq!(spots.len(), 1, "a BEACON-tagged spot must emit on the first decode");
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
+}
+
+#[test]
+fn v17_allowlisted_call_bypasses_validation_and_repetition() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("ZZ9ZZZ");
+    let words = ["DE", "ZZ9ZZZ", "K"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(
+        spots.len(),
+        1,
+        "an allowlisted call must spot despite a bogus cty prefix and a single decode"
+    );
+    assert_eq!(spots[0].callsign, "ZZ9ZZZ");
 }

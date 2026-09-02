@@ -122,6 +122,7 @@ pub struct Validator {
     gate: RepetitionGate,
     dedupe: Dedupe,
     freq_calibration: f64,
+    allowlist: std::collections::BTreeSet<String>,
 }
 
 impl Validator {
@@ -133,6 +134,7 @@ impl Validator {
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
             freq_calibration: 1.0,
+            allowlist: std::collections::BTreeSet::new(),
         }
     }
 
@@ -157,6 +159,14 @@ impl Validator {
     pub fn with_freq_correction_ppm(mut self, ppm: f64) -> Result<Self, InvalidCalibration> {
         self.freq_calibration = calibration_factor_from_ppm(ppm)?;
         Ok(self)
+    }
+
+    /// Adds `call` to the operator's Watch List (MAN-28): an explicitly
+    /// allowlisted callsign bypasses grammar/cty validation and the
+    /// repetition gate entirely, matching CW Skimmer's Watch List
+    /// behavior (Aggregator manual Appendix A2).
+    pub fn allowlist(&mut self, call: &str) {
+        self.allowlist.insert(call.to_ascii_uppercase());
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -250,11 +260,17 @@ impl Validator {
             word.confidences.clone()
         };
 
-        if !grammar::is_plausible(&candidate) {
-            return Vec::new();
-        }
-        if !self.cty.is_allocated(&candidate) {
-            return Vec::new();
+        // MAN-28 Watch List: an allowlisted callsign bypasses
+        // grammar/cty validation and the repetition gate below entirely.
+        let is_allowlisted = self.allowlist.contains(&candidate);
+
+        if !is_allowlisted {
+            if !grammar::is_plausible(&candidate) {
+                return Vec::new();
+            }
+            if !self.cty.is_allocated(&candidate) {
+                return Vec::new();
+            }
         }
 
         let reps = self.gate.record(track_id, &candidate, sample_ts) as u32;
@@ -265,7 +281,7 @@ impl Validator {
         // ARCHITECTURE §6.4 exempts BEACON-tagged messages from the
         // repetition requirement: NCDXF-style beacons ID once per cycle,
         // so a single decode must still spot (MAN-28).
-        if spot_type != SpotType::Beacon && reps < 2 {
+        if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
             return Vec::new();
         }
         if !self
