@@ -46,7 +46,8 @@ separate jobs**, not two:
 | Capability | Disposition |
 |---|---|
 | Bayesian multi-channel CW decode (up to 700 simultaneous decoders) | **Covered** — manta's core channelizer/decoder (`manta-decode`, `manta-dsp`) |
-| CQ/DE/beacon message-context parsing, running-vs-S&P, RST(599)/QRL? extraction | **Covered** — `manta-spot` step 1, "CQ/DE context parse ... beacon patterns" (ARCHITECTURE.md §6) |
+| CQ/DE/beacon message-context parsing (running-vs-S&P proxy) | **Covered** — verified against `crates/manta-spot/src/context.rs`: `SpotType::{Cq,De,Beacon,Unknown}` is implemented and matches the exact pattern families ARCHITECTURE.md §6 describes; `Cq`/`De` classification is manta's equivalent of CW Skimmer's CQ/DE-prefix running-vs-S&P convention |
+| RST(599 label)/QRL? message-content extraction | **Gap** — see MAN-33 below. ARCHITECTURE.md §6's prose reads as if this were covered too, but `manta-spot/src/context.rs` has no RST or QRL? extraction at all — caught by Codex review on PR #57 (correctly), verified against source before filing |
 | Callsign plausibility (pattern/grammar, ITU-block rejection) | **Covered** — `manta-spot` step 2, cty.dat prefix lookup |
 | Master.dta/SCP cross-check | **Covered** — `manta-spot` step 3, `master.scp` (confidence-raising only, an improvement on Aggregator's own binary SCP filter, which the RBN team itself recommends against — see below) |
 | Verified-calls (≥2 occurrences) filtering | **Covered** — `manta-spot` step 4, repetition requirement |
@@ -56,7 +57,8 @@ separate jobs**, not two:
 | DSP audio monitoring (noise blanker/AGC/anti-click/CW filter for a human listening on headphones) | **Non-goal** — same; manta's noise/AGC handling is internal to the decode pipeline, not an operator audio-monitoring feature |
 | I/Q Recorder/player (live in-app WAV capture with RIFF metadata tags) | **Non-goal** — operators can capture raw IQ with standard OS/SDR tooling; not core to spot generation. (Distinct from manta's own WAV-based *test* corpus, MAN-20, which is a different concern.) |
 | Spectrum via UDP (feeds a power spectrum to third-party panadapters like N1MM+) | **Non-goal** — panadapter-adjacent, covered by the same non-interactive-receiver non-goal |
-| CAT/rig control (OmniRig) for band-scope alignment | **Non-goal** — per CW Skimmer's own manual, CAT is required only in 3-kHz and SoftRock-IF (narrowband) modes and is explicitly *not used* with wideband SDRs (SDR-IQ, QS1R, Mercury, Perseus) — manta's OpenHPSDR/Hermes target hardware (MAN-10/11) is in this same wideband class. Band-scope alignment itself is also panadapter-adjacent. |
+| CAT/rig control (OmniRig) for band-scope alignment, wideband sources | **Non-goal** — per CW Skimmer's own manual, CAT is required only in 3-kHz and SoftRock-IF (narrowband) modes and is explicitly *not used* with wideband SDRs (SDR-IQ, QS1R, Mercury, Perseus) — manta's OpenHPSDR/Hermes target hardware (MAN-10/11) is in this same wideband class. Band-scope alignment itself is also panadapter-adjacent. |
+| RF center-frequency reference for the rig-audio input mode | **Gap** — see MAN-34 below. Caught by Codex review on PR #57: the CAT non-goal above only holds for wideband sources — manta's already-shipped `listen`/`listen --device` audio-passband mode has no CAT need either, but also has no *other* way to know the tuned RF frequency. Verified: `AudioIqSource::center_freq_hz()` always returns `0.0` (`crates/manta-input/src/audio.rs:77`), a deliberate M1-scope decision, not a non-goal |
 | Remote SKIMMER/QSY, SKIMMER/AUDIOIF, SKIMMER/LO_FREQ (narrowband retune-by-telnet commands) | **Non-goal** — these retune a single narrowband receiver; manta's channelizer decodes the whole configured passband at once and has nothing to retune |
 | Remote SKIMMER/START, SKIMMER/STOP (process start/stop via telnet) | **Non-goal** — process lifecycle is an ops/systemd concern (MAN-21), not a wire-protocol feature |
 | Multiple instances via per-instance `.ini` files | **Covered (superseded)** — MAN-13's single-daemon multi-source model replaces this |
@@ -82,8 +84,9 @@ separate jobs**, not two:
 | Bad Calls list (operator-maintained callsign blocklist) | **Gap** — see MAN-new-4 below |
 | Notched Frequencies (operator-maintained frequency-range exclusion list, for known false-spot sources) | **Gap** — same ticket as MAN-new-4, see below |
 | Super Check Partial (MASTER.SCP) binary include-filter | **Covered, and already improved on** — manta's SCP cross-check (confidence-raising only) avoids the exact false-negative failure mode the RBN team itself warns against ("screens out ... new calls ... casual contesters") for Aggregator's binary version |
-| VHF-specific grid-format and low-SNR false-positive filters | **Covered** — out of scope entirely; manta targets HF CW, no VHF/grid-format spot class exists |
-| RBN telnet feed (forward filtered spots upstream) | **Covered** — MAN-12's telnet/JSON output serves the same role for manta's downstream consumers (cqdx, etc.) |
+| VHF-specific grid-format and low-SNR false-positive filters | **Non-goal** — corrected from an earlier "Covered" label (caught by Codex review on PR #57): manta targets HF CW only, so no VHF/grid-format spot class exists to filter — this is a non-goal, not a covered capability |
+| RBN telnet feed — inbound serving (clients connect to manta) | **Covered** — MAN-12's telnet/JSON output; a stock DX cluster client connects to and reads from manta, per ROADMAP.md M3's acceptance criterion |
+| RBN telnet feed — outbound submission (manta pushes into RBN's own network) | **Gap** — see MAN-32 below. Corrected from an earlier "Covered" label (caught by Codex review on PR #57): this is Aggregator's actual core job (§2.0 of its manual: "Forwards selected spots to the RBN server via an Internet connection") and is the opposite direction from MAN-12's inbound server — nothing in the current backlog lets manta submit itself as an RBN-contributing node |
 | Dry-run / "don't actually send to RBN" test mode | **Covered** — falls under MAN-17's non-live RBN-parity validation scope |
 | Transverter base-frequency offset | **Non-goal** — a narrow hardware-specific accessory; no MAN-10/11 target hardware is described as transverter-fed |
 | Local User Port (second telnet stream, independently configurable to show all decoded spots vs. only RBN-forwarded spots) | **Covered (implementation detail)** — a design nuance for MAN-12 to consider (single filtered stream vs. dual raw/filtered streams), not a separate capability gap |
@@ -103,6 +106,15 @@ separate jobs**, not two:
 | MAN-29 | Per-source frequency-calibration correction factor | Forum research already flagged "systematic 200+ kHz frequency-calibration errors" as a known recurring bad-spot class; CW Skimmer/SkimSrv's `FreqCalibration=` key and the Aggregator manual's dedicated calibration appendix show this is a real, actively-managed operator workflow today, with no manta equivalent |
 | MAN-30 | Configurable, optionally time-of-day-scheduled CW sub-segment decode restriction | SkimSrv's `CwSegments` (skip non-CW ranges) and Aggregator's `.ini` rotation (day/night, contest, sunrise/sunset-relative swaps) are the same underlying capability split across two legacy programs; lower priority — may be closed as unnecessary if MAN-18's Pi4 CPU-budget gate passes without it |
 | MAN-31 | Operator-configurable spot suppression: bad-call blocklist + notched frequency ranges | Manual operator override lists, orthogonal to manta-spot's automatic validation pipeline (cty.dat/SCP/plausibility); addresses a real, named failure mode (birdies/spurs at fixed frequencies, known-bad callsigns) that automatic validation doesn't catch |
+| MAN-32 | Outbound RBN submission (become an RBN-contributing node) | Aggregator's core job is pushing spots INTO the RBN network; MAN-12's telnet/JSON server is the opposite (inbound) direction. Found by Codex review on PR #57, not the original research pass — the initial matrix mis-disposed this as covered |
+| MAN-33 | RST/QRL? spot-content extraction | `manta-spot/src/context.rs` classifies CQ/DE/Beacon but has no RST or QRL? extraction, contra the original matrix's over-broad "covered" claim. Found by Codex review on PR #57, verified against source before filing |
+| MAN-34 | RF center-frequency reference for the rig-audio input mode | `AudioIqSource::center_freq_hz()` always returns `0.0` — the already-shipped `listen`/`listen --device` mode reports baseband offsets, not absolute frequency. Found by Codex review on PR #57 — the original CAT non-goal was correct for wideband sources but too broad to also cover this already-shipped narrowband mode |
+
+MAN-28 through MAN-31 came from the original research pass; MAN-32 through
+MAN-34 came from Codex's review of this PR (`docs/DECISIONS` diff), which
+caught three capabilities the original matrix had mis-disposed as
+"covered" without checking the actual source. Each was re-verified against
+`manta-spot`/`manta-input` source before filing.
 
 ## Non-goals not yet in README.md
 
@@ -112,10 +124,12 @@ accepted:
 
 - Not a multi-process Windows orchestrator — manta is a single Rust binary;
   there is no companion-program sprawl to sequence-launch.
-- No legacy soundcard/CAT audio-interface layer — manta ingests IQ over the
-  network (OpenHPSDR/Hermes, SoapySDR, file, KiwiSDR), not a soundcard, and
-  doesn't need CAT/rig control to align a narrowband receiver with a
-  channelizer that already covers the whole passband at once.
+- No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
+  CAT/rig control to align a narrowband receiver with the channelizer, for
+  manta's wideband sources. (Narrower than an earlier draft of this bullet,
+  which read as excluding manta's own already-shipped rig-audio input
+  mode entirely — caught by Codex review on PR #57; see MAN-34 above for
+  the gap that mode still has.)
 
 ## Non-outcomes
 
