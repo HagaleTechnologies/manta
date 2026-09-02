@@ -504,14 +504,14 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V29
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V30
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
-| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>` | Correct `SpotType` assigned per pattern family |
+| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
 | V14 | repetition-gate | 1 decode vs. 2 decodes of the same callsign within 90 s, non-beacon spot type | 1 rep never spots; 2 reps does |
@@ -530,6 +530,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
+| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37) | `BEACON`-tagged spot emits on the first decode, gate not applied -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern |
 
 ---
 

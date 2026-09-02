@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15, V18-V29: manta-spot validator
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V30: manta-spot validator
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
@@ -66,6 +66,7 @@ fn v11_context_parse_sets_spot_type() {
         (&["CQ", "TEST", "K5ARH", "K5ARH"], SpotType::Cq),
         (&["K5ARH", "UP", "UP"], SpotType::De),
         (&["V", "V", "V", "K5ARH", "K5ARH"], SpotType::Beacon),
+        (&["K5ARH", "T"], SpotType::Beacon),
     ];
     for (words, expected_type) in cases {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -227,9 +228,9 @@ fn blocklisted_callsign_is_never_spotted_even_if_also_allowlisted() {
 /// V20: an allowlisted callsign with no recognized CQ/DE/UP/beacon context
 /// pattern -- the primary real-world Watch List scenario (an NCDXF beacon
 /// transmits its callsign followed by power-step dashes, no framing
-/// words at all) -- must still spot. `context::parse` returns `None` for a
-/// standalone callsign; the allowlist bypass must not require a pattern
-/// match at all.
+/// words at all) -- must still spot. `context::parse` returns no matches
+/// at all for a standalone callsign; the allowlist bypass must not
+/// require a pattern match at all.
 #[test]
 fn v20_allowlisted_call_spots_with_no_context_pattern() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -502,5 +503,314 @@ fn v29_provenance_bound_to_exact_word_occurrence_across_repetitions() {
             .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::De),
         "K5ARH must not be reclassified to De just because CQ aged out, \
          even across a repeated DE K5ARH occurrence, got {spots:?}"
+    );
+}
+
+/// MAN-37: the same first-decode repetition-gate exemption V18 proves for
+/// the textual `V V V <call>` beacon preamble, extended to the power-step
+/// pattern (`<call> T`) that real NCDXF/IARU beacons actually decode as.
+#[test]
+fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(
+        spots.len(),
+        1,
+        "a power-step BEACON-tagged spot must emit on the first decode"
+    );
+    assert_eq!(spots[0].callsign, "K5ARH");
+    assert_eq!(spots[0].spot_type, SpotType::Beacon);
+}
+
+/// MAN-37 (Codex review rounds 3-6): after three consecutive rounds of
+/// position/range-based refinements to the CQ/DE-framing guard each
+/// traded one false-positive shape for another (see `context::parse`'s
+/// own docs for the full history), the guard was deliberately simplified
+/// to a coarse, whole-window rule: a bare `CQ` or `DE` token ANYWHERE in
+/// the window suppresses the power-step fallback entirely, full stop. A
+/// named-pattern match ("DE W1AW") and a power-step candidate on a
+/// DIFFERENT callsign ("K5ARH T") are genuinely independent transmission
+/// fragments, but under the coarse rule the bare "DE" still suppresses
+/// K5ARH's candidate -- W1AW still spots normally on its own.
+#[test]
+fn a_resolved_named_match_still_suppresses_an_unrelated_power_step_candidate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["DE", "W1AW", "K5ARH", "T"];
+    // De isn't exempt from the repetition gate (only Beacon is) -- decode
+    // twice so W1AW gets its own chance to spot normally.
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::De),
+        "W1AW must still spot as De, got {spots:?}"
+    );
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- the bare DE elsewhere in the \
+         window suppresses the power-step fallback entirely under the \
+         coarse guard, got {spots:?}"
+    );
+}
+
+/// MAN-37: when a named match and the power-step fallback would otherwise
+/// name the SAME callsign, e.g. a normal double-call CQ ("CQ K5ARH
+/// K5ARH") that also decodes a trailing "T", the coarse CQ/DE guard
+/// suppresses the power-step candidate outright (the bare "CQ" is
+/// present) -- K5ARH spots once, as `Cq`, with no Beacon reclassification.
+#[test]
+fn cq_call_with_trailing_t_spots_once_as_cq_not_beacon() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "K5ARH", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "K5ARH must spot as Cq, got {spots:?}"
+    );
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not also reclassify to Beacon -- the bare CQ present \
+         in the window suppresses the power-step fallback entirely under \
+         the coarse guard, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 3's original motivation, deliberately
+/// reverted along with the rest of the position-based guard -- see
+/// `context::parse`'s own docs): an unresolved "CQ DX" earlier in the
+/// window now suppresses a later, unrelated power-step beacon occurrence
+/// too, even several words on in the same 16-word window. A real NCDXF
+/// beacon repeats every ~10s, so an occasional suppression here is an
+/// accepted trade for a much simpler, more robust rule.
+#[test]
+fn a_stale_unresolved_cq_several_words_earlier_still_suppresses_a_later_beacon() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "DX", "FILLER1", "FILLER2", "FILLER3", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- the bare CQ elsewhere in the \
+         window suppresses the power-step fallback entirely under the \
+         coarse guard, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 4): two distinct power-step IDs decoding
+/// before the track's first TrackMeta (V22's `has_meta` gate, MAN-28 round
+/// 8) means NEITHER got a chance to be attempted before both arrived --
+/// collapsing to a single "best" match here would permanently lose
+/// whichever one wasn't kept. Both W1AW and K5ARH must spot once metadata
+/// arrives and the pending candidates are retried (V25).
+#[test]
+fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    let words = ["W1AW", "T", "K5ARH", "T"];
+    let none_yet = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        none_yet.is_empty(),
+        "no TrackMeta yet, must not spot with bogus telemetry, got {none_yet:?}"
+    );
+
+    let spots = v.ingest(&DecoderEvent::TrackMeta {
+        track_id: 1,
+        snr_2500_db: 15.0,
+        freq_hz: 14_020_000.0,
+    });
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
+        "W1AW must spot as Beacon once metadata arrives, got {spots:?}"
+    );
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must also spot as Beacon -- neither occurrence was ever \
+         attempted before metadata arrived, so neither may be dropped, \
+         got {spots:?}"
+    );
+}
+
+/// MAN-37: a real CQ preamble commonly repeats the callsign ("CQ DX
+/// K5ARH K5ARH") -- under the coarse whole-window guard (see
+/// `context::parse`'s own docs) the bare "CQ" suppresses the power-step
+/// fallback regardless of how many words sit between it and the
+/// candidate, so this repeated-call shape is blocked the same as any
+/// other.
+#[test]
+fn power_step_beacon_blocked_by_unresolved_cq_with_a_repeated_call_preamble() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "DX", "K5ARH", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- the repeated-call CQ preamble \
+         is still unresolved framing, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 6): two SEPARATE resolved DE fragments
+/// ("DE W1AW" and "DE N1AA") preceding a power-step candidate used to
+/// break the range-containment version of this guard (only the first
+/// named match's range was ever tracked, so the second fragment looked
+/// unresolved). Under the coarse whole-window rule the point is moot --
+/// any bare DE at all suppresses the fallback, so K5ARH is blocked
+/// regardless of how many resolved fragments came before it.
+#[test]
+fn power_step_beacon_blocked_despite_multiple_resolved_de_fragments() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["DE", "W1AW", "DE", "N1AA", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- bare DE elsewhere in the window \
+         suppresses the power-step fallback entirely, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 6): unresolved framing before the candidate
+/// and a resolved named match AFTER it used to bridge over the candidate
+/// itself in the range-containment version of this guard (the DE/CQ
+/// disambiguation range spans from the earliest bare CQ to the DE match,
+/// however far apart). Under the coarse whole-window rule the ordering is
+/// irrelevant -- any bare CQ/DE anywhere blocks the fallback.
+#[test]
+fn power_step_beacon_blocked_when_unresolved_cq_precedes_a_later_resolved_de() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "DX", "K5ARH", "T", "DE", "W1AW"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- bare CQ/DE elsewhere in the \
+         window suppresses the power-step fallback entirely, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 7): the CQ/DE guard is recomputed solely
+/// from the current window, so a withheld candidate that never reaches
+/// `Validator` never marks its word `attempted` -- once the CQ/DE token
+/// that triggered the guard ages out of the 16-word window, the SAME
+/// occurrence (no newer evidence, nothing new decoded) would otherwise
+/// pass the guard and spot as if freshly seen. `Validator` must burn a
+/// suppressed candidate's word itself so the suppression survives.
+#[test]
+fn power_step_beacon_suppression_survives_the_triggering_cq_aging_out() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "K5ARH", "T"];
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon while CQ is still in the window, \
+         got {spots:?}"
+    );
+
+    // Push 14 more words so CQ (and only CQ) ages out of the 16-word
+    // window, leaving K5ARH and T still present with no new evidence.
+    let filler: Vec<String> = (1..=14).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 100_000), &mut v));
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must still not spot as Beacon once CQ ages out -- no new \
+         evidence arrived, so the original suppression must hold, got \
+         {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 9): a power-step match must bind to the
+/// EXACT decoded word the regex captured, not whichever word currently
+/// shares its text. "CQ DX K5ARH T" suppresses and burns the original
+/// K5ARH occurrence; once exactly enough filler words evict CQ (and only
+/// CQ) at the same moment a brand-new, textually-identical but otherwise
+/// unrelated standalone "K5ARH" (no trailing T at all) decodes, a
+/// text-based lookup would incorrectly resolve the old "K5ARH T" match to
+/// this new, never-attempted word and spot it as Beacon despite it never
+/// having any power-step framing of its own.
+#[test]
+fn power_step_beacon_binds_to_the_captured_word_not_a_same_text_newer_one() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    // CQ, DX, K5ARH, T + 12 filler = 16 words: CQ is still the oldest,
+    // still in the window.
+    let words = ["CQ", "DX", "K5ARH", "T"];
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    let filler: Vec<String> = (1..=12).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 100_000), &mut v));
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot yet -- CQ is still in the window, got {spots:?}"
+    );
+
+    // One more word evicts CQ (the oldest of the now-17) and is itself a
+    // brand-new, standalone "K5ARH" with no trailing T.
+    spots.extend(run(&transmission_events(1, &["K5ARH"], 300_000), &mut v));
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must still not spot as Beacon -- the only match is the \
+         original, already-suppressed CQ DX K5ARH T occurrence; the new \
+         standalone K5ARH has no trailing T and must not inherit the old \
+         match's identity, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 10): when the power-step regex's callsign
+/// capture lands on only PART of a decoded word (its own `\b` matching
+/// mid-word right after a punctuation character glued onto a callsign,
+/// e.g. "-K5ARH"), the capture's byte range doesn't equal any word's own
+/// span -- there's no single word to bind this match to. Falling back to
+/// a text search in that case is exactly the bug round 9's exact-binding
+/// fix exists to close: it could resolve to a wholly unrelated, earlier,
+/// unsuppressed standalone "K5ARH" that was never followed by "T" at all.
+#[test]
+fn power_step_beacon_with_unmapped_exact_range_is_discarded_not_resolved_by_text() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["K5ARH", "-K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- the only power-step regex match \
+         is a partial capture inside \"-K5ARH\" with no word to bind to, \
+         and must not fall back to resolving the earlier, unrelated \
+         standalone K5ARH by text, got {spots:?}"
     );
 }
