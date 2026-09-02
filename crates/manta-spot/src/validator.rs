@@ -271,37 +271,67 @@ impl Validator {
         }
     }
 
-    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
-        let context_match = self.tracks.get(&track_id).and_then(|track| {
-            let joined: String = track
-                .words
-                .iter()
-                .map(|w| w.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            context::parse(&joined)
-        });
-        // MAN-28 Watch List: an allowlisted callsign must still be found
-        // with no recognized CQ/DE/UP/beacon context pattern at all --
-        // this is exactly the scenario real Watch Lists exist for (e.g. an
-        // NCDXF beacon transmits its callsign followed by power-step
-        // dashes, no framing words). `SpotType::Unknown` is the
-        // context-parse-documented fallback for exactly this case.
-        let Some((candidate, spot_type)) = context_match.or_else(|| {
-            self.tracks.get(&track_id).and_then(|track| {
-                track
-                    .words
-                    .iter()
-                    .rev()
-                    .find(|w| self.allowlist.contains(&w.text))
-                    .map(|w| (w.text.clone(), SpotType::Unknown))
-            })
-        }) else {
+    /// Gathers every candidate word worth evaluating this event: at most
+    /// one from context parsing, plus every allowlisted word in the
+    /// window not yet attempted. Independent sources, not one-or-the-
+    /// other by priority (MAN-28 round 7 review): a stale, already-
+    /// attempted context match elsewhere in the 16-word window must never
+    /// block discovery of a different, freshly-allowlisted word -- the
+    /// whole window is scanned (not just the newest word) so a qualifying
+    /// word is found the moment it's allowlisted, `word.attempted`
+    /// (checked in `evaluate_candidate`) prevents re-processing one this
+    /// already spotted or rejected.
+    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType)> {
+        let Some(track) = self.tracks.get(&track_id) else {
             return Vec::new();
         };
+        let mut candidates = Vec::new();
 
+        let joined: String = track
+            .words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(context_match) = context::parse(&joined) {
+            candidates.push(context_match);
+        }
+
+        // MAN-28 Watch List: an allowlisted word is found independently of
+        // context parsing -- including with no recognized CQ/DE/UP/beacon
+        // pattern at all, the primary real-world case (an NCDXF beacon
+        // transmits its callsign followed by power-step dashes, no
+        // framing words). `SpotType::Unknown` is the context-parse-
+        // documented fallback for exactly this case.
+        for word in &track.words {
+            if self.allowlist.contains(&word.text)
+                && !candidates.iter().any(|(c, _)| *c == word.text)
+            {
+                candidates.push((word.text.clone(), SpotType::Unknown));
+            }
+        }
+
+        candidates
+    }
+
+    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
+        self.candidates(track_id)
+            .into_iter()
+            .filter_map(|(candidate, spot_type)| {
+                self.evaluate_candidate(track_id, sample_ts, candidate, spot_type)
+            })
+            .collect()
+    }
+
+    fn evaluate_candidate(
+        &mut self,
+        track_id: u32,
+        sample_ts: u64,
+        candidate: String,
+        spot_type: SpotType,
+    ) -> Option<Spot> {
         let (freq_hz, snr_db, wpm) = {
-            let track = self.tracks.get(&track_id).unwrap();
+            let track = self.tracks.get(&track_id)?;
             (
                 track.freq_hz * self.freq_calibration,
                 track.snr_db,
@@ -309,12 +339,10 @@ impl Validator {
             )
         };
         let char_confidences = {
-            let track = self.tracks.get_mut(&track_id).unwrap();
-            let Some(word) = track.words.iter_mut().rev().find(|w| w.text == candidate) else {
-                return Vec::new();
-            };
+            let track = self.tracks.get_mut(&track_id)?;
+            let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
             if word.attempted {
-                return Vec::new();
+                return None;
             }
             word.attempted = true;
             word.confidences.clone()
@@ -329,11 +357,11 @@ impl Validator {
         // suppression, not silent coverage loss.
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
-            return Vec::new();
+            return None;
         }
         if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
-            return Vec::new();
+            return None;
         }
 
         // MAN-28 Watch List: an allowlisted callsign bypasses grammar/cty
@@ -342,10 +370,10 @@ impl Validator {
 
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
-                return Vec::new();
+                return None;
             }
             if !self.cty.is_allocated(&candidate) {
-                return Vec::new();
+                return None;
             }
         }
 
@@ -358,16 +386,16 @@ impl Validator {
         // repetition requirement: NCDXF-style beacons ID once per cycle,
         // so a single decode must still spot (MAN-28).
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
-            return Vec::new();
+            return None;
         }
         if !self
             .dedupe
             .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
         {
-            return Vec::new();
+            return None;
         }
 
-        vec![Spot {
+        Some(Spot {
             callsign: candidate,
             freq_hz,
             snr_db,
@@ -376,7 +404,7 @@ impl Validator {
             confidence,
             track_id,
             sample_ts,
-        }]
+        })
     }
 }
 

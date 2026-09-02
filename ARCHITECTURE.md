@@ -238,10 +238,14 @@ bypasses step 1's context-parse requirement too — not just steps 2
 (grammar/cty) and 4 (repetition) — since a listed callsign with no
 recognized CQ/DE/UP/beacon framing (tagged type `Unknown`) is exactly the
 primary real-world case: an NCDXF beacon transmits its callsign followed
-by power-step dashes, no framing words at all. Legacy precedent: CW
-Skimmer's Watch List (Aggregator manual Appendix A2), which exists
-specifically for calls that wouldn't otherwise pass automatic validation
-(MAN-28). Dedupe (step 5) still applies.
+by power-step dashes, no framing words at all. Evaluated independently of
+context parsing, not as a lower-priority fallback: a stale, already-
+processed context match elsewhere in the rolling word window never blocks
+discovery of a different, freshly-allowlisted word (`Validator::candidates`
+gathers both per event). Legacy precedent: CW Skimmer's Watch List
+(Aggregator manual Appendix A2), which exists specifically for calls that
+wouldn't otherwise pass automatic validation (MAN-28). Dedupe (step 5)
+still applies.
 
 ## 7. Output layer (`manta-server`)
 

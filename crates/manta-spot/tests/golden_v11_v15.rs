@@ -213,3 +213,23 @@ fn v20_allowlisted_call_spots_with_no_context_pattern() {
     assert_eq!(spots[0].callsign, "QQ9ZZZ");
     assert_eq!(spots[0].spot_type, SpotType::Unknown);
 }
+
+/// V21: an allowlisted word must be found independently of context
+/// parsing, not merely as a fallback when parsing finds nothing at all.
+/// A stale, already-attempted context match elsewhere in the 16-word
+/// window (here: "CQ K5ARH", attempted at an earlier word boundary, never
+/// spotted since it decoded only once) must not block discovery of a
+/// different, freshly-allowlisted word that arrives afterward in the same
+/// window.
+#[test]
+fn v21_allowlisted_word_found_despite_a_stale_attempted_context_match() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("QQ9ZZZ");
+    let words = ["CQ", "K5ARH", "QQ9ZZZ"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.iter().any(|s| s.callsign == "QQ9ZZZ"),
+        "an allowlisted word must be found even when an unrelated, \
+         already-attempted context match (K5ARH) exists in the window, got {spots:?}"
+    );
+}
