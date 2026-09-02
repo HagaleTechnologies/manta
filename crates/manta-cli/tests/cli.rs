@@ -436,7 +436,9 @@ fn hpsdr_rate_rejects_non_finite_values() {
     // parsing behavior, not part of the NaN-panic finding this test
     // covers) unless `allow_negative_numbers` is set, which this flag
     // deliberately doesn't need since every legitimate rate is positive.
-    for bad_rate in ["NaN", "inf", "0"] {
+    // "1e-20" covers the round-2 finding: finite and positive, but still
+    // small enough to overflow `Duration::from_secs_f64` downstream.
+    for bad_rate in ["NaN", "inf", "0", "1e-20"] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
             .args([
                 "listen",
@@ -457,6 +459,33 @@ fn hpsdr_rate_rejects_non_finite_values() {
         assert!(
             stderr.contains("hpsdr-rate"),
             "expected an explanatory error for --hpsdr-rate {bad_rate}, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "hpsdr")]
+fn hpsdr_freq_rejects_non_finite_and_non_positive_values() {
+    // Round-2 review finding: --hpsdr-freq was never validated at all --
+    // `HpsdrConfig` only length-checks `center_freq_hz`, not its values, so
+    // NaN/inf/non-positive input propagated into every emitted spot's
+    // frequency field. Matches `parse_dial_freq_hz`'s validation.
+    for bad_freq in ["NaN", "inf", "-inf", "0", "-14000000"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args([
+                "listen",
+                "--hpsdr-host",
+                "192.168.1.100",
+                "--hpsdr-freq",
+                bad_freq,
+                "--hpsdr-rate",
+                "192000",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--hpsdr-freq {bad_freq} should be rejected before any I/O"
         );
     }
 }

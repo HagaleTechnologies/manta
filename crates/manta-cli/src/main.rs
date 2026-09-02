@@ -144,7 +144,7 @@ enum Command {
         hpsdr_port: u16,
         /// RF center frequency in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
         hpsdr_freq: Option<f64>,
         /// Sample rate in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
@@ -258,7 +258,7 @@ enum Command {
         hpsdr_port: u16,
         /// RF center frequency in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
         hpsdr_freq: Option<f64>,
         /// Sample rate in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
@@ -564,22 +564,59 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     Ok(hz)
 }
 
+/// Lower bound for `--hpsdr-rate`: comfortably below every real HPSDR/
+/// Hermes sample rate (48 kHz-1.536 MHz) while still guaranteeing
+/// `GapDetector::new`'s `Duration::from_secs_f64(126.0 / sample_rate_hz)`
+/// (126 = `USB_FRAMES_PER_PACKET * samples_per_usb_frame(1)`, this CLI's
+/// fixed single-DDC case) stays far inside `Duration`'s representable range
+/// -- a finite, positive but tiny rate like `1e-20` still overflows it and
+/// panics (round-2 review finding: the round-1 fix rejected NaN/inf/<=0 but
+/// not an unrealistically small positive value).
+#[cfg(feature = "hpsdr")]
+const MIN_HPSDR_RATE_HZ: f64 = 1_000.0;
+/// Upper bound for `--hpsdr-rate`: generous headroom above any real
+/// HPSDR/Hermes rate, purely to keep the range symmetric and reject
+/// obviously-wrong input (e.g. a value with stray zeros) rather than to
+/// pin an exact hardware ceiling this CLI layer has no authority over.
+#[cfg(feature = "hpsdr")]
+const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
+
 /// Clap value parser for `--hpsdr-rate`: rejects non-finite (NaN/infinity)
-/// and non-positive values at CLI-parse time. `HpsdrConfig::validate`'s own
+/// and out-of-range values at CLI-parse time. `HpsdrConfig::validate`'s own
 /// `validate_ddc_config` bandwidth check silently passes a NaN rate
 /// (comparisons against NaN are always false), and the value then reaches
 /// `GapDetector::new`'s `Duration::from_secs_f64(samples_per_packet as f64
-/// / sample_rate_hz)`, which panics on NaN (round-1 review finding) --
-/// caught here instead, before any source is opened, matching
+/// / sample_rate_hz)`, which panics on NaN or an unrepresentable Duration
+/// -- caught here instead, before any source is opened, matching
 /// `parse_dial_freq_hz`'s pattern.
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --hpsdr-rate {s:?}: {e}"))?;
+    if !hz.is_finite() || !(MIN_HPSDR_RATE_HZ..=MAX_HPSDR_RATE_HZ).contains(&hz) {
+        return Err(format!(
+            "--hpsdr-rate must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
+             {MAX_HPSDR_RATE_HZ}, got {hz}"
+        ));
+    }
+    Ok(hz)
+}
+
+/// Clap value parser for `--hpsdr-freq`: rejects non-finite (NaN/infinity)
+/// and non-positive values at CLI-parse time, matching
+/// `parse_dial_freq_hz`'s pattern (round-2 review finding: an unvalidated
+/// `--hpsdr-freq NaN`/`inf` reaches `HpsdrConfig.center_freq_hz`, which is
+/// only length-checked, not value-checked, and then propagates into every
+/// emitted spot's frequency field).
+#[cfg(feature = "hpsdr")]
+fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --hpsdr-freq {s:?}: {e}"))?;
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
-            "--hpsdr-rate must be a finite, positive number of Hz, got {hz}"
+            "--hpsdr-freq must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)
