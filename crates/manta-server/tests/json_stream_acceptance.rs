@@ -370,3 +370,52 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
         other => panic!("expected the oversized message to end the connection, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
+    // Regression test (round-7 review): this server never sends Ping, so
+    // any inbound Pong is unsolicited. The round-6 fix disconnected on
+    // Text/Binary application data but still silently ignored Pong
+    // frames -- a client flooding valid small Pong frames kept the read
+    // arm perpetually ready, recreating the exact CPU-exhaustion loop the
+    // Text/Binary rejection was meant to close off.
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
+    let metrics = Arc::new(Metrics::new());
+    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        manta_server::json_stream::serve(
+            listener,
+            bus,
+            metrics,
+            cty,
+            STATION_CALL.to_string(),
+            "manta-test".to_string(),
+            shutdown_rx,
+        )
+        .await;
+    });
+
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+
+    let _ = ws.send(Message::Pong(vec![].into())).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("server never responded to the unsolicited pong");
+    match outcome {
+        None => {}                        // connection closed
+        Some(Err(_)) => {}                // protocol error surfaced to the client
+        Some(Ok(Message::Close(_))) => {} // clean close frame
+        other => panic!("expected the unsolicited pong to end the connection, got {other:?}"),
+    }
+}

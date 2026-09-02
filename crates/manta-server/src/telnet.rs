@@ -44,13 +44,23 @@ pub async fn serve(
                 continue;
             }
         };
+        // Subscribe before spawning the connection task, not just before
+        // the login handshake inside it -- `tokio::spawn` only schedules
+        // the task, it doesn't guarantee it's polled before this loop
+        // moves on to accept the next connection. A spot published after
+        // `accept()` succeeds but before the spawned task is first polled
+        // would otherwise be lost to the broadcast channel's no-history-
+        // for-late-subscribers semantics on a busy runtime or a high-rate
+        // stream (round-7 review finding; same fix applied to
+        // `json_stream::serve`'s accept loop).
+        let rx = bus.subscribe();
         let bus = bus.clone();
         let metrics = metrics.clone();
         let station_call = station_call.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             metrics.inc_telnet_clients();
-            let _ = handle_client(socket, bus, metrics.clone(), station_call, shutdown).await;
+            let _ = handle_client(socket, bus, rx, metrics.clone(), station_call, shutdown).await;
             metrics.dec_telnet_clients();
         });
     }
@@ -59,17 +69,13 @@ pub async fn serve(
 async fn handle_client(
     socket: tokio::net::TcpStream,
     bus: Arc<SpotBus>,
+    mut rx: broadcast::Receiver<crate::bus::BusSpot>,
     metrics: Arc<Metrics>,
     station_call: String,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
-
-    // Subscribe before the login handshake, not after: a spot published
-    // while the client is still typing its callsign must not be lost to
-    // the broadcast channel's no-history-for-late-subscribers semantics.
-    let mut rx = bus.subscribe();
 
     write_with_timeout(&mut wr, b"login: \r\n").await?;
     let mut login_line = String::new();

@@ -101,15 +101,18 @@ pub async fn serve(
                 continue;
             }
         };
+        // Subscribe immediately on accept, before `tokio::spawn` -- not
+        // just before the WS-detection peek inside the spawned task, which
+        // still leaves a real gap: `tokio::spawn` only schedules the task,
+        // it doesn't guarantee the task is polled before this loop moves
+        // on. A spot published after `accept()` succeeds but before the
+        // spawned task is first polled would otherwise be lost to the
+        // broadcast channel's no-history-for-late-subscribers semantics on
+        // a busy runtime or a high-rate stream (round-7 review finding;
+        // same fix applied to the telnet accept path below).
+        let rx = ctx.bus.subscribe();
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            // Subscribe immediately on accept, before the WS-detection
-            // peek (which can wait up to PEEK_TIMEOUT) -- otherwise a spot
-            // published while a connection is still being classified is
-            // lost to the broadcast channel's no-history-for-late-
-            // subscribers semantics (same class of bug the telnet server
-            // hit with subscribe-after-login).
-            let rx = ctx.bus.subscribe();
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
                 let _ = handle_ws_client(socket, rx, ctx.clone()).await;
@@ -266,7 +269,15 @@ async fn handle_ws_client(
                             .await
                             .map_err(|_| anyhow::anyhow!("write timed out"))??;
                     }
-                    Some(Ok(Message::Pong(_))) => {} // unsolicited pong: harmless, ignore
+                    // This server never sends Ping, so ANY inbound Pong is
+                    // unsolicited -- treat it the same as Text/Binary
+                    // below, not as harmless. Silently ignoring it (the
+                    // prior behavior) let a client flood valid small Pong
+                    // frames and kept this arm perpetually ready, recreating
+                    // the exact CPU-exhaustion loop the Text/Binary
+                    // rejection was meant to close off (round-7 review
+                    // finding).
+                    Some(Ok(Message::Pong(_))) => return Ok(()),
                     // Text/Binary/raw Frame: this stream is pure server
                     // push, so any application-data frame is a protocol
                     // violation -- disconnect rather than ignore. Bounding

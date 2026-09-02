@@ -144,6 +144,18 @@ enum Command {
         /// the actual DX frequency.
         #[arg(long, value_parser = parse_dial_freq_hz)]
         dial_freq_hz: Option<f64>,
+        /// Fixed replay epoch, Unix seconds -- overrides the replayed
+        /// file's own mtime as the wall-clock instant SpotBus treats as
+        /// `sample_ts == 0`. Only meaningful with --source (file replay)
+        /// and --server-config; ignored for a live source. Without this,
+        /// the epoch is the file's mtime, which is real and reproducible
+        /// for an untouched file but changes if the file is copied,
+        /// downloaded, or restored without preserving filesystem metadata
+        /// -- pass this explicitly when byte-identical JSON `timestamp`/
+        /// RBN Zulu output across environments matters more than "whatever
+        /// this machine's copy of the file happens to say."
+        #[arg(long, value_parser = parse_replay_epoch)]
+        replay_epoch: Option<i64>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -364,6 +376,24 @@ fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime
         })
 }
 
+/// Resolves the wall-clock epoch fed to `SpotBus`: an explicit
+/// `--replay-epoch` always wins when given (the escape hatch for a copy/
+/// download that didn't preserve the file's mtime); otherwise a replay
+/// session falls back to the file's own mtime, and a live session
+/// (`replay_path` is `None`) uses the current time.
+fn resolve_epoch(
+    replay_path: Option<&std::path::Path>,
+    replay_epoch: Option<i64>,
+) -> Result<std::time::SystemTime> {
+    match (replay_path, replay_epoch) {
+        (_, Some(secs)) => {
+            Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+        }
+        (Some(path), None) => epoch_for_replay_path(path),
+        (None, None) => Ok(std::time::SystemTime::now()),
+    }
+}
+
 /// Derives a stable, recording-specific session nonce from a WAV file's
 /// CONTENT (not its path): same bytes -> same nonce on every run
 /// (deterministic spot `id`s across reruns) *regardless of where the file
@@ -423,6 +453,25 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
         ));
     }
     Ok(hz)
+}
+
+/// Clap value parser for `--replay-epoch`: Unix seconds, non-negative
+/// (a `SystemTime` before `UNIX_EPOCH` isn't representable via the
+/// `UNIX_EPOCH + Duration` construction this flag feeds). Deliberately a
+/// plain integer, not RFC3339 or similar -- avoids pulling in a
+/// date/time-parsing dependency for one CLI flag; any real timestamp
+/// source (a recording tool's own metadata, `date +%s`) can produce Unix
+/// seconds directly.
+fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
+    let secs: i64 = s
+        .parse()
+        .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+    if secs < 0 {
+        return Err(format!(
+            "--replay-epoch must be non-negative Unix seconds, got {secs}"
+        ));
+    }
+    Ok(secs)
 }
 
 /// Strips a leading UTF-8 BOM (`\u{feff}`), common in Windows-authored text
@@ -614,6 +663,7 @@ fn main() -> Result<()> {
             soapy_gain,
             server_config,
             dial_freq_hz,
+            replay_epoch,
         } => {
             let is_file_replay = source.is_some();
             // Captured before `open_source` consumes `source` below --
@@ -672,37 +722,49 @@ fn main() -> Result<()> {
                 None => src,
             };
 
-            // `epoch` feeds SpotBus's wall-clock conversion (every JSON
-            // `timestamp`/RBN Zulu field a client observes) -- a live
-            // session's epoch is this process's real start time; a replay
-            // session's is the replayed file's own mtime, a genuine
-            // timestamp that's also stable across reruns of the same file
-            // (see `epoch_for_replay_path`'s doc comment for why neither
-            // "always now()" nor a content-hash alone was right). `
-            // session_nonce` is the separate, spot-id-uniqueness-only
-            // value: recording-content-derived for file replay (so
-            // different recordings never collide on id even at the same
-            // track/sample position), nanosecond-precision-now for a live
-            // session (so two live sessions started within the same
-            // wall-clock second don't collide either).
-            let epoch = match &replay_path {
-                Some(path) => epoch_for_replay_path(path)?,
-                None => std::time::SystemTime::now(),
-            };
-            let session_nonce: u128 = match &replay_path {
-                Some(path) => session_nonce_for_replay_path(path)?,
-                // Live session: `epoch` above is already SystemTime::now().
-                None => epoch
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .expect("epoch predates the Unix epoch")
-                    .as_nanos(),
-            };
-
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --server-config wasn't
-            // given, in which case `spot_server` stays None too.
+            // given, in which case `spot_server` stays None too. `epoch`/
+            // `session_nonce` are deliberately computed IN this branch, not
+            // above it -- `--source`-only replay (no --server-config) never
+            // consumes either, and computing `session_nonce` means hashing
+            // the entire replayed file a second time after it's already
+            // been opened; skip that full-file pass entirely when nothing
+            // downstream needs it (round-7 review finding).
             let (server_runtime, spot_server) = match server_config {
                 Some(path) => {
+                    // `epoch` feeds SpotBus's wall-clock conversion (every
+                    // JSON `timestamp`/RBN Zulu field a client observes) --
+                    // a live session's epoch is this process's real start
+                    // time; a replay session's defaults to the replayed
+                    // file's own mtime, a genuine timestamp that's stable
+                    // across reruns of the SAME untouched file, but changes
+                    // across a copy/download/restore that doesn't preserve
+                    // filesystem metadata even though the recording's
+                    // content is identical -- pass --replay-epoch to pin an
+                    // exact value when that matters more than "whatever
+                    // this machine's copy says" (round-7 review finding;
+                    // see the flag's own doc comment for the full
+                    // rationale, and `epoch_for_replay_path`'s for why
+                    // neither "always now()" nor a content-hash alone was
+                    // right before this flag existed). `session_nonce` is
+                    // the separate, spot-id-uniqueness-only value:
+                    // recording-content-derived for file replay (so
+                    // different recordings never collide on id even at the
+                    // same track/sample position), nanosecond-precision-now
+                    // for a live session (so two live sessions started
+                    // within the same wall-clock second don't collide
+                    // either).
+                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                    let session_nonce: u128 = match &replay_path {
+                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                        // Live session: `epoch` above is already SystemTime::now().
+                        None => epoch
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .expect("epoch predates the Unix epoch")
+                            .as_nanos(),
+                    };
+
                     let (rt, server) =
                         start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
                     // Real, if coarse, health signal: this source opened
@@ -721,7 +783,7 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            manta_engine::listen(
+            let listen_result = manta_engine::listen(
                 src,
                 &cfg,
                 stop,
@@ -769,20 +831,27 @@ fn main() -> Result<()> {
                         spot.confidence
                     );
                 },
-            )?;
+            );
 
-            // Explicitly signal the client tasks to drain (e.g. spots
-            // from TrackManager::finish() just before `listen` returned)
-            // before tearing the runtime down -- shutdown_timeout's raw
-            // deadline alone doesn't guarantee a task ever gets scheduled
-            // to observe and act on already-queued spots; it just bounds
-            // how long shutdown waits before forcibly aborting.
+            // Run the same server-shutdown sequence on BOTH the success and
+            // error paths -- an SDR disconnect or WAV read failure from
+            // `listen` must not skip draining already-published spots or
+            // abort in-flight client writes with no chance to finish, which
+            // a bare `listen(...)?` before this block used to do on any
+            // error (round-7 review finding). Explicitly signal the client
+            // tasks to drain (e.g. spots from TrackManager::finish() just
+            // before `listen` returned) before tearing the runtime down --
+            // shutdown_timeout's raw deadline alone doesn't guarantee a task
+            // ever gets scheduled to observe and act on already-queued
+            // spots; it just bounds how long shutdown waits before forcibly
+            // aborting.
             if let Some(server) = &spot_server {
                 let _ = server.shutdown_tx.send(true);
             }
             if let Some(rt) = server_runtime {
                 rt.shutdown_timeout(std::time::Duration::from_secs(2));
             }
+            listen_result?;
         }
         Command::Soak {
             duration,
@@ -846,6 +915,49 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn resolve_epoch_prefers_an_explicit_replay_epoch_over_file_mtime() {
+        // --replay-epoch must win even when a replay path is also given --
+        // it's the escape hatch for exactly the case where mtime isn't
+        // trustworthy (a copy/download that didn't preserve it).
+        let f = write_temp_file(b"resolve_epoch fixture");
+        let explicit =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_751_635_200);
+        assert_eq!(
+            resolve_epoch(Some(f.path()), Some(1_751_635_200)).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn resolve_epoch_falls_back_to_file_mtime_for_replay_without_an_explicit_epoch() {
+        let f = write_temp_file(b"resolve_epoch fixture");
+        assert_eq!(
+            resolve_epoch(Some(f.path()), None).unwrap(),
+            epoch_for_replay_path(f.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_epoch_is_now_for_a_live_session_with_no_replay_path() {
+        let before = std::time::SystemTime::now();
+        let epoch = resolve_epoch(None, None).unwrap();
+        let after = std::time::SystemTime::now();
+        assert!(epoch >= before && epoch <= after);
+    }
+
+    #[test]
+    fn parse_replay_epoch_accepts_a_unix_seconds_value() {
+        assert_eq!(parse_replay_epoch("1751635200").unwrap(), 1_751_635_200);
+    }
+
+    #[test]
+    fn parse_replay_epoch_rejects_negative_and_non_numeric_values() {
+        assert!(parse_replay_epoch("-1").is_err());
+        assert!(parse_replay_epoch("not-a-number").is_err());
+        assert!(parse_replay_epoch("2026-07-04T12:00:00Z").is_err());
     }
 
     #[test]
