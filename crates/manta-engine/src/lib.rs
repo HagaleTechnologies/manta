@@ -250,8 +250,7 @@ mod tests {
             blocklist: manta_spot::Blocklist::parse("W1AW\n"),
             ..Default::default()
         };
-        let report =
-            decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        let report = decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, &cfg).unwrap();
         assert!(
             report.spots.is_empty(),
             "blocklisted callsign must never be spotted, got {:?}",
@@ -272,8 +271,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let report =
-            decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        let report = decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, &cfg).unwrap();
         assert!(
             report.spots.is_empty(),
             "signal inside a notched range must never be spotted, got {:?}",
