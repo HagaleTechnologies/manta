@@ -72,7 +72,8 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -115,7 +116,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[arg(long, conflicts_with_all = ["device", "source"])]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -132,7 +134,8 @@ enum Command {
         /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
         /// Requires --hpsdr-freq and --hpsdr-rate.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, conflicts_with_all = ["device", "source"])]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port (default 1024, the standard Metis
         /// discovery/control port).
@@ -145,7 +148,7 @@ enum Command {
         hpsdr_freq: Option<f64>,
         /// Sample rate in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
         /// TOML config with a `[server]`-shaped `ServerConfig` (station
         /// callsign + ports). When given, also starts the telnet cluster
@@ -186,7 +189,8 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -226,7 +230,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[arg(long, conflicts_with_all = ["device", "source"])]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -243,7 +248,8 @@ enum Command {
         /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
         /// Requires --hpsdr-freq and --hpsdr-rate.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, conflicts_with_all = ["device", "source"])]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         hpsdr_host: Option<String>,
         /// HPSDR/Hermes control port (default 1024, the standard Metis
         /// discovery/control port).
@@ -256,7 +262,7 @@ enum Command {
         hpsdr_freq: Option<f64>,
         /// Sample rate in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
     },
 }
@@ -553,6 +559,27 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
             "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
+        ));
+    }
+    Ok(hz)
+}
+
+/// Clap value parser for `--hpsdr-rate`: rejects non-finite (NaN/infinity)
+/// and non-positive values at CLI-parse time. `HpsdrConfig::validate`'s own
+/// `validate_ddc_config` bandwidth check silently passes a NaN rate
+/// (comparisons against NaN are always false), and the value then reaches
+/// `GapDetector::new`'s `Duration::from_secs_f64(samples_per_packet as f64
+/// / sample_rate_hz)`, which panics on NaN (round-1 review finding) --
+/// caught here instead, before any source is opened, matching
+/// `parse_dial_freq_hz`'s pattern.
+#[cfg(feature = "hpsdr")]
+fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --hpsdr-rate {s:?}: {e}"))?;
+    if !hz.is_finite() || hz <= 0.0 {
+        return Err(format!(
+            "--hpsdr-rate must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)

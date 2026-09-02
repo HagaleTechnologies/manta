@@ -392,34 +392,105 @@ fn hpsdr_host_without_freq_and_rate_is_a_clean_error() {
 
 #[test]
 #[cfg(feature = "hpsdr")]
-fn hpsdr_host_is_accepted_by_listen_and_soak() {
+fn hpsdr_flags_are_recognized_by_listen_and_soak() {
     // Flag-recognition smoke test (MAN-51 acceptance): confirms
     // --hpsdr-host/--hpsdr-port/--hpsdr-freq/--hpsdr-rate exist on both
     // subcommands per the ticket's Gherkin -- clap must not reject them as
-    // unknown arguments. Connecting to a real device is MAN-52's job.
+    // unknown arguments. Checked via --help rather than a real invocation
+    // (round-1 review finding): actually running `listen`/`soak` with a
+    // plausible LAN host like 192.168.1.100 risks an unbounded hang on any
+    // machine where something really answers on that address -- `--help`
+    // proves flag recognition with zero I/O. Connecting to a real device
+    // is MAN-52's job.
     for sub in ["listen", "soak"] {
-        let mut args = vec![
-            sub,
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args([sub, "--help"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{sub} --help should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for flag in [
+            "--hpsdr-host",
+            "--hpsdr-port",
+            "--hpsdr-freq",
+            "--hpsdr-rate",
+        ] {
+            assert!(
+                stdout.contains(flag),
+                "{sub} --help should list {flag}, got: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "hpsdr")]
+fn hpsdr_rate_rejects_non_finite_values() {
+    // Round-1 review finding: `HpsdrConfig::validate`'s bandwidth check
+    // silently passes NaN (comparisons against NaN are always false), and
+    // the value then reaches `GapDetector::new`'s
+    // `Duration::from_secs_f64`, which panics. Caught at CLI-parse time
+    // instead, before any source is opened.
+    // "-inf"/negative values aren't exercised here: clap treats a leading
+    // "-" as a new flag rather than this value (a separate, pre-existing
+    // parsing behavior, not part of the NaN-panic finding this test
+    // covers) unless `allow_negative_numbers` is set, which this flag
+    // deliberately doesn't need since every legitimate rate is positive.
+    for bad_rate in ["NaN", "inf", "0"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args([
+                "listen",
+                "--hpsdr-host",
+                "192.168.1.100",
+                "--hpsdr-freq",
+                "14000000",
+                "--hpsdr-rate",
+                bad_rate,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--hpsdr-rate {bad_rate} should be rejected before any I/O"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("hpsdr-rate"),
+            "expected an explanatory error for --hpsdr-rate {bad_rate}, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "hpsdr")]
+fn hpsdr_host_conflicts_with_kiwi_host() {
+    // Round-1 review finding: without this, clap accepted --hpsdr-* and
+    // --kiwi-* together, opened the HPSDR source first, but reported the
+    // Kiwi source name to the server's health metrics -- silently ignoring
+    // the requested Kiwi source.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args([
+            "listen",
             "--hpsdr-host",
             "192.168.1.100",
-            "--hpsdr-port",
-            "1024",
             "--hpsdr-freq",
             "14000000",
             "--hpsdr-rate",
             "192000",
-        ];
-        if sub == "soak" {
-            args.extend(["--duration", "1"]);
-        }
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
-            .args(&args)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("unexpected argument") && !stderr.contains("unrecognized"),
-            "{sub}: --hpsdr-* flags must be recognized, got: {stderr}"
-        );
-    }
+            "--kiwi-host",
+            "example.com",
+            "--kiwi-freq",
+            "14000000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--hpsdr-host and --kiwi-host together should be a clean clap error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict error, got: {stderr}"
+    );
 }
