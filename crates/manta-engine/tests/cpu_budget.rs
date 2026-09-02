@@ -61,38 +61,63 @@ fn event_sample_ts(e: &DecoderEvent) -> Option<u64> {
     }
 }
 
-/// Count of tracks whose decode events span most of the file (first event
-/// in the opening 30%, last event in the closing 30%) -- a proxy for
-/// "concurrently active for nearly the whole run", not exact instantaneous
-/// concurrency. `decode_samples`'s public event stream has no
-/// track-opened/track-closed events, only per-character/word timestamps,
-/// so there's no way to reconstruct the true simultaneous-ACTIVE-track
-/// count from outside `TrackManager` without adding one (a
-/// `manta-engine`/`manta-dsp` production API change, out of scope for this
-/// measurement-only ticket -- see the scope note in
-/// docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md). This scene's
-/// signals are all continuous for the full 15s (`loop_text: true`, no
-/// QSB/silence), so a track that's genuinely alive throughout should show
-/// activity near both ends of the file; a track that churned open/closed
-/// through part of the run should not. Materially stronger than counting
-/// raw distinct `track_id`s (which a churning detector could inflate past
-/// 300 without ever holding anywhere near 300 open at once), though still
-/// not proof of exact simultaneity.
-fn sustained_track_count(events: &[DecoderEvent], total_samples: u64) -> usize {
-    let mut spans: HashMap<u32, (u64, u64)> = HashMap::new();
+/// Count of tracks that were producing output continuously across nearly
+/// the whole file -- a proxy for "concurrently active for nearly the whole
+/// run", not exact instantaneous concurrency. `decode_samples`'s public
+/// event stream has no track-opened/track-closed events, only per-
+/// character/word timestamps, so there's no way to reconstruct the true
+/// simultaneous-ACTIVE-track count from outside `TrackManager` without
+/// adding one (a `manta-engine`/`manta-dsp` production API change, out of
+/// scope for this measurement-only ticket -- see the scope note in
+/// docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md).
+///
+/// Two checks, both against a track's *own* sorted event timestamps:
+/// 1. First event within the opening 10%, last event within the closing
+///    10% -- catches a track promoted late or evicted early.
+/// 2. No gap between consecutive events wider than `MAX_GAP_S` -- catches
+///    the case bounds-checking alone misses: a track present near both
+///    ends of the file but silent (closed and never really "sustained")
+///    for a stretch in the middle. At 20 WPM with this scene's continuous
+///    `loop_text` CQ loop (no fading/silence), a genuinely continuous
+///    track's `CharDecoded`/`WordBoundary` events land every well under a
+///    second; `MAX_GAP_S` is set far more generous than that (but well
+///    under the ~30s GC silent-timer in `track.rs` that would close and
+///    reissue a fresh `track_id` for a real silence) specifically so this
+///    catches an internal gap, not normal per-character/word jitter.
+///
+/// Materially stronger than counting raw distinct `track_id`s (which a
+/// churning detector could inflate past 300 without ever holding anywhere
+/// near 300 open at once) or bounds-only checking (which a track that
+/// churned off only in the middle could still pass), though still not
+/// proof of exact simultaneity.
+fn sustained_track_count(events: &[DecoderEvent], total_samples: u64, fs: f64) -> usize {
+    const MAX_GAP_S: f64 = 3.0;
+
+    let mut timestamps: HashMap<u32, Vec<u64>> = HashMap::new();
     for e in events {
         let Some(ts) = event_sample_ts(e) else {
             continue;
         };
-        let entry = spans.entry(track_id(e)).or_insert((ts, ts));
-        entry.0 = entry.0.min(ts);
-        entry.1 = entry.1.max(ts);
+        timestamps.entry(track_id(e)).or_default().push(ts);
     }
-    let opens_early = total_samples / 10 * 3; // first 30%
-    let closes_late = total_samples / 10 * 7; // last 30% starts here
-    spans
+
+    let opens_early = total_samples / 10; // first 10%
+    let closes_late = total_samples / 10 * 9; // last 10% starts here
+    let max_gap_samples = (MAX_GAP_S * fs) as u64;
+
+    timestamps
         .values()
-        .filter(|&&(min_ts, max_ts)| min_ts <= opens_early && max_ts >= closes_late)
+        .filter(|ts| {
+            let mut sorted = (*ts).clone();
+            sorted.sort_unstable();
+            let (Some(&first), Some(&last)) = (sorted.first(), sorted.last()) else {
+                return false;
+            };
+            if first > opens_early || last < closes_late {
+                return false;
+            }
+            sorted.windows(2).all(|w| w[1] - w[0] <= max_gap_samples)
+        })
         .count()
 }
 
@@ -187,7 +212,7 @@ fn cpu_budget_mac_under_half_core() {
     // `sustained_track_count`'s doc comment for why this is a proxy, not
     // an exact concurrent count.
     let total_samples = iq.len() as u64;
-    let sustained = sustained_track_count(&report.events, total_samples);
+    let sustained = sustained_track_count(&report.events, total_samples, fs);
     println!(
         "cpu_budget: {sustained} tracks sustained across most of the run (scene has 300 signals)"
     );
