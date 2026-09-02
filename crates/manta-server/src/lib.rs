@@ -11,4 +11,5 @@ pub mod metrics;
 pub mod metrics_http;
 pub mod rbn;
 pub mod spot_message;
+pub mod tasks;
 pub mod telnet;

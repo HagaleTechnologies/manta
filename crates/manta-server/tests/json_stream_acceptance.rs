@@ -38,15 +38,19 @@ async fn spawn_server() -> (
 
     let bus2 = bus.clone();
     let metrics2 = metrics.clone();
+    let tasks = manta_server::tasks::new_client_tasks();
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
-            bus2,
-            metrics2,
-            cty,
-            STATION_CALL.to_string(),
-            "manta-test".to_string(),
-            shutdown_rx,
+            manta_server::json_stream::JsonStreamConfig {
+                bus: bus2,
+                metrics: metrics2,
+                cty,
+                station_call: STATION_CALL.to_string(),
+                decoder_version: "manta-test".to_string(),
+                shutdown: shutdown_rx,
+            },
+            tasks,
         )
         .await;
     });
@@ -285,15 +289,19 @@ async fn websocket_client_receives_spot_as_json_message() {
 
     let bus2 = bus.clone();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = manta_server::tasks::new_client_tasks();
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
-            bus2,
-            metrics,
-            cty,
-            STATION_CALL.to_string(),
-            "manta-test".to_string(),
-            shutdown_rx,
+            manta_server::json_stream::JsonStreamConfig {
+                bus: bus2,
+                metrics,
+                cty,
+                station_call: STATION_CALL.to_string(),
+                decoder_version: "manta-test".to_string(),
+                shutdown: shutdown_rx,
+            },
+            tasks,
         )
         .await;
     });
@@ -338,15 +346,19 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
     let addr = listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = manta_server::tasks::new_client_tasks();
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
-            bus,
-            metrics,
-            cty,
-            STATION_CALL.to_string(),
-            "manta-test".to_string(),
-            shutdown_rx,
+            manta_server::json_stream::JsonStreamConfig {
+                bus,
+                metrics,
+                cty,
+                station_call: STATION_CALL.to_string(),
+                decoder_version: "manta-test".to_string(),
+                shutdown: shutdown_rx,
+            },
+            tasks,
         )
         .await;
     });
@@ -389,15 +401,19 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
     let addr = listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = manta_server::tasks::new_client_tasks();
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
-            bus,
-            metrics,
-            cty,
-            STATION_CALL.to_string(),
-            "manta-test".to_string(),
-            shutdown_rx,
+            manta_server::json_stream::JsonStreamConfig {
+                bus,
+                metrics,
+                cty,
+                station_call: STATION_CALL.to_string(),
+                decoder_version: "manta-test".to_string(),
+                shutdown: shutdown_rx,
+            },
+            tasks,
         )
         .await;
     });

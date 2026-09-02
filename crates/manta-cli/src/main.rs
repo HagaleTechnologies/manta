@@ -553,6 +553,11 @@ struct SpotServer {
     /// an in-flight write. Call `.send(true)` before shutting the runtime
     /// down.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Every spawned telnet/JSON/WS per-client connection task, tracked so
+    /// shutdown can genuinely AWAIT their completion (bounded by
+    /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
+    /// duration -- see `shutdown_runtime_after_drain`.
+    tasks: manta_server::tasks::ClientTasks,
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
@@ -569,37 +574,39 @@ struct SpotServer {
 /// spot-`id`-uniqueness-only value -- pass a fixed one (e.g.
 /// `session_nonce_for_replay_path`) when replaying a file, or two runs of
 /// the same fixture emit colliding spot `id`s.
-/// How long `shutdown_runtime_with_drain_grace` blocks the current thread
-/// giving spawned client-connection tasks a chance to observe the shutdown
-/// signal and finish writing their already-queued spots. Always fully
-/// consumed (this function doesn't detect early completion), so shutdown
-/// with zero connected clients pays this cost too -- deliberately kept
-/// short since the drain work itself is just a handful of small,
-/// WRITE_TIMEOUT-bounded socket writes in the common case.
-const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Upper bound on how long `shutdown_runtime_after_drain` waits for
+/// spawned client-connection tasks to actually finish draining before
+/// falling through to `Runtime::shutdown_timeout`'s hard cutoff. Unlike a
+/// fixed sleep, this is a ceiling, not a guess that's always fully paid --
+/// `tasks::await_all` returns as soon as every tracked task completes, so
+/// shutdown with zero (or quickly-finishing) clients is fast regardless of
+/// this value; it only matters when a task is genuinely still writing.
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Shuts down `rt`, first giving its spawned tasks `SHUTDOWN_DRAIN_GRACE`
-/// of REAL scheduler time to run. `Runtime::shutdown_timeout`'s `duration`
-/// parameter does NOT do this on its own -- verified against tokio
+/// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
+/// every spawned client-connection task tracked in `tasks`, bounded by
+/// `SHUTDOWN_DRAIN_DEADLINE`. `Runtime::shutdown_timeout`'s `duration`
+/// parameter does not do this on its own -- verified against tokio
 /// 1.53.1's source (`runtime/runtime.rs`): `shutdown_timeout` calls
-/// `self.handle.inner.shutdown()` synchronously and IMMEDIATELY, which
-/// tears down the async executor and drops in-flight tasks the moment they
-/// next yield; the `duration` argument is passed only to
-/// `self.blocking_pool.shutdown(Some(duration))`, bounding the SEPARATE
-/// blocking-thread-pool's shutdown, not spawned `tokio::spawn` tasks. A
-/// caller that sends a shutdown signal (e.g. `SpotServer::shutdown_tx`)
-/// and immediately calls `shutdown_timeout` therefore has no guarantee the
-/// signaled tasks are ever polled again, let alone finish their drain
-/// write (round-9 review finding). `rt.block_on(sleep(..))`, by contrast,
-/// genuinely drives the runtime's workers forward for that duration,
-/// letting every other spawned task make real progress concurrently.
-fn shutdown_runtime_with_drain_grace(rt: tokio::runtime::Runtime) {
-    // `tokio::time::sleep(..)` must be constructed INSIDE a runtime
-    // context -- it registers with the timer driver at construction time,
-    // not first-poll time -- so it's built inside the async block passed
-    // to `block_on`, not as a bare argument evaluated in this sync
-    // function's own (runtime-less) context.
-    rt.block_on(async { tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await });
+/// `self.handle.inner.shutdown()` synchronously and IMMEDIATELY, tearing
+/// down the async executor and dropping in-flight tasks the moment they
+/// next yield; its `duration` argument bounds only the SEPARATE blocking-
+/// thread-pool's shutdown. An earlier version of this function papered
+/// over that with a fixed blind sleep before `shutdown_timeout` -- real
+/// scheduler time, but no guarantee the tasks actually FINISHED before the
+/// sleep elapsed and `shutdown_timeout` tore things down anyway (round-10
+/// review finding). Awaiting `tasks::await_all` instead genuinely waits
+/// for completion, up to the deadline, then still falls through to
+/// `shutdown_timeout` as a final hard backstop for anything left running
+/// past it.
+fn shutdown_runtime_after_drain(
+    rt: tokio::runtime::Runtime,
+    tasks: &manta_server::tasks::ClientTasks,
+) {
+    rt.block_on(manta_server::tasks::await_all(
+        tasks,
+        SHUTDOWN_DRAIN_DEADLINE,
+    ));
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
@@ -622,6 +629,7 @@ fn start_spot_server(
     let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
     let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -638,15 +646,19 @@ fn start_spot_server(
             metrics.clone(),
             cfg.station_callsign.clone(),
             shutdown_rx.clone(),
+            tasks.clone(),
         ));
         tokio::spawn(manta_server::json_stream::serve(
             json_listener,
-            bus.clone(),
-            metrics.clone(),
-            cty,
-            cfg.station_callsign.clone(),
-            decoder_version,
-            shutdown_rx,
+            manta_server::json_stream::JsonStreamConfig {
+                bus: bus.clone(),
+                metrics: metrics.clone(),
+                cty,
+                station_call: cfg.station_callsign.clone(),
+                decoder_version,
+                shutdown: shutdown_rx,
+            },
+            tasks.clone(),
         ));
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
@@ -662,6 +674,7 @@ fn start_spot_server(
             bus,
             metrics,
             shutdown_tx,
+            tasks,
         },
     ))
 }
@@ -910,8 +923,12 @@ fn main() -> Result<()> {
             if let Some(server) = &spot_server {
                 let _ = server.shutdown_tx.send(true);
             }
-            if let Some(rt) = server_runtime {
-                shutdown_runtime_with_drain_grace(rt);
+            // `server_runtime`/`spot_server` are always constructed as a
+            // matched pair (both `Some` or both `None`, see their
+            // construction above) -- `zip` makes that invariant explicit
+            // instead of a defensive branch for a case that can't happen.
+            if let Some((rt, server)) = server_runtime.zip(spot_server.as_ref()) {
+                shutdown_runtime_after_drain(rt, &server.tasks);
             }
             listen_result?;
         }
@@ -980,22 +997,20 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_runtime_with_drain_grace_lets_a_spawned_task_finish() {
-        // Regression (round-9 review, verified against tokio 1.53's own
-        // source): `Runtime::shutdown_timeout`'s `duration` parameter only
-        // bounds the BLOCKING thread pool's shutdown
-        // (`self.blocking_pool.shutdown(Some(duration))`) -- the async
-        // executor itself is torn down synchronously and immediately via
-        // `self.handle.inner.shutdown()`, called before that duration is
-        // ever consulted. Calling `shutdown_timeout` right after signaling
-        // spawned client-connection tasks to drain therefore does NOT
-        // guarantee they get scheduled at all, let alone finish writing
-        // their already-queued spots. This test spawns a task that only
-        // sets a flag after being signaled AND doing a small amount of
-        // real async work (a short sleep, standing in for a socket write)
-        // -- proving the fix's `rt.block_on(sleep(...))` step actually
-        // drives the runtime forward long enough for that to happen,
-        // which a bare `shutdown_timeout` call would not.
+    fn shutdown_runtime_after_drain_awaits_a_tracked_task_to_completion() {
+        // Regression (round-9/round-10 review, verified against tokio
+        // 1.53's own source): `Runtime::shutdown_timeout`'s `duration`
+        // parameter only bounds the BLOCKING thread pool's shutdown -- the
+        // async executor itself is torn down synchronously and
+        // immediately via `self.handle.inner.shutdown()`. An earlier
+        // version of this function papered over that with a fixed blind
+        // `sleep` before `shutdown_timeout`: real scheduler time, but no
+        // guarantee the task actually FINISHED before the sleep elapsed.
+        // This test spawns a task INTO the tracked `ClientTasks` registry
+        // that only sets a flag after being signaled AND doing a small
+        // amount of real async work (standing in for a socket write) --
+        // proving `shutdown_runtime_after_drain` genuinely awaits its
+        // completion rather than guessing a duration.
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -1003,19 +1018,25 @@ mod tests {
         let (tx, mut rx) = tokio::sync::watch::channel(false);
         let drained = Arc::new(AtomicBool::new(false));
         let drained_task = drained.clone();
+        let tasks = manta_server::tasks::new_client_tasks();
 
-        rt.spawn(async move {
-            let _ = rx.changed().await;
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            drained_task.store(true, Ordering::SeqCst);
+        rt.block_on({
+            let tasks = tasks.clone();
+            async move {
+                tasks.lock().await.spawn(async move {
+                    let _ = rx.changed().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    drained_task.store(true, Ordering::SeqCst);
+                });
+            }
         });
 
         let _ = tx.send(true);
-        shutdown_runtime_with_drain_grace(rt);
+        shutdown_runtime_after_drain(rt, &tasks);
 
         assert!(
             drained.load(Ordering::SeqCst),
-            "the spawned task must have been given real scheduler time to finish draining before the runtime shut down"
+            "the tracked task must have been genuinely awaited to completion before the runtime shut down"
         );
     }
 

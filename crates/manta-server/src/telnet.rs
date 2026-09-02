@@ -10,6 +10,7 @@ use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
 use crate::rbn;
+use crate::tasks::ClientTasks;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -35,6 +36,7 @@ pub async fn serve(
     metrics: Arc<Metrics>,
     station_call: String,
     shutdown: watch::Receiver<bool>,
+    tasks: ClientTasks,
 ) {
     loop {
         let (socket, _peer) = match listener.accept().await {
@@ -58,7 +60,11 @@ pub async fn serve(
         let metrics = metrics.clone();
         let station_call = station_call.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        // Tracked in the shared `ClientTasks` registry (not a bare
+        // `tokio::spawn`) so a shutdown sequence can genuinely AWAIT this
+        // task's completion instead of guessing a fixed grace period
+        // (round-10 review finding).
+        tasks.lock().await.spawn(async move {
             metrics.inc_telnet_clients();
             let _ = handle_client(socket, bus, rx, metrics.clone(), station_call, shutdown).await;
             metrics.dec_telnet_clients();

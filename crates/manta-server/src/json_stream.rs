@@ -10,6 +10,7 @@
 use crate::bus::{BusSpot, SpotBus};
 use crate::metrics::Metrics;
 use crate::spot_message::SpotMessage;
+use crate::tasks::ClientTasks;
 use manta_spot::cty::Table;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,24 +75,30 @@ impl ClientCtx {
     }
 }
 
+/// Everything `serve` needs to start accepting JSON/WebSocket clients,
+/// besides the listener itself and the shared `ClientTasks` registry --
+/// grouped to keep `serve`'s arity sane as this crate's shared-context
+/// list grows (the same reasoning that produced the internal `ClientCtx`
+/// this gets unpacked into).
+pub struct JsonStreamConfig {
+    pub bus: Arc<SpotBus>,
+    pub metrics: Arc<Metrics>,
+    pub cty: Arc<Table>,
+    pub station_call: String,
+    pub decoder_version: String,
+    pub shutdown: watch::Receiver<bool>,
+}
+
 /// Accepts connections on `listener`, dispatching each to the plain-TCP or
 /// WebSocket handler based on a non-destructive peek of its first bytes.
-pub async fn serve(
-    listener: TcpListener,
-    bus: Arc<SpotBus>,
-    metrics: Arc<Metrics>,
-    cty: Arc<Table>,
-    station_call: String,
-    decoder_version: String,
-    shutdown: watch::Receiver<bool>,
-) {
+pub async fn serve(listener: TcpListener, config: JsonStreamConfig, tasks: ClientTasks) {
     let ctx = ClientCtx {
-        bus,
-        metrics,
-        cty,
-        station_call,
-        decoder_version,
-        shutdown,
+        bus: config.bus,
+        metrics: config.metrics,
+        cty: config.cty,
+        station_call: config.station_call,
+        decoder_version: config.decoder_version,
+        shutdown: config.shutdown,
     };
     loop {
         let (socket, _peer) = match listener.accept().await {
@@ -112,7 +119,11 @@ pub async fn serve(
         // same fix applied to the telnet accept path below).
         let rx = ctx.bus.subscribe();
         let ctx = ctx.clone();
-        tokio::spawn(async move {
+        // Tracked in the shared `ClientTasks` registry (not a bare
+        // `tokio::spawn`) so a shutdown sequence can genuinely AWAIT this
+        // task's completion instead of guessing a fixed grace period
+        // (round-10 review finding).
+        tasks.lock().await.spawn(async move {
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
                 let _ = handle_ws_client(socket, rx, ctx.clone()).await;
