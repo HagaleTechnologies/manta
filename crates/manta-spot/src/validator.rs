@@ -354,7 +354,15 @@ impl Validator {
     /// SAME decoded word (its own seq-based provenance guard decides
     /// whether the second is a genuine reclassification), rather than a
     /// text-position heuristic inside `context::parse`.
-    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType, u64)> {
+    ///
+    /// The 4th element is `Some(exact seq)` for a power-step-origin
+    /// candidate -- the specific `Word` the regex actually captured, found
+    /// by matching `context::parse`'s exact-call-range against a word's
+    /// own span -- or `None` for a named-pattern-origin one, which
+    /// `evaluate_candidate` resolves by text instead (see `context::parse`'s
+    /// own docs for why the two pattern families need different
+    /// resolution strategies; Codex review on PR #65, round 9).
+    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType, u64, Option<u64>)> {
         let Some(track) = self.tracks.get(&track_id) else {
             return Vec::new();
         };
@@ -373,14 +381,20 @@ impl Validator {
             joined.push_str(&word.text);
             word_spans.push((start, joined.len(), word.seq));
         }
-        for (candidate, spot_type, range) in context::parse(&joined) {
+        for (candidate, spot_type, range, exact_range) in context::parse(&joined) {
             let involved_max_seq = word_spans
                 .iter()
                 .filter(|(start, end, _)| *start < range.end && range.start < *end)
                 .map(|(_, _, seq)| *seq)
                 .max()
                 .unwrap_or(0);
-            candidates.push((candidate, spot_type, involved_max_seq));
+            let exact_seq = exact_range.and_then(|r| {
+                word_spans
+                    .iter()
+                    .find(|(start, end, _)| *start == r.start && *end == r.end)
+                    .map(|(_, _, seq)| *seq)
+            });
+            candidates.push((candidate, spot_type, involved_max_seq, exact_seq));
         }
 
         // MAN-28 Watch List: an allowlisted word is found independently of
@@ -391,9 +405,9 @@ impl Validator {
         // documented fallback for exactly this case.
         for word in &track.words {
             if self.allowlist.contains(&word.text)
-                && !candidates.iter().any(|(c, _, _)| *c == word.text)
+                && !candidates.iter().any(|(c, _, _, _)| *c == word.text)
             {
-                candidates.push((word.text.clone(), SpotType::Unknown, word.seq));
+                candidates.push((word.text.clone(), SpotType::Unknown, word.seq, None));
             }
         }
 
@@ -402,16 +416,19 @@ impl Validator {
 
     /// Every power-step match `context::parse` currently withholds because
     /// of its CQ/DE guard (MAN-37), paired with the highest `Word::seq`
-    /// involved -- same computation `candidates` does for accepted
-    /// matches. Not filtered against `accepted`: a word can be BOTH an
-    /// accepted candidate through a different, narrower-ranged match (e.g.
-    /// "CQ K5ARH T" -- CQ_CALL_RE resolves "CQ K5ARH" with no filler at
-    /// all, but that match's own range doesn't cover the trailing "T")
-    /// AND have its power-step candidacy on the SAME word suppressed by
-    /// the whole-window CQ/DE guard; burning must still record that the
-    /// trailing word was already considered, or the accepted match's own,
-    /// narrower `classified_max_seq` won't account for it (MAN-37 review).
-    fn suppressed_power_step_candidates(&self, track_id: u32) -> Vec<(String, u64)> {
+    /// involved (same computation `candidates` does for accepted matches)
+    /// and the exact seq of the specific `Word` the regex captured (see
+    /// `candidates`'s own docs on why power-step candidates need exact,
+    /// not text-based, word identity). Not filtered against `accepted`: a
+    /// word can be BOTH an accepted candidate through a different,
+    /// narrower-ranged match (e.g. "CQ K5ARH T" -- CQ_CALL_RE resolves "CQ
+    /// K5ARH" with no filler at all, but that match's own range doesn't
+    /// cover the trailing "T") AND have its power-step candidacy on the
+    /// SAME word suppressed by the whole-window CQ/DE guard; burning must
+    /// still record that the trailing word was already considered, or the
+    /// accepted match's own, narrower `classified_max_seq` won't account
+    /// for it (MAN-37 review).
+    fn suppressed_power_step_candidates(&self, track_id: u32) -> Vec<(String, u64, u64)> {
         let Some(track) = self.tracks.get(&track_id) else {
             return Vec::new();
         };
@@ -430,14 +447,23 @@ impl Validator {
         }
         context::power_step_candidates(&joined)
             .into_iter()
-            .map(|(call, range)| {
+            .filter_map(|(call, range, call_range)| {
                 let involved_max_seq = word_spans
                     .iter()
                     .filter(|(start, end, _)| *start < range.end && range.start < *end)
                     .map(|(_, _, seq)| *seq)
                     .max()
                     .unwrap_or(0);
-                (call, involved_max_seq)
+                // The exact word the regex captured must be identifiable,
+                // or there's nothing to bind this candidate to -- skip
+                // rather than fall back to a text search, which is
+                // precisely the ambiguity this whole mechanism exists to
+                // avoid (Codex review on PR #65, round 9).
+                let exact_seq = word_spans
+                    .iter()
+                    .find(|(start, end, _)| *start == call_range.start && *end == call_range.end)
+                    .map(|(_, _, seq)| *seq)?;
+                Some((call, involved_max_seq, exact_seq))
             })
             .collect()
     }
@@ -457,16 +483,22 @@ impl Validator {
     /// is never weakened, only ever given a fuller picture of what's
     /// already been considered. A genuinely newer word arriving later
     /// still gets a fair, real reclassification, exactly as before.
+    ///
+    /// Resolved by `exact_seq`, not by text -- the exact `Word` the regex
+    /// captured, not whichever word currently shares its text. Otherwise a
+    /// stale, already-suppressed match's callsign could get bound to a
+    /// brand-new, unrelated word decoded later that merely shares the same
+    /// callsign string (Codex review on PR #65, round 9).
     fn burn_suppressed_power_step_candidate(
         &mut self,
         track_id: u32,
-        call: &str,
+        exact_seq: u64,
         involved_max_seq: u64,
     ) {
         let Some(track) = self.tracks.get_mut(&track_id) else {
             return;
         };
-        let Some(word) = track.words.iter_mut().rev().find(|w| w.text == call) else {
+        let Some(word) = track.words.iter_mut().find(|w| w.seq == exact_seq) else {
             return;
         };
         let involved_max_seq = involved_max_seq.max(word.seq);
@@ -492,12 +524,20 @@ impl Validator {
         let suppressed = self.suppressed_power_step_candidates(track_id);
         let spots = candidates
             .into_iter()
-            .filter_map(|(candidate, spot_type, involved_max_seq)| {
-                self.evaluate_candidate(track_id, sample_ts, candidate, spot_type, involved_max_seq)
+            .filter_map(|(candidate, spot_type, involved_max_seq, exact_seq)| {
+                self.evaluate_candidate(
+                    track_id,
+                    sample_ts,
+                    candidate,
+                    spot_type,
+                    involved_max_seq,
+                    exact_seq,
+                )
             })
             .collect();
-        for (call, involved_max_seq) in suppressed {
-            self.burn_suppressed_power_step_candidate(track_id, &call, involved_max_seq);
+        for (_call, involved_max_seq, exact_seq) in suppressed {
+            // Identity resolved via exact_seq, not text -- see burn's own docs.
+            self.burn_suppressed_power_step_candidate(track_id, exact_seq, involved_max_seq);
         }
         spots
     }
@@ -509,6 +549,7 @@ impl Validator {
         candidate: String,
         spot_type: SpotType,
         involved_max_seq: u64,
+        exact_seq: Option<u64>,
     ) -> Option<Spot> {
         let (freq_hz, snr_db, wpm) = {
             let track = self.tracks.get(&track_id)?;
@@ -520,19 +561,30 @@ impl Validator {
         };
         let (char_confidences, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
-            let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
-            // context::parse's regex matches the FIRST occurrence of a
-            // repeated pattern in the joined text, but this lookup always
-            // selects the NEWEST word with matching text -- when the same
-            // callsign has decoded more than once, those can be two
-            // different Word occurrences. Clamping to the selected word's
-            // own seq guarantees involved_max_seq is never understated
-            // relative to the occurrence actually being evaluated (a
-            // word's own seq is always a valid lower bound on its true
-            // provenance), closing the mismatch that let a stale,
-            // first-occurrence-derived seq pass the aging-out guard above
-            // as if it were genuinely new context (MAN-28 round 13
-            // review).
+            // Named patterns resolve by text, always to the NEWEST word
+            // sharing it (MAN-28 round 13, V29 -- a repeated "DE K5ARH ...
+            // DE K5ARH" must credit the newest occurrence, not whichever
+            // one DE_RE's own match happens to describe). Power-step
+            // candidates instead carry `exact_seq`, the specific `Word`
+            // context::parse's regex actually captured -- a text search
+            // here could otherwise bind a stale, already-suppressed
+            // match's callsign to an unrelated, brand-new same-text word
+            // (Codex review on PR #65, round 9). The two pattern families
+            // need opposite resolution strategies; see context::parse's
+            // own docs for why both are genuine, already-tested
+            // requirements.
+            let word = if let Some(seq) = exact_seq {
+                track.words.iter_mut().find(|w| w.seq == seq)?
+            } else {
+                track.words.iter_mut().rev().find(|w| w.text == candidate)?
+            };
+            // Clamping to the selected word's own seq guarantees
+            // involved_max_seq is never understated relative to the
+            // occurrence actually being evaluated (a word's own seq is
+            // always a valid lower bound on its true provenance), closing
+            // the mismatch that let a stale, first-occurrence-derived seq
+            // pass the aging-out guard above as if it were genuinely new
+            // context (MAN-28 round 13 review).
             let involved_max_seq = involved_max_seq.max(word.seq);
             if word.attempted {
                 // A prior attempt is only a genuine reclassification --

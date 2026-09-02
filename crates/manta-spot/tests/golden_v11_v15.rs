@@ -746,3 +746,46 @@ fn power_step_beacon_suppression_survives_the_triggering_cq_aging_out() {
          {spots:?}"
     );
 }
+
+/// MAN-37 (Codex review round 9): a power-step match must bind to the
+/// EXACT decoded word the regex captured, not whichever word currently
+/// shares its text. "CQ DX K5ARH T" suppresses and burns the original
+/// K5ARH occurrence; once exactly enough filler words evict CQ (and only
+/// CQ) at the same moment a brand-new, textually-identical but otherwise
+/// unrelated standalone "K5ARH" (no trailing T at all) decodes, a
+/// text-based lookup would incorrectly resolve the old "K5ARH T" match to
+/// this new, never-attempted word and spot it as Beacon despite it never
+/// having any power-step framing of its own.
+#[test]
+fn power_step_beacon_binds_to_the_captured_word_not_a_same_text_newer_one() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    // CQ, DX, K5ARH, T + 12 filler = 16 words: CQ is still the oldest,
+    // still in the window.
+    let words = ["CQ", "DX", "K5ARH", "T"];
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    let filler: Vec<String> = (1..=12).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 100_000), &mut v));
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot yet -- CQ is still in the window, got {spots:?}"
+    );
+
+    // One more word evicts CQ (the oldest of the now-17) and is itself a
+    // brand-new, standalone "K5ARH" with no trailing T.
+    spots.extend(run(&transmission_events(1, &["K5ARH"], 300_000), &mut v));
+
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must still not spot as Beacon -- the only match is the \
+         original, already-suppressed CQ DX K5ARH T occurrence; the new \
+         standalone K5ARH has no trailing T and must not inherit the old \
+         match's identity, got {spots:?}"
+    );
+}

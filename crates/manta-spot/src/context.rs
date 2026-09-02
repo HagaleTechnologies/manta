@@ -22,6 +22,12 @@ pub enum SpotType {
     Unknown,
 }
 
+/// One `parse` match: callsign (uppercased), spot type, the full match's
+/// byte range, and -- for a power-step-origin match only -- the exact
+/// range of the callsign capture itself. See `parse`'s own docs for what
+/// the last field is for and why only the power-step family gets it.
+pub type ContextMatch = (String, SpotType, Range<usize>, Option<Range<usize>>);
+
 static BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bV\s+V\s+V\s+([A-Z0-9/]{3,15})\b").unwrap());
 static DE_RE: LazyLock<Regex> =
@@ -88,12 +94,32 @@ fn parse_named_pattern(text: &str) -> Option<(String, SpotType, Range<usize>)> {
 /// permanently loses it (Codex review on PR #65, round 4). `Validator`'s
 /// own per-word `attempted` state -- not this function -- is what stops a
 /// genuinely already-resolved word from being reprocessed.
-fn parse_power_step_beacons(text: &str) -> Vec<(String, SpotType, Range<usize>)> {
+///
+/// Returns, per match: the callsign (uppercased), the full match's byte
+/// range (callsign + trailing "T", used to compute which words are
+/// "involved" for the reclassification-aging guard, same as every other
+/// pattern family), and the CALLSIGN CAPTURE'S OWN range alone. The
+/// latter identifies the exact decoded word the callsign landed on --
+/// `Validator` uses it (unlike named patterns, which resolve by text; see
+/// `parse`'s own docs) to bind a match to that specific word rather than
+/// searching for the newest word sharing its text, since two textually
+/// identical but semantically unrelated power-step occurrences -- one
+/// stale/suppressed, one a brand-new decode with no trailing "T" at all
+/// -- can otherwise get conflated purely by sharing a callsign string
+/// once the newer one evicts the framing that suppressed the older
+/// (Codex review on PR #65, round 9).
+fn parse_power_step_beacons(text: &str) -> Vec<(String, SpotType, Range<usize>, Range<usize>)> {
     POWER_STEP_BEACON_RE
         .captures_iter(text)
         .map(|caps| {
             let m = caps.get(0).unwrap();
-            (caps[1].to_uppercase(), SpotType::Beacon, m.range())
+            let call = caps.get(1).unwrap();
+            (
+                caps[1].to_uppercase(),
+                SpotType::Beacon,
+                m.range(),
+                call.range(),
+            )
         })
         .collect()
 }
@@ -151,13 +177,29 @@ fn parse_power_step_beacons(text: &str) -> Vec<(String, SpotType, Range<usize>)>
 /// also appears anywhere in `text` -- the common "CQ CQ DE <call>"
 /// transmission shape, where the callsign always follows `DE` but the
 /// operator is calling CQ, not answering one.
-pub fn parse(text: &str) -> Vec<(String, SpotType, Range<usize>)> {
+///
+/// The 4th element of each returned tuple is `Some(exact call-word range)`
+/// for a power-step-origin candidate, `None` for a named-pattern-origin
+/// one. Named patterns deliberately do NOT get exact-word binding: V29
+/// (MAN-28 round 13) depends on `Validator` resolving a named candidate to
+/// the NEWEST word sharing its text, specifically ignoring which
+/// occurrence the regex itself matched (a repeated "DE K5ARH ... DE
+/// K5ARH" must credit the newest occurrence, not the first one DE_RE's
+/// own match happens to describe). The power-step fallback needs the
+/// opposite: exact binding to the one word the regex actually captured,
+/// not a text search that could land on an unrelated, unsuppressed same-
+/// text word (round 9). Both are real, already-tested requirements that
+/// directly conflict for a single shared resolution strategy, so each
+/// pattern family gets the one it needs.
+pub fn parse(text: &str) -> Vec<ContextMatch> {
     let mut candidates = Vec::new();
-    if let Some(n) = parse_named_pattern(text) {
-        candidates.push(n);
+    if let Some((call, ty, range)) = parse_named_pattern(text) {
+        candidates.push((call, ty, range, None));
     }
     if !power_step_framing_is_unresolved(text) {
-        candidates.extend(parse_power_step_beacons(text));
+        for (call, ty, range, call_range) in parse_power_step_beacons(text) {
+            candidates.push((call, ty, range, Some(call_range)));
+        }
     }
     candidates
 }
@@ -178,10 +220,15 @@ pub fn power_step_framing_is_unresolved(text: &str) -> bool {
 /// withheld candidate never reaches `Validator` and so never marks
 /// anything attempted -- letting the SAME, no-newer-evidence occurrence
 /// spot later as if newly decoded (Codex review on PR #65, round 7).
-pub fn power_step_candidates(text: &str) -> Vec<(String, Range<usize>)> {
+///
+/// Returns (callsign, full match range, callsign-only range) -- see
+/// `parse`'s own docs for why the callsign-only range matters (round 9):
+/// `Validator` uses it to burn the EXACT word the regex captured, not
+/// whichever word currently shares that callsign's text.
+pub fn power_step_candidates(text: &str) -> Vec<(String, Range<usize>, Range<usize>)> {
     parse_power_step_beacons(text)
         .into_iter()
-        .map(|(call, _, range)| (call, range))
+        .map(|(call, _, range, call_range)| (call, range, call_range))
         .collect()
 }
 
@@ -192,7 +239,7 @@ mod tests {
     /// Asserts only the candidate/type of every returned match, ignoring
     /// byte ranges (exercised by their own tests below) and order.
     fn parse_types(text: &str) -> Vec<(String, SpotType)> {
-        parse(text).into_iter().map(|(c, t, _)| (c, t)).collect()
+        parse(text).into_iter().map(|(c, t, _, _)| (c, t)).collect()
     }
 
     #[test]
@@ -245,9 +292,13 @@ mod tests {
         let text = "DE K5ARH K";
         let candidates = parse(text);
         assert_eq!(candidates.len(), 1);
-        let (_, ty, range) = &candidates[0];
+        let (_, ty, range, exact) = &candidates[0];
         assert_eq!(*ty, SpotType::De);
         assert_eq!(&text[range.clone()], "DE K5ARH");
+        assert_eq!(
+            *exact, None,
+            "named-pattern candidates get no exact-word range"
+        );
     }
 
     #[test]
@@ -258,7 +309,7 @@ mod tests {
         let text = "DE K5ARH CQ";
         let candidates = parse(text);
         assert_eq!(candidates.len(), 1);
-        let (_, ty, range) = &candidates[0];
+        let (_, ty, range, _) = &candidates[0];
         assert_eq!(*ty, SpotType::Cq);
         assert_eq!(&text[range.clone()], "DE K5ARH CQ");
     }
@@ -360,8 +411,25 @@ mod tests {
         assert!(power_step_framing_is_unresolved("CQ DX K5ARH T"));
         assert_eq!(
             power_step_candidates("CQ DX K5ARH T"),
-            vec![("K5ARH".to_string(), 6..13)]
+            vec![("K5ARH".to_string(), 6..13, 6..11)]
         );
         assert!(!power_step_framing_is_unresolved("K5ARH T"));
+    }
+
+    #[test]
+    fn accepted_power_step_candidate_carries_its_exact_call_word_range() {
+        // Codex review on PR #65, round 9: Validator must bind a
+        // power-step candidate to the EXACT word the regex captured, not
+        // resolve it by text (unlike named patterns -- see parse's own
+        // docs) -- otherwise a stale match's callsign can get attached to
+        // an unrelated, brand-new same-text word once the original
+        // suppressing framing ages out from under it.
+        let candidates = parse("K5ARH T");
+        assert_eq!(candidates.len(), 1);
+        let (call, ty, full_range, exact) = &candidates[0];
+        assert_eq!(call, "K5ARH");
+        assert_eq!(*ty, SpotType::Beacon);
+        assert_eq!(exact.clone(), Some(0..5));
+        assert_eq!(&"K5ARH T"[full_range.clone()], "K5ARH T");
     }
 }
