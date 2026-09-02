@@ -98,6 +98,7 @@ pub struct ServerConfig {
 /// there. Absent from a config file entirely (`None`) means the uplink is
 /// off; existing single-node operators see no behavior change.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RbnUplinkConfig {
     pub enabled: bool,
     pub target_host: String,
@@ -246,6 +247,28 @@ mod tests {
         assert_eq!(uplink.target_port, 7300);
         assert!(!uplink.dry_run);
         assert_eq!(uplink.login_callsign, None);
+    }
+
+    #[test]
+    fn uplink_unknown_key_is_a_parse_error() {
+        // Mirrors ServerConfig's own deny_unknown_fields rule (round-6
+        // review on MAN-12/PR#63): a typo'd key here is safety-relevant in
+        // a way ServerConfig's typos aren't -- e.g. `dry-run` instead of
+        // `dry_run` would otherwise silently parse as the untouched
+        // dry_run=false default and start transmitting real spots to RBN
+        // instead of failing loudly.
+        let result: Result<DaemonConfigFile, _> = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [rbn_uplink]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            dry-run = true
+            "#,
+        );
+        assert!(result.is_err(), "unknown key should have been rejected");
     }
 
     #[test]
