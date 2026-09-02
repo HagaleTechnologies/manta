@@ -228,9 +228,9 @@ fn blocklisted_callsign_is_never_spotted_even_if_also_allowlisted() {
 /// V20: an allowlisted callsign with no recognized CQ/DE/UP/beacon context
 /// pattern -- the primary real-world Watch List scenario (an NCDXF beacon
 /// transmits its callsign followed by power-step dashes, no framing
-/// words at all) -- must still spot. `context::parse` returns `None` for a
-/// standalone callsign; the allowlist bypass must not require a pattern
-/// match at all.
+/// words at all) -- must still spot. `context::parse` returns no matches
+/// at all for a standalone callsign; the allowlist bypass must not
+/// require a pattern match at all.
 #[test]
 fn v20_allowlisted_call_spots_with_no_context_pattern() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -522,4 +522,74 @@ fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
     );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
+}
+
+/// MAN-37 (Codex review round 2/3): a named-pattern match ("DE W1AW") and
+/// the power-step fallback's match on a DIFFERENT, newer callsign
+/// ("K5ARH T") are two independent transmission fragments, not competing
+/// candidates -- each must spot on its own, at its own decoded word,
+/// rather than the earlier match preempting the later one.
+#[test]
+fn power_step_beacon_spots_alongside_an_unrelated_earlier_named_match() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["DE", "W1AW", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must spot as Beacon on first decode despite the earlier, \
+         unrelated DE W1AW match, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 3): when a named match and the power-step
+/// fallback name the SAME callsign, e.g. a normal double-call CQ
+/// ("CQ K5ARH K5ARH") that also decodes a trailing "T", the first spot
+/// still emits as `Cq`; the trailing "T" is a genuinely new word the
+/// earlier classification never saw, so it drives a second, corrected
+/// `Beacon` spot -- the same reclassification-on-new-evidence contract
+/// V23/V28 already establish for other pattern combinations (e.g.
+/// `Unknown` -> `De` via a trailing `UP`), resolved by the newest word's
+/// own seq-based provenance guard (MAN-28 round 12), not a text-level
+/// heuristic in `context::parse`.
+#[test]
+fn power_step_fallback_reclassifies_a_same_callsign_named_match_via_new_evidence() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "K5ARH", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "K5ARH must spot as Cq first, got {spots:?}"
+    );
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must also reclassify to Beacon once the trailing T decodes \
+         as new evidence, got {spots:?}"
+    );
+}
+
+/// MAN-37 (Codex review round 3): an unresolved "CQ DX" earlier in the
+/// window (itself never recognized -- "DX" breaks CQ_CALL_RE's adjacency
+/// requirement) must not block a later, unrelated power-step beacon
+/// occurrence several words further on in the same 16-word window.
+#[test]
+fn power_step_beacon_not_blocked_by_a_stale_unresolved_cq_several_words_earlier() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "DX", "FILLER1", "FILLER2", "FILLER3", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must spot as Beacon on first decode despite the stale, \
+         unresolved CQ DX several words earlier, got {spots:?}"
+    );
 }

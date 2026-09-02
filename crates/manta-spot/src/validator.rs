@@ -330,8 +330,8 @@ impl Validator {
         }
     }
 
-    /// Gathers every candidate word worth evaluating this event: at most
-    /// one from context parsing, plus every allowlisted word in the
+    /// Gathers every candidate word worth evaluating this event: every
+    /// match `context::parse` finds, plus every allowlisted word in the
     /// window not yet attempted. Independent sources, not one-or-the-
     /// other by priority (MAN-28 round 7 review): a stale, already-
     /// attempted context match elsewhere in the 16-word window must never
@@ -341,10 +341,19 @@ impl Validator {
     /// (checked in `evaluate_candidate`) prevents re-processing one this
     /// already spotted or rejected.
     ///
-    /// Each candidate carries the highest `Word::seq` among the words that
-    /// produced it, so `evaluate_candidate` can tell a genuine
+    /// `context::parse` can return more than one match (e.g. a named
+    /// pattern naming one callsign and the power-step fallback naming a
+    /// different, newer one, or even the same callsign from both) --
+    /// `parse` itself no longer picks a winner between them (Codex review
+    /// on PR #65, rounds 2-3), so every match becomes its own candidate
+    /// here. Each candidate carries the highest `Word::seq` among the
+    /// words that produced it, so `evaluate_candidate` can tell a genuine
     /// reclassification (a newer word contributed) from a type merely
-    /// changing because an older one aged out (MAN-28 round 12 review).
+    /// changing because an older one aged out (MAN-28 round 12 review) --
+    /// this is also what reconciles two candidates that both map to the
+    /// SAME decoded word (its own seq-based provenance guard decides
+    /// whether the second is a genuine reclassification), rather than a
+    /// text-position heuristic inside `context::parse`.
     fn candidates(&self, track_id: u32) -> Vec<(String, SpotType, u64)> {
         let Some(track) = self.tracks.get(&track_id) else {
             return Vec::new();
@@ -364,7 +373,7 @@ impl Validator {
             joined.push_str(&word.text);
             word_spans.push((start, joined.len(), word.seq));
         }
-        if let Some((candidate, spot_type, range)) = context::parse(&joined) {
+        for (candidate, spot_type, range) in context::parse(&joined) {
             let involved_max_seq = word_spans
                 .iter()
                 .filter(|(start, end, _)| *start < range.end && range.start < *end)
