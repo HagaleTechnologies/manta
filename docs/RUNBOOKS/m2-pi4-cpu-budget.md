@@ -52,15 +52,23 @@ MAN-30's fate.
 4. Read the printed output:
    ```
    cpu_budget: 300 tracks sustained across most of the run (scene has 300 signals)
-   cpu_budget: <N>s wall / 15.00s audio = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
-   cpu_budget: <N>s (user+sys) CPU / 15.00s audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
+   cpu_budget: <N>s wall / 13.00s steady-state audio (15.00s scene minus 2.0s detector warmup) = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
+   cpu_budget: <N>s (user+sys) CPU / 13.00s steady-state audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
    ```
-   - **The "tracks sustained" line must read close to 300** (the test
-     itself asserts >= 285, but read the real number). It counts tracks
-     whose decode events span most of the file, not just distinct
-     `track_id`s seen anywhere — a detector that promotes fewer tracks at
-     once, or one that churns through more than 300 short-lived IDs
-     without ever holding close to 300 concurrently, both show up as a low
+   Both ratios divide by 13.0s (the 15s scene minus its 2s detector
+   warmup window, during which no tracks are active yet), not the full
+   15s -- dividing by the full scene duration understates the ratio by
+   diluting the steady-state cost with ~13% of near-free warmup time (a
+   bug in earlier versions of this bench, including the 0.360x number on
+   record in `docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`).
+   - **The "tracks sustained" line must read exactly 300** (the test
+     asserts `== 300`, not a tolerance band — see
+     `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md`'s
+     rationale). It counts tracks whose decode events span most of the
+     file, not just distinct `track_id`s seen anywhere — a detector that
+     promotes fewer tracks at once, or one that churns through more than
+     300 short-lived IDs without ever holding close to 300 concurrently,
+     both show up as a low
      count here. It's a proxy for "held ~300 tracks concurrently", not an
      exact instantaneous count (`decode_samples`'s public event stream has
      no track-opened/closed events to count that directly — see the
