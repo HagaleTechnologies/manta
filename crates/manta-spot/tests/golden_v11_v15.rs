@@ -593,3 +593,40 @@ fn power_step_beacon_not_blocked_by_a_stale_unresolved_cq_several_words_earlier(
          unresolved CQ DX several words earlier, got {spots:?}"
     );
 }
+
+/// MAN-37 (Codex review round 4): two distinct power-step IDs decoding
+/// before the track's first TrackMeta (V22's `has_meta` gate, MAN-28 round
+/// 8) means NEITHER got a chance to be attempted before both arrived --
+/// collapsing to a single "best" match here would permanently lose
+/// whichever one wasn't kept. Both W1AW and K5ARH must spot once metadata
+/// arrives and the pending candidates are retried (V25).
+#[test]
+fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    let words = ["W1AW", "T", "K5ARH", "T"];
+    let none_yet = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        none_yet.is_empty(),
+        "no TrackMeta yet, must not spot with bogus telemetry, got {none_yet:?}"
+    );
+
+    let spots = v.ingest(&DecoderEvent::TrackMeta {
+        track_id: 1,
+        snr_2500_db: 15.0,
+        freq_hz: 14_020_000.0,
+    });
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
+        "W1AW must spot as Beacon once metadata arrives, got {spots:?}"
+    );
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must also spot as Beacon -- neither occurrence was ever \
+         attempted before metadata arrived, so neither may be dropped, \
+         got {spots:?}"
+    );
+}

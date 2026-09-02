@@ -9,6 +9,7 @@
 //! limitations (see the known decode bugs tracked as GitHub issues).
 
 use regex::Regex;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 /// The context a decoded callsign was found in. Carried on `Spot` as the
@@ -48,22 +49,25 @@ static UP_RE: LazyLock<Regex> =
 static POWER_STEP_BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+T(?:\s|$)").unwrap());
 /// An unresolved `CQ`/`DE` token immediately (at most one word) before a
-/// given position -- used only when NO named pattern matched anywhere in
-/// the text (see `parse`), so any `CQ`/`DE` this finds is, by
-/// construction, filler-broken framing (e.g. "CQ DX <call>") rather than
-/// a legitimate resolved target (a real target would have made
-/// `parse_named_pattern` succeed instead). Scoped to the position right
-/// before the fallback's own candidate, not the whole window, so a stale,
-/// unrelated `CQ`/`DE` several words earlier can't block a genuinely new,
-/// later beacon occurrence (Codex review on PR #65, round 3).
+/// given position. A match here is only treated as genuinely unresolved
+/// framing -- rather than the same `CQ`/`DE` a named pattern already
+/// explained -- when it isn't fully covered by that named match's own
+/// range (see `parse_power_step_beacons`): checking whether ANY named
+/// pattern matched ANYWHERE in the text isn't enough, since an unrelated
+/// resolved match elsewhere in the window must not excuse a DIFFERENT,
+/// genuinely unresolved `CQ`/`DE` sitting right next to this candidate
+/// (Codex review on PR #65, round 4). Scoped to the position right before
+/// the candidate, not the whole window, so a stale, unrelated `CQ`/`DE`
+/// several words earlier can't block a genuinely new, later beacon
+/// occurrence either (round 3).
 static CQ_DE_IMMEDIATE_FILLER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(?:CQ|DE)\s+\S+\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b((?:CQ|DE)\s+\S+)\s*$").unwrap());
 
 /// The `BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`UP_RE` family: the first (in that
 /// priority order) named-keyword pattern that matches anywhere in `text`.
 /// Returns the callsign candidate (uppercased), spot type, and match byte
 /// range -- see `parse`'s own docs for what the range is for.
-fn parse_named_pattern(text: &str) -> Option<(String, SpotType, std::ops::Range<usize>)> {
+fn parse_named_pattern(text: &str) -> Option<(String, SpotType, Range<usize>)> {
     if let Some(caps) = BEACON_RE.captures(text) {
         let m = caps.get(0).unwrap();
         return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
@@ -88,49 +92,64 @@ fn parse_named_pattern(text: &str) -> Option<(String, SpotType, std::ops::Range<
     None
 }
 
-/// The power-step fallback (see `POWER_STEP_BEACON_RE`) on its own.
-/// `captures` alone only ever returns the FIRST match in `text`; with the
-/// 16-word rolling window this fallback actually runs against, an older,
-/// already-attempted occurrence sitting earlier in the window must not
-/// starve a newer, genuinely valid one -- take the last (newest) match
-/// instead (Codex review on PR #65).
+/// Every power-step fallback match in `text` (see `POWER_STEP_BEACON_RE`),
+/// each its own independent candidate -- collapsing to a single "best"
+/// match (whether first, last, or otherwise) proved unsound: two distinct,
+/// never-yet-attempted power-step IDs can coexist in the window (e.g. a
+/// track held back by the `has_meta` gate, MAN-28 round 8, so NEITHER got
+/// a chance to be evaluated before both arrived), and dropping either one
+/// permanently loses it (Codex review on PR #65, round 4). `Validator`'s
+/// own per-word `attempted` state -- not this function -- is what stops a
+/// genuinely already-resolved word from being reprocessed.
 ///
-/// `guard_unresolved_framing` is set by `parse` exactly when
-/// `parse_named_pattern` found nothing at all in the whole text -- in that
-/// case only, an unresolved `CQ`/`DE` token immediately before this
-/// candidate blocks it (see `CQ_DE_IMMEDIATE_FILLER_RE`). When a named
-/// pattern DID match (elsewhere in the text, naming the same or a
-/// different callsign), this fallback is left unguarded and both
-/// candidates are returned -- `Validator` reconciles them using each
-/// candidate's own decoded `Word` (round 2/3 review: text-position
-/// heuristics for "which one wins" kept proving too coarse; the caller
-/// already has the real per-word seq/attempted state this decision needs).
-fn parse_power_step_beacon(
+/// `named_range` is `parse_named_pattern`'s own match range, if any. A
+/// candidate is dropped only when an unresolved `CQ`/`DE` token
+/// immediately precedes it (see `CQ_DE_IMMEDIATE_FILLER_RE`) AND that
+/// token isn't already fully explained by `named_range` -- checking
+/// merely whether some named pattern matched ANYWHERE in the text isn't
+/// enough, since an unrelated resolved match elsewhere must not excuse a
+/// different, genuinely unresolved `CQ`/`DE` sitting right next to this
+/// specific candidate (round 4 review, e.g. "DE W1AW CQ DX K5ARH T": the
+/// resolved "DE W1AW" must not excuse the separate, unresolved "CQ DX"
+/// immediately before "K5ARH T").
+fn parse_power_step_beacons(
     text: &str,
-    guard_unresolved_framing: bool,
-) -> Option<(String, SpotType, std::ops::Range<usize>)> {
-    let caps = POWER_STEP_BEACON_RE.captures_iter(text).last()?;
-    if guard_unresolved_framing {
+    named_range: Option<&Range<usize>>,
+) -> Vec<(String, SpotType, Range<usize>)> {
+    let mut candidates = Vec::new();
+    for caps in POWER_STEP_BEACON_RE.captures_iter(text) {
         let call_start = caps.get(1).unwrap().start();
-        if CQ_DE_IMMEDIATE_FILLER_RE.is_match(&text[..call_start]) {
-            return None;
+        if let Some(filler_caps) = CQ_DE_IMMEDIATE_FILLER_RE.captures(&text[..call_start]) {
+            // Group 1 excludes the `\s*` trailing whitespace the outer
+            // match consumes up to the anchor -- comparing the whole
+            // match's range against `named_range` would spuriously fail
+            // containment even for an exact, legitimately-resolved match
+            // like "DE W1AW" (`named_range` itself never includes a
+            // trailing separator space).
+            let filler = filler_caps.get(1).unwrap().range();
+            let explained_by_named =
+                named_range.is_some_and(|nr| nr.start <= filler.start && filler.end <= nr.end);
+            if !explained_by_named {
+                continue;
+            }
         }
+        let m = caps.get(0).unwrap();
+        candidates.push((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
     }
-    let m = caps.get(0).unwrap();
-    Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()))
+    candidates
 }
 
 /// Scans `text` for every CQ/DE/beacon context match, returning each as
 /// (callsign candidate uppercased, spot type, byte range of every token
-/// that determined that type). Named-keyword patterns
-/// (`BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`UP_RE`) contribute at most one
+/// that determined that type). The named-keyword family
+/// (`BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`UP_RE`) contributes at most one
 /// candidate (first match wins within that family); the power-step
-/// fallback contributes at most one (newest match wins within its own
-/// family, and it never fires for a `CQ`/`DE` token it can't explain --
-/// see `parse_power_step_beacon`). More than one candidate can come back
+/// fallback (`POWER_STEP_BEACON_RE`) contributes one PER match it finds
+/// (see `parse_power_step_beacons`). More than one candidate can come back
 /// together -- e.g. an earlier "DE W1AW" and a later, unrelated "K5ARH T"
 /// in the same rolling window both name real, independent transmission
-/// fragments.
+/// fragments, and "W1AW T K5ARH T" names two independent power-step
+/// occurrences.
 ///
 /// The range lets a caller distinguish a genuine reclassification (driven
 /// by a newly-arrived word) from a type merely changing because an older
@@ -142,25 +161,24 @@ fn parse_power_step_beacon(
 /// "CQ K5ARH K5ARH T"): both map to the same decoded `Word`, and that
 /// word's own seq-based provenance guard -- not a text-position heuristic
 /// here -- decides whether the second one is a genuine reclassification.
-/// `parse` itself no longer tries to pick a winner between pattern
-/// families (Codex review on PR #65, rounds 2-3: each attempt at a
-/// text-level recency/same-callsign heuristic here proved too coarse in a
-/// new way every round); it just reports what it found.
+/// `parse` itself does not try to pick a winner between candidates (Codex
+/// review on PR #65, rounds 2-4: every attempt at a text-level
+/// recency/same-callsign/"one match per family" heuristic here proved too
+/// coarse in a new way every round); it just reports what it found and
+/// lets the caller's real per-word state decide.
 ///
 /// A `DE <call>` match is classified `Cq` (not `De`) when a bare `CQ` token
 /// also appears anywhere in `text` -- the common "CQ CQ DE <call>"
 /// transmission shape, where the callsign always follows `DE` but the
 /// operator is calling CQ, not answering one.
-pub fn parse(text: &str) -> Vec<(String, SpotType, std::ops::Range<usize>)> {
+pub fn parse(text: &str) -> Vec<(String, SpotType, Range<usize>)> {
     let named = parse_named_pattern(text);
-    let beacon = parse_power_step_beacon(text, named.is_none());
-    let mut candidates = Vec::with_capacity(2);
+    let named_range = named.as_ref().map(|(_, _, r)| r.clone());
+    let mut candidates = Vec::new();
     if let Some(n) = named {
         candidates.push(n);
     }
-    if let Some(b) = beacon {
-        candidates.push(b);
-    }
+    candidates.extend(parse_power_step_beacons(text, named_range.as_ref()));
     candidates
 }
 
@@ -259,10 +277,10 @@ mod tests {
     #[test]
     fn cq_call_followed_by_lone_t_yields_both_candidates() {
         // Both the CQ_CALL_RE match ("CQ K5ARH") and the power-step
-        // fallback's newest match (the second "K5ARH T") are real,
-        // independent evidence -- parse itself no longer picks a winner
-        // (Validator's per-word provenance does, see validator.rs's own
-        // golden vectors for the end-to-end outcome).
+        // fallback's match (the second "K5ARH T") are real, independent
+        // evidence -- parse itself doesn't pick a winner (Validator's
+        // per-word provenance does; see validator.rs's own golden vectors
+        // for the end-to-end outcome).
         assert_eq!(
             parse_types("CQ K5ARH K5ARH T"),
             vec![
@@ -273,16 +291,21 @@ mod tests {
     }
 
     #[test]
-    fn power_step_fallback_picks_the_newest_call_t_occurrence() {
-        // Codex review on PR #65: `captures` on its own only ever returns
-        // the FIRST "<call> T" match in the window. Once an older one
-        // (already attempted/rejected) is sitting earlier in the window,
-        // a newer, genuinely valid beacon occurrence must not be starved
-        // by it -- the fallback has to pick the newest match, not the
-        // oldest.
+    fn power_step_fallback_returns_every_distinct_occurrence() {
+        // Codex review on PR #65, round 4: collapsing to a single "best"
+        // match (first, last, or otherwise) can permanently lose a
+        // never-yet-attempted occurrence -- e.g. two power-step IDs
+        // decoding before the track's first TrackMeta, so neither got a
+        // chance to be evaluated before both arrived. Both W1AW and
+        // K5ARH are independent candidates; Validator's own per-word
+        // attempted state (not this function) decides what actually
+        // spots.
         assert_eq!(
             parse_types("W1AW T K5ARH T"),
-            vec![("K5ARH".to_string(), SpotType::Beacon)]
+            vec![
+                ("W1AW".to_string(), SpotType::Beacon),
+                ("K5ARH".to_string(), SpotType::Beacon),
+            ]
         );
     }
 
@@ -331,6 +354,24 @@ mod tests {
                 ("W1AW".to_string(), SpotType::De),
                 ("K5ARH".to_string(), SpotType::Beacon),
             ]
+        );
+    }
+
+    #[test]
+    fn unrelated_resolved_named_match_does_not_excuse_a_separate_unresolved_cq() {
+        // Codex review on PR #65, round 4: the bare "CQ" later in this
+        // text makes DE_RE's own pre-existing disambiguation classify
+        // W1AW as `Cq` (not `De`) and widen its range to cover that "CQ"
+        // token too (unrelated to MAN-37 -- see parse_named_pattern's own
+        // docs) -- but that widened range still stops right after "CQ",
+        // so it must NOT excuse the SEPARATE, still-unresolved "DX" filler
+        // immediately before the power-step candidate. Checking "did any
+        // named pattern match somewhere in the text" isn't enough; the
+        // specific CQ/DE-plus-filler token adjacent to THIS candidate must
+        // itself be fully covered by the named match's own range.
+        assert_eq!(
+            parse_types("DE W1AW CQ DX K5ARH T"),
+            vec![("W1AW".to_string(), SpotType::Cq)]
         );
     }
 
