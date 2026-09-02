@@ -113,7 +113,18 @@ async fn handle_client(
                                 continue; // below threshold: filtered out
                             }
                         }
-                        write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
+                        if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                            .await
+                            .is_err()
+                        {
+                            // The write for THIS spot failed, plus
+                            // whatever's still retained in `rx` is
+                            // abandoned along with it -- both must be
+                            // counted, not just a Lagged-induced loss
+                            // (round-11 review finding).
+                            metrics.record_write_failed(1 + rx.len() as u64);
+                            return Ok(());
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // ARCHITECTURE §7: slow clients are disconnected,
@@ -145,8 +156,21 @@ async fn handle_client(
                 match command::parse(&cmd_line) {
                     Command::ShowDx { count } => {
                         let n = count.unwrap_or(DEFAULT_SHOW_DX_COUNT);
-                        for spot in bus.recent(n) {
-                            write_spot_line(&mut wr, &bus, &station_call, &spot).await?;
+                        // Apply the SAME `min_unique` predicate the live
+                        // stream uses -- a spot suppressed live must stay
+                        // suppressed when replayed via `sh/dx`, not leak
+                        // through unfiltered and uncounted (round-11
+                        // review finding). `bus.recent` carries each
+                        // spot's publish-time occurrence_count precisely
+                        // so this comparison is possible here.
+                        for bus_spot in bus.recent(n) {
+                            if let Some(min) = min_unique {
+                                if bus_spot.occurrence_count <= min {
+                                    metrics.record_filter_suppressed(1);
+                                    continue;
+                                }
+                            }
+                            write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
                         }
                     }
                     Command::SetFilterUnique { min } => {

@@ -164,6 +164,54 @@ async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
 }
 
 #[tokio::test]
+async fn sh_dx_history_replay_honors_the_unique_filter() {
+    // Regression test (round-11 review): a spot suppressed on the live
+    // stream by `set dx filter unique > n` must stay suppressed when the
+    // same client replays it via `sh/dx` -- the filter must apply
+    // consistently to both paths, not just the live one.
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+
+    // Published BEFORE the client connects, so this is pure history --
+    // sh/dx's replay path, not the live broadcast path.
+    let mut first = sample_spot();
+    first.callsign = "K5ARH".to_string();
+    let mut second = sample_spot();
+    second.callsign = "K5ARH".to_string();
+    bus.publish(first); // occurrence 1: must be filtered out of history
+    bus.publish(second); // occurrence 2: must survive the filter
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let mut ack = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack))
+        .await
+        .expect("timed out waiting for filter ack")
+        .unwrap();
+
+    wr.write_all(b"sh/dx\r\n").await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the surviving history line")
+        .unwrap();
+    assert!(
+        line.contains("K5ARH"),
+        "the second (unfiltered) occurrence must still appear: {line:?}"
+    );
+
+    // Only one history line should have arrived -- the first (filtered)
+    // occurrence must not also show up.
+    let mut extra = String::new();
+    let extra_result =
+        tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut extra)).await;
+    assert!(
+        extra_result.is_err(),
+        "the filtered-out first occurrence must not appear in sh/dx history: {extra:?}"
+    );
+}
+
+#[tokio::test]
 async fn set_dx_filter_unique_suppresses_below_threshold_occurrences() {
     let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;

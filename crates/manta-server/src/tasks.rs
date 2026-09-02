@@ -33,6 +33,35 @@ pub async fn await_all(tasks: &ClientTasks, deadline: Duration) {
         tokio::time::timeout(deadline, async { while set.join_next().await.is_some() {} }).await;
 }
 
+/// How often the background reaper removes already-completed entries from
+/// the registry. Bounds how long a finished connection's `JoinHandle`
+/// (and its retained task-result allocation) lingers -- without this,
+/// `await_all` (called only at shutdown) is the ONLY thing that ever
+/// calls `join_next`, so ordinary connect/disconnect churn on a
+/// long-running daemon grows the registry without bound (round-11 review
+/// finding).
+const REAP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Spawns a background task that periodically removes already-finished
+/// entries from `tasks`, keeping the registry's size bounded by ongoing
+/// connection churn instead of growing for the life of the process. Each
+/// pass briefly locks `tasks` and drains everything currently finished via
+/// the NON-blocking `try_join_next` (never `join_next`, which would hold
+/// the lock until some future task happens to complete -- starving every
+/// accept loop's own `tasks.lock().await.spawn(..)` for however long that
+/// takes). Returns the reaper's own `JoinHandle`; letting it run
+/// unawaited for the process lifetime is fine; it holds only a clone of
+/// `tasks` and does no other work.
+pub fn spawn_reaper(tasks: ClientTasks) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(REAP_INTERVAL).await;
+            let mut set = tasks.lock().await;
+            while set.try_join_next().is_some() {}
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +102,49 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "must return once the task finishes, not consume the full 30s deadline; elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaper_removes_completed_tasks_without_waiting_for_shutdown() {
+        // Regression (round-11 review): `await_all` is the ONLY thing that
+        // ever called `join_next` on this registry, and it's only ever
+        // called at shutdown. During normal operation, every connection
+        // that completes (a client connects then disconnects) leaves its
+        // finished JoinHandle sitting in the JoinSet forever -- on a
+        // long-running daemon with ordinary reconnect churn, this grows
+        // without bound. `spawn_reaper` must periodically drain finished
+        // entries on its own, independent of shutdown ever happening.
+        let tasks = new_client_tasks();
+        tasks.lock().await.spawn(async {});
+        // Give the trivial task a chance to actually complete before the
+        // reaper's first tick.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            tasks.lock().await.len(),
+            1,
+            "task must still be registered pre-reap"
+        );
+
+        let _reaper = spawn_reaper(tasks.clone());
+        // The reaper needs at least one poll to reach its first
+        // `sleep(REAP_INTERVAL).await` and register that timer BEFORE
+        // advancing the clock -- otherwise `advance` below runs while the
+        // freshly-spawned task hasn't started at all yet, and there's no
+        // timer registered for it to fire.
+        tokio::task::yield_now().await;
+        tokio::time::advance(REAP_INTERVAL + Duration::from_millis(1)).await;
+        // Let the reaper task actually run its post-sleep steps (wake,
+        // acquire the lock, drain) -- each is a separate poll point, so
+        // one yield isn't reliably enough to observe them all settle.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            tasks.lock().await.len(),
+            0,
+            "the reaper must have removed the completed task without any call to await_all"
         );
     }
 

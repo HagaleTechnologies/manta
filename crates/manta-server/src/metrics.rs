@@ -15,6 +15,7 @@ pub struct Metrics {
     spots_total: AtomicU64,
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
+    spots_dropped_write_failed_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -49,6 +50,20 @@ impl Metrics {
     /// identical to an operator without this).
     pub fn record_filter_suppressed(&self, n: u64) {
         self.spots_suppressed_by_filter_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A write to a client's socket timed out or failed before a
+    /// `Lagged`/`Closed` broadcast error was ever observed (e.g. the
+    /// client stopped reading but its TCP connection hasn't reset yet).
+    /// `n` covers the spot whose write just failed plus whatever was
+    /// still retained in the receiver's own buffer and is now abandoned
+    /// along with it. Without this, a client lost this way shows zero
+    /// loss on every counter -- ARCHITECTURE §8 requires every
+    /// dropped/evicted/suppressed item counted, not just lag-induced loss
+    /// (round-11 review finding).
+    pub fn record_write_failed(&self, n: u64) {
+        self.spots_dropped_write_failed_total
             .fetch_add(n, Ordering::Relaxed);
     }
 
@@ -114,6 +129,16 @@ impl Metrics {
         out.push_str(&format!(
             "manta_spots_suppressed_by_filter_total {}\n",
             self.spots_suppressed_by_filter_total
+                .load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_dropped_write_failed_total Spots dropped because a client's socket write timed out or failed before a lag/close error was observed.\n",
+        );
+        out.push_str("# TYPE manta_spots_dropped_write_failed_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_dropped_write_failed_total {}\n",
+            self.spots_dropped_write_failed_total
                 .load(Ordering::Relaxed)
         ));
 
@@ -221,6 +246,16 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_suppressed_by_filter_total counter"));
         assert!(text.contains("manta_spots_suppressed_by_filter_total 2"));
+    }
+
+    #[test]
+    fn renders_write_failed_count_as_a_prometheus_counter() {
+        let m = Metrics::new();
+        m.record_write_failed(3);
+        m.record_write_failed(4);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_dropped_write_failed_total counter"));
+        assert!(text.contains("manta_spots_dropped_write_failed_total 7"));
     }
 
     #[test]

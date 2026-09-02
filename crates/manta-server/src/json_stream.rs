@@ -176,12 +176,21 @@ async fn handle_tcp_client(
                 match spot {
                     Ok(bus_spot) => {
                         let line = ctx.render(&bus_spot);
-                        tokio::time::timeout(WRITE_TIMEOUT, async {
+                        let write_result = tokio::time::timeout(WRITE_TIMEOUT, async {
                             socket.write_all(line.as_bytes()).await?;
                             socket.write_all(b"\n").await
                         })
                         .await
-                        .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "write timed out"))??;
+                        .unwrap_or_else(|_| Err(std::io::Error::new(ErrorKind::TimedOut, "write timed out")));
+                        if write_result.is_err() {
+                            // The write for THIS spot failed, plus
+                            // whatever's still retained in `rx` is
+                            // abandoned along with it -- a bare `?` here
+                            // (the prior behavior) exited with neither
+                            // counted anywhere (round-11 review finding).
+                            ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                            return Ok(());
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // `n` alone under-counts: this receiver is about
@@ -266,9 +275,19 @@ async fn handle_ws_client(
                 match spot {
                     Ok(bus_spot) => {
                         let text = ctx.render(&bus_spot);
-                        tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into())))
-                            .await
-                            .map_err(|_| anyhow::anyhow!("write timed out"))??;
+                        let write_result =
+                            tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into())))
+                                .await;
+                        let write_failed = !matches!(write_result, Ok(Ok(())));
+                        if write_failed {
+                            // The write for THIS spot failed, plus
+                            // whatever's still retained in `rx` is
+                            // abandoned along with it -- a bare `?` here
+                            // (the prior behavior) exited with neither
+                            // counted anywhere (round-11 review finding).
+                            ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                            return Ok(());
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // See the TCP handler's identical Lagged branch

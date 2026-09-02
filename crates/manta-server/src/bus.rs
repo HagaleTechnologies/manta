@@ -44,7 +44,7 @@ pub struct SpotBus {
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
-    recent: Mutex<VecDeque<Spot>>,
+    recent: Mutex<VecDeque<BusSpot>>,
     occurrence_counts: Mutex<HashMap<String, u32>>,
 }
 
@@ -79,13 +79,6 @@ impl SpotBus {
     /// (not an error) when there are zero subscribers -- a spot server
     /// with no connected clients is the common case, not a failure.
     pub fn publish(&self, spot: Spot) {
-        {
-            let mut recent = self.recent.lock().expect("recent lock poisoned");
-            if recent.len() == RECENT_HISTORY_CAP {
-                recent.pop_front();
-            }
-            recent.push_back(spot.clone());
-        }
         // Increment and read back under one lock acquisition -- this *is*
         // the fix: the occurrence count a spot carries is fixed at the
         // instant of this publish, before any subscriber can observe it.
@@ -98,10 +91,24 @@ impl SpotBus {
             *count += 1;
             *count
         };
-        let _ = self.tx.send(BusSpot {
+        let bus_spot = BusSpot {
             spot,
             occurrence_count,
-        });
+        };
+        {
+            let mut recent = self.recent.lock().expect("recent lock poisoned");
+            if recent.len() == RECENT_HISTORY_CAP {
+                recent.pop_front();
+            }
+            // `recent` retains the SAME occurrence_count as the live
+            // broadcast, not just the bare Spot -- otherwise a caller
+            // replaying history (`sh/dx`) has no way to apply the same
+            // occurrence-based filter the live stream already honors, and
+            // a spot suppressed live could leak through history replay,
+            // uncounted (round-11 review finding).
+            recent.push_back(bus_spot.clone());
+        }
+        let _ = self.tx.send(bus_spot);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
@@ -120,8 +127,11 @@ impl SpotBus {
         self.session_nonce
     }
 
-    /// The last `n` published spots, oldest first (`sh/dx` backing store).
-    pub fn recent(&self, n: usize) -> Vec<Spot> {
+    /// The last `n` published spots, oldest first (`sh/dx` backing store),
+    /// each carrying the occurrence_count it had when published -- see
+    /// `publish`'s doc comment for why history must retain this, not just
+    /// the bare `Spot`.
+    pub fn recent(&self, n: usize) -> Vec<BusSpot> {
         let recent = self.recent.lock().expect("recent lock poisoned");
         let skip = recent.len().saturating_sub(n);
         recent.iter().skip(skip).cloned().collect()
@@ -257,7 +267,7 @@ mod tests {
         let recent = bus.recent(3);
         assert_eq!(recent.len(), 3);
         assert_eq!(
-            recent.iter().map(|s| s.track_id).collect::<Vec<_>>(),
+            recent.iter().map(|s| s.spot.track_id).collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
     }
@@ -269,6 +279,29 @@ mod tests {
         bus.publish(sample_spot(1));
 
         assert_eq!(bus.recent(10).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recent_spots_carry_their_publish_time_occurrence_count() {
+        // Regression (round-11 review): `sh/dx` replays history from
+        // `recent()` with no occurrence-count information, so the telnet
+        // server couldn't apply `set dx filter unique > n` to history the
+        // same way it already applies it to the live stream -- a spot
+        // suppressed live could leak through `sh/dx` immediately after,
+        // uncounted. `recent()` must carry the SAME occurrence_count each
+        // spot had when published (see `BusSpot`'s own doc comment on why
+        // that has to be captured at publish time, not recomputed later).
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut first = sample_spot(0);
+        first.callsign = "K5ARH".to_string();
+        let mut second = sample_spot(1);
+        second.callsign = "K5ARH".to_string();
+        bus.publish(first);
+        bus.publish(second);
+
+        let recent = bus.recent(2);
+        assert_eq!(recent[0].occurrence_count, 1);
+        assert_eq!(recent[1].occurrence_count, 2);
     }
 
     #[tokio::test]

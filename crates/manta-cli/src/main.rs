@@ -660,6 +660,12 @@ fn start_spot_server(
             },
             tasks.clone(),
         ));
+        // Reaps completed per-client tasks continuously, independent of
+        // shutdown -- without this, `tasks` only ever shrinks at
+        // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
+        // connect/disconnect churn grows it without bound for the life of
+        // the process (round-11 review finding).
+        manta_server::tasks::spawn_reaper(tasks.clone());
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
             metrics.clone(),

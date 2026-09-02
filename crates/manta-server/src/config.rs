@@ -68,9 +68,17 @@ pub struct ServerConfig {
 /// distinct from `ServerConfig` itself so that struct can stay a plain,
 /// directly-deserializable value everywhere else (tests, future in-process
 /// construction) without every caller needing to know about the table
-/// wrapper. ARCHITECTURE §8: "Single TOML config... server ports."
+/// wrapper. ARCHITECTURE §8: "Single TOML config... server ports." That
+/// same single daemon TOML also carries `[detector]`/`[decode]`/`[input]`/
+/// `[spot]` and other tables this crate doesn't model (SPEC §9) --
+/// deliberately NOT `deny_unknown_fields` here, unlike `ServerConfig`
+/// itself: this wrapper only needs to reject a typo INSIDE `[server]`,
+/// which `ServerConfig`'s own `deny_unknown_fields` already does. Denying
+/// unknown fields at THIS level too (an earlier version did) rejected
+/// every other real, valid table in the unified config, making
+/// `--server-config` unusable with the actual daemon config this repo's
+/// own docs describe (round-11 review finding).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DaemonConfigFile {
     pub server: ServerConfig,
 }
@@ -159,5 +167,50 @@ mod tests {
         assert_eq!(file.server.station_callsign, "W3XYZ");
         assert_eq!(file.server.telnet_port, 17300);
         assert_eq!(file.server.json_port, 7301);
+    }
+
+    #[test]
+    fn daemon_config_file_permits_the_other_daemon_tables() {
+        // Regression (round-11 review): ARCHITECTURE §8 / SPEC §9 describe
+        // ONE daemon TOML with multiple top-level tables ([detector],
+        // [decode], [input], [spot], [server], ...) -- manta-server only
+        // models [server], but the file's OWN top-level
+        // `deny_unknown_fields` (a round-6 fix meant for typos INSIDE
+        // [server]) rejected every other real, valid table too, making
+        // --server-config unusable with the actual unified daemon config
+        // the rest of this repo's docs describe.
+        let file: DaemonConfigFile = toml::from_str(
+            r#"
+            [detector]
+            on_snr_db = 6.0
+
+            [decode]
+            timing_sigma = 0.25
+
+            [server]
+            station_callsign = "W3XYZ"
+            "#,
+        )
+        .expect("unrelated daemon tables alongside [server] must not be rejected");
+
+        assert_eq!(file.server.station_callsign, "W3XYZ");
+    }
+
+    #[test]
+    fn server_config_still_rejects_unknown_keys_within_its_own_table() {
+        // The round-6 fix's actual intent (catching a typo like
+        // bind_address vs bind_addr) must survive -- only the TOP-LEVEL
+        // wrapper's over-broad deny_unknown_fields was wrong.
+        let result: Result<DaemonConfigFile, _> = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            bind_address = "127.0.0.1"
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "a typo'd key inside [server] must still be rejected"
+        );
     }
 }
