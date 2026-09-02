@@ -45,14 +45,14 @@ separate jobs**, not two:
 
 | Capability | Disposition |
 |---|---|
-| Bayesian multi-channel CW decode (up to 700 simultaneous decoders) | **Covered** — manta's core channelizer/decoder (`manta-decode`, `manta-dsp`) |
+| Bayesian multi-channel CW decode | **Covered, at a lower configured capacity** — manta's core channelizer/decoder (`manta-decode`, `manta-dsp`) implements the algorithm; the shipped default (`PipelineConfig::track_cap`, `crates/manta-engine/src/track.rs`) caps concurrent tracks at 500, not CW Skimmer's claimed "up to 700 on a 3-GHz P4" ceiling. `track_cap` is a config value, not an architectural limit — raising it is gated by the same Pi4 CPU-budget invariant MAN-18 already tracks, so no separate ticket is filed; caught by Codex review on PR #57 |
 | CQ/DE/beacon message-context parsing (running-vs-S&P proxy) | **Covered** — verified against `crates/manta-spot/src/context.rs`: `SpotType::{Cq,De,Beacon,Unknown}` is implemented and matches the exact pattern families ARCHITECTURE.md §6 describes; `Cq`/`De` classification is manta's equivalent of CW Skimmer's CQ/DE-prefix running-vs-S&P convention |
 | RST(599 label)/QRL? message-content extraction | **Gap** — see MAN-33 below. ARCHITECTURE.md §6's prose reads as if this were covered too, but `manta-spot/src/context.rs` has no RST or QRL? extraction at all — caught by Codex review on PR #57 (correctly), verified against source before filing |
-| Callsign plausibility (pattern/grammar, ITU-block rejection) | **Covered** — `manta-spot` step 2, cty.dat prefix lookup |
+| Callsign plausibility (pattern/grammar, ITU-block rejection) | **Covered, with a known bug** — `manta-spot` step 2, cty.dat prefix lookup. Codex review on PR #57 found and I verified a real defect (not a matrix-disposition error): `cty.rs::clean_alias` strips the leading `=` off exact-call overrides (e.g. `=4U1UN`) without preserving that they're exact-only, so `is_allocated`'s any-length prefix match lets a bogus extension (`4U1UNA`) pass. Filed as MAN-35 (bug, not a capability gap — the mechanism exists, it has a hole) |
 | Master.dta/SCP cross-check | **Covered** — `manta-spot` step 3, `master.scp` (confidence-raising only, an improvement on Aggregator's own binary SCP filter, which the RBN team itself recommends against — see below) |
 | Verified-calls (≥2 occurrences) filtering | **Covered** — `manta-spot` step 4, repetition requirement |
 | Same-track/single-source dedup (10 min, freq bucket) | **Covered** — `manta-spot` step 5. The 10-minute window and freq-bucket key independently match the operator-stated community rule found in forum research ("same DE+DX+frequency within ~10 min = dupe") — good corroboration, no action needed. |
-| Watch List (explicit allowlist that bypasses repetition/validation, used for low-repetition NCDXF-style beacons) | **Gap** — see MAN-new-1 below |
+| Watch List (explicit allowlist that bypasses repetition/validation, used for low-repetition NCDXF-style beacons) | **Gap** — see MAN-28 below. Widened after Codex review on PR #57: `Validator::try_spot` runs grammar/cty rejection *before* the repetition gate, so a real Watch List equivalent must bypass all three, not just repetition — MAN-28 now covers the general allowlist mechanism plus the beacon case that motivated it |
 | Waterfall display, Band Map UI, Callsign List window | **Non-goal** — README: "Not an interactive receiver or panadapter" |
 | DSP audio monitoring (noise blanker/AGC/anti-click/CW filter for a human listening on headphones) | **Non-goal** — same; manta's noise/AGC handling is internal to the decode pipeline, not an operator audio-monitoring feature |
 | I/Q Recorder/player (live in-app WAV capture with RIFF metadata tags) | **Non-goal** — operators can capture raw IQ with standard OS/SDR tooling; not core to spot generation. (Distinct from manta's own WAV-based *test* corpus, MAN-20, which is a different concern.) |
@@ -63,7 +63,7 @@ separate jobs**, not two:
 | Remote SKIMMER/START, SKIMMER/STOP (process start/stop via telnet) | **Non-goal** — process lifecycle is an ops/systemd concern (MAN-21), not a wire-protocol feature |
 | Multiple instances via per-instance `.ini` files | **Covered (superseded)** — MAN-13's single-daemon multi-source model replaces this |
 | Auto-start (command-line switch / VBScript) | **Covered** — falls under MAN-21's non-developer install/operate scope |
-| Frequency calibration (manual correction-factor procedure) | **Gap** — see MAN-new-2 below |
+| Frequency calibration (manual correction-factor procedure) | **Gap** — see MAN-29 below |
 
 ### SkimSrv (headless multi-band decode engine)
 
@@ -72,29 +72,30 @@ separate jobs**, not two:
 | Headless, multi-band (up to 7 × 192 kHz) decode in one process | **Covered** — MAN-13, single daemon combining multiple SDRs/channels |
 | Built-in telnet server (spot output, default port 7310) | **Covered** — MAN-12 |
 | Per-band `.ini` config (`CenterFreqs*`, `SegmentSel*`) | **Covered** — implementation detail of MAN-11/13's per-source configuration |
-| `CwSegments` — explicit non-contiguous CW sub-range restriction (skip RTTY/PSK/etc. gaps to save CPU) | **Gap** — see MAN-new-3 below |
-| Shares CW Skimmer's Watch List file | **Gap** — same disposition as CW Skimmer's Watch List, MAN-new-1 |
+| `CwSegments` — explicit non-contiguous CW sub-range restriction (skip RTTY/PSK/etc. gaps to save CPU) | **Gap** — see MAN-30 below |
+| Shares CW Skimmer's Watch List file | **Gap** — same disposition as CW Skimmer's Watch List, MAN-28 |
 
 ### Aggregator (multi-instance combiner + RBN feed)
 
 | Capability | Disposition |
 |---|---|
-| Telnet-combines up to 9 Skimmer/SkimSrv/RTTYSkimServ/RCKskimmer instances (Secondary Skimmers), or unlimited via an external combiner (Combined Skimmers) | **Covered (different approach)** — MAN-13's in-process single-daemon model is the native equivalent of what Aggregator does by bolting separate Windows processes together over telnet |
+| Combines multiple *native* SDR/audio sources into one spot stream | **Covered (different approach)** — MAN-13's in-process single-daemon model natively combines multiple raw IQ/audio sources, which is what most operators use Secondary Skimmers for |
+| Combines spots from *external* CW Skimmer/SkimSrv/RTTYSkimServ/RCKskimmer processes over telnet (Secondary/Combined Skimmers) | **Non-goal** — corrected from an earlier "Covered" label (caught by Codex review on PR #57, verified: `manta-input` has no telnet-client input, only `audio.rs`/`kiwi.rs`/`soapy.rs` raw sources). This is already README's existing non-goal ("Not a cluster network. `manta` is a spot source, not an aggregator.") — an operator keeping an external legacy Skimmer instance can't feed it into manta, by design |
 | Cross-instance spot dedup | **Covered** — MAN-16 |
-| Bad Calls list (operator-maintained callsign blocklist) | **Gap** — see MAN-new-4 below |
-| Notched Frequencies (operator-maintained frequency-range exclusion list, for known false-spot sources) | **Gap** — same ticket as MAN-new-4, see below |
+| Bad Calls list (operator-maintained callsign blocklist) | **Gap** — see MAN-31 below |
+| Notched Frequencies (operator-maintained frequency-range exclusion list, for known false-spot sources) | **Gap** — same ticket as MAN-31, see below |
 | Super Check Partial (MASTER.SCP) binary include-filter | **Covered, and already improved on** — manta's SCP cross-check (confidence-raising only) avoids the exact false-negative failure mode the RBN team itself warns against ("screens out ... new calls ... casual contesters") for Aggregator's binary version |
 | VHF-specific grid-format and low-SNR false-positive filters | **Non-goal** — corrected from an earlier "Covered" label (caught by Codex review on PR #57): manta targets HF CW only, so no VHF/grid-format spot class exists to filter — this is a non-goal, not a covered capability |
 | RBN telnet feed — inbound serving (clients connect to manta) | **Covered** — MAN-12's telnet/JSON output; a stock DX cluster client connects to and reads from manta, per ROADMAP.md M3's acceptance criterion |
 | RBN telnet feed — outbound submission (manta pushes into RBN's own network) | **Gap** — see MAN-32 below. Corrected from an earlier "Covered" label (caught by Codex review on PR #57): this is Aggregator's actual core job (§2.0 of its manual: "Forwards selected spots to the RBN server via an Internet connection") and is the opposite direction from MAN-12's inbound server — nothing in the current backlog lets manta submit itself as an RBN-contributing node |
-| Dry-run / "don't actually send to RBN" test mode | **Covered** — falls under MAN-17's non-live RBN-parity validation scope |
+| Dry-run / "don't actually send to RBN" test mode | **Covered (folded into MAN-32)** — corrected from an earlier "Covered by MAN-17" label (caught by Codex review on PR #57): MAN-17 is offline recall/false-spot benchmarking against recorded IQ, not a runtime switch on a live outbound connection. Once MAN-32 (outbound RBN submission) adds that connection, it needs its own suppress-transmission mode — folded into MAN-32's scope rather than left to a validation ticket that doesn't touch the outbound path at all |
 | Transverter base-frequency offset | **Non-goal** — a narrow hardware-specific accessory; no MAN-10/11 target hardware is described as transverter-fed |
 | Local User Port (second telnet stream, independently configurable to show all decoded spots vs. only RBN-forwarded spots) | **Covered (implementation detail)** — a design nuance for MAN-12 to consider (single filtered stream vs. dual raw/filtered streams), not a separate capability gap |
-| `.ini` file rotation (scheduled day/night, weekday/contest swaps, sunrise/sunset-relative) | **Gap** — same ticket as MAN-new-3 (SkimSrv's `CwSegments`), see below — this is the scheduling half of the same underlying capability |
+| `.ini` file rotation (scheduled day/night, weekday/contest swaps, sunrise/sunset-relative) | **Gap** — same ticket as MAN-30 (SkimSrv's `CwSegments`), see below — this is the scheduling half of the same underlying capability |
 | Patt3Ch.lst sync (auto-check/download updated pattern files from the RBN server every ~20 min) | **Non-goal** — manta's validation patterns (cty.dat, master.scp) are bundled/refreshable config, not a community-shared file requiring a bespoke sync client; refreshing them is an ops/packaging concern (MAN-21), not a new capability |
 | FT4/FT8 UDP monitoring (up to 33 WSJT-X/JTDX instances) | **Non-goal** — README: "Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0" |
 | Associate Programs (sequenced launch of up to 8 companion Windows programs at startup) | **Non-goal** — a workaround for the legacy stack's multi-process Windows sprawl (Skimmer + Aggregator + virtual-audio-cable software + WSJT-X, etc.); manta's single-binary architecture (ARCHITECTURE.md) has nothing to orchestrate |
-| Beacon detection heuristic (flags NCDXF-style beacons in the traffic tab) | **Gap** — same ticket as MAN-new-1 (Watch List / beacon repetition exemption) |
+| Beacon detection heuristic (flags NCDXF-style beacons in the traffic tab) | **Gap** — same ticket as MAN-28 (Watch List / beacon repetition exemption) |
 | Cluster-side "unique spot" filter interop (`set dx filter unique > 1`) | **Covered** — a wire-format compatibility detail for MAN-17's cluster-client interop testing, not a distinct manta capability |
 | Computer sizing guidance (8-core AMD FX-8350: 7 bands @ 192 kHz, 8–11% CPU) | **Informational only** — useful reference data point for MAN-18's Pi4 CPU-budget work, not a capability to catalog |
 
@@ -102,19 +103,22 @@ separate jobs**, not two:
 
 | Ticket | Capability | Why it's a genuine gap |
 |---|---|---|
-| MAN-28 | Beacon-aware repetition exemption (Watch List equivalent) | manta's context parser already type-tags BEACON messages (ARCHITECTURE.md §6 step 1), but the standard ≥2-decodes/90s repetition gate (step 4) has no documented exemption for them — NCDXF-style beacons ID once per power-step and would be silently dropped, mirroring exactly the problem CW Skimmer's Watch List was built to solve (Aggregator manual Appendix A2) |
+| MAN-28 | Watch List equivalent (general validation-bypass allowlist, beacon exemption is the motivating case) | Widened after Codex review on PR #57: `Validator::try_spot` runs grammar/cty rejection before the repetition gate, so a real Watch List must bypass all three. manta's context parser already type-tags BEACON messages (ARCHITECTURE.md §6 step 1) but the repetition gate (step 4) has no exemption for them — NCDXF-style beacons ID once per power-step and would be silently dropped, mirroring exactly the problem CW Skimmer's Watch List was built to solve (Aggregator manual Appendix A2) |
 | MAN-29 | Per-source frequency-calibration correction factor | Forum research already flagged "systematic 200+ kHz frequency-calibration errors" as a known recurring bad-spot class; CW Skimmer/SkimSrv's `FreqCalibration=` key and the Aggregator manual's dedicated calibration appendix show this is a real, actively-managed operator workflow today, with no manta equivalent |
-| MAN-30 | Configurable, optionally time-of-day-scheduled CW sub-segment decode restriction | SkimSrv's `CwSegments` (skip non-CW ranges) and Aggregator's `.ini` rotation (day/night, contest, sunrise/sunset-relative swaps) are the same underlying capability split across two legacy programs; lower priority — may be closed as unnecessary if MAN-18's Pi4 CPU-budget gate passes without it |
+| MAN-30 | Configurable CW sub-segment decode restriction, optionally schedulable (time-of-day, weekday/contest, sunrise/sunset-relative) | SkimSrv's `CwSegments` (skip non-CW ranges) and Aggregator's `.ini` rotation (day/night, contest, sunrise/sunset-relative swaps) are the same underlying capability split across two legacy programs; lower priority — may be closed as unnecessary if MAN-18's Pi4 CPU-budget gate passes without it. MAN-30's own scenario is trigger-agnostic (any scheduled swap, not just time-of-day) — this label was narrower than the ticket, caught by Codex review on PR #57 |
 | MAN-31 | Operator-configurable spot suppression: bad-call blocklist + notched frequency ranges | Manual operator override lists, orthogonal to manta-spot's automatic validation pipeline (cty.dat/SCP/plausibility); addresses a real, named failure mode (birdies/spurs at fixed frequencies, known-bad callsigns) that automatic validation doesn't catch |
 | MAN-32 | Outbound RBN submission (become an RBN-contributing node) | Aggregator's core job is pushing spots INTO the RBN network; MAN-12's telnet/JSON server is the opposite (inbound) direction. Found by Codex review on PR #57, not the original research pass — the initial matrix mis-disposed this as covered |
 | MAN-33 | RST/QRL? spot-content extraction | `manta-spot/src/context.rs` classifies CQ/DE/Beacon but has no RST or QRL? extraction, contra the original matrix's over-broad "covered" claim. Found by Codex review on PR #57, verified against source before filing |
 | MAN-34 | RF center-frequency reference for the rig-audio input mode | `AudioIqSource::center_freq_hz()` always returns `0.0` — the already-shipped `listen`/`listen --device` mode reports baseband offsets, not absolute frequency. Found by Codex review on PR #57 — the original CAT non-goal was correct for wideband sources but too broad to also cover this already-shipped narrowband mode |
+| MAN-35 | (Bug, not a capability gap) `is_allocated` lets a callsign extending an exact-call alias pass validation | `cty.rs::clean_alias` strips the exact-call marker (leading `=`) without preserving that the entry is exact-only, so `is_allocated`'s any-length prefix match lets e.g. `4U1UNA` pass because `4U1UN` (from `=4U1UN`) matches as a length-5 slice. Found by Codex review on PR #57, verified against `crates/manta-spot/src/cty.rs` |
 
 MAN-28 through MAN-31 came from the original research pass; MAN-32 through
-MAN-34 came from Codex's review of this PR (`docs/DECISIONS` diff), which
-caught three capabilities the original matrix had mis-disposed as
-"covered" without checking the actual source. Each was re-verified against
-`manta-spot`/`manta-input` source before filing.
+MAN-35 came from Codex's review of this PR across two rounds
+(`docs/DECISIONS` diff), which caught capabilities the original matrix had
+mis-disposed as "covered" without checking the actual source, plus one
+real validation bug (MAN-35, not a disposition error) surfaced along the
+way. Each was re-verified against `manta-spot`/`manta-input` source before
+filing or updating.
 
 ## Non-goals not yet in README.md
 
