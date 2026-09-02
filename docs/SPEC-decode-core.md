@@ -549,6 +549,16 @@ tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
 mu_ratio_bounds = [2.2, 4.5]
 char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
 cluster_alpha = 0.15
+
+[input]
+# Per-source oscillator drift correction, ppm; range [-1000, 1000]
+# (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29.
+freq_correction_ppm = 0.0
+
+[spot]
+# Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
+# validation and the repetition gate entirely in manta-spot's validator.
+allowlist = []
 ```
 
 ## 10. Deviations from ARCHITECTURE.md
