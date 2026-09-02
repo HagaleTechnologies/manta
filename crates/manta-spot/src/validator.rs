@@ -237,6 +237,13 @@ impl Validator {
         self.allowlist.insert(call.to_ascii_uppercase());
     }
 
+    /// Cumulative `RepetitionGate::record` calls for life -- see that
+    /// method's doc. MAN-19 round 3: direct evidence the gate (and so
+    /// `forget_track`'s teardown) was ever exercised at all.
+    pub fn gate_records_total(&self) -> u64 {
+        self.gate.records_total()
+    }
+
     /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
     /// default -- no suppression until the operator supplies one.
     pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {

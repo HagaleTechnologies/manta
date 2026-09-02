@@ -772,6 +772,34 @@ impl TrackManager {
             .flat_map_iter(|d| d.finish())
             .collect();
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        // MAN-19 round 3: honor the same teardown contract `process_hops`
+        // does -- a track still open when the stream ends (EOF/Ctrl-C/
+        // error) must still get its `TrackClosed` if it ever emitted a
+        // real event, including one this very flush just produced (mark
+        // `has_emitted` from `events` first, same as `process_hops`).
+        // Without this, a caller that keeps the `Validator`/
+        // `RepetitionGate` alive past `finish()` (this crate's own
+        // `listen()` doesn't, but the contract shouldn't depend on that)
+        // would leak exactly the state this whole mechanism exists to
+        // free.
+        for e in &events {
+            if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
+                t.has_emitted = true;
+            }
+        }
+        let closed_ids: Vec<u32> = self
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.has_emitted)
+            .map(|(&id, _)| id)
+            .collect();
+        events.extend(
+            closed_ids
+                .into_iter()
+                .map(|track_id| DecoderEvent::TrackClosed { track_id }),
+        );
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        self.tracks.clear();
         events
     }
 

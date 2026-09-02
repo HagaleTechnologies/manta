@@ -11,6 +11,14 @@ const WINDOW_SECONDS: f64 = 90.0;
 pub struct RepetitionGate {
     window_samples: u64,
     seen: BTreeMap<(u32, String), Vec<u64>>,
+    /// Cumulative count of `record()` calls, for life. MAN-19 round 3:
+    /// the only direct evidence that this gate's state was ever touched
+    /// at all -- a soak whose decoding regressed to metadata-only output
+    /// (TrackMeta/SpeedUpdate, no CharDecoded ever reaching a candidate
+    /// word) could still open/close tracks and pass every other
+    /// workload-activity check while never calling `record`, leaving
+    /// `forget_track`'s half of the leak fix completely unexercised.
+    records_total: u64,
 }
 
 impl RepetitionGate {
@@ -18,6 +26,7 @@ impl RepetitionGate {
         Self {
             window_samples: (WINDOW_SECONDS * fs) as u64,
             seen: BTreeMap::new(),
+            records_total: 0,
         }
     }
 
@@ -25,6 +34,7 @@ impl RepetitionGate {
     /// Returns the number of distinct decodes within the trailing window
     /// (including this one).
     pub fn record(&mut self, track_id: u32, callsign: &str, sample_ts: u64) -> usize {
+        self.records_total += 1;
         let entry = self
             .seen
             .entry((track_id, callsign.to_string()))
@@ -33,6 +43,11 @@ impl RepetitionGate {
         let cutoff = sample_ts.saturating_sub(self.window_samples);
         entry.retain(|&ts| ts >= cutoff);
         entry.len()
+    }
+
+    /// See `records_total`'s doc.
+    pub fn records_total(&self) -> u64 {
+        self.records_total
     }
 
     /// Drops every recorded decode for `track_id`. MAN-19: without this,

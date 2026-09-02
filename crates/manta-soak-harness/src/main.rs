@@ -48,12 +48,22 @@ struct Cli {
     /// Length of the one base pileup scene that gets looped, in seconds.
     #[arg(long, default_value_t = 120.0)]
     scene_seconds: f64,
-    /// How often to sample RSS + track/eviction counts, in seconds.
-    #[arg(long, default_value_t = 30)]
+    /// How often to sample RSS + track/eviction counts, in seconds. Must
+    /// be positive -- at 0, every processed chunk would trigger a sample
+    /// (this replays in memory with no real-time pacing), serializing and
+    /// flushing a JSON record far faster than any sampling interval is
+    /// meant to, and could exhaust the output disk over a long soak.
+    #[arg(long, default_value_t = 30, value_parser = parse_positive_secs)]
     sample_interval_secs: u64,
     /// Output directory for scene.wav, scene_manifest.json, metrics.jsonl,
-    /// report.json. Created if missing. Defaults to a timestamped dir
-    /// under ./man19-soak-runs/.
+    /// report.json. Created if missing. Defaults to a collision-resistant
+    /// per-run dir under the OS temp dir (AGENTS.md: "use per-session
+    /// scratch dirs") -- never inside the repo/worktree by default, and
+    /// never colliding with a concurrent run started in the same second
+    /// (round 3 review: the old default was a bare UNIX-seconds
+    /// timestamp under the current directory, so two runs launched
+    /// within the same second silently overwrote each other's files, and
+    /// a run left large untracked artifacts inside the worktree).
     #[arg(long)]
     out_dir: Option<PathBuf>,
     /// Scene RNG seed (noise + reproducibility).
@@ -61,11 +71,31 @@ struct Cli {
     seed: u64,
 }
 
+/// Clap value parser for `--sample-interval-secs`: rejects 0 at CLI-parse
+/// time, before opening any output file (round 3 review).
+fn parse_positive_secs(s: &str) -> std::result::Result<u64, String> {
+    let secs: u64 = s
+        .parse()
+        .map_err(|e| format!("invalid --sample-interval-secs {s:?}: {e}"))?;
+    if secs == 0 {
+        return Err("--sample-interval-secs must be positive (0 samples every processed chunk, far faster than intended)".to_string());
+    }
+    Ok(secs)
+}
+
 /// A crowded 40m CW sub-band as heard in a receiver's audio passband:
 /// ~20 simultaneous stations spread 400-2700 Hz, a couple of close pairs
 /// (deliberately within a channel or two of each other) to exercise
-/// adjacent-channel merge/eviction, varied speed/SNR/jitter. Loosely
-/// modeled on manta-testkit's V8 pileup-scene precedent
+/// adjacent-channel merge/eviction, varied speed/SNR/jitter, plus one
+/// deliberately clean, isolated, high-SNR caller (matching soak.rs's own
+/// proven-working single-signal test) so at least one track reliably
+/// decodes cleanly enough to pass grammar/CTY validation and reach
+/// `RepetitionGate::record` -- without it, `gate_records_total` measured
+/// 0 across every run tried (round 3 review's `workload_exercised`
+/// addition would otherwise make this harness permanently unable to
+/// pass: the rest of the pileup is deliberately dense/colliding enough
+/// that nothing else here ever clears grammar+cty). Loosely modeled on
+/// manta-testkit's V8 pileup-scene precedent
 /// (crates/manta-engine/benches/cpu_budget.rs), just audio-band offsets
 /// instead of RF-band ones and far fewer signals (this needs to run for
 /// hours, not profile a single 15s window).
@@ -99,7 +129,7 @@ fn pileup_signals() -> Vec<SignalSpec> {
         1550.0,
         2000.0,
     ];
-    CALLS
+    let mut signals: Vec<SignalSpec> = CALLS
         .iter()
         .zip(offsets_hz.iter())
         .enumerate()
@@ -123,7 +153,24 @@ fn pileup_signals() -> Vec<SignalSpec> {
                 char_wpm: None,
             }
         })
-        .collect()
+        .collect();
+    // The deliberately clean, isolated caller -- see the function doc.
+    // Offset clear of every other signal above (max is 2660 Hz); 24 dB
+    // SNR, no jitter/QSB, moderate 20 WPM -- same shape as soak.rs's own
+    // unit test (`soak_reports_no_panic_on_a_clean_short_signal`), which
+    // is proven to decode "CQ CQ DE W1AW W1AW K" end to end.
+    signals.push(SignalSpec {
+        text: "CQ CQ DE N1CLR N1CLR K".to_string(),
+        loop_text: true,
+        wpm: 20.0,
+        offset_hz: 3400.0,
+        snr_2500_db: 24.0,
+        jitter: None,
+        qsb: None,
+        watterson: None,
+        char_wpm: None,
+    });
+    signals
 }
 
 /// Loops a real-valued mono buffer indefinitely through the same
@@ -196,11 +243,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let out_dir = cli.out_dir.unwrap_or_else(|| {
-        let ts = std::time::SystemTime::now()
+        // Round 3 review: a bare UNIX-seconds timestamp under the current
+        // directory both collides (two runs launched within the same
+        // second silently overwrote each other's scene/metrics/report
+        // files) and, when invoked from inside the worktree with no
+        // --out-dir, left large untracked artifacts inside the repo.
+        // Seconds+nanos+pid under the OS temp dir is collision-resistant
+        // and matches AGENTS.md's "use per-session scratch dirs".
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        PathBuf::from(format!("man19-soak-runs/{ts}"))
+            .unwrap();
+        std::env::temp_dir().join(format!(
+            "man19-soak-runs/{}-{:09}-{}",
+            now.as_secs(),
+            now.subsec_nanos(),
+            std::process::id()
+        ))
     });
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
@@ -348,9 +406,16 @@ fn main() -> Result<()> {
     // then closed" -- the only population that could have created
     // Validator/RepetitionGate per-track_id state, so it's the only
     // meaningful evidence the leak-motivated path ran at all.
+    // MAN-19 review round 3: `track_closed_events > 0` alone still isn't
+    // enough -- a track can promote, emit only TrackMeta/SpeedUpdate (no
+    // CharDecoded/word ever reaching a repetition-gate candidate), and
+    // close, satisfying that bar while RepetitionGate::record was never
+    // called -- leaving forget_track's half of the leak fix untested.
+    // gate_records_total is direct evidence the gate itself was touched.
     let workload_exercised = report.events_emitted > 0
         && report.peak_active_tracks > 0
-        && report.track_closed_events > 0;
+        && report.track_closed_events > 0
+        && report.gate_records_total > 0;
     // MAN-19 review round 1: a smoke invocation (e.g. `--duration-hours
     // 0.001` for local iteration) must not report the same "PASSED" this
     // harness uses for a genuine acceptance run -- and a run whose
@@ -386,6 +451,7 @@ fn main() -> Result<()> {
         "events_emitted": report.events_emitted,
         "spots_emitted": report.spots_emitted,
         "track_closed_events": report.track_closed_events,
+        "gate_records_total": report.gate_records_total,
         "rss_growth_bytes": report.rss_growth_bytes,
         "rss_growth_mib": rss_growth_mib,
         "panicked": report.panicked,

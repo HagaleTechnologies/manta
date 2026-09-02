@@ -21,7 +21,7 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 - cty.dat prefix lookup rejects unallocated prefixes; SCP membership only *raises* confidence, never gates (rare/new calls must still spot, not just well-known ones): §6.2–6.3.
 - Repetition requirement (a call must decode more than once within a window before first spot) is the main garble filter: §6.4.
 - Dedupe key = (callsign, freq bucket) with a re-spot suppression window unless SNR improves or type changes: §6.5.
-- Per-track_id state (`Validator::tracks`, `RepetitionGate::seen`) is a normative teardown invariant, not an implementation detail: every promoted track that ever emits a `DecoderEvent` **must** eventually produce a `DecoderEvent::TrackClosed`, and both structures **must** free that track_id's state on it. `TrackManager::next_id` never reuses an id, so skipping this leaks unboundedly under sustained track churn — this was a real, measured bug (MAN-19's 24h soak, `crates/manta-soak-harness`), fixed by wiring `TrackClosed` through `manta-engine::track` into `Validator::ingest`/`RepetitionGate::forget_track`. Any future `DecoderEvent` producer or per-track_id validator/gate state must preserve this contract.
+- `Validator::tracks`/`RepetitionGate::seen` are per-track_id state that must be freed on `DecoderEvent::TrackClosed` — the normative teardown contract (a real, measured leak this bug produced) lives in `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`, not here.
 
 ## Why it is shaped this way
 

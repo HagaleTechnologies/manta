@@ -62,6 +62,14 @@ pub struct SoakMetricsReport {
     /// evidence that the teardown path MAN-19 exists to soak-test was
     /// actually exercised (round 2 review).
     pub track_closed_events: usize,
+    /// `Validator::gate_records_total` at the end of the run -- direct
+    /// evidence `RepetitionGate::record` (and so `forget_track`'s half of
+    /// the leak fix) was ever exercised. `track_closed_events` alone
+    /// isn't enough: a track can promote, emit only TrackMeta/SpeedUpdate
+    /// (no CharDecoded/word ever reaching the repetition gate), and still
+    /// close -- satisfying `track_closed_events > 0` while
+    /// `RepetitionGate::record` was never called (round 3 review).
+    pub gate_records_total: u64,
 }
 
 fn peak_rss_bytes() -> u64 {
@@ -114,6 +122,7 @@ pub fn soak_with_metrics(
     let mut track_closed_count = 0usize;
     let mut peak_active_tracks = 0usize;
     let mut final_close_counts = CloseCounts::default();
+    let mut gate_records_total = 0u64;
     let mut last_sample = Instant::now();
 
     let watchdog = std::thread::spawn(move || {
@@ -232,10 +241,14 @@ pub fn soak_with_metrics(
         }
         for ev in tm.finish() {
             event_count += 1;
+            if matches!(ev, DecoderEvent::TrackClosed { .. }) {
+                track_closed_count += 1;
+            }
             spot_count += validator.ingest(&ev).len();
         }
         final_close_counts = tm.close_counts();
         peak_active_tracks = peak_active_tracks.max(tm.active_track_count());
+        gate_records_total = validator.gate_records_total();
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
         // growth after the last tick (or the whole run, if
@@ -274,6 +287,7 @@ pub fn soak_with_metrics(
         peak_active_tracks,
         final_close_counts,
         track_closed_events: track_closed_count,
+        gate_records_total,
     })
 }
 
