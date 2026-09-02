@@ -124,14 +124,20 @@ fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
     Ok(hours)
 }
 
-/// One base scene's sample count is capped here, well short of
-/// `usize::MAX`/an actual out-of-memory abort -- `--scene-seconds` is
-/// meant to be the one base loop unit the harness repeats for the whole
-/// `--duration-hours` run (documented default 120s), not the run's own
-/// length. ~11.6h at `FS_HZ`; `Complex32` samples alone would already be
-/// ~16 GiB at this cap, so there's no real use case past it (round 6
-/// review).
-const MAX_SCENE_SAMPLES: f64 = 2_000_000_000.0;
+/// Safety budget for the primary `Vec<Complex32>` scene buffer alone --
+/// round 6's 2-billion-sample cap (~16 GiB) still permits an allocation
+/// large enough to abort the process on an ordinary machine before Clap
+/// ever gets to return the intended error (Rust's default allocator
+/// aborts on OOM; that isn't a catchable `Result`/panic). 256 MiB is
+/// generous next to `--scene-seconds`'s documented 120s default and
+/// covers any realistic "long base scene" use case (round 7 review's
+/// per-hop peak-tracking discussion alone implies scenes are minutes,
+/// not hours) while staying well inside what even a small CI runner can
+/// allocate without risk.
+const MAX_SCENE_BYTES: usize = 256 * 1024 * 1024;
+/// `MAX_SCENE_BYTES` in `Complex32` samples (8 bytes each) -- ~699s
+/// (~11.6 min) at `FS_HZ` (round 9 review).
+const MAX_SCENE_SAMPLES: f64 = (MAX_SCENE_BYTES / std::mem::size_of::<Complex32>()) as f64;
 
 /// Clap value parser for `--scene-seconds`: rejects non-finite/
 /// non-positive values before they reach `render_scene`/`key_text_loop`
