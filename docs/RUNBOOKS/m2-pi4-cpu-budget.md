@@ -139,6 +139,11 @@ sudo dpkg --add-architecture arm64
 sudo apt update
 sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 
+# Rust's own target standard library -- gcc-aarch64-linux-gnu above gives
+# a linker, not this; skipping it fails before linking with a missing-
+# target/`core` error:
+rustup target add aarch64-unknown-linux-gnu
+
 # Either set this for one invocation:
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   PKG_CONFIG_ALLOW_CROSS=1 \

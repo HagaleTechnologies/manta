@@ -178,12 +178,15 @@ fn cpu_budget_mac_under_half_core() {
     // time by spreading work across more cores than the budget allows
     // must still fail.
     let cpu_ratio = cpu_elapsed / audio_duration_s;
+
+    // Print BOTH ratios before either assert!. A Pi4 run failing the Mac
+    // wall-clock bar (expected -- Pi4's own budget is a different, looser
+    // number, < 1.0x) would otherwise panic on the wall_ratio assert below
+    // before the CPU-time line ever printed, leaving the runbook's
+    // instructed "read the core-seconds line" step with nothing to read
+    // in exactly the slow-Pi scenario it exists for.
     println!(
         "cpu_budget: {elapsed:.2}s wall / {audio_duration_s:.2}s audio = {wall_ratio:.3}x realtime wall-clock (Mac budget: < 0.5x)"
-    );
-    assert!(
-        wall_ratio < 0.5,
-        "192 kS/s / 300-track pipeline used {wall_ratio:.3}x realtime, Mac budget is < 0.5x (< 50% of one core)"
     );
     // Unix-only -- see cpu_seconds' doc comment. cfg!(unix) rather than
     // #[cfg(unix)] on the block: both branches are ordinary std macro
@@ -194,15 +197,22 @@ fn cpu_budget_mac_under_half_core() {
         println!(
             "cpu_budget: {cpu_elapsed:.2}s (user+sys) CPU / {audio_duration_s:.2}s audio = {cpu_ratio:.3}x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)"
         );
+    } else {
+        println!(
+            "cpu_budget: (user+sys) CPU-time ratio not measured on this platform (Unix-only, see cpu_seconds' doc comment)"
+        );
+    }
+
+    assert!(
+        wall_ratio < 0.5,
+        "192 kS/s / 300-track pipeline used {wall_ratio:.3}x realtime, Mac budget is < 0.5x (< 50% of one core)"
+    );
+    if cfg!(unix) {
         assert!(
             cpu_ratio < 0.5,
             "192 kS/s / 300-track pipeline used {cpu_ratio:.3}x (user+sys) core-seconds per \
              audio-second, Mac budget is < 0.5x (< 50% of one core) -- a run can pass on \
              wall-clock alone by spreading the same work across more cores than the budget allows"
-        );
-    } else {
-        println!(
-            "cpu_budget: (user+sys) CPU-time ratio not measured on this platform (Unix-only, see cpu_seconds' doc comment)"
         );
     }
 }
