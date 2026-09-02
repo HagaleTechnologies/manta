@@ -279,17 +279,18 @@ fn v22_exempt_spot_waits_for_track_metadata_before_emitting() {
         "must not spot with bogus 0 Hz/0 dB telemetry before TrackMeta arrives, got {spots:?}"
     );
 
-    v.ingest(&DecoderEvent::TrackMeta {
+    // The pending candidate is retried the moment metadata arrives (V25),
+    // so the spot comes out of this same ingest call.
+    let more_spots = v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
     });
-    let more_spots = run(&transmission_events(1, &["QQ9ZZZ"], 200_000), &mut v);
     assert!(
         more_spots
             .iter()
             .any(|s| s.callsign == "QQ9ZZZ" && s.freq_hz == 14_020_000.0),
-        "once metadata arrives, a later word boundary must spot with real telemetry, got {more_spots:?}"
+        "once metadata arrives, the pending candidate must spot with real telemetry, got {more_spots:?}"
     );
 }
 
@@ -320,5 +321,55 @@ fn v23_allowlisted_call_is_reclassified_when_trailing_context_completes() {
             .iter()
             .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::De),
         "K5ARH UP completing afterward must produce a reclassified De spot, got {second:?}"
+    );
+}
+
+/// V24: a reclassification must reuse the word's existing repetition
+/// count, not record another decode -- otherwise an ordinary,
+/// non-exempt callsign decoded only once could spot after a
+/// reclassification alone inflates its rep count to 2. "DE K5ARH"
+/// decodes once (type De, reps=1, held back by the repetition gate);
+/// a later "CQ" token then reclassifies the same word to type Cq. That
+/// reclassification must NOT itself count as a second decode.
+#[test]
+fn v24_reclassification_does_not_inflate_the_repetition_count() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["DE", "K5ARH", "CQ"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "K5ARH decoded only once must not spot even though its type was \
+         reclassified from De to Cq by the trailing CQ token, got {spots:?}"
+    );
+}
+
+/// V25: a pending first-decode-exempt candidate must be retried the
+/// moment `TrackMeta` arrives, not merely on the next `WordBoundary`. A
+/// short transmission with no further words after the one that completed
+/// the exemption would otherwise lose it permanently -- `try_spot` is
+/// only ever invoked by a word boundary, so if none follows, a pending
+/// candidate held back by V22's metadata gate would never be evaluated
+/// again.
+#[test]
+fn v25_pending_candidate_retried_when_metadata_arrives_with_no_further_words() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("QQ9ZZZ");
+    let words = ["QQ9ZZZ"];
+    let none_yet = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        none_yet.is_empty(),
+        "no TrackMeta yet, must not spot with bogus telemetry, got {none_yet:?}"
+    );
+
+    let spots = v.ingest(&DecoderEvent::TrackMeta {
+        track_id: 1,
+        snr_2500_db: 15.0,
+        freq_hz: 14_020_000.0,
+    });
+    assert!(
+        spots.iter().any(|s| s.callsign == "QQ9ZZZ"),
+        "the pending exempt candidate must spot as soon as metadata arrives, \
+         even with no further words, got {spots:?}"
     );
 }

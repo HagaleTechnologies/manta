@@ -53,6 +53,13 @@ struct Word {
     /// re-attempt of the same evaluation -- `attempted` alone must not
     /// permanently block it (MAN-28 round 8 review).
     last_spot_type: Option<SpotType>,
+    /// The repetition count computed the first time this word was
+    /// evaluated. A reclassification (see `last_spot_type`) reuses this
+    /// rather than calling `RepetitionGate::record` again -- the word was
+    /// decoded once, not twice, so re-recording would let an ordinary,
+    /// non-exempt callsign spot after a type change alone inflated its
+    /// rep count to 2 (MAN-28 round 9 review).
+    last_reps: u32,
 }
 
 #[derive(Default)]
@@ -68,6 +75,12 @@ struct TrackState {
     /// chars/words before the first one ever arrives), so no spot may be
     /// emitted before this is true (MAN-28 round 8 review).
     has_meta: bool,
+    /// The most recent `sample_ts` seen for this track (any event kind).
+    /// `try_spot` is normally only invoked by a `WordBoundary`, but a
+    /// candidate held back by `has_meta` must be retried the moment
+    /// metadata arrives even if no further word ever completes -- this is
+    /// the timestamp that retry uses (MAN-28 round 9 review).
+    last_sample_ts: u64,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -266,6 +279,7 @@ impl Validator {
                         track.words.pop_front();
                     }
                 }
+                track.last_sample_ts = *sample_ts;
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
@@ -278,10 +292,21 @@ impl Validator {
                 freq_hz,
             } => {
                 let track = self.tracks.entry(*track_id).or_default();
+                let had_meta = track.has_meta;
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
                 track.has_meta = true;
-                Vec::new()
+                let sample_ts = track.last_sample_ts;
+                // Retry: a candidate held back by the has_meta gate is
+                // otherwise only ever re-evaluated by a later
+                // WordBoundary, which a short transmission may never
+                // produce again -- silently losing the pending exemption
+                // (MAN-28 round 9 review). No-op once already true.
+                if had_meta {
+                    Vec::new()
+                } else {
+                    self.try_spot(*track_id, sample_ts)
+                }
             }
         }
     }
@@ -359,7 +384,7 @@ impl Validator {
                 track.wpm,
             )
         };
-        let char_confidences = {
+        let (char_confidences, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
             // A prior attempt with the SAME type is a genuine re-attempt
@@ -371,9 +396,10 @@ impl Validator {
             if word.attempted && word.last_spot_type == Some(spot_type) {
                 return None;
             }
+            let reclassifying = word.attempted;
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
-            word.confidences.clone()
+            (word.confidences.clone(), reclassifying)
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
@@ -405,7 +431,30 @@ impl Validator {
             }
         }
 
-        let reps = self.gate.record(track_id, &candidate, sample_ts) as u32;
+        // A reclassification is the same decode re-typed, not a new one --
+        // reuse its already-recorded repetition count instead of calling
+        // `gate.record` again, which would otherwise let a type change
+        // alone inflate an ordinary, non-exempt callsign's rep count past
+        // the repetition gate after only one real decode (MAN-28 round 9
+        // review).
+        let reps = if reclassifying {
+            let track = self.tracks.get(&track_id)?;
+            track
+                .words
+                .iter()
+                .rev()
+                .find(|w| w.text == candidate)
+                .map(|w| w.last_reps)
+                .unwrap_or(0)
+        } else {
+            self.gate.record(track_id, &candidate, sample_ts) as u32
+        };
+        {
+            let track = self.tracks.get_mut(&track_id)?;
+            if let Some(word) = track.words.iter_mut().rev().find(|w| w.text == candidate) {
+                word.last_reps = reps;
+            }
+        }
         let mut confidence = confidence::c_call(&char_confidences, reps);
         if let Some(scp) = &self.scp {
             confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));

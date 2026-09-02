@@ -219,6 +219,9 @@ bucket. The old ≥2-repetition gate hid this by construction (reaching two
 repetitions takes long enough that real telemetry always arrived first); the
 BEACON/allowlist exemptions below removed that incidental protection, so it is
 now an explicit invariant checked before any candidate is evaluated (MAN-28).
+A candidate held back by this gate is retried the moment `TrackMeta` arrives
+(not left waiting on a `WordBoundary` that a short, already-finished
+transmission may never produce again).
 
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`). Context determines
