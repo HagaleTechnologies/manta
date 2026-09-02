@@ -32,3 +32,10 @@ secrets*
 
 # Catalyst thoughts/ symlink (points outside the repo to the shared diario store)
 thoughts/
+
+# Real-audio corpus kept local-only -- either too big for git history
+# without LFS, or pending confirmed redistribution rights from the source.
+# See crates/manta-testkit/audio-corpus/README.md.
+crates/manta-testkit/audio-corpus/wpx_cw_iq_96khz.wav
+crates/manta-testkit/audio-corpus/vp8geo_cw.mp3
+crates/manta-testkit/audio-corpus/vp8geo_cw_48khz.wav
