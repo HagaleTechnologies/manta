@@ -4,7 +4,7 @@
 pub mod listen;
 pub use listen::listen;
 pub mod soak;
-pub use manta_spot::{Spot, SpotType};
+pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 
 mod track;
@@ -55,6 +55,12 @@ pub struct PipelineConfig {
     /// `manta-spot`'s ~10 Hz decode-accuracy figure (ARCHITECTURE §6 step
     /// 5), which is decode precision (MAN-29).
     pub freq_correction_ppm: f64,
+    /// Operator's bad-callsign blocklist (MAN-31). Empty by default -- no
+    /// suppression until the operator supplies one.
+    pub blocklist: Blocklist,
+    /// Operator's notched-frequency list (MAN-31). Empty by default -- no
+    /// suppression until the operator supplies one.
+    pub notch: NotchList,
 }
 
 impl Default for PipelineConfig {
@@ -63,6 +69,8 @@ impl Default for PipelineConfig {
             decode: DecodeConfig::default(),
             detector: track::DetectorConfig::default(),
             freq_correction_ppm: 0.0,
+            blocklist: Blocklist::default(),
+            notch: NotchList::default(),
         }
     }
 }
@@ -187,7 +195,9 @@ pub fn decode_samples(
     // factor (MAN-29 review: validate before construction, not after).
     let mut validator = manta_spot::Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_blocklist(cfg.blocklist.clone())
+        .with_notch(cfg.notch.clone());
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));
@@ -221,4 +231,53 @@ pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
     let center = src.center_freq_hz();
     let iq = read_all(&mut src)?;
     decode_samples(&iq, fs, center, cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MAN-31: `decode_samples` is one of the two production call sites
+    /// that must apply an operator-supplied suppression list -- proves the
+    /// `PipelineConfig` fields actually reach the `Validator`, not just the
+    /// crate-level builders in isolation (those are already covered by
+    /// `manta-spot`'s own golden_v16_v17 tests).
+    #[test]
+    fn decode_samples_suppresses_a_blocklisted_callsign() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let cfg = PipelineConfig {
+            blocklist: manta_spot::Blocklist::parse("W1AW\n"),
+            ..Default::default()
+        };
+        let report =
+            decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert!(
+            report.spots.is_empty(),
+            "blocklisted callsign must never be spotted, got {:?}",
+            report.spots
+        );
+    }
+
+    #[test]
+    fn decode_samples_suppresses_a_notched_frequency() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let signal_freq_hz = spec.center_freq_hz + spec.signals[0].offset_hz;
+        let cfg = PipelineConfig {
+            notch: manta_spot::NotchList::parse(&format!(
+                "{}-{}\n",
+                signal_freq_hz - 50.0,
+                signal_freq_hz + 50.0
+            )),
+            ..Default::default()
+        };
+        let report =
+            decode_samples(&rendered.samples, spec.fs, spec.center_freq_hz, &cfg).unwrap();
+        assert!(
+            report.spots.is_empty(),
+            "signal inside a notched range must never be spotted, got {:?}",
+            report.spots
+        );
+    }
 }

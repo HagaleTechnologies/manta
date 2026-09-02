@@ -30,23 +30,46 @@ pub struct NotchList {
 impl NotchList {
     /// Parses one `low_hz-high_hz` range per line; blank lines and
     /// `#`-prefixed comment lines are ignored (legacy Aggregator "Notched
-    /// Frequencies File" format). Malformed lines are ignored.
+    /// Frequencies File" format). Malformed lines -- including a
+    /// non-finite (`inf`/`NaN`) endpoint, which would otherwise silently
+    /// widen into an unbounded or collapsed notch -- are ignored.
     pub fn parse(text: &str) -> Self {
         let ranges = text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| {
-                let (lo, hi) = line.split_once('-')?;
-                let lo: f64 = lo.trim().parse().ok()?;
-                let hi: f64 = hi.trim().parse().ok()?;
-                Some(FreqRange {
-                    low_hz: lo.min(hi),
-                    high_hz: lo.max(hi),
-                })
-            })
+            .filter_map(Self::parse_range)
             .collect();
         Self { ranges }
+    }
+
+    /// Splits on a `-` that is genuinely the range separator, not the sign
+    /// of a negative endpoint -- an offset-frequency track below center
+    /// reports negative `freq_hz`, so `-1200--800` must parse as
+    /// `(-1200, -800)`, not fail on the leading minus. Tries each `-` from
+    /// left to right (skipping index 0, which can only be a leading sign)
+    /// and accepts the first split where both sides parse as finite
+    /// numbers.
+    fn parse_range(line: &str) -> Option<FreqRange> {
+        for i in 1..line.len() {
+            if line.as_bytes()[i] != b'-' {
+                continue;
+            }
+            if !line.is_char_boundary(i) {
+                continue;
+            }
+            let (Ok(lo), Ok(hi)) = (line[..i].parse::<f64>(), line[i + 1..].parse::<f64>()) else {
+                continue;
+            };
+            if !lo.is_finite() || !hi.is_finite() {
+                continue;
+            }
+            return Some(FreqRange {
+                low_hz: lo.min(hi),
+                high_hz: lo.max(hi),
+            });
+        }
+        None
     }
 
     pub fn contains(&self, freq_hz: f64) -> bool {
@@ -100,5 +123,42 @@ mod tests {
     fn comment_and_blank_lines_are_ignored() {
         let notch = NotchList::parse(FIXTURE);
         assert_eq!(notch.ranges().len(), 2);
+    }
+
+    #[test]
+    fn non_finite_endpoints_are_rejected_not_treated_as_an_open_range() {
+        // A non-finite endpoint must never widen into an unbounded notch --
+        // if it did, "14000000-inf" would silently suppress every spot
+        // above 14 MHz.
+        let notch = NotchList::parse("14000000-inf\n");
+        assert!(!notch.contains(20_000_000.0));
+        assert_eq!(notch.ranges().len(), 0);
+    }
+
+    #[test]
+    fn nan_endpoint_is_rejected_not_collapsed_via_min_max() {
+        let notch = NotchList::parse("NaN-14000000\n");
+        assert_eq!(notch.ranges().len(), 0);
+    }
+
+    #[test]
+    fn negative_endpoints_parse_as_a_signed_range() {
+        // An offset-frequency track below center reports negative freq_hz;
+        // the leading '-' of a negative endpoint must not be mistaken for
+        // the range separator.
+        let notch = NotchList::parse("-1200--800\n");
+        assert!(notch.contains(-1000.0));
+        assert!(!notch.contains(-1201.0));
+        assert!(!notch.contains(-799.0));
+    }
+
+    #[test]
+    fn one_negative_one_positive_endpoint_parses_correctly() {
+        let notch = NotchList::parse("-500-500\n");
+        assert!(notch.contains(0.0));
+        assert!(notch.contains(-500.0));
+        assert!(notch.contains(500.0));
+        assert!(!notch.contains(-501.0));
+        assert!(!notch.contains(501.0));
     }
 }
