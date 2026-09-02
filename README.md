@@ -117,6 +117,16 @@ criteria.
   though the channelizer architecture does not preclude them later.
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
+- Not a multi-process Windows orchestrator. `manta` is a single Rust binary;
+  there is no companion-program sprawl to sequence-launch.
+- No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
+  CAT/rig control to align a narrowband receiver with the channelizer.
+  `manta` does ingest a local audio device (`listen`/`listen --device`,
+  rig-audio passband) — this is about the legacy Windows driver-selection
+  and band-scope-alignment machinery around that, not the input itself,
+  which the wideband sources (OpenHPSDR/Hermes, SoapySDR, KiwiSDR) don't
+  need at all since the channelizer already covers the whole passband at
+  once.
 
 ## Documentation
 
