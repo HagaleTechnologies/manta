@@ -630,3 +630,24 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
          got {spots:?}"
     );
 }
+
+/// MAN-37 (Codex review round 5): a real CQ preamble commonly repeats the
+/// callsign ("CQ DX K5ARH K5ARH"), putting two words (a modifier plus the
+/// first callsign occurrence) between the unresolved "CQ" and the
+/// power-step candidate -- the guard must still recognize this as
+/// unresolved CQ framing and refuse to tag it Beacon, not just the
+/// single-filler-word case.
+#[test]
+fn power_step_beacon_blocked_by_unresolved_cq_with_a_repeated_call_preamble() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "DX", "K5ARH", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- the repeated-call CQ preamble \
+         is still unresolved framing, got {spots:?}"
+    );
+}

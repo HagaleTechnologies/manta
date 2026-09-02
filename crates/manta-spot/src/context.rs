@@ -60,8 +60,18 @@ static POWER_STEP_BEACON_RE: LazyLock<Regex> =
 /// the candidate, not the whole window, so a stale, unrelated `CQ`/`DE`
 /// several words earlier can't block a genuinely new, later beacon
 /// occurrence either (round 3).
+///
+/// Allows 1-3 words between the keyword and this position, not just one:
+/// a real CQ preamble commonly repeats the callsign ("CQ DX K5ARH
+/// K5ARH"), so the immediately-preceding filler content can itself be
+/// more than a single token (round 5) -- 3 covers `CQ`/`DE` + one
+/// modifier word (`TEST`/`DX`/etc.) + the callsign said twice, the
+/// longest realistic unresolved-framing shape seen across every round of
+/// review so far. A stale match further back than that still can't reach
+/// here at all (round 3's fix), so widening this bound doesn't reopen
+/// that gap.
 static CQ_DE_IMMEDIATE_FILLER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b((?:CQ|DE)\s+\S+)\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\b((?:CQ|DE)(?:\s+\S+){1,3})\s*$").unwrap());
 
 /// The `BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`UP_RE` family: the first (in that
 /// priority order) named-keyword pattern that matches anywhere in `text`.
@@ -318,6 +328,17 @@ mod tests {
         // pattern failed to match -- that would turn a merely-unrecognized
         // CQ call into one that wrongly bypasses the repetition gate.
         assert_eq!(parse_types("CQ DX K5ARH T"), vec![]);
+    }
+
+    #[test]
+    fn cq_dx_repeated_call_followed_by_lone_t_is_not_beacon() {
+        // Codex review on PR #65, round 5: a real CQ preamble commonly
+        // repeats the callsign ("CQ DX K5ARH K5ARH"), putting TWO words
+        // (the modifier "DX" and the first "K5ARH") between the bare "CQ"
+        // and the candidate the fallback would tag -- the guard must
+        // still recognize this as unresolved CQ framing, not just the
+        // single-filler-word case.
+        assert_eq!(parse_types("CQ DX K5ARH K5ARH T"), vec![]);
     }
 
     #[test]
