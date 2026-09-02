@@ -5,6 +5,7 @@
 
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
+use crate::tasks::ConnectionLimiter;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
@@ -29,8 +30,16 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `accept()` return immediately, and retrying with no delay turns this
 /// into a tight loop that starves other tasks on the same runtime.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// Upper bound on concurrently in-flight `/metrics` requests. Each is
+/// short-lived (one request, one response, connection closed), but with no
+/// cap at all an unauthenticated client could still open connections
+/// without bound, each holding a socket and a tracked task open for up to
+/// `HEADER_READ_TIMEOUT` (round-15 review finding). A much smaller budget
+/// than the spot-stream listeners -- legitimate traffic here is a
+/// low-cardinality set of Prometheus scrapers, not end-user clients.
+pub const MAX_METRICS_CONNECTIONS: usize = 64;
 
-pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
+pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>, limiter: ConnectionLimiter) {
     loop {
         let (socket, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -39,8 +48,16 @@ pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
                 continue;
             }
         };
+        // Blocks the accept loop itself until capacity is available -- a
+        // flood beyond `MAX_METRICS_CONNECTIONS` is left waiting in the
+        // OS's own connection backlog rather than ever being admitted or
+        // tracked at all (round-15 review finding).
+        let Ok(permit) = limiter.clone().acquire_owned().await else {
+            continue; // limiter closed: unreachable in practice, never panics
+        };
         let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _permit = permit; // held for the connection's lifetime
             let _ = handle_request(socket, metrics).await;
         });
     }

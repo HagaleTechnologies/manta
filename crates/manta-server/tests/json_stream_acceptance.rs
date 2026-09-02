@@ -39,6 +39,9 @@ async fn spawn_server() -> (
     let bus2 = bus.clone();
     let metrics2 = metrics.clone();
     let tasks = manta_server::tasks::new_client_tasks();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+    );
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
@@ -51,6 +54,7 @@ async fn spawn_server() -> (
                 shutdown: shutdown_rx,
             },
             tasks,
+            limiter,
         )
         .await;
     });
@@ -335,6 +339,9 @@ async fn websocket_client_receives_spot_as_json_message() {
     let bus2 = bus.clone();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+    );
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
@@ -347,6 +354,7 @@ async fn websocket_client_receives_spot_as_json_message() {
                 shutdown: shutdown_rx,
             },
             tasks,
+            limiter,
         )
         .await;
     });
@@ -392,6 +400,9 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+    );
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
@@ -404,6 +415,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
                 shutdown: shutdown_rx,
             },
             tasks,
+            limiter,
         )
         .await;
     });
@@ -447,6 +459,9 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+    );
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
@@ -459,6 +474,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
                 shutdown: shutdown_rx,
             },
             tasks,
+            limiter,
         )
         .await;
     });
@@ -501,6 +517,9 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+    );
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
@@ -513,6 +532,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
                 shutdown: shutdown_rx,
             },
             tasks,
+            limiter,
         )
         .await;
     });

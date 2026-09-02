@@ -32,8 +32,9 @@ pub fn parse(line: &str) -> Command {
 
     match t.as_slice() {
         ["SH", "DX"] | ["SHOW", "DX"] => Command::ShowDx { count: None },
-        ["SH", "DX", n] | ["SHOW", "DX", n] => Command::ShowDx {
-            count: n.parse().ok(),
+        ["SH", "DX", n] | ["SHOW", "DX", n] => match n.parse() {
+            Ok(count) => Command::ShowDx { count: Some(count) },
+            Err(_) => Command::Unknown,
         },
         ["SET", "DX", "FILTER", "UNIQUE", ">", n] => match n.parse() {
             Ok(min) => Command::SetFilterUnique { min },
@@ -88,5 +89,20 @@ mod tests {
         assert_eq!(parse("bye"), Command::Unknown);
         assert_eq!(parse(""), Command::Unknown);
         assert_eq!(parse("set dx filter unique > banana"), Command::Unknown);
+    }
+
+    #[test]
+    fn an_explicit_malformed_sh_dx_count_is_unknown_not_the_bare_default() {
+        // A malformed EXPLICIT count (`sh/dx/banana`, a negative number, an
+        // overflow) must be distinguishable from the client simply not
+        // specifying one (`sh/dx`, which legitimately means
+        // `count: None`) -- silently mapping both to `None` (the prior
+        // behavior via `.parse().ok()`) makes a client's mistake behave
+        // exactly like a bare `sh/dx`, matching the filter parser's
+        // existing malformed-input handling just above (round-15 review
+        // finding).
+        assert_eq!(parse("sh/dx/banana"), Command::Unknown);
+        assert_eq!(parse("sh/dx/-1"), Command::Unknown);
+        assert_eq!(parse("sh/dx/99999999999999999999"), Command::Unknown);
     }
 }

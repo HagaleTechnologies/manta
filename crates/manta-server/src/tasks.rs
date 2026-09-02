@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 /// Shared handle a server module's accept loop spawns per-client tasks
@@ -60,6 +60,23 @@ pub fn spawn_reaper(tasks: ClientTasks) -> tokio::task::JoinHandle<()> {
             while set.try_join_next().is_some() {}
         }
     })
+}
+
+/// Bounds how many client connections an accept loop admits concurrently.
+/// Each accepted connection acquires one owned permit (via
+/// `limiter.acquire_owned()`) before its handler task is spawned, and holds
+/// it for the connection's lifetime -- with no limit at all, an
+/// unauthenticated client could open connections without bound, each one
+/// costing a socket/task/broadcast-subscription and, on the JSON/WebSocket
+/// and telnet listeners, its own share of every future publish's fan-out
+/// cost (round-15 review finding). Bounding the ACCEPT loop itself (not
+/// merely disconnecting late) means a flood beyond capacity is left
+/// waiting in the OS's own connection backlog rather than ever being
+/// admitted at all.
+pub type ConnectionLimiter = Arc<Semaphore>;
+
+pub fn new_connection_limiter(max_concurrent: usize) -> ConnectionLimiter {
+    Arc::new(Semaphore::new(max_concurrent))
 }
 
 #[cfg(test)]
@@ -170,6 +187,32 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(2),
             "a never-finishing task must not block past the deadline; elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_limiter_blocks_admission_past_capacity_until_a_permit_is_released() {
+        let limiter = new_connection_limiter(2);
+        let first = limiter.clone().acquire_owned().await.unwrap();
+        let _second = limiter.clone().acquire_owned().await.unwrap();
+
+        // A 3rd acquire beyond the capacity of 2 must not resolve while
+        // both existing permits are still held.
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), limiter.clone().acquire_owned()).await;
+        assert!(
+            blocked.is_err(),
+            "a 3rd connection must be left waiting while capacity is exhausted"
+        );
+
+        // Releasing one existing permit (simulating that connection's
+        // handler task completing) must free capacity for the waiter.
+        drop(first);
+        let third =
+            tokio::time::timeout(Duration::from_millis(100), limiter.clone().acquire_owned()).await;
+        assert!(
+            third.is_ok(),
+            "releasing a permit must admit the next waiting connection"
         );
     }
 }

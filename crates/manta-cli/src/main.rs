@@ -591,7 +591,18 @@ struct SpotServer {
 /// `tasks::await_all` returns as soon as every tracked task completes, so
 /// shutdown with zero (or quickly-finishing) clients is fast regardless of
 /// this value; it only matters when a task is genuinely still writing.
-const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// Must stay comfortably >= the worst-case time a SINGLE legitimately-slow
+/// client's final drain write is itself permitted to take, or this deadline
+/// cuts a write off before it could ever finish even under its own
+/// individual timeout -- not a lagged/dead client, just an ordinary slow
+/// one. `telnet::handle_client`'s drain loop writes each spot via TWO
+/// separately-timed `write_with_timeout` calls (the RBN line, then
+/// `\r\n`), each up to telnet's own `WRITE_TIMEOUT` (10s) -- up to ~20s for
+/// one spot. The previous 2s value was shorter than even a single one of
+/// those 10s writes, so a genuinely slow-but-completing client was
+/// routinely cut off mid-drain for no reason (round-15 review finding).
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
@@ -657,6 +668,9 @@ fn start_spot_server(
             cfg.station_callsign.clone(),
             shutdown_rx.clone(),
             tasks.clone(),
+            manta_server::tasks::new_connection_limiter(
+                manta_server::telnet::MAX_TELNET_CONNECTIONS,
+            ),
         ));
         tokio::spawn(manta_server::json_stream::serve(
             json_listener,
@@ -669,6 +683,9 @@ fn start_spot_server(
                 shutdown: shutdown_rx,
             },
             tasks.clone(),
+            manta_server::tasks::new_connection_limiter(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+            ),
         ));
         // Reaps completed per-client tasks continuously, independent of
         // shutdown -- without this, `tasks` only ever shrinks at
@@ -679,6 +696,9 @@ fn start_spot_server(
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
             metrics.clone(),
+            manta_server::tasks::new_connection_limiter(
+                manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+            ),
         ));
 
         anyhow::Ok(())

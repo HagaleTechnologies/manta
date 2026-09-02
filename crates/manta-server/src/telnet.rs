@@ -10,7 +10,7 @@ use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
 use crate::rbn;
-use crate::tasks::ClientTasks;
+use crate::tasks::{ClientTasks, ConnectionLimiter};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -39,6 +39,13 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// be disconnected just for staying connected a long time.
 pub const MAX_TELNET_COMMANDS: u32 = 30;
 pub const COMMAND_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Upper bound on concurrently admitted telnet clients. With no cap at all,
+/// an unauthenticated client could open connections without bound, each one
+/// costing a socket, a tracked task, and its own broadcast subscription
+/// that every future publish must additionally fan out to (round-15 review
+/// finding). Generous headroom over any realistic legitimate DX-cluster
+/// client count.
+pub const MAX_TELNET_CONNECTIONS: usize = 512;
 
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
@@ -49,6 +56,7 @@ pub async fn serve(
     station_call: String,
     shutdown: watch::Receiver<bool>,
     tasks: ClientTasks,
+    limiter: ConnectionLimiter,
 ) {
     loop {
         let (socket, _peer) = match listener.accept().await {
@@ -57,6 +65,14 @@ pub async fn serve(
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
+        };
+        // Blocks the accept loop itself (not just the client) until
+        // capacity is available -- a flood beyond `MAX_TELNET_CONNECTIONS`
+        // is left waiting in the OS's own connection backlog rather than
+        // ever being admitted, tracked, or given a broadcast subscription
+        // at all (round-15 review finding).
+        let Ok(permit) = limiter.clone().acquire_owned().await else {
+            continue; // limiter closed: unreachable in practice, never panics
         };
         // Subscribe before spawning the connection task, not just before
         // the login handshake inside it -- `tokio::spawn` only schedules
@@ -77,6 +93,7 @@ pub async fn serve(
         // task's completion instead of guessing a fixed grace period
         // (round-10 review finding).
         tasks.lock().await.spawn(async move {
+            let _permit = permit; // held for the connection's lifetime
             metrics.inc_telnet_clients();
             let _ = handle_client(socket, bus, rx, metrics.clone(), station_call, shutdown).await;
             metrics.dec_telnet_clients();
@@ -214,8 +231,24 @@ async fn handle_client(
                     }
                     Command::SetFilterUnique { min } => {
                         min_unique = Some(min);
-                        write_with_timeout(&mut wr, format!("Filter set: unique > {min}\r\n").as_bytes())
-                            .await?;
+                        if write_with_timeout(
+                            &mut wr,
+                            format!("Filter set: unique > {min}\r\n").as_bytes(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            // A bare `?` here (the prior behavior) left
+                            // whatever's queued on the live channel
+                            // abandoned uncounted -- the same accounting
+                            // gap every other write site in this file
+                            // already closed (round-15 review finding).
+                            // The failed write itself isn't a queued spot,
+                            // so only the retained live-channel backlog
+                            // counts here (no `1 +`).
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
                     }
                     // Read-mostly protocol: any other line (unrecognized
                     // commands the client sent) is accepted without

@@ -21,8 +21,11 @@ async fn operator_get_request_sees_spot_count_active_tracks_and_source_health() 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let metrics2 = metrics.clone();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+    );
     tokio::spawn(async move {
-        manta_server::metrics_http::serve(listener, metrics2).await;
+        manta_server::metrics_http::serve(listener, metrics2, limiter).await;
     });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();

@@ -10,7 +10,7 @@
 use crate::bus::{BusSpot, SpotBus};
 use crate::metrics::Metrics;
 use crate::spot_message::SpotMessage;
-use crate::tasks::ClientTasks;
+use crate::tasks::{ClientTasks, ConnectionLimiter};
 use manta_spot::cty::Table;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +58,14 @@ const PEEK_TIMEOUT: Duration = Duration::from_millis(500);
 /// that starves other tasks on the same runtime instead of giving the
 /// system a chance to recover.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// Upper bound on concurrently admitted JSON-Lines/WebSocket clients (this
+/// listener serves both over one port). With no cap at all, an
+/// unauthenticated client could open connections without bound, each one
+/// costing a socket, a tracked task, and its own broadcast subscription
+/// that every future publish must additionally fan out to (round-15 review
+/// finding). Generous headroom over any realistic legitimate consumer
+/// count (this is the cqdx ingest surface, not a public high-fanout feed).
+pub const MAX_JSON_STREAM_CONNECTIONS: usize = 512;
 
 /// Everything a per-connection handler needs besides the socket and its
 /// broadcast subscription -- grouped so `handle_tcp_client`/
@@ -104,7 +112,12 @@ pub struct JsonStreamConfig {
 
 /// Accepts connections on `listener`, dispatching each to the plain-TCP or
 /// WebSocket handler based on a non-destructive peek of its first bytes.
-pub async fn serve(listener: TcpListener, config: JsonStreamConfig, tasks: ClientTasks) {
+pub async fn serve(
+    listener: TcpListener,
+    config: JsonStreamConfig,
+    tasks: ClientTasks,
+    limiter: ConnectionLimiter,
+) {
     let ctx = ClientCtx {
         bus: config.bus,
         metrics: config.metrics,
@@ -120,6 +133,14 @@ pub async fn serve(listener: TcpListener, config: JsonStreamConfig, tasks: Clien
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
+        };
+        // Blocks the accept loop itself (not just the client) until
+        // capacity is available -- a flood beyond
+        // `MAX_JSON_STREAM_CONNECTIONS` is left waiting in the OS's own
+        // connection backlog rather than ever being admitted, tracked, or
+        // given a broadcast subscription at all (round-15 review finding).
+        let Ok(permit) = limiter.clone().acquire_owned().await else {
+            continue; // limiter closed: unreachable in practice, never panics
         };
         // Subscribe immediately on accept, before `tokio::spawn` -- not
         // just before the WS-detection peek inside the spawned task, which
@@ -137,6 +158,7 @@ pub async fn serve(listener: TcpListener, config: JsonStreamConfig, tasks: Clien
         // task's completion instead of guessing a fixed grace period
         // (round-10 review finding).
         tasks.lock().await.spawn(async move {
+            let _permit = permit; // held for the connection's lifetime
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
                 let _ = handle_ws_client(socket, rx, ctx.clone()).await;

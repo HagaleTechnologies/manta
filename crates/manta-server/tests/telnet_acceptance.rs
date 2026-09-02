@@ -31,6 +31,8 @@ async fn spawn_server() -> (
     let metrics2 = metrics.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    let limiter =
+        manta_server::tasks::new_connection_limiter(manta_server::telnet::MAX_TELNET_CONNECTIONS);
     tokio::spawn(async move {
         manta_server::telnet::serve(
             listener,
@@ -39,6 +41,7 @@ async fn spawn_server() -> (
             STATION_CALL.to_string(),
             shutdown_rx,
             tasks,
+            limiter,
         )
         .await;
     });
