@@ -14,3 +14,4 @@ pub mod rbn;
 pub mod spot_message;
 pub mod tasks;
 pub mod telnet;
+pub mod uplink;
