@@ -789,3 +789,28 @@ fn power_step_beacon_binds_to_the_captured_word_not_a_same_text_newer_one() {
          match's identity, got {spots:?}"
     );
 }
+
+/// MAN-37 (Codex review round 10): when the power-step regex's callsign
+/// capture lands on only PART of a decoded word (its own `\b` matching
+/// mid-word right after a punctuation character glued onto a callsign,
+/// e.g. "-K5ARH"), the capture's byte range doesn't equal any word's own
+/// span -- there's no single word to bind this match to. Falling back to
+/// a text search in that case is exactly the bug round 9's exact-binding
+/// fix exists to close: it could resolve to a wholly unrelated, earlier,
+/// unsuppressed standalone "K5ARH" that was never followed by "T" at all.
+#[test]
+fn power_step_beacon_with_unmapped_exact_range_is_discarded_not_resolved_by_text() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["K5ARH", "-K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        !spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "K5ARH must not spot as Beacon -- the only power-step regex match \
+         is a partial capture inside \"-K5ARH\" with no word to bind to, \
+         and must not fall back to resolving the earlier, unrelated \
+         standalone K5ARH by text, got {spots:?}"
+    );
+}

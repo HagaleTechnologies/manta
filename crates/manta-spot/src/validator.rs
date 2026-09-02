@@ -388,13 +388,32 @@ impl Validator {
                 .map(|(_, _, seq)| *seq)
                 .max()
                 .unwrap_or(0);
-            let exact_seq = exact_range.and_then(|r| {
-                word_spans
-                    .iter()
-                    .find(|(start, end, _)| *start == r.start && *end == r.end)
-                    .map(|(_, _, seq)| *seq)
-            });
-            candidates.push((candidate, spot_type, involved_max_seq, exact_seq));
+            match exact_range {
+                // Named-pattern origin: no exact-word binding by design,
+                // resolved by text in evaluate_candidate (see context::
+                // parse's own docs on why -- V29 needs it).
+                None => candidates.push((candidate, spot_type, involved_max_seq, None)),
+                // Power-step origin MUST bind to the exact word or be
+                // discarded entirely -- falling back to a text search here
+                // is exactly the bug this whole mechanism exists to close.
+                // A capture landing on only PART of a decoded word (e.g.
+                // the regex's `\b` matching mid-word after a punctuation
+                // character glued onto a callsign, "-K5ARH") produces a
+                // range that doesn't equal any word's own span; resolving
+                // it by text could then bind this match to a wholly
+                // unrelated, unsuppressed word that merely happens to
+                // share the callsign's text (Codex review on PR #65,
+                // round 10).
+                Some(r) => {
+                    if let Some(seq) = word_spans
+                        .iter()
+                        .find(|(start, end, _)| *start == r.start && *end == r.end)
+                        .map(|(_, _, seq)| *seq)
+                    {
+                        candidates.push((candidate, spot_type, involved_max_seq, Some(seq)));
+                    }
+                }
+            }
         }
 
         // MAN-28 Watch List: an allowlisted word is found independently of
