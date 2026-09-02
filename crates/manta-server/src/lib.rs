@@ -9,6 +9,7 @@ pub mod config;
 pub mod json_stream;
 pub mod metrics;
 pub mod metrics_http;
+pub mod rate_limit;
 pub mod rbn;
 pub mod spot_message;
 pub mod tasks;

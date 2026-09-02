@@ -35,15 +35,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// memory-exhaustion DoS multiplied across connections). 16 KiB is
 /// generous headroom over any real control frame.
 const MAX_INBOUND_WS_MESSAGE_BYTES: usize = 16 * 1024;
-/// Caps how many Ping frames one WebSocket connection may send over its
-/// lifetime before being disconnected. Unlike Pong/Text/Binary (never
-/// legitimate on this pure-server-push stream, so rejected outright),
-/// Ping is genuine client behavior this server must answer -- but
-/// replying to an UNLIMITED sequence of them keeps the read arm
-/// perpetually ready, recreating the same CPU/bandwidth-exhaustion shape
-/// (round-13 review finding). 60 is generous headroom for any real
-/// keepalive cadence over a connection's life.
-pub const MAX_INBOUND_PINGS: u32 = 60;
+/// Ping rate budget: at most this many Ping frames per `PING_RATE_WINDOW`.
+/// Unlike Pong/Text/Binary (never legitimate on this pure-server-push
+/// stream, so rejected outright), Ping is genuine client behavior this
+/// server must answer -- but replying to an UNLIMITED sequence of them
+/// keeps the read arm perpetually ready, recreating the same
+/// CPU/bandwidth-exhaustion shape (round-13 review finding). A per-window
+/// RATE, not a lifetime total -- a lifetime cap disconnects a
+/// well-behaved long-running client just for staying connected a long
+/// time (one Ping/minute hits a 60-count lifetime cap after an hour
+/// regardless of pacing; round-14 review finding). 10 pings per minute is
+/// generous headroom over any real keepalive cadence.
+pub const MAX_INBOUND_PINGS: u32 = 10;
+pub const PING_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// How long `serve` waits for a connection's first bytes before assuming
 /// it's a raw JSON Lines client (which may never send anything).
 const PEEK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -154,8 +158,9 @@ pub async fn serve(listener: TcpListener, config: JsonStreamConfig, tasks: Clien
 const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
-    let deadline = tokio::time::Instant::now() + PEEK_TIMEOUT;
+    let mut deadline = tokio::time::Instant::now() + PEEK_TIMEOUT;
     let mut peek_buf = [0u8; 3];
+    let mut seen_any_bytes = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -164,7 +169,26 @@ async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
         match tokio::time::timeout(remaining, socket.peek(&mut peek_buf)).await {
             Ok(Ok(n)) if n >= 3 => return &peek_buf[..3] == b"GET",
             Ok(Ok(0)) => return false, // peer closed without sending anything
-            Ok(Ok(_)) => tokio::time::sleep(PEEK_RETRY_INTERVAL).await,
+            Ok(Ok(_)) => {
+                if !seen_any_bytes {
+                    // Some evidence of an in-progress handshake (e.g. "G"
+                    // arrived but "ET" hasn't yet) -- extend patience to
+                    // the FULL handshake budget, not just the short
+                    // no-bytes-yet PEEK_TIMEOUT, so a slow-arriving but
+                    // genuine WS client isn't misclassified as raw JSON
+                    // and handed to the raw-TCP handler, which then closes
+                    // it once the rest of the HTTP request arrives as
+                    // "unexpected client data" (round-14 review finding).
+                    // A client that has sent NOTHING yet still only gets
+                    // the original short PEEK_TIMEOUT, so a genuine raw
+                    // JSON client (expected to send nothing at all) is
+                    // still classified quickly, not delayed to the full
+                    // handshake budget for no reason.
+                    seen_any_bytes = true;
+                    deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+                }
+                tokio::time::sleep(PEEK_RETRY_INTERVAL).await;
+            }
             Ok(Err(_)) | Err(_) => return false,
         }
     }
@@ -290,7 +314,7 @@ async fn handle_ws_client(
         tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
     )
     .await??;
-    let mut ping_count: u32 = 0;
+    let mut ping_limiter = crate::rate_limit::RateLimiter::new(MAX_INBOUND_PINGS, PING_RATE_WINDOW);
     loop {
         tokio::select! {
             spot = rx.recv() => {
@@ -327,12 +351,13 @@ async fn handle_ws_client(
                         // A Ping IS legitimate client behavior, unlike
                         // Pong/Text/Binary below -- but replying to an
                         // UNLIMITED sequence of them keeps this arm
-                        // perpetually ready the same way those did.
-                        // Disconnect once a connection exceeds a small
-                        // lifetime budget instead (round-13 review
+                        // perpetually ready the same way those did
+                        // (round-13 review finding). A RATE budget, not a
+                        // lifetime total -- a lifetime cap would disconnect
+                        // a well-behaved long-running client just for
+                        // staying connected a long time (round-14 review
                         // finding).
-                        ping_count += 1;
-                        if ping_count > MAX_INBOUND_PINGS {
+                        if !ping_limiter.allow() {
                             return Ok(());
                         }
                         tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))

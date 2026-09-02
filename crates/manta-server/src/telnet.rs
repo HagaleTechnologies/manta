@@ -27,6 +27,18 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `accept()` return immediately, and retrying with no delay turns this
 /// into a tight loop that starves other tasks on the same runtime.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// Command rate budget for an established (logged-in) client: at most this
+/// many commands per `COMMAND_RATE_WINDOW`. A read-mostly protocol
+/// legitimately sends very few commands (`sh/dx`, an occasional filter
+/// change) -- but with no budget at all, an unauthenticated client could
+/// send an unlimited sequence of complete commands (e.g. repeated
+/// `sh/dx/50`), each one real CPU/bandwidth work formatting and writing up
+/// to 50 history entries (round-14 review finding). A RATE, not a
+/// lifetime total (see `json_stream`'s identical reasoning for its Ping
+/// budget) -- a long session that occasionally issues commands must never
+/// be disconnected just for staying connected a long time.
+pub const MAX_TELNET_COMMANDS: u32 = 30;
+pub const COMMAND_RATE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
@@ -102,6 +114,8 @@ async fn handle_client(
     // truncating the command to whatever chunk arrives next. Only cleared
     // once a full line has actually been parsed, below.
     let mut cmd_line = String::new();
+    let mut command_limiter =
+        crate::rate_limit::RateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
     loop {
         tokio::select! {
             spot = rx.recv() => {
@@ -152,6 +166,14 @@ async fn handle_client(
             n = read_line_bounded(&mut reader, &mut cmd_line) => {
                 if n? == 0 {
                     return Ok(()); // client disconnected
+                }
+                // Every completed command line counts against the budget,
+                // regardless of what it parses to (an unrecognized line
+                // still costs a parse + a select! iteration) -- an
+                // unlimited sequence of e.g. `sh/dx/50` is real CPU/
+                // bandwidth work, not free (round-14 review finding).
+                if !command_limiter.allow() {
+                    return Ok(());
                 }
                 match command::parse(&cmd_line) {
                     Command::ShowDx { count } => {

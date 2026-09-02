@@ -410,3 +410,41 @@ async fn a_logged_in_client_that_sends_no_commands_survives_past_the_login_idle_
         .unwrap();
     assert!(line.contains("DX de"), "line was: {line:?}");
 }
+
+#[tokio::test]
+async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
+    // Regression test (round-14 review): an established (logged-in)
+    // client could previously send an unlimited sequence of complete
+    // commands with no rate or lifetime budget -- each `set dx filter`
+    // (or worse, repeated `sh/dx/50`) is real CPU/bandwidth work. A
+    // client must be disconnected once it exceeds a small per-window
+    // command budget.
+    let (addr, _bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    for i in 0..manta_server::telnet::MAX_TELNET_COMMANDS {
+        wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+        let mut ack = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for ack #{i} within the budget"))
+            .unwrap_or_else(|_| panic!("read error waiting for ack #{i} within the budget"));
+        assert!(
+            ack.to_lowercase().contains("filter"),
+            "expected a filter ack within budget, got: {ack:?}"
+        );
+    }
+
+    // One more command, past the budget, must end the connection instead
+    // of getting another ack.
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let mut extra = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut extra))
+        .await
+        .expect("server never responded after the command budget was exceeded")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "expected the connection to close after exceeding the command budget, got: {extra:?}"
+    );
+}

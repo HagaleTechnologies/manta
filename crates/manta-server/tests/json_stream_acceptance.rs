@@ -242,6 +242,51 @@ async fn a_websocket_handshake_split_across_tcp_writes_is_still_detected() {
 }
 
 #[tokio::test]
+async fn a_websocket_handshake_arriving_slower_than_the_old_peek_timeout_is_still_detected() {
+    // Regression test (round-14 review): the classifying peek's own
+    // budget (PEEK_TIMEOUT, 500ms) used to be the ONLY patience a
+    // slow-arriving handshake got, even though the separately declared
+    // HANDSHAKE_TIMEOUT is 10s. A genuine WS client whose remaining bytes
+    // arrive after 500ms but well within 10s must still be classified as
+    // WebSocket, not misclassified as raw TCP (which then closes it once
+    // the rest of the HTTP request shows up as "unexpected client data").
+    use tokio::io::AsyncWriteExt;
+
+    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream.write_all(b"GE").await.unwrap(); // fewer than 3 bytes
+                                            // Past the OLD 500ms PEEK_TIMEOUT, comfortably under the 10s
+                                            // HANDSHAKE_TIMEOUT.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    stream
+        .write_all(
+            b"T / HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if metrics
+                .render_prometheus_text()
+                .contains("manta_ws_clients_connected 1")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("slow-arriving GET was never classified as a WebSocket client");
+}
+
+#[tokio::test]
 async fn tcp_and_websocket_clients_share_the_same_port() {
     // ARCHITECTURE §7 documents one shared "tcp/ws :7301" port -- prove a
     // raw TCP client and a WebSocket client can both connect to the exact
