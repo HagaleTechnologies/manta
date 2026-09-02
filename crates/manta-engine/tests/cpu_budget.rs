@@ -99,7 +99,19 @@ fn sustained_track_count(events: &[DecoderEvent], total_samples: u64) -> usize {
 fn cpu_budget_scene() -> (Vec<Complex32>, f64, f64, PipelineConfig) {
     const FS: f64 = 192_000.0;
     const CENTER_FREQ_HZ: f64 = 14_000_000.0;
-    const DURATION_S: f64 = 15.0;
+    // 60s, not the original 15s: the 2s detector warmup isn't the only cost
+    // excluded from steady_state_s's denominator below -- the channelizer/
+    // PFB decomposition runs at a constant per-sample rate for the WHOLE
+    // call, warmup included, so "subtract warmup duration from the
+    // denominator" alone still leaves 2s of real (non-decoder-pool, but
+    // non-zero) channelizer cost sitting in the numerator, which a short
+    // scene can't average away (Codex review, this PR: could turn a real
+    // sub-budget result into a false failure). Lengthening the scene
+    // shrinks warmup's share of the total from 13% (2s of 15s) to ~3.3%
+    // (2s of 60s), shrinking that residual error proportionally without
+    // needing a new engine API to time only the post-warmup portion of a
+    // single `decode_samples` call (out of scope -- see the pins doc).
+    const DURATION_S: f64 = 60.0;
     const N_SIGNALS: usize = 300;
 
     let signals: Vec<SignalSpec> = (0..N_SIGNALS)

@@ -151,6 +151,50 @@ scene duration) and was never re-checked before landing.
    reason not to expect the much larger Pi4 gap (below) to close on real
    hardware.
 
+## Follow-up: is the warmup correction itself accurate? (yes, empirically)
+
+A later review round raised a fair concern about the fix above: dividing
+by `(audio_duration - warmup)` corrects for the *time* warmup occupies,
+but the numerator (full elapsed CPU/wall time) still includes warmup's own
+real cost — the channelizer/PFB decomposition runs at a constant per-
+sample rate for the *entire* call, warmup included, so subtracting only
+the *duration* could still leave a non-trivial amount of real (non-
+decoder-pool) cost baked into a short scene's numerator, overstating the
+ratio by more than the intended "safer direction to be wrong" margin.
+
+Tested directly rather than argued about: lengthened `cpu_budget_scene`'s
+`DURATION_S` from 15s to 60s, so the 2s warmup drops from 13% to ~3.3% of
+the total — if warmup's own channelizer-only cost were a large confound,
+a 4x longer scene should show a *materially different* CPU-time ratio
+(closer to the true steady-state rate) than the 15s version. It didn't:
+
+```
+cpu_budget: 300 tracks sustained across most of the run (scene has 300 signals)
+cpu_budget: 38.10s wall / 58.00s steady-state audio (60.00s scene minus 2.0s detector warmup) = 0.657x realtime wall-clock (Mac budget: < 0.5x)
+cpu_budget: 33.67s (user+sys) CPU / 58.00s steady-state audio = 0.581x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
+```
+
+CPU-time ratio: 0.581x at 60s vs. 0.573x-0.583x at 15s — essentially
+unchanged. That's the empirical answer: warmup's own channelizer-only cost
+is not a large contributor to the CPU-time ratio in this scene, and the
+original correction (divide by duration-minus-warmup) was reasonably
+accurate for that metric specifically. Kept the 60s scene anyway (smaller
+residual error, and it's an `#[ignore]`d test with no CI cost either way).
+
+**Wall-clock ratio, by contrast, jumped from ~0.45x-0.46x to 0.657x** —
+and `uptime` at the time of this run read `load averages: 91.92 47.38
+31.45` (started this session's earlier readings at 10-14, now spiking to
+92 on a 12-core machine — this shared host got dramatically busier over
+the course of this session, unrelated to anything this PR did). CPU-time
+staying flat while wall-clock ballooned is exactly the signature you'd
+expect from contention (the process gets preempted more across a longer
+wall-clock window without actually consuming more CPU-seconds), not a
+real change in the pipeline's behavior — further confirming CPU-time,
+not wall-clock, is the metric to trust under anything but a dedicated
+quiet machine, and that **no wall-clock number from this session should
+be treated as representative** of anything but "this shared host's
+instantaneous contention level during a ~9-60s window."
+
 ## A cross-architecture estimate for the Pi4 leg (NOT a measurement)
 
 To make this ticket's finding actionable rather than a bare "couldn't run

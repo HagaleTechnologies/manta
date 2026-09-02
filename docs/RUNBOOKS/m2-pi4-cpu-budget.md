@@ -52,8 +52,8 @@ MAN-30's fate.
 4. Read the printed output:
    ```
    cpu_budget: 300 tracks sustained across most of the run (scene has 300 signals)
-   cpu_budget: <N>s wall / 13.00s steady-state audio (15.00s scene minus 2.0s detector warmup) = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
-   cpu_budget: <N>s (user+sys) CPU / 13.00s steady-state audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
+   cpu_budget: <N>s wall / 58.00s steady-state audio (60.00s scene minus 2.0s detector warmup) = <ratio>x realtime wall-clock (Mac budget: < 0.5x)
+   cpu_budget: <N>s (user+sys) CPU / 58.00s steady-state audio = <ratio>x core-seconds (Pi4 budget: < 1.0x; Mac budget: < 0.5x)
    ```
    Both ratios divide by 13.0s (the 15s scene minus its 2s detector
    warmup window, during which no tracks are active yet), not the full
@@ -105,6 +105,17 @@ MAN-30's fate.
    unthrottled by drift alone — the throttling flags are the direct
    signal, an upward drift across runs is only a secondary corroborating
    one.
+   **How the runs decide pass/fail:** record every run's CPU-time ratio,
+   not just the best or the last one. The gate is **PASS only if every
+   non-throttled run's CPU-time ratio is < 1.0x**. A single non-throttled
+   run at or above 1.0x is a **FAIL**, even if other runs on the same Pi
+   came in lower — don't average across runs or report only the most
+   favorable one; ROADMAP's criterion is about the pipeline actually
+   staying under budget, not about it being possible to catch it under
+   budget on a good run. If every run is throttled (per step 2/this
+   step's `vcgencmd` checks), the gate is **INCONCLUSIVE**, not a pass —
+   fix cooling/config and re-run rather than reporting a throttled number
+   either way.
 6. Record the result in this file's "Runs" section below: date, Pi4
    revision/RAM size, OS version, stock vs. overclocked config, throttling
    flags before/after, track count, both ratios, pass/fail against the
