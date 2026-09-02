@@ -92,11 +92,14 @@ fn parse_positive_secs(s: &str) -> std::result::Result<u64, String> {
 
 /// Clap value parser for `--duration-hours`: rejects non-finite/
 /// non-positive values before they reach `Duration::from_secs_f64` (which
-/// panics on NaN) (round 4 review), AND rejects a finite value so large
-/// that `hours * 3600.0` (the exact conversion `main()` performs) itself
-/// overflows to infinity -- e.g. `1e308` passes the plain finite check
-/// but `1e308 * 3600.0` overflows f64's ~1.8e308 max, and THAT infinity
-/// is what reaches `Duration::from_secs_f64` and panics (round 6 review).
+/// panics on NaN) (round 4 review), a value so large that `hours *
+/// 3600.0` (the exact conversion `main()` performs) itself overflows to
+/// infinity (round 6 review: `1e308 * 3600.0` overflows f64's ~1.8e308
+/// max), AND a value whose seconds, while still finite, exceed what
+/// `Duration` itself can represent -- e.g. `1e16` hours is `3.6e19`
+/// seconds, a perfectly finite f64, but past `Duration::MAX`'s ~1.8e19
+/// second ceiling (`u64` seconds internally), so `Duration::from_secs_f64`
+/// panics anyway (round 7 review).
 fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
     let hours: f64 = s
         .parse()
@@ -106,9 +109,10 @@ fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
             "--duration-hours must be finite and positive, got {hours}"
         ));
     }
-    if !(hours * 3600.0).is_finite() {
+    let secs = hours * 3600.0;
+    if !secs.is_finite() || secs > Duration::MAX.as_secs_f64() {
         return Err(format!(
-            "--duration-hours {hours} is too large -- converting to seconds overflows"
+            "--duration-hours {hours} is too large -- {secs} seconds exceeds what Duration can represent"
         ));
     }
     Ok(hours)

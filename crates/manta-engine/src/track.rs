@@ -793,30 +793,22 @@ impl TrackManager {
             .filter(|(_, t)| t.has_emitted)
             .map(|(&id, _)| id)
             .collect();
-        // MAN-19 round 4: append, don't re-sort. `TrackClosed` has no
-        // real timestamp (sorts at ts=0, tied with SpeedUpdate/TrackMeta
-        // -- see `event_sample_ts`), so re-running the same
-        // `sort_by_key` here would put a track's own `TrackClosed`
-        // *before* the final `CharDecoded`/`WordBoundary` this same
-        // flush just produced for it (those carry real, positive
-        // timestamps). A consumer processing in order would then see the
-        // closure first -- `Validator` frees the track's state, then the
-        // final events recreate it with nothing left to ever clean it up
-        // again, reintroducing the exact leak this mechanism exists to
-        // prevent. `process_hops` doesn't have this problem (a track
-        // closed there was already removed by `step_hop`, before
-        // `drain_pool` runs, so it can never coexist with its own real
-        // event in the same batch) -- `finish()` is the one place a
-        // track's closure and its own final content are produced
-        // together, so it's the one place order must be enforced by
-        // construction: `events` above is already correctly sorted
-        // among itself; appending after that guarantees every
-        // `TrackClosed` lands after every real event for every track.
+        // MAN-19 round 7: append, then apply ONE consistent global
+        // `(sample_ts, track_id)` sort (SPEC-decode-core.md §6 rule 6) --
+        // round 4's version appended without re-sorting specifically to
+        // dodge `TrackClosed`'s old ts=0 treatment (which would've put a
+        // track's own closure *before* the real content this same flush
+        // just produced for it), but that broke the spec's single-global-
+        // sort requirement. Now that `event_sample_ts` gives `TrackClosed`
+        // a synthetic `u64::MAX` (guaranteed after every real event, for
+        // every track, not just this one), a normal full re-sort is safe
+        // and correct again.
         events.extend(
             closed_ids
                 .into_iter()
                 .map(|track_id| DecoderEvent::TrackClosed { track_id }),
         );
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         self.tracks.clear();
         events
     }
@@ -856,15 +848,27 @@ impl TrackManager {
 }
 
 /// SPEC §6 rule 6 resequencing key: the sample timestamp an event is
-/// anchored to, or `0` for events with no inherent timestamp (`SpeedUpdate`/
-/// `TrackMeta`), which sort first among ties on `event_track_id`.
+/// anchored to, `0` for events with no inherent timestamp (`SpeedUpdate`/
+/// `TrackMeta`, which sort first among ties on `event_track_id`), or
+/// `u64::MAX` for `TrackClosed` -- a synthetic "after everything" marker,
+/// not `0` (round 7 review): `TrackClosed` isn't anchored to a real
+/// timestamp either, but unlike `SpeedUpdate`/`TrackMeta` it must never
+/// sort before another real event for the SAME track_id (a track's own
+/// final `CharDecoded`/`WordBoundary`, `finish()`'s flush) -- doing so
+/// lets a consumer free that track's state and then recreate it
+/// processing the trailing events, with nothing left to ever clean that
+/// up again (the exact leak this whole mechanism exists to prevent).
+/// `MAX` guarantees that regardless of how large a real `sample_ts`
+/// grows. This is what lets `finish()` (and `process_hops`) apply ONE
+/// consistent `(sample_ts, track_id)` sort across the whole batch
+/// (SPEC-decode-core.md §6 rule 6) instead of the append-without-
+/// re-sorting workaround round 4 used.
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
-        DecoderEvent::SpeedUpdate { .. }
-        | DecoderEvent::TrackMeta { .. }
-        | DecoderEvent::TrackClosed { .. } => 0,
+        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
+        DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
 }
 

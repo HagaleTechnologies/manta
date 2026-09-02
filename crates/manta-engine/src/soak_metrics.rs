@@ -219,11 +219,17 @@ pub fn soak_with_metrics(
                 }
                 spot_count += validator.ingest(&ev).len();
             }
+            // MAN-19 round 7: updated after every processed chunk, not
+            // just at sample_interval ticks -- a track that opens AND
+            // closes entirely between two ticks (plausible for a busy
+            // pileup with a coarse interval) previously left no trace in
+            // peak_active_tracks at all. Cheap: active_track_count() is
+            // just self.tracks.len().
+            let active = tm.active_track_count();
+            peak_active_tracks = peak_active_tracks.max(active);
 
             if last_sample.elapsed() >= sample_interval {
                 last_sample = Instant::now();
-                let active = tm.active_track_count();
-                peak_active_tracks = peak_active_tracks.max(active);
                 final_close_counts = tm.close_counts();
                 let rss = peak_rss_bytes();
                 if start.elapsed() >= WARMUP {
@@ -239,6 +245,13 @@ pub fn soak_with_metrics(
                 });
             }
         }
+        // MAN-19 round 7: captured BEFORE finish(), which clears
+        // self.tracks internally (round 4) -- calling
+        // tm.active_track_count() after finish() always reads 0 against
+        // an already-emptied map, silently contributing nothing to the
+        // peak regardless of how many tracks were actually open right up
+        // to end-of-stream.
+        peak_active_tracks = peak_active_tracks.max(tm.active_track_count());
         for ev in tm.finish() {
             event_count += 1;
             if matches!(ev, DecoderEvent::TrackClosed { .. }) {
@@ -247,7 +260,6 @@ pub fn soak_with_metrics(
             spot_count += validator.ingest(&ev).len();
         }
         final_close_counts = tm.close_counts();
-        peak_active_tracks = peak_active_tracks.max(tm.active_track_count());
         gate_records_total = validator.gate_records_total();
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
