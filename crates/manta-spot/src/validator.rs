@@ -54,6 +54,12 @@ struct TrackState {
     freq_hz: f64,
     snr_db: f32,
     wpm: f32,
+    /// Set once a real `TrackMeta` event has been received. `freq_hz`/
+    /// `snr_db` hold bogus `0.0` defaults until then (decoder.rs emits
+    /// `TrackMeta` only every 375 hops -- a fast decode can complete
+    /// chars/words before the first one ever arrives), so no spot may be
+    /// emitted before this is true (MAN-28 round 8 review).
+    has_meta: bool,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -266,6 +272,7 @@ impl Validator {
                 let track = self.tracks.entry(*track_id).or_default();
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
+                track.has_meta = true;
                 Vec::new()
             }
         }
@@ -315,6 +322,12 @@ impl Validator {
     }
 
     fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
+        // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
+        // defaults. Bail without marking anything attempted, so pending
+        // candidates are simply re-evaluated once metadata does arrive.
+        if !self.tracks.get(&track_id).is_some_and(|t| t.has_meta) {
+            return Vec::new();
+        }
         self.candidates(track_id)
             .into_iter()
             .filter_map(|(candidate, spot_type)| {
@@ -453,9 +466,21 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         events.iter().flat_map(|e| v.ingest(e)).collect()
     }
 
+    /// Real telemetry, so `try_spot`'s `has_meta` gate (MAN-28 round 8)
+    /// doesn't hold back every spot in tests that don't otherwise care
+    /// about metadata timing.
+    fn seed_meta(v: &mut Validator, track_id: u32) {
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_000.0,
+        });
+    }
+
     #[test]
     fn full_pipeline_spots_a_repeated_valid_callsign() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
@@ -520,6 +545,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn bundled_validator_spots_a_real_repeated_callsign() {
         let mut v = Validator::bundled(FS);
+        seed_meta(&mut v, 1);
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));

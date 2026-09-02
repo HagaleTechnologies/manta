@@ -212,6 +212,14 @@ Decoder output: timestamped character stream + WPM + SNR + confidence per track.
 Decoded text is noisy; validation is what makes spots trustworthy. Pipeline per
 track, over a rolling text window:
 
+No spot is ever emitted before a track's first `TrackMeta` event (SPEC §5, 1 Hz
+cadence) — until then `freq_hz`/`snr_db` hold bogus `0.0` defaults, and a spot
+carrying them would poison both the emitted record and dedupe's frequency
+bucket. The old ≥2-repetition gate hid this by construction (reaching two
+repetitions takes long enough that real telemetry always arrived first); the
+BEACON/allowlist exemptions below removed that incidental protection, so it is
+now an explicit invariant checked before any candidate is evaluated (MAN-28).
+
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`). Context determines
    spot type (CQ / DE / BEACON) — RBN spots carry this flag.

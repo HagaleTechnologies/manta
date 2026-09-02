@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15, V18-V19: manta-spot validator
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V21: manta-spot validator
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
@@ -47,6 +47,17 @@ fn run(events: &[DecoderEvent], v: &mut Validator) -> Vec<Spot> {
     events.iter().flat_map(|e| v.ingest(e)).collect()
 }
 
+/// Real telemetry, so `try_spot`'s `has_meta` gate (MAN-28 round 8) doesn't
+/// hold back every spot in tests that don't otherwise care about metadata
+/// timing.
+fn seed_meta(v: &mut Validator, track_id: u32) {
+    v.ingest(&DecoderEvent::TrackMeta {
+        track_id,
+        snr_2500_db: 20.0,
+        freq_hz: 14_000_000.0,
+    });
+}
+
 #[test]
 fn v11_context_parse_sets_spot_type() {
     let cases: &[(&[&str], SpotType)] = &[
@@ -58,6 +69,7 @@ fn v11_context_parse_sets_spot_type() {
     ];
     for (words, expected_type) in cases {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
         let mut spots = run(&transmission_events(1, words, 0), &mut v);
         spots.extend(run(&transmission_events(1, words, 100_000), &mut v));
         let hit = spots
@@ -93,7 +105,9 @@ fn v13_scp_membership_boosts_confidence_without_gating_absence() {
     };
 
     let mut v_scp = Validator::new(FS, CTY_FIXTURE, Some(scp_fixture));
+    seed_meta(&mut v_scp, 1);
     let mut v_noscp = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v_noscp, 1);
     let with_scp = run_twice(&mut v_scp, &words);
     let without_scp = run_twice(&mut v_noscp, &words);
     assert!(!with_scp.is_empty() && !without_scp.is_empty());
@@ -105,6 +119,7 @@ fn v13_scp_membership_boosts_confidence_without_gating_absence() {
     );
 
     let mut v_absent = Validator::new(FS, CTY_FIXTURE, Some(scp_fixture));
+    seed_meta(&mut v_absent, 1);
     let no_member = run_twice(&mut v_absent, &words_not_in_scp);
     assert!(
         !no_member.is_empty(),
@@ -115,6 +130,7 @@ fn v13_scp_membership_boosts_confidence_without_gating_absence() {
 #[test]
 fn v14_repetition_gate_requires_two_reps() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
     let words = ["DE", "K5ARH", "K"];
     let once = run(&transmission_events(1, &words, 0), &mut v);
     assert!(once.is_empty(), "1 rep must never spot, got {once:?}");
@@ -126,6 +142,14 @@ fn v14_repetition_gate_requires_two_reps() {
 #[test]
 fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    // Real telemetry, but a low starting SNR -- the test's own later
+    // TrackMeta jumps to 6.0 dB, which must read as a genuine >= 6 dB
+    // increase for the dedupe override below.
+    v.ingest(&DecoderEvent::TrackMeta {
+        track_id: 1,
+        snr_2500_db: 0.0,
+        freq_hz: 14_000_000.0,
+    });
     let words = ["DE", "K5ARH", "K"];
 
     let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -145,7 +169,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
         snr_2500_db: 6.0,
-        freq_hz: 0.0,
+        freq_hz: 14_000_000.0,
     });
     let allowed = run(&transmission_events(1, &words, 300_000), &mut v);
     assert!(
@@ -157,6 +181,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
 #[test]
 fn v18_beacon_pattern_exempt_from_repetition_gate() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
     let words = ["V", "V", "V", "K5ARH"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
     assert_eq!(spots.len(), 1, "a BEACON-tagged spot must emit on the first decode");
@@ -167,6 +192,7 @@ fn v18_beacon_pattern_exempt_from_repetition_gate() {
 #[test]
 fn v19_allowlisted_call_bypasses_validation_and_repetition() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
     v.allowlist("ZZ9ZZZ");
     let words = ["DE", "ZZ9ZZZ", "K"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -184,6 +210,7 @@ fn v19_allowlisted_call_bypasses_validation_and_repetition() {
 #[test]
 fn blocklisted_callsign_is_never_spotted_even_if_also_allowlisted() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+    seed_meta(&mut v, 1);
     v.allowlist("K5ARH");
     let words = ["DE", "K5ARH", "K"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -202,6 +229,7 @@ fn blocklisted_callsign_is_never_spotted_even_if_also_allowlisted() {
 #[test]
 fn v20_allowlisted_call_spots_with_no_context_pattern() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
     v.allowlist("QQ9ZZZ");
     let words = ["QQ9ZZZ"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -224,6 +252,7 @@ fn v20_allowlisted_call_spots_with_no_context_pattern() {
 #[test]
 fn v21_allowlisted_word_found_despite_a_stale_attempted_context_match() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
     v.allowlist("QQ9ZZZ");
     let words = ["CQ", "K5ARH", "QQ9ZZZ"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -231,5 +260,35 @@ fn v21_allowlisted_word_found_despite_a_stale_attempted_context_match() {
         spots.iter().any(|s| s.callsign == "QQ9ZZZ"),
         "an allowlisted word must be found even when an unrelated, \
          already-attempted context match (K5ARH) exists in the window, got {spots:?}"
+    );
+}
+
+/// V22: a fast, first-decode-exempt spot (BEACON or allowlist) must not be
+/// emitted before the track's first `TrackMeta` event -- `TrackState`'s
+/// `freq_hz`/`snr_db` still hold their `0.0` defaults until then, and the
+/// old repetition gate only *incidentally* hid this by taking long enough
+/// that real telemetry always arrived first.
+#[test]
+fn v22_exempt_spot_waits_for_track_metadata_before_emitting() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("QQ9ZZZ");
+    let words = ["QQ9ZZZ"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "must not spot with bogus 0 Hz/0 dB telemetry before TrackMeta arrives, got {spots:?}"
+    );
+
+    v.ingest(&DecoderEvent::TrackMeta {
+        track_id: 1,
+        snr_2500_db: 15.0,
+        freq_hz: 14_020_000.0,
+    });
+    let more_spots = run(&transmission_events(1, &["QQ9ZZZ"], 200_000), &mut v);
+    assert!(
+        more_spots
+            .iter()
+            .any(|s| s.callsign == "QQ9ZZZ" && s.freq_hz == 14_020_000.0),
+        "once metadata arrives, a later word boundary must spot with real telemetry, got {more_spots:?}"
     );
 }
