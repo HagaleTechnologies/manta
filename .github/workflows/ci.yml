@@ -136,8 +136,17 @@ jobs:
             # --slurp is required alongside it so multiple pages' JSON
             # arrays combine into one array of arrays instead of
             # concatenating as invalid JSON, matching this fleet's own
-            # established --paginate --slurp convention.
-            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --paginate --slurp --jq '[.[][].name]' 2>/dev/null); then
+            # established --paginate --slurp convention. gh rejects
+            # --slurp combined with --jq/--template in the same
+            # invocation ("the --slurp option is not supported with
+            # --jq or --template", gh 2.98.0) -- every call in this loop
+            # errored, so the label was never found and the job burned
+            # its full ~88-minute budget before hard-failing on every
+            # synchronize push, fleet-wide, regardless of whether the
+            # label had already landed. Piping to a separate jq
+            # invocation keeps the --paginate --slurp fetch and adds the
+            # filter as its own step.
+            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --paginate --slurp 2>/dev/null | jq '[.[][].name]' 2>/dev/null); then
               if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
                 echo "Found $target -- this round raised nothing new, safe to run the gated jobs."
                 exit 0
