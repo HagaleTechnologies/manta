@@ -133,11 +133,26 @@ jobs:
             # exceed 100 total labels, silently hiding the current
             # revision's valid one past page 1 (Codex P3, flagged
             # reviewing this step). --paginate fetches every page;
-            # --slurp is required alongside it so multiple pages' JSON
-            # arrays combine into one array of arrays instead of
-            # concatenating as invalid JSON, matching this fleet's own
-            # established --paginate --slurp convention.
-            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --paginate --slurp --jq '[.[][].name]' 2>/dev/null); then
+            # --slurp combines multiple pages' JSON arrays into one array
+            # of arrays instead of concatenating as invalid JSON --
+            # CORRECTED (fleet-wide bug, found live on this repo's own
+            # PR #56 sitting in_progress 30+ minutes despite the label
+            # already being applied): gh CLI 2.98.0 rejects --slurp
+            # combined with --jq/--template outright ("the --slurp option
+            # is not supported with --jq or --template"), so every poll
+            # iteration was silently failing via the `2>/dev/null`
+            # swallow, and the loop could never see the label no matter
+            # how long it waited. Fetch and filter are now two explicit,
+            # &&-chained steps -- same combine-then-flatten semantics,
+            # just not routed through --jq's own incompatible flag check.
+            # Deliberately NOT a bare `cmd1 | cmd2` pipe: GitHub Actions'
+            # default shell is `bash -e {0}` (no `-o pipefail`), so a pipe's
+            # exit status reflects only the last command (jq) -- a genuine
+            # gh api failure (rate limit, transient 5xx) could then still
+            # slip through if jq happened to accept whatever partial/empty
+            # output leaked past it, silently masking a real fetch error
+            # the same way the original --slurp/--jq bug did.
+            if raw=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --paginate --slurp 2>/dev/null) && labels=$(echo "$raw" | jq '[.[][].name]' 2>/dev/null); then
               if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
                 echo "Found $target -- this round raised nothing new, safe to run the gated jobs."
                 exit 0
