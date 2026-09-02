@@ -33,7 +33,7 @@ pub fn listen(
 ) -> Result<()> {
     // Validated up front so a bad config value fails fast, before spending
     // CALIBRATION_SECONDS reading from a live device (MAN-29).
-    manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+    let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let fs = src.sample_rate();
@@ -67,13 +67,13 @@ pub fn listen(
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
     for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&ev);
+        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&ev);
+        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
@@ -91,14 +91,14 @@ pub fn listen(
         for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
             m.saturating_sub(pad_hops) * hop
         }) {
-            on_event(&ev);
+            on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
             for spot in validator.ingest(&ev) {
                 on_spot(&spot);
             }
         }
     }
     for ev in tm.finish() {
-        on_event(&ev);
+        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
@@ -212,6 +212,51 @@ mod tests {
                 spec.center_freq_hz + 12_340.0
             );
         }
+    }
+
+    /// MAN-29 review round 3: the `TrackMeta` events `listen()` passes to
+    /// `on_event` (consumed directly by `listen --json`) must be
+    /// calibrated too, not just the emitted spots.
+    #[test]
+    fn listen_calibrates_track_meta_events_passed_to_on_event() {
+        const PPM: f64 = 10.0;
+        let factor = 1.0 + PPM * 1e-6;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig {
+            freq_correction_ppm: PPM,
+            ..Default::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut last_freq_hz = None;
+        listen(
+            src,
+            &cfg,
+            stop,
+            |ev| {
+                if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
+                    last_freq_hz = Some(*freq_hz);
+                }
+            },
+            |_spot| {},
+        )
+        .unwrap();
+
+        let freq_hz = last_freq_hz.expect("expected at least one TrackMeta event");
+        let uncorrected = freq_hz / factor;
+        assert!(
+            (uncorrected - (spec.center_freq_hz + 12_340.0)).abs() < 100.0,
+            "on_event's TrackMeta.freq_hz {freq_hz} divided back by the calibration factor \
+             should land near the raw decoded frequency {}",
+            spec.center_freq_hz + 12_340.0
+        );
     }
 
     /// MAN-29 review: an invalid `freq_correction_ppm` must fail `listen()`

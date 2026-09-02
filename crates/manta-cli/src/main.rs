@@ -27,6 +27,14 @@ enum Command {
         /// Emit the full DecodeReport as one JSON object on stdout.
         #[arg(long)]
         json: bool,
+        /// Per-source frequency-calibration correction, in ppm (config key
+        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
+        /// correction). Applied to `freq_hz` and every spot's `freq_hz`.
+        /// Corrects a drifted source clock/LO -- legacy precedent: CW
+        /// Skimmer/SkimSrv's `FreqCalibration=` .ini key (a raw
+        /// multiplier; this flag is ppm, per the spec's contract).
+        #[arg(long, default_value_t = 0.0, value_parser = parse_freq_correction_ppm)]
+        freq_correction_ppm: f64,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
@@ -231,8 +239,16 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Decode { path, json } => {
-            let report = decode_wav(&path, &PipelineConfig::default())?;
+        Command::Decode {
+            path,
+            json,
+            freq_correction_ppm,
+        } => {
+            let cfg = PipelineConfig {
+                freq_correction_ppm,
+                ..Default::default()
+            };
+            let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
             } else {

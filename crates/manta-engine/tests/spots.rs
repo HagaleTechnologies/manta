@@ -2,6 +2,7 @@
 //! run over the full multi-track event stream. M3 engine-wiring sub-
 //! project, docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md.
 
+use manta_decode::events::DecoderEvent;
 use manta_engine::SpotType;
 use manta_engine::{decode_samples, PipelineConfig};
 use manta_testkit::scene::{render_scene, SignalSpec};
@@ -83,6 +84,87 @@ fn decode_samples_applies_freq_correction_consistently_to_report_and_spots() {
          decoded frequency {}",
         report.freq_hz,
         14_000_000.0 + 12_340.0
+    );
+}
+
+/// MAN-29 review round 3: the raw `TrackMeta.freq_hz` values in
+/// `DecodeReport::events` (consumed directly by `decode --json`/`listen
+/// --json`) must also be calibrated, not just the summary `freq_hz` and
+/// `spots[*].freq_hz` -- without double-correcting the copy fed to the
+/// validator.
+#[test]
+fn decode_samples_calibrates_track_meta_events_too() {
+    const PPM: f64 = 10.0;
+
+    let sig = SignalSpec {
+        text: "CQ CQ DE K5ARH K5ARH K".into(),
+        loop_text: true,
+        wpm: 20.0,
+        offset_hz: 12_340.0,
+        snr_2500_db: 20.0,
+        jitter: None,
+        qsb: None,
+        watterson: None,
+        char_wpm: None,
+    };
+    let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
+
+    let uncalibrated =
+        decode_samples(&iq, 96_000.0, 14_000_000.0, &PipelineConfig::default()).unwrap();
+    let cfg = PipelineConfig {
+        freq_correction_ppm: PPM,
+        ..Default::default()
+    };
+    let calibrated = decode_samples(&iq, 96_000.0, 14_000_000.0, &cfg).unwrap();
+
+    let raw_freqs: Vec<f64> = uncalibrated
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            DecoderEvent::TrackMeta { freq_hz, .. } => Some(*freq_hz),
+            _ => None,
+        })
+        .collect();
+    let calibrated_freqs: Vec<f64> = calibrated
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            DecoderEvent::TrackMeta { freq_hz, .. } => Some(*freq_hz),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !raw_freqs.is_empty(),
+        "expected at least one TrackMeta event"
+    );
+    assert_eq!(raw_freqs.len(), calibrated_freqs.len());
+    let factor = 1.0 + PPM * 1e-6;
+    for (raw, corrected) in raw_freqs.iter().zip(calibrated_freqs.iter()) {
+        assert!(
+            (corrected - raw * factor).abs() < 1e-6,
+            "TrackMeta.freq_hz {corrected} should equal raw {raw} * factor {factor}"
+        );
+    }
+
+    // The validator's own spot output must NOT be double-corrected by this
+    // fix -- it should match exactly what round 1's fix already produced.
+    let spot = calibrated
+        .spots
+        .iter()
+        .find(|s| s.callsign == "K5ARH")
+        .expect("expected a K5ARH spot");
+    let uncalibrated_spot = uncalibrated
+        .spots
+        .iter()
+        .find(|s| s.callsign == "K5ARH")
+        .expect("expected a K5ARH spot");
+    assert!(
+        (spot.freq_hz - uncalibrated_spot.freq_hz * factor).abs() < 1e-6,
+        "spot.freq_hz {} should equal uncalibrated spot.freq_hz {} * factor {factor} exactly \
+         once, not twice",
+        spot.freq_hz,
+        uncalibrated_spot.freq_hz
     );
 }
 

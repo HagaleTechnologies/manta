@@ -17,6 +17,29 @@ use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
 
+/// Applies the calibration factor to a `TrackMeta` event's `freq_hz`,
+/// leaving every other event variant untouched. Used to calibrate the
+/// public-facing event stream (`DecodeReport::events`, `listen()`'s
+/// `on_event` callback) -- both consumed directly by `decode --json`/
+/// `listen --json` -- WITHOUT touching the copy fed to
+/// `manta_spot::Validator::ingest`, which already applies its own
+/// calibration internally; applying it here too would double-correct the
+/// validator's spot output (MAN-29 review round 3).
+pub(crate) fn calibrate_track_meta(ev: &DecoderEvent, factor: f64) -> DecoderEvent {
+    match ev {
+        DecoderEvent::TrackMeta {
+            track_id,
+            snr_2500_db,
+            freq_hz,
+        } => DecoderEvent::TrackMeta {
+            track_id: *track_id,
+            snr_2500_db: *snr_2500_db,
+            freq_hz: freq_hz * factor,
+        },
+        other => other.clone(),
+    }
+}
+
 /// M0 pipeline tunables. SPEC §5.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -169,6 +192,14 @@ pub fn decode_samples(
     for ev in &events {
         spots.extend(validator.ingest(ev));
     }
+    // Calibrated from the same (still-uncorrected) `events` the validator
+    // above just ingested -- validator.ingest() already applied its own
+    // correction to its internal spot output, so this must not run before
+    // that loop (MAN-29 review round 3).
+    let events: Vec<DecoderEvent> = events
+        .iter()
+        .map(|ev| calibrate_track_meta(ev, calibration_factor))
+        .collect();
     Ok(DecodeReport {
         freq_hz,
         wpm,

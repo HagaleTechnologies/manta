@@ -67,11 +67,25 @@ pub struct InvalidCalibration {
 
 impl std::fmt::Display for InvalidCalibration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "freq_correction_ppm {} yields calibration factor {}, which must be finite and positive",
-            self.ppm, self.factor
-        )
+        // Names the actual reason -- a ppm outside the supported range can
+        // have a factor that's perfectly finite and positive, so that
+        // message would be actively misleading for it (MAN-29 review
+        // round 3).
+        if !self.ppm.is_finite() {
+            write!(f, "freq_correction_ppm {} is not finite", self.ppm)
+        } else if self.ppm.abs() > MAX_ABS_PPM {
+            write!(
+                f,
+                "freq_correction_ppm {} is outside the supported range [-{MAX_ABS_PPM}, {MAX_ABS_PPM}]",
+                self.ppm
+            )
+        } else {
+            write!(
+                f,
+                "freq_correction_ppm {} yields calibration factor {}, which must be finite and positive",
+                self.ppm, self.factor
+            )
+        }
     }
 }
 
@@ -485,5 +499,31 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             Ok(_) => panic!("expected NaN ppm to be rejected"),
             Err(err) => assert!(err.ppm.is_nan()),
         }
+    }
+
+    /// MAN-29 review round 3: a ppm just outside the supported range
+    /// (whose derived factor is otherwise perfectly finite and positive)
+    /// must not be reported with the "must be finite and positive"
+    /// message -- that's not why it failed, and the message must name the
+    /// actual supported range so a caller can fix their input.
+    #[test]
+    fn invalid_calibration_display_names_the_range_when_ppm_is_out_of_range() {
+        let err = calibration_factor_from_ppm(1_001.0).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("must be finite and positive"),
+            "1001 ppm's factor (1.001001) IS finite and positive -- the real problem is the \
+             ppm range, message was: {msg}"
+        );
+        assert!(
+            msg.contains("1000"),
+            "expected the message to name the supported range, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_calibration_display_reports_non_finite_ppm() {
+        let err = calibration_factor_from_ppm(f64::NAN).unwrap_err();
+        assert!(err.to_string().contains("finite"));
     }
 }
