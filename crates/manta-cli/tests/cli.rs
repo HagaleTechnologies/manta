@@ -86,6 +86,48 @@ fn kiwi_host_without_freq_is_a_clean_error() {
 }
 
 #[test]
+fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
+    // Validated before any file I/O (open_source/start_spot_server), so
+    // nonexistent paths are fine for provoking this specific error.
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure without --dial-freq-hz"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+}
+
+#[test]
+fn dial_freq_hz_rejects_non_finite_and_non_positive_values() {
+    for bad in ["nan", "inf", "-inf", "0", "-14027000"] {
+        let out = manta()
+            .args([
+                "listen",
+                "--source",
+                "/nonexistent.wav",
+                "--dial-freq-hz",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--dial-freq-hz {bad} should have been rejected"
+        );
+    }
+}
+
+#[test]
 fn json_output_is_valid_and_deterministic_across_three_runs() {
     // SPEC §6 CI rule: same binary + same file, 3 runs -> identical output.
     let dir = tempfile::tempdir().unwrap();
