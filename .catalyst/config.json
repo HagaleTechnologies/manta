@@ -6,11 +6,11 @@
       "name": "manta"
     },
     "project": {
-      "ticketPrefix": "SKI",
+      "ticketPrefix": "MAN",
       "name": "manta"
     },
     "linear": {
-      "teamKey": "SKI",
+      "teamKey": "MAN",
       "stateMap": {
         "backlog": "Backlog",
         "todo": "Todo",
