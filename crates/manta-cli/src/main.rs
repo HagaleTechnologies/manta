@@ -639,7 +639,7 @@ fn start_spot_server(
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let cfg_text = std::fs::read_to_string(config_path)?;
     let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
-    let rbn_uplink_cfg = file.rbn_uplink.clone();
+    let rbn_uplink_cfgs = file.rbn_uplink.clone();
     let cfg = file.server;
 
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
@@ -681,9 +681,9 @@ fn start_spot_server(
                 cty,
                 station_call: cfg.station_callsign.clone(),
                 decoder_version,
-                // .clone(): MAN-32's uplink::serve spawn below also needs
-                // shutdown_rx -- can't let this be the moving consumer
-                // anymore now that there's a third one.
+                // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
+                // need shutdown_rx -- can't let this be the moving consumer
+                // anymore now that there are more consumers.
                 shutdown: shutdown_rx.clone(),
             },
             tasks.clone(),
@@ -704,19 +704,22 @@ fn start_spot_server(
                 manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
             ),
         ));
-        // MAN-32: only spawned when the table is present at all -- the
-        // common case for existing single-node operators is no
-        // [rbn_uplink] table, and uplink::serve itself also no-ops when
+        // MAN-32/MAN-42: one independent uplink::serve task per configured
+        // [[rbn_uplink]] entry -- the common case for existing single-node
+        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
+        // body never runs), and uplink::serve itself also no-ops when
         // `enabled = false` (belt-and-suspenders, not a duplicate check:
-        // this `if let` additionally avoids spawning a task at all for
-        // the common "table absent" case).
-        if let Some(uplink_cfg) = rbn_uplink_cfg {
+        // this loop additionally avoids spawning a task at all when the
+        // Vec is empty). Each task owns its own SpotBus subscription and
+        // backoff state, so one target being down never affects another's
+        // delivery or retry timing.
+        for uplink_cfg in rbn_uplink_cfgs {
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
                 bus.clone(),
                 metrics.clone(),
-                shutdown_rx,
+                shutdown_rx.clone(),
             ));
         }
 
@@ -1290,8 +1293,8 @@ mod tests {
         );
     }
 
-    // MAN-32: start_spot_server spawns the RBN uplink only when configured
-    // and enabled.
+    // MAN-32/MAN-42: start_spot_server spawns one RBN uplink task per
+    // configured [[rbn_uplink]] target, only for those that are enabled.
 
     #[test]
     fn disabled_uplink_makes_no_connection_attempt_from_the_daemon() {
@@ -1309,7 +1312,7 @@ mod tests {
                 json_port = 0
                 metrics_port = 0
 
-                [rbn_uplink]
+                [[rbn_uplink]]
                 enabled = false
                 target_host = "127.0.0.1"
                 target_port = {target_port}
@@ -1359,7 +1362,7 @@ mod tests {
                 json_port = 0
                 metrics_port = 0
 
-                [rbn_uplink]
+                [[rbn_uplink]]
                 enabled = true
                 target_host = "127.0.0.1"
                 target_port = {target_port}
@@ -1391,5 +1394,65 @@ mod tests {
             accepted.unwrap_or(false),
             "enabled=true must connect to the configured target"
         );
+    }
+
+    #[test]
+    fn two_enabled_uplink_targets_each_independently_connect() {
+        let target1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target1.set_nonblocking(true).unwrap();
+        let target1_port = target1.local_addr().unwrap().port();
+
+        let target2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target2.set_nonblocking(true).unwrap();
+        let target2_port = target2.local_addr().unwrap().port();
+
+        let cfg_file = write_temp_file(
+            format!(
+                r#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+
+                [[rbn_uplink]]
+                enabled = true
+                target_host = "127.0.0.1"
+                target_port = {target1_port}
+
+                [[rbn_uplink]]
+                enabled = true
+                target_host = "127.0.0.1"
+                target_port = {target2_port}
+                "#
+            )
+            .as_bytes(),
+        );
+
+        let (rt, _server) = start_spot_server(
+            cfg_file.path(),
+            96_000.0,
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        async fn wait_for_accept(listener: &std::net::TcpListener) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if listener.accept().is_ok() {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or(false)
+        }
+        let (accepted1, accepted2) = rt
+            .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
+        assert!(accepted1, "first configured target must be connected to");
+        assert!(accepted2, "second configured target must be connected to");
     }
 }

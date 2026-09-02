@@ -12,6 +12,19 @@
 //!     Then the spot is NOT forwarded to the RBN's collection endpoint
 //!     And the spot is still visible through manta's local telnet/JSON output
 //!
+//! MAN-42 acceptance scenarios:
+//!   Scenario: Spots are forwarded to every configured RBN target
+//!     Given manta's uplink is configured with two RBN collection targets
+//!     When manta validates and emits a spot
+//!     Then the spot is forwarded to both configured targets
+//!
+//!   Scenario: One target failing does not stop delivery to the others
+//!     Given manta's uplink is configured with two RBN collection targets
+//!     And one target's connection is down
+//!     When manta validates and emits a spot
+//!     Then the spot is still forwarded to the target that is reachable
+//!     And the unreachable target's connection is retried independently
+//!
 //! The mock listener in this file stands in for RBN's own collection
 //! server -- manta is the connecting *client* here, the reverse of
 //! `telnet_acceptance.rs`'s role.
@@ -74,6 +87,38 @@ fn spawn_uplink(target_port: u16, dry_run: bool) -> Harness {
         manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, metrics2, shutdown_rx)
             .await;
     });
+
+    Harness {
+        bus,
+        metrics,
+        shutdown_tx,
+    }
+}
+
+/// Spawns one `uplink::serve` task per config, all sharing the same
+/// bus/metrics/shutdown -- mirroring `start_spot_server`'s real MAN-42
+/// wiring (one independent task per configured `[[rbn_uplink]]` target).
+fn spawn_uplinks(configs: Vec<RbnUplinkConfig>) -> Harness {
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
+    let metrics = Arc::new(Metrics::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    for cfg in configs {
+        let bus2 = bus.clone();
+        let metrics2 = metrics.clone();
+        let shutdown_rx2 = shutdown_rx.clone();
+        tokio::spawn(async move {
+            manta_server::uplink::serve(
+                cfg,
+                STATION_CALL.to_string(),
+                bus2,
+                metrics2,
+                shutdown_rx2,
+            )
+            .await;
+        });
+    }
 
     Harness {
         bus,
@@ -247,4 +292,114 @@ async fn disabled_uplink_makes_no_connection_attempt() {
         attempt.is_err(),
         "a disabled uplink must never attempt a connection"
     );
+}
+
+#[tokio::test]
+async fn spot_is_forwarded_to_every_configured_target() {
+    let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port1 = listener1.local_addr().unwrap().port();
+    let port2 = listener2.local_addr().unwrap().port();
+
+    let harness = spawn_uplinks(vec![
+        uplink_config(port1, false),
+        uplink_config(port2, false),
+    ]);
+
+    let (login1, mut reader1, _wr1) = mock_rbn_accept_and_login(&listener1).await;
+    let (login2, mut reader2, _wr2) = mock_rbn_accept_and_login(&listener2).await;
+    assert_eq!(login1.trim_end(), STATION_CALL);
+    assert_eq!(login2.trim_end(), STATION_CALL);
+
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    harness.bus.publish(spot);
+
+    let mut line1 = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader1.read_line(&mut line1))
+        .await
+        .expect("timed out waiting for the forwarded spot on target 1")
+        .unwrap();
+    let mut line2 = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader2.read_line(&mut line2))
+        .await
+        .expect("timed out waiting for the forwarded spot on target 2")
+        .unwrap();
+
+    assert_eq!(line1.trim_end(), expected);
+    assert_eq!(line2.trim_end(), expected);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_retries_independently()
+{
+    let listener_up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_up = listener_up.local_addr().unwrap().port();
+
+    // Bind then immediately drop to get a port nothing listens on, so the
+    // second uplink task's connection attempts fail for the life of the test.
+    let temp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_down = temp.local_addr().unwrap().port();
+    drop(temp);
+
+    let harness = spawn_uplinks(vec![
+        uplink_config(port_up, false),
+        uplink_config(port_down, false),
+    ]);
+
+    // Then the spot is still forwarded to the target that is reachable
+    let (login_up, mut reader_up, _wr_up) = mock_rbn_accept_and_login(&listener_up).await;
+    assert_eq!(login_up.trim_end(), STATION_CALL);
+
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    harness.bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader_up.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the forwarded spot on the reachable target")
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+
+    // And the unreachable target's connection is retried independently --
+    // wait for at least one reconnect attempt from the down target's own
+    // backoff loop.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.metrics.uplink_reconnects_total() < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the unreachable target's reconnect loop never attempted a retry");
+
+    // The down target's failed attempts must not clear the shared
+    // uplink_connected gauge while the reachable target is still up
+    // (regression coverage: a shared last-writer-wins boolean would flip
+    // this to false here even though the reachable target never dropped).
+    assert!(
+        harness.metrics.uplink_connected(),
+        "an unrelated target's failed reconnects cleared the connected gauge"
+    );
+
+    // The reachable target's own delivery must be unaffected by the other
+    // target's ongoing retries: forward a second spot and confirm it still
+    // arrives on the same still-open connection.
+    let spot2 = sample_spot();
+    let expected2 = rbn::format_line(
+        &spot2,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot2.sample_ts),
+    );
+    harness.bus.publish(spot2);
+    let mut line2 = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader_up.read_line(&mut line2))
+        .await
+        .expect("reachable target stopped receiving spots while the other target retried")
+        .unwrap();
+    assert_eq!(line2.trim_end(), expected2);
+
+    let _ = harness.shutdown_tx.send(true);
 }
