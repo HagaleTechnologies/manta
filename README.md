@@ -117,6 +117,12 @@ criteria.
   though the channelizer architecture does not preclude them later.
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
+- Not a multi-process Windows orchestrator. `manta` is a single Rust binary;
+  there is no companion-program sprawl to sequence-launch.
+- No legacy soundcard/CAT audio-interface layer. `manta` ingests IQ over the
+  network (OpenHPSDR/Hermes, SoapySDR, file, KiwiSDR), not a soundcard, and
+  doesn't need CAT/rig control to align a narrowband receiver with a
+  channelizer that already covers the whole passband at once.
 
 ## Documentation
 

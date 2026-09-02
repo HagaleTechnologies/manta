@@ -1,0 +1,125 @@
+# 2026-09-01 — CW Skimmer / SkimSrv / Aggregator capability matrix
+
+**Status:** accepted (investigation only — no implementation in this doc or its PR).
+
+## Decision
+
+Every capability of the three legacy programs a real RBN operator runs today
+— **CW Skimmer** (decode engine/GUI), **SkimSrv** (headless multi-band decode
+engine), and **Aggregator** (multi-instance combiner + RBN telnet feed) — is
+catalogued below and given exactly one disposition: already covered by manta
+or an existing ticket, a genuine gap filed as its own new ticket, or a
+deliberate non-goal.
+
+Sources are each program's own published documentation only (clean-room — no
+decompilation, no leaked/pirated source):
+
+- `CwSkimmer.pdf` v2.1 (Afreet Software, official manual, dxatlas.com)
+- `dxatlas.com/skimserver/` (CW Skimmer Server product page)
+- *Using Aggregator with the Reverse Beacon Network* v6.0, Dec 2019 (RBN's own
+  CMS, `cms.reversebeacon.net`)
+- RBN-OPS (groups.io) forum research, two rounds, already logged as comments
+  on MAN-15 (2026-09-02) — not re-run here.
+
+Cross-checked against `README.md` §Non-goals, `ARCHITECTURE.md` §6 (`manta-spot`
+validation pipeline), `ROADMAP.md`, and MAN-10 through MAN-23.
+
+## Correction to MAN-15's own technical notes
+
+CW Skimmer, SkimSrv, and Aggregator are **three separate programs with three
+separate jobs**, not two:
+
+- **CW Skimmer** — the interactive decode engine + GUI. One process, one
+  receiver, human-facing.
+- **SkimSrv** ("CW Skimmer Server") — the same Bayesian decode engine,
+  headless, covering up to 7 bands (192 kHz each) in one process. Interfaces
+  the decode engine to SDRs beyond CW Skimmer's own hardware list.
+- **Aggregator** — a *separate* Windows program (by Dick Williams W3OA / Pete
+  Smith N4ZR, distributed by the RBN team, not Afreet) that telnets into one
+  or more CW Skimmer/SkimSrv/RTTYSkimServ/RCKskimmer instances, filters and
+  dedupes their spots, and forwards them to the RBN network.
+
+## Capability matrix
+
+### CW Skimmer (decode engine/GUI)
+
+| Capability | Disposition |
+|---|---|
+| Bayesian multi-channel CW decode (up to 700 simultaneous decoders) | **Covered** — manta's core channelizer/decoder (`manta-decode`, `manta-dsp`) |
+| CQ/DE/beacon message-context parsing, running-vs-S&P, RST(599)/QRL? extraction | **Covered** — `manta-spot` step 1, "CQ/DE context parse ... beacon patterns" (ARCHITECTURE.md §6) |
+| Callsign plausibility (pattern/grammar, ITU-block rejection) | **Covered** — `manta-spot` step 2, cty.dat prefix lookup |
+| Master.dta/SCP cross-check | **Covered** — `manta-spot` step 3, `master.scp` (confidence-raising only, an improvement on Aggregator's own binary SCP filter, which the RBN team itself recommends against — see below) |
+| Verified-calls (≥2 occurrences) filtering | **Covered** — `manta-spot` step 4, repetition requirement |
+| Same-track/single-source dedup (10 min, freq bucket) | **Covered** — `manta-spot` step 5. The 10-minute window and freq-bucket key independently match the operator-stated community rule found in forum research ("same DE+DX+frequency within ~10 min = dupe") — good corroboration, no action needed. |
+| Watch List (explicit allowlist that bypasses repetition/validation, used for low-repetition NCDXF-style beacons) | **Gap** — see MAN-new-1 below |
+| Waterfall display, Band Map UI, Callsign List window | **Non-goal** — README: "Not an interactive receiver or panadapter" |
+| DSP audio monitoring (noise blanker/AGC/anti-click/CW filter for a human listening on headphones) | **Non-goal** — same; manta's noise/AGC handling is internal to the decode pipeline, not an operator audio-monitoring feature |
+| I/Q Recorder/player (live in-app WAV capture with RIFF metadata tags) | **Non-goal** — operators can capture raw IQ with standard OS/SDR tooling; not core to spot generation. (Distinct from manta's own WAV-based *test* corpus, MAN-20, which is a different concern.) |
+| Spectrum via UDP (feeds a power spectrum to third-party panadapters like N1MM+) | **Non-goal** — panadapter-adjacent, covered by the same non-interactive-receiver non-goal |
+| CAT/rig control (OmniRig) for band-scope alignment | **Non-goal** — per CW Skimmer's own manual, CAT is required only in 3-kHz and SoftRock-IF (narrowband) modes and is explicitly *not used* with wideband SDRs (SDR-IQ, QS1R, Mercury, Perseus) — manta's OpenHPSDR/Hermes target hardware (MAN-10/11) is in this same wideband class. Band-scope alignment itself is also panadapter-adjacent. |
+| Remote SKIMMER/QSY, SKIMMER/AUDIOIF, SKIMMER/LO_FREQ (narrowband retune-by-telnet commands) | **Non-goal** — these retune a single narrowband receiver; manta's channelizer decodes the whole configured passband at once and has nothing to retune |
+| Remote SKIMMER/START, SKIMMER/STOP (process start/stop via telnet) | **Non-goal** — process lifecycle is an ops/systemd concern (MAN-21), not a wire-protocol feature |
+| Multiple instances via per-instance `.ini` files | **Covered (superseded)** — MAN-13's single-daemon multi-source model replaces this |
+| Auto-start (command-line switch / VBScript) | **Covered** — falls under MAN-21's non-developer install/operate scope |
+| Frequency calibration (manual correction-factor procedure) | **Gap** — see MAN-new-2 below |
+
+### SkimSrv (headless multi-band decode engine)
+
+| Capability | Disposition |
+|---|---|
+| Headless, multi-band (up to 7 × 192 kHz) decode in one process | **Covered** — MAN-13, single daemon combining multiple SDRs/channels |
+| Built-in telnet server (spot output, default port 7310) | **Covered** — MAN-12 |
+| Per-band `.ini` config (`CenterFreqs*`, `SegmentSel*`) | **Covered** — implementation detail of MAN-11/13's per-source configuration |
+| `CwSegments` — explicit non-contiguous CW sub-range restriction (skip RTTY/PSK/etc. gaps to save CPU) | **Gap** — see MAN-new-3 below |
+| Shares CW Skimmer's Watch List file | **Gap** — same disposition as CW Skimmer's Watch List, MAN-new-1 |
+
+### Aggregator (multi-instance combiner + RBN feed)
+
+| Capability | Disposition |
+|---|---|
+| Telnet-combines up to 9 Skimmer/SkimSrv/RTTYSkimServ/RCKskimmer instances (Secondary Skimmers), or unlimited via an external combiner (Combined Skimmers) | **Covered (different approach)** — MAN-13's in-process single-daemon model is the native equivalent of what Aggregator does by bolting separate Windows processes together over telnet |
+| Cross-instance spot dedup | **Covered** — MAN-16 |
+| Bad Calls list (operator-maintained callsign blocklist) | **Gap** — see MAN-new-4 below |
+| Notched Frequencies (operator-maintained frequency-range exclusion list, for known false-spot sources) | **Gap** — same ticket as MAN-new-4, see below |
+| Super Check Partial (MASTER.SCP) binary include-filter | **Covered, and already improved on** — manta's SCP cross-check (confidence-raising only) avoids the exact false-negative failure mode the RBN team itself warns against ("screens out ... new calls ... casual contesters") for Aggregator's binary version |
+| VHF-specific grid-format and low-SNR false-positive filters | **Covered** — out of scope entirely; manta targets HF CW, no VHF/grid-format spot class exists |
+| RBN telnet feed (forward filtered spots upstream) | **Covered** — MAN-12's telnet/JSON output serves the same role for manta's downstream consumers (cqdx, etc.) |
+| Dry-run / "don't actually send to RBN" test mode | **Covered** — falls under MAN-17's non-live RBN-parity validation scope |
+| Transverter base-frequency offset | **Non-goal** — a narrow hardware-specific accessory; no MAN-10/11 target hardware is described as transverter-fed |
+| Local User Port (second telnet stream, independently configurable to show all decoded spots vs. only RBN-forwarded spots) | **Covered (implementation detail)** — a design nuance for MAN-12 to consider (single filtered stream vs. dual raw/filtered streams), not a separate capability gap |
+| `.ini` file rotation (scheduled day/night, weekday/contest swaps, sunrise/sunset-relative) | **Gap** — same ticket as MAN-new-3 (SkimSrv's `CwSegments`), see below — this is the scheduling half of the same underlying capability |
+| Patt3Ch.lst sync (auto-check/download updated pattern files from the RBN server every ~20 min) | **Non-goal** — manta's validation patterns (cty.dat, master.scp) are bundled/refreshable config, not a community-shared file requiring a bespoke sync client; refreshing them is an ops/packaging concern (MAN-21), not a new capability |
+| FT4/FT8 UDP monitoring (up to 33 WSJT-X/JTDX instances) | **Non-goal** — README: "Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0" |
+| Associate Programs (sequenced launch of up to 8 companion Windows programs at startup) | **Non-goal** — a workaround for the legacy stack's multi-process Windows sprawl (Skimmer + Aggregator + virtual-audio-cable software + WSJT-X, etc.); manta's single-binary architecture (ARCHITECTURE.md) has nothing to orchestrate |
+| Beacon detection heuristic (flags NCDXF-style beacons in the traffic tab) | **Gap** — same ticket as MAN-new-1 (Watch List / beacon repetition exemption) |
+| Cluster-side "unique spot" filter interop (`set dx filter unique > 1`) | **Covered** — a wire-format compatibility detail for MAN-17's cluster-client interop testing, not a distinct manta capability |
+| Computer sizing guidance (8-core AMD FX-8350: 7 bands @ 192 kHz, 8–11% CPU) | **Informational only** — useful reference data point for MAN-18's Pi4 CPU-budget work, not a capability to catalog |
+
+## New gap tickets filed from this matrix
+
+| Ticket | Capability | Why it's a genuine gap |
+|---|---|---|
+| MAN-28 | Beacon-aware repetition exemption (Watch List equivalent) | manta's context parser already type-tags BEACON messages (ARCHITECTURE.md §6 step 1), but the standard ≥2-decodes/90s repetition gate (step 4) has no documented exemption for them — NCDXF-style beacons ID once per power-step and would be silently dropped, mirroring exactly the problem CW Skimmer's Watch List was built to solve (Aggregator manual Appendix A2) |
+| MAN-29 | Per-source frequency-calibration correction factor | Forum research already flagged "systematic 200+ kHz frequency-calibration errors" as a known recurring bad-spot class; CW Skimmer/SkimSrv's `FreqCalibration=` key and the Aggregator manual's dedicated calibration appendix show this is a real, actively-managed operator workflow today, with no manta equivalent |
+| MAN-30 | Configurable, optionally time-of-day-scheduled CW sub-segment decode restriction | SkimSrv's `CwSegments` (skip non-CW ranges) and Aggregator's `.ini` rotation (day/night, contest, sunrise/sunset-relative swaps) are the same underlying capability split across two legacy programs; lower priority — may be closed as unnecessary if MAN-18's Pi4 CPU-budget gate passes without it |
+| MAN-31 | Operator-configurable spot suppression: bad-call blocklist + notched frequency ranges | Manual operator override lists, orthogonal to manta-spot's automatic validation pipeline (cty.dat/SCP/plausibility); addresses a real, named failure mode (birdies/spurs at fixed frequencies, known-bad callsigns) that automatic validation doesn't catch |
+
+## Non-goals not yet in README.md
+
+Two capability classes are Non-goal dispositions above but don't fit any of
+README's four existing bullets. Recommend folding these in if this doc is
+accepted:
+
+- Not a multi-process Windows orchestrator — manta is a single Rust binary;
+  there is no companion-program sprawl to sequence-launch.
+- No legacy soundcard/CAT audio-interface layer — manta ingests IQ over the
+  network (OpenHPSDR/Hermes, SoapySDR, file, KiwiSDR), not a soundcard, and
+  doesn't need CAT/rig control to align a narrowband receiver with a
+  channelizer that already covers the whole passband at once.
+
+## Non-outcomes
+
+- No implementation work was done from this ticket.
+- manta's existing `manta-spot` validation design (confidence-raising SCP,
+  10-minute same-track dedup) independently converges with, and in the SCP
+  case improves on, the legacy stack's approach — no design change indicated.
