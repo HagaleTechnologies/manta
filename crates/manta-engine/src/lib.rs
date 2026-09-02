@@ -55,6 +55,10 @@ pub struct PipelineConfig {
     /// `manta-spot`'s ~10 Hz decode-accuracy figure (ARCHITECTURE §6 step
     /// 5), which is decode precision (MAN-29).
     pub freq_correction_ppm: f64,
+    /// Operator Watch List (ARCHITECTURE §6, MAN-28): callsigns here
+    /// bypass grammar/cty validation and the repetition gate entirely in
+    /// the production validator, matching CW Skimmer's Watch List.
+    pub allowlist: Vec<String>,
     /// Operator's bad-callsign blocklist (MAN-31). Empty by default -- no
     /// suppression until the operator supplies one.
     pub blocklist: Blocklist,
@@ -69,6 +73,7 @@ impl Default for PipelineConfig {
             decode: DecodeConfig::default(),
             detector: track::DetectorConfig::default(),
             freq_correction_ppm: 0.0,
+            allowlist: Vec::new(),
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
         }
@@ -198,6 +203,9 @@ pub fn decode_samples(
         .map_err(|e| anyhow::anyhow!(e))?
         .with_blocklist(cfg.blocklist.clone())
         .with_notch(cfg.notch.clone());
+    for call in &cfg.allowlist {
+        validator.allowlist(call);
+    }
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));

@@ -41,10 +41,39 @@ pub struct Spot {
 struct Word {
     text: String,
     confidences: Vec<f32>,
+    /// Assigned from `TrackState::next_word_seq` when this word is pushed
+    /// to `TrackState::words` -- a per-track, strictly-increasing "age"
+    /// used to tell a genuinely new supporting word apart from an older
+    /// one merely still being present (MAN-28 round 12 review).
+    seq: u64,
     /// Set once this word has been offered to the validation pipeline as a
     /// context-match candidate, so a later, unrelated word boundary that
     /// re-scans a growing window doesn't re-process it.
     attempted: bool,
+    /// The `SpotType` this word was last processed as, if any. An
+    /// allowlisted word can spot immediately with no context yet (type
+    /// `Unknown`); if a trailing word later completes a real context
+    /// pattern (e.g. "K5ARH" then "UP" completing `<call> UP` -> `De`),
+    /// that's a genuinely new type worth a reclassification, not a
+    /// re-attempt of the same evaluation -- `attempted` alone must not
+    /// permanently block it (MAN-28 round 8 review).
+    last_spot_type: Option<SpotType>,
+    /// The highest `seq` among the words that produced `last_spot_type`
+    /// (this word's own `seq`, for a context-free allowlist match). A
+    /// later re-evaluation is only a genuine reclassification -- driven by
+    /// a newly-arrived word -- if its own max involved `seq` is strictly
+    /// greater than this. Re-deriving a word's type from whatever
+    /// currently sits in the window, with no way to tell "gained new
+    /// context" from "lost old context" as it ages out, produced two
+    /// separate downgrade bugs (rounds 11 and 12) before this was added.
+    classified_max_seq: u64,
+    /// The repetition count computed the first time this word was
+    /// evaluated. A reclassification (see `last_spot_type`) reuses this
+    /// rather than calling `RepetitionGate::record` again -- the word was
+    /// decoded once, not twice, so re-recording would let an ordinary,
+    /// non-exempt callsign spot after a type change alone inflated its
+    /// rep count to 2 (MAN-28 round 9 review).
+    last_reps: u32,
 }
 
 #[derive(Default)]
@@ -54,6 +83,21 @@ struct TrackState {
     freq_hz: f64,
     snr_db: f32,
     wpm: f32,
+    /// Set once a real `TrackMeta` event has been received. `freq_hz`/
+    /// `snr_db` hold bogus `0.0` defaults until then (decoder.rs emits
+    /// `TrackMeta` only every 375 hops -- a fast decode can complete
+    /// chars/words before the first one ever arrives), so no spot may be
+    /// emitted before this is true (MAN-28 round 8 review).
+    has_meta: bool,
+    /// The most recent `sample_ts` seen for this track (any event kind).
+    /// `try_spot` is normally only invoked by a `WordBoundary`, but a
+    /// candidate held back by `has_meta` must be retried the moment
+    /// metadata arrives even if no further word ever completes -- this is
+    /// the timestamp that retry uses (MAN-28 round 9 review).
+    last_sample_ts: u64,
+    /// Source of `Word::seq`; incremented each time a word is pushed to
+    /// `words` (MAN-28 round 12 review).
+    next_word_seq: u64,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -137,6 +181,7 @@ pub struct Validator {
     gate: RepetitionGate,
     dedupe: Dedupe,
     freq_calibration: f64,
+    allowlist: std::collections::BTreeSet<String>,
     blocklist: Blocklist,
     notch: NotchList,
     suppression_counts: SuppressionCounts,
@@ -151,6 +196,7 @@ impl Validator {
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
             freq_calibration: 1.0,
+            allowlist: std::collections::BTreeSet::new(),
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
             suppression_counts: SuppressionCounts::default(),
@@ -178,6 +224,17 @@ impl Validator {
     pub fn with_freq_correction_ppm(mut self, ppm: f64) -> Result<Self, InvalidCalibration> {
         self.freq_calibration = calibration_factor_from_ppm(ppm)?;
         Ok(self)
+    }
+
+    /// Adds `call` to the operator's Watch List (MAN-28): an explicitly
+    /// allowlisted callsign bypasses grammar/cty validation and the
+    /// repetition gate entirely, matching CW Skimmer's Watch List
+    /// behavior (Aggregator manual Appendix A2). Checked after the MAN-31
+    /// suppression overrides below -- an explicit blocklist/notch entry is
+    /// the more specific, deliberate override and is never silently
+    /// defeated by a broader allowlist entry.
+    pub fn allowlist(&mut self, call: &str) {
+        self.allowlist.insert(call.to_ascii_uppercase());
     }
 
     /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
@@ -233,12 +290,15 @@ impl Validator {
             } => {
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
-                    let word = std::mem::take(&mut track.current);
+                    let mut word = std::mem::take(&mut track.current);
+                    word.seq = track.next_word_seq;
+                    track.next_word_seq += 1;
                     track.words.push_back(word);
                     if track.words.len() > WORD_WINDOW {
                         track.words.pop_front();
                     }
                 }
+                track.last_sample_ts = *sample_ts;
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
@@ -251,82 +311,230 @@ impl Validator {
                 freq_hz,
             } => {
                 let track = self.tracks.entry(*track_id).or_default();
+                let had_meta = track.has_meta;
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
-                Vec::new()
+                track.has_meta = true;
+                let sample_ts = track.last_sample_ts;
+                // Retry: a candidate held back by the has_meta gate is
+                // otherwise only ever re-evaluated by a later
+                // WordBoundary, which a short transmission may never
+                // produce again -- silently losing the pending exemption
+                // (MAN-28 round 9 review). No-op once already true.
+                if had_meta {
+                    Vec::new()
+                } else {
+                    self.try_spot(*track_id, sample_ts)
+                }
             }
         }
     }
 
-    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
-        let Some((candidate, spot_type)) = self.tracks.get(&track_id).and_then(|track| {
-            let joined: String = track
-                .words
-                .iter()
-                .map(|w| w.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            context::parse(&joined)
-        }) else {
+    /// Gathers every candidate word worth evaluating this event: at most
+    /// one from context parsing, plus every allowlisted word in the
+    /// window not yet attempted. Independent sources, not one-or-the-
+    /// other by priority (MAN-28 round 7 review): a stale, already-
+    /// attempted context match elsewhere in the 16-word window must never
+    /// block discovery of a different, freshly-allowlisted word -- the
+    /// whole window is scanned (not just the newest word) so a qualifying
+    /// word is found the moment it's allowlisted, `word.attempted`
+    /// (checked in `evaluate_candidate`) prevents re-processing one this
+    /// already spotted or rejected.
+    ///
+    /// Each candidate carries the highest `Word::seq` among the words that
+    /// produced it, so `evaluate_candidate` can tell a genuine
+    /// reclassification (a newer word contributed) from a type merely
+    /// changing because an older one aged out (MAN-28 round 12 review).
+    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType, u64)> {
+        let Some(track) = self.tracks.get(&track_id) else {
             return Vec::new();
         };
+        let mut candidates = Vec::new();
 
+        // Byte range of each word within `joined`, in the same order as
+        // `track.words`, to map a context match's span back to the
+        // word(s) that produced it.
+        let mut joined = String::new();
+        let mut word_spans = Vec::with_capacity(track.words.len());
+        for word in &track.words {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            let start = joined.len();
+            joined.push_str(&word.text);
+            word_spans.push((start, joined.len(), word.seq));
+        }
+        if let Some((candidate, spot_type, range)) = context::parse(&joined) {
+            let involved_max_seq = word_spans
+                .iter()
+                .filter(|(start, end, _)| *start < range.end && range.start < *end)
+                .map(|(_, _, seq)| *seq)
+                .max()
+                .unwrap_or(0);
+            candidates.push((candidate, spot_type, involved_max_seq));
+        }
+
+        // MAN-28 Watch List: an allowlisted word is found independently of
+        // context parsing -- including with no recognized CQ/DE/UP/beacon
+        // pattern at all, the primary real-world case (an NCDXF beacon
+        // transmits its callsign followed by power-step dashes, no
+        // framing words). `SpotType::Unknown` is the context-parse-
+        // documented fallback for exactly this case.
+        for word in &track.words {
+            if self.allowlist.contains(&word.text)
+                && !candidates.iter().any(|(c, _, _)| *c == word.text)
+            {
+                candidates.push((word.text.clone(), SpotType::Unknown, word.seq));
+            }
+        }
+
+        candidates
+    }
+
+    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
+        // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
+        // defaults. Bail without marking anything attempted, so pending
+        // candidates are simply re-evaluated once metadata does arrive.
+        if !self.tracks.get(&track_id).is_some_and(|t| t.has_meta) {
+            return Vec::new();
+        }
+        self.candidates(track_id)
+            .into_iter()
+            .filter_map(|(candidate, spot_type, involved_max_seq)| {
+                self.evaluate_candidate(track_id, sample_ts, candidate, spot_type, involved_max_seq)
+            })
+            .collect()
+    }
+
+    fn evaluate_candidate(
+        &mut self,
+        track_id: u32,
+        sample_ts: u64,
+        candidate: String,
+        spot_type: SpotType,
+        involved_max_seq: u64,
+    ) -> Option<Spot> {
         let (freq_hz, snr_db, wpm) = {
-            let track = self.tracks.get(&track_id).unwrap();
+            let track = self.tracks.get(&track_id)?;
             (
                 track.freq_hz * self.freq_calibration,
                 track.snr_db,
                 track.wpm,
             )
         };
-        let char_confidences = {
-            let track = self.tracks.get_mut(&track_id).unwrap();
-            let Some(word) = track.words.iter_mut().rev().find(|w| w.text == candidate) else {
-                return Vec::new();
-            };
+        let (char_confidences, reclassifying) = {
+            let track = self.tracks.get_mut(&track_id)?;
+            let word = track.words.iter_mut().rev().find(|w| w.text == candidate)?;
+            // context::parse's regex matches the FIRST occurrence of a
+            // repeated pattern in the joined text, but this lookup always
+            // selects the NEWEST word with matching text -- when the same
+            // callsign has decoded more than once, those can be two
+            // different Word occurrences. Clamping to the selected word's
+            // own seq guarantees involved_max_seq is never understated
+            // relative to the occurrence actually being evaluated (a
+            // word's own seq is always a valid lower bound on its true
+            // provenance), closing the mismatch that let a stale,
+            // first-occurrence-derived seq pass the aging-out guard above
+            // as if it were genuinely new context (MAN-28 round 13
+            // review).
+            let involved_max_seq = involved_max_seq.max(word.seq);
             if word.attempted {
-                return Vec::new();
+                // A prior attempt is only a genuine reclassification --
+                // not a re-attempt of stale information -- if a word
+                // strictly younger than any that produced the previous
+                // classification is involved this time. Re-deriving a
+                // word's type from whatever currently sits in the window,
+                // with no way to tell "gained new context" from "lost old
+                // context" as it ages out, produced two separate downgrade
+                // bugs before this check existed: a type reverting to
+                // Unknown (round 11) and a type changing between two real
+                // context types (round 12), both merely because an older
+                // framing word (DE, CQ) fell out of the 16-word window,
+                // not because anything new arrived.
+                if word.last_spot_type == Some(spot_type)
+                    || involved_max_seq <= word.classified_max_seq
+                {
+                    return None;
+                }
             }
+            let reclassifying = word.attempted;
             word.attempted = true;
-            word.confidences.clone()
+            word.last_spot_type = Some(spot_type);
+            word.classified_max_seq = involved_max_seq;
+            (word.confidences.clone(), reclassifying)
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
-        // checked ahead of, the automatic validation pipeline below. Each
-        // hit is counted (ARCHITECTURE §8) so it reads as a deliberate
+        // checked ahead of, both the automatic validation pipeline and the
+        // MAN-28 allowlist below: an explicit blocklist/notch entry is the
+        // operator's more specific, deliberate override and must not be
+        // silently defeated by a broader allowlist entry. Each hit is
+        // counted (ARCHITECTURE §8) so it reads as a deliberate
         // suppression, not silent coverage loss.
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
-            return Vec::new();
+            return None;
         }
         if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
-            return Vec::new();
+            return None;
         }
 
-        if !grammar::is_plausible(&candidate) {
-            return Vec::new();
-        }
-        if !self.cty.is_allocated(&candidate) {
-            return Vec::new();
+        // MAN-28 Watch List: an allowlisted callsign bypasses grammar/cty
+        // validation and the repetition gate below entirely.
+        let is_allowlisted = self.allowlist.contains(&candidate);
+
+        if !is_allowlisted {
+            if !grammar::is_plausible(&candidate) {
+                return None;
+            }
+            if !self.cty.is_allocated(&candidate) {
+                return None;
+            }
         }
 
-        let reps = self.gate.record(track_id, &candidate, sample_ts) as u32;
+        // A reclassification is the same decode re-typed, not a new one --
+        // reuse its already-recorded repetition count instead of calling
+        // `gate.record` again, which would otherwise let a type change
+        // alone inflate an ordinary, non-exempt callsign's rep count past
+        // the repetition gate after only one real decode (MAN-28 round 9
+        // review).
+        let reps = if reclassifying {
+            let track = self.tracks.get(&track_id)?;
+            track
+                .words
+                .iter()
+                .rev()
+                .find(|w| w.text == candidate)
+                .map(|w| w.last_reps)
+                .unwrap_or(0)
+        } else {
+            self.gate.record(track_id, &candidate, sample_ts) as u32
+        };
+        {
+            let track = self.tracks.get_mut(&track_id)?;
+            if let Some(word) = track.words.iter_mut().rev().find(|w| w.text == candidate) {
+                word.last_reps = reps;
+            }
+        }
         let mut confidence = confidence::c_call(&char_confidences, reps);
         if let Some(scp) = &self.scp {
             confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));
         }
-        if reps < 2 {
-            return Vec::new();
+        // ARCHITECTURE §6.4 exempts BEACON-tagged messages from the
+        // repetition requirement: NCDXF-style beacons ID once per cycle,
+        // so a single decode must still spot (MAN-28).
+        if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
+            return None;
         }
         if !self
             .dedupe
             .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
         {
-            return Vec::new();
+            return None;
         }
 
-        vec![Spot {
+        Some(Spot {
             callsign: candidate,
             freq_hz,
             snr_db,
@@ -335,7 +543,7 @@ impl Validator {
             confidence,
             track_id,
             sample_ts,
-        }]
+        })
     }
 }
 
@@ -384,9 +592,21 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         events.iter().flat_map(|e| v.ingest(e)).collect()
     }
 
+    /// Real telemetry, so `try_spot`'s `has_meta` gate (MAN-28 round 8)
+    /// doesn't hold back every spot in tests that don't otherwise care
+    /// about metadata timing.
+    fn seed_meta(v: &mut Validator, track_id: u32) {
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_000.0,
+        });
+    }
+
     #[test]
     fn full_pipeline_spots_a_repeated_valid_callsign() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
@@ -451,6 +671,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn bundled_validator_spots_a_real_repeated_callsign() {
         let mut v = Validator::bundled(FS);
+        seed_meta(&mut v, 1);
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
