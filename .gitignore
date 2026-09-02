@@ -32,3 +32,7 @@ secrets*
 
 # Catalyst thoughts/ symlink (points outside the repo to the shared diario store)
 thoughts/
+
+# Large real-audio fixtures kept local-only (too big for git history without
+# LFS -- see crates/manta-testkit/audio-corpus/README.md).
+crates/manta-testkit/audio-corpus/wpx_cw_iq_96khz.wav
