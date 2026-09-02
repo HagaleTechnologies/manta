@@ -66,7 +66,13 @@ pub async fn serve(
         match connect_and_forward(&config, &login_callsign, &bus, &metrics, &mut shutdown).await {
             Ok(()) => return, // clean shutdown-signaled exit
             Err(outcome) => {
-                metrics.set_uplink_connected(false);
+                // No mark_uplink_disconnected() here: connect_and_forward
+                // already paired its own mark_uplink_connected() with a
+                // mark_uplink_disconnected() before returning Err (or
+                // never marked connected at all, if it failed before
+                // login completed) -- an extra call here would double-
+                // decrement the shared count once other targets are also
+                // marking it (MAN-42).
                 metrics.record_uplink_reconnect();
                 let sleep_for = backoff;
                 backoff = next_backoff(backoff, &outcome);
@@ -110,7 +116,7 @@ async fn connect_and_forward(
         .await
         .map_err(|_| ConnectAttemptError::NeverConnected)?;
 
-    metrics.set_uplink_connected(true);
+    metrics.mark_uplink_connected();
     let result = forward_loop(
         &mut reader,
         &mut wr,
@@ -122,7 +128,7 @@ async fn connect_and_forward(
         shutdown,
     )
     .await;
-    metrics.set_uplink_connected(false);
+    metrics.mark_uplink_disconnected();
     result.map_err(|_| ConnectAttemptError::Disconnected)
 }
 
