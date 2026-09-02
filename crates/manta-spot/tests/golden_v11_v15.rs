@@ -1,4 +1,4 @@
-//! SPEC-decode-core.md §7.1 V11-V15, V18-V21: manta-spot validator
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V28: manta-spot validator
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
@@ -184,7 +184,11 @@ fn v18_beacon_pattern_exempt_from_repetition_gate() {
     seed_meta(&mut v, 1);
     let words = ["V", "V", "V", "K5ARH"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
-    assert_eq!(spots.len(), 1, "a BEACON-tagged spot must emit on the first decode");
+    assert_eq!(
+        spots.len(),
+        1,
+        "a BEACON-tagged spot must emit on the first decode"
+    );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
 }
