@@ -146,8 +146,8 @@ async fn dry_run_logs_in_but_does_not_forward_the_spot_line() {
     harness.bus.publish(sample_spot());
 
     let mut line = String::new();
-    let result = tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line))
-        .await;
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
     assert!(
         result.is_err(),
         "dry-run must not transmit the spot line, got: {line:?}"
@@ -239,8 +239,7 @@ async fn disabled_uplink_makes_no_connection_attempt() {
     let mut cfg = uplink_config(addr.port(), false);
     cfg.enabled = false;
     tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, metrics, shutdown_rx)
-            .await;
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, metrics, shutdown_rx).await;
     });
 
     let attempt = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
