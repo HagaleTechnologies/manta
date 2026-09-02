@@ -77,14 +77,25 @@ impl std::fmt::Display for InvalidCalibration {
 
 impl std::error::Error for InvalidCalibration {}
 
+/// Widest physically-plausible oscillator drift a real source could report
+/// (a few hundred ppm covers even a badly-drifted uncalibrated RTL-SDR
+/// crystal; SPEC's own worked example is 10 ppm). Bounding `ppm` this way
+/// keeps the derived factor comfortably inside `[0.999, 1.001]`, which
+/// rules out the overflow-to-infinity a finite-but-absurd ppm (e.g.
+/// `f64::MAX`) would otherwise produce once multiplied against a real RF
+/// frequency -- a factor merely being finite and positive isn't enough
+/// (MAN-29 review round 2).
+const MAX_ABS_PPM: f64 = 1_000.0;
+
 /// Converts a ppm frequency-correction setting (config key
 /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4) into the
 /// multiplicative factor applied to a spot's reported frequency:
-/// `factor = 1.0 + ppm * 1e-6`. Errors if the result isn't finite and
-/// positive (MAN-29).
+/// `factor = 1.0 + ppm * 1e-6`. Errors if `ppm` is outside
+/// `[-MAX_ABS_PPM, MAX_ABS_PPM]`, or the result isn't finite and positive
+/// (MAN-29).
 pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> {
     let factor = 1.0 + ppm * 1e-6;
-    if !factor.is_finite() || factor <= 0.0 {
+    if !ppm.is_finite() || ppm.abs() > MAX_ABS_PPM || !factor.is_finite() || factor <= 0.0 {
         return Err(InvalidCalibration { ppm, factor });
     }
     Ok(factor)
@@ -447,6 +458,25 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // negative flips it negative.
         assert!(calibration_factor_from_ppm(-1_000_000.0).is_err());
         assert!(calibration_factor_from_ppm(-2_000_000.0).is_err());
+    }
+
+    /// MAN-29 review round 2: a finite ppm whose derived factor is itself
+    /// finite and positive can still overflow to infinity once multiplied
+    /// against a real RF frequency (e.g. `f64::MAX` -> factor ~1.8e302).
+    /// Reject ppm outside any physically-plausible oscillator drift, not
+    /// just outside "finite and positive".
+    #[test]
+    fn calibration_factor_from_ppm_rejects_absurdly_large_finite_ppm() {
+        assert!(calibration_factor_from_ppm(f64::MAX).is_err());
+        assert!(calibration_factor_from_ppm(1e300).is_err());
+    }
+
+    #[test]
+    fn calibration_factor_from_ppm_accepts_realistic_oscillator_drift() {
+        // SPEC's own worked example (10 ppm) and a generously bad cheap-SDR
+        // crystal (a few hundred ppm) both stay accepted.
+        assert!(calibration_factor_from_ppm(10.0).is_ok());
+        assert!(calibration_factor_from_ppm(-500.0).is_ok());
     }
 
     #[test]

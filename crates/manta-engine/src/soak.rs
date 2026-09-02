@@ -51,6 +51,14 @@ pub fn soak(
     cfg: &PipelineConfig,
     duration: Duration,
 ) -> Result<SoakReport> {
+    // Validated before the watchdog thread is spawned -- otherwise an
+    // invalid config only surfaces once `duration` elapses (`listen()`
+    // itself already validates and returns fast, but the watchdog below
+    // doesn't know that and sleeps for the full `duration` regardless;
+    // MAN-29 review round 2).
+    manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
     let start = Instant::now();
@@ -126,5 +134,38 @@ mod tests {
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
         assert!(!report.panicked);
         assert!(soak_passed(&report));
+    }
+
+    /// MAN-29 review round 2: an invalid `freq_correction_ppm` must fail
+    /// `soak()` before it joins the watchdog thread -- otherwise the error
+    /// doesn't surface until the full `duration` elapses (potentially 24h
+    /// on a real hardware soak). `duration` here (20s) is deliberately
+    /// larger than the assertion's threshold (5s), so a regression back to
+    /// the duration-gated bug fails this test quickly rather than hanging
+    /// for a real 24h soak's worth of wall-clock time.
+    #[test]
+    fn soak_rejects_an_invalid_freq_correction_ppm_before_the_watchdog_duration() {
+        let fs = manta_input::TARGET_RATE_HZ;
+        let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
+        let (env, _) =
+            manta_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 8.0)
+                .unwrap();
+        let real: Vec<f32> = env.to_vec();
+        let src: Box<dyn manta_input::IqSource> = Box::new(
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap(),
+        );
+        let cfg = PipelineConfig {
+            freq_correction_ppm: f64::NAN,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let result = soak(src, &cfg, Duration::from_secs(20));
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "soak() with an invalid freq_correction_ppm took {:?} -- it must fail before \
+             joining the watchdog, not wait out the requested duration",
+            start.elapsed()
+        );
     }
 }
