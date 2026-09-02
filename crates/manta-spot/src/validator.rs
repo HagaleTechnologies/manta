@@ -1,12 +1,14 @@
 //! Ties `grammar`/`context`/`cty`/`scp`/`confidence`/`gate`/`dedupe`
 //! together into one `Validator::ingest` entry point. ARCHITECTURE §6.
 
+use crate::blocklist::Blocklist;
 use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::dedupe::Dedupe;
 use crate::gate::RepetitionGate;
 use crate::grammar;
+use crate::notch::NotchList;
 use crate::scp;
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::{Glyph, Prosign};
@@ -115,6 +117,19 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
     Ok(factor)
 }
 
+/// Per-reason counts of spots suppressed by an operator override (MAN-31).
+/// ARCHITECTURE §8: "Every dropped/evicted/suppressed item is counted. No
+/// silent loss anywhere in the pipeline." Exposed via
+/// `Validator::suppression_counts` for the future M3 metrics endpoint to
+/// read, mirroring `manta_engine::track::CloseCounts` -- nothing wires it
+/// externally yet, since the Prometheus text endpoint itself is explicit
+/// M3 scope (ROADMAP.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuppressionCounts {
+    pub blocklist: u64,
+    pub notch: u64,
+}
+
 pub struct Validator {
     cty: cty::Table,
     scp: Option<scp::Set>,
@@ -123,6 +138,9 @@ pub struct Validator {
     dedupe: Dedupe,
     freq_calibration: f64,
     allowlist: std::collections::BTreeSet<String>,
+    blocklist: Blocklist,
+    notch: NotchList,
+    suppression_counts: SuppressionCounts,
 }
 
 impl Validator {
@@ -135,6 +153,9 @@ impl Validator {
             dedupe: Dedupe::new(fs),
             freq_calibration: 1.0,
             allowlist: std::collections::BTreeSet::new(),
+            blocklist: Blocklist::default(),
+            notch: NotchList::default(),
+            suppression_counts: SuppressionCounts::default(),
         }
     }
 
@@ -164,9 +185,32 @@ impl Validator {
     /// Adds `call` to the operator's Watch List (MAN-28): an explicitly
     /// allowlisted callsign bypasses grammar/cty validation and the
     /// repetition gate entirely, matching CW Skimmer's Watch List
-    /// behavior (Aggregator manual Appendix A2).
+    /// behavior (Aggregator manual Appendix A2). Checked after the MAN-31
+    /// suppression overrides below -- an explicit blocklist/notch entry is
+    /// the more specific, deliberate override and is never silently
+    /// defeated by a broader allowlist entry.
     pub fn allowlist(&mut self, call: &str) {
         self.allowlist.insert(call.to_ascii_uppercase());
+    }
+
+    /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
+    /// default -- no suppression until the operator supplies one.
+    pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {
+        self.blocklist = blocklist;
+        self
+    }
+
+    /// Sets the operator's notched-frequency list (MAN-31). Empty by
+    /// default -- no suppression until the operator supplies one.
+    pub fn with_notch(mut self, notch: NotchList) -> Self {
+        self.notch = notch;
+        self
+    }
+
+    /// Per-reason counts of operator-suppressed spots so far (MAN-31,
+    /// ARCHITECTURE §8).
+    pub fn suppression_counts(&self) -> SuppressionCounts {
+        self.suppression_counts
     }
 
     /// Feeds one decoder event in. Returns zero or more validated spots
@@ -260,8 +304,24 @@ impl Validator {
             word.confidences.clone()
         };
 
-        // MAN-28 Watch List: an allowlisted callsign bypasses
-        // grammar/cty validation and the repetition gate below entirely.
+        // Operator suppression overrides (MAN-31) -- orthogonal to, and
+        // checked ahead of, both the automatic validation pipeline and the
+        // MAN-28 allowlist below: an explicit blocklist/notch entry is the
+        // operator's more specific, deliberate override and must not be
+        // silently defeated by a broader allowlist entry. Each hit is
+        // counted (ARCHITECTURE §8) so it reads as a deliberate
+        // suppression, not silent coverage loss.
+        if self.blocklist.contains(&candidate) {
+            self.suppression_counts.blocklist += 1;
+            return Vec::new();
+        }
+        if self.notch.contains(freq_hz) {
+            self.suppression_counts.notch += 1;
+            return Vec::new();
+        }
+
+        // MAN-28 Watch List: an allowlisted callsign bypasses grammar/cty
+        // validation and the repetition gate below entirely.
         let is_allowlisted = self.allowlist.contains(&candidate);
 
         if !is_allowlisted {

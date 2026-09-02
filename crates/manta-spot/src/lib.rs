@@ -1,17 +1,25 @@
 //! Callsign/CQ-DE validation, cty.dat/SCP cross-check, repetition gate,
-//! dedupe. ARCHITECTURE §6.
+//! dedupe. ARCHITECTURE §6. Plus operator suppression overrides
+//! (bad-call blocklist, notched frequencies -- MAN-31) orthogonal to
+//! that pipeline.
 
+pub mod blocklist;
 pub mod confidence;
 pub mod context;
 pub mod cty;
 pub mod dedupe;
 pub mod gate;
 pub mod grammar;
+pub mod notch;
 pub mod scp;
 pub mod validator;
 
+pub use blocklist::Blocklist;
 pub use context::SpotType;
-pub use validator::{calibration_factor_from_ppm, InvalidCalibration, Spot, Validator};
+pub use notch::{FreqRange, NotchList};
+pub use validator::{
+    calibration_factor_from_ppm, InvalidCalibration, Spot, SuppressionCounts, Validator,
+};
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see
 /// `data/SOURCES.md` for provenance and refresh instructions.

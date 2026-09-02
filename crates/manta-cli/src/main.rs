@@ -1,7 +1,7 @@
 //! `manta` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
 //! The daemon (SDR input, servers) arrives at M2/M3 (ROADMAP).
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
@@ -46,6 +46,13 @@ enum Command {
         /// (Aggregator manual Appendix A2). Repeatable.
         #[arg(long)]
         allowlist: Vec<String>,
+        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
+        #[arg(long)]
+        blocklist: Option<PathBuf>,
+        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
+        /// range per line (MAN-31).
+        #[arg(long)]
+        notch: Option<PathBuf>,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
@@ -98,6 +105,13 @@ enum Command {
         /// (Aggregator manual Appendix A2). Repeatable.
         #[arg(long)]
         allowlist: Vec<String>,
+        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
+        #[arg(long)]
+        blocklist: Option<PathBuf>,
+        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
+        /// range per line (MAN-31).
+        #[arg(long)]
+        notch: Option<PathBuf>,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -157,6 +171,13 @@ enum Command {
         /// (Aggregator manual Appendix A2). Repeatable.
         #[arg(long)]
         allowlist: Vec<String>,
+        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
+        #[arg(long)]
+        blocklist: Option<PathBuf>,
+        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
+        /// range per line (MAN-31).
+        #[arg(long)]
+        notch: Option<PathBuf>,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -270,6 +291,43 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
+/// Strips a leading UTF-8 BOM (`\u{feff}`), common in Windows-authored text
+/// files -- `str::trim` does not remove it, so left unstripped it corrupts
+/// the first line's parse (a blocklist callsign that never matches, or a
+/// notch range silently rejected).
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
+/// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
+/// frequency-calibration correction, the MAN-28 operator Watch List, and
+/// the MAN-31 operator suppression lists. Each is optional/repeatable; an
+/// absent one leaves that list empty, matching `PipelineConfig`'s own
+/// defaults.
+fn build_pipeline_config(
+    freq_correction_ppm: f64,
+    allowlist: Vec<String>,
+    blocklist: Option<PathBuf>,
+    notch: Option<PathBuf>,
+) -> Result<PipelineConfig> {
+    let mut cfg = PipelineConfig {
+        freq_correction_ppm,
+        allowlist,
+        ..Default::default()
+    };
+    if let Some(path) = blocklist {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading blocklist file {}", path.display()))?;
+        cfg.blocklist = manta_engine::Blocklist::parse(strip_bom(&text));
+    }
+    if let Some(path) = notch {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading notch file {}", path.display()))?;
+        cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
+    }
+    Ok(cfg)
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Decode {
@@ -277,12 +335,10 @@ fn main() -> Result<()> {
             json,
             freq_correction_ppm,
             allowlist,
+            blocklist,
+            notch,
         } => {
-            let cfg = PipelineConfig {
-                freq_correction_ppm,
-                allowlist,
-                ..Default::default()
-            };
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -323,6 +379,8 @@ fn main() -> Result<()> {
             json,
             freq_correction_ppm,
             allowlist,
+            blocklist,
+            notch,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -338,6 +396,7 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             #[cfg(feature = "soapy")]
             let src = open_source(
                 device,
@@ -357,11 +416,6 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            let cfg = PipelineConfig {
-                freq_correction_ppm,
-                allowlist,
-                ..Default::default()
-            };
             manta_engine::listen(
                 src,
                 &cfg,
@@ -417,6 +471,8 @@ fn main() -> Result<()> {
             kiwi_password,
             freq_correction_ppm,
             allowlist,
+            blocklist,
+            notch,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
@@ -432,6 +488,7 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             #[cfg(feature = "soapy")]
             let src = open_source(
                 device,
@@ -446,11 +503,6 @@ fn main() -> Result<()> {
             )?;
             #[cfg(not(feature = "soapy"))]
             let src = open_source(device, source, kiwi)?;
-            let cfg = PipelineConfig {
-                freq_correction_ppm,
-                allowlist,
-                ..Default::default()
-            };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {

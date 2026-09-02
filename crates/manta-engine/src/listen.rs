@@ -61,7 +61,9 @@ pub fn listen(
     );
     let mut validator = Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_blocklist(cfg.blocklist.clone())
+        .with_notch(cfg.notch.clone());
     for call in &cfg.allowlist {
         validator.allowlist(call);
     }
@@ -280,5 +282,38 @@ mod tests {
         };
         let stop = Arc::new(AtomicBool::new(false));
         assert!(listen(src, &cfg, stop, |_ev| {}, |_spot| {}).is_err());
+    }
+
+    /// MAN-31: `listen()` is the other production call site that must
+    /// apply an operator-supplied suppression list.
+    #[test]
+    fn listen_suppresses_a_blocklisted_callsign() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let cfg = PipelineConfig {
+            blocklist: manta_spot::Blocklist::parse("W1AW\n"),
+            ..Default::default()
+        };
+        let mut spots = Vec::new();
+        listen(
+            src,
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            |_ev| {},
+            |spot| spots.push(spot.clone()),
+        )
+        .unwrap();
+
+        assert!(
+            spots.is_empty(),
+            "blocklisted callsign must never be spotted, got {spots:?}"
+        );
     }
 }

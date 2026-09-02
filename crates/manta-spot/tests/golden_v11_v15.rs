@@ -1,8 +1,10 @@
-//! SPEC-decode-core.md §7.1 V11-V17: manta-spot validator vectors.
+//! SPEC-decode-core.md §7.1 V11-V15, V18-V19: manta-spot validator
+//! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
+//! golden_v16_v17.rs.)
 
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::Glyph;
-use manta_spot::{Spot, SpotType, Validator};
+use manta_spot::{Blocklist, Spot, SpotType, Validator};
 
 const FS: f64 = 96_000.0;
 const CTY_FIXTURE: &str = "\
@@ -153,7 +155,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
 }
 
 #[test]
-fn v16_beacon_pattern_exempt_from_repetition_gate() {
+fn v18_beacon_pattern_exempt_from_repetition_gate() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     let words = ["V", "V", "V", "K5ARH"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -163,7 +165,7 @@ fn v16_beacon_pattern_exempt_from_repetition_gate() {
 }
 
 #[test]
-fn v17_allowlisted_call_bypasses_validation_and_repetition() {
+fn v19_allowlisted_call_bypasses_validation_and_repetition() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     v.allowlist("ZZ9ZZZ");
     let words = ["DE", "ZZ9ZZZ", "K"];
@@ -174,4 +176,19 @@ fn v17_allowlisted_call_bypasses_validation_and_repetition() {
         "an allowlisted call must spot despite a bogus cty prefix and a single decode"
     );
     assert_eq!(spots[0].callsign, "ZZ9ZZZ");
+}
+
+/// MAN-28/MAN-31 interaction: an explicit blocklist entry is the more
+/// specific, deliberate operator override and must not be silently
+/// defeated by a broader allowlist entry on the same callsign.
+#[test]
+fn blocklisted_callsign_is_never_spotted_even_if_also_allowlisted() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
+    v.allowlist("K5ARH");
+    let words = ["DE", "K5ARH", "K"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "a blocklisted callsign must never spot, even if also allowlisted, got {spots:?}"
+    );
 }
