@@ -168,6 +168,40 @@ fn decode_samples_calibrates_track_meta_events_too() {
     );
 }
 
+/// MAN-28 Watch List: `PipelineConfig::allowlist` must actually reach the
+/// production validator, not just `manta_spot::Validator::allowlist` in
+/// isolation -- otherwise an operator has no way to use the documented
+/// bypass via `manta decode`/`listen`. Single-decode repetition-gate
+/// bypass is already covered at the `Validator` level (V17); this proves
+/// the config wiring itself, via a bogus cty prefix that grammar/cty
+/// validation would otherwise reject regardless of repetition count.
+#[test]
+fn decode_samples_spots_an_allowlisted_call_despite_bogus_cty_prefix() {
+    let sig = SignalSpec {
+        text: "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into(),
+        loop_text: true,
+        wpm: 20.0,
+        offset_hz: 12_340.0,
+        snr_2500_db: 20.0,
+        jitter: None,
+        qsb: None,
+        watterson: None,
+        char_wpm: None,
+    };
+    let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
+    let cfg = PipelineConfig {
+        allowlist: vec!["QQ9ZZZ".into()],
+        ..Default::default()
+    };
+    let report = decode_samples(&iq, 96_000.0, 14_000_000.0, &cfg).unwrap();
+
+    assert!(
+        report.spots.iter().any(|s| s.callsign == "QQ9ZZZ"),
+        "allowlisted QQ9ZZZ (unallocated cty prefix) should still spot, got: {:?}",
+        report.spots
+    );
+}
+
 #[test]
 fn decode_samples_rejects_an_invalid_freq_correction_ppm() {
     let sig = SignalSpec {

@@ -212,6 +212,17 @@ Decoder output: timestamped character stream + WPM + SNR + confidence per track.
 Decoded text is noisy; validation is what makes spots trustworthy. Pipeline per
 track, over a rolling text window:
 
+No spot is ever emitted before a track's first `TrackMeta` event (SPEC §5, 1 Hz
+cadence) — until then `freq_hz`/`snr_db` hold bogus `0.0` defaults, and a spot
+carrying them would poison both the emitted record and dedupe's frequency
+bucket. The old ≥2-repetition gate hid this by construction (reaching two
+repetitions takes long enough that real telemetry always arrived first); the
+BEACON/allowlist exemptions below removed that incidental protection, so it is
+now an explicit invariant checked before any candidate is evaluated (MAN-28).
+A candidate held back by this gate is retried the moment `TrackMeta` arrives
+(not left waiting on a `WordBoundary` that a short, already-finished
+transmission may never produce again).
+
 1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`). Context determines
    spot type (CQ / DE / BEACON) — RBN spots carry this flag.
@@ -224,11 +235,41 @@ track, over a rolling text window:
 4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
    the same track before first spot (CW ops repeat their calls; single decodes
    are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
-   SNR, SCP/cty hits).
+   SNR, SCP/cty hits). **Exemption**: messages already type-tagged `BEACON` by
+   step 1's context parse skip this gate entirely — NCDXF-style beacons ID
+   once per power-step cycle and legitimately won't repeat within the window
+   (MAN-28).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
    WPM, type, confidence.
+
+**Operator allowlist (Watch List)**: a callsign the operator explicitly lists
+bypasses step 1's context-parse requirement too — not just steps 2
+(grammar/cty) and 4 (repetition) — since a listed callsign with no
+recognized CQ/DE/UP/beacon framing (tagged type `Unknown`) is exactly the
+primary real-world case: an NCDXF beacon transmits its callsign followed
+by power-step dashes, no framing words at all. Evaluated independently of
+context parsing, not as a lower-priority fallback: a stale, already-
+processed context match elsewhere in the rolling word window never blocks
+discovery of a different, freshly-allowlisted word (`Validator::candidates`
+gathers both per event). An immediate `Unknown`-typed spot is not final: if
+a trailing word later completes a real context pattern for the same word
+(e.g. `<call> UP` -> `De`), that reclassification is emitted as a second
+spot via dedupe's existing type-changed override (step 5) -- an
+already-processed word is not permanently locked to its first type.
+Reclassification requires a genuinely younger word: `manta-spot::context`
+returns not just a candidate/type but the byte span of every word that
+determined it, which the validator maps back to word identities and their
+insertion order; a later classification is only accepted when it involves
+a word strictly newer than any that produced the previous one. This is
+what makes reclassification promotion-only in practice -- a word is never
+downgraded (to `Unknown`, or between two real context types) just because
+an older framing word ages out of the rolling window, since aging out
+never introduces a *newer* word, only removes an old one. Legacy
+precedent: CW Skimmer's Watch List (Aggregator manual Appendix A2), which
+exists specifically for calls that wouldn't otherwise pass automatic
+validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 7. Output layer (`manta-server`)
 

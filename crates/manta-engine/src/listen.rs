@@ -64,6 +64,9 @@ pub fn listen(
         .map_err(|e| anyhow::anyhow!(e))?
         .with_blocklist(cfg.blocklist.clone())
         .with_notch(cfg.notch.clone());
+    for call in &cfg.allowlist {
+        validator.allowlist(call);
+    }
 
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);

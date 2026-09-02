@@ -40,6 +40,12 @@ enum Command {
             allow_negative_numbers = true
         )]
         freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
+        /// bypasses grammar/cty validation and the repetition gate
+        /// entirely -- legacy precedent: CW Skimmer's Watch List
+        /// (Aggregator manual Appendix A2). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
         /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
         #[arg(long)]
         blocklist: Option<PathBuf>,
@@ -93,6 +99,12 @@ enum Command {
             allow_negative_numbers = true
         )]
         freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
+        /// bypasses grammar/cty validation and the repetition gate
+        /// entirely -- legacy precedent: CW Skimmer's Watch List
+        /// (Aggregator manual Appendix A2). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
         /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
         #[arg(long)]
         blocklist: Option<PathBuf>,
@@ -153,6 +165,12 @@ enum Command {
             allow_negative_numbers = true
         )]
         freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
+        /// bypasses grammar/cty validation and the repetition gate
+        /// entirely -- legacy precedent: CW Skimmer's Watch List
+        /// (Aggregator manual Appendix A2). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
         /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
         #[arg(long)]
         blocklist: Option<PathBuf>,
@@ -282,16 +300,19 @@ fn strip_bom(text: &str) -> &str {
 }
 
 /// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
-/// frequency-calibration correction plus the MAN-31 operator suppression
-/// lists. Either suppression flag is optional; an absent one leaves that
-/// list empty (no suppression), matching `PipelineConfig`'s own defaults.
+/// frequency-calibration correction, the MAN-28 operator Watch List, and
+/// the MAN-31 operator suppression lists. Each is optional/repeatable; an
+/// absent one leaves that list empty, matching `PipelineConfig`'s own
+/// defaults.
 fn build_pipeline_config(
     freq_correction_ppm: f64,
+    allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
+        allowlist,
         ..Default::default()
     };
     if let Some(path) = blocklist {
@@ -313,10 +334,11 @@ fn main() -> Result<()> {
             path,
             json,
             freq_correction_ppm,
+            allowlist,
             blocklist,
             notch,
         } => {
-            let cfg = build_pipeline_config(freq_correction_ppm, blocklist, notch)?;
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -356,6 +378,7 @@ fn main() -> Result<()> {
             kiwi_password,
             json,
             freq_correction_ppm,
+            allowlist,
             blocklist,
             notch,
             #[cfg(feature = "soapy")]
@@ -373,7 +396,7 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, blocklist, notch)?;
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             #[cfg(feature = "soapy")]
             let src = open_source(
                 device,
@@ -447,6 +470,7 @@ fn main() -> Result<()> {
             kiwi_freq,
             kiwi_password,
             freq_correction_ppm,
+            allowlist,
             blocklist,
             notch,
             #[cfg(feature = "soapy")]
@@ -464,7 +488,7 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, blocklist, notch)?;
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             #[cfg(feature = "soapy")]
             let src = open_source(
                 device,

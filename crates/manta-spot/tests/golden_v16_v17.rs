@@ -53,11 +53,23 @@ fn run_twice(v: &mut Validator, words: &[&str]) -> Vec<Spot> {
     spots
 }
 
+/// Real telemetry, so `try_spot`'s `has_meta` gate (MAN-28 round 8) doesn't
+/// hold back every spot in tests that don't otherwise care about metadata
+/// timing.
+fn seed_meta(v: &mut Validator, track_id: u32) {
+    v.ingest(&DecoderEvent::TrackMeta {
+        track_id,
+        snr_2500_db: 20.0,
+        freq_hz: 14_000_000.0,
+    });
+}
+
 #[test]
 fn v16_blocklisted_callsign_never_spots() {
     // Given a callsign is present in the operator's bad-call list
     let blocklist = Blocklist::parse("K5ARH\n");
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(blocklist);
+    seed_meta(&mut v, 1);
     let words = ["DE", "K5ARH", "K"];
 
     // When manta-spot would otherwise emit a spot for that callsign
@@ -74,6 +86,7 @@ fn v16_blocklisted_callsign_never_spots() {
 fn v16_non_blocklisted_callsign_still_spots() {
     let blocklist = Blocklist::parse("W9ZZZ\n");
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(blocklist);
+    seed_meta(&mut v, 1);
     let words = ["DE", "K5ARH", "K"];
 
     let spots = run_twice(&mut v, &words);
@@ -114,6 +127,7 @@ fn v17_notched_frequency_never_spots() {
 fn suppressed_spots_are_counted_by_reason() {
     let blocklist = Blocklist::parse("K5ARH\n");
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(blocklist);
+    seed_meta(&mut v, 1);
     let words = ["DE", "K5ARH", "K"];
     // One transmission attempt -> one blocklist hit (the check runs on
     // every candidate word, ahead of the repetition gate).

@@ -198,6 +198,57 @@ fn decode_json_includes_spots_field() {
     );
 }
 
+/// MAN-28 Watch List: an operator running `manta decode` on a real
+/// recording must be able to force-spot a callsign that fails automatic
+/// validation, via `--allowlist`. `decode` is the only subcommand
+/// testable without a live device/file, same rationale as the
+/// freq-correction-ppm CLI tests above.
+#[test]
+fn decode_allowlist_spots_a_call_that_fails_cty_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.duration_s = 30.0;
+    spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join(format!("{}.wav", spec.name));
+
+    let without_allowlist = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(without_allowlist.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&without_allowlist.stdout).unwrap();
+    assert!(
+        !report["spots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["callsign"] == "QQ9ZZZ"),
+        "QQ9ZZZ (unallocated cty prefix) must not spot without --allowlist, got: {report}"
+    );
+
+    let with_allowlist = manta()
+        .args(["decode", "--json", "--allowlist", "QQ9ZZZ"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        with_allowlist.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_allowlist.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&with_allowlist.stdout).unwrap();
+    assert!(
+        report["spots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["callsign"] == "QQ9ZZZ"),
+        "--allowlist QQ9ZZZ should force a spot for QQ9ZZZ, got: {report}"
+    );
+}
+
 /// MAN-31: an operator must be able to supply the suppression lists from
 /// the CLI, not just via the library API -- this is the end-to-end proof
 /// the wiring reaches production, not just `PipelineConfig` in isolation.
