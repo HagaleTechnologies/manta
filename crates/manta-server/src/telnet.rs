@@ -163,14 +163,31 @@ async fn handle_client(
                         // review finding). `bus.recent` carries each
                         // spot's publish-time occurrence_count precisely
                         // so this comparison is possible here.
-                        for bus_spot in bus.recent(n) {
+                        let mut history = bus.recent(n).into_iter();
+                        while let Some(bus_spot) = history.next() {
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
                                     continue;
                                 }
                             }
-                            write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
+                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                                .await
+                                .is_err()
+                            {
+                                // A bare `?` here (the prior behavior)
+                                // abandoned not just the rest of this
+                                // history replay but every live spot
+                                // still retained in `rx` too, uncounted
+                                // (round-13 review finding) -- count this
+                                // failed write, whatever's left of the
+                                // history iterator, and whatever's still
+                                // retained on the live channel.
+                                metrics.record_write_failed(
+                                    1 + history.len() as u64 + rx.len() as u64,
+                                );
+                                return Ok(());
+                            }
                         }
                     }
                     Command::SetFilterUnique { min } => {

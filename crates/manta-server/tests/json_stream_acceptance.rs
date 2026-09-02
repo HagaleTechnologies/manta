@@ -435,3 +435,71 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
         other => panic!("expected the unsolicited pong to end the connection, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
+    // Regression test (round-13 review): unlike Pong/Text/Binary, a Ping
+    // frame is legitimate client behavior -- so it can't just be rejected
+    // outright the way those are. But replying to an UNLIMITED sequence of
+    // them still keeps the read arm perpetually ready, recreating the
+    // same CPU/bandwidth-exhaustion shape. A client must be disconnected
+    // once it exceeds a small lifetime Ping budget, generous enough for
+    // any real keepalive cadence.
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
+    let metrics = Arc::new(Metrics::new());
+    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = manta_server::tasks::new_client_tasks();
+    tokio::spawn(async move {
+        manta_server::json_stream::serve(
+            listener,
+            manta_server::json_stream::JsonStreamConfig {
+                bus,
+                metrics,
+                cty,
+                station_call: STATION_CALL.to_string(),
+                decoder_version: "manta-test".to_string(),
+                shutdown: shutdown_rx,
+            },
+            tasks,
+        )
+        .await;
+    });
+
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+
+    for _ in 0..manta_server::json_stream::MAX_INBOUND_PINGS {
+        ws.send(Message::Ping(vec![].into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a Pong within the budget")
+            .expect("stream ended before the budget was exhausted")
+            .expect("ws error before the budget was exhausted");
+        assert!(
+            matches!(pong, Message::Pong(_)),
+            "expected a Pong reply within budget, got {pong:?}"
+        );
+    }
+
+    // One more Ping, past the budget, must end the connection instead of
+    // getting another Pong.
+    let _ = ws.send(Message::Ping(vec![].into())).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("server never responded after the ping budget was exceeded");
+    match outcome {
+        None => {}                        // connection closed
+        Some(Err(_)) => {}                // protocol error surfaced to the client
+        Some(Ok(Message::Close(_))) => {} // clean close frame
+        other => panic!("expected exceeding the ping budget to end the connection, got {other:?}"),
+    }
+}

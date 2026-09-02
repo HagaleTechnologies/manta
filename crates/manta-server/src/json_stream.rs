@@ -35,6 +35,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// memory-exhaustion DoS multiplied across connections). 16 KiB is
 /// generous headroom over any real control frame.
 const MAX_INBOUND_WS_MESSAGE_BYTES: usize = 16 * 1024;
+/// Caps how many Ping frames one WebSocket connection may send over its
+/// lifetime before being disconnected. Unlike Pong/Text/Binary (never
+/// legitimate on this pure-server-push stream, so rejected outright),
+/// Ping is genuine client behavior this server must answer -- but
+/// replying to an UNLIMITED sequence of them keeps the read arm
+/// perpetually ready, recreating the same CPU/bandwidth-exhaustion shape
+/// (round-13 review finding). 60 is generous headroom for any real
+/// keepalive cadence over a connection's life.
+pub const MAX_INBOUND_PINGS: u32 = 60;
 /// How long `serve` waits for a connection's first bytes before assuming
 /// it's a raw JSON Lines client (which may never send anything).
 const PEEK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -281,6 +290,7 @@ async fn handle_ws_client(
         tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
     )
     .await??;
+    let mut ping_count: u32 = 0;
     loop {
         tokio::select! {
             spot = rx.recv() => {
@@ -314,6 +324,17 @@ async fn handle_ws_client(
                 match frame {
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
                     Some(Ok(Message::Ping(payload))) => {
+                        // A Ping IS legitimate client behavior, unlike
+                        // Pong/Text/Binary below -- but replying to an
+                        // UNLIMITED sequence of them keeps this arm
+                        // perpetually ready the same way those did.
+                        // Disconnect once a connection exceeds a small
+                        // lifetime budget instead (round-13 review
+                        // finding).
+                        ping_count += 1;
+                        if ping_count > MAX_INBOUND_PINGS {
+                            return Ok(());
+                        }
                         tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
                             .await
                             .map_err(|_| anyhow::anyhow!("write timed out"))??;
