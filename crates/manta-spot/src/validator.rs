@@ -178,7 +178,10 @@ impl Validator {
         if let Some(scp) = &self.scp {
             confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));
         }
-        if reps < 2 {
+        // ARCHITECTURE §6.4 exempts BEACON-tagged messages from the
+        // repetition requirement: NCDXF-style beacons ID once per cycle,
+        // so a single decode must still spot (MAN-28).
+        if spot_type != SpotType::Beacon && reps < 2 {
             return Vec::new();
         }
         if !self
@@ -308,6 +311,16 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(track.current.text.is_empty());
         assert_eq!(track.words.len(), 1);
         assert_eq!(track.words[0].text, "DE");
+    }
+
+    #[test]
+    fn beacon_pattern_emits_spot_after_single_decode() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let words = ["V", "V", "V", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
     #[test]

@@ -224,7 +224,10 @@ track, over a rolling text window:
 4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
    the same track before first spot (CW ops repeat their calls; single decodes
    are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
-   SNR, SCP/cty hits).
+   SNR, SCP/cty hits). **Exemption**: messages already type-tagged `BEACON` by
+   step 1's context parse skip this gate entirely — NCDXF-style beacons ID
+   once per power-step cycle and legitimately won't repeat within the window
+   (MAN-28).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
