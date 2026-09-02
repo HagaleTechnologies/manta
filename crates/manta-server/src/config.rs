@@ -21,15 +21,40 @@ fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
 }
 
+fn default_dry_run() -> bool {
+    false
+}
+
+/// Shared by `deserialize_station_callsign` (required) and
+/// `deserialize_optional_callsign` (MAN-32's `login_callsign`, optional) so
+/// the plausibility rule -- and the line-injection concern it guards
+/// against, see `ServerConfig::station_callsign`'s doc comment -- can't
+/// drift between the two call sites.
+fn check_plausible(call: &str) -> Result<(), String> {
+    if !manta_spot::grammar::is_plausible(call) {
+        return Err(format!("{call:?} is not a plausible callsign"));
+    }
+    Ok(())
+}
+
 fn deserialize_station_callsign<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
     let call = String::deserialize(deserializer)?;
-    if !manta_spot::grammar::is_plausible(&call) {
-        return Err(serde::de::Error::custom(format!(
-            "station_callsign {call:?} is not a plausible callsign"
-        )));
+    check_plausible(&call)
+        .map_err(|e| serde::de::Error::custom(format!("station_callsign {e}")))?;
+    Ok(call)
+}
+
+fn deserialize_optional_callsign<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let call: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(call) = &call {
+        check_plausible(call)
+            .map_err(|e| serde::de::Error::custom(format!("login_callsign {e}")))?;
     }
     Ok(call)
 }
@@ -63,6 +88,41 @@ pub struct ServerConfig {
     pub metrics_port: u16,
 }
 
+/// `[rbn_uplink]` TOML table -- MAN-32. Outbound telnet client that logs
+/// into RBN's own spot-collection endpoint and forwards manta's spots
+/// there. Absent from a config file entirely (`None`) means the uplink is
+/// off; existing single-node operators see no behavior change. Scoped
+/// `deny_unknown_fields` the same way `ServerConfig` is (see
+/// `DaemonConfigFile`'s doc comment on why the wrapper itself is NOT):
+/// this only needs to reject a typo INSIDE `[rbn_uplink]`, and doing so is
+/// specifically safety-relevant here -- an operator typo like `dry-run`
+/// instead of `dry_run` would otherwise silently parse as the untouched
+/// `dry_run = false` default and start transmitting real spots to RBN.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RbnUplinkConfig {
+    pub enabled: bool,
+    pub target_host: String,
+    pub target_port: u16,
+    /// Defaults to `[server].station_callsign` when omitted -- see
+    /// `effective_login_callsign`.
+    #[serde(default, deserialize_with = "deserialize_optional_callsign")]
+    pub login_callsign: Option<String>,
+    /// When true, the connection is still made (so operators can validate
+    /// connectivity/login) but spot lines are not transmitted --
+    /// legacy Aggregator's "prevent sending false spots during testing"
+    /// checkbox, folded into MAN-32's scope per
+    /// `docs/DECISIONS/2026-09-01-legacy-capability-matrix.md:91`.
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+}
+
+impl RbnUplinkConfig {
+    pub fn effective_login_callsign<'a>(&'a self, station_callsign: &'a str) -> &'a str {
+        self.login_callsign.as_deref().unwrap_or(station_callsign)
+    }
+}
+
 /// The real on-disk daemon config file's shape: a `[server]` TOML table
 /// (this is the file `manta listen --server-config <path>` reads) --
 /// distinct from `ServerConfig` itself so that struct can stay a plain,
@@ -71,16 +131,18 @@ pub struct ServerConfig {
 /// wrapper. ARCHITECTURE §8: "Single TOML config... server ports." That
 /// same single daemon TOML also carries `[detector]`/`[decode]`/`[input]`/
 /// `[spot]` and other tables this crate doesn't model (SPEC §9) --
-/// deliberately NOT `deny_unknown_fields` here, unlike `ServerConfig`
-/// itself: this wrapper only needs to reject a typo INSIDE `[server]`,
-/// which `ServerConfig`'s own `deny_unknown_fields` already does. Denying
-/// unknown fields at THIS level too (an earlier version did) rejected
-/// every other real, valid table in the unified config, making
-/// `--server-config` unusable with the actual daemon config this repo's
-/// own docs describe (round-11 review finding).
+/// deliberately NOT `deny_unknown_fields` here, unlike `ServerConfig`/
+/// `RbnUplinkConfig` themselves: this wrapper only needs to reject a typo
+/// INSIDE `[server]`/`[rbn_uplink]`, which those structs' own
+/// `deny_unknown_fields` already does. Denying unknown fields at THIS
+/// level too (an earlier version did) rejected every other real, valid
+/// table in the unified config, making `--server-config` unusable with
+/// the actual daemon config this repo's own docs describe (round-11
+/// review finding).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DaemonConfigFile {
     pub server: ServerConfig,
+    pub rbn_uplink: Option<RbnUplinkConfig>,
 }
 
 #[cfg(test)]
@@ -212,5 +274,112 @@ mod tests {
             result.is_err(),
             "a typo'd key inside [server] must still be rejected"
         );
+    }
+
+    // MAN-32: [rbn_uplink] table.
+
+    #[test]
+    fn uplink_disabled_by_default_when_table_omitted() {
+        let file: DaemonConfigFile = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            "#,
+        )
+        .unwrap();
+        assert!(file.rbn_uplink.is_none());
+    }
+
+    #[test]
+    fn uplink_table_requires_target_when_present() {
+        let result: Result<DaemonConfigFile, _> = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [rbn_uplink]
+            enabled = true
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "enabled=true with no target should fail to parse"
+        );
+    }
+
+    #[test]
+    fn uplink_table_parses_with_defaults() {
+        let file: DaemonConfigFile = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [rbn_uplink]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            "#,
+        )
+        .unwrap();
+        let uplink = file.rbn_uplink.unwrap();
+        assert!(uplink.enabled);
+        assert_eq!(uplink.target_host, "example.invalid");
+        assert_eq!(uplink.target_port, 7300);
+        assert!(!uplink.dry_run);
+        assert_eq!(uplink.login_callsign, None);
+    }
+
+    #[test]
+    fn uplink_unknown_key_is_a_parse_error() {
+        // Mirrors ServerConfig's own deny_unknown_fields rule (round-6
+        // review on MAN-12/PR#63): a typo'd key here is safety-relevant in
+        // a way ServerConfig's typos aren't -- e.g. `dry-run` instead of
+        // `dry_run` would otherwise silently parse as the untouched
+        // dry_run=false default and start transmitting real spots to RBN
+        // instead of failing loudly.
+        let result: Result<DaemonConfigFile, _> = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [rbn_uplink]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            dry-run = true
+            "#,
+        );
+        assert!(result.is_err(), "unknown key should have been rejected");
+    }
+
+    #[test]
+    fn uplink_rejects_implausible_login_callsign() {
+        let result: Result<DaemonConfigFile, _> = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [rbn_uplink]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            login_callsign = "W3XYZ\r\nEVIL LINE"
+            "#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn uplink_effective_login_callsign_falls_back_to_station_callsign() {
+        let uplink = RbnUplinkConfig {
+            enabled: true,
+            target_host: "example.invalid".to_string(),
+            target_port: 7300,
+            login_callsign: None,
+            dry_run: false,
+        };
+        assert_eq!(uplink.effective_login_callsign("W3XYZ"), "W3XYZ");
+
+        let uplink_override = RbnUplinkConfig {
+            login_callsign: Some("W3XYZ-2".to_string()),
+            ..uplink
+        };
+        assert_eq!(uplink_override.effective_login_callsign("W3XYZ"), "W3XYZ-2");
     }
 }

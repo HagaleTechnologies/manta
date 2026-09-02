@@ -21,6 +21,13 @@ pub struct Metrics {
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
+    uplink_sent_total: AtomicU64,
+    uplink_suppressed_total: AtomicU64,
+    uplink_lagged_total: AtomicU64,
+    uplink_reconnects_total: AtomicU64,
+    /// 0/1 rather than a bool -- mirrors `telnet_clients`'s style so it
+    /// renders as a normal Prometheus gauge.
+    uplink_connected: AtomicI64,
 }
 
 impl Metrics {
@@ -102,6 +109,52 @@ impl Metrics {
             .write()
             .expect("source_health lock poisoned")
             .insert(source.to_string(), healthy);
+    }
+
+    // MAN-32: RBN uplink counters. ARCHITECTURE §8's "every
+    // dropped/evicted/suppressed item is counted" invariant applies here
+    // too -- a dry-run-suppressed or lag-dropped spot must be visible,
+    // not silent.
+
+    pub fn record_uplink_sent(&self) {
+        self.uplink_sent_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_sent_total(&self) -> u64 {
+        self.uplink_sent_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_uplink_suppressed(&self) {
+        self.uplink_suppressed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_suppressed_total(&self) -> u64 {
+        self.uplink_suppressed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_uplink_lagged(&self, n: u64) {
+        self.uplink_lagged_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn uplink_lagged_total(&self) -> u64 {
+        self.uplink_lagged_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_uplink_reconnect(&self) {
+        self.uplink_reconnects_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_reconnects_total(&self) -> u64 {
+        self.uplink_reconnects_total.load(Ordering::Relaxed)
+    }
+
+    pub fn set_uplink_connected(&self, connected: bool) {
+        self.uplink_connected
+            .store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    pub fn uplink_connected(&self) -> bool {
+        self.uplink_connected.load(Ordering::Relaxed) != 0
     }
 
     pub fn render_prometheus_text(&self) -> String {
@@ -188,6 +241,47 @@ impl Metrics {
             ));
         }
 
+        out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
+        out.push_str("# TYPE manta_uplink_sent_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_sent_total {}\n",
+            self.uplink_sent_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_suppressed_total Spots suppressed by dry-run instead of sent to the RBN uplink target.\n",
+        );
+        out.push_str("# TYPE manta_uplink_suppressed_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_suppressed_total {}\n",
+            self.uplink_suppressed_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_dropped_lagged_total Spots the uplink fell behind on and lost before its next reconnect.\n",
+        );
+        out.push_str("# TYPE manta_uplink_dropped_lagged_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_dropped_lagged_total {}\n",
+            self.uplink_lagged_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str("# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.\n");
+        out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_reconnects_total {}\n",
+            self.uplink_reconnects_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_connected Whether the RBN uplink is currently connected (1) or not (0).\n",
+        );
+        out.push_str("# TYPE manta_uplink_connected gauge\n");
+        out.push_str(&format!(
+            "manta_uplink_connected {}\n",
+            self.uplink_connected.load(Ordering::Relaxed)
+        ));
+
         out
     }
 }
@@ -266,5 +360,48 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    // MAN-32: RBN uplink counters.
+
+    #[test]
+    fn uplink_counters_start_at_zero_and_increment() {
+        let m = Metrics::new();
+        assert_eq!(m.uplink_sent_total(), 0);
+        m.record_uplink_sent();
+        assert_eq!(m.uplink_sent_total(), 1);
+
+        assert_eq!(m.uplink_suppressed_total(), 0);
+        m.record_uplink_suppressed();
+        assert_eq!(m.uplink_suppressed_total(), 1);
+
+        assert_eq!(m.uplink_lagged_total(), 0);
+        m.record_uplink_lagged(3);
+        assert_eq!(m.uplink_lagged_total(), 3);
+
+        assert_eq!(m.uplink_reconnects_total(), 0);
+        m.record_uplink_reconnect();
+        assert_eq!(m.uplink_reconnects_total(), 1);
+
+        assert!(!m.uplink_connected());
+        m.set_uplink_connected(true);
+        assert!(m.uplink_connected());
+        m.set_uplink_connected(false);
+        assert!(!m.uplink_connected());
+    }
+
+    #[test]
+    fn renders_uplink_counters_as_prometheus_metrics() {
+        let m = Metrics::new();
+        m.record_uplink_sent();
+        m.record_uplink_sent();
+        m.record_uplink_suppressed();
+        m.record_uplink_reconnect();
+        m.set_uplink_connected(true);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_uplink_sent_total 2"));
+        assert!(text.contains("manta_uplink_suppressed_total 1"));
+        assert!(text.contains("manta_uplink_reconnects_total 1"));
+        assert!(text.contains("manta_uplink_connected 1"));
     }
 }
