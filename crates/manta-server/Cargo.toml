@@ -1,0 +1,21 @@
+[package]
+name = "manta-server"
+description = "Telnet DX-cluster server + JSON Lines/WebSocket spot stream. ARCHITECTURE §7."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+manta-spot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "io-util", "macros", "time"] }
+tokio-tungstenite = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

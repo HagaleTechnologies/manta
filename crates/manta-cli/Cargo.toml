@@ -22,8 +22,12 @@ serde_json = { workspace = true }
 manta-decode = { workspace = true }
 manta-engine = { workspace = true }
 manta-input = { workspace = true }
+manta-server = { workspace = true }
+num-complex = { workspace = true }
 manta-spot = { workspace = true }
 manta-testkit = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+toml = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }
