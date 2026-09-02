@@ -360,7 +360,7 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
 /// handled by `session_nonce_for_replay_path` below, independently of
 /// this epoch.
 fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
-    std::fs::metadata(path)
+    let mtime = std::fs::metadata(path)
         .with_context(|| {
             format!(
                 "reading metadata for {} to derive its replay epoch",
@@ -373,24 +373,43 @@ fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime
                 "{} has no modification time on this platform",
                 path.display()
             )
-        })
+        })?;
+    // A Unix filesystem can represent a pre-1970 mtime. Left unvalidated,
+    // this SystemTime flows all the way to SpotBus::unix_ts_for, whose
+    // `.duration_since(UNIX_EPOCH).expect(...)` panics on the very first
+    // spot delivered to any client -- reject it here, at startup, with a
+    // clear error instead (round-8 review finding).
+    if mtime < std::time::SystemTime::UNIX_EPOCH {
+        bail!(
+            "{} has a modification time before the Unix epoch (1970-01-01), which can't be used \
+             as a replay epoch -- pass --replay-epoch explicitly instead",
+            path.display()
+        );
+    }
+    Ok(mtime)
 }
 
 /// Resolves the wall-clock epoch fed to `SpotBus`: an explicit
-/// `--replay-epoch` always wins when given (the escape hatch for a copy/
-/// download that didn't preserve the file's mtime); otherwise a replay
-/// session falls back to the file's own mtime, and a live session
-/// (`replay_path` is `None`) uses the current time.
+/// `--replay-epoch` wins when given AND this is a replay session (the
+/// escape hatch for a copy/download that didn't preserve the file's
+/// mtime); a replay session with no explicit epoch falls back to the
+/// file's own mtime; a live session (`replay_path` is `None`) always uses
+/// the current time, ignoring `replay_epoch` entirely -- matching the
+/// flag's own documented "ignored for a live source" contract. Applying it
+/// to a live session (round-8 review finding) would publish spots with a
+/// fabricated historical timestamp and derive the live session_nonce from
+/// that same fixed value, breaking the "two live sessions started within
+/// the same wall-clock second don't collide" guarantee.
 fn resolve_epoch(
     replay_path: Option<&std::path::Path>,
     replay_epoch: Option<i64>,
 ) -> Result<std::time::SystemTime> {
     match (replay_path, replay_epoch) {
-        (_, Some(secs)) => {
+        (Some(_), Some(secs)) => {
             Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
         }
         (Some(path), None) => epoch_for_replay_path(path),
-        (None, None) => Ok(std::time::SystemTime::now()),
+        (None, _) => Ok(std::time::SystemTime::now()),
     }
 }
 
@@ -915,6 +934,48 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn epoch_for_replay_path_rejects_a_pre_unix_epoch_mtime() {
+        // Regression (round-8 review): a Unix filesystem can represent an
+        // mtime before 1970 (rare, but real). Left unvalidated, that
+        // SystemTime flows all the way to SpotBus::unix_ts_for, whose
+        // `.duration_since(UNIX_EPOCH).expect(...)` panics on the very
+        // first spot delivered to any client -- a crash discovered at
+        // spot-delivery time instead of a clean error at startup.
+        let f = write_temp_file(b"pre-epoch mtime fixture");
+        let pre_epoch = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        std::fs::File::open(f.path())
+            .unwrap()
+            .set_modified(pre_epoch)
+            .expect("this platform must support setting mtime for the test to be meaningful");
+
+        let result = epoch_for_replay_path(f.path());
+        assert!(
+            result.is_err(),
+            "a pre-1970 mtime must be rejected at startup, not deferred to a later panic"
+        );
+    }
+
+    #[test]
+    fn resolve_epoch_ignores_replay_epoch_for_a_live_session() {
+        // Regression (round-8 review): --replay-epoch's own doc comment
+        // says "ignored for a live source," but the old match applied it
+        // unconditionally on `Some(secs)` regardless of `replay_path`. A
+        // live session given the flag would then publish spots with a
+        // fabricated historical timestamp AND derive its session_nonce
+        // from that same fixed value instead of a fresh nanosecond-
+        // precision now -- breaking the "two live sessions started within
+        // the same wall-clock second don't collide" guarantee entirely,
+        // since every live start with the same flag value would collide.
+        let before = std::time::SystemTime::now();
+        let epoch = resolve_epoch(None, Some(1_751_635_200)).unwrap();
+        let after = std::time::SystemTime::now();
+        assert!(
+            epoch >= before && epoch <= after,
+            "a live session (no replay_path) must ignore --replay-epoch and use now(), got {epoch:?}"
+        );
     }
 
     #[test]
