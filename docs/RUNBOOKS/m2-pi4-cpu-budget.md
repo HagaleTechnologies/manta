@@ -97,10 +97,16 @@ MAN-30's fate.
    unthrottled by drift alone — the throttling flags are the direct
    signal, an upward drift across runs is only a secondary corroborating
    one.
-6. Record the result (date, Pi4 revision/RAM size, OS version, stock vs.
-   overclocked config, throttling flags before/after, track count, both
-   ratios, pass/fail against the 1.0x CPU-time bar) in this file's "Runs"
-   section below.
+6. Record the result in this file's "Runs" section below: date, Pi4
+   revision/RAM size, OS version, stock vs. overclocked config, throttling
+   flags before/after, track count, both ratios, pass/fail against the
+   1.0x CPU-time bar -- **and which exact code was measured**: `git
+   rev-parse HEAD` and `git status --porcelain` (empty output = clean) on
+   the checkout you built from, plus `rustc --version`. This result closes
+   a performance gate for a specific pipeline implementation; without the
+   commit and clean-status recorded, nobody reading it later can tell
+   whether it measured the code currently on `main`, an older revision, or
+   a local modification.
 
 ## Cross-compiling (only if native build is impractical)
 
@@ -144,9 +150,15 @@ sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 # target/`core` error:
 rustup target add aarch64-unknown-linux-gnu
 
-# Either set this for one invocation:
+# Either set this for one invocation. PKG_CONFIG_ALLOW_CROSS=1 alone only
+# permits a cross query -- it does NOT point pkg-config at the arm64
+# .pc files; PKG_CONFIG_LIBDIR overrides its search path to Debian's
+# multiarch arm64 location (empty PKG_CONFIG_PATH so the host's own
+# x86_64 paths aren't also searched and matched by mistake):
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   PKG_CONFIG_ALLOW_CROSS=1 \
+  PKG_CONFIG_PATH= \
+  PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig \
   cargo test --release --target aarch64-unknown-linux-gnu -p manta-engine \
   --test cpu_budget --no-run -- --ignored --nocapture
 
