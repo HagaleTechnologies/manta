@@ -3,6 +3,7 @@
 
 pub mod band;
 pub mod bus;
+pub mod command;
 pub mod config;
 pub mod json_stream;
 pub mod metrics;

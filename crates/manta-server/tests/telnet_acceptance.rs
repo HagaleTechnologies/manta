@@ -115,6 +115,81 @@ async fn sh_dx_command_does_not_disconnect_the_client() {
 }
 
 #[tokio::test]
+async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
+    let (addr, bus, _metrics) = spawn_server().await;
+
+    // History predates the client's connection entirely -- `sh/dx` reads
+    // the bus's retained history, not the live broadcast subscription.
+    let mut first = sample_spot();
+    first.callsign = "K5ARH".to_string();
+    let mut second = sample_spot();
+    second.callsign = "N0CALL".to_string();
+    let expected_first = rbn::format_line(&first, STATION_CALL, bus.unix_ts_for(first.sample_ts));
+    let expected_second =
+        rbn::format_line(&second, STATION_CALL, bus.unix_ts_for(second.sample_ts));
+    bus.publish(first);
+    bus.publish(second);
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"sh/dx\r\n").await.unwrap();
+
+    let mut line1 = String::new();
+    let mut line2 = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line1))
+        .await
+        .expect("timed out waiting for first history line")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line2))
+        .await
+        .expect("timed out waiting for second history line")
+        .unwrap();
+
+    assert_eq!(line1.trim_end(), expected_first);
+    assert_eq!(line2.trim_end(), expected_second);
+}
+
+#[tokio::test]
+async fn set_dx_filter_unique_suppresses_below_threshold_occurrences() {
+    let (addr, bus, _metrics) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let mut ack = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack))
+        .await
+        .expect("timed out waiting for filter ack")
+        .unwrap();
+    assert!(ack.to_lowercase().contains("filter"), "ack was: {ack:?}");
+
+    let mut spot = sample_spot();
+    spot.callsign = "K5ARH".to_string();
+
+    // First occurrence: occurrence_count becomes 1, filter requires > 1,
+    // so this must NOT be forwarded.
+    bus.publish(spot.clone());
+    let mut suppressed = String::new();
+    let first_result = tokio::time::timeout(
+        Duration::from_millis(300),
+        reader.read_line(&mut suppressed),
+    )
+    .await;
+    assert!(
+        first_result.is_err(),
+        "first occurrence should have been filtered out, got: {suppressed:?}"
+    );
+
+    // Second occurrence: occurrence_count becomes 2, which clears the
+    // > 1 threshold, so this one must arrive.
+    bus.publish(spot);
+    let mut forwarded = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut forwarded))
+        .await
+        .expect("second occurrence should have been forwarded")
+        .unwrap();
+    assert!(forwarded.contains("K5ARH"), "line was: {forwarded:?}");
+}
+
+#[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
     let (addr, _bus, metrics) = spawn_server().await;
     let (_reader, _wr) = connect_and_login(addr).await;

@@ -8,6 +8,8 @@
 //! treat `Lagged` as "disconnect this client," not "catch up."
 
 use manta_spot::Spot;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 
@@ -15,10 +17,18 @@ use tokio::sync::broadcast;
 /// it starts missing spots (and its next `recv()` returns `Lagged`).
 const CHANNEL_CAPACITY: usize = 1024;
 
+/// How many of the most recently published spots `recent()` can return --
+/// backs the telnet server's `sh/dx` command (MAN-12 scope, per the
+/// 2026-09-02 ticket clarification: real command grammar, not just
+/// "don't disconnect").
+const RECENT_HISTORY_CAP: usize = 50;
+
 pub struct SpotBus {
     tx: broadcast::Sender<Spot>,
     epoch: SystemTime,
     sample_rate_hz: f64,
+    recent: Mutex<VecDeque<Spot>>,
+    occurrence_counts: Mutex<HashMap<String, u32>>,
 }
 
 impl SpotBus {
@@ -31,6 +41,8 @@ impl SpotBus {
             tx,
             epoch,
             sample_rate_hz,
+            recent: Mutex::new(VecDeque::with_capacity(RECENT_HISTORY_CAP)),
+            occurrence_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -38,11 +50,42 @@ impl SpotBus {
     /// (not an error) when there are zero subscribers -- a spot server
     /// with no connected clients is the common case, not a failure.
     pub fn publish(&self, spot: Spot) {
+        {
+            let mut recent = self.recent.lock().expect("recent lock poisoned");
+            if recent.len() == RECENT_HISTORY_CAP {
+                recent.pop_front();
+            }
+            recent.push_back(spot.clone());
+        }
+        *self
+            .occurrence_counts
+            .lock()
+            .expect("occurrence_counts lock poisoned")
+            .entry(spot.callsign.clone())
+            .or_insert(0) += 1;
         let _ = self.tx.send(spot);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Spot> {
         self.tx.subscribe()
+    }
+
+    /// The last `n` published spots, oldest first (`sh/dx` backing store).
+    pub fn recent(&self, n: usize) -> Vec<Spot> {
+        let recent = self.recent.lock().expect("recent lock poisoned");
+        let skip = recent.len().saturating_sub(n);
+        recent.iter().skip(skip).cloned().collect()
+    }
+
+    /// How many times a callsign has been published on this bus so far --
+    /// backs the telnet server's `set dx filter unique > n` command.
+    pub fn occurrence_count(&self, callsign: &str) -> u32 {
+        self.occurrence_counts
+            .lock()
+            .expect("occurrence_counts lock poisoned")
+            .get(callsign)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Converts a spot's `sample_ts` (samples since session start) to a
@@ -118,6 +161,45 @@ mod tests {
             Err(broadcast::error::RecvError::Lagged(_)) => {}
             other => panic!("expected Lagged, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn recent_returns_the_last_n_published_spots_oldest_first() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        for i in 0..5u64 {
+            let mut spot = sample_spot(i);
+            spot.track_id = i as u32;
+            bus.publish(spot);
+        }
+
+        let recent = bus.recent(3);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(
+            recent.iter().map(|s| s.track_id).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_caps_at_the_available_history() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        bus.publish(sample_spot(0));
+        bus.publish(sample_spot(1));
+
+        assert_eq!(bus.recent(10).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn occurrence_count_tracks_how_many_times_a_callsign_has_been_published() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        assert_eq!(bus.occurrence_count("K5ARH"), 0);
+
+        bus.publish(sample_spot(0));
+        assert_eq!(bus.occurrence_count("K5ARH"), 1);
+
+        bus.publish(sample_spot(1));
+        assert_eq!(bus.occurrence_count("K5ARH"), 2);
+        assert_eq!(bus.occurrence_count("JA1ABC"), 0);
     }
 
     #[test]
