@@ -9,7 +9,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 ## Deviations and pinned decisions
 
 1. **`DetectorConfig.track_cap` is not in SPEC §9's literal `[detector]`
-   table.** `crates/skimmer-engine/src/track.rs`'s `DetectorConfig` struct
+   table.** `crates/manta-engine/src/track.rs`'s `DetectorConfig` struct
    docs this explicitly: "SPEC §9 `[detector]` table, plus ARCHITECTURE §4's
    track cap (not in the literal SPEC table)." Sourced from ARCHITECTURE
    §4's stated default of 500 concurrent tracks; `Default::default()` sets
@@ -53,7 +53,7 @@ decided; SPEC and docs/ still win on anything not listed here.
      every ACTIVE track every `gc_hops` (~30 s) regardless of ongoing
      activity, fragmenting one continuous signal into many `track_id`s.
 
-3. **`CENTER_EMA_ALPHA = 0.01`** (`crates/skimmer-engine/src/track.rs:263`)
+3. **`CENTER_EMA_ALPHA = 0.01`** (`crates/manta-engine/src/track.rs:263`)
    — confirmed unchanged from its originally-designed value. Task 9's V9
    empirical-tuning step found it needed **no retuning**: `Track::center`'s
    existing ownership/read-selection EMA (already using this alpha) was
@@ -62,7 +62,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    byte-for-byte unchanged, confirmed by the Task 9 review.
 
 4. **V7 golden vector: SPEC §7's literal 150 Hz separation (10,000/10,150
-   Hz) deviated to a grid-aligned, 4-channel pair.** `crates/skimmer-testkit/
+   Hz) deviated to a grid-aligned, 4-channel pair.** `crates/manta-testkit/
    src/vectors.rs` places V7's two signals at channel 107 (10,031.25 Hz)
    and channel 111 (10,406.25 Hz), both bin-centered (zero fractional
    channel offset), 4 channels (375 Hz) apart. SPEC's literal 150 Hz
@@ -95,7 +95,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    change, 16.5 Hz -> 9.9 Hz.
 
 6. **Separately-deferred, NOT-fixed-in-this-branch systematic bias in
-   `interpolate_offset`** (`skimmer-dsp::channelizer`, SPEC §1.4's
+   `interpolate_offset`** (`manta-dsp::channelizer`, SPEC §1.4's
    quadratic-on-power interpolator): an S-curve bias vs. fractional
    channel position, zero at bin-center/half-bin, peaking at roughly
    ±21 Hz at quarter-bin offsets. Identified as the cross-cutting root
@@ -109,7 +109,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    decision for later, scoped and reviewed independently.
 
 7. **`FARNS_MIN_COUNT`: SPEC §9's nominal default of 8 lowered to 5.**
-   `crates/skimmer-decode/src/timing.rs` sets `const FARNS_MIN_COUNT: u32 =
+   `crates/manta-decode/src/timing.rs` sets `const FARNS_MIN_COUNT: u32 =
    5`. Confirmed as the constant's practical floor: `ClusterPair::observe()`
    has its own hardcoded 5-sample bootstrap (shared with mark-speed
    `mu_dit`/`mu_dah` clustering, not Farnsworth-specific) before it leaves
@@ -123,7 +123,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 8. **V10 golden vector's word-boundary pass criterion: SPEC's literal
    "100% correct" deviated to tolerating a small, documented warmup-floor
-   window.** `crates/skimmer-cli/tests/golden_v7_v9_v10.rs` defines
+   window.** `crates/manta-cli/tests/golden_v7_v9_v10.rs` defines
    `const FARNSWORTH_BOOTSTRAP_WORD_TOLERANCE: usize = 4` and asserts
    `decoded_words` falls in `expected_words..=expected_words + 4`. The
    shared 5-sample bootstrap (item 7) means a few early inter-character
@@ -134,15 +134,15 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 9. **Task 11's exact tolerance re-measurement outcomes** (freq/WPM, all
    confirmed against the current test files):
-   - `crates/skimmer-cli/tests/golden_v1.rs`: freq error fully reverted
+   - `crates/manta-cli/tests/golden_v1.rs`: freq error fully reverted
      from the M2-sub-project-1 widened 25 Hz back to SPEC's original
      `<= 10.0` Hz (measured ~9.9 Hz; Task 9's EMA fix, item 5, closed the
      gap that originally required widening).
-   - `crates/skimmer-engine/tests/pipeline.rs`: freq error partially
+   - `crates/manta-engine/tests/pipeline.rs`: freq error partially
      tightened from 25 Hz to `<= 15.0` Hz (measured 11.51 Hz; this test's
      scene is a shorter 20 s render with less averaging than V1's 120 s,
      so it could not be fully reverted to 10 Hz).
-   - `crates/skimmer-engine/tests/roundtrip_iq.rs`: freq error kept at
+   - `crates/manta-engine/tests/roundtrip_iq.rs`: freq error kept at
      `<= 25.0` Hz (unchanged). Its proptest sweeps a wide ±40 kHz offset
      range, exposing item 6's deferred interpolator bias far more than
      V1's narrow, fixed single-offset scenario.
@@ -153,17 +153,17 @@ decided; SPEC and docs/ still win on anything not listed here.
    - Six warmup-floor CER/duration tolerances re-measured and fixed in
      Task 11 Step 0 (unplanned scope surfaced by Task 7's discovery of
      the same warmup-floor pattern in every real end-to-end test):
-     - `crates/skimmer-cli/tests/cli.rs`: CER `< 0.17` (measured floor
+     - `crates/manta-cli/tests/cli.rs`: CER `< 0.17` (measured floor
        0.1304).
-     - `crates/skimmer-cli/tests/golden_v1.rs`: CER `< 0.02` (measured
+     - `crates/manta-cli/tests/golden_v1.rs`: CER `< 0.02` (measured
        floor 0.0155, matches `track.rs`'s own floor from item 2).
-     - `crates/skimmer-engine/tests/pipeline.rs`: CER `< 0.12` (measured
+     - `crates/manta-engine/tests/pipeline.rs`: CER `< 0.12` (measured
        floor 0.09375), un-ignored.
-     - `crates/skimmer-engine/tests/regression_char_gap_high_wpm.rs`:
+     - `crates/manta-engine/tests/regression_char_gap_high_wpm.rs`:
        scene extended to a looped 30 s duration (`loop_text: true`),
        preserving the original char-gap regression's direct `':'`-absence
        check; CER `< 0.12` (measured floor 0.0874).
-     - `crates/skimmer-engine/tests/roundtrip_iq.rs`: duration floor
+     - `crates/manta-engine/tests/roundtrip_iq.rs`: duration floor
        `(keyed_length + 1.5 s).max(12.0)`, `loop_text: true`. CER bound
        kept at `< 0.25`, noted as "aspirational" rather than tied to a
        measured floor like every other tolerance in this list — dormant
@@ -173,7 +173,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 10. **V2 golden vector and `roundtrip_iq.rs`'s proptest remain
     `#[ignore]`d — NOT fixed in this branch**, tracked as known
     limitations (same precedent as V2/V5 from M2 sub-project 1):
-    - **V2** (`crates/skimmer-cli/tests/golden_v2_v3.rs`,
+    - **V2** (`crates/manta-cli/tests/golden_v2_v3.rs`,
       `v2_passes_end_to_end_from_wav`): the CER story from sub-project 1's
       pin 7/8 is resolved (0.0325 measured at 90 s, shrinking with
       duration, confirming pure warmup-floor dilution) but investigation
@@ -196,7 +196,7 @@ decided; SPEC and docs/ still win on anything not listed here.
       **not** reduced (`with_cases(16)` unchanged).
 
 11. **V9's staircase-drift rendering approximation
-    (`render_v9_drift`, `crates/skimmer-testkit/src/vectors.rs`)** renders
+    (`render_v9_drift`, `crates/manta-testkit/src/vectors.rs`)** renders
     SPEC §7 V9's linear +50 Hz/min drift as a staircase of discrete 2 s
     segments rendered separately and concatenated, rather than a true
     continuous linear-drift NCO. Adequate for V9's current 15 Hz
@@ -216,7 +216,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 13. **V6 golden vector regressed from green (sub-project 1) to `#[ignore]`d,
     filed as a new known limitation — discovered post-close-out, not caught
-    during Task 11/12.** `crates/skimmer-cli/tests/golden_v2_v3.rs`'s
+    during Task 11/12.** `crates/manta-cli/tests/golden_v2_v3.rs`'s
     `v6_passes_end_to_end_from_wav` measures CER 0.1429 (need `<= 0.10`)
     under the real detector/track manager; it passed under sub-project 1's
     placeholder detector (prior CLAUDE.md status: "V1/V3/V4/V6 green").
@@ -232,8 +232,8 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 **Pre-existing `cargo fmt --all --check` drift found and fixed during this
 close-out's Step 1 verification**, not introduced by this task:
-`crates/skimmer-decode/src/timing.rs` (a doc-comment block's indentation)
-and `crates/skimmer-testkit/src/keyer.rs` (one over-long `assert_eq!` line)
+`crates/manta-decode/src/timing.rs` (a doc-comment block's indentation)
+and `crates/manta-testkit/src/keyer.rs` (one over-long `assert_eq!` line)
 had drifted out of formatting compliance in an earlier commit on this
 branch. Fixed mechanically via `cargo fmt --all` (whitespace/wrapping only,
 zero semantic change) before proceeding with verification. This echoes the

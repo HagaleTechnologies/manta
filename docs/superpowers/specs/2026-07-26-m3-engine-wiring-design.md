@@ -1,12 +1,12 @@
-# M3 sub-project 2 — wire `skimmer-spot` into `skimmer-engine`: Design
+# M3 sub-project 2 — wire `manta-spot` into `manta-engine`: Design
 
 Design for the second of M3's independent sub-projects (ROADMAP.md "M3 —
-Spots: validation + servers + RBN parity benchmark"). `skimmer-spot`
+Spots: validation + servers + RBN parity benchmark"). `manta-spot`
 (ARCHITECTURE §6's validation pipeline: context parse, grammar, cty.dat,
 SCP, confidence, repetition gate, dedupe) landed as a standalone crate in
 PR #34, deliberately scoped to stop short of engine wiring — see
-`docs/superpowers/specs/2026-07-25-m3-skimmer-spot-design.md` §1. This
-sub-project wires it in: real `Spot`s come out of `skimmer-engine`'s batch
+`docs/superpowers/specs/2026-07-25-m3-manta-spot-design.md` §1. This
+sub-project wires it in: real `Spot`s come out of `manta-engine`'s batch
 and streaming pipelines instead of raw decoder text, and the golden tests
 that previously approximated validation with text-substring heuristics
 swap onto the real thing.
@@ -15,38 +15,38 @@ swap onto the real thing.
 
 In scope:
 
-- `skimmer-spot` exposes its bundled `cty.dat`/`master.scp` data as public
+- `manta-spot` exposes its bundled `cty.dat`/`master.scp` data as public
   constants plus a `Validator::bundled(fs)` convenience constructor.
-- `skimmer-engine` takes a dependency on `skimmer-spot`; `decode_samples`/
+- `manta-engine` takes a dependency on `manta-spot`; `decode_samples`/
   `decode_wav` run a `Validator` over the full multi-track event stream and
   return the resulting `Spot`s as a new `DecodeReport` field.
-- `skimmer-engine::listen` gains a second callback, `on_spot`, invoked for
+- `manta-engine::listen` gains a second callback, `on_spot`, invoked for
   every `Spot` a live `Validator` emits as events stream through.
-- `skimmer-cli`'s `decode`/`listen` subcommands surface spots (JSON and
+- `manta-cli`'s `decode`/`listen` subcommands surface spots (JSON and
   human-readable).
 - `golden_v8_v8w.rs` and `golden_v2_v3.rs` (V5) swap their
   exact-match-against-fixture/substring-count validation stubs for the real
   `Validator`'s output.
 - ROADMAP.md M3 status update.
 
-Explicitly out of scope (later M3 sub-projects, per the skimmer-spot design
+Explicitly out of scope (later M3 sub-projects, per the manta-spot design
 doc's §1):
 
-- `skimmer-server` (telnet cluster + JSON Lines/WebSocket transport), TOML
+- `manta-server` (telnet cluster + JSON Lines/WebSocket transport), TOML
   config loading, metrics endpoint. `listen --json`'s spot-line format
   introduced here is explicitly provisional CLI-debugging output, not the
-  ecosystem JSON contract skimmer-server will define.
+  ecosystem JSON contract manta-server will define.
 - The RBN parity benchmark and its golden IQ corpus (data dependency still
   unresolved).
-- Any change to `skimmer-spot`'s validation logic itself (context/grammar/
+- Any change to `manta-spot`'s validation logic itself (context/grammar/
   cty/scp/confidence/gate/dedupe) — this sub-project only wires the
   already-complete, already-tested `Validator` in.
 
 ## 2. Components
 
-### `skimmer-spot`: bundled-data ownership
+### `manta-spot`: bundled-data ownership
 
-`crates/skimmer-spot/src/lib.rs` gains:
+`crates/manta-spot/src/lib.rs` gains:
 
 ```rust
 pub const CTY_DAT: &str = include_str!("../data/cty.dat");
@@ -63,17 +63,17 @@ impl Validator {
 }
 ```
 
-Callers never reference the data files directly — `skimmer-spot` is the
+Callers never reference the data files directly — `manta-spot` is the
 sole owner of "what data backs a production validator," matching its
 existing ownership of `data/SOURCES.md`.
 
-### `skimmer-engine`: batch path
+### `manta-engine`: batch path
 
-`Cargo.toml` gains `skimmer-spot = { workspace = true }`. In
+`Cargo.toml` gains `manta-spot = { workspace = true }`. In
 `decode_samples`, after the existing chunked channelizer/track-manager loop
 produces `events: Vec<DecoderEvent>` (already globally ordered — the
 existing `this_track` filter already relies on this), construct
-`skimmer_spot::Validator::bundled(fs)` and feed it every event in order,
+`manta_spot::Validator::bundled(fs)` and feed it every event in order,
 collecting the returned `Spot`s. Validation runs over the **full**
 multi-track stream, not the `this_track` filter used for `report.text`/
 `freq_hz`/`wpm` — V8/V8w's pileup scenes need spots from all tracks.
@@ -81,18 +81,18 @@ multi-track stream, not the `this_track` filter used for `report.text`/
 `DecodeReport` gains:
 
 ```rust
-pub spots: Vec<skimmer_spot::Spot>,
+pub spots: Vec<manta_spot::Spot>,
 ```
 
-`skimmer_engine::lib.rs` re-exports `pub use skimmer_spot::Spot;` so
-downstream crates (`skimmer-cli`, tests) don't need a direct `skimmer-spot`
+`manta_engine::lib.rs` re-exports `pub use manta_spot::Spot;` so
+downstream crates (`manta-cli`, tests) don't need a direct `manta-spot`
 dependency just to name the type.
 
 `decode_wav` is unchanged beyond inheriting `decode_samples`'s new
 behavior — no signature change.
 
 **CPU-budget bench impact (accepted, per design discussion):**
-`crates/skimmer-engine/benches/cpu_budget.rs` and
+`crates/manta-engine/benches/cpu_budget.rs` and
 `tests/cpu_budget.rs::cpu_budget_mac_under_half_core` call `decode_samples`
 directly, so the Mac-leg 0.36x/0.5x ROADMAP M2 measurement now includes
 cty.dat/master.scp parsing and per-word regex validation across the
@@ -102,7 +102,7 @@ sub-project's verification and the new ratio is recorded in ROADMAP.md; if
 it regresses past 0.5x that's a real finding to surface, not silently
 absorbed.
 
-### `skimmer-engine`: streaming path
+### `manta-engine`: streaming path
 
 `listen`'s signature changes from:
 
@@ -140,12 +140,12 @@ grep — no others exist):
 
 - `soak.rs::soak`: `|_spot| {}` — `SoakReport` spot-counting is not in
   scope for this sub-project.
-- `crates/skimmer-engine/tests/listen_audio.rs`: `|_spot| {}` — test is
+- `crates/manta-engine/tests/listen_audio.rs`: `|_spot| {}` — test is
   already `#[ignore]`d (pre-existing Hilbert near-DC issue, issue #21,
   unrelated to this change); just needs to keep compiling.
-- `skimmer-cli`'s `Listen` command: real handling, below.
+- `manta-cli`'s `Listen` command: real handling, below.
 
-### `skimmer-cli`
+### `manta-cli`
 
 **`decode` subcommand:**
 - `--json`: `DecodeReport`'s new `spots` field serializes automatically
@@ -220,13 +220,13 @@ separately, M1 pins doc) is unchanged and unrelated to this sub-project.
 ## 5. Error handling
 
 No new fallible surface: `Validator::bundled`/`Validator::ingest` are
-infallible (matches `skimmer-spot`'s existing API — no `Result` anywhere in
+infallible (matches `manta-spot`'s existing API — no `Result` anywhere in
 `validator.rs`). `decode_samples`/`decode_wav`/`listen`'s existing
 `Result<...>` return types are unchanged.
 
 ## 6. Testing
 
-- New `skimmer-engine` integration test (`tests/spots.rs` or added to
+- New `manta-engine` integration test (`tests/spots.rs` or added to
   existing `pipeline.rs`): a synthetic "CQ CQ DE K5ARH K5ARH K" fixture,
   looped so the repetition gate is satisfied, decoded via `decode_samples`,
   asserting `report.spots` contains exactly one `Spot` with
@@ -238,7 +238,7 @@ infallible (matches `skimmer-spot`'s existing API — no `Result` anywhere in
   style complex-IQ source that bypasses `AudioIqSource`'s Hilbert
   transformer (per that file's own note on issue #21) so this new test
   isn't blocked by an unrelated, already-tracked bug.
-- Full existing suite (V1–V10, V8/V8w, V2–V6, `skimmer-spot`'s own
+- Full existing suite (V1–V10, V8/V8w, V2–V6, `manta-spot`'s own
   V11–V15) re-run to confirm no regressions from the golden-test rewrite.
 - CPU-budget Mac leg (`cpu_budget_mac_under_half_core`, `--release`,
   currently `#[ignore]`d — run explicitly) re-measured; new ratio recorded.
@@ -246,7 +246,7 @@ infallible (matches `skimmer-spot`'s existing API — no `Result` anywhere in
 ## 7. Determinism
 
 No new determinism risk: `Validator` is already proven deterministic
-(`skimmer-spot`'s own SPEC §6 compliance — `BTreeMap`-backed gate/dedupe,
+(`manta-spot`'s own SPEC §6 compliance — `BTreeMap`-backed gate/dedupe,
 `sample_ts`-based timing, no RNG). Feeding it the same already-deterministic
 `events` stream in the same order produces the same `spots` every time.
 `decode_wav`'s byte-identical-output requirement (SPEC §6) extends
@@ -255,6 +255,6 @@ naturally to the new `spots` field with no additional work.
 ## 8. ROADMAP.md update
 
 M3's status paragraph updates to note the engine-wiring sub-project
-complete, alongside `skimmer-spot`'s validation crate. Remaining M3 work:
-`skimmer-server` (telnet + JSON/WebSocket, TOML config, metrics) and the
+complete, alongside `manta-spot`'s validation crate. Remaining M3 work:
+`manta-server` (telnet + JSON/WebSocket, TOML config, metrics) and the
 RBN parity benchmark (still blocked on the recorded-IQ data dependency).

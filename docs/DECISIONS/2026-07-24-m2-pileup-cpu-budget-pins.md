@@ -9,15 +9,15 @@ decided; SPEC and docs/ still win on anything not listed here.
 ## Deviations and pinned decisions
 
 1. **Pileup fixture callsigns are synthetic/deterministic, not real operator
-   calls.** `crates/skimmer-testkit/src/callsigns.rs`'s `pileup_calls()`
+   calls.** `crates/manta-testkit/src/callsigns.rs`'s `pileup_calls()`
    generates 50 unique callsigns via ChaCha8-seeded prefix+suffix
    composition, with uniqueness enforced at generation time. Same
-   determinism discipline as the rest of `skimmer-testkit` ("all randomness
+   determinism discipline as the rest of `manta-testkit` ("all randomness
    is ChaCha8 seeded per fixture") — none of these calls reference real
    operators.
 
 2. **V8/V8w's "callsign validated"/"bogus callsign"/"cross-channel ghost
-   decode" are test-local heuristics, not the real `skimmer-spot`
+   decode" are test-local heuristics, not the real `manta-spot`
    validator** (which doesn't exist yet — M3 scope). Same convention V5/V6
    already established for "callsign validated" in
    `docs/DECISIONS/2026-07-17-m1-implementation-pins.md`, but upgraded here:
@@ -27,7 +27,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    presence/absence guess.
 
 3. **V8 (pileup-50, AWGN) passes cleanly, no `#[ignore]`, no issue filed.**
-   `crates/skimmer-cli/tests/golden_v8_v8w.rs`'s
+   `crates/manta-cli/tests/golden_v8_v8w.rs`'s
    `v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls` measures
    49/50 callsigns validated (threshold ≥ 45/50, SPEC §7) with 0 bogus
    callsigns.
@@ -47,15 +47,15 @@ decided; SPEC and docs/ still win on anything not listed here.
    fading-robustness gap already tracked for V5/V6
    (`docs/DECISIONS/2026-07-17-m1-implementation-pins.md`, issue #25), now
    demonstrated at scale (34 independent fading realizations in one scene).
-   Filed as <https://github.com/HagaleTechnologies/skimmer/issues/28>;
-   revisit alongside V5/V6 once `skimmer-decode` gains real fading
+   Filed as <https://github.com/HagaleTechnologies/manta/issues/28>;
+   revisit alongside V5/V6 once `manta-decode` gains real fading
    resilience (M4).
 
 5. **CPU-budget Mac measurement: PASSES the < 0.5x budget.**
-   `crates/skimmer-engine/benches/cpu_budget.rs` (criterion, 192 kS/s, 300
+   `crates/manta-engine/benches/cpu_budget.rs` (criterion, 192 kS/s, 300
    simultaneous tones, 15 s synthetic scene) measures mean 5.5455 s
    wall-clock per iteration, 95 % CI [5.5341 s, 5.5578 s] (≈ 0.37x
-   realtime). `crates/skimmer-engine/tests/cpu_budget.rs`'s `#[ignore]`d
+   realtime). `crates/manta-engine/tests/cpu_budget.rs`'s `#[ignore]`d
    `cpu_budget_mac_under_half_core` — the actual accept-criterion gate, same
    scene — confirms it under `cargo test --release`:
    ```
@@ -72,7 +72,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 6. **Raspberry Pi 4 leg (< 1 core / < 1.0x realtime) is explicitly
    outstanding, not run in this branch.** Deferred pending Tony running
-   `cargo test --release -p skimmer-engine --test cpu_budget -- --ignored
+   `cargo test --release -p manta-engine --test cpu_budget -- --ignored
    --nocapture` on real Pi4 hardware — same pattern as M1's still-
    outstanding W1AW live-copy run (see CLAUDE.md Status).
 

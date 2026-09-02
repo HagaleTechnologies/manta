@@ -9,7 +9,7 @@ decided; SPEC and docs/ still win on anything not listed here.
 
 1. **Protocol handshake: the design spec was missing a required command,
    found only by live debugging.** `KiwiIqSource::connect`
-   (`crates/skimmer-input/src/kiwi.rs`) opens `ws://<host>:<port>/<timestamp>/SND`
+   (`crates/manta-input/src/kiwi.rs`) opens `ws://<host>:<port>/<timestamp>/SND`
    (`timestamp` any process-unique value), then exchanges `SET ...` **text**
    frames while `MSG ...` parameter frames and `SND ...` IQ frames arrive as
    WebSocket **binary** frames carrying a 3-byte ASCII tag. Beyond what the
@@ -74,7 +74,7 @@ decided; SPEC and docs/ still win on anything not listed here.
      analogous to `CALIBRATION_SECONDS` elsewhere in the pipeline.
 
 4. **`center_freq_hz` bug: same root cause independently found and fixed
-   twice, on two different branches.** `skimmer_engine::listen()` hardcoded
+   twice, on two different branches.** `manta_engine::listen()` hardcoded
    `center_freq_hz = 0.0` when constructing `Channelizer::new` and
    `TrackManager::new`, instead of reading `src.center_freq_hz()`. This is
    the same bug already found and fixed once before on the separate,
@@ -82,7 +82,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    started fresh from `origin/main` per repo hygiene and so needed its own
    independent copy of the same fix — proven via a new regression test
    (`listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero` in
-   `crates/skimmer-engine/src/listen.rs`) using a test double with a
+   `crates/manta-engine/src/listen.rs`) using a test double with a
    genuinely nonzero `center_freq_hz()`. Whichever of PR #30 or this
    sub-project's PR merges second will need to resolve this as a trivial
    merge conflict (both branches touch the same two call sites the same
@@ -95,7 +95,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    so only error-path coverage was possible), KiwiSDR needs no local
    hardware — the shipped `#[ignore]`d test
    `connects_to_a_real_public_receiver_and_streams_iq`
-   (`crates/skimmer-input/src/kiwi.rs`) performs a genuine live connection
+   (`crates/manta-input/src/kiwi.rs`) performs a genuine live connection
    to a real public receiver (`kiwisdr.inf.dhbw-ravensburg.de:8073`),
    completes the real handshake, and reads real streamed IQ. Measured
    result from an independently-run fresh pass: `sample_rate=96000`

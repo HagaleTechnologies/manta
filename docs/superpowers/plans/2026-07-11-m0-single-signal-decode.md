@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `skimmer decode fixture.wav` prints the correct text for the SPEC §7 V1 vector (20 WPM, +20 dB SNR-in-2500-Hz, offset +12.34 kHz, W1AW, AWGN only) — end to end from a WAV file, deterministically, with CI green on Linux + macOS.
+**Goal:** `manta decode fixture.wav` prints the correct text for the SPEC §7 V1 vector (20 WPM, +20 dB SNR-in-2500-Hz, offset +12.34 kHz, W1AW, AWGN only) — end to end from a WAV file, deterministically, with CI green on Linux + macOS.
 
-**Architecture:** Cargo workspace with 6 of the 8 planned crates (`skimmer-input`, `skimmer-dsp`, `skimmer-decode`, `skimmer-engine`, `skimmer-testkit`, `skimmer-cli`; `skimmer-spot`/`skimmer-server` arrive at M3). M0 uses a *single hardwired channel*: an FFT peak search finds the signal, a direct mix + Kaiser-prototype FIR decimator extracts one 375 Hz channel stream (the same prototype the M2 PFB will use), and the full classical decode chain (SPEC §3–§5) turns it into text. `skimmer-testkit` synthesizes the IQ ground truth.
+**Architecture:** Cargo workspace with 6 of the 8 planned crates (`manta-input`, `manta-dsp`, `manta-decode`, `manta-engine`, `manta-testkit`, `manta-cli`; `manta-spot`/`manta-server` arrive at M3). M0 uses a *single hardwired channel*: an FFT peak search finds the signal, a direct mix + Kaiser-prototype FIR decimator extracts one 375 Hz channel stream (the same prototype the M2 PFB will use), and the full classical decode chain (SPEC §3–§5) turns it into text. `manta-testkit` synthesizes the IQ ground truth.
 
 **Tech Stack:** Rust (edition 2021, rust-version 1.85.0), `coppa-dsp` (FFT only, pinned git dep), `hound` (WAV), `num-complex`, `clap`, `serde`/`serde_json`, `rand_chacha` (testkit only), `proptest`, `tempfile`.
 
@@ -12,9 +12,9 @@
 
 Copied from SPEC-decode-core.md, ARCHITECTURE.md, ROADMAP.md, CLAUDE.md. Every task's requirements implicitly include this section.
 
-- **Determinism (SPEC §6):** NO RNG and NO wall clock anywhere in `skimmer-dsp`/`skimmer-decode`/`skimmer-engine` decode path. All timers are hop/sample counters. Any output-affecting map is `BTreeMap` or sorted `Vec`, never an iterated `HashMap`. Per-sample state is `f32`; the FIR dot product and any long accumulation run **sequentially in `f64`**. Beam tie-break: equal scores order by element-sequence lexical order, dit < dah. Softmax uses the max-subtraction trick in fixed order.
+- **Determinism (SPEC §6):** NO RNG and NO wall clock anywhere in `manta-dsp`/`manta-decode`/`manta-engine` decode path. All timers are hop/sample counters. Any output-affecting map is `BTreeMap` or sorted `Vec`, never an iterated `HashMap`. Per-sample state is `f32`; the FIR dot product and any long accumulation run **sequentially in `f64`**. Beam tie-break: equal scores order by element-sequence lexical order, dit < dah. Softmax uses the max-subtraction trick in fixed order.
 - **Timing constants:** channel output rate `fo = 375 Hz` exactly; hop period `HOP_MS = 8/3 ms`. All ms→hop conversions round **half-up** exactly once at startup: `hops = floor(ms · 0.375 + 0.5)` (SPEC §1.1). Config defaults are the SPEC §9 table — copy values exactly; do not invent constants.
-- **coppa reuse boundary (SPEC §10, wiki `coppa-reuse`):** reuse `coppa-dsp::fft::FftProcessor` ONLY. The Kaiser prototype designer is NEW code in `skimmer-dsp::proto`. `coppa-dsp::agc::AdaptiveAgc` is NOT used. `coppa-channel::awgn*` is NOT used at M0 (wrong SNR convention — see Deviations below).
+- **coppa reuse boundary (SPEC §10, wiki `coppa-reuse`):** reuse `coppa-dsp::fft::FftProcessor` ONLY. The Kaiser prototype designer is NEW code in `manta-dsp::proto`. `coppa-dsp::agc::AdaptiveAgc` is NOT used. `coppa-channel::awgn*` is NOT used at M0 (wrong SNR convention — see Deviations below).
 - **Dependency pin:** `coppa-dsp` is a git dependency on `https://github.com/HagaleTechnologies/coppa.git` pinned by `rev` (resolve `origin/main` HEAD at execution time via `git ls-remote`; record the rev in Cargo.toml and in `docs/DECISIONS/`).
 - **No SoapySDR anywhere** (M0 default features must build without native libs — ROADMAP M0).
 - **Licensing/metadata:** every crate `license = "MIT OR Apache-2.0"`, `edition = "2021"`, `rust-version = "1.85.0"` via workspace inheritance. LICENSE-MIT / LICENSE-APACHE files at repo root.
@@ -28,7 +28,7 @@ Copied from SPEC-decode-core.md, ARCHITECTURE.md, ROADMAP.md, CLAUDE.md. Every t
 These are implementation decisions this plan makes where SPEC/ROADMAP are silent or conflicting. Implementers: treat these as decided.
 
 1. **V1 is 20 WPM, not 25.** ROADMAP M0 says "25 WPM" but defers to "SPEC-decode-core §7's M0 definition", and SPEC §7 defines M0 = V1 = 20 WPM. SPEC wins; Task 16 fixes the ROADMAP line.
-2. **Noise generation is testkit-local, not `coppa-channel`.** SPEC §7 says "impairments via coppa-channel (`awgn(seed)`)", but coppa's `awgn_seeded` (a) takes real `&[f32]`, not complex IQ; (b) defines SNR against measured total signal power over the full bandwidth (duty-cycle-dependent, wrong for keyed CW); (c) uses `StdRng`, which is not stable across `rand` versions. The `awgn_ref_bw` design (SPEC-watterson §6, orchestrator repo) fixes this but is **not yet in coppa**. M0 therefore implements the same formula locally in `skimmer-testkit::noise` using `ChaCha8Rng` (a specified cipher — stable forever) with a hand-rolled u64→f64 conversion and Box-Muller, so fixtures never change under dep upgrades. Migrate to coppa's `awgn_ref_bw` when it ships.
+2. **Noise generation is testkit-local, not `coppa-channel`.** SPEC §7 says "impairments via coppa-channel (`awgn(seed)`)", but coppa's `awgn_seeded` (a) takes real `&[f32]`, not complex IQ; (b) defines SNR against measured total signal power over the full bandwidth (duty-cycle-dependent, wrong for keyed CW); (c) uses `StdRng`, which is not stable across `rand` versions. The `awgn_ref_bw` design (SPEC-watterson §6, orchestrator repo) fixes this but is **not yet in coppa**. M0 therefore implements the same formula locally in `manta-testkit::noise` using `ChaCha8Rng` (a specified cipher — stable forever) with a hand-rolled u64→f64 conversion and Box-Muller, so fixtures never change under dep upgrades. Migrate to coppa's `awgn_ref_bw` when it ships.
 3. **SNR convention:** `amplitude = sqrt(10^(SNR_dB/10) · 2500 / fs)` against unit-power complex noise (per-component variance 0.5). SNR is defined at **key-down** (carrier amplitude), not duty-cycle-averaged.
 4. **Demod init replay:** SPEC §3.2 initializes rails from the first 375 hops but doesn't say what happens to those hops' key decisions. Pin: after successful init, the buffered 375-hop window is **replayed** through the normal per-hop update so the first second of elements is decoded (required for V1 = 100% accuracy).
 5. **Short leading run (debounce edge):** a sub-12 ms run with no preceding run is absorbed into the *following* run (takes the following run's polarity).
@@ -46,7 +46,7 @@ These are implementation decisions this plan makes where SPEC/ROADMAP are silent
 17. **`check_flush` must drain `Demod` before committing (found during Task 6 implementation, 2026-07-11):** `Demod` (Task 5) keeps a `held: Option<Run>` field that lags `open` by one full run for debounce confirmation (SPEC §3.3) — a completed run only surfaces via `Demod::push()`'s returned `Vec<Run>` once a FURTHER polarity flip evicts it from `held`. The last run before a track goes quiet (no further flip ever comes) is therefore stuck in `held` and invisible to the normal `push()` path. Task 6's original `check_flush` (SPEC §4.2's 7-dit forced-flush rule) read `demod.open_space_hops()`/`open_space_start_ts()` — which ARE live/un-lagged — to detect the trailing space, but then called `emit_char` directly against `self.cur_marks`, which was missing that stuck last mark. Traced on `decode("PARIS")`: flushing `S` (`...`) with only 2 of its 3 dits visible decoded as `I`, and the real EOF `finish()` call later drained the stuck mark as a spurious extra character plus a duplicate `WordBoundary` — net output `"PARII E"` instead of `"PARIS"`. Pin: `check_flush`, on deciding to force-flush, calls `self.demod.finish()` FIRST — draining both `held` and `open` — feeds any returned mark run through `process_run(r, live=true, ..)` (so it counts toward `cur_marks` and speed tracking), and deliberately does NOT separately gap-classify the returned space run (the manual `emit_char`+`WordBoundary` immediately after already decides that space's fate; classifying it too would double-emit). Verified general (not scenario-specific): `Demod::finish()` mutates only `open`/`held`, never the EMA rails/`a_ref`/`phase`, so mid-stream draining is safe and calibration survives; the held/open opposite-polarity invariant guarantees any drained `held` is always a mark when `check_flush` fires (since firing requires `open` to be a space); and the `word_flushed` guard prevents `demod.finish()` from being called twice for the same flush event.
 18. **Nyquist-bin sign in `freqest::estimate_peak_hz` (found during Task 9 implementation, 2026-07-11):** SPEC §1.3's channel-index-to-Hz formula, `f(k) = f_center + ((k + N/2) mod N − N/2) · Δ`, assigns the exact Nyquist bin (`k = N/2`) the NEGATIVE label: `(N/2 + N/2) mod N = 0`, so `signed(N/2) = 0 − N/2 = −N/2`. This is the same convention as `numpy.fft.fftfreq`/`scipy.fft.fftfreq`. The task's original code used strict `if k0 > FFT_SIZE/2 { k0 - FFT_SIZE } else { k0 }`, which at exactly `k0 == FFT_SIZE/2` takes the `else` branch and returns `+N/2` — the wrong sign per SPEC. Pin: use `>=` instead of `>` in this comparison, so `k0 == FFT_SIZE/2` routes into the wrap branch. Practical impact is low (a tone at exactly ±fs/2 is physically indistinguishable at the sample level — `e^{jπn} = e^{-jπn} = (-1)^n` — so no measurement-based test can ever discriminate `>` from `>=`), but the fix keeps this estimator's Hz↔bin convention consistent with the SPEC formula the rest of the engine (channelizer, §1.4 centroid) is built on.
 19. **Extractor group-delay blind zone at recording onset (found via Task 14's proptests, root-caused and fixed 2026-07-12, three attempts):** `SingleChannelExtractor`'s causal FIR prototype filter (8192 taps at fs=96kHz, frozen Task 7/SPEC §1.2 design) has group delay `(8192−1)/2/96000 = 42.661 ms`. Because the filter is causal and a recording has no history before sample 0, **no output can ever represent a true signal instant earlier than 42.661 ms into the recording** — a hard architectural floor, not a settling/tuning effect. Any part of a message's opening element(s) before that point is either fully swallowed (element dropped, e.g. `P→G`) or reduced to a corrupted decay-tail duration (e.g. a true 52.6 ms dit measured as 13.3 ms), which then corrupts `SpeedTracker`'s 5-mark bootstrap — sometimes just misclassifying dit/dah for the first character, sometimes locking `mu_dit` at its clamp floor in a structural absorbing state (`check_drift`'s CV-gate becomes unsatisfiable by the resulting mixed cluster) that cascades into garbling the entire message. Two ruled-out hypotheses, both disproven by clean-rebuild A/B evidence before the real cause was found: (a) NOT a generic "filter takes ~85ms to settle" effect — a warm-up-skip fix had no effect and broke previously-working low-WPM cases (skip landed mid-mark); (b) NOT insufficient EMA settling in `SpeedTracker` — buffering extra marks before trusting the tracker had zero measurable effect, byte-identical output with/without, even when far more marks than needed were available. **Fix**: prepend `pad_samples = extractor.filter_len()` (one full filter length) zero-valued IQ samples before the real input, run the padded array through the extractor, and — critically — feed **every** resulting output to the decoder (do NOT skip early outputs; skipping is mathematically a no-op here, since `filter_len()/hop = 4·TAPS_PER_BRANCH = 32` exactly for any supported rate, making the padded output at `m=32` reconstruct the identical envelope magnitude the unpadded pipeline already produced at its own `m=0` — proven via the extractor's NCO-mixing-then-FIR linearity: the padded and unpadded windows differ only by a global complex phase factor, which `.norm()` discards, so magnitudes are exactly identical and "skip past the padding" throws away precisely the boundary-straddling outputs that recover the message's true opening transient). Only the reported `sample_ts` is rebaselined (`sample_ts = m.saturating_sub(pad_hops) * hop`, clamped to 0 for pre-start hops) — this is reporting-only and doesn't affect decode correctness, since mark/space durations are computed from hop counts (`run.hops`), never from `sample_ts` deltas. Verified: all three originally-failing case classes (element-dropping, element-preserving misclassification, cascading garble) now decode correctly, and the full `roundtrip_iq` proptest suite (16 cases + the persisted regression) passes CER=0 across the full `10–40 WPM, 15–30 dB SNR, ±40 kHz offset` range.
-20. **Undocumented asymmetric decode limitation — all-dah message openings (found during final whole-branch review, 2026-07-13):** `ClusterPair::initialize()` (`crates/skimmer-decode/src/timing.rs`) implements SPEC §4.1's unimodal-init branch — "if all one cluster... `μ_dit = mean`, `μ_dah = 3·μ_dit` provisionally, flagged unconfirmed until a mark lands `≥ 2·μ_dit`" — unconditionally, i.e. it always assumes the lone 5-mark cluster is dits. SPEC §4.1 itself asserts this self-corrects ("an all-dah opening... corrects itself via the constraint clamp... the first time a real dit arrives"), but that correction requires a dit to actually arrive, and SPEC never specifies what happens if the "unconfirmed" state can never be confirmed because none does. A stress sweep of opener letters through the real pipeline found exactly this gap: all-dit openings (E, I, S, H) decode fine, but all-dah openings fail 12/12 (`"TTTTT"→"5"`, `"MMM"→""`, `"OO"→""`) — silently producing plausible-looking wrong text, not an error. Root cause: `ClusterPair::observe()`'s re-anchor condition (`v >= 2.0 * self.lo`) is structurally unreachable when every early mark is a homogeneous dah, because `lo` was itself set to that same dah's duration — there is no smaller value in a stream of same-length marks that could ever reach `2*lo`. This is a genuine SPEC ambiguity/gap, not an implementation bug against a fully-specified rule. Accepted as a known M0 limitation: it does not block M0's acceptance gates (neither V1 nor the guarded proptest's input distribution exercises an all-dah opener), but it must be addressed before M1 builds live off-air decoding on top of this code, where dah-heavy openers (callsigns, "OM", "TU", "73" after a space) are realistic. Recommended M1 fix direction: an absolute-ms prior for unimodal init — the existing `[20, 150]` ms dit clamp (SPEC §4.1) already gives a usable prior, since a lone ~180 ms cluster is far likelier dahs than dits — rather than the current "always assume dits" default. Not implemented at M0; this pin records the limitation and points to the fix direction.
+20. **Undocumented asymmetric decode limitation — all-dah message openings (found during final whole-branch review, 2026-07-13):** `ClusterPair::initialize()` (`crates/manta-decode/src/timing.rs`) implements SPEC §4.1's unimodal-init branch — "if all one cluster... `μ_dit = mean`, `μ_dah = 3·μ_dit` provisionally, flagged unconfirmed until a mark lands `≥ 2·μ_dit`" — unconditionally, i.e. it always assumes the lone 5-mark cluster is dits. SPEC §4.1 itself asserts this self-corrects ("an all-dah opening... corrects itself via the constraint clamp... the first time a real dit arrives"), but that correction requires a dit to actually arrive, and SPEC never specifies what happens if the "unconfirmed" state can never be confirmed because none does. A stress sweep of opener letters through the real pipeline found exactly this gap: all-dit openings (E, I, S, H) decode fine, but all-dah openings fail 12/12 (`"TTTTT"→"5"`, `"MMM"→""`, `"OO"→""`) — silently producing plausible-looking wrong text, not an error. Root cause: `ClusterPair::observe()`'s re-anchor condition (`v >= 2.0 * self.lo`) is structurally unreachable when every early mark is a homogeneous dah, because `lo` was itself set to that same dah's duration — there is no smaller value in a stream of same-length marks that could ever reach `2*lo`. This is a genuine SPEC ambiguity/gap, not an implementation bug against a fully-specified rule. Accepted as a known M0 limitation: it does not block M0's acceptance gates (neither V1 nor the guarded proptest's input distribution exercises an all-dah opener), but it must be addressed before M1 builds live off-air decoding on top of this code, where dah-heavy openers (callsigns, "OM", "TU", "73" after a space) are realistic. Recommended M1 fix direction: an absolute-ms prior for unimodal init — the existing `[20, 150]` ms dit clamp (SPEC §4.1) already gives a usable prior, since a lone ~180 ms cluster is far likelier dahs than dits — rather than the current "always assume dits" default. Not implemented at M0; this pin records the limitation and points to the fix direction.
 
 ## Prior art you must read before implementing
 
@@ -58,14 +58,14 @@ These are implementation decisions this plan makes where SPEC/ROADMAP are silent
 ## File Structure
 
 ```
-skimmer/
+manta/
 ├── Cargo.toml                      # workspace + [workspace.dependencies] + profiles
 ├── Cargo.lock                      # committed
 ├── LICENSE-MIT, LICENSE-APACHE
 ├── .gitignore                      # /target
 ├── .github/workflows/ci.yml
 ├── crates/
-│   ├── skimmer-decode/
+│   ├── manta-decode/
 │   │   └── src/
 │   │       ├── lib.rs              # consts (FO_HZ, HOP_MS, ms_to_hops), module decls
 │   │       ├── tree.rs             # Morse table, MorseTree, Glyph, pattern_for   (SPEC §4.4 table)
@@ -74,15 +74,15 @@ skimmer/
 │   │       ├── envelope.rs         # Demod: A_ref, rails, hysteresis, debounce   (SPEC §3)
 │   │       ├── decoder.rs          # TrackDecoder glue, events_to_text           (SPEC §5)
 │   │       └── events.rs           # DecoderEvent                                (SPEC §5)
-│   ├── skimmer-dsp/
+│   ├── manta-dsp/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── proto.rs            # Kaiser windowed-sinc prototype              (SPEC §1.2)
 │   │       ├── single.rs           # SingleChannelExtractor (M0 shim; superseded by pfb at M2)
 │   │       └── freqest.rs          # averaged-periodogram peak search (M0 shim; superseded by §1.4 at M2)
-│   ├── skimmer-input/
+│   ├── manta-input/
 │   │   └── src/lib.rs              # IqSource trait, WavIqSource, Sidecar
-│   ├── skimmer-testkit/
+│   ├── manta-testkit/
 │   │   ├── src/
 │   │   │   ├── lib.rs
 │   │   │   ├── keyer.rs            # text → keyed envelope (raised-cosine, jitter)
@@ -92,11 +92,11 @@ skimmer/
 │   │   │   ├── wav.rs              # fixture writer (WAV + sidecar + manifest)
 │   │   │   └── vectors.rs          # VectorSpec, v1()                            (SPEC §7)
 │   │   └── tests/roundtrip_envelope.rs
-│   ├── skimmer-engine/
+│   ├── manta-engine/
 │   │   ├── src/lib.rs              # decode_samples / decode_source pipeline
 │   │   └── tests/roundtrip_iq.rs   # proptest, ROADMAP M0 criterion 2
-│   └── skimmer-cli/
-│       ├── src/main.rs             # `skimmer decode`, `skimmer gen`
+│   └── manta-cli/
+│       ├── src/main.rs             # `manta decode`, `manta gen`
 │       └── tests/golden_v1.rs      # V1 acceptance + 3-run determinism
 └── docs/DECISIONS/2026-07-11-m0-implementation-pins.md   (Task 15)
 ```
@@ -110,10 +110,10 @@ Dependency edges (all path deps inside the workspace):
 
 **Files:**
 - Create: `Cargo.toml`, `.gitignore`, `LICENSE-MIT`, `LICENSE-APACHE`, `.github/workflows/ci.yml`
-- Create: `crates/skimmer-{decode,dsp,input,testkit,engine,cli}/Cargo.toml` + minimal `src/lib.rs` / `src/main.rs`
+- Create: `crates/manta-{decode,dsp,input,testkit,engine,cli}/Cargo.toml` + minimal `src/lib.rs` / `src/main.rs`
 
 **Interfaces:**
-- Produces: a building, testing, CI-green empty workspace every later task adds to. Crate names: `skimmer-decode`, `skimmer-dsp`, `skimmer-input`, `skimmer-testkit`, `skimmer-engine`, `skimmer-cli` (binary name `skimmer`).
+- Produces: a building, testing, CI-green empty workspace every later task adds to. Crate names: `manta-decode`, `manta-dsp`, `manta-input`, `manta-testkit`, `manta-engine`, `manta-cli` (binary name `manta`).
 
 - [ ] **Step 1: Sync and branch (multi-agent hygiene)**
 
@@ -141,12 +141,12 @@ Record the returned hash; it is `<COPPA_REV>` in every snippet below.
 [workspace]
 resolver = "2"
 members = [
-    "crates/skimmer-decode",
-    "crates/skimmer-dsp",
-    "crates/skimmer-input",
-    "crates/skimmer-testkit",
-    "crates/skimmer-engine",
-    "crates/skimmer-cli",
+    "crates/manta-decode",
+    "crates/manta-dsp",
+    "crates/manta-input",
+    "crates/manta-testkit",
+    "crates/manta-engine",
+    "crates/manta-cli",
 ]
 
 [workspace.package]
@@ -154,14 +154,14 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
-repository = "https://github.com/HagaleTechnologies/skimmer"
+repository = "https://github.com/HagaleTechnologies/manta"
 
 [workspace.dependencies]
-skimmer-decode = { path = "crates/skimmer-decode" }
-skimmer-dsp = { path = "crates/skimmer-dsp" }
-skimmer-input = { path = "crates/skimmer-input" }
-skimmer-testkit = { path = "crates/skimmer-testkit" }
-skimmer-engine = { path = "crates/skimmer-engine" }
+manta-decode = { path = "crates/manta-decode" }
+manta-dsp = { path = "crates/manta-dsp" }
+manta-input = { path = "crates/manta-input" }
+manta-testkit = { path = "crates/manta-testkit" }
+manta-engine = { path = "crates/manta-engine" }
 
 coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "<COPPA_REV>" }
 
@@ -186,11 +186,11 @@ opt-level = 2
 
 - [ ] **Step 4: Write the six crate manifests and stub sources**
 
-`crates/skimmer-decode/Cargo.toml`:
+`crates/manta-decode/Cargo.toml`:
 
 ```toml
 [package]
-name = "skimmer-decode"
+name = "manta-decode"
 description = "CW keying state machine, timing, Morse decode"
 version.workspace = true
 edition.workspace = true
@@ -204,12 +204,12 @@ serde = { workspace = true }
 approx = { workspace = true }
 ```
 
-`crates/skimmer-dsp/Cargo.toml`:
+`crates/manta-dsp/Cargo.toml`:
 
 ```toml
 [package]
-name = "skimmer-dsp"
-description = "Channel extraction and frequency estimation for skimmer"
+name = "manta-dsp"
+description = "Channel extraction and frequency estimation for manta"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -223,12 +223,12 @@ num-complex = { workspace = true }
 approx = { workspace = true }
 ```
 
-`crates/skimmer-input/Cargo.toml`:
+`crates/manta-input/Cargo.toml`:
 
 ```toml
 [package]
-name = "skimmer-input"
-description = "IQ sources for skimmer (file playback at M0)"
+name = "manta-input"
+description = "IQ sources for manta (file playback at M0)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -245,11 +245,11 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 ```
 
-`crates/skimmer-testkit/Cargo.toml`:
+`crates/manta-testkit/Cargo.toml`:
 
 ```toml
 [package]
-name = "skimmer-testkit"
+name = "manta-testkit"
 description = "Synthetic CW generator and golden-vector harness"
 version.workspace = true
 edition.workspace = true
@@ -264,19 +264,19 @@ rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-skimmer-decode = { workspace = true }
-skimmer-dsp = { workspace = true }
+manta-decode = { workspace = true }
+manta-dsp = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
 ```
 
-`crates/skimmer-engine/Cargo.toml`:
+`crates/manta-engine/Cargo.toml`:
 
 ```toml
 [package]
-name = "skimmer-engine"
+name = "manta-engine"
 description = "Pipeline orchestration: input -> channel -> decoder"
 version.workspace = true
 edition.workspace = true
@@ -287,40 +287,40 @@ rust-version.workspace = true
 anyhow = { workspace = true }
 num-complex = { workspace = true }
 serde = { workspace = true }
-skimmer-decode = { workspace = true }
-skimmer-dsp = { workspace = true }
-skimmer-input = { workspace = true }
+manta-decode = { workspace = true }
+manta-dsp = { workspace = true }
+manta-input = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-skimmer-testkit = { workspace = true }
+manta-testkit = { workspace = true }
 ```
 
-`crates/skimmer-cli/Cargo.toml`:
+`crates/manta-cli/Cargo.toml`:
 
 ```toml
 [package]
-name = "skimmer-cli"
-description = "skimmer daemon and CLI"
+name = "manta-cli"
+description = "manta daemon and CLI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "skimmer"
+name = "manta"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
-skimmer-engine = { workspace = true }
-skimmer-testkit = { workspace = true }
+manta-engine = { workspace = true }
+manta-testkit = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-skimmer-testkit = { workspace = true }
+manta-testkit = { workspace = true }
 tempfile = { workspace = true }
 ```
 
@@ -330,11 +330,11 @@ Each library crate gets `src/lib.rs` containing only a doc comment for now, e.g.
 //! CW keying state machine, timing, and Morse decode (SPEC-decode-core §3–§5).
 ```
 
-`crates/skimmer-cli/src/main.rs`:
+`crates/manta-cli/src/main.rs`:
 
 ```rust
 fn main() {
-    println!("skimmer: no subcommands yet (M0 in progress)");
+    println!("manta: no subcommands yet (M0 in progress)");
 }
 ```
 
@@ -403,11 +403,11 @@ gh pr create --draft --title "M0: single-signal decode from WAV" \
 
 ---
 
-### Task 2: `skimmer-decode::tree` — Morse table, tree, Glyph
+### Task 2: `manta-decode::tree` — Morse table, tree, Glyph
 
 **Files:**
-- Create: `crates/skimmer-decode/src/tree.rs`
-- Modify: `crates/skimmer-decode/src/lib.rs`
+- Create: `crates/manta-decode/src/tree.rs`
+- Modify: `crates/manta-decode/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing (leaf module).
@@ -422,7 +422,7 @@ gh pr create --draft --title "M0: single-signal decode from WAV" \
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/skimmer-decode/src/tree.rs` (module skeleton + tests; implementation comes in Step 3):
+Append to `crates/manta-decode/src/tree.rs` (module skeleton + tests; implementation comes in Step 3):
 
 ```rust
 #[cfg(test)]
@@ -525,12 +525,12 @@ mod lib_tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-decode`
+Run: `cargo test -p manta-decode`
 Expected: compile error (`MorseTree` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-decode/src/lib.rs`:
+`crates/manta-decode/src/lib.rs`:
 
 ```rust
 //! CW keying state machine, timing, and Morse decode (SPEC-decode-core §3–§5).
@@ -555,7 +555,7 @@ pub fn ms_to_hops(ms: f64) -> u32 {
 
 (Declare all six modules now; create empty `beam.rs`, `decoder.rs`, `envelope.rs`, `events.rs`, `timing.rs` files containing only `//! stub` so the crate compiles — later tasks fill them.)
 
-`crates/skimmer-decode/src/tree.rs`:
+`crates/manta-decode/src/tree.rs`:
 
 ```rust
 //! Morse code tree and glyph table. SPEC §4.4.
@@ -739,7 +739,7 @@ pub fn pattern_for(c: char) -> Option<&'static str> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-decode`
+Run: `cargo test -p manta-decode`
 Expected: all tree + `ms_to_hops` tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -751,10 +751,10 @@ git add -A && git commit -m "feat(decode): Morse tree, glyph table, hop constant
 
 ---
 
-### Task 3: `skimmer-decode::timing` — 2-means speed tracking + gap classification
+### Task 3: `manta-decode::timing` — 2-means speed tracking + gap classification
 
 **Files:**
-- Create/replace: `crates/skimmer-decode/src/timing.rs`
+- Create/replace: `crates/manta-decode/src/timing.rs`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -876,12 +876,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-decode timing`
+Run: `cargo test -p manta-decode timing`
 Expected: compile error (`SpeedTracker` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-decode/src/timing.rs`:
+`crates/manta-decode/src/timing.rs`:
 
 ```rust
 //! Online 2-means speed tracking and gap classification. SPEC §4.1–§4.2.
@@ -1169,7 +1169,7 @@ impl GapClassifier {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-decode timing`
+Run: `cargo test -p manta-decode timing`
 Expected: all 8 tests PASS. If `step_speed_change_reinitializes` fails, print `t.mu_dit_ms()` per mark — the reinit should fire on the 12th consecutive fast dit; check the ring excludes init-consumed marks.
 
 - [ ] **Step 5: Commit**
@@ -1181,10 +1181,10 @@ git add -A && git commit -m "feat(decode): 2-means speed tracker and Farnsworth 
 
 ---
 
-### Task 4: `skimmer-decode::beam` — likelihoods, beam search, confidence
+### Task 4: `manta-decode::beam` — likelihoods, beam search, confidence
 
 **Files:**
-- Create/replace: `crates/skimmer-decode/src/beam.rs`
+- Create/replace: `crates/manta-decode/src/beam.rs`
 
 **Interfaces:**
 - Consumes: `tree::{MorseTree, Element, Glyph, Prosign}`.
@@ -1281,12 +1281,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-decode beam`
+Run: `cargo test -p manta-decode beam`
 Expected: compile error (`decode_char` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-decode/src/beam.rs`:
+`crates/manta-decode/src/beam.rs`:
 
 ```rust
 //! Character-local beam search over the Morse tree. SPEC §4.3–§4.5, §10.3.
@@ -1396,7 +1396,7 @@ pub fn decode_char(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-decode beam`
+Run: `cargo test -p manta-decode beam`
 Expected: all 9 tests PASS.
 
 - [ ] **Step 5: Commit**
@@ -1408,10 +1408,10 @@ git add -A && git commit -m "feat(decode): character-local beam search with conf
 
 ---
 
-### Task 5: `skimmer-decode::envelope` — Demod (normalization, rails, hysteresis, debounce)
+### Task 5: `manta-decode::envelope` — Demod (normalization, rails, hysteresis, debounce)
 
 **Files:**
-- Create/replace: `crates/skimmer-decode/src/envelope.rs`
+- Create/replace: `crates/manta-decode/src/envelope.rs`
 
 **Interfaces:**
 - Consumes: `crate::ms_to_hops`, `crate::HOP_MS`.
@@ -1567,12 +1567,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-decode envelope`
+Run: `cargo test -p manta-decode envelope`
 Expected: compile error (`Demod` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-decode/src/envelope.rs`:
+`crates/manta-decode/src/envelope.rs`:
 
 ```rust
 //! Per-track demodulation: normalization, dual-EMA keying threshold,
@@ -1869,7 +1869,7 @@ impl Demod {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-decode envelope`
+Run: `cargo test -p manta-decode envelope`
 Expected: all 7 tests PASS. Debugging notes if not:
 - `clean_keying_yields_alternating_runs`: dump `(e_hi, e_lo, t)` per hop; rails must settle near (1.0, 0.01).
 - `debounce_merges_short_dropout`: the merged run must combine `held + short + open`; check the `hops + 1` accounting (the current hop belongs to the merged run).
@@ -1883,10 +1883,10 @@ git add -A && git commit -m "feat(decode): dual-EMA demod with hysteresis, debou
 
 ---
 
-### Task 6: `skimmer-decode::decoder` + `events` — TrackDecoder glue
+### Task 6: `manta-decode::decoder` + `events` — TrackDecoder glue
 
 **Files:**
-- Create/replace: `crates/skimmer-decode/src/events.rs`, `crates/skimmer-decode/src/decoder.rs`
+- Create/replace: `crates/manta-decode/src/events.rs`, `crates/manta-decode/src/decoder.rs`
 
 **Interfaces:**
 - Consumes: `envelope::{Demod, DemodConfig, Run}`, `timing::{SpeedTracker, GapClassifier, GapClass}`, `beam::{decode_char, BeamConfig, CharDecode}`, `tree::Glyph`, `crate::HOP_MS`.
@@ -2032,12 +2032,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-decode decoder`
+Run: `cargo test -p manta-decode decoder`
 Expected: compile error (`TrackDecoder` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-decode/src/events.rs`:
+`crates/manta-decode/src/events.rs`:
 
 ```rust
 //! Decoder output event stream. SPEC §5.
@@ -2054,7 +2054,7 @@ pub enum DecoderEvent {
 }
 ```
 
-`crates/skimmer-decode/src/decoder.rs`:
+`crates/manta-decode/src/decoder.rs`:
 
 ```rust
 //! Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
@@ -2298,7 +2298,7 @@ pub fn events_to_text(events: &[DecoderEvent]) -> String {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-decode`
+Run: `cargo test -p manta-decode`
 Expected: whole crate green (tree + timing + beam + envelope + decoder). Debugging notes:
 - `decodes_single_word` failing on the first char: check the pending-run drain happens *after* the 5th mark's `on_mark` (the 5th mark run must be in `pending` when the drain runs).
 - `trailing_word_flushes_by_timeout_not_eof`: `check_flush` must run on every hop, not only on completed runs.
@@ -2312,11 +2312,11 @@ git add -A && git commit -m "feat(decode): TrackDecoder glue and event stream (S
 
 ---
 
-### Task 7: `skimmer-dsp::proto` — Kaiser windowed-sinc prototype designer
+### Task 7: `manta-dsp::proto` — Kaiser windowed-sinc prototype designer
 
 **Files:**
-- Create: `crates/skimmer-dsp/src/proto.rs`
-- Modify: `crates/skimmer-dsp/src/lib.rs`
+- Create: `crates/manta-dsp/src/proto.rs`
+- Modify: `crates/manta-dsp/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing (pure math; this is the NEW code SPEC §10.1 calls out — do NOT look for it in coppa).
@@ -2398,15 +2398,15 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-dsp proto`
+Run: `cargo test -p manta-dsp proto`
 Expected: compile error (`design_prototype` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-dsp/src/lib.rs`:
+`crates/manta-dsp/src/lib.rs`:
 
 ```rust
-//! Channel extraction and frequency estimation for skimmer.
+//! Channel extraction and frequency estimation for manta.
 //!
 //! At M0 this crate holds the Kaiser prototype designer (SPEC §1.2 — NEW code,
 //! coppa-dsp has no FIR designer), a single-channel extractor shim, and an
@@ -2419,7 +2419,7 @@ pub mod single;
 
 (Create empty stub files for `freqest.rs`/`single.rs` with a `//! stub` line so the crate compiles.)
 
-`crates/skimmer-dsp/src/proto.rs`:
+`crates/manta-dsp/src/proto.rs`:
 
 ```rust
 //! PFB prototype lowpass: Kaiser-windowed sinc. SPEC §1.2, §10.1.
@@ -2477,7 +2477,7 @@ pub fn design_prototype(n_channels: usize, taps_per_branch: usize) -> Vec<f32> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-dsp proto`
+Run: `cargo test -p manta-dsp proto`
 Expected: all 5 PASS. If `stopband_at_least_78_db` misses by < 2 dB, that is a real design-margin conversation — check the window formula before touching the assertion, and if the assertion must move, record it in `docs/DECISIONS/` (Task 15).
 
 - [ ] **Step 5: Pin the tap snapshot (SPEC §1.2 "first/middle/last 4 taps at N=1024 pinned to 1e-7")**
@@ -2496,7 +2496,7 @@ fn dump_reference_taps() {
 }
 ```
 
-Run: `cargo test -p skimmer-dsp dump_reference_taps -- --ignored --nocapture`
+Run: `cargo test -p manta-dsp dump_reference_taps -- --ignored --nocapture`
 
 Paste the printed values into a new pinned test (replace the `<...>` placeholders with the actual printed numbers — they are the cross-platform stability contract from here on):
 
@@ -2522,7 +2522,7 @@ fn reference_taps_pinned() {
 }
 ```
 
-Run: `cargo test -p skimmer-dsp proto` — all green including the pinned test.
+Run: `cargo test -p manta-dsp proto` — all green including the pinned test.
 
 - [ ] **Step 6: Commit**
 
@@ -2533,10 +2533,10 @@ git add -A && git commit -m "feat(dsp): Kaiser windowed-sinc PFB prototype desig
 
 ---
 
-### Task 8: `skimmer-dsp::single` — single-channel extractor (M0 shim)
+### Task 8: `manta-dsp::single` — single-channel extractor (M0 shim)
 
 **Files:**
-- Create/replace: `crates/skimmer-dsp/src/single.rs`
+- Create/replace: `crates/manta-dsp/src/single.rs`
 
 **Interfaces:**
 - Consumes: `proto::{design_prototype, TAPS_PER_BRANCH}`, `num_complex::Complex32`.
@@ -2642,12 +2642,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-dsp single`
+Run: `cargo test -p manta-dsp single`
 Expected: compile error.
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-dsp/src/single.rs`:
+`crates/manta-dsp/src/single.rs`:
 
 ```rust
 //! Single-channel extractor: one PFB channel computed directly (M0 shim).
@@ -2735,7 +2735,7 @@ impl SingleChannelExtractor {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-dsp single`
+Run: `cargo test -p manta-dsp single`
 Expected: all 6 PASS. `on_channel_tone_passes_at_unity` failing at ~0.5 means the mixer sign is wrong (signal landed at the −6 dB edge); `output_rate` off by ~32 means the warm-up accounting differs — adjust the test only if the total count is right (`(len − LN)/hop + 1`).
 
 - [ ] **Step 5: Commit**
@@ -2747,10 +2747,10 @@ git add -A && git commit -m "feat(dsp): single-channel extractor shim (mix + pro
 
 ---
 
-### Task 9: `skimmer-dsp::freqest` — averaged-periodogram peak search (M0 shim)
+### Task 9: `manta-dsp::freqest` — averaged-periodogram peak search (M0 shim)
 
 **Files:**
-- Create/replace: `crates/skimmer-dsp/src/freqest.rs`
+- Create/replace: `crates/manta-dsp/src/freqest.rs`
 
 **Interfaces:**
 - Consumes: `coppa_dsp::fft::FftProcessor` (the ONE coppa reuse at M0), `num_complex::Complex32`.
@@ -2828,12 +2828,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-dsp freqest`
+Run: `cargo test -p manta-dsp freqest`
 Expected: compile error.
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-dsp/src/freqest.rs`:
+`crates/manta-dsp/src/freqest.rs`:
 
 ```rust
 //! M0 frequency finder: averaged periodogram + parabolic interpolation.
@@ -2904,7 +2904,7 @@ pub fn estimate_peak_hz(iq: &[Complex32], fs: f64) -> Option<f64> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-dsp`
+Run: `cargo test -p manta-dsp`
 Expected: whole crate green (proto + single + freqest).
 
 - [ ] **Step 5: Commit**
@@ -2916,10 +2916,10 @@ git add -A && git commit -m "feat(dsp): averaged-periodogram frequency estimator
 
 ---
 
-### Task 10: `skimmer-input` — IqSource trait + WAV playback
+### Task 10: `manta-input` — IqSource trait + WAV playback
 
 **Files:**
-- Create/replace: `crates/skimmer-input/src/lib.rs`
+- Create/replace: `crates/manta-input/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `hound`, `serde_json`.
@@ -3036,12 +3036,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-input`
+Run: `cargo test -p manta-input`
 Expected: compile error.
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-input/src/lib.rs`:
+`crates/manta-input/src/lib.rs`:
 
 ```rust
 //! IQ sources. At M0: WAV file playback only (ARCHITECTURE §3).
@@ -3143,7 +3143,7 @@ pub fn read_all(src: &mut dyn IqSource) -> Result<Vec<Complex32>> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-input`
+Run: `cargo test -p manta-input`
 Expected: all 5 PASS.
 
 - [ ] **Step 5: Commit**
@@ -3155,13 +3155,13 @@ git add -A && git commit -m "feat(input): IqSource trait and WAV+sidecar playbac
 
 ---
 
-### Task 11: `skimmer-testkit::keyer` — text → keyed envelope
+### Task 11: `manta-testkit::keyer` — text → keyed envelope
 
 **Files:**
-- Create: `crates/skimmer-testkit/src/keyer.rs`, `crates/skimmer-testkit/src/lib.rs`
+- Create: `crates/manta-testkit/src/keyer.rs`, `crates/manta-testkit/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_decode::tree::pattern_for`, `rand_chacha::ChaCha8Rng`, `rand_core::{RngCore, SeedableRng}`.
+- Consumes: `manta_decode::tree::pattern_for`, `rand_chacha::ChaCha8Rng`, `rand_core::{RngCore, SeedableRng}`.
 - Produces (used by scene, tests):
   - `pub struct Jitter { pub sigma: f32, pub seed: u64 }`
   - `pub struct KeyerSpec { pub wpm: f32, pub rise_ms: f64, pub jitter: Option<Jitter> }` with `pub fn new(wpm: f32) -> Self` (rise 5.0 ms — SPEC §7 preamble)
@@ -3288,12 +3288,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-testkit keyer`
+Run: `cargo test -p manta-testkit keyer`
 Expected: compile error.
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-testkit/src/lib.rs`:
+`crates/manta-testkit/src/lib.rs`:
 
 ```rust
 //! Synthetic CW generator and golden-vector harness (ARCHITECTURE §9).
@@ -3325,7 +3325,7 @@ pub(crate) fn gaussian_pair(rng: &mut rand_chacha::ChaCha8Rng) -> (f64, f64) {
 
 (Create `//! stub` files for `cer.rs`, `noise.rs`, `scene.rs`, `vectors.rs`, `wav.rs`.)
 
-`crates/skimmer-testkit/src/keyer.rs`:
+`crates/manta-testkit/src/keyer.rs`:
 
 ```rust
 //! Text -> keyed CW envelope: raised-cosine edges, optional timing jitter.
@@ -3335,7 +3335,7 @@ use crate::gaussian_pair;
 use anyhow::{bail, Result};
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
-use skimmer_decode::tree::pattern_for;
+use manta_decode::tree::pattern_for;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Jitter {
@@ -3516,7 +3516,7 @@ pub fn key_text_loop(text: &str, spec: &KeyerSpec, fs: f64, duration_s: f64) -> 
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-testkit keyer`
+Run: `cargo test -p manta-testkit keyer`
 Expected: all 6 PASS. Note for `paris_mark_durations_at_20wpm`: the >0.5 width of an element with contained raised-cosine edges is `nominal − rise_ms` (half-height is reached `rise/2` in from each end... verify: half-height at `t_in = rise/2` on each side ⇒ width = `nominal − rise`). If the measured runs are `nominal − rise/2`, the edges were placed *outside* the element — fix the keyer, not the test.
 
 - [ ] **Step 5: Commit**
@@ -3528,13 +3528,13 @@ git add -A && git commit -m "feat(testkit): CW keyer with raised-cosine edges an
 
 ---
 
-### Task 12: `skimmer-testkit` — noise, scene, CER, WAV writer, V1 vector
+### Task 12: `manta-testkit` — noise, scene, CER, WAV writer, V1 vector
 
 **Files:**
-- Create/replace: `crates/skimmer-testkit/src/{noise,scene,cer,wav,vectors}.rs`
+- Create/replace: `crates/manta-testkit/src/{noise,scene,cer,wav,vectors}.rs`
 
 **Interfaces:**
-- Consumes: `keyer`, `gaussian_pair`, `hound`, `skimmer-decode` (nothing else).
+- Consumes: `keyer`, `gaussian_pair`, `hound`, `manta-decode` (nothing else).
 - Produces (used by engine tests and cli):
   - `noise.rs`: `pub fn add_unit_awgn(samples: &mut [Complex32], seed: u64)` (unit-power complex noise: per-component σ² = 0.5; I then Q per sample, fixed order); `pub fn amplitude_for_snr_2500(snr_db: f32, fs: f64) -> f32` = `sqrt(10^(snr/10) · 2500/fs)` (pinned decision 3)
   - `scene.rs`: `pub struct SignalSpec { pub text: String, pub loop_text: bool, pub wpm: f32, pub offset_hz: f64, pub snr_2500_db: f32, pub jitter: Option<Jitter> }`; `pub const MASTER_SCALE: f32 = 0.05;`; `pub fn render_scene(signals: &[SignalSpec], fs: f64, duration_s: f64, noise_seed: Option<u64>) -> anyhow::Result<(Vec<Complex32>, Vec<String>)>` (signals summed in slice order, then noise, then `MASTER_SCALE`; returns keyed texts per signal)
@@ -3545,7 +3545,7 @@ git add -A && git commit -m "feat(testkit): CW keyer with raised-cosine edges an
     - `pub fn v1() -> VectorSpec` — SPEC §7 V1: 96 kS/s, 120 s, 20 WPM, +20 dB, offset +12 340.0 Hz, `"CQ CQ DE W1AW W1AW K"` looped, no jitter, `noise_seed = 0x534B_494D_5631` ("SKIMV1"), center 14 MHz
     - `pub struct RenderedVector { pub samples: Vec<Complex32>, pub keyed_texts: Vec<String>, pub expected_freq_hz: f64 }`
     - `pub fn render(spec: &VectorSpec) -> anyhow::Result<RenderedVector>`
-    - `pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> anyhow::Result<Manifest>` — wav + sidecar + `<name>.manifest.json`; `pub struct Manifest { pub name: String, pub fs: f64, pub duration_s: f64, pub center_freq_hz: f64, pub noise_seed: u64, pub expected_freq_hz: f64, pub keyed_texts: Vec<String>, pub generator: String }` (serde Serialize + Deserialize; `generator` = `concat!("skimmer-testkit ", env!("CARGO_PKG_VERSION"))`)
+    - `pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> anyhow::Result<Manifest>` — wav + sidecar + `<name>.manifest.json`; `pub struct Manifest { pub name: String, pub fs: f64, pub duration_s: f64, pub center_freq_hz: f64, pub noise_seed: u64, pub expected_freq_hz: f64, pub keyed_texts: Vec<String>, pub generator: String }` (serde Serialize + Deserialize; `generator` = `concat!("manta-testkit ", env!("CARGO_PKG_VERSION"))`)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3661,7 +3661,7 @@ In `vectors.rs`:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skimmer_input::{IqSource, WavIqSource};
+    use manta_input::{IqSource, WavIqSource};
 
     #[test]
     fn v1_spec_matches_spec_table() {
@@ -3688,29 +3688,29 @@ mod tests {
         let mut src = WavIqSource::open(&dir.path().join("v1.wav")).unwrap();
         assert_eq!(src.sample_rate(), 96_000.0);
         assert_eq!(src.center_freq_hz(), 14_000_000.0);
-        let back = skimmer_input::read_all(&mut src).unwrap();
+        let back = manta_input::read_all(&mut src).unwrap();
         assert_eq!(back, rendered.samples); // float32 WAV is lossless
     }
 }
 ```
 
-This test needs `skimmer-input` as a dev-dependency of `skimmer-testkit` — add it:
+This test needs `manta-input` as a dev-dependency of `manta-testkit` — add it:
 
 ```toml
 [dev-dependencies]
-skimmer-input = { workspace = true }
+manta-input = { workspace = true }
 ```
 
-(also add `skimmer-input = { path = "crates/skimmer-input" }` … it is already in `[workspace.dependencies]` from Task 1.)
+(also add `manta-input = { path = "crates/manta-input" }` … it is already in `[workspace.dependencies]` from Task 1.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-testkit`
+Run: `cargo test -p manta-testkit`
 Expected: compile errors for the four new modules.
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-testkit/src/noise.rs`:
+`crates/manta-testkit/src/noise.rs`:
 
 ```rust
 //! Complex AWGN with the SNR-in-reference-bandwidth convention.
@@ -3744,7 +3744,7 @@ pub fn amplitude_for_snr_2500(snr_db: f32, fs: f64) -> f32 {
 }
 ```
 
-`crates/skimmer-testkit/src/scene.rs`:
+`crates/manta-testkit/src/scene.rs`:
 
 ```rust
 //! Compose keyed CW signals + noise into one IQ scene. ARCHITECTURE §9.
@@ -3819,7 +3819,7 @@ pub fn render_scene(
 }
 ```
 
-`crates/skimmer-testkit/src/cer.rs`:
+`crates/manta-testkit/src/cer.rs`:
 
 ```rust
 //! Character error rate: Levenshtein distance / expected length.
@@ -3858,7 +3858,7 @@ pub fn char_accuracy(expected: &str, decoded: &str) -> f64 {
 }
 ```
 
-`crates/skimmer-testkit/src/wav.rs`:
+`crates/manta-testkit/src/wav.rs`:
 
 ```rust
 //! Fixture I/O: float32 stereo IQ WAV + JSON sidecar (pinned decision 15).
@@ -3894,11 +3894,11 @@ pub fn write_fixture(
 }
 ```
 
-`crates/skimmer-testkit/src/vectors.rs`:
+`crates/manta-testkit/src/vectors.rs`:
 
 ```rust
 //! Golden test vectors. SPEC §7: definitions live here
-//! (module map §8: "§7 vectors -> skimmer-testkit::vectors").
+//! (module map §8: "§7 vectors -> manta-testkit::vectors").
 
 use crate::scene::{render_scene, SignalSpec};
 use crate::wav::write_fixture;
@@ -3976,7 +3976,7 @@ pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
         noise_seed: spec.noise_seed,
         expected_freq_hz: rendered.expected_freq_hz,
         keyed_texts: rendered.keyed_texts,
-        generator: concat!("skimmer-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
+        generator: concat!("manta-testkit ", env!("CARGO_PKG_VERSION")).to_string(),
     };
     std::fs::write(
         dir.join(format!("{}.manifest.json", spec.name)),
@@ -3988,7 +3988,7 @@ pub fn write_fixture_set(spec: &VectorSpec, dir: &Path) -> Result<Manifest> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-testkit`
+Run: `cargo test -p manta-testkit`
 Expected: keyer + noise + scene + cer + vectors all PASS. `achieved_snr_matches_request` is the load-bearing one — it validates pinned decision 3 empirically.
 
 - [ ] **Step 5: Commit**
@@ -4000,13 +4000,13 @@ git add -A && git commit -m "feat(testkit): scene renderer, ref-bw AWGN, CER, V1
 
 ---
 
-### Task 13: `skimmer-engine` — single-channel pipeline
+### Task 13: `manta-engine` — single-channel pipeline
 
 **Files:**
-- Create/replace: `crates/skimmer-engine/src/lib.rs`
+- Create/replace: `crates/manta-engine/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_dsp::{freqest::estimate_peak_hz, single::SingleChannelExtractor}`, `skimmer_decode::{decoder::{TrackDecoder, DecodeConfig, events_to_text}, events::DecoderEvent}`, `skimmer_input::{IqSource, WavIqSource, read_all}`.
+- Consumes: `manta_dsp::{freqest::estimate_peak_hz, single::SingleChannelExtractor}`, `manta_decode::{decoder::{TrackDecoder, DecodeConfig, events_to_text}, events::DecoderEvent}`, `manta_input::{IqSource, WavIqSource, read_all}`.
 - Produces (used by cli):
   - `pub struct PipelineConfig { pub decode: DecodeConfig }` with `Default`
   - `pub struct DecodeReport { pub freq_hz: f64, pub wpm: Option<f32>, pub text: String, pub events: Vec<DecoderEvent> }` (`serde::Serialize`)
@@ -4014,17 +4014,17 @@ git add -A && git commit -m "feat(testkit): scene renderer, ref-bw AWGN, CER, V1
   - `pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> anyhow::Result<DecodeReport>`
 - Pipeline: freq estimate (error if none found) → extractor at that offset → per-hop `a = |y|`, `sample_ts = m·hop` → `TrackDecoder` (track_id 1, freq = center + offset) → `finish()` → text + last-reported WPM.
 
-- [ ] **Step 1: Write the failing test** (`crates/skimmer-engine/tests/pipeline.rs`)
+- [ ] **Step 1: Write the failing test** (`crates/manta-engine/tests/pipeline.rs`)
 
 ```rust
-use skimmer_engine::{decode_samples, PipelineConfig};
-use skimmer_testkit::cer::cer;
-use skimmer_testkit::scene::{render_scene, SignalSpec};
+use manta_engine::{decode_samples, PipelineConfig};
+use manta_testkit::cer::cer;
+use manta_testkit::scene::{render_scene, SignalSpec};
 
 #[test]
 fn v1_lite_decodes_end_to_end() {
     // 20 s slice of the V1 scene: same parameters, faster test. The full
-    // 120 s V1 gate lives in skimmer-cli/tests/golden_v1.rs.
+    // 120 s V1 gate lives in manta-cli/tests/golden_v1.rs.
     let sig = SignalSpec {
         text: "CQ CQ DE W1AW W1AW K".into(),
         loop_text: true,
@@ -4054,16 +4054,16 @@ fn silence_errors_cleanly() {
 }
 ```
 
-(`num-complex` is already a dependency of `skimmer-engine`.)
+(`num-complex` is already a dependency of `manta-engine`.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p skimmer-engine`
+Run: `cargo test -p manta-engine`
 Expected: compile error (`decode_samples` not defined).
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-engine/src/lib.rs`:
+`crates/manta-engine/src/lib.rs`:
 
 ```rust
 //! M0 pipeline: WAV -> frequency estimate -> single channel -> decoder.
@@ -4071,11 +4071,11 @@ Expected: compile error (`decode_samples` not defined).
 
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
-use skimmer_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
-use skimmer_decode::events::DecoderEvent;
-use skimmer_dsp::freqest::estimate_peak_hz;
-use skimmer_dsp::single::SingleChannelExtractor;
-use skimmer_input::{read_all, IqSource, WavIqSource};
+use manta_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
+use manta_decode::events::DecoderEvent;
+use manta_dsp::freqest::estimate_peak_hz;
+use manta_dsp::single::SingleChannelExtractor;
+use manta_input::{read_all, IqSource, WavIqSource};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
@@ -4143,7 +4143,7 @@ pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p skimmer-engine`
+Run: `cargo test -p manta-engine`
 Expected: both tests PASS. This is the first full-chain integration — if `v1_lite_decodes_end_to_end` fails, bisect with the layer tests: freqest alone (Task 9 style), extractor envelope plateau (Task 8 style), then dump `report.events` and compare against the keyed text character by character. Common first failure: the last character missing because `finish()` isn't called — or doubled word boundaries (check `word_flushed` handling).
 
 - [ ] **Step 5: Commit**
@@ -4158,8 +4158,8 @@ git add -A && git commit -m "feat(engine): M0 single-channel decode pipeline"
 ### Task 14: Round-trip proptests (ROADMAP M0 acceptance criterion 2)
 
 **Files:**
-- Create: `crates/skimmer-testkit/tests/roundtrip_envelope.rs`
-- Create: `crates/skimmer-engine/tests/roundtrip_iq.rs`
+- Create: `crates/manta-testkit/tests/roundtrip_envelope.rs`
+- Create: `crates/manta-engine/tests/roundtrip_iq.rs`
 
 **Interfaces:**
 - Consumes: everything built so far. No new public API.
@@ -4168,16 +4168,16 @@ git add -A && git commit -m "feat(engine): M0 single-channel decode pipeline"
 
 - [ ] **Step 1: Write the envelope-level proptest**
 
-`crates/skimmer-testkit/tests/roundtrip_envelope.rs`:
+`crates/manta-testkit/tests/roundtrip_envelope.rs`:
 
 ```rust
 //! text -> keyed envelope (375 Hz) -> TrackDecoder -> text, CER = 0.
 //! Isolates the decode chain from the DSP front end.
 
 use proptest::prelude::*;
-use skimmer_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
-use skimmer_testkit::cer::cer;
-use skimmer_testkit::keyer::{key_text, KeyerSpec};
+use manta_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
+use manta_testkit::cer::cer;
+use manta_testkit::keyer::{key_text, KeyerSpec};
 
 /// First char must contain both elements (see task preamble).
 const MIXED_FIRST: &str = "ACDFGKLNPQRVWXYZ";
@@ -4234,17 +4234,17 @@ Note: a clean envelope has `E_lo` at the 1e-6 floor; the demod's keying-depth ga
 
 - [ ] **Step 2: Write the IQ-level proptest**
 
-`crates/skimmer-engine/tests/roundtrip_iq.rs`:
+`crates/manta-engine/tests/roundtrip_iq.rs`:
 
 ```rust
 //! ROADMAP M0 criterion: text -> testkit CW -> (IQ + AWGN) -> full pipeline
 //! -> text, CER = 0, for 10–40 WPM at >= +15 dB SNR-in-2500-Hz.
 
 use proptest::prelude::*;
-use skimmer_engine::{decode_samples, PipelineConfig};
-use skimmer_testkit::cer::cer;
-use skimmer_testkit::keyer::{key_text, KeyerSpec};
-use skimmer_testkit::scene::{render_scene, SignalSpec};
+use manta_engine::{decode_samples, PipelineConfig};
+use manta_testkit::cer::cer;
+use manta_testkit::keyer::{key_text, KeyerSpec};
+use manta_testkit::scene::{render_scene, SignalSpec};
 
 const MIXED_FIRST: &str = "ACDFGKLNPQRVWXYZ";
 const REST: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -4308,7 +4308,7 @@ proptest! {
 
 - [ ] **Step 3: Run both proptests**
 
-Run: `cargo test -p skimmer-testkit --test roundtrip_envelope && cargo test -p skimmer-engine --test roundtrip_iq`
+Run: `cargo test -p manta-testkit --test roundtrip_envelope && cargo test -p manta-engine --test roundtrip_iq`
 Expected: PASS. **These are the acceptance tests most likely to surface real spec-level bugs.** If a case fails:
 1. `proptest` prints the minimal failing input — reproduce it as a standalone `#[test]` before touching code.
 2. Diagnose bottom-up: does the envelope-level test pass for the same text/WPM? If yes, the bug is DSP-side (edge softening at high WPM through the 93.75 Hz channel is the known risk); if no, it's decode-side (gap classification at boundary values is the known risk).
@@ -4323,38 +4323,38 @@ git add -A && git commit -m "test: envelope- and IQ-level round-trip proptests (
 
 ---
 
-### Task 15: `skimmer-cli` — `decode` and `gen` subcommands
+### Task 15: `manta-cli` — `decode` and `gen` subcommands
 
 **Files:**
-- Create/replace: `crates/skimmer-cli/src/main.rs`
+- Create/replace: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_engine::{decode_wav, PipelineConfig}`, `skimmer_testkit::vectors`.
+- Consumes: `manta_engine::{decode_wav, PipelineConfig}`, `manta_testkit::vectors`.
 - Produces (the M0 user surface):
-  - `skimmer decode <fixture.wav>` — stdout: the decoded text (exactly one line). stderr: `freq_hz` and `wpm` diagnostics.
-  - `skimmer decode --json <fixture.wav>` — stdout: one JSON object (the full `DecodeReport`, serde_json). This is the byte-comparison surface for the determinism gate.
-  - `skimmer gen <vector> --out <dir>` — writes `<vector>.wav` + sidecar + manifest via `write_fixture_set`; errors on unknown vector names (only `v1` at M0).
+  - `manta decode <fixture.wav>` — stdout: the decoded text (exactly one line). stderr: `freq_hz` and `wpm` diagnostics.
+  - `manta decode --json <fixture.wav>` — stdout: one JSON object (the full `DecodeReport`, serde_json). This is the byte-comparison surface for the determinism gate.
+  - `manta gen <vector> --out <dir>` — writes `<vector>.wav` + sidecar + manifest via `write_fixture_set`; errors on unknown vector names (only `v1` at M0).
 
-- [ ] **Step 1: Write the failing integration test** (`crates/skimmer-cli/tests/cli.rs`)
+- [ ] **Step 1: Write the failing integration test** (`crates/manta-cli/tests/cli.rs`)
 
 ```rust
 use std::process::Command;
 
-fn skimmer() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_skimmer"))
+fn manta() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_manta"))
 }
 
 #[test]
 fn gen_then_decode_prints_text() {
     let dir = tempfile::tempdir().unwrap();
     // Generate a short fixture through the library (fast), decode via the CLI.
-    let spec = skimmer_testkit::vectors::VectorSpec {
+    let spec = manta_testkit::vectors::VectorSpec {
         duration_s: 15.0,
-        ..skimmer_testkit::vectors::v1()
+        ..manta_testkit::vectors::v1()
     };
-    let manifest = skimmer_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
 
-    let out = skimmer().arg("decode").arg(dir.path().join("v1.wav")).output().unwrap();
+    let out = manta().arg("decode").arg(dir.path().join("v1.wav")).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(text.trim(), manifest.keyed_texts[0]);
@@ -4364,7 +4364,7 @@ fn gen_then_decode_prints_text() {
 fn gen_subcommand_writes_fixture_set() {
     let dir = tempfile::tempdir().unwrap();
     // NOTE: full 120 s V1 — this is also the fixture-generation smoke test.
-    let out = skimmer().args(["gen", "v1", "--out"]).arg(dir.path()).output().unwrap();
+    let out = manta().args(["gen", "v1", "--out"]).arg(dir.path()).output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(dir.path().join("v1.wav").exists());
     assert!(dir.path().join("v1.json").exists());
@@ -4374,7 +4374,7 @@ fn gen_subcommand_writes_fixture_set() {
 #[test]
 fn unknown_vector_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let out = skimmer().args(["gen", "v99", "--out"]).arg(dir.path()).output().unwrap();
+    let out = manta().args(["gen", "v99", "--out"]).arg(dir.path()).output().unwrap();
     assert!(!out.status.success());
 }
 
@@ -4382,11 +4382,11 @@ fn unknown_vector_errors() {
 fn json_output_is_valid_and_deterministic_across_three_runs() {
     // SPEC §6 CI rule: same binary + same file, 3 runs -> identical output.
     let dir = tempfile::tempdir().unwrap();
-    let spec = skimmer_testkit::vectorspec_short();
-    let _ = skimmer_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let spec = manta_testkit::vectorspec_short();
+    let _ = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
     let runs: Vec<Vec<u8>> = (0..3)
         .map(|_| {
-            let out = skimmer()
+            let out = manta()
                 .args(["decode", "--json"])
                 .arg(dir.path().join("v1.wav"))
                 .output()
@@ -4404,7 +4404,7 @@ fn json_output_is_valid_and_deterministic_across_three_runs() {
 }
 ```
 
-Add the helper to `skimmer-testkit/src/lib.rs` (a 20 s V1 variant used by two test crates):
+Add the helper to `manta-testkit/src/lib.rs` (a 20 s V1 variant used by two test crates):
 
 ```rust
 /// Short V1 variant for fast integration/determinism tests. Same code path
@@ -4416,24 +4416,24 @@ pub fn vectorspec_short() -> vectors::VectorSpec {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p skimmer-cli`
+Run: `cargo test -p manta-cli`
 Expected: failures — the binary has no subcommands yet.
 
 - [ ] **Step 3: Implement**
 
-`crates/skimmer-cli/src/main.rs`:
+`crates/manta-cli/src/main.rs`:
 
 ```rust
-//! `skimmer` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
+//! `manta` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
 //! The daemon (SDR input, servers) arrives at M2/M3 (ROADMAP).
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use skimmer_engine::{decode_wav, PipelineConfig};
+use manta_engine::{decode_wav, PipelineConfig};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "skimmer", version, about = "Wideband multi-signal CW skimmer")]
+#[command(name = "manta", version, about = "Wideband multi-signal CW skimmer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -4472,11 +4472,11 @@ fn main() -> Result<()> {
         }
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
-                "v1" => skimmer_testkit::vectors::v1(),
+                "v1" => manta_testkit::vectors::v1(),
                 other => bail!("unknown vector {other:?} (available: v1)"),
             };
             std::fs::create_dir_all(&out)?;
-            let manifest = skimmer_testkit::vectors::write_fixture_set(&spec, &out)?;
+            let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
             eprintln!(
                 "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {:.1} Hz)",
                 out.display(), spec.name, spec.name, spec.name, manifest.expected_freq_hz
@@ -4489,14 +4489,14 @@ fn main() -> Result<()> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p skimmer-cli`
+Run: `cargo test -p manta-cli`
 Expected: all 4 PASS (the full-V1 `gen` test takes a few seconds).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
-git add -A && git commit -m "feat(cli): skimmer decode + gen subcommands"
+git add -A && git commit -m "feat(cli): manta decode + gen subcommands"
 ```
 
 ---
@@ -4504,11 +4504,11 @@ git add -A && git commit -m "feat(cli): skimmer decode + gen subcommands"
 ### Task 16: V1 golden acceptance test, docs, PR finalization
 
 **Files:**
-- Create: `crates/skimmer-cli/tests/golden_v1.rs`
+- Create: `crates/manta-cli/tests/golden_v1.rs`
 - Create: `docs/DECISIONS/2026-07-11-m0-implementation-pins.md`
 - Modify: `ROADMAP.md` (one line), `CLAUDE.md` (Status section), `README.md` (quickstart)
 
-- [ ] **Step 1: Write the V1 golden test** (`crates/skimmer-cli/tests/golden_v1.rs`)
+- [ ] **Step 1: Write the V1 golden test** (`crates/manta-cli/tests/golden_v1.rs`)
 
 This is ROADMAP M0 acceptance criterion 1 / SPEC §7 "M0 = V1 passing end-to-end from a WAV file". It must run in CI on every push (not `#[ignore]`d).
 
@@ -4521,10 +4521,10 @@ use std::process::Command;
 #[test]
 fn v1_passes_end_to_end_from_wav() {
     let dir = tempfile::tempdir().unwrap();
-    let spec = skimmer_testkit::vectors::v1();
-    let manifest = skimmer_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let spec = manta_testkit::vectors::v1();
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", "--json"])
         .arg(dir.path().join("v1.wav"))
         .output()
@@ -4535,7 +4535,7 @@ fn v1_passes_end_to_end_from_wav() {
     // char accuracy = 100 %
     let decoded = report["text"].as_str().unwrap();
     assert_eq!(
-        skimmer_testkit::cer::cer(&manifest.keyed_texts[0], decoded),
+        manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded),
         0.0,
         "V1 char accuracy must be 100 %\nexpected: {}\ndecoded:  {}",
         manifest.keyed_texts[0],
@@ -4563,7 +4563,7 @@ fn v1_passes_end_to_end_from_wav() {
 
 - [ ] **Step 2: Run the golden test**
 
-Run: `cargo test -p skimmer-cli --test golden_v1 -- --nocapture`
+Run: `cargo test -p manta-cli --test golden_v1 -- --nocapture`
 Expected: PASS in well under a minute (release-grade opt levels are set in the workspace profile). **If this fails, M0 is not done.** Debug via the engine-level `v1_lite` test first (same scene, 20 s).
 
 - [ ] **Step 3: Write the decisions record**
@@ -4577,7 +4577,7 @@ Expected: PASS in well under a minute (release-grade opt levels are set in the w
 
 - `ROADMAP.md`: change `synthetic 25 WPM / +20 dB SNR / AWGN-only single-signal IQ file` → `synthetic 20 WPM / +20 dB SNR / AWGN-only single-signal IQ file (SPEC §7 V1)` (deviation 1 — ROADMAP already defers to SPEC §7).
 - `CLAUDE.md` Status section: `Design phase complete; no implementation yet.` → `M0 implemented (single-signal WAV decode, V1 green); next is M1 in ROADMAP.md.` Add one line under Key constraints: `- M0 testkit generates its own ref-bandwidth AWGN (see docs/DECISIONS/2026-07-11-m0-implementation-pins.md); migrate to coppa awgn_ref_bw when it ships.`
-- `README.md`: add a Quickstart: `cargo run -p skimmer-cli -- gen v1 --out /tmp/v1 && cargo run -p skimmer-cli -- decode /tmp/v1/v1.wav`.
+- `README.md`: add a Quickstart: `cargo run -p manta-cli -- gen v1 --out /tmp/v1 && cargo run -p manta-cli -- decode /tmp/v1/v1.wav`.
 
 - [ ] **Step 5: Full-workspace verification**
 
@@ -4598,7 +4598,7 @@ Then run the superpowers:requesting-code-review skill against the branch, addres
 
 ## Self-Review (completed at plan-writing time)
 
-**Spec coverage** against ROADMAP M0's four bullets: workspace scaffolding (Task 1); testkit generator (Tasks 11–12); file playback (Task 10); single hardwired channel (Tasks 7–9); classical decoder chain (Tasks 2–6); `skimmer decode fixture.wav` criterion (Tasks 13, 15, 16); proptest criterion (Task 14); CI Linux+macOS without SoapySDR (Task 1, no soapy dep anywhere). SPEC §3–§5 are covered task-by-task; §1.2 by Task 7; §6 rules are embedded in every implementation (no RNG/clock deps exist in dsp/decode/engine — check `Cargo.toml`s in review); §7 V1 by Tasks 12/16. SPEC §1.3 (WOLA PFB), §2 (noise floor/track manager) are deliberately OUT of M0 scope per ROADMAP (M2).
+**Spec coverage** against ROADMAP M0's four bullets: workspace scaffolding (Task 1); testkit generator (Tasks 11–12); file playback (Task 10); single hardwired channel (Tasks 7–9); classical decoder chain (Tasks 2–6); `manta decode fixture.wav` criterion (Tasks 13, 15, 16); proptest criterion (Task 14); CI Linux+macOS without SoapySDR (Task 1, no soapy dep anywhere). SPEC §3–§5 are covered task-by-task; §1.2 by Task 7; §6 rules are embedded in every implementation (no RNG/clock deps exist in dsp/decode/engine — check `Cargo.toml`s in review); §7 V1 by Tasks 12/16. SPEC §1.3 (WOLA PFB), §2 (noise floor/track manager) are deliberately OUT of M0 scope per ROADMAP (M2).
 
 **Known risks accepted:** (1) the 40 WPM end of the IQ proptest exercises keying edges softened by the 93.75 Hz channel — if it fails, that's a real finding to surface, not to paper over; (2) `timing_sigma = 0.25` is flagged by the SPEC itself as its riskiest constant — the proptests are the early-warning system; (3) the stopband property test may sit within ~2 dB of the assertion — margin documented in the decisions file if touched.
 

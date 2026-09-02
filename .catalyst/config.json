@@ -3,11 +3,11 @@
     "projectKey": "HagaleTechnologies",
     "repository": {
       "org": "HagaleTechnologies",
-      "name": "skimmer"
+      "name": "manta"
     },
     "project": {
       "ticketPrefix": "SKI",
-      "name": "skimmer"
+      "name": "manta"
     },
     "linear": {
       "teamKey": "SKI",
@@ -25,7 +25,7 @@
     },
     "thoughts": {
       "user": null,
-      "directory": "skimmer",
+      "directory": "manta",
       "profile": "HagaleTechnologies"
     },
     "sweep": {

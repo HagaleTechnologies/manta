@@ -1,0 +1,14 @@
+[package]
+name = "manta-decode"
+description = "CW keying state machine, timing, Morse decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

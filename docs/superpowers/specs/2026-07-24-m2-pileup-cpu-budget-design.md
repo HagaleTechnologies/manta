@@ -20,15 +20,15 @@ criteria.
 
 ### Fixture callsigns
 
-`skimmer-testkit` gains a deterministic 50-call fixture list: composed
+`manta-testkit` gains a deterministic 50-call fixture list: composed
 from a fixed set of ham-style prefixes crossed with ChaCha8-seeded
-suffixes (same determinism discipline as the rest of `skimmer-testkit` —
+suffixes (same determinism discipline as the rest of `manta-testkit` —
 "all randomness is ChaCha8 seeded per fixture"), not 50 hand-picked
 real-looking calls. Uniqueness enforced at generation time.
 
 ### Scene generation
 
-`skimmer-testkit::vectors` gains `pileup_scene(watterson: bool) ->
+`manta-testkit::vectors` gains `pileup_scene(watterson: bool) ->
 VectorSpec`, shared by `v8()` and `v8w()`:
 
 - `fs = 96_000.0`, `duration_s = 120.0`, per SPEC §7's stated defaults.
@@ -49,8 +49,8 @@ VectorSpec`, shared by `v8()` and `v8w()`:
 
 ### Golden tests
 
-New `crates/skimmer-cli/tests/golden_v8_v8w.rs`, following the existing
-CLI-binary-decode pattern (`skimmer` binary, `--json`, parse `report`).
+New `crates/manta-cli/tests/golden_v8_v8w.rs`, following the existing
+CLI-binary-decode pattern (`manta` binary, `--json`, parse `report`).
 
 Track-to-signal association: for each decoded track, take its last
 `TrackMeta` event's `freq_hz`; match to the closest `manifest.expected_freqs_hz[i]`
@@ -85,11 +85,11 @@ never silently widen a threshold to force a pass.
 
 ## CPU-budget bench
 
-New `crates/skimmer-engine/benches/cpu_budget.rs`, `criterion` added as
+New `crates/manta-engine/benches/cpu_budget.rs`, `criterion` added as
 a dev-dependency (`harness = false` bench target).
 
-- Synthetic scene reusing `skimmer-testkit::scene` directly (already a
-  dev-dependency of `skimmer-engine`): `fs = 192_000.0`, ~15 s duration
+- Synthetic scene reusing `manta-testkit::scene` directly (already a
+  dev-dependency of `manta-engine`): `fs = 192_000.0`, ~15 s duration
   (tunable after the first real measurement — must clear `warmup_hops`
   (~2 s) plus enough steady-state samples to be a meaningful measurement),
   ~300 keyed tones spread evenly across the passband (2048 channels at
@@ -102,7 +102,7 @@ a dev-dependency (`harness = false` bench target).
   `listen_audio.rs`'s environment-dependent ignored test) that does a
   real `std::time::Instant` wall-clock measurement over the same scene
   and asserts wall time < 50% of audio duration (the Mac budget). Run on
-  demand (`cargo test --release -p skimmer-engine -- --ignored cpu_budget`),
+  demand (`cargo test --release -p manta-engine -- --ignored cpu_budget`),
   not part of default `cargo test --workspace` / CI — perf assertions on
   shared CI runners are flaky, and GitHub-hosted runners aren't Pi4
   hardware anyway, so there's nothing CI could meaningfully gate here.
@@ -115,10 +115,10 @@ a dev-dependency (`harness = false` bench target).
 ## Testing
 
 - `cargo test --workspace` must stay green (existing suite unaffected).
-- New golden tests run via the normal `cargo test -p skimmer-cli` path;
+- New golden tests run via the normal `cargo test -p manta-cli` path;
   if V8/V8w fail on first real measurement, diagnose per the escalation
   policy above before deciding whether to `#[ignore]` with a documented
   reason (consistent with V2/V5/V6's precedent) or fix a real bug.
-- `cargo bench -p skimmer-engine --bench cpu_budget` for the criterion
+- `cargo bench -p manta-engine --bench cpu_budget` for the criterion
   profiling target; the `#[ignore]`d wall-clock test is the actual
   Mac-budget assertion, run manually.

@@ -11,7 +11,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    file-replay sources (what the CI soak test runs against) have no ring and
    cannot overrun by construction. Live-hardware overrun observability needs
    a `coppa-audio` API addition — out of scope for M1, tracked as a
-   follow-up. `skimmer-engine::soak` checks panics and RSS growth only.
+   follow-up. `manta-engine::soak` checks panics and RSS growth only.
 2. **The coppa commit pin lives in `Cargo.toml`/`Cargo.lock` + this doc, not
    per-vector `.manifest.json`** — following M0's actual established
    convention (see the M0 pins doc's "coppa dependency pin" section), not
@@ -26,9 +26,9 @@ decided; SPEC and docs/ still win on anything not listed here.
    48000 Hz (`TARGET_RATE_HZ`); `AudioIqSource::new()` errors clearly
    otherwise. This means most real audio hardware (which doesn't natively
    run at exactly 48000 Hz) will need an OS-level or external resampling
-   step before working with `skimmer listen --device`, until either
-   coppa-audio gains a working resampler or skimmer vendors its own. See
-   `crates/skimmer-input/src/audio.rs`'s module doc comment for the exact
+   step before working with `manta listen --device`, until either
+   coppa-audio gains a working resampler or manta vendors its own. See
+   `crates/manta-input/src/audio.rs`'s module doc comment for the exact
    wording:
 
    > M1 scope: no automatic resampling. Sources must already run at exactly
@@ -36,7 +36,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    > a resample attempt (coppa-audio's ResamplingSource is unreachable -- no
    > `rubato` dependency and no `mod resampler;` declaration upstream).
 4. **Pinned decision 20 (all-dah opener) fix required a follow-up scoping
-   correction.** `ClusterPair` (`crates/skimmer-decode/src/timing.rs`) is
+   correction.** `ClusterPair` (`crates/manta-decode/src/timing.rs`) is
    shared machinery between `SpeedTracker` (millisecond-typed mark
    durations) and `GapClassifier` (dimensionless dit-ratio values). The
    initial fix's absolute-ms ceiling for the unimodal-init "assume dahs"
@@ -52,7 +52,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    carry the sign of its frequency (cos is even), so the Hilbert-converted
    analytic signal always landed on the positive-frequency side regardless
    of the requested offset's sign. Fixed in
-   `crates/skimmer-testkit/src/scene.rs`'s `render_scene` by building the
+   `crates/manta-testkit/src/scene.rs`'s `render_scene` by building the
    tone from `offset_hz.abs()` and conjugating the analytic result when
    `offset_hz < 0.0` (`conj(e^{+jwt}) = e^{-jwt}`, exactly the
    negative-frequency tone the signed offset asked for).
@@ -73,7 +73,7 @@ decided; SPEC and docs/ still win on anything not listed here.
    project's own stated design intent (CLAUDE.md: "Classical decoder
    first; ML fusion ... only at M4, gated on beating the classical
    baseline under simulated fading"). `v5_passes_end_to_end_from_wav` in
-   `crates/skimmer-cli/tests/golden_v2_v3.rs` is `#[ignore]`d with the
+   `crates/manta-cli/tests/golden_v2_v3.rs` is `#[ignore]`d with the
    investigation recorded inline in its doc comment:
 
    > Ignored: WattersonPreset::Poor at V5's 3 dB SNR produces near-continuous
@@ -86,13 +86,13 @@ decided; SPEC and docs/ still win on anything not listed here.
    > robustness gap, consistent with this project's stated design (CLAUDE.md:
    > "Classical decoder first; ML fusion ... only at M4, gated on beating the
    > classical baseline under simulated fading"). Tracked in the M1 pinned-
-   > decisions doc; revisit once skimmer-decode gains real fading resilience
+   > decisions doc; revisit once manta-decode gains real fading resilience
    > (M4) or a different mitigation is found.
 
    **This means M1 does NOT ship with V1-V6 fully green — V5 is the one
    exception, explicitly.**
 8. **The Hilbert transformer's FIR sign is negated relative to the
-   textbook formula.** `skimmer-dsp::hilbert::design_hilbert_fir()`
+   textbook formula.** `manta-dsp::hilbert::design_hilbert_fir()`
    implements `-2/(pi*n)` rather than the standard `+2/(pi*n)`, because
    `HilbertTransformer::process()`'s history buffer is oldest-first and
    pairs `taps[i]` directly with `hist[i]` (rather than the mirrored index
@@ -114,10 +114,10 @@ decided; SPEC and docs/ still win on anything not listed here.
    run reported clean while `cargo clippy --workspace --all-targets --
    -D warnings` (the actual CI command) found real failures in crates that
    weren't in scope for the task being reviewed at the time (e.g. a
-   `SignalSpec` field addition breaking compilation in `skimmer-engine`'s
-   tests when the change was made in `skimmer-testkit`; two
-   `clippy::needless_range_loop` warnings in `skimmer-dsp` that a
-   `skimmer-cli`/`skimmer-testkit`-scoped clippy run never saw). Worth a
+   `SignalSpec` field addition breaking compilation in `manta-engine`'s
+   tests when the change was made in `manta-testkit`; two
+   `clippy::needless_range_loop` warnings in `manta-dsp` that a
+   `manta-cli`/`manta-testkit`-scoped clippy run never saw). Worth a
    one-line callout since it's a real process gotcha for anyone extending
    this codebase later.
 

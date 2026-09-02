@@ -2,7 +2,7 @@
 
 ## Background
 
-`crates/skimmer-engine/tests/roundtrip_iq.rs`'s `iq_roundtrip_with_noise`
+`crates/manta-engine/tests/roundtrip_iq.rs`'s `iq_roundtrip_with_noise`
 proptest carried a known, pre-existing flaky failure noted (not fixed) in
 `docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md` pin #12, confirmed via
 `git stash` to predate the M2 channelizer work entirely. This doc records the
@@ -18,7 +18,7 @@ sequence was measured correctly (`dit, dah, dah, dit, dit, dit`, matching
 "A"+"B"'s true keyed elements) and the true inter-character gap (90.67ms,
 between A's dah and B's dah) was correctly the largest of the five
 inter-element/inter-character gaps in the sequence. The corruption happens
-one layer up, in `GapClassifier::classify` (`crates/skimmer-decode/src/timing.rs`):
+one layer up, in `GapClassifier::classify` (`crates/manta-decode/src/timing.rs`):
 
 ```
 gap dur_ms=90.667  mu_dit_ms=49.778  u=1.8214  class=InterElement
@@ -45,7 +45,7 @@ realization, below the 2.0-dit decision boundary entirely.
 ## Fix
 
 **[DEVIATION]** Lowered `CHAR_GAP_DITS` from SPEC §4.2's pinned `2.0` to
-`1.6` (`crates/skimmer-decode/src/timing.rs`). `2.0` and `1.6` were compared
+`1.6` (`crates/manta-decode/src/timing.rs`). `2.0` and `1.6` were compared
 before choosing 1.8/1.4 too:
 
 | threshold | failures / 500 (seed A) | failures / 500 (seed B) |
@@ -63,9 +63,9 @@ fails at 1.6 also failed at 2.0.
 
 Verified: `timing::tests::gap_classification_nominal` updated for the new
 boundary; the pre-existing pinned regression
-(`crates/skimmer-engine/tests/roundtrip_iq.proptest-regressions`, `"PA"` at
+(`crates/manta-engine/tests/roundtrip_iq.proptest-regressions`, `"PA"` at
 32.79 WPM) now passes; a new deterministic regression test
-(`crates/skimmer-engine/tests/regression_char_gap_high_wpm.rs`) pins the
+(`crates/manta-engine/tests/regression_char_gap_high_wpm.rs`) pins the
 exact "AB" case above.
 
 ## Known limitations found during the sweep, deliberately not fixed here

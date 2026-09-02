@@ -5,7 +5,7 @@ Wideband: PFB + detector + decoder pool"; sub-project 1, the PFB
 channelizer, is complete — see
 `docs/superpowers/specs/2026-07-18-m2-pfb-channelizer-design.md`). This
 sub-project replaces sub-project 1's placeholder single-channel-argmax
-detector (`skimmer-engine::detect::calibrate_channel`) with SPEC §2's real
+detector (`manta-engine::detect::calibrate_channel`) with SPEC §2's real
 order-statistic noise floor, hysteresis-gated detection, and track lifecycle
 state machine — and folds in the decoder-pool *mechanism* from ARCHITECTURE
 §10, merging what ROADMAP originally listed as two separate remaining
@@ -16,11 +16,11 @@ ROADMAP.md is updated accordingly once this lands.
 
 In scope:
 
-- `skimmer-dsp::floor` (new): per-channel order-statistic floor estimator
+- `manta-dsp::floor` (new): per-channel order-statistic floor estimator
   (SPEC §2.1), neighborhood/effective floor (§2.2), and the per-hop smoothed
   power + rise/drop boolean gate (§2.3) — pure, stateful-per-channel, no
   lifecycle or timing persistence.
-- `skimmer-engine::track` (new): the track lifecycle state machine (§2.4:
+- `manta-engine::track` (new): the track lifecycle state machine (§2.4:
   IDLE → CANDIDATE → ACTIVE → HANG → CLOSED, all hop/ms counters — confirm,
   hang, gc, warmup), adjacent-channel ownership and track-convergence merging
   (§2.5), and the decoder pool.
@@ -30,7 +30,7 @@ In scope:
   This is the *mechanism* only — the surrounding real-time architecture
   (rtrb SDR-input ring, tokio runtime for validator/servers/metrics from
   ARCHITECTURE §10) stays deferred; those depend on SoapySDR/KiwiSDR input
-  and `skimmer-spot`/`skimmer-server`, none of which exist yet.
+  and `manta-spot`/`manta-server`, none of which exist yet.
 - Wiring the new detector + track manager into **both** `decode_samples`/
   `decode_wav` (batch) and `listen` (streaming) — replacing `detect.rs`'s
   `calibrate_channel` and each call site's single hardcoded `TrackDecoder`.
@@ -50,8 +50,8 @@ Explicitly out of scope (later work):
   deferred as a follow-up once this sub-project's correctness lands.
 - The rtrb SDR-input ring and tokio async runtime split (ARCHITECTURE §10)
   — no producer or consumer exists on either end yet (SoapySDR/KiwiSDR
-  input; `skimmer-spot` validator; `skimmer-server` telnet/JSON surfaces).
-- `skimmer-spot`'s real callsign validation (cty.dat, SCP, dedupe) — M3
+  input; `manta-spot` validator; `manta-server` telnet/JSON surfaces).
+- `manta-spot`'s real callsign validation (cty.dat, SCP, dedupe) — M3
   work. Golden tests continue approximating "validated" as substring-match
   against decoded text, same as V5's existing test.
 - TOML config file loading for any config struct, including the new
@@ -59,7 +59,7 @@ Explicitly out of scope (later work):
 
 ## 2. Components
 
-### `skimmer-dsp::floor` (new)
+### `manta-dsp::floor` (new)
 
 Per SPEC §2.1–§2.3, driven once per hop per channel from `HopOutput.power`:
 
@@ -80,7 +80,7 @@ Per SPEC §2.1–§2.3, driven once per hop per channel from `HopOutput.power`:
   track lifecycle's job, not this module's; `floor` is a pure function of
   its own per-channel ring/EMA state, with no notion of "track."
 
-### `skimmer-engine::track` (new)
+### `manta-engine::track` (new)
 
 - **`TrackManager`**: owns one `floor` estimator + gate per channel, and
   `BTreeMap<u32, Track>` keyed by a monotonic `track_id` (ascending birth
@@ -112,7 +112,7 @@ Per SPEC §2.1–§2.3, driven once per hop per channel from `HopOutput.power`:
 - **Resequencing**: collected per-track event vectors are merged and sorted
   by `(sample_ts, track_id)` before returning — SPEC §6 rule 6, verbatim.
 
-### `skimmer-engine` call-site wiring
+### `manta-engine` call-site wiring
 
 `detect.rs`'s `calibrate_channel` and each call site's single hardcoded
 `TrackDecoder::new(1, ...)` are removed. `decode_samples`/`decode_wav` and
@@ -128,7 +128,7 @@ after; `TrackManager` just sees more hops.
 ```
 IQ samples → channelizer sliding window → hop slice (HopOutput per hop)
   → TrackManager::process_hops (sequential, per hop):
-      floor + gate (skimmer-dsp::floor) → per-channel rise/drop booleans
+      floor + gate (manta-dsp::floor) → per-channel rise/drop booleans
       → track lifecycle (IDLE/CANDIDATE/ACTIVE/HANG/CLOSED, §2.4)
       → ownership + ownership-window max-power selection + merge (§2.5)
       → ACTIVE tracks: append (mag, sample_ts) to per-track queue
@@ -139,11 +139,11 @@ IQ samples → channelizer sliding window → hop slice (HopOutput per hop)
 
 ## 4. Testing
 
-- **`skimmer-dsp::floor` unit tests**: quantile correctness against known
+- **`manta-dsp::floor` unit tests**: quantile correctness against known
   histograms, neighborhood-floor clamping (`min(F_ch, F_blk + 3dB)`),
   startup/warmup behavior, rise/drop boolean correctness at threshold
   boundaries.
-- **`skimmer-engine::track` unit tests**: state machine transitions
+- **`manta-engine::track` unit tests**: state machine transitions
   (promotion at exactly 19 hops, hang timer reset on recovery, GC after 30s
   silence, cap eviction of lowest-SNR track), ownership absorption and
   same-hop tie-break, merge-on-convergence.
@@ -152,8 +152,8 @@ IQ samples → channelizer sliding window → hop slice (HopOutput per hop)
   unrelated fading-robustness pin).
 - **V2**: `#[ignore]` removed; this is the pin-8-tracked case the real
   detector was expected to fix.
-- **V7/V9/V10 golden tests**: added to `skimmer-cli/tests`, using
-  `skimmer-testkit::scene::render_scene`'s existing multi-signal support
+- **V7/V9/V10 golden tests**: added to `manta-cli/tests`, using
+  `manta-testkit::scene::render_scene`'s existing multi-signal support
   (already generic, per sub-project 1's design doc §4 — no testkit changes
   needed for V7; V9/V10 are single-signal).
 - **Pins 9/10 tolerance re-measurement**: with real hysteresis gating
@@ -175,7 +175,7 @@ to run in any order), never the sequential per-hop state-machine bookkeeping
 in `TrackManager::process_hops`, which stays single-threaded and
 hop-ordered. `BTreeMap<u32, Track>` (never `HashMap`) per rule 3. All
 lifecycle timers are hop/ms counters, never wall-clock, per rule 2. No RNG
-anywhere in `skimmer-dsp`/`skimmer-engine`, per rule 1.
+anywhere in `manta-dsp`/`manta-engine`, per rule 1.
 
 ## 6. ROADMAP update
 

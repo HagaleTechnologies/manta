@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement ARCHITECTURE.md §3's SoapySDR `IqSource` (RTL-SDR/Airspy HF+/SDRplay via the `soapysdr` crate), generalize `skimmer_engine::listen`/`soak` to accept any `IqSource`, wire it into the CLI, and add CI coverage — the next M2 remaining sub-project after V8/V8w pileup validation.
+**Goal:** Implement ARCHITECTURE.md §3's SoapySDR `IqSource` (RTL-SDR/Airspy HF+/SDRplay via the `soapysdr` crate), generalize `manta_engine::listen`/`soak` to accept any `IqSource`, wire it into the CLI, and add CI coverage — the next M2 remaining sub-project after V8/V8w pileup validation.
 
-**Architecture:** `skimmer-input` gains a `soapy` feature-gated module wrapping `soapysdr::Device`/`RxStream<Complex32>` directly (no format conversion needed — `Complex32` is SoapySDR's native `CF32`). `skimmer-engine`'s `listen`/`soak` change from a concrete `AudioIqSource` parameter to `Box<dyn IqSource>` (already dyn-compatible) so the CLI can select among file/audio/SoapySDR sources at runtime. `skimmer-cli` gets new `--soapy-*` flags, feature-forwarded.
+**Architecture:** `manta-input` gains a `soapy` feature-gated module wrapping `soapysdr::Device`/`RxStream<Complex32>` directly (no format conversion needed — `Complex32` is SoapySDR's native `CF32`). `manta-engine`'s `listen`/`soak` change from a concrete `AudioIqSource` parameter to `Box<dyn IqSource>` (already dyn-compatible) so the CLI can select among file/audio/SoapySDR sources at runtime. `manta-cli` gets new `--soapy-*` flags, feature-forwarded.
 
-**Tech Stack:** Rust, `soapysdr = "0.5"` (new optional dependency), existing `skimmer-input`/`skimmer-engine`/`skimmer-cli` crates.
+**Tech Stack:** Rust, `soapysdr = "0.5"` (new optional dependency), existing `manta-input`/`manta-engine`/`manta-cli` crates.
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - ARCHITECTURE.md §3: `soapysdr` crate, feature-gated `soapy`. `IqSource` trait: `sample_rate()`, `center_freq_hz()`, `read(&mut [Complex32]) -> Result<usize>`.
 - No RF hardware available anywhere in this environment. Two real, hardware-free error paths were confirmed via spike and must be covered by tests: (1) `driver=rtlsdr` with no device attached — `Device::new()` fails; (2) `type=null` — opens but `rx_stream()` fails with `NotSupported`. The actual `read()`/streaming path has no hardware-free coverage available — do not fake it with a mock; document the gap instead.
 - `Complex32` (`num_complex::Complex<f32>`) is SoapySDR's native `CF32` stream format (confirmed: `unsafe impl StreamSample for Complex<f32>`) — no conversion layer.
-- Real, pre-existing bug in scope for this plan: `crates/skimmer-engine/src/listen.rs` hardcodes `center_freq_hz = 0.0` in both `Channelizer::new(fs, 0.0)` and `TrackManager::new(.., 0.0, ..)` instead of reading `src.center_freq_hz()`. Fix this in Task 2 (the engine-generalization task) — it's harmless today (only `AudioIqSource`, always `0.0`, has ever fed `listen()`) but would silently produce wrong absolute spot frequencies once `SoapySdrIqSource` (real nonzero RF center frequency) can feed it.
+- Real, pre-existing bug in scope for this plan: `crates/manta-engine/src/listen.rs` hardcodes `center_freq_hz = 0.0` in both `Channelizer::new(fs, 0.0)` and `TrackManager::new(.., 0.0, ..)` instead of reading `src.center_freq_hz()`. Fix this in Task 2 (the engine-generalization task) — it's harmless today (only `AudioIqSource`, always `0.0`, has ever fed `listen()`) but would silently produce wrong absolute spot frequencies once `SoapySdrIqSource` (real nonzero RF center frequency) can feed it.
 - Full spec: `docs/superpowers/specs/2026-07-25-m2-soapysdr-input-design.md`.
 - This repo's CI (`.github/workflows/ci.yml`) SHA-pins third-party actions (see existing `actions/checkout@34e114...`, `dtolnay/rust-toolchain@4cda84...`, `Swatinem/rust-cache@42dc69...`) — any new job reuses these exact same pinned actions, doesn't introduce new unpinned ones.
 
@@ -24,12 +24,12 @@
 
 **Files:**
 - Modify: `Cargo.toml` (workspace root — add `soapysdr` to `[workspace.dependencies]`)
-- Modify: `crates/skimmer-input/Cargo.toml` (add optional `soapysdr` dependency + `soapy` feature)
-- Modify: `crates/skimmer-input/src/lib.rs` (add `#[cfg(feature = "soapy")] pub mod soapy;`)
-- Create: `crates/skimmer-input/src/soapy.rs`
+- Modify: `crates/manta-input/Cargo.toml` (add optional `soapysdr` dependency + `soapy` feature)
+- Modify: `crates/manta-input/src/lib.rs` (add `#[cfg(feature = "soapy")] pub mod soapy;`)
+- Create: `crates/manta-input/src/soapy.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_input::IqSource` (existing trait, this crate).
+- Consumes: `manta_input::IqSource` (existing trait, this crate).
 - Produces: `pub struct SoapySdrIqSource` implementing `IqSource`, with `pub fn open(driver_args: &str, fs: f64, center_freq_hz: f64, gain_db: Option<f64>) -> anyhow::Result<Self>`. Used by Task 3 (CLI wiring).
 
 - [ ] **Step 1: Add the dependency**
@@ -40,7 +40,7 @@ In `Cargo.toml` (workspace root), add to `[workspace.dependencies]`:
 soapysdr = "0.5"
 ```
 
-In `crates/skimmer-input/Cargo.toml`, change `[dependencies]`'s `hound = { workspace = true }` line area to add (keep alphabetical-ish ordering, next to the other deps) and add a `[features]` section:
+In `crates/manta-input/Cargo.toml`, change `[dependencies]`'s `hound = { workspace = true }` line area to add (keep alphabetical-ish ordering, next to the other deps) and add a `[features]` section:
 
 ```toml
 [dependencies]
@@ -51,7 +51,7 @@ hound = { workspace = true }
 num-complex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-skimmer-dsp = { workspace = true }
+manta-dsp = { workspace = true }
 soapysdr = { workspace = true, optional = true }
 
 [features]
@@ -60,7 +60,7 @@ soapy = ["dep:soapysdr"]
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `crates/skimmer-input/src/soapy.rs`:
+Create `crates/manta-input/src/soapy.rs`:
 
 ```rust
 //! SoapySDR IQ source (RTL-SDR, Airspy HF+, SDRplay). ARCHITECTURE §3.
@@ -83,7 +83,7 @@ pub struct SoapySdrIqSource {
 
 /// Read timeout, microseconds. Short enough that a caller polling a stop
 /// signal between `read()` calls (matching `AudioIqSource`/`ctrlc`'s pattern
-/// in `skimmer-cli`) stays responsive; long enough not to busy-loop on an
+/// in `manta-cli`) stays responsive; long enough not to busy-loop on an
 /// idle stream.
 const TIMEOUT_US: i64 = 100_000;
 
@@ -172,7 +172,7 @@ mod tests {
 
 - [ ] **Step 3: Wire the module into the crate**
 
-In `crates/skimmer-input/src/lib.rs`, add after the existing `pub mod audio;`/`pub use audio::...` lines:
+In `crates/manta-input/src/lib.rs`, add after the existing `pub mod audio;`/`pub use audio::...` lines:
 
 ```rust
 #[cfg(feature = "soapy")]
@@ -183,7 +183,7 @@ pub use soapy::SoapySdrIqSource;
 
 - [ ] **Step 4: Run the tests to verify they fail, then implement, then pass**
 
-Run: `cargo test -p skimmer-input --features soapy soapy:: -- --nocapture`
+Run: `cargo test -p manta-input --features soapy soapy:: -- --nocapture`
 Expected first (before Step 2's implementation code exists — if you're following strict TDD, write the tests against a stub `open()` that does `todo!()` first): FAIL to compile or `todo!()` panic.
 
 After implementing per Step 2's full code: run the same command again.
@@ -191,18 +191,18 @@ Expected: both tests pass. Both are REAL runs against the real, installed SoapyS
 
 - [ ] **Step 5: Verify the default (non-soapy) build is untouched**
 
-Run: `cargo build -p skimmer-input` (no `--features soapy`) and `cargo clippy -p skimmer-input --all-targets -- -D warnings` (no `--features soapy`).
+Run: `cargo build -p manta-input` (no `--features soapy`) and `cargo clippy -p manta-input --all-targets -- -D warnings` (no `--features soapy`).
 Expected: both succeed with no reference to `soapysdr` at all — confirms the feature gate actually keeps the native dependency out of the default build path.
 
 - [ ] **Step 6: Run clippy/fmt with the feature enabled**
 
-Run: `cargo clippy -p skimmer-input --all-targets --features soapy -- -D warnings` and `cargo fmt -p skimmer-input --check`.
+Run: `cargo clippy -p manta-input --all-targets --features soapy -- -D warnings` and `cargo fmt -p manta-input --check`.
 Expected: both clean.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add Cargo.toml crates/skimmer-input/Cargo.toml crates/skimmer-input/src/lib.rs crates/skimmer-input/src/soapy.rs
+git add Cargo.toml crates/manta-input/Cargo.toml crates/manta-input/src/lib.rs crates/manta-input/src/soapy.rs
 git commit -m "feat(input): SoapySDR IqSource behind --features soapy"
 ```
 
@@ -211,32 +211,32 @@ git commit -m "feat(input): SoapySDR IqSource behind --features soapy"
 ### Task 2: Engine generalization (`Box<dyn IqSource>`) + `center_freq_hz` fix
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/listen.rs`
-- Modify: `crates/skimmer-engine/src/soak.rs`
-- Modify: `crates/skimmer-engine/tests/listen_audio.rs` (existing call site)
-- Modify: `crates/skimmer-cli/tests/soak_ci.rs` (existing call site)
-- Modify: `crates/skimmer-cli/src/main.rs` (existing call sites — kept compiling; NEW `--soapy-*` flags are Task 3's job, not this one)
+- Modify: `crates/manta-engine/src/listen.rs`
+- Modify: `crates/manta-engine/src/soak.rs`
+- Modify: `crates/manta-engine/tests/listen_audio.rs` (existing call site)
+- Modify: `crates/manta-cli/tests/soak_ci.rs` (existing call site)
+- Modify: `crates/manta-cli/src/main.rs` (existing call sites — kept compiling; NEW `--soapy-*` flags are Task 3's job, not this one)
 
 **Interfaces:**
-- Consumes: `skimmer_input::IqSource` (dyn-compatible, confirmed: no generics, no `Self`-returning methods).
+- Consumes: `manta_input::IqSource` (dyn-compatible, confirmed: no generics, no `Self`-returning methods).
 - Produces: `pub fn listen(mut src: Box<dyn IqSource>, cfg: &PipelineConfig, stop: Arc<AtomicBool>, on_event: impl FnMut(&DecoderEvent)) -> Result<()>`, `pub fn soak(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) -> Result<SoakReport>`. Used by Task 3.
 
 - [ ] **Step 1: Write/update the failing tests**
 
-In `crates/skimmer-engine/src/soak.rs`'s existing `#[cfg(test)] mod tests` block, add an explicit `use skimmer_input::AudioIqSource;` (the test needs it directly now — Step 3 below removes `soak.rs`'s top-level `use skimmer_input::AudioIqSource;`, since the non-test body no longer references the concrete type, only `use super::*;` won't bring it back):
+In `crates/manta-engine/src/soak.rs`'s existing `#[cfg(test)] mod tests` block, add an explicit `use manta_input::AudioIqSource;` (the test needs it directly now — Step 3 below removes `soak.rs`'s top-level `use manta_input::AudioIqSource;`, since the non-test body no longer references the concrete type, only `use super::*;` won't bring it back):
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skimmer_input::AudioIqSource;
+    use manta_input::AudioIqSource;
 
     #[test]
     fn soak_reports_no_panic_on_a_clean_short_signal() {
-        let fs = skimmer_input::TARGET_RATE_HZ;
-        let spec = skimmer_testkit::keyer::KeyerSpec::new(20.0);
+        let fs = manta_input::TARGET_RATE_HZ;
+        let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
         let (env, _) =
-            skimmer_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 8.0)
+            manta_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 8.0)
                 .unwrap();
         let mut real = vec![0.0f32; env.len()];
         let dphi = std::f64::consts::TAU * 700.0 / fs as f64;
@@ -245,7 +245,7 @@ mod tests {
             *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
             phi += dphi;
         }
-        let src: Box<dyn skimmer_input::IqSource> = Box::new(
+        let src: Box<dyn manta_input::IqSource> = Box::new(
             AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap(),
         );
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
@@ -257,7 +257,7 @@ mod tests {
 
 This replaces `soak.rs`'s entire existing `#[cfg(test)] mod tests { ... }` block (it currently has exactly this one test and nothing else) — not an insertion alongside other content.
 
-Also add a new test to `crates/skimmer-engine/src/listen.rs`'s (currently nonexistent) `#[cfg(test)] mod tests` at the end of the file, proving the `center_freq_hz` fix with a minimal test-only `IqSource` that reports a nonzero center frequency:
+Also add a new test to `crates/manta-engine/src/listen.rs`'s (currently nonexistent) `#[cfg(test)] mod tests` at the end of the file, proving the `center_freq_hz` fix with a minimal test-only `IqSource` that reports a nonzero center frequency:
 
 ```rust
 #[cfg(test)]
@@ -275,7 +275,7 @@ mod tests {
         center_freq_hz: f64,
     }
 
-    impl skimmer_input::IqSource for FixedFreqSource {
+    impl manta_input::IqSource for FixedFreqSource {
         fn sample_rate(&self) -> f64 {
             self.fs
         }
@@ -296,9 +296,9 @@ mod tests {
         // a source that reports a nonzero center_freq_hz -- if listen() were
         // still hardcoding 0.0, every TrackMeta.freq_hz would come back as
         // just the +12.34 kHz baseband offset, not centered on 14 MHz.
-        let spec = skimmer_testkit::vectors::v1();
-        let rendered = skimmer_testkit::vectors::render(&spec).unwrap();
-        let src: Box<dyn skimmer_input::IqSource> = Box::new(FixedFreqSource {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
             samples: rendered.samples,
             cursor: 0,
             fs: spec.fs,
@@ -327,17 +327,17 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p skimmer-engine --lib` and `cargo test -p skimmer-cli --test soak_ci` (this second one will fail to *compile* right now, since Step 1 already changed its source to a boxed type but `soak()`'s signature hasn't changed yet).
+Run: `cargo test -p manta-engine --lib` and `cargo test -p manta-cli --test soak_ci` (this second one will fail to *compile* right now, since Step 1 already changed its source to a boxed type but `soak()`'s signature hasn't changed yet).
 Expected: compile errors (signature mismatch) — confirms the tests are actually exercising the not-yet-changed signatures.
 
 - [ ] **Step 3: Change the signatures and fix the `center_freq_hz` bug**
 
-In `crates/skimmer-engine/src/listen.rs`, change the imports and signature:
+In `crates/manta-engine/src/listen.rs`, change the imports and signature:
 
 ```rust
-use skimmer_input::IqSource;
+use manta_input::IqSource;
 ```
-(replace the existing `use skimmer_input::{AudioIqSource, IqSource};` — `AudioIqSource` is no longer referenced directly in this file)
+(replace the existing `use manta_input::{AudioIqSource, IqSource};` — `AudioIqSource` is no longer referenced directly in this file)
 
 ```rust
 pub fn listen(
@@ -354,7 +354,7 @@ and change both constructor calls below it from the literal `0.0` to `center_fre
 
 ```rust
     let mut ch =
-        skimmer_dsp::channelizer::Channelizer::new(fs, center_freq_hz).map_err(|e| anyhow::anyhow!(e))?;
+        manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz).map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
     let mut tm = crate::track::TrackManager::new(
         ch.n_channels(),
@@ -365,12 +365,12 @@ and change both constructor calls below it from the literal `0.0` to `center_fre
     );
 ```
 
-In `crates/skimmer-engine/src/soak.rs`, change the import and signature:
+In `crates/manta-engine/src/soak.rs`, change the import and signature:
 
 ```rust
-use skimmer_input::IqSource;
+use manta_input::IqSource;
 ```
-(replace `use skimmer_input::AudioIqSource;`)
+(replace `use manta_input::AudioIqSource;`)
 
 ```rust
 pub fn soak(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) -> Result<SoakReport> {
@@ -380,67 +380,67 @@ pub fn soak(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) ->
 
 - [ ] **Step 4: Fix the existing call sites so the workspace compiles**
 
-In `crates/skimmer-engine/tests/listen_audio.rs`, change:
+In `crates/manta-engine/tests/listen_audio.rs`, change:
 ```rust
     let src =
         AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap();
 ```
 to:
 ```rust
-    let src: Box<dyn skimmer_input::IqSource> = Box::new(
+    let src: Box<dyn manta_input::IqSource> = Box::new(
         AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap(),
     );
 ```
 
-In `crates/skimmer-cli/tests/soak_ci.rs`, change:
+In `crates/manta-cli/tests/soak_ci.rs`, change:
 ```rust
     let src = AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap();
     let report = soak(src, &PipelineConfig::default(), Duration::from_secs(120)).unwrap();
 ```
 to:
 ```rust
-    let src: Box<dyn skimmer_input::IqSource> =
+    let src: Box<dyn manta_input::IqSource> =
         Box::new(AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap());
     let report = soak(src, &PipelineConfig::default(), Duration::from_secs(120)).unwrap();
 ```
 
-In `crates/skimmer-cli/src/main.rs`, the two existing call sites need their already-constructed `src` boxed before the call (this is NOT adding the new `--soapy-*` flags — that's Task 3 — just keeping the existing `--device`/`--source` paths compiling against the new signature):
+In `crates/manta-cli/src/main.rs`, the two existing call sites need their already-constructed `src` boxed before the call (this is NOT adding the new `--soapy-*` flags — that's Task 3 — just keeping the existing `--device`/`--source` paths compiling against the new signature):
 
 In `Command::Listen`'s handler, change:
 ```rust
             let src = match source {
-                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
-                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+                Some(path) => manta_input::AudioIqSource::from_wav_file(&path)?,
+                None => manta_input::AudioIqSource::from_device(device.as_deref())?,
             };
 ```
 to:
 ```rust
-            let src: Box<dyn skimmer_input::IqSource> = match source {
-                Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
-                None => Box::new(skimmer_input::AudioIqSource::from_device(device.as_deref())?),
+            let src: Box<dyn manta_input::IqSource> = match source {
+                Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+                None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
             };
 ```
 
 In `Command::Soak`'s handler, change:
 ```rust
             let src = match source {
-                Some(path) => skimmer_input::AudioIqSource::from_wav_file(&path)?,
-                None => skimmer_input::AudioIqSource::from_device(device.as_deref())?,
+                Some(path) => manta_input::AudioIqSource::from_wav_file(&path)?,
+                None => manta_input::AudioIqSource::from_device(device.as_deref())?,
             };
 ```
 to the same pattern:
 ```rust
-            let src: Box<dyn skimmer_input::IqSource> = match source {
-                Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
-                None => Box::new(skimmer_input::AudioIqSource::from_device(device.as_deref())?),
+            let src: Box<dyn manta_input::IqSource> = match source {
+                Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+                None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
             };
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p skimmer-engine --lib` — expect `listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero` and the updated `soak_reports_no_panic_on_a_clean_short_signal` both pass.
-Run: `cargo test -p skimmer-cli --test soak_ci` — expect pass.
-Run: `cargo build -p skimmer-cli` — expect clean compile (confirms `main.rs`'s two updated call sites are correct).
+Run: `cargo test -p manta-engine --lib` — expect `listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero` and the updated `soak_reports_no_panic_on_a_clean_short_signal` both pass.
+Run: `cargo test -p manta-cli --test soak_ci` — expect pass.
+Run: `cargo build -p manta-cli` — expect clean compile (confirms `main.rs`'s two updated call sites are correct).
 
 - [ ] **Step 6: Run the full workspace test suite and clippy**
 
@@ -450,7 +450,7 @@ Run: `cargo clippy --workspace --all-targets -- -D warnings`. Expect clean.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/listen.rs crates/skimmer-engine/src/soak.rs crates/skimmer-engine/tests/listen_audio.rs crates/skimmer-cli/tests/soak_ci.rs crates/skimmer-cli/src/main.rs
+git add crates/manta-engine/src/listen.rs crates/manta-engine/src/soak.rs crates/manta-engine/tests/listen_audio.rs crates/manta-cli/tests/soak_ci.rs crates/manta-cli/src/main.rs
 git commit -m "feat(engine): generalize listen()/soak() to Box<dyn IqSource>, fix hardcoded center_freq_hz=0.0"
 ```
 
@@ -459,24 +459,24 @@ git commit -m "feat(engine): generalize listen()/soak() to Box<dyn IqSource>, fi
 ### Task 3: CLI wiring
 
 **Files:**
-- Modify: `crates/skimmer-cli/Cargo.toml` (add `soapy` feature forwarding)
-- Modify: `crates/skimmer-cli/src/main.rs` (new `--soapy-*` flags, dispatch)
+- Modify: `crates/manta-cli/Cargo.toml` (add `soapy` feature forwarding)
+- Modify: `crates/manta-cli/src/main.rs` (new `--soapy-*` flags, dispatch)
 
 **Interfaces:**
-- Consumes: `skimmer_input::soapy::SoapySdrIqSource::open(driver_args: &str, fs: f64, center_freq_hz: f64, gain_db: Option<f64>) -> Result<Self>` (Task 1), `skimmer_engine::{listen, soak}` now taking `Box<dyn IqSource>` (Task 2).
+- Consumes: `manta_input::soapy::SoapySdrIqSource::open(driver_args: &str, fs: f64, center_freq_hz: f64, gain_db: Option<f64>) -> Result<Self>` (Task 1), `manta_engine::{listen, soak}` now taking `Box<dyn IqSource>` (Task 2).
 
 - [ ] **Step 1: Add feature forwarding**
 
-In `crates/skimmer-cli/Cargo.toml`, add:
+In `crates/manta-cli/Cargo.toml`, add:
 
 ```toml
 [features]
-soapy = ["skimmer-input/soapy"]
+soapy = ["manta-input/soapy"]
 ```
 
 - [ ] **Step 2: Add the CLI flags**
 
-In `crates/skimmer-cli/src/main.rs`, add to both `Command::Listen` and `Command::Soak` variants (after their existing `device`/`source` fields):
+In `crates/manta-cli/src/main.rs`, add to both `Command::Listen` and `Command::Soak` variants (after their existing `device`/`source` fields):
 
 ```rust
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
@@ -511,7 +511,7 @@ use anyhow::{anyhow, bail, Result};
 Then add, near the top of `main.rs` (after the imports, before `fn main()`):
 
 ```rust
-use skimmer_input::IqSource;
+use manta_input::IqSource;
 
 #[cfg(feature = "soapy")]
 fn open_source(
@@ -525,7 +525,7 @@ fn open_source(
     if let Some(driver) = soapy_driver {
         let freq = soapy_freq.ok_or_else(|| anyhow!("--soapy-freq is required with --soapy-driver"))?;
         let rate = soapy_rate.ok_or_else(|| anyhow!("--soapy-rate is required with --soapy-driver"))?;
-        return Ok(Box::new(skimmer_input::soapy::SoapySdrIqSource::open(
+        return Ok(Box::new(manta_input::soapy::SoapySdrIqSource::open(
             &driver, rate, freq, soapy_gain,
         )?));
     }
@@ -539,15 +539,15 @@ fn open_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dy
 
 fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
-        Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
-        None => Box::new(skimmer_input::AudioIqSource::from_device(device.as_deref())?),
+        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+        None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
 }
 ```
 
 - [ ] **Step 4: Wire the dispatch**
 
-In `Command::Listen`'s handler, replace the (Task 2's Step 4) `let src: Box<dyn skimmer_input::IqSource> = match source { ... };` block with:
+In `Command::Listen`'s handler, replace the (Task 2's Step 4) `let src: Box<dyn manta_input::IqSource> = match source { ... };` block with:
 
 ```rust
             #[cfg(feature = "soapy")]
@@ -580,18 +580,18 @@ and analogously for `Command::Soak { duration, device, source, #[cfg(feature = "
 
 - [ ] **Step 5: Build both ways**
 
-Run: `cargo build -p skimmer-cli` (no feature) — expect clean, `--help` shows no `--soapy-*` flags (spot-check: `./target/debug/skimmer listen --help` should not mention `soapy`).
-Run: `cargo build -p skimmer-cli --features soapy` — expect clean, `--help` on this build DOES show the new flags.
+Run: `cargo build -p manta-cli` (no feature) — expect clean, `--help` shows no `--soapy-*` flags (spot-check: `./target/debug/manta listen --help` should not mention `soapy`).
+Run: `cargo build -p manta-cli --features soapy` — expect clean, `--help` on this build DOES show the new flags.
 
 - [ ] **Step 6: Write a CLI-level test for the validation error**
 
-Add to `crates/skimmer-cli/tests/cli.rs` (read the existing file first to match its conventions — likely uses `assert_cmd`-style `Command::new(env!("CARGO_BIN_EXE_skimmer"))` per this repo's established pattern seen in the golden tests):
+Add to `crates/manta-cli/tests/cli.rs` (read the existing file first to match its conventions — likely uses `assert_cmd`-style `Command::new(env!("CARGO_BIN_EXE_manta"))` per this repo's established pattern seen in the golden tests):
 
 ```rust
 #[test]
 #[cfg(feature = "soapy")]
 fn soapy_driver_without_freq_and_rate_is_a_clean_error() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["listen", "--soapy-driver", "driver=rtlsdr"])
         .output()
         .unwrap();
@@ -607,7 +607,7 @@ fn soapy_driver_without_freq_and_rate_is_a_clean_error() {
 }
 ```
 
-Run: `cargo test -p skimmer-cli --features soapy soapy_driver_without` — expect pass. (This test doesn't exist/compile without the feature, matching the same `#[cfg(feature = "soapy")]` gating as the CLI flags themselves.)
+Run: `cargo test -p manta-cli --features soapy soapy_driver_without` — expect pass. (This test doesn't exist/compile without the feature, matching the same `#[cfg(feature = "soapy")]` gating as the CLI flags themselves.)
 
 - [ ] **Step 7: Full check**
 
@@ -615,16 +615,16 @@ Run:
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy -- -D warnings
+cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
 cargo test --workspace
-cargo test -p skimmer-input -p skimmer-cli --features soapy
+cargo test -p manta-input -p manta-cli --features soapy
 ```
 All must be clean.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/skimmer-cli/Cargo.toml crates/skimmer-cli/src/main.rs crates/skimmer-cli/tests/cli.rs
+git add crates/manta-cli/Cargo.toml crates/manta-cli/src/main.rs crates/manta-cli/tests/cli.rs
 git commit -m "feat(cli): wire --soapy-driver/--soapy-freq/--soapy-rate/--soapy-gain into listen/soak"
 ```
 
@@ -659,26 +659,26 @@ In `.github/workflows/ci.yml`, add a new job after the existing `test` job (same
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2.9.1
-      - run: cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy -- -D warnings
-      - run: cargo test -p skimmer-input -p skimmer-cli --features soapy
+      - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
+      - run: cargo test -p manta-input -p manta-cli --features soapy
 ```
 
-(`libasound2-dev` is repeated from the existing Linux step because `skimmer-input`/`skimmer-cli` still pull in `cpal`/`coppa-audio` regardless of the `soapy` feature — this job needs the same audio build deps as the default job, plus `libsoapysdr-dev`.)
+(`libasound2-dev` is repeated from the existing Linux step because `manta-input`/`manta-cli` still pull in `cpal`/`coppa-audio` regardless of the `soapy` feature — this job needs the same audio build deps as the default job, plus `libsoapysdr-dev`.)
 
 - [ ] **Step 2: Validate the job's commands locally**
 
 This machine already has `soapysdr`/`pkg-config` installed (from this plan's brainstorming phase) — run the exact commands the new job runs, to catch any issue before it only surfaces in CI:
 
 ```
-cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy -- -D warnings
-cargo test -p skimmer-input -p skimmer-cli --features soapy
+cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
+cargo test -p manta-input -p manta-cli --features soapy
 ```
 
 Both must be clean/passing (they should already be, from Tasks 1 and 3's own verification — this step is a final confirmation of the exact CI command line, not new work).
 
 - [ ] **Step 3: Validate YAML syntax**
 
-Run: `cd /Users/thagale/Code/skimmer/.claude/worktrees/m2-soapysdr-input && python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))" ` (or any available YAML linter) to catch indentation errors before pushing — GitHub Actions failures from bad YAML are otherwise only visible after a push.
+Run: `cd /Users/thagale/Code/manta/.claude/worktrees/m2-soapysdr-input && python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))" ` (or any available YAML linter) to catch indentation errors before pushing — GitHub Actions failures from bad YAML are otherwise only visible after a push.
 
 - [ ] **Step 4: Commit**
 
@@ -723,9 +723,9 @@ Run, in order:
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy -- -D warnings
+cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
 cargo test --workspace
-cargo test -p skimmer-input -p skimmer-cli --features soapy
+cargo test -p manta-input -p manta-cli --features soapy
 ```
 All five must be clean.
 
@@ -743,8 +743,8 @@ git push -u origin feat/m2-soapysdr-input
 gh pr create --title "feat(input,engine,cli): M2 SoapySDR input (RTL-SDR/Airspy HF+/SDRplay)" --body "$(cat <<'EOF'
 ## Summary
 
-- ARCHITECTURE.md §3 SoapySDR IqSource (crates/skimmer-input/src/soapy.rs), feature-gated `soapy`.
-- skimmer_engine::listen()/soak() generalized from AudioIqSource to Box<dyn IqSource>.
+- ARCHITECTURE.md §3 SoapySDR IqSource (crates/manta-input/src/soapy.rs), feature-gated `soapy`.
+- manta_engine::listen()/soak() generalized from AudioIqSource to Box<dyn IqSource>.
 - Fixed a real pre-existing bug: listen() hardcoded center_freq_hz=0.0 instead of reading it from the source.
 - CLI --soapy-driver/--soapy-freq/--soapy-rate/--soapy-gain flags on listen/soak.
 - New CI job building/testing --features soapy on ubuntu-latest + macos-latest.
@@ -759,9 +759,9 @@ No RF hardware was available anywhere in this environment. Two real, hardware-fr
 
 - [x] cargo fmt --all --check
 - [x] cargo clippy --workspace --all-targets -- -D warnings
-- [x] cargo clippy -p skimmer-input -p skimmer-cli --all-targets --features soapy -- -D warnings
+- [x] cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
 - [x] cargo test --workspace
-- [x] cargo test -p skimmer-input -p skimmer-cli --features soapy
+- [x] cargo test -p manta-input -p manta-cli --features soapy
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF

@@ -21,8 +21,8 @@ The channelizer is a 4×-oversampled polyphase filterbank (PFB) that splits the 
 
 - Polyphase FIR commutator + one N-point FFT per hop, via `coppa-dsp::fft::FftProcessor` (reused — see [[coppa-reuse]]).
 - N scales with input rate to hold channel spacing near 100 Hz; the exact N table and hop are in SPEC §1.1.
-- Prototype lowpass is a Kaiser-designed FIR — **new code** in `skimmer-dsp::proto`, not from coppa (SPEC §1.2, §10.1).
-- Fine frequency estimate (for ±10 Hz spot accuracy) lands in `skimmer-dsp::centroid`, per SPEC §1.4.
+- Prototype lowpass is a Kaiser-designed FIR — **new code** in `manta-dsp::proto`, not from coppa (SPEC §1.2, §10.1).
+- Fine frequency estimate (for ±10 Hz spot accuracy) lands in `manta-dsp::centroid`, per SPEC §1.4.
 - Module map: SPEC §8 pins each spec section to its crate::module.
 
 ## Why it is shaped this way

@@ -1,6 +1,6 @@
 ---
 id: spot-validation
-title: How does skimmer decide a decoded call is trustworthy enough to spot?
+title: How does manta decide a decoded call is trustworthy enough to spot?
 kind: subsystem
 status: current
 maintainer: agent
@@ -13,7 +13,7 @@ links:
   - decode-chain
   - spot-output-contract
 ---
-Decoded CW text is noisy, so validation — not decoding — is what makes a spot trustworthy. Per track, over a rolling text window, `skimmer-spot` parses CQ/DE context, checks callsign plausibility against a bundled cty.dat prefix list, optionally cross-checks the SCP super-check-partial list, requires a call to repeat before first spot, and dedupes/aggregates re-spots. The full pipeline and its parameters are described in ARCHITECTURE §6 — this page is the map, not the spec.
+Decoded CW text is noisy, so validation — not decoding — is what makes a spot trustworthy. Per track, over a rolling text window, `manta-spot` parses CQ/DE context, checks callsign plausibility against a bundled cty.dat prefix list, optionally cross-checks the SCP super-check-partial list, requires a call to repeat before first spot, and dedupes/aggregates re-spots. The full pipeline and its parameters are described in ARCHITECTURE §6 — this page is the map, not the spec.
 
 ## How it works
 

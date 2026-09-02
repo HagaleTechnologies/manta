@@ -4,7 +4,7 @@ Design for the first of M2's independent sub-projects (ROADMAP.md "M2 —
 Wideband: PFB + detector + decoder pool" decomposes into: **1) PFB
 channelizer** (this doc), 2) detector + track manager, 3) decoder pool, 4)
 SoapySDR input, 5) KiwiSDR input). This sub-project builds the real
-N-channel polyphase filterbank and swaps it into `skimmer-engine`, replacing
+N-channel polyphase filterbank and swaps it into `manta-engine`, replacing
 the M0/M1 single-channel shim — without yet building the real detector or
 multi-track pool.
 
@@ -12,10 +12,10 @@ multi-track pool.
 
 In scope:
 
-- New `skimmer-dsp` module implementing the WOLA polyphase filterbank per
+- New `manta-dsp` module implementing the WOLA polyphase filterbank per
   SPEC-decode-core.md §1 (§1.1 dimensions, §1.2 prototype reuse, §1.3
   per-hop WOLA/FFT/power, §1.4 fine-frequency interpolation).
-- Wiring into `skimmer-engine`'s batch (`decode_wav`) and streaming
+- Wiring into `manta-engine`'s batch (`decode_wav`) and streaming
   (`listen`) paths: the channelizer runs continuously over all N channels;
   a **placeholder detector** (one-time calibration-window peak search over
   real per-channel power, replacing `estimate_peak_hz`'s periodogram) picks
@@ -34,23 +34,23 @@ Explicitly out of scope (later M2 sub-projects):
   placeholder detector here is deliberately minimal: pick the loudest
   channel once, not a real multi-track detector.
 - The decoder pool (multiple concurrent `TrackDecoder`s, one per active
-  track) — `skimmer-engine` keeps decoding exactly one track, same as
+  track) — `manta-engine` keeps decoding exactly one track, same as
   today.
 - SoapySDR/KiwiSDR input, and the CPU-budget criterion bench (SPEC's
   "300 active tracks" gate needs the decoder pool to mean anything).
-- Deleting `skimmer-dsp::single`/`freqest` — deprecated in place (§6),
+- Deleting `manta-dsp::single`/`freqest` — deprecated in place (§6),
   revisit pruning later once the new path has proven itself.
 
 ## 2. Components
 
-### `skimmer-dsp::channelizer` (new)
+### `manta-dsp::channelizer` (new)
 
 Owns the WOLA polyphase filterbank, per SPEC §1.1–§1.3:
 
 - **Dimensions** (§1.1): `N = fs / 93.75` (a power of two for all supported
   table rates — 1024 at 96 kS/s, 2048 at 192 kS/s, etc.), `hop = N/4`,
   output rate `fo = 375 Hz` invariant across input rates.
-- **Prototype filter** (§1.2): reuses `skimmer_dsp::proto::design_prototype`
+- **Prototype filter** (§1.2): reuses `manta_dsp::proto::design_prototype`
   unchanged — it was already written channel-count-generically at M0
   (`design_prototype(n_channels, taps_per_branch)`), so no new filter-design
   code is needed, only a new *consumer* of it (the M0 shim used it for one
@@ -71,7 +71,7 @@ Owns the WOLA polyphase filterbank, per SPEC §1.1–§1.3:
   primitive only; accumulating it into a track-lifetime centroid `C` is the
   track manager's job (a later sub-project) — out of scope here.
 
-### Placeholder detector (in `skimmer-engine`)
+### Placeholder detector (in `manta-engine`)
 
 A deliberately minimal stand-in for SPEC §2's real detector, scoped to keep
 today's single-track decode path working through the new channelizer:
@@ -89,7 +89,7 @@ today's single-track decode path working through the new channelizer:
   picks one channel once and never re-evaluates. Multi-track, re-detection,
   and QSB-survival-via-hysteresis are the next sub-project's job.
 
-### `skimmer-engine` wiring
+### `manta-engine` wiring
 
 `decode_samples`/`decode_wav` (M0 batch) and `listen` (M1 streaming) both
 currently build a `SingleChannelExtractor` from a periodogram-estimated
@@ -115,7 +115,7 @@ IQ samples → channelizer sliding window
 - **V1–V6 regression**: must pass unchanged through the new channelizer +
   placeholder-detector path — proof the swap is behaviorally transparent
   for the single-signal case these vectors already cover.
-- **New multi-signal wideband scenes**: `skimmer-testkit::scene::render_scene`
+- **New multi-signal wideband scenes**: `manta-testkit::scene::render_scene`
   already accepts multiple simultaneous `SignalSpec` entries (built
   generically at M0, never exercised with >1 signal until now). Add 2-4
   new test scenes with multiple signals at distinct offsets/SNRs in one
@@ -142,11 +142,11 @@ accumulation and the fine-frequency interpolator's arithmetic run in `f64`
 per the project's existing per-sample-`f32`/long-accumulation-`f64`
 convention.
 
-## 6. Deprecation of `skimmer-dsp::single`/`freqest`
+## 6. Deprecation of `manta-dsp::single`/`freqest`
 
 Per Tony's decision: do not delete these M0 modules when the engine stops
 using them. Mark both clearly deprecated (module-level doc comment stating
-they're superseded by `skimmer-dsp::channelizer` as of this sub-project,
+they're superseded by `manta-dsp::channelizer` as of this sub-project,
 kept only for reference/fallback) and leave them compiled and tested as-is.
 Revisit actual removal after the new path has run cleanly for a few months
 — tracked as a follow-up, not an open question in this spec.

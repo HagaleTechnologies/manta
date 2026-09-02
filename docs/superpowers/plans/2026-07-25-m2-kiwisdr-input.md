@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement ARCHITECTURE.md §3's KiwiSDR websocket IQ client (`skimmer-input::kiwi::KiwiIqSource`), generalize `skimmer_engine::listen`/`soak` to accept any `IqSource`, wire it into the CLI — the last of M2's remaining sub-projects.
+**Goal:** Implement ARCHITECTURE.md §3's KiwiSDR websocket IQ client (`manta-input::kiwi::KiwiIqSource`), generalize `manta_engine::listen`/`soak` to accept any `IqSource`, wire it into the CLI — the last of M2's remaining sub-projects.
 
-**Architecture:** `skimmer-input` gains an unconditional (no feature gate — pure Rust, no native library) `kiwi` module: a synchronous `tungstenite` WebSocket client implementing the real, live-verified KiwiSDR wire protocol (handshake, binary `MSG`/`SND` frame parsing), feeding a `rubato`-based rational resampler (the real device rate, e.g. ~11999 Hz, is not a clean fraction of any SPEC §1.1 table rate and needs genuine resampling, not simple decimation) to produce 96 kHz `Complex32` samples. `skimmer_engine::listen`/`soak` change from a concrete `AudioIqSource` parameter to `Box<dyn IqSource>` (same generalization as the — separate, unmerged — SoapySDR PR #30, redone independently here per this repo's "always branch fresh from origin/main" hygiene).
+**Architecture:** `manta-input` gains an unconditional (no feature gate — pure Rust, no native library) `kiwi` module: a synchronous `tungstenite` WebSocket client implementing the real, live-verified KiwiSDR wire protocol (handshake, binary `MSG`/`SND` frame parsing), feeding a `rubato`-based rational resampler (the real device rate, e.g. ~11999 Hz, is not a clean fraction of any SPEC §1.1 table rate and needs genuine resampling, not simple decimation) to produce 96 kHz `Complex32` samples. `manta_engine::listen`/`soak` change from a concrete `AudioIqSource` parameter to `Box<dyn IqSource>` (same generalization as the — separate, unmerged — SoapySDR PR #30, redone independently here per this repo's "always branch fresh from origin/main" hygiene).
 
-**Tech Stack:** Rust, `tungstenite` + `rubato` (new dependencies), existing `skimmer-input`/`skimmer-engine`/`skimmer-cli` crates.
+**Tech Stack:** Rust, `tungstenite` + `rubato` (new dependencies), existing `manta-input`/`manta-engine`/`manta-cli` crates.
 
 ## Global Constraints
 
-- `docs/SPEC-decode-core.md` §1.1: non-power-of-two input rates (KiwiSDR's ~12 kHz IQ) must be rational-resampled in `skimmer-input` to the nearest SPEC table rate (96000/192000/384000/768000 Hz) before reaching the channelizer — use 96000 (the nearest to 12 kHz's natural ~8x ratio).
+- `docs/SPEC-decode-core.md` §1.1: non-power-of-two input rates (KiwiSDR's ~12 kHz IQ) must be rational-resampled in `manta-input` to the nearest SPEC table rate (96000/192000/384000/768000 Hz) before reaching the channelizer — use 96000 (the nearest to 12 kHz's natural ~8x ratio).
 - The real KiwiSDR protocol, verified via a live connection during brainstorming (`docs/superpowers/specs/2026-07-25-m2-kiwisdr-input-design.md` — read this in full before starting, it has the complete real findings):
   - WS URL: `ws://<host>:<port>/<timestamp>/SND`.
   - Handshake (WebSocket **text** frames): `SET auth t=kiwi p=<password>`, `SET mod=iq low_cut=-5000 high_cut=5000 freq=<khz>`, `SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50`, `SET compression=0`.
@@ -21,7 +21,7 @@
 - `rubato = "4.0"`'s `Fft::new` takes `usize` sample rates (round the real fractional rate to the nearest Hz) and needs its own re-exported `rubato::audioadapter_buffers::direct::InterleavedSlice` buffer-wrapper type for `process_into_buffer` — no separate `audioadapter`/`audioadapter-buffers` Cargo.toml entries needed, `rubato` re-exports both.
 - Real, live-confirmed finding: feeding the resampler in KiwiSDR's native 512-sample SND-frame chunks produces a 48,000-output-sample (0.5s) delay with **zero** output after 6 consecutive chunks. The resampler's chunk size must be decoupled from the raw per-SND-frame sample count via a separate raw-sample accumulation buffer — Task 1 tunes the actual `RESAMPLER_CHUNK` value empirically.
 - No feature gate needed (unlike `soapy`) — `tungstenite`/`rubato` are pure Rust with no system library dependency, so no new CI job is needed either; the existing default `test` job already covers this.
-- Real, pre-existing bug (same one fixed independently in the unmerged SoapySDR PR #30 — this branch doesn't have that fix, redo it here): `crates/skimmer-engine/src/listen.rs` hardcodes `center_freq_hz = 0.0` in both `Channelizer::new(fs, 0.0)` and `TrackManager::new(.., 0.0, ..)` instead of reading `src.center_freq_hz()`. Fix in Task 2.
+- Real, pre-existing bug (same one fixed independently in the unmerged SoapySDR PR #30 — this branch doesn't have that fix, redo it here): `crates/manta-engine/src/listen.rs` hardcodes `center_freq_hz = 0.0` in both `Channelizer::new(fs, 0.0)` and `TrackManager::new(.., 0.0, ..)` instead of reading `src.center_freq_hz()`. Fix in Task 2.
 - Full design spec: `docs/superpowers/specs/2026-07-25-m2-kiwisdr-input-design.md`.
 - A real public KiwiSDR receiver is available for genuine integration testing (unlike SoapySDR, which had no real hardware at all) — use it, `#[ignore]`d by default (network-dependent, third-party infrastructure, not for default `cargo test`/CI).
 
@@ -31,12 +31,12 @@
 
 **Files:**
 - Modify: `Cargo.toml` (workspace root — add `tungstenite` and `rubato` to `[workspace.dependencies]`)
-- Modify: `crates/skimmer-input/Cargo.toml` (add both as regular, unconditional dependencies — no feature gate)
-- Modify: `crates/skimmer-input/src/lib.rs` (add `pub mod kiwi;`, no `#[cfg(...)]`)
-- Create: `crates/skimmer-input/src/kiwi.rs`
+- Modify: `crates/manta-input/Cargo.toml` (add both as regular, unconditional dependencies — no feature gate)
+- Modify: `crates/manta-input/src/lib.rs` (add `pub mod kiwi;`, no `#[cfg(...)]`)
+- Create: `crates/manta-input/src/kiwi.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_input::IqSource` (existing trait, this crate).
+- Consumes: `manta_input::IqSource` (existing trait, this crate).
 - Produces: `pub struct KiwiIqSource` implementing `IqSource`, with `pub fn connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> anyhow::Result<Self>`. Used by Task 3 (CLI wiring).
 
 - [ ] **Step 1: Re-verify the SND frame byte layout with a fresh live capture**
@@ -58,7 +58,7 @@ tungstenite = "0.24"
 rubato = "4.0"
 ```
 
-In `crates/skimmer-input/Cargo.toml`, add to `[dependencies]` (no feature gate — these are pure Rust, no system library):
+In `crates/manta-input/Cargo.toml`, add to `[dependencies]` (no feature gate — these are pure Rust, no system library):
 
 ```toml
 tungstenite = { workspace = true }
@@ -67,8 +67,8 @@ rubato = { workspace = true }
 
 - [ ] **Step 3: Implement the connection/handshake**
 
-Create `crates/skimmer-input/src/kiwi.rs`. Implement `KiwiIqSource::connect()`:
-1. `std::net::TcpStream::connect((host, port))`, then `.set_read_timeout(Some(Duration::from_millis(...)))` — pick a value that keeps `read()` responsive (matches `SoapySdrIqSource`'s `TIMEOUT_US` reasoning in `crates/skimmer-input/src/soapy.rs` from the — unmerged — SoapySDR PR; read that file if it's not present on this branch, the reasoning still applies, redo the analogous constant here).
+Create `crates/manta-input/src/kiwi.rs`. Implement `KiwiIqSource::connect()`:
+1. `std::net::TcpStream::connect((host, port))`, then `.set_read_timeout(Some(Duration::from_millis(...)))` — pick a value that keeps `read()` responsive (matches `SoapySdrIqSource`'s `TIMEOUT_US` reasoning in `crates/manta-input/src/soapy.rs` from the — unmerged — SoapySDR PR; read that file if it's not present on this branch, the reasoning still applies, redo the analogous constant here).
 2. Build the URL `format!("ws://{host}:{port}/{timestamp}/SND", timestamp = /* any process-unique value, e.g. current unix time in ms via std::time */)`.
 3. `tungstenite::client(url, tcp_stream)` to perform the WS handshake.
 4. Send the SET commands from Global Constraints, in order, as `Message::Text`.
@@ -140,7 +140,7 @@ fn connects_to_a_real_public_receiver_and_streams_iq() {
 
 If the receiver used in Step 1 isn't reachable when you run this, pick a different currently-live public node and use that instead (update both this test and Step 1's findings consistently).
 
-Run: `cargo test -p skimmer-input kiwi:: -- --ignored --nocapture`
+Run: `cargo test -p manta-input kiwi:: -- --ignored --nocapture`
 Expected: PASS, with real evidence (actual sample rate achieved, actual `n` samples read) in your report — this is a real network test, don't assume, run it and report the true output.
 
 - [ ] **Step 7: Write hardware/network-independent tests**
@@ -157,24 +157,24 @@ fn connect_refused_is_a_clean_error() {
 
 Add a focused unit test for the resampling math alone (no network): construct a `rubato::Fft` resampler directly with known parameters, feed it synthetic known-frequency input, and confirm the output sample rate/count relationship matches what's expected (e.g. `written / read ≈ rate_out / rate_in` once the resampler's internal delay has been primed with enough chunks — base this on what you actually observe, per Step 3's `RESAMPLER_CHUNK` tuning).
 
-Run: `cargo test -p skimmer-input kiwi::` (no `--ignored` — these two should run by default)
+Run: `cargo test -p manta-input kiwi::` (no `--ignored` — these two should run by default)
 Expected: both pass.
 
 - [ ] **Step 8: Full check**
 
 Run:
 ```
-cargo build -p skimmer-input
-cargo clippy -p skimmer-input --all-targets -- -D warnings
-cargo fmt -p skimmer-input --check
-cargo test -p skimmer-input kiwi::
+cargo build -p manta-input
+cargo clippy -p manta-input --all-targets -- -D warnings
+cargo fmt -p manta-input --check
+cargo test -p manta-input kiwi::
 ```
 All clean. (The `--ignored` live test from Step 6 doesn't need to be part of this default run, but should have already passed once for real per Step 6's own instructions.)
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add Cargo.toml crates/skimmer-input/Cargo.toml crates/skimmer-input/src/lib.rs crates/skimmer-input/src/kiwi.rs
+git add Cargo.toml crates/manta-input/Cargo.toml crates/manta-input/src/lib.rs crates/manta-input/src/kiwi.rs
 git commit -m "feat(input): KiwiSDR websocket IqSource"
 ```
 
@@ -183,34 +183,34 @@ git commit -m "feat(input): KiwiSDR websocket IqSource"
 ### Task 2: Engine generalization (`Box<dyn IqSource>`) + `center_freq_hz` fix
 
 **Files:**
-- Modify: `crates/skimmer-engine/src/listen.rs`
-- Modify: `crates/skimmer-engine/src/soak.rs`
-- Modify: `crates/skimmer-engine/tests/listen_audio.rs`
-- Modify: `crates/skimmer-cli/tests/soak_ci.rs`
-- Modify: `crates/skimmer-cli/src/main.rs`
+- Modify: `crates/manta-engine/src/listen.rs`
+- Modify: `crates/manta-engine/src/soak.rs`
+- Modify: `crates/manta-engine/tests/listen_audio.rs`
+- Modify: `crates/manta-cli/tests/soak_ci.rs`
+- Modify: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_input::IqSource` (dyn-compatible: no generics, no `Self`-returning methods).
+- Consumes: `manta_input::IqSource` (dyn-compatible: no generics, no `Self`-returning methods).
 - Produces: `pub fn listen(mut src: Box<dyn IqSource>, cfg: &PipelineConfig, stop: Arc<AtomicBool>, on_event: impl FnMut(&DecoderEvent)) -> Result<()>`, `pub fn soak(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) -> Result<SoakReport>`. Used by Task 3.
 
 This task is IDENTICAL in shape to a task already completed once on a separate, unmerged branch (`feat/m2-soapysdr-input`, PR #30) — same signature change, same bug, same fix. Follow this exact recipe (already implemented and code-reviewed once; this is a known-good pattern, not new design work):
 
 - [ ] **Step 1: Write/update the failing tests**
 
-In `crates/skimmer-engine/src/soak.rs`'s existing `#[cfg(test)] mod tests` block, box the source and add an explicit import (the non-test body will no longer import `AudioIqSource` directly after Step 3):
+In `crates/manta-engine/src/soak.rs`'s existing `#[cfg(test)] mod tests` block, box the source and add an explicit import (the non-test body will no longer import `AudioIqSource` directly after Step 3):
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skimmer_input::AudioIqSource;
+    use manta_input::AudioIqSource;
 
     #[test]
     fn soak_reports_no_panic_on_a_clean_short_signal() {
-        let fs = skimmer_input::TARGET_RATE_HZ;
-        let spec = skimmer_testkit::keyer::KeyerSpec::new(20.0);
+        let fs = manta_input::TARGET_RATE_HZ;
+        let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
         let (env, _) =
-            skimmer_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 8.0)
+            manta_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 8.0)
                 .unwrap();
         let mut real = vec![0.0f32; env.len()];
         let dphi = std::f64::consts::TAU * 700.0 / fs as f64;
@@ -219,7 +219,7 @@ mod tests {
             *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
             phi += dphi;
         }
-        let src: Box<dyn skimmer_input::IqSource> = Box::new(
+        let src: Box<dyn manta_input::IqSource> = Box::new(
             AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap(),
         );
         let report = soak(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
@@ -231,7 +231,7 @@ mod tests {
 
 This replaces `soak.rs`'s entire existing `#[cfg(test)] mod tests { ... }` block (it currently has exactly this one test).
 
-Also add a new test to `crates/skimmer-engine/src/listen.rs`'s (currently nonexistent) `#[cfg(test)] mod tests` at the end of the file, proving the `center_freq_hz` fix:
+Also add a new test to `crates/manta-engine/src/listen.rs`'s (currently nonexistent) `#[cfg(test)] mod tests` at the end of the file, proving the `center_freq_hz` fix:
 
 ```rust
 #[cfg(test)]
@@ -245,7 +245,7 @@ mod tests {
         center_freq_hz: f64,
     }
 
-    impl skimmer_input::IqSource for FixedFreqSource {
+    impl manta_input::IqSource for FixedFreqSource {
         fn sample_rate(&self) -> f64 {
             self.fs
         }
@@ -262,9 +262,9 @@ mod tests {
 
     #[test]
     fn listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero() {
-        let spec = skimmer_testkit::vectors::v1();
-        let rendered = skimmer_testkit::vectors::render(&spec).unwrap();
-        let src: Box<dyn skimmer_input::IqSource> = Box::new(FixedFreqSource {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
             samples: rendered.samples,
             cursor: 0,
             fs: spec.fs,
@@ -292,12 +292,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p skimmer-engine --lib` and `cargo test -p skimmer-cli --test soak_ci`.
+Run: `cargo test -p manta-engine --lib` and `cargo test -p manta-cli --test soak_ci`.
 Expected: compile errors (signature mismatch) — confirms the tests exercise the not-yet-changed signatures.
 
 - [ ] **Step 3: Change the signatures and fix the bug**
 
-In `crates/skimmer-engine/src/listen.rs`: change `use skimmer_input::{AudioIqSource, IqSource};` to `use skimmer_input::IqSource;`. Change the signature to `pub fn listen(mut src: Box<dyn IqSource>, cfg: &PipelineConfig, stop: Arc<AtomicBool>, mut on_event: impl FnMut(&DecoderEvent)) -> Result<()> {`. Read `center_freq_hz` alongside `fs`:
+In `crates/manta-engine/src/listen.rs`: change `use manta_input::{AudioIqSource, IqSource};` to `use manta_input::IqSource;`. Change the signature to `pub fn listen(mut src: Box<dyn IqSource>, cfg: &PipelineConfig, stop: Arc<AtomicBool>, mut on_event: impl FnMut(&DecoderEvent)) -> Result<()> {`. Read `center_freq_hz` alongside `fs`:
 
 ```rust
     let fs = src.sample_rate();
@@ -306,38 +306,38 @@ In `crates/skimmer-engine/src/listen.rs`: change `use skimmer_input::{AudioIqSou
 
 and use `center_freq_hz` (not the literal `0.0`) in both `Channelizer::new(fs, center_freq_hz)` and `TrackManager::new(ch.n_channels(), fs, center_freq_hz, cfg.detector, cfg.decode.clone())`.
 
-In `crates/skimmer-engine/src/soak.rs`: change `use skimmer_input::AudioIqSource;` to `use skimmer_input::IqSource;`. Change the signature to `pub fn soak(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) -> Result<SoakReport> {` (body unchanged — `listen(src, cfg, stop.clone(), ...)` already just forwards `src`).
+In `crates/manta-engine/src/soak.rs`: change `use manta_input::AudioIqSource;` to `use manta_input::IqSource;`. Change the signature to `pub fn soak(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) -> Result<SoakReport> {` (body unchanged — `listen(src, cfg, stop.clone(), ...)` already just forwards `src`).
 
 - [ ] **Step 4: Fix the existing call sites**
 
-In `crates/skimmer-engine/tests/listen_audio.rs`, box the source:
+In `crates/manta-engine/tests/listen_audio.rs`, box the source:
 ```rust
-    let src: Box<dyn skimmer_input::IqSource> = Box::new(
+    let src: Box<dyn manta_input::IqSource> = Box::new(
         AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap(),
     );
 ```
 
-In `crates/skimmer-cli/tests/soak_ci.rs`, box the source:
+In `crates/manta-cli/tests/soak_ci.rs`, box the source:
 ```rust
-    let src: Box<dyn skimmer_input::IqSource> =
+    let src: Box<dyn manta_input::IqSource> =
         Box::new(AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, fs))).unwrap());
     let report = soak(src, &PipelineConfig::default(), Duration::from_secs(120)).unwrap();
 ```
 
-In `crates/skimmer-cli/src/main.rs`, box the existing `AudioIqSource` construction in BOTH `Command::Listen` and `Command::Soak`'s handlers (do NOT add any new CLI flags here — that's Task 3):
+In `crates/manta-cli/src/main.rs`, box the existing `AudioIqSource` construction in BOTH `Command::Listen` and `Command::Soak`'s handlers (do NOT add any new CLI flags here — that's Task 3):
 ```rust
-            let src: Box<dyn skimmer_input::IqSource> = match source {
-                Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
-                None => Box::new(skimmer_input::AudioIqSource::from_device(device.as_deref())?),
+            let src: Box<dyn manta_input::IqSource> = match source {
+                Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+                None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
             };
 ```
 (same replacement in both handlers, matching what's already there structurally).
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p skimmer-engine --lib` — expect `listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero` and `soak_reports_no_panic_on_a_clean_short_signal` both pass.
-Run: `cargo test -p skimmer-cli --test soak_ci` — expect pass.
-Run: `cargo build -p skimmer-cli` — expect clean compile.
+Run: `cargo test -p manta-engine --lib` — expect `listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero` and `soak_reports_no_panic_on_a_clean_short_signal` both pass.
+Run: `cargo test -p manta-cli --test soak_ci` — expect pass.
+Run: `cargo build -p manta-cli` — expect clean compile.
 
 - [ ] **Step 6: Run the full workspace test suite and clippy**
 
@@ -347,7 +347,7 @@ Run: `cargo clippy --workspace --all-targets -- -D warnings`. Expect clean.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/skimmer-engine/src/listen.rs crates/skimmer-engine/src/soak.rs crates/skimmer-engine/tests/listen_audio.rs crates/skimmer-cli/tests/soak_ci.rs crates/skimmer-cli/src/main.rs
+git add crates/manta-engine/src/listen.rs crates/manta-engine/src/soak.rs crates/manta-engine/tests/listen_audio.rs crates/manta-cli/tests/soak_ci.rs crates/manta-cli/src/main.rs
 git commit -m "feat(engine): generalize listen()/soak() to Box<dyn IqSource>, fix hardcoded center_freq_hz=0.0"
 ```
 
@@ -356,14 +356,14 @@ git commit -m "feat(engine): generalize listen()/soak() to Box<dyn IqSource>, fi
 ### Task 3: CLI wiring
 
 **Files:**
-- Modify: `crates/skimmer-cli/src/main.rs`
+- Modify: `crates/manta-cli/src/main.rs`
 
 **Interfaces:**
-- Consumes: `skimmer_input::kiwi::KiwiIqSource::connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> anyhow::Result<Self>` (Task 1), `skimmer_engine::{listen, soak}` now taking `Box<dyn IqSource>` (Task 2).
+- Consumes: `manta_input::kiwi::KiwiIqSource::connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> anyhow::Result<Self>` (Task 1), `manta_engine::{listen, soak}` now taking `Box<dyn IqSource>` (Task 2).
 
 - [ ] **Step 1: Check the real current state of `main.rs` first**
 
-Read `crates/skimmer-cli/src/main.rs` as it exists after Task 2's changes on THIS branch. Unlike the SoapySDR sub-project, this branch has no `--soapy-*` flags (they exist only on the separate, unmerged `feat/m2-soapysdr-input` branch) — don't assume they're present; your CLI additions here are independent.
+Read `crates/manta-cli/src/main.rs` as it exists after Task 2's changes on THIS branch. Unlike the SoapySDR sub-project, this branch has no `--soapy-*` flags (they exist only on the separate, unmerged `feat/m2-soapysdr-input` branch) — don't assume they're present; your CLI additions here are independent.
 
 - [ ] **Step 2: Add the CLI flags**
 
@@ -398,10 +398,10 @@ fn open_source(
     kiwi_port: u16,
     kiwi_freq: Option<f64>,
     kiwi_password: String,
-) -> Result<Box<dyn skimmer_input::IqSource>> {
+) -> Result<Box<dyn manta_input::IqSource>> {
     if let Some(host) = kiwi_host {
         let freq = kiwi_freq.ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
-        return Ok(Box::new(skimmer_input::kiwi::KiwiIqSource::connect(
+        return Ok(Box::new(manta_input::kiwi::KiwiIqSource::connect(
             &host,
             kiwi_port,
             freq,
@@ -409,8 +409,8 @@ fn open_source(
         )?));
     }
     Ok(match source {
-        Some(path) => Box::new(skimmer_input::AudioIqSource::from_wav_file(&path)?),
-        None => Box::new(skimmer_input::AudioIqSource::from_device(device.as_deref())?),
+        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+        None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
 }
 ```
@@ -423,17 +423,17 @@ In both `Command::Listen` and `Command::Soak`'s handlers, replace the existing s
 
 - [ ] **Step 5: Build and test**
 
-Run: `cargo build -p skimmer-cli` — clean.
-Run: `./target/debug/skimmer listen --help` — confirm the new `--kiwi-*` flags appear with sensible descriptions.
+Run: `cargo build -p manta-cli` — clean.
+Run: `./target/debug/manta listen --help` — confirm the new `--kiwi-*` flags appear with sensible descriptions.
 
 - [ ] **Step 6: Write a CLI-level validation test**
 
-Add to `crates/skimmer-cli/tests/cli.rs` (read the existing file first to match its conventions):
+Add to `crates/manta-cli/tests/cli.rs` (read the existing file first to match its conventions):
 
 ```rust
 #[test]
 fn kiwi_host_without_freq_is_a_clean_error() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skimmer"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["listen", "--kiwi-host", "example.com"])
         .output()
         .unwrap();
@@ -444,7 +444,7 @@ fn kiwi_host_without_freq_is_a_clean_error() {
 }
 ```
 
-Run: `cargo test -p skimmer-cli --test cli kiwi_host_without_freq` — expect pass.
+Run: `cargo test -p manta-cli --test cli kiwi_host_without_freq` — expect pass.
 
 - [ ] **Step 7: Full check**
 
@@ -459,7 +459,7 @@ All clean (use direct output redirection for `cargo test --workspace`, not a pip
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/skimmer-cli/src/main.rs crates/skimmer-cli/tests/cli.rs
+git add crates/manta-cli/src/main.rs crates/manta-cli/tests/cli.rs
 git commit -m "feat(cli): wire --kiwi-host/--kiwi-port/--kiwi-freq/--kiwi-password into listen/soak"
 ```
 
@@ -477,7 +477,7 @@ git commit -m "feat(cli): wire --kiwi-host/--kiwi-port/--kiwi-freq/--kiwi-passwo
 
 - [ ] **Step 1: Check the real merge status of the other M2 sub-project PRs**
 
-Before touching ROADMAP.md/CLAUDE.md, run `gh pr list --repo HagaleTechnologies/skimmer --state all --search "M2"` (or similar) to check whether PR #29 (V8/V8w pileup + CPU-budget) and PR #30 (SoapySDR input) have been merged since this branch started. M2's "Remaining M2 sub-projects" list and its accept-criteria checklist must reflect REAL current state, not an assumption — this exact kind of check caught a real staleness bug during the SoapySDR sub-project's own close-out (its Task 5 had to correct a brief that assumed PR #29 would already be merged; it wasn't). Do the analogous check here.
+Before touching ROADMAP.md/CLAUDE.md, run `gh pr list --repo HagaleTechnologies/manta --state all --search "M2"` (or similar) to check whether PR #29 (V8/V8w pileup + CPU-budget) and PR #30 (SoapySDR input) have been merged since this branch started. M2's "Remaining M2 sub-projects" list and its accept-criteria checklist must reflect REAL current state, not an assumption — this exact kind of check caught a real staleness bug during the SoapySDR sub-project's own close-out (its Task 5 had to correct a brief that assumed PR #29 would already be merged; it wasn't). Do the analogous check here.
 
 - [ ] **Step 2: Write the DECISIONS pin doc**
 
@@ -521,8 +521,8 @@ git push -u origin feat/m2-kiwisdr-input
 gh pr create --title "feat(input,engine,cli): M2 KiwiSDR input (websocket IQ client)" --body "$(cat <<'EOF'
 ## Summary
 
-- ARCHITECTURE.md §3 KiwiSDR websocket IqSource (crates/skimmer-input/src/kiwi.rs), no feature gate (pure Rust).
-- skimmer_engine::listen()/soak() generalized from AudioIqSource to Box<dyn IqSource> (redone independently from the separate, unmerged SoapySDR PR #30).
+- ARCHITECTURE.md §3 KiwiSDR websocket IqSource (crates/manta-input/src/kiwi.rs), no feature gate (pure Rust).
+- manta_engine::listen()/soak() generalized from AudioIqSource to Box<dyn IqSource> (redone independently from the separate, unmerged SoapySDR PR #30).
 - Fixed the same real pre-existing bug independently found on PR #30: listen() hardcoded center_freq_hz=0.0.
 - CLI --kiwi-host/--kiwi-port/--kiwi-freq/--kiwi-password flags on listen/soak.
 - Real, live integration test against a public KiwiSDR receiver (not just error-path coverage — genuine network testing was possible here, unlike SoapySDR's no-hardware situation).
