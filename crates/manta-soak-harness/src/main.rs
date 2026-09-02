@@ -42,11 +42,18 @@ const DEFAULT_SEED: u64 = 0x4D41_4E31_395F_534F; // "MAN19_SO"...(ascii-ish)
     about = "MAN-19: multi-hour unattended soak against a looped synthetic 40m CW pileup scene"
 )]
 struct Cli {
-    /// Wall-clock soak duration, in hours. ROADMAP.md's M2 gate calls for 24.
-    #[arg(long, default_value_t = 24.0)]
+    /// Wall-clock soak duration, in hours. ROADMAP.md's M2 gate calls for
+    /// 24. Must be finite and positive -- NaN reaches
+    /// `Duration::from_secs_f64` and panics.
+    #[arg(long, default_value_t = 24.0, value_parser = parse_positive_finite_hours)]
     duration_hours: f64,
     /// Length of the one base pileup scene that gets looped, in seconds.
-    #[arg(long, default_value_t = 120.0)]
+    /// Must be finite and positive -- NaN makes `key_text_loop`'s
+    /// budget comparison permanently false (scene construction grows
+    /// unbounded until resource exhaustion); very small/negative values
+    /// produce an empty buffer and trip `LoopingAudioIqSource::new`'s
+    /// assertion instead of a normal CLI error.
+    #[arg(long, default_value_t = 120.0, value_parser = parse_positive_finite_scene_seconds)]
     scene_seconds: f64,
     /// How often to sample RSS + track/eviction counts, in seconds. Must
     /// be positive -- at 0, every processed chunk would trigger a sample
@@ -79,6 +86,39 @@ fn parse_positive_secs(s: &str) -> std::result::Result<u64, String> {
         .map_err(|e| format!("invalid --sample-interval-secs {s:?}: {e}"))?;
     if secs == 0 {
         return Err("--sample-interval-secs must be positive (0 samples every processed chunk, far faster than intended)".to_string());
+    }
+    Ok(secs)
+}
+
+/// Clap value parser for `--duration-hours`: rejects non-finite/
+/// non-positive values before they reach `Duration::from_secs_f64` (which
+/// panics on NaN) (round 4 review).
+fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
+    let hours: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --duration-hours {s:?}: {e}"))?;
+    if !hours.is_finite() || hours <= 0.0 {
+        return Err(format!(
+            "--duration-hours must be finite and positive, got {hours}"
+        ));
+    }
+    Ok(hours)
+}
+
+/// Clap value parser for `--scene-seconds`: rejects non-finite/
+/// non-positive values before they reach `render_scene`/`key_text_loop`
+/// (round 4 review: NaN makes `key_text_loop`'s budget comparison
+/// permanently false, growing the scene buffer unbounded; a
+/// too-small/negative value produces an empty buffer that trips
+/// `LoopingAudioIqSource::new`'s assertion instead of a normal error).
+fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, String> {
+    let secs: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --scene-seconds {s:?}: {e}"))?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return Err(format!(
+            "--scene-seconds must be finite and positive, got {secs}"
+        ));
     }
     Ok(secs)
 }

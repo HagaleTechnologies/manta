@@ -793,12 +793,30 @@ impl TrackManager {
             .filter(|(_, t)| t.has_emitted)
             .map(|(&id, _)| id)
             .collect();
+        // MAN-19 round 4: append, don't re-sort. `TrackClosed` has no
+        // real timestamp (sorts at ts=0, tied with SpeedUpdate/TrackMeta
+        // -- see `event_sample_ts`), so re-running the same
+        // `sort_by_key` here would put a track's own `TrackClosed`
+        // *before* the final `CharDecoded`/`WordBoundary` this same
+        // flush just produced for it (those carry real, positive
+        // timestamps). A consumer processing in order would then see the
+        // closure first -- `Validator` frees the track's state, then the
+        // final events recreate it with nothing left to ever clean it up
+        // again, reintroducing the exact leak this mechanism exists to
+        // prevent. `process_hops` doesn't have this problem (a track
+        // closed there was already removed by `step_hop`, before
+        // `drain_pool` runs, so it can never coexist with its own real
+        // event in the same batch) -- `finish()` is the one place a
+        // track's closure and its own final content are produced
+        // together, so it's the one place order must be enforced by
+        // construction: `events` above is already correctly sorted
+        // among itself; appending after that guarantees every
+        // `TrackClosed` lands after every real event for every track.
         events.extend(
             closed_ids
                 .into_iter()
                 .map(|track_id| DecoderEvent::TrackClosed { track_id }),
         );
-        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         self.tracks.clear();
         events
     }
@@ -1230,5 +1248,54 @@ mod tests {
             rendered.keyed_texts[0],
             text
         );
+    }
+
+    /// MAN-19 round 4: `finish()`'s own `TrackClosed` must be ordered
+    /// after every other event it emits for the same track_id -- a
+    /// `TrackClosed` sorted in *before* that track's final `CharDecoded`/
+    /// `WordBoundary` (both carry real, positive timestamps;
+    /// `TrackClosed` sorts at ts=0) would let a consumer see the closure
+    /// first, free the track's state, then recreate it processing the
+    /// trailing events, with nothing left to ever clean that up again --
+    /// reintroducing the exact leak this mechanism exists to prevent.
+    #[test]
+    fn finish_orders_track_closed_after_every_other_event_for_that_track() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            tm.process_hops(&hops, |m| m * hop_samples);
+        }
+        let finish_events = tm.finish();
+        assert!(
+            finish_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackClosed { .. })),
+            "V1's track should still be open at EOF, so finish() should close it"
+        );
+
+        let mut closed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for e in &finish_events {
+            let id = event_track_id(e);
+            if matches!(e, DecoderEvent::TrackClosed { .. }) {
+                closed.insert(id);
+            } else {
+                assert!(
+                    !closed.contains(&id),
+                    "track {id} got a real event after its own TrackClosed -- \
+                     finish() must order TrackClosed after every other event for that track"
+                );
+            }
+        }
     }
 }
