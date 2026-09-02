@@ -130,13 +130,16 @@ impl Table {
     }
 
     /// Looks up `call[..len]`, but an exact-call alias (`is_exact`) only
-    /// counts as a match when `len` reaches the callsign's BASE length --
-    /// i.e. the callsign IS that alias, or is that alias plus a valid
-    /// portable designator (`=4U1UN` must still resolve `4U1UN/P`, not
-    /// just bare `4U1UN`) -- not merely prefixed by it (`=K5AGC` must not
-    /// make `K5AGCA` resolve through it instead of the generic `K`
-    /// prefix). cty.dat carries no separate alias for portable variants,
-    /// so an exact alias has to mean "this call, portable suffix or not."
+    /// counts as a match when EITHER: `len == call.len()` -- a literal
+    /// full match, covering both a plain exact alias (`=K5AGC` matching
+    /// bare `K5AGC`) and an alias that already carries its own portable
+    /// suffix (`=EA5IYX/P`, a distinct real DXCC entity from its base
+    /// call -- matching literal `EA5IYX/P`, not stripped) -- OR `len`
+    /// reaches the callsign's BASE length, i.e. `call` is that alias plus
+    /// a valid portable designator the alias itself doesn't carry
+    /// (`=4U1UN` must still resolve `4U1UN/P`). Neither condition is met
+    /// by a callsign merely PREFIXED by the alias (`=K5AGC` must not make
+    /// `K5AGCA` resolve through it instead of the generic `K` prefix).
     fn prefix_entry(&self, call: &str, len: usize) -> Option<&Entry> {
         let slice = &call[..len];
         let idx = self
@@ -144,7 +147,7 @@ impl Table {
             .binary_search_by(|row| row.prefix.as_str().cmp(slice))
             .ok()?;
         let row = &self.entries[idx];
-        if row.is_exact && len != exact_match_base_len(call) {
+        if row.is_exact && len != call.len() && len != exact_match_base_len(call) {
             return None;
         }
         Some(&row.entry)
@@ -332,6 +335,36 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             table.lookup("K5AGCA").expect("K5AGCA should resolve").cq_zone,
             5,
             "a longer call must fall through to the generic K prefix, not match =K5AGC as a substring prefix"
+        );
+    }
+
+    #[test]
+    fn exact_alias_that_already_carries_its_own_portable_suffix_still_matches_literally() {
+        // Regression (round-6 review): real vendored cty.dat lists
+        // `=EA5IYX/P` as its own exact alias under Balearic Islands,
+        // distinct from mainland Spain's `EA` generic prefix -- the alias
+        // ITSELF already has a portable suffix baked in (this specific
+        // operator's portable designation is its own DXCC entity, not a
+        // generic "any portable variant of this base call" rule). The
+        // round-5 fix's `exact_match_base_len` unconditionally stripped
+        // ANY portable-looking suffix off the INPUT before comparing,
+        // which wrongly rejected a literal full match against an alias
+        // that itself contains a slash -- falling through to the generic
+        // `EA` prefix and emitting mainland Spain's lat/lon/zone instead
+        // of the Balearic Islands'.
+        let fixture = "\
+Spain:                    14: 37: EU:  40.32:   -3.68: -1.0: EA:
+    EA;
+Balearic Islands:         14: 37: EU:  39.60:    2.95: -1.0: EA6:
+    EA6,=EA5IYX/P;
+";
+        let table = Table::parse(fixture);
+        let balearic = table
+            .lookup("EA5IYX/P")
+            .expect("EA5IYX/P should resolve via its exact alias");
+        assert_eq!(
+            balearic.lat, 39.60,
+            "must resolve Balearic Islands, not mainland Spain"
         );
     }
 

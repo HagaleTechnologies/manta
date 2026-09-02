@@ -330,6 +330,40 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
+/// Derives the replay session's wall-clock epoch (fed to `SpotBus`, and
+/// from there into every JSON `timestamp`/RBN Zulu field a client
+/// observes) from the replayed file's own filesystem modification time.
+/// This satisfies two constraints an earlier version traded off against
+/// each other across several review rounds: it must be a GENUINE
+/// wall-clock instant (a file-content hash reinterpreted as nanoseconds
+/// produced technically-unique but fabricated dates spanning 1970-2554 --
+/// round 5), and it must be STABLE across reruns of the same replay file
+/// (unconditionally using `SystemTime::now()` made every rerun's JSON/RBN
+/// output non-reproducible -- round 6's finding). A file's mtime is a real
+/// system fact -- not perfect (it's "when this file was last written,"
+/// not "when the recording happened"), but honest and non-arbitrary,
+/// unlike either prior approach -- and it doesn't change between two
+/// reads of the same untouched file. Session-identity uniqueness (the
+/// separate concern that originally motivated the content hash) is
+/// handled by `session_nonce_for_replay_path` below, independently of
+/// this epoch.
+fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .with_context(|| {
+            format!(
+                "reading metadata for {} to derive its replay epoch",
+                path.display()
+            )
+        })?
+        .modified()
+        .with_context(|| {
+            format!(
+                "{} has no modification time on this platform",
+                path.display()
+            )
+        })
+}
+
 /// Derives a stable, recording-specific session nonce from a WAV file's
 /// CONTENT (not its path): same bytes -> same nonce on every run
 /// (deterministic spot `id`s across reruns) *regardless of where the file
@@ -638,21 +672,26 @@ fn main() -> Result<()> {
                 None => src,
             };
 
-            // `epoch` is always this process's real wall-clock start --
-            // truthful for both live and replay sessions, since a network
-            // client's `timestamp`/RBN Zulu time means "when this daemon
-            // observed it," not "when the original recording happened."
-            // `session_nonce` is the separate, spot-id-uniqueness-only
-            // value: recording-content-derived (but deterministic) for
-            // file replay, so reruns of the SAME file emit identical spot
-            // `id`s while two DIFFERENT recordings don't collide on the
-            // same id at the same track/sample position; nanosecond-
-            // precision-now for a live session, so two live sessions
-            // started within the same wall-clock second still don't
-            // collide.
-            let epoch = std::time::SystemTime::now();
+            // `epoch` feeds SpotBus's wall-clock conversion (every JSON
+            // `timestamp`/RBN Zulu field a client observes) -- a live
+            // session's epoch is this process's real start time; a replay
+            // session's is the replayed file's own mtime, a genuine
+            // timestamp that's also stable across reruns of the same file
+            // (see `epoch_for_replay_path`'s doc comment for why neither
+            // "always now()" nor a content-hash alone was right). `
+            // session_nonce` is the separate, spot-id-uniqueness-only
+            // value: recording-content-derived for file replay (so
+            // different recordings never collide on id even at the same
+            // track/sample position), nanosecond-precision-now for a live
+            // session (so two live sessions started within the same
+            // wall-clock second don't collide either).
+            let epoch = match &replay_path {
+                Some(path) => epoch_for_replay_path(path)?,
+                None => std::time::SystemTime::now(),
+            };
             let session_nonce: u128 = match &replay_path {
                 Some(path) => session_nonce_for_replay_path(path)?,
+                // Live session: `epoch` above is already SystemTime::now().
                 None => epoch
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .expect("epoch predates the Unix epoch")
@@ -807,6 +846,33 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn epoch_for_replay_path_is_a_real_deterministic_timestamp() {
+        // Regression (round-6 review): the epoch fed into SpotBus (and
+        // from there into every JSON `timestamp`/RBN Zulu field) must be
+        // BOTH a genuine wall-clock instant (not a content-hash reinterpreted
+        // as nanoseconds, which produced dates spanning 1970-2554) AND
+        // stable across reruns of the same replay file (a fresh
+        // SystemTime::now() every run broke reproducible replay output,
+        // the specific regression this round's finding flagged). A file's
+        // own mtime satisfies both: it's a real filesystem fact, and it
+        // doesn't change between two reads of the same untouched file.
+        let f = write_temp_file(b"replay epoch fixture");
+        let a = epoch_for_replay_path(f.path()).unwrap();
+        let b = epoch_for_replay_path(f.path()).unwrap();
+        assert_eq!(a, b, "must be stable across reruns of the same file");
+
+        let now = std::time::SystemTime::now();
+        let drift = now
+            .duration_since(a)
+            .or_else(|_| a.duration_since(now))
+            .unwrap();
+        assert!(
+            drift < std::time::Duration::from_secs(60),
+            "must be a genuine near-present timestamp, not a fabricated far date; drift was {drift:?}"
+        );
     }
 
     #[test]

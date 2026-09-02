@@ -50,7 +50,13 @@ impl SpotMessage {
     /// `sample_ts` alone are only unique within one decode session, so two
     /// manta stations (or the same station restarted, even twice within
     /// one wall-clock second) could otherwise emit colliding `id`s that a
-    /// shared cqdx ingest keyed on `id` would overwrite or drop.
+    /// shared cqdx ingest keyed on `id` would overwrite or drop. `id` also
+    /// includes the callsign itself: MAN-28's Watch List allowlist can
+    /// legitimately emit more than one spot at the SAME `track_id`/
+    /// `sample_ts` within one session (several allowlisted words found
+    /// before a track's first `TrackMeta`, all stamped by the metadata-
+    /// arrival retry with that track's saved timestamp) -- without the
+    /// callsign, those would collide too.
     pub fn from_spot(
         spot: &Spot,
         station_call: &str,
@@ -59,9 +65,20 @@ impl SpotMessage {
         unix_ts_secs: i64,
         session_nonce: u128,
     ) -> Self {
-        // Falls back to empty/zero only if `dx_call` isn't cty-allocated --
-        // should be unreachable in practice, since `Validator` only emits
-        // spots for callsigns that already passed `cty.is_allocated()`.
+        // Falls back to empty-string/zero when `dx_call` isn't
+        // cty-allocated. Reachable in practice, not just a defensive
+        // fallback: MAN-28's Watch List lets an operator allowlist a call
+        // that bypasses `cty.is_allocated()` entirely (e.g. a deliberately
+        // unallocated or malformed test callsign), so `Validator` can emit
+        // a spot for a callsign `cty.lookup` genuinely can't resolve.
+        // dxContinent/dxCqZone (and their de* counterparts) are REQUIRED,
+        // non-nullable fields on dispensa's spots.v1 wire contract, unlike
+        // dxDxcc/deDxcc (declared nullable there) -- there is currently no
+        // contract-defined "unknown" representation for these two fields,
+        // so this fallback stays a real (if honestly imperfect) value
+        // rather than null, which the contract would reject outright. See
+        // the follow-up ticket linked from this PR's round-6 review thread
+        // for the cross-repo contract question this raises.
         let dx = cty.lookup(&spot.callsign);
         let de = cty.lookup(station_call);
         // `band` must be derived from the SAME rounded value reported as
@@ -74,8 +91,8 @@ impl SpotMessage {
 
         Self {
             id: format!(
-                "{station_call}:{session_nonce}:{}:{}",
-                spot.track_id, spot.sample_ts
+                "{station_call}:{session_nonce}:{}:{}:{}",
+                spot.track_id, spot.sample_ts, spot.callsign
             ),
             source: "skimmer",
             timestamp: unix_ts_secs,
@@ -220,6 +237,33 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
 
         assert_eq!(msg.decode_confidence, Some(0.9));
         assert_eq!(msg.decoder_version.as_deref(), Some("manta-0.1.0"));
+    }
+
+    #[test]
+    fn id_differs_across_callsigns_sharing_the_same_track_and_sample() {
+        // Regression (round-6 review): MAN-28's Watch List allowlist can
+        // legitimately emit multiple distinct spots for the SAME
+        // track_id/sample_ts within one session -- when several
+        // allowlisted words accumulate before that track's first
+        // TrackMeta, the metadata-arrival retry evaluates and emits all of
+        // them stamped with the same saved sample_ts. Without the
+        // callsign in `id`, a cqdx ingest keyed on `id` would discard all
+        // but one of them.
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot_a = sample_spot();
+        spot_a.callsign = "JA1ABC".to_string();
+        let mut spot_b = sample_spot();
+        spot_b.callsign = "K5ARH".to_string();
+        assert_eq!(spot_a.track_id, spot_b.track_id);
+        assert_eq!(spot_a.sample_ts, spot_b.sample_ts);
+
+        let msg_a = SpotMessage::from_spot(&spot_a, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
+        let msg_b = SpotMessage::from_spot(&spot_b, "W3XYZ", &cty, "manta-0.1.0", 0, 1_000);
+
+        assert_ne!(
+            msg_a.id, msg_b.id,
+            "distinct callsigns at the same track/sample must not collide"
+        );
     }
 
     #[test]

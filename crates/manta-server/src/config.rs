@@ -35,6 +35,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// The spotter's own callsign, used as the telnet `DX de <call>-#:`
     /// identity and the JSON stream's `deCall`. No sensible default --
@@ -69,6 +70,7 @@ pub struct ServerConfig {
 /// construction) without every caller needing to know about the table
 /// wrapper. ARCHITECTURE §8: "Single TOML config... server ports."
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfigFile {
     pub server: ServerConfig,
 }
@@ -125,6 +127,22 @@ mod tests {
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));
             assert!(result.is_err(), "{bad:?} should have been rejected");
         }
+    }
+
+    #[test]
+    fn unknown_server_config_key_is_a_parse_error() {
+        // Regression (round-6 review): a typo'd key (e.g. `bind_address`
+        // instead of `bind_addr`) must not silently parse and fall back to
+        // that field's default -- for `bind_addr` specifically, silently
+        // keeping the "0.0.0.0" default instead of the operator's intended
+        // restriction unexpectedly exposes all three listeners publicly.
+        let result: Result<ServerConfig, _> = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            bind_address = "127.0.0.1"
+            "#,
+        );
+        assert!(result.is_err(), "unknown key should have been rejected");
     }
 
     #[test]

@@ -97,6 +97,7 @@ async fn handle_client(
                     Ok(bus_spot) => {
                         if let Some(min) = min_unique {
                             if bus_spot.occurrence_count <= min {
+                                metrics.record_filter_suppressed(1);
                                 continue; // below threshold: filtered out
                             }
                         }
@@ -151,13 +152,28 @@ async fn handle_client(
             // published right before the daemon exited -- rather than
             // dropping them unsent.
             _ = shutdown.changed() => {
-                while let Ok(bus_spot) = rx.try_recv() {
-                    if let Some(min) = min_unique {
-                        if bus_spot.occurrence_count <= min {
-                            continue;
+                // A `Lagged(n)` mid-drain means this subscriber missed `n`
+                // spots, not that the channel is empty -- there can still
+                // be spots queued after the gap. Stopping on the first
+                // `Err` (the prior behavior) silently dropped everything
+                // from that point on without even recording the loss
+                // (round-6 review finding).
+                loop {
+                    match rx.try_recv() {
+                        Ok(bus_spot) => {
+                            if let Some(min) = min_unique {
+                                if bus_spot.occurrence_count <= min {
+                                    metrics.record_filter_suppressed(1);
+                                    continue;
+                                }
+                            }
+                            write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
                         }
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            metrics.record_lagged(n);
+                        }
+                        Err(_) => break, // Empty or Closed: nothing left to drain
                     }
-                    write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
                 }
                 return Ok(());
             }

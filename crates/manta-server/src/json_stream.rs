@@ -197,13 +197,27 @@ async fn handle_tcp_client(
             // Explicit shutdown: drain whatever's already queued rather
             // than dropping it when the runtime forcibly tears down.
             _ = ctx.shutdown.changed() => {
-                while let Ok(bus_spot) = rx.try_recv() {
-                    let line = ctx.render(&bus_spot);
-                    let _ = tokio::time::timeout(WRITE_TIMEOUT, async {
-                        socket.write_all(line.as_bytes()).await?;
-                        socket.write_all(b"\n").await
-                    })
-                    .await;
+                // A `Lagged(n)` mid-drain means this subscriber missed `n`
+                // spots, not that the channel is empty -- there can still
+                // be spots queued after the gap. Stopping on the first
+                // `Err` (the prior behavior) silently dropped everything
+                // from that point on without even recording the loss
+                // (round-6 review finding).
+                loop {
+                    match rx.try_recv() {
+                        Ok(bus_spot) => {
+                            let line = ctx.render(&bus_spot);
+                            let _ = tokio::time::timeout(WRITE_TIMEOUT, async {
+                                socket.write_all(line.as_bytes()).await?;
+                                socket.write_all(b"\n").await
+                            })
+                            .await;
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            ctx.metrics.record_lagged(n);
+                        }
+                        Err(_) => break, // Empty or Closed: nothing left to drain
+                    }
                 }
                 return Ok(());
             }
@@ -252,16 +266,35 @@ async fn handle_ws_client(
                             .await
                             .map_err(|_| anyhow::anyhow!("write timed out"))??;
                     }
-                    Some(Ok(_)) => {} // client isn't expected to send data; ignore other frames
+                    Some(Ok(Message::Pong(_))) => {} // unsolicited pong: harmless, ignore
+                    // Text/Binary/raw Frame: this stream is pure server
+                    // push, so any application-data frame is a protocol
+                    // violation -- disconnect rather than ignore. Bounding
+                    // each message's SIZE (MAX_INBOUND_WS_MESSAGE_BYTES)
+                    // isn't enough on its own: a client sending an
+                    // unbounded SEQUENCE of small messages kept this arm
+                    // perpetually ready, burning CPU indefinitely (round-6
+                    // review finding).
+                    Some(Ok(_)) => return Ok(()),
                     Some(Err(_)) => return Ok(()),
                 }
             }
             // Explicit shutdown: drain whatever's already queued rather
             // than dropping it when the runtime forcibly tears down.
             _ = ctx.shutdown.changed() => {
-                while let Ok(bus_spot) = rx.try_recv() {
-                    let text = ctx.render(&bus_spot);
-                    let _ = tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))).await;
+                // See the TCP handler's identical shutdown-drain branch
+                // above for why `Lagged` must not stop the drain.
+                loop {
+                    match rx.try_recv() {
+                        Ok(bus_spot) => {
+                            let text = ctx.render(&bus_spot);
+                            let _ = tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))).await;
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            ctx.metrics.record_lagged(n);
+                        }
+                        Err(_) => break,
+                    }
                 }
                 return Ok(());
             }

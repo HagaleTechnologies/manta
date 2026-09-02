@@ -14,6 +14,7 @@ use std::sync::RwLock;
 pub struct Metrics {
     spots_total: AtomicU64,
     spots_dropped_lagged_total: AtomicU64,
+    spots_suppressed_by_filter_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -37,6 +38,17 @@ impl Metrics {
     /// instead of silent.
     pub fn record_lagged(&self, n: u64) {
         self.spots_dropped_lagged_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A spot was suppressed by a client's own `set dx filter unique > n`
+    /// threshold, not by a broadcast-lag disconnect. ARCHITECTURE §8:
+    /// "every dropped/evicted/suppressed item is counted" -- deliberate
+    /// per-client filtering is exactly the kind of drop that would
+    /// otherwise be silent (a quiet feed and heavy filtering look
+    /// identical to an operator without this).
+    pub fn record_filter_suppressed(&self, n: u64) {
+        self.spots_suppressed_by_filter_total
             .fetch_add(n, Ordering::Relaxed);
     }
 
@@ -93,6 +105,16 @@ impl Metrics {
         out.push_str(&format!(
             "manta_spots_dropped_lagged_total {}\n",
             self.spots_dropped_lagged_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_suppressed_by_filter_total Spots suppressed by a client's own filter (e.g. set dx filter unique), not a lag disconnect.\n",
+        );
+        out.push_str("# TYPE manta_spots_suppressed_by_filter_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_suppressed_by_filter_total {}\n",
+            self.spots_suppressed_by_filter_total
+                .load(Ordering::Relaxed)
         ));
 
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
@@ -189,6 +211,16 @@ mod tests {
         m.set_active_tracks(12);
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_active_tracks 12"));
+    }
+
+    #[test]
+    fn renders_filter_suppressed_count_as_a_prometheus_counter() {
+        let m = Metrics::new();
+        m.record_filter_suppressed(1);
+        m.record_filter_suppressed(1);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_suppressed_by_filter_total counter"));
+        assert!(text.contains("manta_spots_suppressed_by_filter_total 2"));
     }
 
     #[test]
