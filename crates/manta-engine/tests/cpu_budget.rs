@@ -90,7 +90,12 @@ fn event_sample_ts(e: &DecoderEvent) -> Option<u64> {
 /// near 300 open at once) or bounds-only checking (which a track that
 /// churned off only in the middle could still pass), though still not
 /// proof of exact simultaneity.
-fn sustained_track_count(events: &[DecoderEvent], total_samples: u64, fs: f64) -> usize {
+fn sustained_track_count(
+    events: &[DecoderEvent],
+    steady_state_start: u64,
+    total_samples: u64,
+    fs: f64,
+) -> usize {
     const MAX_GAP_S: f64 = 3.0;
 
     let mut timestamps: HashMap<u32, Vec<u64>> = HashMap::new();
@@ -101,21 +106,27 @@ fn sustained_track_count(events: &[DecoderEvent], total_samples: u64, fs: f64) -
         timestamps.entry(track_id(e)).or_default().push(ts);
     }
 
-    let opens_early = total_samples / 10; // first 10%
-    let closes_late = total_samples / 10 * 9; // last 10% starts here
     let max_gap_samples = (MAX_GAP_S * fs) as u64;
 
+    // Bracket the true post-warmup interval with two virtual endpoints
+    // (steady_state_start, total_samples) and require the SAME max-gap
+    // bound across every gap, including the edges -- not just between a
+    // track's own recorded events. A percentage-of-file margin (10%/90%,
+    // this function's prior version) left real slack at both ends that
+    // the internal-gap check alone didn't cover: a track could be silent
+    // from steady_state_start up to its first event, or from its last
+    // event to the end of file, without either gap ever being checked
+    // (Codex review, this PR -- ~17% of the interval could go
+    // unaccounted-for at the file's own 60s/58s scale). Folding the
+    // boundaries into the same windowed gap check closes that instead of
+    // just tightening another percentage.
     timestamps
         .values()
         .filter(|ts| {
             let mut sorted = (*ts).clone();
+            sorted.push(steady_state_start);
+            sorted.push(total_samples);
             sorted.sort_unstable();
-            let (Some(&first), Some(&last)) = (sorted.first(), sorted.last()) else {
-                return false;
-            };
-            if first > opens_early || last < closes_late {
-                return false;
-            }
             sorted.windows(2).all(|w| w[1] - w[0] <= max_gap_samples)
         })
         .count()
@@ -212,7 +223,8 @@ fn cpu_budget_mac_under_half_core() {
     // `sustained_track_count`'s doc comment for why this is a proxy, not
     // an exact concurrent count.
     let total_samples = iq.len() as u64;
-    let sustained = sustained_track_count(&report.events, total_samples, fs);
+    let steady_state_start = (warmup * fs) as u64;
+    let sustained = sustained_track_count(&report.events, steady_state_start, total_samples, fs);
     println!(
         "cpu_budget: {sustained} tracks sustained across most of the run (scene has 300 signals)"
     );
