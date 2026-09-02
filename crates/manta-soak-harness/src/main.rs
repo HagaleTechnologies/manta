@@ -92,7 +92,11 @@ fn parse_positive_secs(s: &str) -> std::result::Result<u64, String> {
 
 /// Clap value parser for `--duration-hours`: rejects non-finite/
 /// non-positive values before they reach `Duration::from_secs_f64` (which
-/// panics on NaN) (round 4 review).
+/// panics on NaN) (round 4 review), AND rejects a finite value so large
+/// that `hours * 3600.0` (the exact conversion `main()` performs) itself
+/// overflows to infinity -- e.g. `1e308` passes the plain finite check
+/// but `1e308 * 3600.0` overflows f64's ~1.8e308 max, and THAT infinity
+/// is what reaches `Duration::from_secs_f64` and panics (round 6 review).
 fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
     let hours: f64 = s
         .parse()
@@ -102,19 +106,38 @@ fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
             "--duration-hours must be finite and positive, got {hours}"
         ));
     }
+    if !(hours * 3600.0).is_finite() {
+        return Err(format!(
+            "--duration-hours {hours} is too large -- converting to seconds overflows"
+        ));
+    }
     Ok(hours)
 }
+
+/// One base scene's sample count is capped here, well short of
+/// `usize::MAX`/an actual out-of-memory abort -- `--scene-seconds` is
+/// meant to be the one base loop unit the harness repeats for the whole
+/// `--duration-hours` run (documented default 120s), not the run's own
+/// length. ~11.6h at `FS_HZ`; `Complex32` samples alone would already be
+/// ~16 GiB at this cap, so there's no real use case past it (round 6
+/// review).
+const MAX_SCENE_SAMPLES: f64 = 2_000_000_000.0;
 
 /// Clap value parser for `--scene-seconds`: rejects non-finite/
 /// non-positive values before they reach `render_scene`/`key_text_loop`
 /// (round 4 review: NaN makes `key_text_loop`'s budget comparison
-/// permanently false, growing the scene buffer unbounded), AND rejects
-/// any positive value too small to round to at least one sample at
-/// `FS_HZ` (round 5 review: `secs <= 0.0` alone still let e.g.
-/// `0.000001` through, which `render_scene`'s own `(duration_s *
-/// fs).round() as usize` computation -- mirrored here -- turns into an
-/// empty buffer, tripping `LoopingAudioIqSource::new`'s assertion
-/// instead of a normal CLI error).
+/// permanently false, growing the scene buffer unbounded), rejects any
+/// positive value too small to round to at least one sample at `FS_HZ`
+/// (round 5 review: `secs <= 0.0` alone still let e.g. `0.000001`
+/// through, which `render_scene`'s own `(duration_s * fs).round() as
+/// usize` computation -- mirrored here -- turns into an empty buffer,
+/// tripping `LoopingAudioIqSource::new`'s assertion instead of a normal
+/// CLI error), AND rejects a value so large the sample count either
+/// overflows to infinity or exceeds `MAX_SCENE_SAMPLES` -- e.g. `1e300`
+/// passes the finite/positive check but `secs * FS_HZ` is itself
+/// `usize::MAX`-saturating or an outright multi-exabyte allocation
+/// attempt, which aborts the process rather than returning a normal CLI
+/// error (round 6 review).
 fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, String> {
     let secs: f64 = s
         .parse()
@@ -124,9 +147,17 @@ fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, Stri
             "--scene-seconds must be finite and positive, got {secs}"
         ));
     }
-    if (secs * FS_HZ).round() < 1.0 {
+    let n_samples = secs * FS_HZ;
+    if n_samples.round() < 1.0 {
         return Err(format!(
             "--scene-seconds {secs} is too small to produce even one sample at {FS_HZ} Hz"
+        ));
+    }
+    if !n_samples.is_finite() || n_samples >= MAX_SCENE_SAMPLES {
+        return Err(format!(
+            "--scene-seconds {secs} would need {n_samples:.0} samples at {FS_HZ} Hz, over the \
+             {MAX_SCENE_SAMPLES:.0}-sample cap -- this is meant to be the one base loop unit the \
+             harness repeats for the whole --duration-hours run, not the run's own length"
         ));
     }
     Ok(secs)
