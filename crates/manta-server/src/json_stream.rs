@@ -7,14 +7,14 @@
 //! server push), so a peek timeout with no bytes is itself the "not a
 //! WebSocket handshake" signal, not an error.
 
-use crate::bus::SpotBus;
+use crate::bus::{BusSpot, SpotBus};
 use crate::metrics::Metrics;
 use crate::spot_message::SpotMessage;
 use manta_spot::cty::Table;
 use manta_spot::Spot;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
@@ -79,12 +79,29 @@ pub async fn serve(
             let rx = bus.subscribe();
             if looks_like_websocket_handshake(&socket).await {
                 metrics.inc_ws_clients();
-                let _ = handle_ws_client(socket, rx, bus, cty, station_call, decoder_version).await;
+                let _ = handle_ws_client(
+                    socket,
+                    rx,
+                    bus,
+                    metrics.clone(),
+                    cty,
+                    station_call,
+                    decoder_version,
+                )
+                .await;
                 metrics.dec_ws_clients();
             } else {
                 metrics.inc_json_clients();
-                let _ =
-                    handle_tcp_client(socket, rx, bus, cty, station_call, decoder_version).await;
+                let _ = handle_tcp_client(
+                    socket,
+                    rx,
+                    bus,
+                    metrics.clone(),
+                    cty,
+                    station_call,
+                    decoder_version,
+                )
+                .await;
                 metrics.dec_json_clients();
             }
         });
@@ -101,41 +118,65 @@ async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
 
 async fn handle_tcp_client(
     mut socket: TcpStream,
-    mut rx: broadcast::Receiver<Spot>,
+    mut rx: broadcast::Receiver<BusSpot>,
     bus: Arc<SpotBus>,
+    metrics: Arc<Metrics>,
     cty: Arc<Table>,
     station_call: String,
     decoder_version: String,
 ) -> std::io::Result<()> {
+    // This protocol is pure server push -- the client never needs to send
+    // anything -- so this scratch buffer only exists to notice EOF/close;
+    // any bytes a client does send are unexpected and simply discarded.
+    let mut scratch = [0u8; 64];
     loop {
-        match rx.recv().await {
-            Ok(spot) => {
-                let unix_ts = bus.unix_ts_for(spot.sample_ts);
-                let line = render(
-                    &spot,
-                    &station_call,
-                    &cty,
-                    &decoder_version,
-                    unix_ts,
-                    bus.epoch_unix_secs(),
-                );
-                tokio::time::timeout(WRITE_TIMEOUT, async {
-                    socket.write_all(line.as_bytes()).await?;
-                    socket.write_all(b"\n").await
-                })
-                .await
-                .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "write timed out"))??;
+        tokio::select! {
+            spot = rx.recv() => {
+                match spot {
+                    Ok(bus_spot) => {
+                        let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
+                        let line = render(
+                            &bus_spot.spot,
+                            &station_call,
+                            &cty,
+                            &decoder_version,
+                            unix_ts,
+                            bus.epoch_unix_secs(),
+                        );
+                        tokio::time::timeout(WRITE_TIMEOUT, async {
+                            socket.write_all(line.as_bytes()).await?;
+                            socket.write_all(b"\n").await
+                        })
+                        .await
+                        .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "write timed out"))??;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        metrics.record_lagged(n);
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => return Ok(()),
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            // Detects the client closing the connection during a quiet
+            // period -- without this, only `rx.recv()` is ever polled, so
+            // a closed-but-idle client's task/socket/gauge would linger
+            // until the next spot's write happened to fail.
+            read_result = socket.read(&mut scratch) => {
+                match read_result {
+                    Ok(0) => return Ok(()),  // client closed the connection
+                    Ok(_) => {}              // unexpected client data; ignore
+                    Err(_) => return Ok(()),
+                }
+            }
         }
     }
 }
 
 async fn handle_ws_client(
     socket: TcpStream,
-    mut rx: broadcast::Receiver<Spot>,
+    mut rx: broadcast::Receiver<BusSpot>,
     bus: Arc<SpotBus>,
+    metrics: Arc<Metrics>,
     cty: Arc<Table>,
     station_call: String,
     decoder_version: String,
@@ -149,10 +190,10 @@ async fn handle_ws_client(
         tokio::select! {
             spot = rx.recv() => {
                 match spot {
-                    Ok(spot) => {
-                        let unix_ts = bus.unix_ts_for(spot.sample_ts);
+                    Ok(bus_spot) => {
+                        let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
                         let text = render(
-                            &spot,
+                            &bus_spot.spot,
                             &station_call,
                             &cty,
                             &decoder_version,
@@ -163,7 +204,10 @@ async fn handle_ws_client(
                             .await
                             .map_err(|_| anyhow::anyhow!("write timed out"))??;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => return Ok(()),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        metrics.record_lagged(n);
+                        return Ok(());
+                    }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }

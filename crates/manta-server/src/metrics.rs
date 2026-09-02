@@ -13,6 +13,7 @@ use std::sync::RwLock;
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
+    spots_dropped_lagged_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -27,6 +28,16 @@ impl Metrics {
 
     pub fn record_spot(&self) {
         self.spots_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A subscriber fell behind and `n` spots it never saw were dropped
+    /// (`broadcast::error::RecvError::Lagged(n)`) before it was
+    /// disconnected. ARCHITECTURE §8: "every dropped/evicted/suppressed
+    /// item is counted" -- this is what makes a lag-induced loss visible
+    /// instead of silent.
+    pub fn record_lagged(&self, n: u64) {
+        self.spots_dropped_lagged_total
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn inc_telnet_clients(&self) {
@@ -73,6 +84,15 @@ impl Metrics {
         out.push_str(&format!(
             "manta_spots_total {}\n",
             self.spots_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_dropped_lagged_total Spots dropped because a slow client fell behind and was disconnected.\n",
+        );
+        out.push_str("# TYPE manta_spots_dropped_lagged_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_dropped_lagged_total {}\n",
+            self.spots_dropped_lagged_total.load(Ordering::Relaxed)
         ));
 
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
@@ -137,6 +157,16 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_total counter"));
         assert!(text.contains("manta_spots_total 2"));
+    }
+
+    #[test]
+    fn renders_lagged_drop_count_as_a_prometheus_counter() {
+        let m = Metrics::new();
+        m.record_lagged(3);
+        m.record_lagged(4);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_dropped_lagged_total counter"));
+        assert!(text.contains("manta_spots_dropped_lagged_total 7"));
     }
 
     #[test]

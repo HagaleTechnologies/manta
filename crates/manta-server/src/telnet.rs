@@ -40,7 +40,7 @@ pub async fn serve(
         let station_call = station_call.clone();
         tokio::spawn(async move {
             metrics.inc_telnet_clients();
-            let _ = handle_client(socket, bus, station_call).await;
+            let _ = handle_client(socket, bus, metrics.clone(), station_call).await;
             metrics.dec_telnet_clients();
         });
     }
@@ -49,6 +49,7 @@ pub async fn serve(
 async fn handle_client(
     socket: tokio::net::TcpStream,
     bus: Arc<SpotBus>,
+    metrics: Arc<Metrics>,
     station_call: String,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
@@ -76,17 +77,19 @@ async fn handle_client(
         tokio::select! {
             spot = rx.recv() => {
                 match spot {
-                    Ok(spot) => {
+                    Ok(bus_spot) => {
                         if let Some(min) = min_unique {
-                            if bus.occurrence_count(&spot.callsign) <= min {
+                            if bus_spot.occurrence_count <= min {
                                 continue; // below threshold: filtered out
                             }
                         }
-                        write_spot_line(&mut wr, &bus, &station_call, &spot).await?;
+                        write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         // ARCHITECTURE §7: slow clients are disconnected,
-                        // never back-pressured.
+                        // never back-pressured -- and ARCHITECTURE §8:
+                        // every dropped item is counted, not silent.
+                        metrics.record_lagged(n);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),

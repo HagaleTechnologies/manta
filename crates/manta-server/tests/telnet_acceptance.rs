@@ -190,6 +190,44 @@ async fn set_dx_filter_unique_suppresses_below_threshold_occurrences() {
 }
 
 #[tokio::test]
+async fn filter_evaluates_each_spot_at_its_own_publication_time_not_drain_time() {
+    // Regression test: two occurrences published back-to-back BEFORE the
+    // client's task drains either one. `occurrence_count` must reflect
+    // what each spot had at ITS OWN publish, not the running total by the
+    // time the client gets around to checking it -- otherwise both the
+    // first (which should be suppressed) and second occurrence would pass
+    // a `unique > 1` filter once the count had already reached 2.
+    let (addr, bus, _metrics) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let mut ack = String::new();
+    reader.read_line(&mut ack).await.unwrap();
+
+    let mut spot = sample_spot();
+    spot.callsign = "K5ARH".to_string();
+    bus.publish(spot.clone()); // occurrence 1: must be suppressed
+    bus.publish(spot); // occurrence 2: must be forwarded
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the second occurrence")
+        .unwrap();
+    assert!(line.contains("K5ARH"), "line was: {line:?}");
+
+    // Exactly one line should have arrived -- the first occurrence must
+    // not also show up as a second forwarded line.
+    let mut extra = String::new();
+    let extra_result =
+        tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut extra)).await;
+    assert!(
+        extra_result.is_err(),
+        "the suppressed first occurrence must not also arrive: {extra:?}"
+    );
+}
+
+#[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
     let (addr, _bus, metrics) = spawn_server().await;
     let (_reader, _wr) = connect_and_login(addr).await;

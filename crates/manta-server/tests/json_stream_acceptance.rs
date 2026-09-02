@@ -23,7 +23,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     JA,JD,JE,JF,JG,JH,JI,JJ,JK,JL,JM,JN,JO,JP,JQ,JR,JS;
 ";
 
-async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>) {
+async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>, Arc<Metrics>) {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
@@ -31,11 +31,12 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>) {
     let addr = listener.local_addr().unwrap();
 
     let bus2 = bus.clone();
+    let metrics2 = metrics.clone();
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
             bus2,
-            metrics,
+            metrics2,
             cty,
             STATION_CALL.to_string(),
             "manta-test".to_string(),
@@ -43,7 +44,7 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>) {
         .await;
     });
 
-    (addr, bus)
+    (addr, bus, metrics)
 }
 
 fn sample_spot() -> Spot {
@@ -61,7 +62,7 @@ fn sample_spot() -> Spot {
 
 #[tokio::test]
 async fn tcp_client_receives_spot_as_json_lines_message() {
-    let (addr, bus) = spawn_server().await;
+    let (addr, bus, _metrics) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();
     let mut reader = BufReader::new(stream);
 
@@ -90,11 +91,53 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
 }
 
 #[tokio::test]
+async fn tcp_client_close_during_a_quiet_period_is_detected() {
+    // Regression test: a raw JSON-lines client that disconnects while no
+    // spots are being published must not leave its task/socket/gauge
+    // alive until some later spot's write happens to fail.
+    let (addr, _bus, metrics) = spawn_server().await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    // The WS-detection peek can wait up to PEEK_TIMEOUT (500ms) before
+    // classifying a client that sends nothing as plain TCP and
+    // incrementing the gauge -- poll instead of a fixed short sleep.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if metrics
+                .render_prometheus_text()
+                .contains("manta_json_clients_connected 1")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("client was never classified/counted as a JSON client");
+
+    drop(stream); // client closes the connection, no spot involved at all
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if metrics
+                .render_prometheus_text()
+                .contains("manta_json_clients_connected 0")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("client close was never detected during the quiet period");
+}
+
+#[tokio::test]
 async fn tcp_and_websocket_clients_share_the_same_port() {
     // ARCHITECTURE §7 documents one shared "tcp/ws :7301" port -- prove a
     // raw TCP client and a WebSocket client can both connect to the exact
     // same listener and each get correctly classified.
-    let (addr, bus) = spawn_server().await;
+    let (addr, bus, _metrics) = spawn_server().await;
 
     let tcp_stream = TcpStream::connect(addr).await.unwrap();
     let mut tcp_reader = BufReader::new(tcp_stream);

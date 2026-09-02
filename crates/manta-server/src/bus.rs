@@ -23,8 +23,24 @@ const CHANNEL_CAPACITY: usize = 1024;
 /// "don't disconnect").
 const RECENT_HISTORY_CAP: usize = 50;
 
+/// One published spot plus its occurrence count *at the moment it was
+/// published* -- captured here, not recomputed by a subscriber later, so
+/// a subscriber applying an occurrence-based filter (e.g. the telnet
+/// server's `set dx filter unique > n`) sees the count each spot actually
+/// had when it was published, not whatever the running total has grown to
+/// by the time a lagging subscriber gets around to draining it. Querying
+/// `SpotBus` for the "current" count of a callsign at filter-evaluation
+/// time is exactly the bug this type exists to make impossible to
+/// reintroduce: two back-to-back publications for the same callsign would
+/// otherwise both observe the *later* count.
+#[derive(Debug, Clone)]
+pub struct BusSpot {
+    pub spot: Spot,
+    pub occurrence_count: u32,
+}
+
 pub struct SpotBus {
-    tx: broadcast::Sender<Spot>,
+    tx: broadcast::Sender<BusSpot>,
     epoch: SystemTime,
     sample_rate_hz: f64,
     recent: Mutex<VecDeque<Spot>>,
@@ -57,16 +73,25 @@ impl SpotBus {
             }
             recent.push_back(spot.clone());
         }
-        *self
-            .occurrence_counts
-            .lock()
-            .expect("occurrence_counts lock poisoned")
-            .entry(spot.callsign.clone())
-            .or_insert(0) += 1;
-        let _ = self.tx.send(spot);
+        // Increment and read back under one lock acquisition -- this *is*
+        // the fix: the occurrence count a spot carries is fixed at the
+        // instant of this publish, before any subscriber can observe it.
+        let occurrence_count = {
+            let mut counts = self
+                .occurrence_counts
+                .lock()
+                .expect("occurrence_counts lock poisoned");
+            let count = counts.entry(spot.callsign.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        let _ = self.tx.send(BusSpot {
+            spot,
+            occurrence_count,
+        });
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Spot> {
+    pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
         self.tx.subscribe()
     }
 
@@ -86,17 +111,6 @@ impl SpotBus {
         let recent = self.recent.lock().expect("recent lock poisoned");
         let skip = recent.len().saturating_sub(n);
         recent.iter().skip(skip).cloned().collect()
-    }
-
-    /// How many times a callsign has been published on this bus so far --
-    /// backs the telnet server's `set dx filter unique > n` command.
-    pub fn occurrence_count(&self, callsign: &str) -> u32 {
-        self.occurrence_counts
-            .lock()
-            .expect("occurrence_counts lock poisoned")
-            .get(callsign)
-            .copied()
-            .unwrap_or(0)
     }
 
     /// Converts a spot's `sample_ts` (samples since session start) to a
@@ -136,7 +150,7 @@ mod tests {
         bus.publish(sample_spot(0));
 
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.callsign, "K5ARH");
+        assert_eq!(received.spot.callsign, "K5ARH");
     }
 
     #[tokio::test]
@@ -153,8 +167,8 @@ mod tests {
 
         bus.publish(sample_spot(0));
 
-        assert_eq!(rx1.recv().await.unwrap().callsign, "K5ARH");
-        assert_eq!(rx2.recv().await.unwrap().callsign, "K5ARH");
+        assert_eq!(rx1.recv().await.unwrap().spot.callsign, "K5ARH");
+        assert_eq!(rx2.recv().await.unwrap().spot.callsign, "K5ARH");
     }
 
     #[tokio::test]
@@ -201,16 +215,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn occurrence_count_tracks_how_many_times_a_callsign_has_been_published() {
+    async fn published_spot_carries_its_occurrence_count_at_publish_time() {
         let bus = SpotBus::new(96_000.0, SystemTime::now());
-        assert_eq!(bus.occurrence_count("K5ARH"), 0);
+        let mut rx = bus.subscribe();
 
         bus.publish(sample_spot(0));
-        assert_eq!(bus.occurrence_count("K5ARH"), 1);
+        assert_eq!(rx.recv().await.unwrap().occurrence_count, 1);
 
         bus.publish(sample_spot(1));
-        assert_eq!(bus.occurrence_count("K5ARH"), 2);
-        assert_eq!(bus.occurrence_count("JA1ABC"), 0);
+        assert_eq!(rx.recv().await.unwrap().occurrence_count, 2);
+    }
+
+    #[tokio::test]
+    async fn occurrence_count_is_fixed_at_publish_even_if_the_subscriber_hasnt_drained_yet() {
+        // The bug this type exists to make impossible: two back-to-back
+        // publications for the same callsign, drained together by a
+        // subscriber that was momentarily behind. Each must still carry
+        // the count it actually had *when published*, not the running
+        // total by the time the subscriber gets to it.
+        let bus = SpotBus::new(96_000.0, SystemTime::now());
+        let mut rx = bus.subscribe();
+
+        bus.publish(sample_spot(0));
+        bus.publish(sample_spot(1));
+
+        assert_eq!(rx.recv().await.unwrap().occurrence_count, 1);
+        assert_eq!(rx.recv().await.unwrap().occurrence_count, 2);
     }
 
     #[test]
