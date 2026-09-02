@@ -110,7 +110,13 @@ fn parse_positive_finite_hours(s: &str) -> std::result::Result<f64, String> {
         ));
     }
     let secs = hours * 3600.0;
-    if !secs.is_finite() || secs > Duration::MAX.as_secs_f64() {
+    // Round 8 review: `Duration::MAX.as_secs_f64()` itself rounds UP to
+    // exactly 2^64 (u64::MAX seconds isn't exactly representable in f64,
+    // and the nearest representable value above it is 2^64) -- a strict
+    // `>` bound let a `secs` that rounds to exactly that boundary value
+    // through, which still panics in `Duration::from_secs_f64` (its true
+    // max is u64::MAX seconds, one less than 2^64). `>=` closes that.
+    if !secs.is_finite() || secs >= Duration::MAX.as_secs_f64() {
         return Err(format!(
             "--duration-hours {hours} is too large -- {secs} seconds exceeds what Duration can represent"
         ));
