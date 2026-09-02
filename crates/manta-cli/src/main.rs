@@ -313,24 +313,39 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
 }
 
 /// Derives a stable, recording-specific replay epoch from a WAV file's
-/// path: same path -> same epoch on every run (deterministic reruns), but
-/// two different files hash to (almost certainly) different epochs, so
-/// their spots don't collide in JSON `id`/`timestamp` even at the same
-/// track/sample position. `DefaultHasher`'s output isn't guaranteed
-/// stable across Rust compiler versions, but this only needs to be
-/// consistent within one build -- the same determinism guarantee this
-/// repo's own "3 runs, same binary -> identical output" CI rule already
-/// relies on, not cross-version stability.
-fn epoch_for_replay_path(path: &std::path::Path) -> std::time::SystemTime {
-    use std::hash::{Hash, Hasher};
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+/// CONTENT (not its path): same bytes -> same epoch on every run
+/// (deterministic reruns) *regardless of where the file lives* -- a
+/// different checkout, mount point, rename, or machine must not change
+/// it, since it's the same recording. Two different recordings hash to
+/// (almost certainly) different epochs, so their spots don't collide in
+/// JSON `id`/`timestamp` even at the same track/sample position.
+/// `DefaultHasher`'s output isn't guaranteed stable across Rust compiler
+/// versions, but this only needs to be consistent within one build -- the
+/// same determinism guarantee this repo's own "3 runs, same binary ->
+/// identical output" CI rule already relies on, not cross-version
+/// stability.
+fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
+    use std::hash::Hasher;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to derive its replay identity", path.display()))?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    // Keep the offset within a sane calendar range rather than the full
-    // u64 span, purely so a printed/logged timestamp still looks like a
-    // real date instead of some near-the-epoch-of-time-itself value.
-    let offset_secs = hasher.finish() % 1_000_000_000;
-    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(offset_secs)
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {} to derive its replay identity", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.write(&buf[..n]);
+    }
+    // Nanosecond-granularity offset (not just whole seconds): the same
+    // hash value also flows into SpotBus::session_nonce for spot-id
+    // uniqueness, which wants real sub-second entropy, not just a
+    // plausible-looking date.
+    Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(hasher.finish()))
 }
 
 /// Clap value parser for `--dial-freq-hz`: rejects non-finite (NaN/infinity)
@@ -592,7 +607,7 @@ fn main() -> Result<()> {
             // same track/sample position from unrelated files collide on
             // the same id. A live source gets a real wall-clock epoch.
             let epoch = match &replay_path {
-                Some(path) => epoch_for_replay_path(path),
+                Some(path) => epoch_for_replay_path(path)?,
                 None => std::time::SystemTime::now(),
             };
 
@@ -736,16 +751,41 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn write_temp_file(contents: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
     #[test]
-    fn epoch_for_replay_path_is_deterministic_for_the_same_path() {
-        let path = PathBuf::from("/some/fixture.wav");
-        assert_eq!(epoch_for_replay_path(&path), epoch_for_replay_path(&path));
+    fn epoch_for_replay_path_is_deterministic_for_the_same_content() {
+        let f = write_temp_file(b"same recording bytes");
+        assert_eq!(
+            epoch_for_replay_path(f.path()).unwrap(),
+            epoch_for_replay_path(f.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn epoch_for_replay_path_is_stable_across_different_paths_for_the_same_content() {
+        // The exact bug this fix exists to prevent: the same recording,
+        // re-read from a different path (a rename, a different mount, a
+        // different checkout) must derive the SAME replay epoch.
+        let a = write_temp_file(b"identical recording bytes");
+        let b = write_temp_file(b"identical recording bytes");
+        assert_eq!(
+            epoch_for_replay_path(a.path()).unwrap(),
+            epoch_for_replay_path(b.path()).unwrap(),
+            "the same content at two different paths must derive the same epoch"
+        );
     }
 
     #[test]
     fn epoch_for_replay_path_differs_across_different_recordings() {
-        let a = epoch_for_replay_path(&PathBuf::from("/some/contest-weekend.wav"));
-        let b = epoch_for_replay_path(&PathBuf::from("/some/quiet-weeknight.wav"));
+        let a = epoch_for_replay_path(write_temp_file(b"contest-weekend bytes").path()).unwrap();
+        let b = epoch_for_replay_path(write_temp_file(b"quiet-weeknight bytes").path()).unwrap();
         assert_ne!(
             a, b,
             "two different recordings must not collide on the same replay epoch"

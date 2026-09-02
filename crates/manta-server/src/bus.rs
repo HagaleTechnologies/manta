@@ -95,15 +95,20 @@ impl SpotBus {
         self.tx.subscribe()
     }
 
-    /// This bus's session epoch as a Unix timestamp -- a stable per-session
-    /// identity used (alongside `track_id`/`sample_ts`) to keep JSON spot
-    /// IDs unique across stations and restarts, not just within one
-    /// session (see `spot_message::SpotMessage::from_spot`).
-    pub fn epoch_unix_secs(&self) -> i64 {
+    /// Full nanosecond-precision session identity -- combined (alongside
+    /// `track_id`/`sample_ts`) into JSON spot `id`s to keep them unique
+    /// across stations and restarts, not just within one session (see
+    /// `spot_message::SpotMessage::from_spot`). Deliberately NOT
+    /// second-truncated: a whole-second epoch lets the same station
+    /// starting two live sessions within one wall-clock second collide on
+    /// early spot ids, since `id` otherwise only varies by
+    /// `track_id`/`sample_ts`, both small session-relative counters that
+    /// naturally restart near zero.
+    pub fn session_nonce(&self) -> u128 {
         self.epoch
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("epoch predates the Unix epoch")
-            .as_secs() as i64
+            .as_nanos()
     }
 
     /// The last `n` published spots, oldest first (`sh/dx` backing store).
@@ -252,9 +257,25 @@ mod tests {
     }
 
     #[test]
-    fn epoch_unix_secs_returns_the_session_epoch() {
+    fn session_nonce_returns_full_nanosecond_precision() {
         let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = SpotBus::new(1000.0, epoch);
-        assert_eq!(bus.epoch_unix_secs(), 1_700_000_000);
+        assert_eq!(bus.session_nonce(), 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn session_nonce_differs_for_epochs_within_the_same_second() {
+        // The exact bug this precision exists to prevent: two epochs a
+        // few hundred milliseconds apart, both `UNIX_EPOCH + 1 whole
+        // second` if truncated -- session_nonce must still tell them apart.
+        let a = SpotBus::new(
+            1000.0,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_100),
+        );
+        let b = SpotBus::new(
+            1000.0,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_900),
+        );
+        assert_ne!(a.session_nonce(), b.session_nonce());
     }
 }

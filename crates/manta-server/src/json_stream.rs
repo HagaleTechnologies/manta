@@ -59,7 +59,7 @@ impl ClientCtx {
             &self.cty,
             &self.decoder_version,
             unix_ts,
-            self.bus.epoch_unix_secs(),
+            self.bus.session_nonce(),
         );
         serde_json::to_string(&msg).expect("SpotMessage always serializes")
     }

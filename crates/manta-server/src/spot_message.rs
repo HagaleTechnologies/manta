@@ -45,18 +45,19 @@ impl SpotMessage {
     /// Builds the wire message for one validated spot. `unix_ts_secs` is
     /// the spot's wall-clock time (see `rbn::format_line`'s doc comment on
     /// why that conversion happens here, not on `Spot` itself).
-    /// `session_epoch_unix` is the producing bus's session epoch
-    /// (`SpotBus::epoch_unix_secs`) -- `track_id`/`sample_ts` alone are
-    /// only unique within one decode session, so two manta stations (or
-    /// the same station restarted) could otherwise emit colliding `id`s
-    /// that a shared cqdx ingest keyed on `id` would overwrite or drop.
+    /// `session_nonce` is the producing bus's full-nanosecond-precision
+    /// session identity (`SpotBus::session_nonce`) -- `track_id`/
+    /// `sample_ts` alone are only unique within one decode session, so two
+    /// manta stations (or the same station restarted, even twice within
+    /// one wall-clock second) could otherwise emit colliding `id`s that a
+    /// shared cqdx ingest keyed on `id` would overwrite or drop.
     pub fn from_spot(
         spot: &Spot,
         station_call: &str,
         cty: &cty::Table,
         decoder_version: &str,
         unix_ts_secs: i64,
-        session_epoch_unix: i64,
+        session_nonce: u128,
     ) -> Self {
         // Falls back to empty/zero only if `dx_call` isn't cty-allocated --
         // should be unreachable in practice, since `Validator` only emits
@@ -66,7 +67,7 @@ impl SpotMessage {
 
         Self {
             id: format!(
-                "{station_call}:{session_epoch_unix}:{}:{}",
+                "{station_call}:{session_nonce}:{}:{}",
                 spot.track_id, spot.sample_ts
             ),
             source: "skimmer",
