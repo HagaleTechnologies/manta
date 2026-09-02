@@ -412,7 +412,9 @@ step 1), or a callsign the operator has explicitly allowlisted (ARCHITECTURE
 §6's Watch List), is exempt from this gate and may spot on its first decode
 (MAN-28) — `r` still feeds `c_call` above unchanged, so a single-decode spot
 of either kind still carries the `r=1` confidence penalty. An allowlisted
-callsign also bypasses ARCHITECTURE §6 step 2 (grammar/cty) entirely.
+callsign also bypasses ARCHITECTURE §6 steps 1 (context parse -- tagged
+`SpotType::Unknown` when no CQ/DE/UP/beacon pattern matched) and 2
+(grammar/cty) entirely.
 
 ---
 
@@ -502,7 +504,7 @@ M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate 
 
 Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `DecoderEvent`-stream level -- hand-built event sequences feeding
-`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V19
+`Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V20
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
@@ -518,6 +520,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V17 | notched frequency | Track frequency inside vs. outside a notched range | Inside → 0 spots; outside → spots normally |
 | V18 | beacon-repetition-exemption | 1 decode of a `V V V <call>` beacon pattern | `BEACON`-tagged spot emits on the first decode, gate not applied (MAN-28) |
 | V19 | allowlist-bypass | A single decode of a callsign with an unallocated cty prefix, explicitly allowlisted | Spots despite failing grammar/cty and despite only 1 decode (MAN-28 Watch List) |
+| V20 | allowlist-no-context | An allowlisted callsign decoded with no CQ/DE/UP/beacon framing at all | Spots, tagged `SpotType::Unknown` (MAN-28 Watch List, the primary NCDXF-beacon case) |
 
 ---
 

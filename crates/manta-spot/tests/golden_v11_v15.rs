@@ -192,3 +192,24 @@ fn blocklisted_callsign_is_never_spotted_even_if_also_allowlisted() {
         "a blocklisted callsign must never spot, even if also allowlisted, got {spots:?}"
     );
 }
+
+/// V20: an allowlisted callsign with no recognized CQ/DE/UP/beacon context
+/// pattern -- the primary real-world Watch List scenario (an NCDXF beacon
+/// transmits its callsign followed by power-step dashes, no framing
+/// words at all) -- must still spot. `context::parse` returns `None` for a
+/// standalone callsign; the allowlist bypass must not require a pattern
+/// match at all.
+#[test]
+fn v20_allowlisted_call_spots_with_no_context_pattern() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("QQ9ZZZ");
+    let words = ["QQ9ZZZ"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(
+        spots.len(),
+        1,
+        "an allowlisted call with no CQ/DE/UP/beacon pattern must still spot, got {spots:?}"
+    );
+    assert_eq!(spots[0].callsign, "QQ9ZZZ");
+    assert_eq!(spots[0].spot_type, SpotType::Unknown);
+}

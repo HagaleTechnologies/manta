@@ -234,11 +234,14 @@ track, over a rolling text window:
    WPM, type, confidence.
 
 **Operator allowlist (Watch List)**: a callsign the operator explicitly lists
-bypasses steps 2 (grammar/cty) and 4 (repetition) entirely — legacy
-precedent: CW Skimmer's Watch List (Aggregator manual Appendix A2), which
-exists specifically for calls (e.g. low-repetition NCDXF beacons) that
-wouldn't otherwise pass automatic validation (MAN-28). Dedupe (step 5) still
-applies.
+bypasses step 1's context-parse requirement too — not just steps 2
+(grammar/cty) and 4 (repetition) — since a listed callsign with no
+recognized CQ/DE/UP/beacon framing (tagged type `Unknown`) is exactly the
+primary real-world case: an NCDXF beacon transmits its callsign followed
+by power-step dashes, no framing words at all. Legacy precedent: CW
+Skimmer's Watch List (Aggregator manual Appendix A2), which exists
+specifically for calls that wouldn't otherwise pass automatic validation
+(MAN-28). Dedupe (step 5) still applies.
 
 ## 7. Output layer (`manta-server`)
 

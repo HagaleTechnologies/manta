@@ -272,7 +272,7 @@ impl Validator {
     }
 
     fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
-        let Some((candidate, spot_type)) = self.tracks.get(&track_id).and_then(|track| {
+        let context_match = self.tracks.get(&track_id).and_then(|track| {
             let joined: String = track
                 .words
                 .iter()
@@ -280,6 +280,22 @@ impl Validator {
                 .collect::<Vec<_>>()
                 .join(" ");
             context::parse(&joined)
+        });
+        // MAN-28 Watch List: an allowlisted callsign must still be found
+        // with no recognized CQ/DE/UP/beacon context pattern at all --
+        // this is exactly the scenario real Watch Lists exist for (e.g. an
+        // NCDXF beacon transmits its callsign followed by power-step
+        // dashes, no framing words). `SpotType::Unknown` is the
+        // context-parse-documented fallback for exactly this case.
+        let Some((candidate, spot_type)) = context_match.or_else(|| {
+            self.tracks.get(&track_id).and_then(|track| {
+                track
+                    .words
+                    .iter()
+                    .rev()
+                    .find(|w| self.allowlist.contains(&w.text))
+                    .map(|w| (w.text.clone(), SpotType::Unknown))
+            })
         }) else {
             return Vec::new();
         };
