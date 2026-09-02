@@ -87,6 +87,14 @@ pub fn soak_with_metrics(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
+    // MAN-19 review round 1: distinct from `stop` (watchdog -> processing
+    // loop). This one runs the other direction -- processing loop ->
+    // watchdog -- so a source that ends (EOF/error/panic) well before
+    // `duration` elapses doesn't leave the watchdog thread sleeping out
+    // the rest of `duration` for nothing, and this function returns
+    // promptly instead of silently blocking for up to a day.
+    let done = Arc::new(AtomicBool::new(false));
+    let done_watchdog = done.clone();
     let start = Instant::now();
     let baseline_rss = peak_rss_bytes();
     let mut worst_growth = 0u64;
@@ -98,6 +106,9 @@ pub fn soak_with_metrics(
 
     let watchdog = std::thread::spawn(move || {
         while start.elapsed() < duration {
+            if done_watchdog.load(Ordering::Relaxed) {
+                break;
+            }
             let remaining = duration.saturating_sub(start.elapsed());
             std::thread::sleep(Duration::from_secs(1).min(remaining.max(Duration::from_millis(1))));
         }
@@ -105,7 +116,19 @@ pub fn soak_with_metrics(
     });
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-        let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+        // MAN-19 review round 1: unlike `listen()`'s `on_event` callback
+        // (which the CLI's `--json` output needs calibrated), this
+        // function never surfaces raw events to a caller -- only
+        // `validator.ingest` sees them, and `Validator` already applies
+        // `cfg.freq_correction_ppm` internally (`with_freq_correction_ppm`
+        // below). Calibrating here too, as an earlier version of this
+        // file did, double-applies the correction to every spot's
+        // frequency (and to notch/dedupe bucketing) whenever
+        // `freq_correction_ppm != 0.0` -- matching `lib.rs`'s
+        // `calibrate_track_meta` doc, which explicitly warns against
+        // feeding its output to `Validator::ingest`. Validated up front
+        // only so a NaN/out-of-range ppm fails fast, same as soak.rs.
+        manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
             .map_err(|e| anyhow::anyhow!(e))?;
         let fs = src.sample_rate();
         let center_freq_hz = src.center_freq_hz();
@@ -144,13 +167,11 @@ pub fn soak_with_metrics(
         let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
         for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
             event_count += 1;
-            let calibrated = crate::calibrate_track_meta(&ev, calibration_factor);
-            spot_count += validator.ingest(&calibrated).len();
+            spot_count += validator.ingest(&ev).len();
         }
         for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
             event_count += 1;
-            let calibrated = crate::calibrate_track_meta(&ev, calibration_factor);
-            spot_count += validator.ingest(&calibrated).len();
+            spot_count += validator.ingest(&ev).len();
         }
 
         let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
@@ -166,8 +187,7 @@ pub fn soak_with_metrics(
                 m.saturating_sub(pad_hops) * hop
             }) {
                 event_count += 1;
-                let calibrated = crate::calibrate_track_meta(&ev, calibration_factor);
-                spot_count += validator.ingest(&calibrated).len();
+                spot_count += validator.ingest(&ev).len();
             }
 
             if last_sample.elapsed() >= sample_interval {
@@ -191,13 +211,31 @@ pub fn soak_with_metrics(
         }
         for ev in tm.finish() {
             event_count += 1;
-            let calibrated = crate::calibrate_track_meta(&ev, calibration_factor);
-            spot_count += validator.ingest(&calibrated).len();
+            spot_count += validator.ingest(&ev).len();
         }
         final_close_counts = tm.close_counts();
         peak_active_tracks = peak_active_tracks.max(tm.active_track_count());
+        // MAN-19 review round 1: `worst_growth` was otherwise only ever
+        // updated inside the periodic `sample_interval` branch above -- any
+        // growth after the last tick (or the whole run, if
+        // `sample_interval >= duration` or the source ends before one tick
+        // fires) never got measured, so `rss_growth_bytes` could read well
+        // below the true peak. One last reading here closes that gap.
+        let rss = peak_rss_bytes();
+        if start.elapsed() >= WARMUP {
+            worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
+        }
         Ok(())
     }));
+    // MAN-19 review round 1: captured immediately once the processing
+    // closure has actually returned (normally, by error, or by panic --
+    // `catch_unwind` above already blocked until one of those happened),
+    // not after `watchdog.join()` -- which can otherwise still be
+    // sleeping out the rest of `duration` for a source that finished
+    // early, inflating the reported duration to look like a full run that
+    // did nothing for most of it.
+    let processing_end = Instant::now();
+    done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
 
     let panicked = match result {
@@ -207,7 +245,7 @@ pub fn soak_with_metrics(
     };
 
     Ok(SoakMetricsReport {
-        duration_actual: start.elapsed(),
+        duration_actual: processing_end.duration_since(start),
         events_emitted: event_count,
         spots_emitted: spot_count,
         rss_growth_bytes: worst_growth,

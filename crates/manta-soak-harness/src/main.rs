@@ -18,9 +18,14 @@ use manta_input::IqSource;
 use manta_testkit::keyer::Jitter;
 use manta_testkit::scene::{render_scene, QsbSine, SignalSpec};
 use num_complex::Complex32;
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// ROADMAP.md's M2 accept gate: 24h. Below this, a run may be healthy but
+/// is not itself a MAN-19 acceptance result (round 1 review).
+const MAN19_ACCEPT_HOURS: f64 = 24.0;
 
 /// Fixed target rate the real `manta listen`/`manta soak` audio path
 /// requires (manta-input::audio::TARGET_RATE_HZ) -- not re-exported, so
@@ -243,7 +248,20 @@ fn main() -> Result<()> {
         .with_context(|| format!("creating {}", metrics_path.display()))?;
     let mut metrics_w = std::io::BufWriter::new(metrics_file);
 
+    // MAN-19 review round 1: a write/flush failure (disk full, unmounted
+    // volume) during an unattended run must not be silently swallowed --
+    // that would leave `metrics.jsonl` incomplete or empty while
+    // `overall_pass` hardcodes `metrics_visible = true` below, reporting
+    // success for a run whose actual observability failed. Recorded here
+    // (not returned from the closure -- `soak_with_metrics`'s `on_sample`
+    // is `FnMut(&SoakMetricsSample)`, not fallible) and checked once the
+    // run completes.
+    let io_error: RefCell<Option<std::io::Error>> = RefCell::new(None);
+
     let on_sample = |s: &SoakMetricsSample| {
+        if io_error.borrow().is_some() {
+            return; // already failed -- stop trying, first error wins
+        }
         let line = serde_json::json!({
             "elapsed_s": s.elapsed_s,
             "rss_bytes": s.rss_bytes,
@@ -259,9 +277,22 @@ fn main() -> Result<()> {
                 "evicted": s.close_counts.evicted,
             },
         });
-        if let Ok(text) = serde_json::to_string(&line) {
-            let _ = writeln!(metrics_w, "{text}");
-            let _ = metrics_w.flush(); // survive a kill mid-run
+        let text = match serde_json::to_string(&line) {
+            Ok(t) => t,
+            Err(e) => {
+                *io_error.borrow_mut() = Some(std::io::Error::other(e));
+                return;
+            }
+        };
+        if let Err(e) = writeln!(metrics_w, "{text}") {
+            *io_error.borrow_mut() = Some(e);
+            return;
+        }
+        if let Err(e) = metrics_w.flush() {
+            // survive a kill mid-run -- flushed per sample so a partial
+            // run's data isn't lost, but a flush failure itself is real
+            *io_error.borrow_mut() = Some(e);
+            return;
         }
         eprintln!(
             "t={:>8.0}s rss={:>7.1}MiB active_tracks={:>4} evicted={:>5} merged={:>5} events={} spots={}",
@@ -282,6 +313,9 @@ fn main() -> Result<()> {
         Duration::from_secs(cli.sample_interval_secs),
         on_sample,
     )?;
+    if let Some(e) = io_error.into_inner() {
+        anyhow::bail!("failed to persist metrics.jsonl mid-run: {e}");
+    }
 
     let rss_growth_mib = report.rss_growth_bytes as f64 / (1024.0 * 1024.0);
     let no_crash = !report.panicked;
@@ -294,7 +328,40 @@ fn main() -> Result<()> {
     // Satisfied structurally: every metrics.jsonl line carries
     // active_tracks + close_counts throughout the run.
     let metrics_visible = true;
-    let overall_pass = no_crash && no_input_overrun && no_unbounded_growth && metrics_visible;
+    // MAN-19 review round 1: without this, a regression that keeps the
+    // detector from opening any usable track (or the decoder pool from
+    // producing any output) would still satisfy every criterion above --
+    // zero events, zero growth, no crash -- and report success despite
+    // never having exercised the per-track `Validator`/`RepetitionGate`
+    // state whose leak motivated this harness in the first place. Require
+    // concrete evidence of real pipeline activity: at least one promoted
+    // (ever-emitting) track opened AND closed, plus the raw event volume
+    // that implies.
+    let workload_exercised = report.events_emitted > 0
+        && report.peak_active_tracks > 0
+        && (report.final_close_counts.unconfirmed
+            + report.final_close_counts.hang_expired
+            + report.final_close_counts.silent
+            + report.final_close_counts.merged
+            + report.final_close_counts.evicted)
+            > 0;
+    // MAN-19 review round 1: a smoke invocation (e.g. `--duration-hours
+    // 0.001` for local iteration) must not report the same "PASSED" this
+    // harness uses for a genuine acceptance run -- and a run whose
+    // *processing* ended well short of what was requested (source EOF,
+    // an error, a panic) is not a completed run at all, regardless of
+    // how long `--duration-hours` asked for. 1% tolerance for scheduling
+    // jitter around the watchdog's 1s poll granularity.
+    let requested_duration_reached =
+        report.duration_actual.as_secs_f64() >= cli.duration_hours * 3600.0 * 0.99;
+    let is_full_24h_acceptance_run = cli.duration_hours >= MAN19_ACCEPT_HOURS;
+    let overall_pass = no_crash
+        && no_input_overrun
+        && no_unbounded_growth
+        && metrics_visible
+        && workload_exercised
+        && requested_duration_reached;
+    let man19_acceptance_gate_met = overall_pass && is_full_24h_acceptance_run;
 
     let summary = serde_json::json!({
         "duration_requested_hours": cli.duration_hours,
@@ -317,8 +384,12 @@ fn main() -> Result<()> {
             "no_input_overrun": no_input_overrun,
             "no_unbounded_memory_growth": no_unbounded_growth,
             "track_count_and_evictions_visible_in_metrics": metrics_visible,
+            "workload_exercised": workload_exercised,
+            "requested_duration_reached": requested_duration_reached,
         },
         "overall_pass": overall_pass,
+        "is_full_24h_acceptance_run": is_full_24h_acceptance_run,
+        "man19_acceptance_gate_met": man19_acceptance_gate_met,
     });
     std::fs::write(
         out_dir.join("report.json"),
@@ -329,7 +400,13 @@ fn main() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&summary)?);
     eprintln!(
         "MAN-19 soak {}: {}",
-        if overall_pass { "PASSED" } else { "FAILED" },
+        if man19_acceptance_gate_met {
+            "PASSED"
+        } else if overall_pass {
+            "OK (healthy, but not a full 24h MAN-19 acceptance run -- see is_full_24h_acceptance_run)"
+        } else {
+            "FAILED"
+        },
         out_dir.join("report.json").display()
     );
 

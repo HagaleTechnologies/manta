@@ -279,6 +279,15 @@ pub(crate) struct Track {
     /// drained once per `process_hops` call by `drain_pool` (ARCHITECTURE
     /// §10's decoder pool).
     pending: Vec<(f32, u64)>,
+    /// Set by `process_hops` once `drain_pool` has actually produced a
+    /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
+    /// a track promoted and then merged/evicted within the *same*
+    /// `process_hops` batch never gets a `drain_pool` pass before it's
+    /// removed (that only runs once, after every hop in the batch), so it
+    /// can have an allocated decoder yet have emitted nothing at all
+    /// (MAN-19 review round 1). `TrackClosed` emission checks this, not
+    /// decoder presence.
+    has_emitted: bool,
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -306,6 +315,7 @@ impl Track {
             birth_channel,
             decoder: None,
             pending: Vec::new(),
+            has_emitted: false,
         }
     }
 
@@ -552,21 +562,23 @@ impl TrackManager {
             }
         }
         // MAN-19: only report a close as `TrackClosed`-worthy if the track
-        // was ever promoted (had a decoder, so could have produced a real
-        // event `manta-spot`'s `Validator`/`RepetitionGate` might have
-        // recorded state against). A CANDIDATE that closes Unconfirmed
-        // without ever being promoted never emitted a CharDecoded/
-        // WordBoundary/SpeedUpdate/TrackMeta and so never created any
-        // downstream state to free -- and critically, it never appeared
-        // in the event stream at all before this change; surfacing a
-        // `TrackClosed` for it anyway would introduce a track_id into the
-        // stream that callers like `decode_samples` (which picks the
-        // *lowest* track_id present as its single-track report) never
-        // used to see, silently changing which track gets reported.
+        // actually emitted a real event (`has_emitted`), not merely
+        // whether it was ever promoted (`decoder.is_some()`) -- a track
+        // promoted and then merged/evicted within this *same*
+        // `process_hops` batch never gets a `drain_pool` pass before it's
+        // removed here (that runs once, after every hop in the batch), so
+        // it can have an allocated decoder yet have produced nothing at
+        // all (round 1 review). A CANDIDATE that closes Unconfirmed
+        // without ever being promoted never appeared in the event stream
+        // either; surfacing a `TrackClosed` for either case would
+        // introduce a track_id into the stream that callers like
+        // `decode_samples` (which picks the *lowest* track_id present as
+        // its single-track report) never used to see, silently changing
+        // which track gets reported.
         closed.retain(|id| {
             self.tracks
                 .remove(id)
-                .is_some_and(|track| track.decoder.is_some())
+                .is_some_and(|track| track.has_emitted)
         });
         self.recompute_ownership();
 
@@ -645,20 +657,22 @@ impl TrackManager {
             }
         }
         // MAN-19: only report a merge-loser as `TrackClosed`-worthy if it
-        // was ever promoted -- see the matching comment in `step_hop`.
-        let ever_promoted_closed = to_close
+        // actually emitted a real event -- see the matching comment in
+        // `step_hop` (a track promoted this same batch can be merged away
+        // before ever getting a `drain_pool` pass).
+        let ever_emitted_closed = to_close
             .into_iter()
             .filter(|id| {
                 self.close_counts.record(CloseReason::Merged);
                 self.tracks
                     .remove(id)
-                    .is_some_and(|track| track.decoder.is_some())
+                    .is_some_and(|track| track.has_emitted)
             })
             .collect();
         if !ids.is_empty() {
             self.recompute_ownership();
         }
-        ever_promoted_closed
+        ever_emitted_closed
     }
 
     /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
@@ -673,11 +687,12 @@ impl TrackManager {
                 .map(|(id, _)| id)
                 .unwrap();
             self.close_counts.record(CloseReason::Evicted);
-            // MAN-19: only report as `TrackClosed`-worthy if ever promoted.
+            // MAN-19: only report as `TrackClosed`-worthy if it actually
+            // emitted a real event -- see `step_hop`'s matching comment.
             if self
                 .tracks
                 .remove(&loser)
-                .is_some_and(|track| track.decoder.is_some())
+                .is_some_and(|track| track.has_emitted)
             {
                 evicted.push(loser);
             }
@@ -710,7 +725,19 @@ impl TrackManager {
         // so this post-pool reset is the only thing that keeps a
         // continuously-decoding signal from being force-closed
         // `CloseReason::Silent` after `gc_hops` and re-spawned as a new track.
+        //
+        // Also marks `has_emitted` for MAN-19's `TrackClosed` filter (see
+        // `step_hop`'s comment on `closed.retain`) -- every event kind
+        // here counts as real output, not just `CharDecoded`. A track
+        // closed by a LATER `process_hops` call reads whatever this set,
+        // which is exactly what "did this track ever actually emit
+        // anything" needs; a track promoted and closed within THIS same
+        // call never reaches this loop before being removed, so it
+        // correctly stays `false`.
         for e in &events {
+            if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
+                t.has_emitted = true;
+            }
             if let DecoderEvent::CharDecoded { track_id, .. } = e {
                 if let Some(t) = self.tracks.get_mut(track_id) {
                     t.lifecycle.note_char_decoded();

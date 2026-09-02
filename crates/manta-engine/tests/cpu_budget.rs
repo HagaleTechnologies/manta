@@ -47,17 +47,20 @@ fn track_id(e: &DecoderEvent) -> u32 {
         DecoderEvent::CharDecoded { track_id, .. }
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
-        | DecoderEvent::TrackMeta { track_id, .. } => *track_id,
+        | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TrackClosed { track_id } => *track_id,
     }
 }
 
 /// `sample_ts` for the two `DecoderEvent` variants that carry one --
-/// `SpeedUpdate`/`TrackMeta` don't, so `None` for those.
+/// `SpeedUpdate`/`TrackMeta`/`TrackClosed` don't, so `None` for those.
 fn event_sample_ts(e: &DecoderEvent) -> Option<u64> {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. } => Some(*sample_ts),
-        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => None,
+        DecoderEvent::SpeedUpdate { .. }
+        | DecoderEvent::TrackMeta { .. }
+        | DecoderEvent::TrackClosed { .. } => None,
     }
 }
 
