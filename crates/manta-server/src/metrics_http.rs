@@ -15,12 +15,20 @@ use tokio::net::TcpListener;
 /// open by trickling headers, one every few seconds, forever.
 const MAX_HEADER_LINES: usize = 100;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the accept loop backs off after a failed `accept()` before
+/// retrying -- a persistent resource error (e.g. `EMFILE`) makes
+/// `accept()` return immediately, and retrying with no delay turns this
+/// into a tight loop that starves other tasks on the same runtime.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>) {
     loop {
         let (socket, _peer) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
         let metrics = metrics.clone();
         tokio::spawn(async move {

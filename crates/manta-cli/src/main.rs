@@ -130,7 +130,7 @@ enum Command {
         /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
         /// would publish an audio-tone offset (e.g. 700 Hz) as if it were
         /// the actual DX frequency.
-        #[arg(long)]
+        #[arg(long, value_parser = parse_dial_freq_hz)]
         dial_freq_hz: Option<f64>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
@@ -312,6 +312,44 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
+/// Derives a stable, recording-specific replay epoch from a WAV file's
+/// path: same path -> same epoch on every run (deterministic reruns), but
+/// two different files hash to (almost certainly) different epochs, so
+/// their spots don't collide in JSON `id`/`timestamp` even at the same
+/// track/sample position. `DefaultHasher`'s output isn't guaranteed
+/// stable across Rust compiler versions, but this only needs to be
+/// consistent within one build -- the same determinism guarantee this
+/// repo's own "3 runs, same binary -> identical output" CI rule already
+/// relies on, not cross-version stability.
+fn epoch_for_replay_path(path: &std::path::Path) -> std::time::SystemTime {
+    use std::hash::{Hash, Hasher};
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    // Keep the offset within a sane calendar range rather than the full
+    // u64 span, purely so a printed/logged timestamp still looks like a
+    // real date instead of some near-the-epoch-of-time-itself value.
+    let offset_secs = hasher.finish() % 1_000_000_000;
+    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(offset_secs)
+}
+
+/// Clap value parser for `--dial-freq-hz`: rejects non-finite (NaN/infinity)
+/// and non-positive values at CLI-parse time, before they're baked into
+/// `FixedCenterFreqSource` and silently propagate into malformed RBN/JSON
+/// frequency fields (e.g. a literal `NaN`, or a "0"/`band: "unknown"` from
+/// a zero or negative dial frequency).
+fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+    if !hz.is_finite() || hz <= 0.0 {
+        return Err(format!(
+            "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
+        ));
+    }
+    Ok(hz)
+}
+
 /// Strips a leading UTF-8 BOM (`\u{feff}`), common in Windows-authored text
 /// files -- `str::trim` does not remove it, so left unstripped it corrupts
 /// the first line's parse (a blocklist callsign that never matches, or a
@@ -350,13 +388,20 @@ fn build_pipeline_config(
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+    /// Signals the telnet/JSON/WS client tasks to drain their already-
+    /// queued spots and exit, instead of being forcibly cut off by
+    /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
+    /// an in-flight write. Call `.send(true)` before shutting the runtime
+    /// down.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
 /// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
-/// alive for the servers to keep running -- dropping it stops them; call
-/// `Runtime::shutdown_timeout` on it before exit to let in-flight writes
-/// (e.g. spots from `TrackManager::finish()`) drain instead of vanishing.
+/// alive for the servers to keep running -- dropping it stops them.
+/// Before exit: send `true` on `SpotServer::shutdown_tx` so client tasks
+/// get a chance to drain (e.g. spots from `TrackManager::finish()`), THEN
+/// call `Runtime::shutdown_timeout` as the bounded safety net.
 ///
 /// `epoch` is the bus's session epoch (see `SpotBus::new`) -- pass a fixed
 /// value (not `SystemTime::now()`) when replaying a file, or two runs of
@@ -375,6 +420,7 @@ fn start_spot_server(
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
     let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -390,6 +436,7 @@ fn start_spot_server(
             bus.clone(),
             metrics.clone(),
             cfg.station_callsign.clone(),
+            shutdown_rx.clone(),
         ));
         tokio::spawn(manta_server::json_stream::serve(
             json_listener,
@@ -398,6 +445,7 @@ fn start_spot_server(
             cty,
             cfg.station_callsign.clone(),
             decoder_version,
+            shutdown_rx,
         ));
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
@@ -407,7 +455,14 @@ fn start_spot_server(
         anyhow::Ok(())
     })?;
 
-    Ok((rt, SpotServer { bus, metrics }))
+    Ok((
+        rt,
+        SpotServer {
+            bus,
+            metrics,
+            shutdown_tx,
+        },
+    ))
 }
 
 fn main() -> Result<()> {
@@ -473,6 +528,9 @@ fn main() -> Result<()> {
             dial_freq_hz,
         } => {
             let is_file_replay = source.is_some();
+            // Captured before `open_source` consumes `source` below --
+            // needed to derive a recording-specific replay epoch.
+            let replay_path = source.clone();
             #[cfg(feature = "soapy")]
             let has_soapy_source = soapy_driver.is_some();
             #[cfg(not(feature = "soapy"))]
@@ -526,13 +584,16 @@ fn main() -> Result<()> {
                 None => src,
             };
 
-            // A fixed epoch for file replay keeps JSON timestamps/ids
-            // byte-identical across runs (this repo's determinism
-            // requirement); a live source gets a real wall-clock epoch.
-            let epoch = if is_file_replay {
-                std::time::SystemTime::UNIX_EPOCH
-            } else {
-                std::time::SystemTime::now()
+            // A recording-specific-but-deterministic epoch for file replay
+            // keeps JSON timestamps/ids byte-identical across reruns of
+            // the SAME file (this repo's determinism requirement) while
+            // still telling two DIFFERENT recordings apart -- a single
+            // fixed epoch (e.g. always UNIX_EPOCH) would let spots at the
+            // same track/sample position from unrelated files collide on
+            // the same id. A live source gets a real wall-clock epoch.
+            let epoch = match &replay_path {
+                Some(path) => epoch_for_replay_path(path),
+                None => std::time::SystemTime::now(),
             };
 
             // Kept alive for the process lifetime: dropping it would stop
@@ -607,9 +668,15 @@ fn main() -> Result<()> {
                 },
             )?;
 
-            // Let in-flight writes (e.g. spots from TrackManager::finish()
-            // just before `listen` returned) drain instead of vanishing
-            // when the runtime and its spawned client tasks are dropped.
+            // Explicitly signal the client tasks to drain (e.g. spots
+            // from TrackManager::finish() just before `listen` returned)
+            // before tearing the runtime down -- shutdown_timeout's raw
+            // deadline alone doesn't guarantee a task ever gets scheduled
+            // to observe and act on already-queued spots; it just bounds
+            // how long shutdown waits before forcibly aborting.
+            if let Some(server) = &spot_server {
+                let _ = server.shutdown_tx.send(true);
+            }
             if let Some(rt) = server_runtime {
                 rt.shutdown_timeout(std::time::Duration::from_secs(2));
             }
@@ -663,4 +730,25 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_for_replay_path_is_deterministic_for_the_same_path() {
+        let path = PathBuf::from("/some/fixture.wav");
+        assert_eq!(epoch_for_replay_path(&path), epoch_for_replay_path(&path));
+    }
+
+    #[test]
+    fn epoch_for_replay_path_differs_across_different_recordings() {
+        let a = epoch_for_replay_path(&PathBuf::from("/some/contest-weekend.wav"));
+        let b = epoch_for_replay_path(&PathBuf::from("/some/quiet-weeknight.wav"));
+        assert_ne!(
+            a, b,
+            "two different recordings must not collide on the same replay epoch"
+        );
+    }
 }

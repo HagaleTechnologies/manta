@@ -15,7 +15,12 @@ use tokio::net::{TcpListener, TcpStream};
 const SAMPLE_RATE_HZ: f64 = 96_000.0;
 const STATION_CALL: &str = "W3XYZ";
 
-async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>, Arc<Metrics>) {
+async fn spawn_server() -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch));
     let metrics = Arc::new(Metrics::new());
@@ -24,11 +29,19 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>, Arc<Metrics>) {
 
     let bus2 = bus.clone();
     let metrics2 = metrics.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        manta_server::telnet::serve(listener, bus2, metrics2, STATION_CALL.to_string()).await;
+        manta_server::telnet::serve(
+            listener,
+            bus2,
+            metrics2,
+            STATION_CALL.to_string(),
+            shutdown_rx,
+        )
+        .await;
     });
 
-    (addr, bus, metrics)
+    (addr, bus, metrics, shutdown_tx)
 }
 
 fn sample_spot() -> Spot {
@@ -78,7 +91,7 @@ async fn connect_and_login(
 
 #[tokio::test]
 async fn standard_client_receives_spot_in_rbn_format_after_login() {
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     let spot = sample_spot();
@@ -96,7 +109,7 @@ async fn standard_client_receives_spot_in_rbn_format_after_login() {
 
 #[tokio::test]
 async fn sh_dx_command_does_not_disconnect_the_client() {
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"sh/dx\r\n").await.unwrap();
@@ -116,7 +129,7 @@ async fn sh_dx_command_does_not_disconnect_the_client() {
 
 #[tokio::test]
 async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
 
     // History predates the client's connection entirely -- `sh/dx` reads
     // the bus's retained history, not the live broadcast subscription.
@@ -150,7 +163,7 @@ async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
 
 #[tokio::test]
 async fn set_dx_filter_unique_suppresses_below_threshold_occurrences() {
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
@@ -197,7 +210,7 @@ async fn filter_evaluates_each_spot_at_its_own_publication_time_not_drain_time()
     // time the client gets around to checking it -- otherwise both the
     // first (which should be suppressed) and second occurrence would pass
     // a `unique > 1` filter once the count had already reached 2.
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
@@ -228,8 +241,82 @@ async fn filter_evaluates_each_spot_at_its_own_publication_time_not_drain_time()
 }
 
 #[tokio::test]
+async fn a_command_split_across_writes_survives_a_spot_arriving_mid_command() {
+    // Regression test: the command line ("sh/dx") arrives in two TCP
+    // writes with a live spot published in between -- forcing the
+    // server's `tokio::select!` to cancel the in-progress read for the
+    // spot branch, then resume reading the command's remainder. The full
+    // command must still be recognized, not corrupted into "x" (parsed as
+    // Command::Unknown, silently producing no history replay at all).
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    let mut history_spot = sample_spot();
+    history_spot.callsign = "N0CALL".to_string();
+    bus.publish(history_spot);
+
+    wr.write_all(b"sh/d").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await; // let the server start awaiting more
+
+    let live_spot = sample_spot();
+    bus.publish(live_spot); // races the in-progress command read
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    wr.write_all(b"x\r\n").await.unwrap(); // completes "sh/dx"
+
+    // Collect whatever arrives over a bounded window -- the live spot's
+    // broadcast delivery and the sh/dx history reply can interleave in
+    // either order; what matters is that N0CALL (only ever reachable via
+    // a correctly-reassembled "sh/dx", never via "x" parsed as
+    // Command::Unknown) shows up at all.
+    let mut lines = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            lines.push(line);
+        }
+    })
+    .await;
+
+    assert!(
+        lines.iter().any(|l| l.contains("N0CALL")),
+        "sh/dx must have been recognized, not corrupted into an unknown command; got: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
+    // Regression test: a spot published right as the daemon shuts down
+    // (e.g. from TrackManager::finish() just before exit) must still
+    // reach the client, not be dropped when the runtime tears the
+    // connection's task down.
+    let (addr, bus, _metrics, shutdown_tx) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    bus.publish(sample_spot());
+    let _ = shutdown_tx.send(true);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("a spot published right at shutdown must not be lost")
+        .unwrap();
+    assert!(line.contains("DX de"), "line was: {line:?}");
+
+    let mut trailing = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut trailing))
+        .await
+        .expect("connection never closed after the shutdown drain")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF after shutdown drain, got: {trailing:?}");
+}
+
+#[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
-    let (addr, _bus, metrics) = spawn_server().await;
+    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
     let (_reader, _wr) = connect_and_login(addr).await;
 
     // Give the accept/login task a moment to run and increment the gauge.

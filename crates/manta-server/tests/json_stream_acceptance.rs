@@ -23,12 +23,18 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     JA,JD,JE,JF,JG,JH,JI,JJ,JK,JL,JM,JN,JO,JP,JQ,JR,JS;
 ";
 
-async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>, Arc<Metrics>) {
+async fn spawn_server() -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now()));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let bus2 = bus.clone();
     let metrics2 = metrics.clone();
@@ -40,11 +46,12 @@ async fn spawn_server() -> (std::net::SocketAddr, Arc<SpotBus>, Arc<Metrics>) {
             cty,
             STATION_CALL.to_string(),
             "manta-test".to_string(),
+            shutdown_rx,
         )
         .await;
     });
 
-    (addr, bus, metrics)
+    (addr, bus, metrics, shutdown_tx)
 }
 
 fn sample_spot() -> Spot {
@@ -62,7 +69,7 @@ fn sample_spot() -> Spot {
 
 #[tokio::test]
 async fn tcp_client_receives_spot_as_json_lines_message() {
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
     let stream = TcpStream::connect(addr).await.unwrap();
     let mut reader = BufReader::new(stream);
 
@@ -91,11 +98,33 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
 }
 
 #[tokio::test]
+async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
+    // Regression test: a spot published right as the daemon shuts down
+    // must still reach the client, not be dropped when the runtime tears
+    // the connection's task down.
+    let (addr, bus, _metrics, shutdown_tx) = spawn_server().await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    tokio::time::sleep(Duration::from_millis(600)).await; // past the WS-detection peek window
+
+    bus.publish(sample_spot());
+    let _ = shutdown_tx.send(true);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("a spot published right at shutdown must not be lost")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
+    assert_eq!(value["dxCall"], "JA1ABC");
+}
+
+#[tokio::test]
 async fn tcp_client_close_during_a_quiet_period_is_detected() {
     // Regression test: a raw JSON-lines client that disconnects while no
     // spots are being published must not leave its task/socket/gauge
     // alive until some later spot's write happens to fail.
-    let (addr, _bus, metrics) = spawn_server().await;
+    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
 
     let stream = TcpStream::connect(addr).await.unwrap();
     // The WS-detection peek can wait up to PEEK_TIMEOUT (500ms) before
@@ -133,11 +162,50 @@ async fn tcp_client_close_during_a_quiet_period_is_detected() {
 }
 
 #[tokio::test]
+async fn a_websocket_handshake_split_across_tcp_writes_is_still_detected() {
+    // Regression test: the classifying peek must not misjudge a genuine
+    // WebSocket client as plain TCP just because its "GET" arrived in
+    // pieces smaller than 3 bytes on the first look.
+    use tokio::io::AsyncWriteExt;
+
+    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream.write_all(b"GE").await.unwrap(); // fewer than 3 bytes
+    tokio::time::sleep(Duration::from_millis(50)).await; // let the first peek see only "GE"
+    stream
+        .write_all(
+            b"T / HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if metrics
+                .render_prometheus_text()
+                .contains("manta_ws_clients_connected 1")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("split GET was never classified as a WebSocket client");
+}
+
+#[tokio::test]
 async fn tcp_and_websocket_clients_share_the_same_port() {
     // ARCHITECTURE §7 documents one shared "tcp/ws :7301" port -- prove a
     // raw TCP client and a WebSocket client can both connect to the exact
     // same listener and each get correctly classified.
-    let (addr, bus, _metrics) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
 
     let tcp_stream = TcpStream::connect(addr).await.unwrap();
     let mut tcp_reader = BufReader::new(tcp_stream);
@@ -179,6 +247,7 @@ async fn websocket_client_receives_spot_as_json_message() {
     let addr = listener.local_addr().unwrap();
 
     let bus2 = bus.clone();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         manta_server::json_stream::serve(
             listener,
@@ -187,6 +256,7 @@ async fn websocket_client_receives_spot_as_json_message() {
             cty,
             STATION_CALL.to_string(),
             "manta-test".to_string(),
+            shutdown_rx,
         )
         .await;
     });

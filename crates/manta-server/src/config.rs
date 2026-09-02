@@ -3,7 +3,7 @@
 //! Naming follows `docs/SPEC-decode-core.md` §9's convention
 //! (`lower_snake_case`, `_port` unit suffix, table name = subsystem name).
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 fn default_telnet_port() -> u16 {
     7300
@@ -21,11 +21,31 @@ fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
 }
 
+fn deserialize_station_callsign<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let call = String::deserialize(deserializer)?;
+    if !manta_spot::grammar::is_plausible(&call) {
+        return Err(serde::de::Error::custom(format!(
+            "station_callsign {call:?} is not a plausible callsign"
+        )));
+    }
+    Ok(call)
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerConfig {
     /// The spotter's own callsign, used as the telnet `DX de <call>-#:`
     /// identity and the JSON stream's `deCall`. No sensible default --
-    /// every real cluster/spot-stream node identifies itself.
+    /// every real cluster/spot-stream node identifies itself. Validated
+    /// (via `manta_spot::grammar::is_plausible`, the same grammar the
+    /// decode pipeline itself uses) at deserialize time: an empty,
+    /// control-character-laden, or malformed value would otherwise be
+    /// interpolated straight into every telnet line and JSON `deCall`
+    /// unescaped -- e.g. a callsign containing `\r\n` could forge
+    /// additional bogus cluster lines.
+    #[serde(deserialize_with = "deserialize_station_callsign")]
     pub station_callsign: String,
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
@@ -96,6 +116,15 @@ mod tests {
     fn missing_station_callsign_is_a_parse_error() {
         let result: Result<ServerConfig, _> = toml::from_str("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn implausible_station_callsign_is_rejected() {
+        for bad in ["", "W3XYZ-#", "W3XYZ\r\nEVIL LINE", "not a callsign"] {
+            let result: Result<ServerConfig, _> =
+                toml::from_str(&format!(r#"station_callsign = {bad:?}"#));
+            assert!(result.is_err(), "{bad:?} should have been rejected");
+        }
     }
 
     #[test]

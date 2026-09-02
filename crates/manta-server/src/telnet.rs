@@ -14,13 +14,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// Every outbound write gets this long before the client is treated as
 /// stalled and disconnected -- ARCHITECTURE §7's "slow clients are
 /// disconnected, never back-pressured" policy applies to a client that
 /// stops reading, not just one that falls behind the broadcast channel.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the accept loop backs off after a failed `accept()` before
+/// retrying -- a persistent resource error (e.g. `EMFILE`) makes
+/// `accept()` return immediately, and retrying with no delay turns this
+/// into a tight loop that starves other tasks on the same runtime.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
@@ -29,18 +34,23 @@ pub async fn serve(
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
     station_call: String,
+    shutdown: watch::Receiver<bool>,
 ) {
     loop {
         let (socket, _peer) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
         let bus = bus.clone();
         let metrics = metrics.clone();
         let station_call = station_call.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             metrics.inc_telnet_clients();
-            let _ = handle_client(socket, bus, metrics.clone(), station_call).await;
+            let _ = handle_client(socket, bus, metrics.clone(), station_call, shutdown).await;
             metrics.dec_telnet_clients();
         });
     }
@@ -51,6 +61,7 @@ async fn handle_client(
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
     station_call: String,
+    mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
@@ -71,9 +82,15 @@ async fn handle_client(
     // `sh/dx` default when the client didn't specify a count.
     const DEFAULT_SHOW_DX_COUNT: usize = 10;
     let mut min_unique: Option<u32> = None;
+    // Not cleared at the top of the loop, deliberately: `tokio::select!`
+    // can cancel `read_line_bounded_with_timeout` mid-line (a spot arrived
+    // first), and the bytes it already consumed from `reader` were
+    // already appended into `cmd_line` as a side effect before that
+    // cancellation point -- clearing here would discard them, silently
+    // truncating the command to whatever chunk arrives next. Only cleared
+    // once a full line has actually been parsed, below.
     let mut cmd_line = String::new();
     loop {
-        cmd_line.clear();
         tokio::select! {
             spot = rx.recv() => {
                 match spot {
@@ -116,6 +133,23 @@ async fn handle_client(
                     // choking the connection.
                     Command::Unknown => {}
                 }
+                cmd_line.clear(); // a full line was consumed and processed
+            }
+            // Explicit shutdown signal (not just letting the runtime's
+            // forced-timeout abort us): drain whatever's already queued
+            // on the broadcast channel -- e.g. spots TrackManager::finish()
+            // published right before the daemon exited -- rather than
+            // dropping them unsent.
+            _ = shutdown.changed() => {
+                while let Ok(bus_spot) = rx.try_recv() {
+                    if let Some(min) = min_unique {
+                        if bus_spot.occurrence_count <= min {
+                            continue;
+                        }
+                    }
+                    write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot).await?;
+                }
+                return Ok(());
             }
         }
     }

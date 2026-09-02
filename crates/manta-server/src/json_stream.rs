@@ -11,12 +11,11 @@ use crate::bus::{BusSpot, SpotBus};
 use crate::metrics::Metrics;
 use crate::spot_message::SpotMessage;
 use manta_spot::cty::Table;
-use manta_spot::Spot;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// How long a slow client is given to accept one write before it's treated
 /// as stalled and disconnected -- otherwise a write blocked forever would
@@ -29,24 +28,41 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `serve` waits for a connection's first bytes before assuming
 /// it's a raw JSON Lines client (which may never send anything).
 const PEEK_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long the accept loop backs off after a failed `accept()` before
+/// retrying -- a persistent resource error (e.g. the process's
+/// file-descriptor limit, `EMFILE`) makes `accept()` return immediately
+/// with an error, and retrying with no delay turns this into a tight loop
+/// that starves other tasks on the same runtime instead of giving the
+/// system a chance to recover.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-fn render(
-    spot: &Spot,
-    station_call: &str,
-    cty: &Table,
-    decoder_version: &str,
-    unix_ts: i64,
-    session_epoch_unix: i64,
-) -> String {
-    let msg = SpotMessage::from_spot(
-        spot,
-        station_call,
-        cty,
-        decoder_version,
-        unix_ts,
-        session_epoch_unix,
-    );
-    serde_json::to_string(&msg).expect("SpotMessage always serializes")
+/// Everything a per-connection handler needs besides the socket and its
+/// broadcast subscription -- grouped so `handle_tcp_client`/
+/// `handle_ws_client` stay at a sane arity as this crate's shared-context
+/// list grows.
+#[derive(Clone)]
+struct ClientCtx {
+    bus: Arc<SpotBus>,
+    metrics: Arc<Metrics>,
+    cty: Arc<Table>,
+    station_call: String,
+    decoder_version: String,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl ClientCtx {
+    fn render(&self, bus_spot: &BusSpot) -> String {
+        let unix_ts = self.bus.unix_ts_for(bus_spot.spot.sample_ts);
+        let msg = SpotMessage::from_spot(
+            &bus_spot.spot,
+            &self.station_call,
+            &self.cty,
+            &self.decoder_version,
+            unix_ts,
+            self.bus.epoch_unix_secs(),
+        );
+        serde_json::to_string(&msg).expect("SpotMessage always serializes")
+    }
 }
 
 /// Accepts connections on `listener`, dispatching each to the plain-TCP or
@@ -58,17 +74,25 @@ pub async fn serve(
     cty: Arc<Table>,
     station_call: String,
     decoder_version: String,
+    shutdown: watch::Receiver<bool>,
 ) {
+    let ctx = ClientCtx {
+        bus,
+        metrics,
+        cty,
+        station_call,
+        decoder_version,
+        shutdown,
+    };
     loop {
         let (socket, _peer) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
-        let bus = bus.clone();
-        let metrics = metrics.clone();
-        let cty = cty.clone();
-        let station_call = station_call.clone();
-        let decoder_version = decoder_version.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             // Subscribe immediately on accept, before the WS-detection
             // peek (which can wait up to PEEK_TIMEOUT) -- otherwise a spot
@@ -76,54 +100,48 @@ pub async fn serve(
             // lost to the broadcast channel's no-history-for-late-
             // subscribers semantics (same class of bug the telnet server
             // hit with subscribe-after-login).
-            let rx = bus.subscribe();
+            let rx = ctx.bus.subscribe();
             if looks_like_websocket_handshake(&socket).await {
-                metrics.inc_ws_clients();
-                let _ = handle_ws_client(
-                    socket,
-                    rx,
-                    bus,
-                    metrics.clone(),
-                    cty,
-                    station_call,
-                    decoder_version,
-                )
-                .await;
-                metrics.dec_ws_clients();
+                ctx.metrics.inc_ws_clients();
+                let _ = handle_ws_client(socket, rx, ctx.clone()).await;
+                ctx.metrics.dec_ws_clients();
             } else {
-                metrics.inc_json_clients();
-                let _ = handle_tcp_client(
-                    socket,
-                    rx,
-                    bus,
-                    metrics.clone(),
-                    cty,
-                    station_call,
-                    decoder_version,
-                )
-                .await;
-                metrics.dec_json_clients();
+                ctx.metrics.inc_json_clients();
+                let _ = handle_tcp_client(socket, rx, ctx.clone()).await;
+                ctx.metrics.dec_json_clients();
             }
         });
     }
 }
 
+/// How long to wait between re-peeks while fewer than 3 bytes have arrived
+/// so far -- a single peek only ever returns what's *currently* in the
+/// kernel receive buffer, so a `GET` split across TCP segments (e.g. `G`
+/// then `ET ...`) must not be misclassified as "not a WebSocket client"
+/// just because the first peek alone came up short.
+const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
 async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
+    let deadline = tokio::time::Instant::now() + PEEK_TIMEOUT;
     let mut peek_buf = [0u8; 3];
-    matches!(
-        tokio::time::timeout(PEEK_TIMEOUT, socket.peek(&mut peek_buf)).await,
-        Ok(Ok(n)) if n >= 3 && &peek_buf[..3] == b"GET"
-    )
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false; // budget exhausted with < 3 bytes ever seen
+        }
+        match tokio::time::timeout(remaining, socket.peek(&mut peek_buf)).await {
+            Ok(Ok(n)) if n >= 3 => return &peek_buf[..3] == b"GET",
+            Ok(Ok(0)) => return false, // peer closed without sending anything
+            Ok(Ok(_)) => tokio::time::sleep(PEEK_RETRY_INTERVAL).await,
+            Ok(Err(_)) | Err(_) => return false,
+        }
+    }
 }
 
 async fn handle_tcp_client(
     mut socket: TcpStream,
     mut rx: broadcast::Receiver<BusSpot>,
-    bus: Arc<SpotBus>,
-    metrics: Arc<Metrics>,
-    cty: Arc<Table>,
-    station_call: String,
-    decoder_version: String,
+    mut ctx: ClientCtx,
 ) -> std::io::Result<()> {
     // This protocol is pure server push -- the client never needs to send
     // anything -- so this scratch buffer only exists to notice EOF/close;
@@ -134,15 +152,7 @@ async fn handle_tcp_client(
             spot = rx.recv() => {
                 match spot {
                     Ok(bus_spot) => {
-                        let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
-                        let line = render(
-                            &bus_spot.spot,
-                            &station_call,
-                            &cty,
-                            &decoder_version,
-                            unix_ts,
-                            bus.epoch_unix_secs(),
-                        );
+                        let line = ctx.render(&bus_spot);
                         tokio::time::timeout(WRITE_TIMEOUT, async {
                             socket.write_all(line.as_bytes()).await?;
                             socket.write_all(b"\n").await
@@ -151,7 +161,7 @@ async fn handle_tcp_client(
                         .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "write timed out"))??;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        metrics.record_lagged(n);
+                        ctx.metrics.record_lagged(n);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -168,6 +178,19 @@ async fn handle_tcp_client(
                     Err(_) => return Ok(()),
                 }
             }
+            // Explicit shutdown: drain whatever's already queued rather
+            // than dropping it when the runtime forcibly tears down.
+            _ = ctx.shutdown.changed() => {
+                while let Ok(bus_spot) = rx.try_recv() {
+                    let line = ctx.render(&bus_spot);
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, async {
+                        socket.write_all(line.as_bytes()).await?;
+                        socket.write_all(b"\n").await
+                    })
+                    .await;
+                }
+                return Ok(());
+            }
         }
     }
 }
@@ -175,11 +198,7 @@ async fn handle_tcp_client(
 async fn handle_ws_client(
     socket: TcpStream,
     mut rx: broadcast::Receiver<BusSpot>,
-    bus: Arc<SpotBus>,
-    metrics: Arc<Metrics>,
-    cty: Arc<Table>,
-    station_call: String,
-    decoder_version: String,
+    mut ctx: ClientCtx,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -191,21 +210,13 @@ async fn handle_ws_client(
             spot = rx.recv() => {
                 match spot {
                     Ok(bus_spot) => {
-                        let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
-                        let text = render(
-                            &bus_spot.spot,
-                            &station_call,
-                            &cty,
-                            &decoder_version,
-                            unix_ts,
-                            bus.epoch_unix_secs(),
-                        );
+                        let text = ctx.render(&bus_spot);
                         tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into())))
                             .await
                             .map_err(|_| anyhow::anyhow!("write timed out"))??;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        metrics.record_lagged(n);
+                        ctx.metrics.record_lagged(n);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -222,6 +233,15 @@ async fn handle_ws_client(
                     Some(Ok(_)) => {} // client isn't expected to send data; ignore other frames
                     Some(Err(_)) => return Ok(()),
                 }
+            }
+            // Explicit shutdown: drain whatever's already queued rather
+            // than dropping it when the runtime forcibly tears down.
+            _ = ctx.shutdown.changed() => {
+                while let Ok(bus_spot) = rx.try_recv() {
+                    let text = ctx.render(&bus_spot);
+                    let _ = tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Text(text.into()))).await;
+                }
+                return Ok(());
             }
         }
     }

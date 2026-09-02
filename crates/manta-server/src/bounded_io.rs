@@ -13,14 +13,24 @@ pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reads one line, accumulating at most `MAX_LINE_BYTES` before treating
 /// an unterminated line as a protocol violation (an `InvalidData` error)
 /// rather than growing `buf` without bound. Returns the number of bytes
-/// read, `0` meaning EOF -- matching `AsyncBufReadExt::read_line`'s
-/// contract for everything except the size cap.
+/// read (including whatever `buf` already held on entry), `0` meaning EOF
+/// with `buf` empty on entry.
+///
+/// Deliberately does **not** clear `buf` itself -- this future is not
+/// cancellation-safe against losing already-consumed bytes (nothing async
+/// I/O can be, short of buffering independently of the caller), but it
+/// *is* resumable: a caller using this inside `tokio::select!` and NOT
+/// clearing `buf` between calls can safely let a losing-race read be
+/// dropped mid-line and simply call this again later to continue where it
+/// left off, because every byte already pulled off the reader was already
+/// appended to `buf` as a side effect before any cancellation point. A
+/// caller that clears `buf` before every call (a fresh line each time)
+/// gets the same behavior `read_line_bounded` had when it auto-cleared.
 pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut String,
 ) -> std::io::Result<usize> {
-    buf.clear();
-    let mut total = 0usize;
+    let mut total = buf.len();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -98,6 +108,48 @@ mod tests {
         let mut buf = String::new();
         let n = read_line_bounded(&mut reader, &mut buf).await.unwrap();
         assert_eq!(n, MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn resumes_a_partially_read_line_across_a_select_cancellation() {
+        // Regression test for the telnet server's real bug: a command
+        // split across TCP chunks, where `tokio::select!` cancels the
+        // read future after it consumed the first chunk (no newline yet)
+        // but before a second chunk arrives. The bytes already pulled off
+        // the reader must not vanish with the cancelled future. Manually
+        // polling once (rather than racing inside a real `select!`) makes
+        // the cancellation point deterministic instead of scheduler-order
+        // dependent.
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+
+        write_half.write_all(b"sh/d").await.unwrap();
+        tokio::task::yield_now().await; // let the duplex pipe deliver it
+
+        {
+            let fut = read_line_bounded(&mut reader, &mut buf);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Pending => {} // expected: no newline in "sh/d" yet
+                std::task::Poll::Ready(r) => panic!("must not complete yet, got {r:?}"),
+            }
+            // `fut` drops here at the end of this scope -- the cancellation.
+        }
+        assert_eq!(
+            buf, "sh/d",
+            "bytes already consumed from the reader must survive cancellation"
+        );
+
+        write_half.write_all(b"x\r\n").await.unwrap();
+        let n = read_line_bounded(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(buf, "sh/dx\r\n");
+        assert_eq!(n, 7);
     }
 
     #[tokio::test]
