@@ -72,6 +72,18 @@ pub const MAX_TELNET_CONNECTIONS_PER_IP: usize = 16;
 // "this many commands per source in this window", not "per connection" --
 // opening more connections must not multiply it.
 
+/// MAN-59 review round 2: the per-IP quota-rejection warning below runs
+/// on every rejected socket, BEFORE any request/command rate limiter --
+/// nothing bounds how often it fires. A source that holds its allotment
+/// and keeps completing new TCP handshakes anyway could otherwise flood
+/// or block the log sink at whatever rate the OS lets it open sockets,
+/// unrelated to and unbounded by `MAX_TELNET_CONNECTIONS_PER_IP`. Caps
+/// this one specific event to once per source per window; the actual
+/// rejection behavior (declining the connection) is unaffected either
+/// way -- only how often it gets LOGGED is throttled.
+const QUOTA_REJECT_LOG_MAX_PER_WINDOW: u32 = 1;
+const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
 #[allow(clippy::too_many_arguments)]
@@ -86,6 +98,9 @@ pub async fn serve(
     ip_quota: IpQuota,
     ip_command_limiter: IpRateLimiter,
 ) {
+    let quota_reject_log_limiter =
+        IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -100,7 +115,9 @@ pub async fn serve(
         // dropped here, closing the connection, leaving that shared
         // capacity for other sources.
         let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
-            tracing::warn!(ip = %peer.ip(), "telnet: per-IP connection quota exceeded, declining");
+            if quota_reject_log_limiter.allow(peer.ip()) {
+                tracing::warn!(ip = %peer.ip(), "telnet: per-IP connection quota exceeded, declining");
+            }
             continue;
         };
         // Blocks the accept loop itself (not just the client) until
@@ -236,6 +253,10 @@ async fn handle_client(
                             // abandoned along with it -- both must be
                             // counted, not just a Lagged-induced loss
                             // (round-11 review finding).
+                            // MAN-59 review round 2: this returns Ok(()),
+                            // not Err, so the task-boundary catch-all
+                            // never sees it -- log it directly.
+                            tracing::warn!("telnet: spot write failed, disconnecting");
                             metrics.record_write_failed(1 + rx.len() as u64);
                             return Ok(());
                         }
@@ -333,6 +354,9 @@ async fn handle_client(
                                 // failed write, whatever's left of the
                                 // history iterator, and whatever's still
                                 // retained on the live channel.
+                                // MAN-59 review round 2: returns Ok(()),
+                                // not Err -- log it directly.
+                                tracing::warn!("telnet: sh/dx history write failed, disconnecting");
                                 metrics.record_write_failed(
                                     1 + history.len() as u64 + rx.len() as u64,
                                 );
@@ -357,6 +381,9 @@ async fn handle_client(
                             // The failed write itself isn't a queued spot,
                             // so only the retained live-channel backlog
                             // counts here (no `1 +`).
+                            // MAN-59 review round 2: returns Ok(()), not
+                            // Err -- log it directly.
+                            tracing::warn!("telnet: filter-ack write failed, disconnecting");
                             metrics.record_write_failed(rx.len() as u64);
                             return Ok(());
                         }
@@ -400,6 +427,9 @@ async fn handle_client(
                                 // handler, abandoning the rest of the
                                 // drain loop uncounted (round-12 review
                                 // finding).
+                                // MAN-59 review round 2: returns Ok(()),
+                                // not Err -- log it directly.
+                                tracing::warn!("telnet: shutdown-drain write failed, disconnecting");
                                 metrics.record_write_failed(1 + rx.len() as u64);
                                 return Ok(());
                             }

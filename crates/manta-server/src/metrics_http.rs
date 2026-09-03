@@ -5,6 +5,7 @@
 
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
+use crate::rate_limit::IpRateLimiter;
 use crate::tasks::{ConnectionLimiter, IpQuota};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,12 +53,22 @@ pub const MAX_METRICS_CONNECTIONS: usize = 64;
 /// proportionally smaller, total ceiling).
 pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 
+/// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
+/// -- this warning runs on every rejected socket, before any request rate
+/// limiter, so a source completing repeated handshakes despite holding
+/// its allotment could otherwise flood the log sink unbounded.
+const QUOTA_REJECT_LOG_MAX_PER_WINDOW: u32 = 1;
+const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 pub async fn serve(
     listener: TcpListener,
     metrics: Arc<Metrics>,
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
 ) {
+    let quota_reject_log_limiter =
+        IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -72,7 +83,9 @@ pub async fn serve(
         // dropped here, closing the connection, leaving that shared
         // capacity for other sources.
         let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
-            tracing::warn!(ip = %peer.ip(), "metrics_http: per-IP connection quota exceeded, declining");
+            if quota_reject_log_limiter.allow(peer.ip()) {
+                tracing::warn!(ip = %peer.ip(), "metrics_http: per-IP connection quota exceeded, declining");
+            }
             continue;
         };
         // Blocks the accept loop itself until capacity is available -- a

@@ -130,6 +130,13 @@ pub struct JsonStreamConfig {
     pub shutdown: watch::Receiver<bool>,
 }
 
+/// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
+/// -- this warning runs on every rejected socket, before any request rate
+/// limiter, so a source completing repeated handshakes despite holding
+/// its allotment could otherwise flood the log sink unbounded.
+const QUOTA_REJECT_LOG_MAX_PER_WINDOW: u32 = 1;
+const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 /// Accepts connections on `listener`, dispatching each to the plain-TCP or
 /// WebSocket handler based on a non-destructive peek of its first bytes.
 pub async fn serve(
@@ -148,6 +155,9 @@ pub async fn serve(
         decoder_version: config.decoder_version,
         shutdown: config.shutdown,
     };
+    let quota_reject_log_limiter =
+        IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -162,7 +172,9 @@ pub async fn serve(
         // dropped here, closing the connection, leaving that shared
         // capacity for other sources.
         let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
-            tracing::warn!(ip = %peer.ip(), "json_stream: per-IP connection quota exceeded, declining");
+            if quota_reject_log_limiter.allow(peer.ip()) {
+                tracing::warn!(ip = %peer.ip(), "json_stream: per-IP connection quota exceeded, declining");
+            }
             continue;
         };
         // Blocks the accept loop itself (not just the client) until
@@ -292,6 +304,9 @@ async fn handle_tcp_client(
                             // abandoned along with it -- a bare `?` here
                             // (the prior behavior) exited with neither
                             // counted anywhere (round-11 review finding).
+                            // MAN-59 review round 2: returns Ok(()), not
+                            // Err -- log it directly.
+                            tracing::warn!("json_stream: spot write failed, disconnecting");
                             ctx.metrics.record_write_failed(1 + rx.len() as u64);
                             return Ok(());
                         }
@@ -367,6 +382,11 @@ async fn handle_tcp_client(
                                 // discarding the error and continuing to
                                 // burn the write timeout on every remaining
                                 // queued spot (round-12 review finding).
+                                // MAN-59 review round 2: returns Ok(()),
+                                // not Err -- log it directly.
+                                tracing::warn!(
+                                    "json_stream: shutdown-drain write failed, disconnecting"
+                                );
                                 ctx.metrics.record_write_failed(1 + rx.len() as u64);
                                 return Ok(());
                             }
@@ -436,6 +456,9 @@ async fn handle_ws_client(
                             // abandoned along with it -- a bare `?` here
                             // (the prior behavior) exited with neither
                             // counted anywhere (round-11 review finding).
+                            // MAN-59 review round 2: returns Ok(()), not
+                            // Err -- log it directly.
+                            tracing::warn!("json_stream: WS spot write failed, disconnecting");
                             ctx.metrics.record_write_failed(1 + rx.len() as u64);
                             return Ok(());
                         }
@@ -531,6 +554,11 @@ async fn handle_ws_client(
                                 // write stops the drain instead of
                                 // silently continuing (round-12 review
                                 // finding).
+                                // MAN-59 review round 2: returns Ok(()),
+                                // not Err -- log it directly.
+                                tracing::warn!(
+                                    "json_stream: WS shutdown-drain write failed, disconnecting"
+                                );
                                 ctx.metrics.record_write_failed(1 + rx.len() as u64);
                                 return Ok(());
                             }
