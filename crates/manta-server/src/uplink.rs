@@ -303,14 +303,22 @@ async fn forward_loop(
                             write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
                                 if write_result.is_err() {
                                     // Counted before propagating (PR #80
-                                    // review, round 3): a spot lost to a
-                                    // failed/timed-out write was
-                                    // otherwise silently dropped --
-                                    // invisible on every other counter,
-                                    // since uplink_lagged_total is
-                                    // specifically broadcast-channel lag,
-                                    // not a network write failure.
-                                    metrics.record_uplink_write_failed();
+                                    // review, round 3, tightened round 4):
+                                    // a spot lost to a failed/timed-out
+                                    // write was otherwise silently
+                                    // dropped -- invisible on every other
+                                    // counter, since uplink_lagged_total
+                                    // is specifically broadcast-channel
+                                    // lag, not a network write failure.
+                                    // `1 + rx.len()`, not just `1`: the
+                                    // `?` below drops `rx` (a fresh
+                                    // subscription is made on reconnect),
+                                    // abandoning whatever was ALSO
+                                    // already queued in its backlog --
+                                    // matching `record_write_failed`'s
+                                    // identical convention on the inbound
+                                    // telnet/JSON write path.
+                                    metrics.record_uplink_write_failed(1 + rx.len() as u64);
                                     write_result?;
                                 }
                                 metrics.record_uplink_sent();

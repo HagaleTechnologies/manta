@@ -149,15 +149,21 @@ impl Metrics {
     }
 
     /// A write to the uplink target's socket timed out or failed (PR #80
-    /// review, round 3): distinct from `uplink_lagged_total`, which is
-    /// specifically broadcast-channel lag (the receiver falling behind),
-    /// not a network-level write failure. Without this, a spot lost to a
-    /// stalled/failed write is silently dropped -- invisible on every
-    /// existing counter, the same class of gap `record_write_failed`
-    /// already closed for the inbound telnet/JSON write path.
-    pub fn record_uplink_write_failed(&self) {
+    /// review, round 3, tightened round 4): distinct from
+    /// `uplink_lagged_total`, which is specifically broadcast-channel lag
+    /// (the receiver falling behind), not a network-level write failure.
+    /// `n` covers the spot whose write just failed plus whatever was
+    /// still retained in the receiver's own buffer and is now abandoned
+    /// along with it when `forward_loop` returns and the connection's
+    /// `broadcast::Receiver` is dropped -- matching
+    /// `record_write_failed`'s identical `1 + rx.len()` convention on the
+    /// inbound telnet/JSON write path (round-11 review finding there).
+    /// Without counting the backlog too, a write failure right after a
+    /// burst of spots would silently lose everything still queued in
+    /// `rx`, not just the one spot whose write actually failed.
+    pub fn record_uplink_write_failed(&self, n: u64) {
         self.uplink_write_failed_total
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn uplink_write_failed_total(&self) -> u64 {
@@ -422,8 +428,10 @@ mod tests {
         assert_eq!(m.uplink_lagged_total(), 3);
 
         assert_eq!(m.uplink_write_failed_total(), 0);
-        m.record_uplink_write_failed();
+        m.record_uplink_write_failed(1);
         assert_eq!(m.uplink_write_failed_total(), 1);
+        m.record_uplink_write_failed(4); // e.g. the failed spot + 3 abandoned backlog
+        assert_eq!(m.uplink_write_failed_total(), 5);
 
         assert_eq!(m.uplink_reconnects_total(), 0);
         m.record_uplink_reconnect();
@@ -443,7 +451,7 @@ mod tests {
         m.record_uplink_sent();
         m.record_uplink_suppressed();
         m.record_uplink_reconnect();
-        m.record_uplink_write_failed();
+        m.record_uplink_write_failed(1);
         m.mark_uplink_connected();
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_uplink_sent_total 2"));
