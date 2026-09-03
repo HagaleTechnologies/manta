@@ -10,7 +10,7 @@
 use crate::bus::{BusSpot, SpotBus};
 use crate::metrics::Metrics;
 use crate::spot_message::SpotMessage;
-use crate::tasks::{ClientTasks, ConnectionLimiter};
+use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
 use manta_spot::cty::Table;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +66,15 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// finding). Generous headroom over any realistic legitimate consumer
 /// count (this is the cqdx ingest surface, not a public high-fanout feed).
 pub const MAX_JSON_STREAM_CONNECTIONS: usize = 512;
+/// Upper bound on concurrently admitted JSON/WS clients from a SINGLE
+/// source IP (MAN-61, `docs/DECISIONS/2026-09-03-man61-per-ip-connection-
+/// quota.md`): a raw JSON client is *designed* to be quiet forever after
+/// connecting (that's the whole point of a push-only protocol), so
+/// `MAX_JSON_STREAM_CONNECTIONS` alone lets one source open up to that
+/// many connections, send nothing further, and permanently deny
+/// admission to every other client. Same reasoning and value as
+/// `telnet::MAX_TELNET_CONNECTIONS_PER_IP`.
+pub const MAX_JSON_STREAM_CONNECTIONS_PER_IP: usize = 16;
 
 /// Everything a per-connection handler needs besides the socket and its
 /// broadcast subscription -- grouped so `handle_tcp_client`/
@@ -117,6 +126,7 @@ pub async fn serve(
     config: JsonStreamConfig,
     tasks: ClientTasks,
     limiter: ConnectionLimiter,
+    ip_quota: IpQuota,
 ) {
     let ctx = ClientCtx {
         bus: config.bus,
@@ -127,12 +137,20 @@ pub async fn serve(
         shutdown: config.shutdown,
     };
     loop {
-        let (socket, _peer) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => {
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
+        };
+        // Checked BEFORE the shared limiter, not after (MAN-61): a source
+        // already at its own per-IP cap is declined without consuming a
+        // `ConnectionLimiter` permit at all -- the socket is simply
+        // dropped here, closing the connection, leaving that shared
+        // capacity for other sources.
+        let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
+            continue;
         };
         // Blocks the accept loop itself (not just the client) until
         // capacity is available -- a flood beyond
@@ -159,6 +177,7 @@ pub async fn serve(
         // (round-10 review finding).
         tasks.lock().await.spawn(async move {
             let _permit = permit; // held for the connection's lifetime
+            let _ip_guard = ip_guard; // held for the connection's lifetime
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
                 let _ = handle_ws_client(socket, rx, ctx.clone()).await;

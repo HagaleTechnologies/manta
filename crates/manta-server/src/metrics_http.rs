@@ -5,7 +5,7 @@
 
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
-use crate::tasks::ConnectionLimiter;
+use crate::tasks::{ConnectionLimiter, IpQuota};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
@@ -38,15 +38,41 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// than the spot-stream listeners -- legitimate traffic here is a
 /// low-cardinality set of Prometheus scrapers, not end-user clients.
 pub const MAX_METRICS_CONNECTIONS: usize = 64;
+/// Upper bound on concurrently admitted `/metrics` connections from a
+/// SINGLE source IP (MAN-61, `docs/DECISIONS/2026-09-03-man61-per-ip-
+/// connection-quota.md`, scope-expanded from the telnet/JSON finding in
+/// PR #76 review round 2): each permit is held for up to
+/// `HEADER_READ_TIMEOUT` even for a client sending an incomplete request,
+/// so one unauthenticated peer continuously opening and holding
+/// connections just under that deadline could occupy all
+/// `MAX_METRICS_CONNECTIONS` permits, denying every legitimate Prometheus
+/// scrape. A smaller value than the spot-stream listeners' per-IP cap --
+/// legitimate traffic here is a low-cardinality set of scrapers, not
+/// end-user clients (matching `MAX_METRICS_CONNECTIONS`'s own,
+/// proportionally smaller, total ceiling).
+pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 
-pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>, limiter: ConnectionLimiter) {
+pub async fn serve(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    limiter: ConnectionLimiter,
+    ip_quota: IpQuota,
+) {
     loop {
-        let (socket, _peer) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => {
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
+        };
+        // Checked BEFORE the shared limiter, not after (MAN-61): a source
+        // already at its own per-IP cap is declined without consuming a
+        // `ConnectionLimiter` permit at all -- the socket is simply
+        // dropped here, closing the connection, leaving that shared
+        // capacity for other sources.
+        let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
+            continue;
         };
         // Blocks the accept loop itself until capacity is available -- a
         // flood beyond `MAX_METRICS_CONNECTIONS` is left waiting in the
@@ -58,6 +84,7 @@ pub async fn serve(listener: TcpListener, metrics: Arc<Metrics>, limiter: Connec
         let metrics = metrics.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime
+            let _ip_guard = ip_guard; // held for the connection's lifetime
             let _ = handle_request(socket, metrics).await;
         });
     }

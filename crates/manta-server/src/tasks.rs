@@ -8,7 +8,9 @@
 //! milliseconds (round-10 review finding). Tracking real `JoinHandle`s and
 //! awaiting them, bounded by an overall deadline, fixes both.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -77,6 +79,75 @@ pub type ConnectionLimiter = Arc<Semaphore>;
 
 pub fn new_connection_limiter(max_concurrent: usize) -> ConnectionLimiter {
     Arc::new(Semaphore::new(max_concurrent))
+}
+
+/// Per-source-IP connection quota (MAN-61,
+/// `docs/DECISIONS/2026-09-03-man61-per-ip-connection-quota.md`).
+/// `ConnectionLimiter` bounds only the TOTAL ceiling shared across every
+/// client combined -- it does not prevent one source from permanently
+/// holding a large share (up to all) of that ceiling by opening many
+/// connections and never sending anything further after login/handshake
+/// (a telnet client after login; a raw JSON/WS client, whose entire point
+/// is being quiet forever). `IpQuota` caps how many of the shared
+/// ceiling's permits a single source IP may hold concurrently, so one
+/// misbehaving or malicious source can only ever deny a bounded slice of
+/// capacity, not all of it -- other IPs still get admitted while one
+/// source is parked at ITS OWN cap. `std::sync::Mutex`, not
+/// `tokio::sync::Mutex`: the critical section is a plain hashmap
+/// increment/decrement with no `.await` inside it, so a blocking lock is
+/// both simpler and correct (holding it briefly never blocks the async
+/// runtime in a way that matters).
+#[derive(Clone)]
+pub struct IpQuota {
+    max_per_ip: usize,
+    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+}
+
+impl IpQuota {
+    pub fn new(max_per_ip: usize) -> Self {
+        Self {
+            max_per_ip,
+            counts: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Reserves one slot for `ip`, returning `None` if `ip` is already at
+    /// `max_per_ip` -- the caller must then decline the connection (drop
+    /// the socket without spawning a handler or consuming a
+    /// `ConnectionLimiter` permit) rather than admit it.
+    pub fn try_acquire(&self, ip: IpAddr) -> Option<IpQuotaGuard> {
+        let mut counts = self.counts.lock().unwrap();
+        let entry = counts.entry(ip).or_insert(0);
+        if *entry >= self.max_per_ip {
+            return None;
+        }
+        *entry += 1;
+        Some(IpQuotaGuard {
+            ip,
+            counts: self.counts.clone(),
+        })
+    }
+}
+
+/// Held for the life of one admitted connection; releases its IP's slot
+/// on drop (connection handler task completing, panicking, or being
+/// aborted all release it the same way, matching `ConnectionLimiter`'s
+/// own `OwnedSemaphorePermit` drop-releases-on-completion behavior).
+pub struct IpQuotaGuard {
+    ip: IpAddr,
+    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for IpQuotaGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap();
+        if let Some(entry) = counts.get_mut(&self.ip) {
+            *entry -= 1;
+            if *entry == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +284,48 @@ mod tests {
         assert!(
             third.is_ok(),
             "releasing a permit must admit the next waiting connection"
+        );
+    }
+
+    fn ip(octet: u8) -> IpAddr {
+        IpAddr::from([127, 0, 0, octet])
+    }
+
+    #[test]
+    fn ip_quota_rejects_a_source_past_its_own_cap_but_admits_other_sources() {
+        let quota = IpQuota::new(2);
+        let addr = ip(1);
+        let other = ip(2);
+
+        let _g1 = quota.try_acquire(addr).expect("1st connection from addr");
+        let _g2 = quota.try_acquire(addr).expect("2nd connection from addr");
+        assert!(
+            quota.try_acquire(addr).is_none(),
+            "a 3rd connection from the SAME source must be rejected at its per-IP cap"
+        );
+
+        assert!(
+            quota.try_acquire(other).is_some(),
+            "a DIFFERENT source must still be admitted while addr is at its own cap -- \
+             this is the whole point of a per-IP quota over a global one"
+        );
+    }
+
+    #[test]
+    fn ip_quota_frees_a_slot_when_its_guard_drops() {
+        let quota = IpQuota::new(1);
+        let addr = ip(1);
+
+        let g1 = quota.try_acquire(addr).unwrap();
+        assert!(
+            quota.try_acquire(addr).is_none(),
+            "at cap while g1 is still held"
+        );
+
+        drop(g1);
+        assert!(
+            quota.try_acquire(addr).is_some(),
+            "dropping the guard (connection handler completing) must free the slot"
         );
     }
 }
