@@ -86,3 +86,19 @@ This publicly-bound-by-default posture is deliberate and documented (see
 `docs/DECISIONS/2026-09-02-man23-threat-model.md`, findings 11 and 20) —
 not an oversight — but it's easy to misconfigure if you're only thinking
 about the telnet/JSON ports as "the public ones."
+
+**Same caveat applies to `json_max_pings_per_ip`/`telnet_max_commands_per_ip`
+(MAN-57)** — separate from the connection quota above: each listener also
+caps the AGGREGATE command/Ping rate a single source IP may generate
+across every connection it holds (matching what a lone connection's own
+per-connection budget already allows), to stop one source from
+multiplying its effective rate by opening more connections. Behind the
+same reverse proxy setup, every downstream client's commands/Pings would
+be aggregated into that ONE shared budget too — a sharper false positive
+than the connection quota, since this window is much tighter (e.g. 30
+telnet commands per 10s, TOTAL, for every client behind the proxy
+combined). If you disable or raise `json_max_connections_per_ip` for a
+proxied JSON/WS deployment, raise or disable `json_max_pings_per_ip` the
+same way (`0` disables it; only each connection's own per-connection
+Ping budget still applies). Same reasoning for telnet's
+`telnet_max_commands_per_ip` if telnet is ever put behind a proxy too.

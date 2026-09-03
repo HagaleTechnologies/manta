@@ -8,6 +8,9 @@
 //! client that's actually sending events FASTER than the allowed rate,
 //! no matter how long the connection has been open.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -44,6 +47,100 @@ impl RateLimiter {
         self.count += 1;
         self.count <= self.max_per_window
     }
+}
+
+/// MAN-57: `RateLimiter` above is instantiated fresh per connection, so a
+/// source opening N connections gets N independent full budgets -- the
+/// effective per-IP rate is N x the intended single-connection budget, not
+/// the budget itself. `IpRateLimiter` is a SHARED, IP-keyed sibling
+/// checked in addition to (never instead of) each connection's own
+/// `RateLimiter`: an event must be within budget on both the connection's
+/// own window AND the aggregate window for that source IP across every
+/// connection it currently holds. Same `std::sync::Mutex` reasoning as
+/// `tasks::IpQuota` -- the critical section is a plain hashmap read/write
+/// with no `.await` inside it.
+#[derive(Clone)]
+pub struct IpRateLimiter {
+    max_per_window: u32,
+    window: Duration,
+    state: Arc<StdMutex<HashMap<IpAddr, (Instant, u32)>>>,
+}
+
+impl IpRateLimiter {
+    pub fn new(max_per_window: u32, window: Duration) -> Self {
+        Self {
+            max_per_window,
+            window,
+            state: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Like `new`, but `override_val` (from `ServerConfig`'s per-listener
+    /// rate-override fields) takes precedence over `default` when
+    /// present -- same override shape as `tasks::IpQuota::new_with_override`
+    /// and for the identical reason (PR #81 review, round 1): the
+    /// documented reverse-proxy TLS-termination deployment
+    /// (`docs/RUNBOOKS/network-exposure.md`) has every downstream client
+    /// sharing the proxy's own IP as far as `peer.ip()` is concerned, so
+    /// the built-in per-IP default would otherwise aggregate every
+    /// legitimate client behind the proxy into ONE shared command/Ping
+    /// budget -- an even sharper false positive here than for
+    /// `IpQuota`'s connection cap, since this budget's window is much
+    /// tighter. `Some(0)` means no per-IP aggregate cap at all (only each
+    /// connection's own `RateLimiter` still applies); `Some(n)` for `n >
+    /// 0` uses that budget directly; `None` falls back to `default`.
+    pub fn new_with_override(default: u32, window: Duration, override_val: Option<u32>) -> Self {
+        let max_per_window = match override_val {
+            None => default,
+            Some(0) => u32::MAX,
+            Some(n) => n,
+        };
+        Self::new(max_per_window, window)
+    }
+
+    /// Records one event for `ip` and returns `true` if the AGGREGATE
+    /// count across every connection this source currently holds is still
+    /// within budget for the current window, `false` otherwise. Same
+    /// reset-on-elapsed-window semantics as `RateLimiter::allow`.
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entry(ip).or_insert((now, 0));
+        if now.duration_since(entry.0) >= self.window {
+            entry.0 = now;
+            entry.1 = 0;
+        }
+        entry.1 += 1;
+        entry.1 <= self.max_per_window
+    }
+}
+
+/// How often the background reaper evicts stale per-IP entries. Unlike
+/// `IpQuota` (whose entries self-remove when a connection's guard drops to
+/// zero holders), `IpRateLimiter`'s entries have no such release event --
+/// a source that sent traffic once and never again would otherwise leave
+/// its entry in the map for the life of the process, growing it without
+/// bound across ordinary connection churn from many distinct real client
+/// IPs over a long uptime (same class of gap as MAN-62's
+/// `SpotBus::occurrence_counts`).
+const IP_RATE_LIMITER_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawns a background task that periodically evicts entries whose window
+/// has been idle for more than one full `window` past its own reset --
+/// i.e. genuinely stale, not just mid-window. Letting it run unawaited for
+/// the process lifetime is fine; it holds only a clone of the shared
+/// state and does no other work.
+pub fn spawn_stale_entry_reaper(limiter: IpRateLimiter) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(IP_RATE_LIMITER_REAP_INTERVAL).await;
+            let now = Instant::now();
+            let mut state = limiter.state.lock().unwrap();
+            state.retain(|_, (window_start, _)| {
+                now.duration_since(*window_start) < limiter.window * 2
+            });
+        }
+    })
 }
 
 #[cfg(test)]
@@ -88,6 +185,114 @@ mod tests {
         assert!(
             limiter.allow(),
             "an event after the window elapsed must be allowed again"
+        );
+    }
+
+    fn addr(n: u8) -> IpAddr {
+        IpAddr::from([127, 0, 0, n])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ip_rate_limiter_caps_the_aggregate_across_many_connections_from_one_source() {
+        // MAN-57's core scenario: N connections from the same IP must NOT
+        // each get a full independent budget.
+        let limiter = IpRateLimiter::new(3, Duration::from_secs(10));
+        let ip = addr(1);
+        assert!(limiter.allow(ip));
+        assert!(limiter.allow(ip)); // as if from a 2nd connection
+        assert!(limiter.allow(ip)); // as if from a 3rd connection
+        assert!(
+            !limiter.allow(ip),
+            "a 4th event from the SAME source IP (regardless of which connection) must be rejected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ip_rate_limiter_override_disables_the_cap_at_zero_and_uses_default_when_unset() {
+        let ip = addr(1);
+
+        let defaulted = IpRateLimiter::new_with_override(2, Duration::from_secs(10), None);
+        assert!(defaulted.allow(ip));
+        assert!(defaulted.allow(ip));
+        assert!(
+            !defaulted.allow(ip),
+            "None must fall back to the default cap"
+        );
+
+        let overridden = IpRateLimiter::new_with_override(2, Duration::from_secs(10), Some(5));
+        for _ in 0..5 {
+            assert!(overridden.allow(ip));
+        }
+        assert!(!overridden.allow(ip), "Some(n) must use n, not the default");
+
+        let disabled = IpRateLimiter::new_with_override(2, Duration::from_secs(10), Some(0));
+        for _ in 0..1000 {
+            assert!(disabled.allow(ip), "Some(0) must mean no per-IP cap at all");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ip_rate_limiter_tracks_sources_independently() {
+        let limiter = IpRateLimiter::new(1, Duration::from_secs(10));
+        assert!(limiter.allow(addr(1)));
+        assert!(
+            limiter.allow(addr(2)),
+            "a different source IP must have its own independent budget"
+        );
+        assert!(
+            !limiter.allow(addr(1)),
+            "the first source is still over its own budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ip_rate_limiter_resets_the_budget_once_the_window_elapses() {
+        let limiter = IpRateLimiter::new(1, Duration::from_secs(60));
+        let ip = addr(1);
+        assert!(limiter.allow(ip));
+        assert!(!limiter.allow(ip));
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        assert!(
+            limiter.allow(ip),
+            "an event after the window elapsed must be allowed again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_entry_reaper_evicts_sources_idle_past_two_windows() {
+        // window (100s) deliberately larger than IP_RATE_LIMITER_REAP_INTERVAL
+        // (60s) so the first reap pass lands well inside 2 windows (200s) and
+        // a later pass lands past it -- exercising "survives, then evicted"
+        // across two real reaper ticks rather than one.
+        let limiter = IpRateLimiter::new(1, Duration::from_secs(100));
+        let ip = addr(1);
+        assert!(limiter.allow(ip));
+        assert_eq!(limiter.state.lock().unwrap().len(), 1);
+
+        let _reaper = spawn_stale_entry_reaper(limiter.clone());
+        tokio::task::yield_now().await;
+        tokio::time::advance(IP_RATE_LIMITER_REAP_INTERVAL + Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            limiter.state.lock().unwrap().len(),
+            1,
+            "an entry less than 2 windows (200s) idle must survive a reap pass"
+        );
+
+        // Land just past the reap tick at t=240s (elapsed=240s > 2*window's
+        // 200s), the first tick after which eviction is actually due.
+        tokio::time::advance(IP_RATE_LIMITER_REAP_INTERVAL * 3 + Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            limiter.state.lock().unwrap().len(),
+            0,
+            "an entry idle past 2 full windows must be reaped"
         );
     }
 }
