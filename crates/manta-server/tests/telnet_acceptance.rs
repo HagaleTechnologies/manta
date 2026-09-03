@@ -415,6 +415,48 @@ async fn a_logged_in_client_that_sends_no_commands_survives_past_the_login_idle_
 }
 
 #[tokio::test]
+async fn a_line_with_no_newline_past_the_max_length_is_disconnected_not_crashed() {
+    // MAN-22 acceptance: an unterminated line past `bounded_io::MAX_LINE_BYTES`
+    // is rejected as a protocol violation (bounded_io.rs is unit-tested for
+    // this directly), but that alone doesn't prove the real telnet server
+    // wires the bound through end-to-end -- an oversized line could in
+    // principle still grow an internal buffer, wedge the connection, or
+    // take the whole listener down before the accept loop's own error
+    // handling ever sees it. Send one over a real socket and confirm: the
+    // offending connection is cleanly closed, and the server (and other
+    // clients) keep working afterward.
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    let oversized = vec![b'A'; manta_server::bounded_io::MAX_LINE_BYTES + 1];
+    wr.write_all(&oversized).await.unwrap();
+    // Deliberately never send a newline -- this is the "no terminator at
+    // all" shape bounded_io.rs's unit test also covers.
+
+    let mut trailing = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut trailing))
+        .await
+        .expect("server must actively close an oversized-line connection, not hang")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "expected the offending connection to be closed, got: {trailing:?}"
+    );
+
+    // The server itself must still be healthy: a fresh client can connect,
+    // log in, and receive a spot.
+    let (mut reader2, _wr2) = connect_and_login(addr).await;
+    let spot = sample_spot();
+    bus.publish(spot);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader2.read_line(&mut line))
+        .await
+        .expect("server must still serve other clients after an oversized line")
+        .unwrap();
+    assert!(line.contains("DX de"), "line was: {line:?}");
+}
+
+#[tokio::test]
 async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
     // Regression test (round-14 review): an established (logged-in)
     // client could previously send an unlimited sequence of complete

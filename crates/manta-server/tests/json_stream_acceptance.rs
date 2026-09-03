@@ -498,6 +498,104 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
 }
 
 #[tokio::test]
+async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected_not_crashed() {
+    // MAN-22: existing WS hardening tests exercise well-formed-but-hostile
+    // messages (oversized, unsolicited Pong, ping flood) built through
+    // tungstenite's own client API, which can only ever emit valid frames.
+    // None of them prove the server survives a frame that isn't valid
+    // WebSocket framing at all -- e.g. a corrupted opcode/length byte. Do
+    // the handshake over a raw socket, then write hand-crafted garbage
+    // bytes tungstenite's server-side parser must reject as a protocol
+    // error rather than panicking or wedging the connection.
+    use tokio::io::AsyncWriteExt;
+
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
+    let metrics = Arc::new(Metrics::new());
+    let cty = Arc::new(Table::parse(CTY_FIXTURE));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tasks = manta_server::tasks::new_client_tasks();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+    );
+    tokio::spawn(async move {
+        manta_server::json_stream::serve(
+            listener,
+            manta_server::json_stream::JsonStreamConfig {
+                bus,
+                metrics,
+                cty,
+                station_call: STATION_CALL.to_string(),
+                decoder_version: "manta-test".to_string(),
+                shutdown: shutdown_rx,
+            },
+            tasks,
+            limiter,
+        )
+        .await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    // Drain the HTTP 101 upgrade response before sending frame bytes.
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("timed out reading the WS upgrade response")
+            .unwrap();
+        assert!(n > 0, "connection closed before completing the upgrade");
+        if line == "\r\n" {
+            break; // end of HTTP headers
+        }
+    }
+    let mut stream = reader.into_inner();
+
+    // A client-to-server frame MUST be masked (RFC 6455 §5.1); this one
+    // additionally declares opcode 0xF (reserved/invalid) with the FIN bit
+    // set, a masked bit set, and a payload length that doesn't match what
+    // follows -- structurally invalid on more than one axis at once.
+    let garbage: [u8; 6] = [0x8F, 0x82, 0xDE, 0xAD, 0xBE, 0xEF];
+    stream.write_all(&garbage).await.unwrap();
+
+    // The connection must end (close/error), never hang or take the
+    // process down.
+    let mut trailing = Vec::new();
+    let read_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut trailing),
+    )
+    .await;
+    assert!(
+        read_result.is_ok(),
+        "server must close a malformed-frame connection, not hang indefinitely"
+    );
+
+    // The listener itself must still be healthy after a malformed-frame
+    // client -- a fresh connection must still be accepted, not left
+    // wedged or the accept loop taken down.
+    let reconnect = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await;
+    assert!(
+        reconnect.is_ok() && reconnect.unwrap().is_ok(),
+        "listener must still accept new connections after a malformed-frame client"
+    );
+}
+
+#[tokio::test]
 async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
     // Regression test (round-13 review): unlike Pong/Text/Binary, a Ping
     // frame is legitimate client behavior -- so it can't just be rejected
