@@ -19,6 +19,19 @@ name: Release
 # - `workflow_dispatch` (`publish=true`) additionally pushes real Docker
 #   tags to GHCR, for testing that path specifically post-merge; it never
 #   creates a GitHub Release.
+#
+# Known limitations, deferred as MAN-65 (later review round -- ticketed
+# per the PR review convergence policy rather than another live round):
+# a `v*` tag with SemVer build metadata (e.g. v1.2.3+linux) would produce
+# an invalid Docker tag; the Windows archive needs the VC++ Redistributable
+# installed separately (dynamic MSVC runtime, not bundled); overlapping
+# tag pushes could theoretically race on the shared `:latest` tag; and a
+# brand-new GHCR package defaults to private on first publish -- the
+# README's anonymous `docker run` command won't work until a maintainer
+# manually flips it to public in GitHub's package settings the first time
+# a real tag actually publishes (deliberately not automated here --
+# changing a package's visibility is a "make something public" action
+# outside what this workflow should do unsupervised).
 
 on:
   push:

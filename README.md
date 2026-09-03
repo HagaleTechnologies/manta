@@ -61,7 +61,12 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 
 Both are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
 directly from each tagged release's commit — every published binary
-traces to a specific, auditable source revision.
+traces to a specific, auditable source revision. (If the image above
+returns an authorization error, the GHCR package needs its one-time
+"make public" step in GitHub's package settings after the first real
+release — see MAN-65. Windows binaries need the [Visual C++
+Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+installed if it isn't already.)
 
 **Building from source** (if you're developing manta itself, or need a
 platform/feature combination the release matrix doesn't cover — the
