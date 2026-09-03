@@ -325,6 +325,16 @@ async fn forward_loop(
                             }
                             _ = shutdown.changed() => {
                                 if *shutdown.borrow() {
+                                    // Counted before returning (PR #80
+                                    // review, round 5): the write in
+                                    // flight when shutdown arrived is
+                                    // cancelled by dropping this select!
+                                    // arm's losing future -- otherwise
+                                    // this spot was silently lost during
+                                    // a clean shutdown, even though the
+                                    // equivalent timeout/error path above
+                                    // is already counted.
+                                    metrics.record_uplink_write_failed(1);
                                     return Ok(());
                                 }
                             }
