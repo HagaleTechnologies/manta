@@ -408,6 +408,10 @@ impl IqSource for FixedCenterFreqSource {
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
+
+    fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.inner.confirmed_live_handle()
+    }
 }
 
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
@@ -1079,7 +1083,30 @@ fn main() -> Result<()> {
                     // hook yet -- manta-engine exposes no live track-count
                     // API for `listen()`'s callbacks to read, so it stays
                     // at Metrics::default()'s 0 until that surface exists.
-                    server.metrics.set_source_health(source_name, true);
+                    //
+                    // MAN-55: for a source where `open()` succeeding
+                    // doesn't confirm a live device (HPSDR's UDP
+                    // connect/send need no peer response at all),
+                    // `confirmed_live_handle()` returns Some, and health
+                    // starts false, flipping true only once the source's
+                    // own read loop has actually processed a valid
+                    // packet. Every other source type (Kiwi/Soapy/audio/
+                    // file) returns None from the trait's default and
+                    // keeps the original immediate-true behavior, since
+                    // opening those already implies liveness.
+                    match src.confirmed_live_handle() {
+                        Some(live) => {
+                            server.metrics.set_source_health(source_name, false);
+                            let metrics = server.metrics.clone();
+                            rt.spawn(async move {
+                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                                metrics.set_source_health(source_name, true);
+                            });
+                        }
+                        None => server.metrics.set_source_health(source_name, true),
+                    }
                     (Some(rt), Some(server))
                 }
                 None => (None, None),
