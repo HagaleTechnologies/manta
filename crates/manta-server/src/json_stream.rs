@@ -150,6 +150,7 @@ pub async fn serve(
         // dropped here, closing the connection, leaving that shared
         // capacity for other sources.
         let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
+            tracing::warn!(ip = %peer.ip(), "json_stream: per-IP connection quota exceeded, declining");
             continue;
         };
         // Blocks the accept loop itself (not just the client) until
@@ -180,11 +181,11 @@ pub async fn serve(
             let _ip_guard = ip_guard; // held for the connection's lifetime
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
-                let _ = handle_ws_client(socket, rx, ctx.clone()).await;
+                let _ = handle_ws_client(socket, rx, ctx.clone(), peer).await;
                 ctx.metrics.dec_ws_clients();
             } else {
                 ctx.metrics.inc_json_clients();
-                let _ = handle_tcp_client(socket, rx, ctx.clone()).await;
+                let _ = handle_tcp_client(socket, rx, ctx.clone(), peer).await;
                 ctx.metrics.dec_json_clients();
             }
         });
@@ -235,11 +236,14 @@ async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
     }
 }
 
+#[tracing::instrument(name = "json_client", skip(socket, rx, ctx), fields(peer = %peer))]
 async fn handle_tcp_client(
     mut socket: TcpStream,
     mut rx: broadcast::Receiver<BusSpot>,
     mut ctx: ClientCtx,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
+    tracing::info!("json_stream: raw TCP client connected");
     // This protocol is pure server push -- the client never needs to send
     // anything -- so this scratch buffer only exists to notice EOF/close;
     // any bytes a client does send are unexpected and simply discarded.
@@ -272,7 +276,9 @@ async fn handle_tcp_client(
                         // whatever it still has retained is lost too, not
                         // just what the channel already evicted (round-9
                         // review finding).
-                        ctx.metrics.record_lagged(crate::bus::total_lag_loss(n, &rx));
+                        let lost = crate::bus::total_lag_loss(n, &rx);
+                        tracing::warn!(lost, "json_stream: client lagged behind broadcast, disconnecting");
+                        ctx.metrics.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -284,7 +290,10 @@ async fn handle_tcp_client(
             // until the next spot's write happened to fail.
             read_result = socket.read(&mut scratch) => {
                 match read_result {
-                    Ok(0) => return Ok(()), // client closed the connection
+                    Ok(0) => {
+                        tracing::info!("json_stream: raw TCP client disconnected");
+                        return Ok(());
+                    }
                     // Any non-EOF data is a protocol violation on this
                     // pure-server-push stream -- close instead of looping
                     // back to read again. Looping (the prior behavior)
@@ -292,7 +301,10 @@ async fn handle_tcp_client(
                     // that keeps sending data, starving the spot-write
                     // branch and burning CPU in a tight select! loop
                     // (round-5 review finding).
-                    Ok(_) => return Ok(()),
+                    Ok(_) => {
+                        tracing::warn!("json_stream: unexpected client data on pure-push stream, disconnecting");
+                        return Ok(());
+                    }
                     Err(_) => return Ok(()),
                 }
             }
@@ -339,10 +351,12 @@ async fn handle_tcp_client(
     }
 }
 
+#[tracing::instrument(name = "ws_client", skip(socket, rx, ctx), fields(peer = %peer))]
 async fn handle_ws_client(
     socket: TcpStream,
     mut rx: broadcast::Receiver<BusSpot>,
     mut ctx: ClientCtx,
+    peer: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
@@ -350,11 +364,23 @@ async fn handle_ws_client(
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES));
-    let mut ws = tokio::time::timeout(
+    let ws_result = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
     )
-    .await??;
+    .await;
+    let mut ws = match ws_result {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "json_stream: WS handshake rejected");
+            return Err(e.into());
+        }
+        Err(_) => {
+            tracing::warn!("json_stream: WS handshake timed out");
+            return Err(anyhow::anyhow!("WS handshake timed out"));
+        }
+    };
+    tracing::info!("json_stream: WS client connected");
     let mut ping_limiter = crate::rate_limit::RateLimiter::new(MAX_INBOUND_PINGS, PING_RATE_WINDOW);
     loop {
         tokio::select! {
@@ -379,7 +405,9 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // See the TCP handler's identical Lagged branch
                         // above for why `n` alone under-counts.
-                        ctx.metrics.record_lagged(crate::bus::total_lag_loss(n, &rx));
+                        let lost = crate::bus::total_lag_loss(n, &rx);
+                        tracing::warn!(lost, "json_stream: WS client lagged behind broadcast, disconnecting");
+                        ctx.metrics.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -387,7 +415,10 @@ async fn handle_ws_client(
             }
             frame = ws.next() => {
                 match frame {
-                    Some(Ok(Message::Close(_))) | None => return Ok(()),
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::info!("json_stream: WS client disconnected");
+                        return Ok(());
+                    }
                     Some(Ok(Message::Ping(payload))) => {
                         // A Ping IS legitimate client behavior, unlike
                         // Pong/Text/Binary below -- but replying to an
@@ -399,6 +430,7 @@ async fn handle_ws_client(
                         // staying connected a long time (round-14 review
                         // finding).
                         if !ping_limiter.allow() {
+                            tracing::warn!("json_stream: client exceeded Ping rate budget, disconnecting");
                             return Ok(());
                         }
                         tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
@@ -413,7 +445,10 @@ async fn handle_ws_client(
                     // the exact CPU-exhaustion loop the Text/Binary
                     // rejection was meant to close off (round-7 review
                     // finding).
-                    Some(Ok(Message::Pong(_))) => return Ok(()),
+                    Some(Ok(Message::Pong(_))) => {
+                        tracing::warn!("json_stream: unsolicited Pong on pure-push stream, disconnecting");
+                        return Ok(());
+                    }
                     // Text/Binary/raw Frame: this stream is pure server
                     // push, so any application-data frame is a protocol
                     // violation -- disconnect rather than ignore. Bounding
@@ -422,8 +457,14 @@ async fn handle_ws_client(
                     // unbounded SEQUENCE of small messages kept this arm
                     // perpetually ready, burning CPU indefinitely (round-6
                     // review finding).
-                    Some(Ok(_)) => return Ok(()),
-                    Some(Err(_)) => return Ok(()),
+                    Some(Ok(_)) => {
+                        tracing::warn!("json_stream: unexpected data frame on pure-push stream, disconnecting");
+                        return Ok(());
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "json_stream: malformed WS frame, disconnecting");
+                        return Ok(());
+                    }
                 }
             }
             // Explicit shutdown: drain whatever's already queued rather

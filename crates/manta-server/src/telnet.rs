@@ -86,6 +86,7 @@ pub async fn serve(
         // dropped here, closing the connection, leaving that shared
         // capacity for other sources.
         let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
+            tracing::warn!(ip = %peer.ip(), "telnet: per-IP connection quota exceeded, declining");
             continue;
         };
         // Blocks the accept loop itself (not just the client) until
@@ -118,12 +119,27 @@ pub async fn serve(
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
             metrics.inc_telnet_clients();
-            let _ = handle_client(socket, bus, rx, metrics.clone(), station_call, shutdown).await;
+            let _ = handle_client(
+                socket,
+                bus,
+                rx,
+                metrics.clone(),
+                station_call,
+                shutdown,
+                peer,
+            )
+            .await;
             metrics.dec_telnet_clients();
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "telnet_client",
+    skip(socket, bus, rx, metrics, station_call, shutdown),
+    fields(peer = %peer)
+)]
 async fn handle_client(
     socket: tokio::net::TcpStream,
     bus: Arc<SpotBus>,
@@ -131,15 +147,26 @@ async fn handle_client(
     metrics: Arc<Metrics>,
     station_call: String,
     mut shutdown: watch::Receiver<bool>,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
+    tracing::info!("telnet: client connected");
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
 
     write_with_timeout(&mut wr, b"login: \r\n").await?;
     let mut login_line = String::new();
-    if read_line_bounded_with_timeout(&mut reader, &mut login_line).await? == 0 {
-        return Ok(()); // client hung up before logging in
+    match read_line_bounded_with_timeout(&mut reader, &mut login_line).await {
+        Ok(0) => {
+            tracing::info!("telnet: client disconnected before completing login");
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+            return Err(e);
+        }
     }
+    tracing::info!(login = %login_line.trim(), "telnet: client logged in");
 
     write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
 
@@ -187,7 +214,9 @@ async fn handle_client(
                         // alone under-counts what's still retained in
                         // `rx`'s own buffer that this disconnect abandons
                         // too (round-9 review finding).
-                        metrics.record_lagged(crate::bus::total_lag_loss(n, &rx));
+                        let lost = crate::bus::total_lag_loss(n, &rx);
+                        tracing::warn!(lost, "telnet: client lagged behind broadcast, disconnecting");
+                        metrics.record_lagged(lost);
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -204,7 +233,15 @@ async fn handle_client(
             // review finding: this branch used to reuse the timed variant
             // here too, which cut off exactly that client after 30s.)
             n = read_line_bounded(&mut reader, &mut cmd_line) => {
-                if n? == 0 {
+                let n = match n {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "telnet: command read rejected (oversized/malformed line), disconnecting");
+                        return Err(e);
+                    }
+                };
+                if n == 0 {
+                    tracing::info!("telnet: client disconnected");
                     return Ok(()); // client disconnected
                 }
                 // Every completed command line counts against the budget,
@@ -213,6 +250,7 @@ async fn handle_client(
                 // unlimited sequence of e.g. `sh/dx/50` is real CPU/
                 // bandwidth work, not free (round-14 review finding).
                 if !command_limiter.allow() {
+                    tracing::warn!("telnet: client exceeded command rate budget, disconnecting");
                     return Ok(());
                 }
                 match command::parse(&cmd_line) {

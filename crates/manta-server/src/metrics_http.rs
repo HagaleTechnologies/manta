@@ -72,6 +72,7 @@ pub async fn serve(
         // dropped here, closing the connection, leaving that shared
         // capacity for other sources.
         let Some(ip_guard) = ip_quota.try_acquire(peer.ip()) else {
+            tracing::warn!(ip = %peer.ip(), "metrics_http: per-IP connection quota exceeded, declining");
             continue;
         };
         // Blocks the accept loop itself until capacity is available -- a
@@ -85,7 +86,7 @@ pub async fn serve(
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
-            let _ = handle_request(socket, metrics).await;
+            let _ = handle_request(socket, metrics, peer).await;
         });
     }
 }
@@ -116,17 +117,31 @@ async fn read_headers<R: AsyncBufRead + Unpin>(
 async fn handle_request(
     socket: tokio::net::TcpStream,
     metrics: Arc<Metrics>,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
 
     let mut request_line = String::new();
-    let eof = tokio::time::timeout(
+    let headers_result = tokio::time::timeout(
         HEADER_READ_TIMEOUT,
         read_headers(&mut reader, &mut request_line),
     )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "header read timed out"))??;
+    .await;
+    let eof = match headers_result {
+        Ok(Ok(eof)) => eof,
+        Ok(Err(e)) => {
+            tracing::warn!(peer = %peer, error = %e, "metrics_http: header read rejected (oversized/malformed line), disconnecting");
+            return Err(e);
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, "metrics_http: header read timed out, disconnecting");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "header read timed out",
+            ));
+        }
+    };
     if eof {
         return Ok(());
     }

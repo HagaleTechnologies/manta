@@ -57,6 +57,8 @@ tokio = "1"
 tokio-tungstenite = "0.26"
 toml = "0.8"
 futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # DSP in debug tests is unusably slow without this; golden V1 runs in seconds.
 [profile.dev]
