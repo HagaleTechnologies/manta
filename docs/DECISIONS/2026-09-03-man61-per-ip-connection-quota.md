@@ -82,3 +82,30 @@ network/infrastructure-layer concern (firewall, reverse proxy rate
 limiting) outside what a per-connection application-layer quota can
 address. This closes the specific "one source parks at the ceiling"
 shape the ticket describes, not distributed abuse.
+
+## Addendum: PR #81 review, round 1 (2026-09-03)
+
+The reviewer correctly flagged a real conflict with an already-documented
+deployment topology: `docs/RUNBOOKS/network-exposure.md` explicitly
+supports fronting the JSON/WS port with a TLS-terminating reverse proxy.
+In that topology every downstream client's connection has the proxy's own
+IP as `peer.ip()`, so the built-in per-IP defaults would cap TOTAL
+concurrent clients at the quota (16) instead of the listener's real
+capacity (512) — the exact failure mode this ticket was written to
+prevent, now self-inflicted against legitimate traffic instead of an
+attacker.
+
+Fixed by adding `[server].max_connections_per_ip` (`Option<usize>`,
+`ServerConfig`): `None` (default, field omitted) keeps each listener's
+built-in per-IP default; `0` disables the per-IP cap entirely (only each
+listener's total `ConnectionLimiter` ceiling still applies); any other
+value overrides all three listeners' caps uniformly. An operator behind a
+reverse proxy sets this to `0` and relies on the proxy's own
+connection-rate limiting instead — which is exactly the third option this
+ticket's own original technical notes considered and set aside only
+because it wasn't needed for the default (no-proxy) deployment. Kept as
+one shared knob across all three listeners rather than per-listener
+granularity: the reverse-proxy scenario applies uniformly to whichever
+listeners are actually proxied, and per-listener TOML keys are unwarranted
+complexity until an operator needs the proxy in front of only one
+listener specifically.

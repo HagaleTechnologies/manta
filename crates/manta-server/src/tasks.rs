@@ -111,6 +111,26 @@ impl IpQuota {
         }
     }
 
+    /// Like `new`, but `override_val` (from
+    /// `ServerConfig::max_connections_per_ip`) takes precedence over
+    /// `default` when present (PR #81 review, round 1): a reverse-proxy
+    /// TLS-termination deployment (`docs/RUNBOOKS/network-exposure.md`)
+    /// has every downstream client sharing the proxy's own IP as far as
+    /// `peer.ip()` is concerned, so a listener's built-in per-IP default
+    /// would otherwise cap TOTAL concurrent clients at the quota instead
+    /// of the listener's real capacity. `Some(0)` means no per-IP cap at
+    /// all (only the listener's total `ConnectionLimiter` ceiling
+    /// applies); `Some(n)` for `n > 0` uses that cap directly; `None`
+    /// falls back to `default`.
+    pub fn new_with_override(default: usize, override_val: Option<usize>) -> Self {
+        let max_per_ip = match override_val {
+            None => default,
+            Some(0) => usize::MAX,
+            Some(n) => n,
+        };
+        Self::new(max_per_ip)
+    }
+
     /// Reserves one slot for `ip`, returning `None` if `ip` is already at
     /// `max_per_ip` -- the caller must then decline the connection (drop
     /// the socket without spawning a handler or consuming a
@@ -326,6 +346,44 @@ mod tests {
         assert!(
             quota.try_acquire(addr).is_some(),
             "dropping the guard (connection handler completing) must free the slot"
+        );
+    }
+
+    /// PR #81 review, round 1: a reverse-proxy deployment needs to raise
+    /// or disable the per-IP cap since every client shares the proxy's IP.
+    #[test]
+    fn ip_quota_override_disables_the_cap_at_zero_and_uses_default_when_unset() {
+        let addr = ip(1);
+
+        let disabled = IpQuota::new_with_override(2, Some(0));
+        // Guards held (not dropped per-iteration), so the count genuinely
+        // accumulates -- otherwise every acquire trivially succeeds
+        // regardless of any cap, testing nothing.
+        let mut disabled_guards = Vec::new();
+        for _ in 0..100 {
+            disabled_guards.push(
+                disabled
+                    .try_acquire(addr)
+                    .expect("Some(0) must mean no per-IP cap at all"),
+            );
+        }
+
+        let overridden = IpQuota::new_with_override(2, Some(5));
+        let mut overridden_guards = Vec::new();
+        for _ in 0..5 {
+            overridden_guards.push(overridden.try_acquire(addr).unwrap());
+        }
+        assert!(
+            overridden.try_acquire(addr).is_none(),
+            "Some(n) must use n as the cap, not the default"
+        );
+
+        let defaulted = IpQuota::new_with_override(2, None);
+        let _g1 = defaulted.try_acquire(addr).unwrap();
+        let _g2 = defaulted.try_acquire(addr).unwrap();
+        assert!(
+            defaulted.try_acquire(addr).is_none(),
+            "None must fall back to the listener's own default cap"
         );
     }
 }

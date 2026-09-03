@@ -86,6 +86,21 @@ pub struct ServerConfig {
     pub json_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// Overrides the per-source-IP connection quota (MAN-61) applied
+    /// uniformly across the telnet, JSON/WS, and metrics listeners --
+    /// `None` (the default, field omitted) uses each listener's own
+    /// built-in default (16/16/8). Needed for the documented reverse-proxy
+    /// TLS-termination deployment (`docs/RUNBOOKS/network-exposure.md`):
+    /// every client behind the proxy shares the proxy's own IP as far as
+    /// `peer.ip()` is concerned, so the built-in per-IP defaults would
+    /// otherwise cap TOTAL concurrent clients at the quota instead of the
+    /// listener's real capacity (PR #81 review, round 1). `0` means "no
+    /// per-IP cap" -- only the listener's total connection ceiling
+    /// applies, and the operator relies on the reverse proxy's own
+    /// connection-rate limiting instead (MAN-61's ticket's own
+    /// third-option disposition, now actionable for this topology).
+    #[serde(default)]
+    pub max_connections_per_ip: Option<usize>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.

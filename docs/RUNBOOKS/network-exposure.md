@@ -54,6 +54,20 @@ block direct external access to manta's own plaintext port**, per the
 bypass note above, or the TLS termination is purely cosmetic against
 anyone who just connects to the real port instead.
 
+**If you front manta with a reverse proxy, raise or disable
+`[server].max_connections_per_ip`** (MAN-61,
+`docs/DECISIONS/2026-09-03-man61-per-ip-connection-quota.md`): every
+listener caps how many concurrent connections a single source IP may
+hold (16 for telnet/JSON, 8 for metrics) to stop one quiet client from
+parking at the connection ceiling. Behind a proxy, every downstream
+client shares the proxy's own IP as far as manta can tell, so the
+default cap would deny admission after only that many real users despite
+the listener having room for far more. Set `max_connections_per_ip = 0`
+under `[server]` to disable the per-IP cap entirely (only each
+listener's total connection ceiling still applies), or set it to a
+higher number — and rely on the proxy's own connection-rate limiting to
+cover what the per-IP quota otherwise would.
+
 This publicly-bound-by-default posture is deliberate and documented (see
 `docs/DECISIONS/2026-09-02-man23-threat-model.md`, findings 11 and 20) —
 not an oversight — but it's easy to misconfigure if you're only thinking
