@@ -185,19 +185,23 @@ jobs:
 
       - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
 
-      - name: Determine version and lowercase image name
+      - name: Determine version, image, push flag, and tag list
         id: version
         shell: bash
         run: |
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            VERSION="${GITHUB_REF_NAME#v}"
           else
-            echo "version=dispatch-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            VERSION="dispatch-${{ github.run_id }}"
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
           # OCI/Docker repository paths must be lowercase; github.repository
           # is case-preserving ("HagaleTechnologies/manta") and buildx
           # rejects a mixed-case tag outright (PR #78 review round 1).
-          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
           # Computed as an explicit true/false string here rather than
           # inline in the `push:` input below (PR #78 review round 7):
           # GitHub Actions' `||` returns whichever operand it evaluates,
@@ -214,6 +218,23 @@ jobs:
             echo "push=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # `:latest` is reserved for real tag pushes only (PR #78 review
+          # round 2) -- a workflow_dispatch run with publish=true can
+          # target any branch, not just a release, and README's `docker
+          # run ghcr.io/.../manta:latest` install command must always
+          # trace to a real tagged release, not a manual test build that
+          # happened to also push. The dispatch-<run_id> tag is still
+          # pushed on a dispatch publish, for testing that path
+          # specifically -- just never `:latest`.
+          {
+            echo "tags<<RELEASE_TAGS_EOF"
+            echo "$IMAGE:$VERSION"
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              echo "$IMAGE:latest"
+            fi
+            echo "RELEASE_TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         if: steps.version.outputs.push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -227,9 +248,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ steps.version.outputs.push == 'true' }}
-          tags: |
-            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
-            ${{ steps.version.outputs.image }}:latest
+          tags: ${{ steps.version.outputs.tags }}
 
   release:
     needs: [build, docker]
