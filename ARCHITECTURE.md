@@ -289,16 +289,42 @@ validation (MAN-28). Dedupe (step 5) still applies.
   existing ecosystem contracts.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline.
+- **Exposure policy (normative, not just observed behavior):** both servers are
+  designed to be internet-reachable with no client authentication, matching the
+  DX cluster/RBN ecosystem's own long-standing convention (CW Skimmer, SkimSrv,
+  and Aggregator have the identical property) — this is a deliberate compatibility
+  choice, not an oversight, and manta-specific client auth would make it
+  incompatible with the clients it exists to interoperate with. See
+  `docs/DECISIONS/2026-09-02-man23-threat-model.md` findings 10/20 for the full
+  threat-model rationale. The metrics HTTP endpoint (§8) shares the same
+  publicly-bound-by-default posture but is NOT part of this compatibility
+  contract — it's operational tooling, not an RBN-facing surface — see that same
+  doc's finding 11 and `docs/RUNBOOKS/network-exposure.md` for how to restrict it.
 
 ## 8. Configuration & observability
 
 - Single TOML config (coppa convention): device, center freq, band plan
   (CW segment limits — don't decode/spot outside them), thresholds, track cap,
   server ports, cty/scp paths, station callsign (spotter ID).
-- `tracing` throughout with `EnvFilter`; `manta --status` hits a local control
-  socket for live stats. Prometheus text endpoint (feature `metrics`): input
-  overruns, active tracks, evictions, decode rate, spots/min, per-stage queue
-  depths, spot confidence histogram.
+- **`tracing` throughout with `EnvFilter` is aspirational, not yet
+  implemented** — corrected 2026-09-03: neither `tracing` nor `log` is a
+  dependency of any crate in this workspace today (confirmed by a
+  workspace-wide grep while investigating
+  `docs/DECISIONS/2026-09-02-man23-threat-model.md`'s finding 9/MAN-59),
+  and there is no structured logging or audit trail anywhere in
+  `manta-server`/`manta-input`. `manta --status` hitting a local control
+  socket for live stats is similarly not yet implemented. Prometheus text
+  endpoint (feature `metrics`): input overruns, active tracks, evictions,
+  decode rate, spots/min, per-stage queue depths, spot confidence
+  histogram — also aspirational for several of these fields; the
+  currently-implemented subset is `manta_spots_total`,
+  `manta_spots_dropped_lagged_total`,
+  `manta_spots_suppressed_by_filter_total`,
+  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
+  gauges, `manta_active_tracks`, `manta_source_health`, and the uplink
+  counters (`crates/manta-server/src/metrics.rs`) — not input-layer
+  overruns or per-stage queue depths, which MAN-56 tracks as a separate
+  gap.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
