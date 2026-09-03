@@ -55,6 +55,9 @@ async fn spawn_server() -> (
             },
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
         )
         .await;
     });
@@ -355,6 +358,9 @@ async fn websocket_client_receives_spot_as_json_message() {
             },
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
         )
         .await;
     });
@@ -416,6 +422,9 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
             },
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
         )
         .await;
     });
@@ -475,6 +484,9 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
             },
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
         )
         .await;
     });
@@ -540,6 +552,9 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
             },
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
         )
         .await;
     });
@@ -658,6 +673,9 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
             },
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
         )
         .await;
     });

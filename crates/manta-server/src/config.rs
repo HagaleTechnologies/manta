@@ -86,6 +86,44 @@ pub struct ServerConfig {
     pub json_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// Overrides the telnet listener's per-source-IP connection quota
+    /// (MAN-61) -- `None` (default, field omitted) uses the built-in
+    /// default (16). `0` means "no per-IP cap" (only
+    /// `MAX_TELNET_CONNECTIONS`'s total ceiling still applies). See
+    /// `json_max_connections_per_ip`'s doc comment for why these three
+    /// are separate, per-listener fields rather than one shared knob
+    /// (PR #81 review, round 3).
+    #[serde(default)]
+    pub telnet_max_connections_per_ip: Option<usize>,
+    /// Overrides the JSON/WS listener's per-source-IP connection quota
+    /// (MAN-61) -- `None` (default, field omitted) uses the built-in
+    /// default (16). `0` means "no per-IP cap" (only
+    /// `MAX_JSON_STREAM_CONNECTIONS`'s total ceiling still applies).
+    /// Needed for the documented reverse-proxy TLS-termination deployment
+    /// (`docs/RUNBOOKS/network-exposure.md`): every client behind the
+    /// proxy shares the proxy's own IP as far as `peer.ip()` is
+    /// concerned, so the built-in per-IP default would otherwise cap
+    /// TOTAL concurrent clients at the quota instead of the listener's
+    /// real capacity.
+    ///
+    /// Deliberately a SEPARATE field from `telnet_max_connections_per_ip`/
+    /// `metrics_max_connections_per_ip`, not one shared override (PR #81
+    /// review, round 3, correcting round 1's initial single-knob design):
+    /// the runbook's reverse-proxy setup only fronts the JSON/WS port --
+    /// telnet and metrics stay directly exposed. A single shared override
+    /// set to disable the JSON/WS quota would ALSO disable it on those
+    /// still-directly-exposed listeners, undoing MAN-61's protection on
+    /// listeners that were never behind the proxy.
+    #[serde(default)]
+    pub json_max_connections_per_ip: Option<usize>,
+    /// Overrides the metrics listener's per-source-IP connection quota
+    /// (MAN-61) -- `None` (default, field omitted) uses the built-in
+    /// default (8). `0` means "no per-IP cap" (only
+    /// `MAX_METRICS_CONNECTIONS`'s total ceiling still applies). See
+    /// `json_max_connections_per_ip`'s doc comment for why these three
+    /// are separate, per-listener fields.
+    #[serde(default)]
+    pub metrics_max_connections_per_ip: Option<usize>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -191,6 +229,33 @@ mod tests {
         assert_eq!(cfg.json_port, 17301);
         assert_eq!(cfg.metrics_port, 17302);
         assert_eq!(cfg.bind_addr, "127.0.0.1");
+    }
+
+    /// PR #81 review, round 3: the three per-IP quota overrides are
+    /// independent fields, not one shared knob -- setting only
+    /// `json_max_connections_per_ip` must leave the other two `None`.
+    #[test]
+    fn per_ip_quota_overrides_default_to_none_and_are_independent() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.telnet_max_connections_per_ip, None);
+        assert_eq!(cfg.json_max_connections_per_ip, None);
+        assert_eq!(cfg.metrics_max_connections_per_ip, None);
+
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            json_max_connections_per_ip = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.telnet_max_connections_per_ip, None);
+        assert_eq!(cfg.json_max_connections_per_ip, Some(0));
+        assert_eq!(cfg.metrics_max_connections_per_ip, None);
     }
 
     #[test]

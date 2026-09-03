@@ -54,6 +54,34 @@ block direct external access to manta's own plaintext port**, per the
 bypass note above, or the TLS termination is purely cosmetic against
 anyone who just connects to the real port instead.
 
+**If you front the JSON/WS port with a reverse proxy, raise or disable
+`[server].json_max_connections_per_ip`** (MAN-61,
+`docs/DECISIONS/2026-09-03-man61-per-ip-connection-quota.md`): every
+listener caps how many concurrent connections a single source IP may
+hold (16 for telnet/JSON, 8 for metrics) to stop one quiet client from
+parking at the connection ceiling. Behind a proxy, every downstream
+client shares the proxy's own IP as far as manta can tell, so the
+default cap would deny admission after only that many real users despite
+the listener having room for far more. Set `json_max_connections_per_ip
+= 0` under `[server]` to disable the JSON/WS listener's per-IP cap
+entirely (only its total connection ceiling still applies), or set it to
+a higher number. **Only override the listener(s) actually behind the
+proxy** — `telnet_max_connections_per_ip` and
+`metrics_max_connections_per_ip` are separate fields for exactly this
+reason: the setup above fronts JSON/WS only, so telnet and metrics stay
+directly exposed and should keep their own per-IP protection.
+
+Disabling the per-IP cap shifts responsibility for bounding one client's
+share of capacity to the proxy — and **rate limiting alone is not
+sufficient there**. These are long-lived streams that may legitimately
+stay open and silent forever (the whole point of a push protocol), so a
+client opening connections slowly enough to stay under any new-connection
+rate budget can still retain every one of them and eventually occupy all
+512 backend permits. Configure a genuine **per-client concurrent-connection
+limit** at the proxy (most reverse proxies support this directly), not
+just a connection-rate limit, before disabling the backend's own per-IP
+quota.
+
 This publicly-bound-by-default posture is deliberate and documented (see
 `docs/DECISIONS/2026-09-02-man23-threat-model.md`, findings 11 and 20) —
 not an oversight — but it's easy to misconfigure if you're only thinking

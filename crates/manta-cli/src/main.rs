@@ -814,6 +814,10 @@ fn start_spot_server(
             manta_server::tasks::new_connection_limiter(
                 manta_server::telnet::MAX_TELNET_CONNECTIONS,
             ),
+            manta_server::tasks::IpQuota::new_with_override(
+                manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                cfg.telnet_max_connections_per_ip,
+            ),
         ));
         tokio::spawn(manta_server::json_stream::serve(
             json_listener,
@@ -832,6 +836,10 @@ fn start_spot_server(
             manta_server::tasks::new_connection_limiter(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
             ),
+            manta_server::tasks::IpQuota::new_with_override(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                cfg.json_max_connections_per_ip,
+            ),
         ));
         // Reaps completed per-client tasks continuously, independent of
         // shutdown -- without this, `tasks` only ever shrinks at
@@ -844,6 +852,10 @@ fn start_spot_server(
             metrics.clone(),
             manta_server::tasks::new_connection_limiter(
                 manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+            ),
+            manta_server::tasks::IpQuota::new_with_override(
+                manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+                cfg.metrics_max_connections_per_ip,
             ),
         ));
         // MAN-32/MAN-42: one independent uplink::serve task per configured
