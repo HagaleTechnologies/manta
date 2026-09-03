@@ -102,3 +102,25 @@ proxied JSON/WS deployment, raise or disable `json_max_pings_per_ip` the
 same way (`0` disables it; only each connection's own per-connection
 Ping budget still applies). Same reasoning for telnet's
 `telnet_max_commands_per_ip` if telnet is ever put behind a proxy too.
+
+**Known limitation (MAN-59, review round 5): per-client audit-log
+attribution is unavailable for WS traffic behind this same reverse-proxy
+deployment.** `json_stream.rs`'s connect/disconnect/rejection logging
+(`docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`) records
+the TCP socket's own remote address as `peer` — behind the proxy, that's
+the PROXY's backend-facing address for every downstream client, not the
+real client's, since the proxy terminates the actual client connection
+and opens its own to manta. Every WS audit event in this deployment will
+show the proxy's IP, indistinguishable from any other client behind it —
+the audit trail cannot reconstruct which real client originated an
+abusive session, only that "some client behind the proxy" did.
+`accept_async_with_config` (`tokio_tungstenite`) has no built-in support
+for a trusted-proxy forwarded-address header (`X-Forwarded-For`/
+`Forwarded`), and adding one correctly needs a genuine trust-boundary
+design (a configured trusted-proxy allowlist, so an arbitrary client
+can't simply set its own `X-Forwarded-For` and spoof a different logged
+identity) — real future work if per-client attribution behind this
+deployment becomes operationally necessary, not assumed here. Until
+then: the proxy's OWN access log (most reverse proxies log the real
+client IP per request/connection by default) is the only place to find
+per-client attribution in this specific deployment shape.

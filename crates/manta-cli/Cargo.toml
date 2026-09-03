@@ -29,6 +29,8 @@ manta-spot = { workspace = true }
 manta-testkit = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
 toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }

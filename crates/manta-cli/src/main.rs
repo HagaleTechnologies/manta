@@ -779,6 +779,33 @@ fn start_spot_server(
     epoch: std::time::SystemTime,
     session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    // MAN-59: the daemon's only durable record of connection events/
+    // rejections was the live Prometheus counters (no history, reset on
+    // restart) -- nothing to reconstruct WHAT happened or FROM WHERE
+    // after an abuse incident. `try_init` (not `init`, which panics on a
+    // second call) since this function is the sole place the daemon's
+    // Tokio runtime is constructed, but a defensive no-op on an
+    // already-initialized global subscriber costs nothing. `RUST_LOG`
+    // overrides; unset defaults to `info` -- connection/rejection events
+    // below are logged at `info`/`warn`, so an operator gets useful
+    // output with zero configuration, and can raise verbosity for deeper
+    // debugging without a code change.
+    //
+    // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
+    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
+    // byte-identical spot logs" hard requirement means any interleaved
+    // non-JSON tracing line corrupts that machine-readable stream for
+    // real consumers and breaks deterministic-replay byte-identity.
+    // stderr is a separate stream a JSON-Lines consumer never reads.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
     let cfg_text = std::fs::read_to_string(config_path)?;
     let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
     let rbn_uplink_cfgs = file.rbn_uplink.clone();
