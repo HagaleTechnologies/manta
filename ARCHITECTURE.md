@@ -321,10 +321,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_active_tracks`, `manta_source_health`, and the uplink
-  counters (`crates/manta-server/src/metrics.rs`) — not input-layer
-  overruns or per-stage queue depths, which MAN-56 tracks as a separate
-  gap.
+  gauges, `manta_source_health`, and the uplink counters
+  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
+  per-stage queue depths, which MAN-56 tracks as a separate gap.
+  **`manta_active_tracks` is served but not populated** (corrected
+  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
+  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
+  own comment says the engine exposes no hook for it yet — so every
+  production daemon run reports a constant `0`, not a real track count.
+  Listed separately from the "currently-implemented" set above so an
+  operator doesn't read a served-but-frozen placeholder as live data.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
