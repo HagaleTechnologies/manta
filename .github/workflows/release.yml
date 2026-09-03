@@ -4,19 +4,39 @@ name: Release
 # `manta` binary for every committed platform, built from that exact
 # tagged commit, plus a multi-arch Docker image pushed to GHCR.
 #
-# `workflow_dispatch` exists so the full build matrix can be exercised
-# (and verified against real CI, not guessed at) from a branch/PR before
-# any real version tag is ever pushed -- it never creates a GitHub
-# Release or pushes a Docker tag unless `publish` is explicitly set.
+# A GitHub Release is ONLY ever created from a real `v*` tag push --
+# never from `pull_request` or `workflow_dispatch` (softprops/action-
+# gh-release requires an explicit tag for non-tag events, and there's no
+# sane tag to invent for either of those triggers; PR #78 review round 1).
+#
+# Two ways to exercise the build+Docker matrix without creating a release:
+# - `pull_request` (path-filtered to the files below) runs it automatically
+#   on any PR touching the release pipeline itself -- this is what actually
+#   solves the "how do you validate a BRAND NEW workflow_dispatch-triggered
+#   workflow before it's even on the default branch" bootstrap problem
+#   (GitHub only delivers workflow_dispatch for a workflow file that
+#   already exists on the default branch -- PR #78 review round 1).
+# - `workflow_dispatch` (`publish=true`) additionally pushes real Docker
+#   tags to GHCR, for testing that path specifically post-merge; it never
+#   creates a GitHub Release.
 
 on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Dockerfile'
+      - 'Cross.toml'
+      - '.dockerignore'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish a GitHub Release and push the Docker image (leave off to just build and verify)'
+        description: 'Also push the Docker image to GHCR (never creates a GitHub Release -- that only ever happens from a real v* tag push)'
         type: boolean
         default: false
 
@@ -24,11 +44,15 @@ env:
   CARGO_TERM_COLOR: always
   BIN_NAME: manta
 
-# One release run per tag/dispatch; never cancel a real tag's build
-# because a later manual dispatch happened to fire (each dispatch run
-# gets its own group via run_id, tags key on the ref).
+# One in-flight run per ref for a real tag push (never cancel a release
+# build mid-flight); each pull_request and workflow_dispatch run gets its
+# own group keyed on run_id, so unrelated PRs/manual runs never contend
+# with each other or with a tag's own release build (PR #78 review round
+# 1 -- an earlier draft used github.ref unconditionally, which put every
+# manual dispatch from the same branch in the SAME group, letting a third
+# dispatch silently cancel a second one's still-pending run).
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -40,10 +64,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS x86_64: macos-13 is GitHub's last Intel runner --
-          # native build, no cross-compilation needed.
+          # macOS x86_64: macos-13 was retired (no longer in GitHub's
+          # supported runner-image table as of this workflow) -- the
+          # current Intel label is macos-15-intel (PR #78 review round 1).
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             artifact: manta-macos-x86_64
           # macOS arm64: macos-14+ runners are Apple Silicon natively.
           - target: aarch64-apple-darwin
@@ -53,9 +78,18 @@ jobs:
             os: windows-latest
             artifact: manta-windows-x86_64
             exe_ext: .exe
+          # Linux x86_64: built via `cross` rather than natively on
+          # ubuntu-latest (PR #78 review round 1) -- a native build on
+          # the current runner's glibc would raise the binary's minimum
+          # glibc symbol-version requirement above what's actually
+          # available on still-supported distros (RHEL 8, Debian 11,
+          # Ubuntu 20.04), despite README advertising a generic Linux
+          # x86_64 binary. cross-rs's images are deliberately built on an
+          # older base for exactly this reason.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: manta-linux-x86_64
+            use_cross: true
           # Linux arm64: covers Raspberry Pi OS 64-bit and other ARM
           # SBCs. Cross-compiled via `cross` (cross-rs) rather than a
           # native runner -- GitHub has no arm64 Linux hosted runner in
@@ -135,6 +169,11 @@ jobs:
           retention-days: 14
 
   docker:
+    # Gated on the native/cross build matrix (PR #78 review round 1) --
+    # without this, a real tag push could publish Docker tags for a
+    # release where a Windows/macOS/Linux leg had already failed, since
+    # this job previously had no dependency on `build` at all.
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -146,7 +185,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
 
-      - name: Determine version tag
+      - name: Determine version and lowercase image name
         id: version
         shell: bash
         run: |
@@ -155,6 +194,10 @@ jobs:
           else
             echo "version=dispatch-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
           fi
+          # OCI/Docker repository paths must be lowercase; github.repository
+          # is case-preserving ("HagaleTechnologies/manta") and buildx
+          # rejects a mixed-case tag outright (PR #78 review round 1).
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         if: github.event_name == 'push' || inputs.publish
@@ -170,12 +213,14 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' || inputs.publish }}
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+            ${{ steps.version.outputs.image }}:latest
 
   release:
     needs: [build, docker]
-    if: github.event_name == 'push' || inputs.publish
+    # Only ever from a real tag push -- see the top-of-file comment for
+    # why workflow_dispatch/pull_request never reach this job.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -192,4 +237,3 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
-          draft: ${{ github.event_name == 'workflow_dispatch' }}

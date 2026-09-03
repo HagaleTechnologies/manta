@@ -1,13 +1,27 @@
 # Cross-compilation config for `cross` (cross-rs), used by
-# .github/workflows/release.yml for the aarch64-unknown-linux-gnu target.
+# .github/workflows/release.yml for both Linux gnu targets.
 #
 # `cpal` (live audio input, crates/manta-input) is an unconditional
 # dependency -- not behind any feature flag -- and its Linux backend links
-# against ALSA (`libasound2-dev`) at build time. cross-rs's default
-# aarch64-unknown-linux-gnu image doesn't ship that header/lib for the
-# target architecture, so it has to be installed for the target arch
-# (arm64) specifically, not the host's own (amd64), inside the build
-# container before cargo ever runs.
+# against ALSA (`libasound2-dev`) at build time.
+#
+# x86_64-unknown-linux-gnu is built via `cross` too, not natively on the
+# runner -- deliberately, to build against cross-rs's older glibc
+# baseline rather than the current ubuntu-latest runner's, so the
+# released binary doesn't raise its minimum glibc symbol-version
+# requirement above what's still available on RHEL 8/Debian 11/Ubuntu
+# 20.04-class systems (PR #78 review round 1). Native amd64 in the
+# container, so no cross-arch dpkg dance needed here.
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update",
+    "apt-get install --assume-yes libasound2-dev",
+]
+
+# aarch64-unknown-linux-gnu: covers Raspberry Pi OS 64-bit and other ARM
+# SBCs. cross-rs's default image doesn't ship libasound2-dev for a
+# non-host target architecture, so it has to be installed for the target
+# arch (arm64) specifically, not the container's own host arch (amd64).
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
     "dpkg --add-architecture arm64",

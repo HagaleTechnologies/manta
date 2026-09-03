@@ -46,7 +46,11 @@ No Rust toolchain, no cloning the source. Pick one:
 page](https://github.com/HagaleTechnologies/manta/releases) — macOS
 (Intel or Apple Silicon), Windows, or Linux (x86_64 or arm64, including
 Raspberry Pi OS 64-bit). Unpack the archive and run the `manta` binary
-inside it.
+inside it. **Linux binaries need `libasound2` installed** (audio input is
+an unconditional dependency, even if you only ever use file, KiwiSDR, or
+HPSDR input) — `sudo apt install libasound2` on Debian/Ubuntu/Raspberry Pi
+OS, or the equivalent ALSA runtime package on other distros; without it
+the binary fails to start.
 
 **Or run the Docker image** (works anywhere Docker does, `linux/amd64` and
 `linux/arm64`):

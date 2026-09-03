@@ -41,5 +41,16 @@ WORKDIR /home/manta
 # metrics (:7302) -- ARCHITECTURE.md §7/§8. Defaults; override via config.
 EXPOSE 7300 7301 7302
 
+# `docker stop` sends SIGTERM by default, but manta-cli's shutdown
+# handling (ctrlc, without its optional `termination` feature) only
+# registers for SIGINT -- an unmodified SIGTERM would kill the process
+# directly, bypassing manta_engine::listen's cleanup, track finalization,
+# and the server-drain sequence, and potentially dropping final spots on
+# every routine container shutdown (PR #78 review round 1). Retargeting
+# the stop signal to SIGINT here is the in-scope fix for this
+# release-pipeline PR; switching manta-cli's own ctrlc feature flags is a
+# separate, broader behavior change to the application itself.
+STOPSIGNAL SIGINT
+
 ENTRYPOINT ["manta"]
 CMD ["--help"]
