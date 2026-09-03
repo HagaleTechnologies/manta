@@ -228,19 +228,33 @@ async fn connect_and_forward(
     loop {
         tokio::select! {
             result = read_line_bounded_with_timeout(&mut reader, &mut prompt_line) => {
+                if result.is_err() {
+                    // Counted before propagating (PR #80 review, round
+                    // 7): `rx` was already subscribed above (subscribe-
+                    // before-handshake), so a stalled or errored login
+                    // prompt still abandons whatever was published during
+                    // the wait -- the next connection attempt subscribes
+                    // fresh with no history.
+                    record_disconnect_loss(metrics, &rx, 0);
+                }
                 result.map_err(|_| ConnectAttemptError::NeverConnected)?;
                 break;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    record_disconnect_loss(metrics, &rx, 0);
                     return Ok(());
                 }
             }
         }
     }
-    write_with_timeout(&mut wr, format!("{login_callsign}\r\n").as_bytes())
-        .await
-        .map_err(|_| ConnectAttemptError::NeverConnected)?;
+    if let Err(_e) = write_with_timeout(&mut wr, format!("{login_callsign}\r\n").as_bytes()).await {
+        // Same accounting gap as the login-prompt read above, closed the
+        // same way (PR #80 review pattern, round 7): `rx` was already
+        // subscribed, so a failed login write still abandons its backlog.
+        record_disconnect_loss(metrics, &rx, 0);
+        return Err(ConnectAttemptError::NeverConnected);
+    }
 
     metrics.mark_uplink_connected();
     let result = forward_loop(
@@ -265,25 +279,15 @@ async fn connect_and_forward(
 /// that only notices it's disconnected whenever the next spot arrives
 /// could sit silently un-contributing for an arbitrarily long gap.
 ///
-/// Records however many bus spots are being abandoned as `forward_loop`
-/// is ABOUT to exit and drop `rx` -- a reconnect subscribes fresh with no
-/// history, so anything still queued in `rx`'s own backlog at that point
-/// is genuinely lost, not just delayed. `extra` is `1` when the
-/// triggering event was itself a specific spot that failed to send (its
-/// write was in flight, or just failed), `0` when only the backlog is
-/// lost (e.g. a rate-limit or protocol-violation disconnect with no
-/// single spot to blame).
-///
-/// Every early return out of `forward_loop`'s select loop MUST call this
-/// first (PR #80 review, rounds 3-6): this exact accounting gap recurred
-/// at a NEW exit path in four consecutive review rounds -- the "same code
-/// region keeps breaking" signal that ad-hoc inline `rx.len()` at each
-/// call site was the wrong shape, not that any individual fix was wrong.
-/// A shared, named helper makes the correct call the path of least
-/// resistance at any exit site added in the future, including the ones
-/// below closing gaps no review round had flagged yet (`Ok(0)`/`Err(e)`
-/// read failures, and the outer idle-wait shutdown branch).
-fn record_disconnect_loss(
+/// Records however many bus spots are being abandoned as a spot's write
+/// to the target ITSELF just failed or timed out -- distinct from
+/// `record_disconnect_loss` below (PR #80 review, round 8: conflating
+/// every disconnect cause into the write-failure counter contradicted its
+/// own name/HELP text and would misdirect alerting). `extra` is always
+/// `1` here: the triggering event is always the one spot whose write just
+/// failed, plus whatever else was still queued in `rx`'s own backlog and
+/// is now abandoned alongside it when the caller drops `rx` on reconnect.
+fn record_write_failure_loss(
     metrics: &Metrics,
     rx: &broadcast::Receiver<crate::bus::BusSpot>,
     extra: u64,
@@ -291,6 +295,35 @@ fn record_disconnect_loss(
     let n = extra + rx.len() as u64;
     if n > 0 {
         metrics.record_uplink_write_failed(n);
+    }
+}
+
+/// Records however many bus spots are being abandoned as the uplink
+/// connection is torn down for a reason OTHER than a failed/timed-out
+/// write itself -- a rate-limit disconnect, a protocol violation, a
+/// stalled login prompt, or a shutdown cancelling an in-flight write. See
+/// `record_write_failure_loss`'s doc comment for why these are two
+/// separate counters, not one. `extra` is `1` when the triggering event
+/// was itself a specific spot whose write was cancelled (not failed) in
+/// flight, `0` when only the backlog is lost (no single spot to blame).
+///
+/// Every early return out of `forward_loop`'s select loop, and out of
+/// `connect_and_forward`'s pre-login connect/prompt-read loops once `rx`
+/// has been subscribed, MUST call one of these two helpers first (PR #80
+/// review, rounds 3-8): this exact accounting gap recurred at a NEW exit
+/// path across five consecutive review rounds -- the "same code region
+/// keeps breaking" signal that ad-hoc inline `rx.len()` at each call site
+/// was the wrong shape, not that any individual fix was wrong. Named
+/// helpers make the correct call (into the correct counter) the path of
+/// least resistance at any exit site added in the future.
+fn record_disconnect_loss(
+    metrics: &Metrics,
+    rx: &broadcast::Receiver<crate::bus::BusSpot>,
+    extra: u64,
+) {
+    let n = extra + rx.len() as u64;
+    if n > 0 {
+        metrics.record_uplink_disconnected(n);
     }
 }
 
@@ -332,7 +365,7 @@ async fn forward_loop(
                         tokio::select! {
                             write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
                                 if write_result.is_err() {
-                                    record_disconnect_loss(metrics, rx, 1);
+                                    record_write_failure_loss(metrics, rx, 1);
                                     write_result?;
                                 }
                                 metrics.record_uplink_sent();
@@ -444,18 +477,8 @@ mod tests {
         );
     }
 
-    /// PR #80 review, rounds 3-6: `record_disconnect_loss` is the single
-    /// place every disconnect-causing exit from `forward_loop` must go
-    /// through, after this exact accounting gap recurred at a new exit
-    /// path across four consecutive review rounds.
-    #[test]
-    fn record_disconnect_loss_counts_extra_plus_backlog() {
-        let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
-        let rx = bus.subscribe();
-        let metrics = Metrics::new();
-
-        let spot = manta_spot::Spot {
+    fn sample_spot_for_loss_tests() -> manta_spot::Spot {
+        manta_spot::Spot {
             callsign: "JA1ABC".to_string(),
             freq_hz: 14_027_100.0,
             snr_db: 23.0,
@@ -464,33 +487,82 @@ mod tests {
             confidence: 0.9,
             track_id: 1,
             sample_ts: 0,
-        };
-        // 3 spots queued in the backlog, none yet drained by `rx`.
-        bus.publish(spot.clone());
-        bus.publish(spot.clone());
-        bus.publish(spot);
-        assert_eq!(rx.len(), 3);
-
-        record_disconnect_loss(&metrics, &rx, 1); // the "current" spot + backlog
-        assert_eq!(metrics.uplink_write_failed_total(), 4);
-
-        record_disconnect_loss(&metrics, &rx, 0); // called again: still counts the same still-queued backlog
-        assert_eq!(metrics.uplink_write_failed_total(), 7);
+        }
     }
 
+    /// PR #80 review, rounds 3-8: `record_write_failure_loss` and
+    /// `record_disconnect_loss` are the two places every disconnect-
+    /// causing exit from `forward_loop`/`connect_and_forward` must go
+    /// through, after this exact accounting gap recurred at a new exit
+    /// path across five consecutive review rounds, and round 8 further
+    /// split "write itself failed" from "connection torn down for some
+    /// other reason" into separate counters so
+    /// `uplink_write_failed_total`'s own name/HELP text stays accurate.
     #[test]
-    fn record_disconnect_loss_records_nothing_when_extra_and_backlog_are_both_zero() {
+    fn record_write_failure_loss_counts_extra_plus_backlog() {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
         let metrics = Metrics::new();
 
+        // 3 spots queued in the backlog, none yet drained by `rx`.
+        let spot = sample_spot_for_loss_tests();
+        bus.publish(spot.clone());
+        bus.publish(spot.clone());
+        bus.publish(spot);
+        assert_eq!(rx.len(), 3);
+
+        record_write_failure_loss(&metrics, &rx, 1); // the failed spot + backlog
+        assert_eq!(metrics.uplink_write_failed_total(), 4);
+        assert_eq!(
+            metrics.uplink_disconnected_total(),
+            0,
+            "a write failure must not also count against the disconnect counter"
+        );
+
+        record_write_failure_loss(&metrics, &rx, 1); // called again: still counts the same still-queued backlog
+        assert_eq!(metrics.uplink_write_failed_total(), 8);
+    }
+
+    #[test]
+    fn record_disconnect_loss_counts_extra_plus_backlog_separately_from_write_failures() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
+        let rx = bus.subscribe();
+        let metrics = Metrics::new();
+
+        let spot = sample_spot_for_loss_tests();
+        bus.publish(spot.clone());
+        bus.publish(spot);
+        assert_eq!(rx.len(), 2);
+
+        record_disconnect_loss(&metrics, &rx, 0); // e.g. a rate-limit disconnect: no single spot to blame
+        assert_eq!(metrics.uplink_disconnected_total(), 2);
+        assert_eq!(
+            metrics.uplink_write_failed_total(),
+            0,
+            "a non-write disconnect must not also count against the write-failure counter"
+        );
+
+        record_disconnect_loss(&metrics, &rx, 1); // e.g. shutdown cancelling an in-flight write
+        assert_eq!(metrics.uplink_disconnected_total(), 5);
+    }
+
+    #[test]
+    fn record_loss_helpers_record_nothing_when_extra_and_backlog_are_both_zero() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
+        let rx = bus.subscribe();
+        let metrics = Metrics::new();
+
+        record_write_failure_loss(&metrics, &rx, 0);
         record_disconnect_loss(&metrics, &rx, 0);
         assert_eq!(
             metrics.uplink_write_failed_total(),
             0,
             "must not record a spurious 0-count event"
         );
+        assert_eq!(metrics.uplink_disconnected_total(), 0);
     }
 
     #[test]
