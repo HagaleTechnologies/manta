@@ -264,6 +264,36 @@ async fn connect_and_forward(
 /// spot happens to be published and the resulting write fails. A node
 /// that only notices it's disconnected whenever the next spot arrives
 /// could sit silently un-contributing for an arbitrarily long gap.
+///
+/// Records however many bus spots are being abandoned as `forward_loop`
+/// is ABOUT to exit and drop `rx` -- a reconnect subscribes fresh with no
+/// history, so anything still queued in `rx`'s own backlog at that point
+/// is genuinely lost, not just delayed. `extra` is `1` when the
+/// triggering event was itself a specific spot that failed to send (its
+/// write was in flight, or just failed), `0` when only the backlog is
+/// lost (e.g. a rate-limit or protocol-violation disconnect with no
+/// single spot to blame).
+///
+/// Every early return out of `forward_loop`'s select loop MUST call this
+/// first (PR #80 review, rounds 3-6): this exact accounting gap recurred
+/// at a NEW exit path in four consecutive review rounds -- the "same code
+/// region keeps breaking" signal that ad-hoc inline `rx.len()` at each
+/// call site was the wrong shape, not that any individual fix was wrong.
+/// A shared, named helper makes the correct call the path of least
+/// resistance at any exit site added in the future, including the ones
+/// below closing gaps no review round had flagged yet (`Ok(0)`/`Err(e)`
+/// read failures, and the outer idle-wait shutdown branch).
+fn record_disconnect_loss(
+    metrics: &Metrics,
+    rx: &broadcast::Receiver<crate::bus::BusSpot>,
+    extra: u64,
+) {
+    let n = extra + rx.len() as u64;
+    if n > 0 {
+        metrics.record_uplink_write_failed(n);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_loop(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
@@ -302,45 +332,14 @@ async fn forward_loop(
                         tokio::select! {
                             write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
                                 if write_result.is_err() {
-                                    // Counted before propagating (PR #80
-                                    // review, round 3, tightened round 4):
-                                    // a spot lost to a failed/timed-out
-                                    // write was otherwise silently
-                                    // dropped -- invisible on every other
-                                    // counter, since uplink_lagged_total
-                                    // is specifically broadcast-channel
-                                    // lag, not a network write failure.
-                                    // `1 + rx.len()`, not just `1`: the
-                                    // `?` below drops `rx` (a fresh
-                                    // subscription is made on reconnect),
-                                    // abandoning whatever was ALSO
-                                    // already queued in its backlog --
-                                    // matching `record_write_failed`'s
-                                    // identical convention on the inbound
-                                    // telnet/JSON write path.
-                                    metrics.record_uplink_write_failed(1 + rx.len() as u64);
+                                    record_disconnect_loss(metrics, rx, 1);
                                     write_result?;
                                 }
                                 metrics.record_uplink_sent();
                             }
                             _ = shutdown.changed() => {
                                 if *shutdown.borrow() {
-                                    // Counted before returning (PR #80
-                                    // review, round 5, tightened round 6):
-                                    // the write in flight when shutdown
-                                    // arrived is cancelled by dropping
-                                    // this select! arm's losing future --
-                                    // otherwise this spot was silently
-                                    // lost during a clean shutdown, even
-                                    // though the equivalent timeout/error
-                                    // path above is already counted.
-                                    // `1 + rx.len()`, not just `1`: the
-                                    // outer loop returns right after this,
-                                    // dropping `rx` and abandoning
-                                    // whatever else was already queued in
-                                    // its backlog too -- the round-5 fix
-                                    // only covered the one in-flight spot.
-                                    metrics.record_uplink_write_failed(1 + rx.len() as u64);
+                                    record_disconnect_loss(metrics, rx, 1);
                                     return Ok(());
                                 }
                             }
@@ -350,7 +349,10 @@ async fn forward_loop(
                         metrics.record_uplink_lagged(n);
                         continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        record_disconnect_loss(metrics, rx, 0);
+                        return Ok(());
+                    }
                 }
             }
             // Bounded via bounded_io (MAN-58 finding 2): an unterminated
@@ -366,6 +368,7 @@ async fn forward_loop(
             read_result = read_line_bounded(reader, &mut discard) => {
                 match read_result {
                     Ok(0) => {
+                        record_disconnect_loss(metrics, rx, 0);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionReset,
                             "RBN uplink target closed the connection",
@@ -379,31 +382,21 @@ async fn forward_loop(
                         // an unbounded stream of otherwise-harmless lines
                         // is still unbounded CPU/bandwidth work.
                         if !response_limiter.allow() {
-                            // Counted before returning (PR #80 review,
-                            // round 6): this disconnect drops `rx`
-                            // (a fresh subscription starts empty on
-                            // reconnect), abandoning whatever bus spots
-                            // were already queued in its backlog while
-                            // this read was pending -- no `1 +` here
-                            // (unlike the write-failure paths), since
-                            // the triggering event itself wasn't a
-                            // dropped spot write, only the retained
-                            // backlog is lost, matching telnet.rs's
-                            // identical `record_write_failed(rx.len()
-                            // as u64)` convention for a non-write-
-                            // triggered disconnect (round-15 review
-                            // finding there).
-                            metrics.record_uplink_write_failed(rx.len() as u64);
+                            record_disconnect_loss(metrics, rx, 0);
                             return Err(std::io::Error::other(
                                 "RBN uplink target exceeded the response-line rate budget",
                             ));
                         }
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        record_disconnect_loss(metrics, rx, 0);
+                        return Err(e);
+                    }
                 }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    record_disconnect_loss(metrics, rx, 0);
                     return Ok(());
                 }
             }
@@ -448,6 +441,55 @@ mod tests {
                 &ConnectAttemptError::NeverConnected
             ),
             MAX_BACKOFF
+        );
+    }
+
+    /// PR #80 review, rounds 3-6: `record_disconnect_loss` is the single
+    /// place every disconnect-causing exit from `forward_loop` must go
+    /// through, after this exact accounting gap recurred at a new exit
+    /// path across four consecutive review rounds.
+    #[test]
+    fn record_disconnect_loss_counts_extra_plus_backlog() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
+        let rx = bus.subscribe();
+        let metrics = Metrics::new();
+
+        let spot = manta_spot::Spot {
+            callsign: "JA1ABC".to_string(),
+            freq_hz: 14_027_100.0,
+            snr_db: 23.0,
+            wpm: 28.0,
+            spot_type: manta_spot::SpotType::Cq,
+            confidence: 0.9,
+            track_id: 1,
+            sample_ts: 0,
+        };
+        // 3 spots queued in the backlog, none yet drained by `rx`.
+        bus.publish(spot.clone());
+        bus.publish(spot.clone());
+        bus.publish(spot);
+        assert_eq!(rx.len(), 3);
+
+        record_disconnect_loss(&metrics, &rx, 1); // the "current" spot + backlog
+        assert_eq!(metrics.uplink_write_failed_total(), 4);
+
+        record_disconnect_loss(&metrics, &rx, 0); // called again: still counts the same still-queued backlog
+        assert_eq!(metrics.uplink_write_failed_total(), 7);
+    }
+
+    #[test]
+    fn record_disconnect_loss_records_nothing_when_extra_and_backlog_are_both_zero() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
+        let rx = bus.subscribe();
+        let metrics = Metrics::new();
+
+        record_disconnect_loss(&metrics, &rx, 0);
+        assert_eq!(
+            metrics.uplink_write_failed_total(),
+            0,
+            "must not record a spurious 0-count event"
         );
     }
 
