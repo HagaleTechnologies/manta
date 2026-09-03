@@ -1,37 +1,18 @@
 name: Release
 
-# MAN-21: a tagged release (v*) publishes a GitHub Release with a prebuilt
-# `manta` binary for every committed platform, built from that exact
-# tagged commit, plus a multi-arch Docker image pushed to GHCR.
+# MAN-21: builds and validates the release binaries + Docker image for
+# every committed platform, from `pull_request` (path-filtered, build-only
+# validation), `workflow_dispatch` (manual re-run), or a real `v*` tag
+# push (also validated here, redundantly with release-publish.yml, purely
+# for CI hygiene -- harmless, never publishes anything).
 #
-# A GitHub Release is ONLY ever created from a real `v*` tag push --
-# never from `pull_request` or `workflow_dispatch` (softprops/action-
-# gh-release requires an explicit tag for non-tag events, and there's no
-# sane tag to invent for either of those triggers; PR #78 review round 1).
-#
-# Two ways to exercise the build+Docker matrix without creating a release:
-# - `pull_request` (path-filtered to the files below) runs it automatically
-#   on any PR touching the release pipeline itself -- this is what actually
-#   solves the "how do you validate a BRAND NEW workflow_dispatch-triggered
-#   workflow before it's even on the default branch" bootstrap problem
-#   (GitHub only delivers workflow_dispatch for a workflow file that
-#   already exists on the default branch -- PR #78 review round 1).
-# - `workflow_dispatch` (`publish=true`) additionally pushes real Docker
-#   tags to GHCR, for testing that path specifically post-merge; it never
-#   creates a GitHub Release.
-#
-# Known limitations, deferred as MAN-65 (later review round -- ticketed
-# per the PR review convergence policy rather than another live round):
-# a `v*` tag with SemVer build metadata (e.g. v1.2.3+linux) would produce
-# an invalid Docker tag; the Windows archive needs the VC++ Redistributable
-# installed separately (dynamic MSVC runtime, not bundled); overlapping
-# tag pushes could theoretically race on the shared `:latest` tag; and a
-# brand-new GHCR package defaults to private on first publish -- the
-# README's anonymous `docker run` command won't work until a maintainer
-# manually flips it to public in GitHub's package settings the first time
-# a real tag actually publishes (deliberately not automated here --
-# changing a package's visibility is a "make something public" action
-# outside what this workflow should do unsupervised).
+# This file NEVER publishes anything and NEVER requests write permissions
+# anywhere -- deliberately, so it's safe to also trigger on `pull_request`
+# without a PR being able to reach any credential by editing it (PR #78
+# review round 6). The actual publish path (Docker push to GHCR, GitHub
+# Release creation) lives in release-publish.yml, which has NO
+# `pull_request` trigger at all -- see that file's own header comment for
+# why splitting the trigger SET, not just the job, matters here.
 
 on:
   push:
@@ -40,30 +21,19 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release.yml'
+      - '.github/workflows/release-publish.yml'
       - 'Dockerfile'
       - 'Cross.toml'
       - '.dockerignore'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
-  workflow_dispatch:
-    inputs:
-      publish:
-        description: 'Also push the Docker image to GHCR (never creates a GitHub Release -- that only ever happens from a real v* tag push)'
-        type: boolean
-        default: false
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: manta
 
-# One in-flight run per ref for a real tag push (never cancel a release
-# build mid-flight); each pull_request and workflow_dispatch run gets its
-# own group keyed on run_id, so unrelated PRs/manual runs never contend
-# with each other or with a tag's own release build (PR #78 review round
-# 1 -- an earlier draft used github.ref unconditionally, which put every
-# manual dispatch from the same branch in the SAME group, letting a third
-# dispatch silently cancel a second one's still-pending run).
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: false
@@ -182,12 +152,9 @@ jobs:
           retention-days: 14
 
   docker-build:
-    # Runs on every trigger, including pull_request -- build-only, never
-    # pushes, and deliberately has NO packages:write permission at all
-    # (see docker-publish below for why that has to be a separate job).
-    # Gated on the native/cross build matrix (PR #78 review round 1) --
-    # without this, a real tag push could publish Docker tags for a
-    # release where a Windows/macOS/Linux leg had already failed.
+    # Build-and-validate only, never pushes, never requests packages:write
+    # -- see the top-of-file comment for why that's what makes it safe to
+    # also run on `pull_request`.
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -201,105 +168,3 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: false
-
-  docker-publish:
-    # A SEPARATE job, not a conditional step in docker-build, because
-    # `permissions:` is scoped to the whole job and cannot be gated by an
-    # `if:` (PR #78 review round 5) -- granting packages:write to a job
-    # that also runs on `pull_request` would hand that token to
-    # PR-controlled workflow/Dockerfile content, which isn't
-    # auto-downgraded for a same-repository PR the way a fork PR's token
-    # is. This job's own `if:` below is evaluated by GitHub against
-    # immutable built-in context (github.event_name), not anything a PR's
-    # diff can influence, so it structurally never runs for pull_request
-    # regardless of what the PR modifies in this very file.
-    needs: [build, docker-build]
-    if: github.event_name == 'push' || inputs.publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-
-      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
-
-      - name: Determine version, image, and tag list
-        id: version
-        shell: bash
-        run: |
-          # Gated on the EVENT being a real push, not merely on
-          # github.ref_type == 'tag' (PR #78 review round 9 -- ref_type is
-          # ALSO 'tag' for `gh workflow run release.yml --ref <existing-
-          # tag> -f publish=true`, a workflow_dispatch run targeting an
-          # existing tag, not a push. The earlier ref_type-only check let
-          # a manual dispatch against an old release tag compute that
-          # tag's real version number and, unconditionally, overwrite the
-          # already-published immutable :$VERSION image with a rebuild).
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="dispatch-${{ github.run_id }}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # OCI/Docker repository paths must be lowercase; github.repository
-          # is case-preserving ("HagaleTechnologies/manta") and buildx
-          # rejects a mixed-case tag outright (PR #78 review round 1).
-          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-
-          # `:latest` is reserved for real tag pushes only (PR #78 review
-          # round 2) -- a workflow_dispatch run with publish=true can
-          # target any branch, not just a release, and README's `docker
-          # run ghcr.io/.../manta:latest` install command must always
-          # trace to a real tagged release, not a manual test build that
-          # happened to also push. The dispatch-<run_id> tag is still
-          # pushed on a dispatch publish, for testing that path
-          # specifically -- just never `:latest`.
-          {
-            echo "tags<<RELEASE_TAGS_EOF"
-            echo "$IMAGE:$VERSION"
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              echo "$IMAGE:latest"
-            fi
-            echo "RELEASE_TAGS_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.version.outputs.tags }}
-
-  release:
-    needs: [build, docker-publish]
-    # Only ever from a real tag push -- see the top-of-file comment for
-    # why workflow_dispatch/pull_request never reach this job.
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: List downloaded artifacts
-        run: find dist -type f
-
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: dist/*
-          generate_release_notes: true

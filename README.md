@@ -65,7 +65,7 @@ period before SIGKILL is shorter than manta's supported drain window for
 a slow client's final write (up to 25s), so the default can cut a
 graceful shutdown off mid-drain.
 
-Both are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
+Both are built by [`.github/workflows/release-publish.yml`](.github/workflows/release-publish.yml)
 directly from each tagged release's commit — every published binary
 traces to a specific, auditable source revision. (If the image above
 returns an authorization error, the GHCR package needs its one-time
