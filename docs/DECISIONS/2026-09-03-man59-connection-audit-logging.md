@@ -73,3 +73,40 @@ reconstruction. `ConnectionLimiter` itself has no discrete "rejected"
 event to hook (a flood beyond it just waits in the OS accept backlog, per
 its own doc comment) — consistent with what the code actually does, not
 logged as a rejection that never occurs.
+
+## Addendum (review round 4): consolidated per-connection log budget
+
+Rounds 2-3 each found one more individually un-gated audit-log call site
+(the quota-reject warning, then the 404-reject warning, then a missing
+task-boundary catch-all in `metrics_http`) — the same gap recurring three
+rounds running. Replaced the several one-off, event-specific
+`IpRateLimiter`s with ONE budget per listener, decided once per admitted
+connection (`telnet`/`json_stream` — every admitted connection there
+always logs at least a connect event, so nothing is wasted) and threaded
+through as `log_enabled`: every tracing call in that connection's entire
+lifetime checks the same decision, closing the whole class of gap rather
+than the one specific instance each round happened to find.
+
+## Addendum (review round 5): two corrections
+
+1. **`metrics_http`'s "decide once" budget was itself wrong.** Unlike
+   telnet/json_stream, most admitted connections here are successful
+   scrapes that log NOTHING — deciding the budget once per connection
+   (the round-4 shape, copied uncritically from telnet/json_stream)
+   silently spent a slot on connections that were never going to produce
+   a log line, letting a source burn its whole window on harmless
+   scrapes and then flood rejections for free. Fixed: `metrics_http`
+   consults its `IpRateLimiter` LAZILY, right at each actual warning
+   site, instead of pre-deciding at admission time. `telnet`/
+   `json_stream` keep the decide-once shape — it's correct there because
+   every admitted connection genuinely does log something.
+2. **WS audit attribution is unavailable behind the documented
+   reverse-proxy deployment** — `peer` there is the proxy's own address
+   for every downstream client, not the real client's, so the audit
+   trail can't reconstruct which real client originated an abusive WS
+   session in that specific deployment shape. A correct fix (trusting a
+   forwarded-address header only from a configured trusted-proxy
+   allowlist) is real future work, not implemented here — documented as
+   a known limitation instead, per `docs/RUNBOOKS/network-exposure.md`'s
+   own MAN-59 addendum, which is the reviewer's own explicitly offered
+   alternative to building that feature blind at review time.

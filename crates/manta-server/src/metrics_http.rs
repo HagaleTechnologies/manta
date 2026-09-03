@@ -68,10 +68,20 @@ const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 /// `telnet::CONNECTION_LOG_MAX_PER_WINDOW`'s doc comment for the full
 /// "reconsider the fix strategy" rationale. Replaces the narrower,
 /// round-3-only `REJECTED_REQUEST_LOG_*`/`rejected_request_log_limiter`:
-/// ONE budget decided once per admitted connection covers header
-/// rejections, the 404 rejection, and the task-boundary catch-all alike,
-/// so there's no longer a second limiter to remember to wire a future
-/// call site into.
+/// ONE budget covers header rejections, the 404 rejection, and the
+/// task-boundary catch-all alike, so there's no longer a second limiter
+/// to remember to wire a future call site into.
+///
+/// Round 5 correction: UNLIKE `telnet`/`json_stream` (where an admitted
+/// connection always logs at least a connect event, so deciding the
+/// budget once per connection never wastes it), most connections here
+/// are successful scrapes that log NOTHING at all -- deciding this once
+/// at admission time (the original round-4 shape) would silently spend a
+/// budget slot on connections that were never going to produce a log
+/// line, letting a source burn through its window on harmless scrapes
+/// and then flood rejections for free for the rest of it. Consulted
+/// LAZILY at each actual warning site in `handle_request` instead of
+/// once per connection.
 const CONNECTION_LOG_MAX_PER_WINDOW: u32 = 30;
 const CONNECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 
@@ -114,20 +124,29 @@ pub async fn serve(
             continue; // limiter closed: unreachable in practice, never panics
         };
         let metrics = metrics.clone();
-        // Decided ONCE per admitted connection -- see
-        // CONNECTION_LOG_MAX_PER_WINDOW's doc comment above.
-        let log_enabled = connection_log_limiter.allow(peer.ip());
+        // MAN-59 review round 5: unlike telnet/json_stream (where an
+        // admitted connection ALWAYS logs at least a connect event), most
+        // admitted connections here are successful scrapes that
+        // deliberately emit NOTHING -- deciding this once per connection
+        // (the round-4 pattern) would silently spend budget on connections
+        // that were never going to log anything, letting a source use up
+        // its whole window on harmless scrapes and then flood rejections
+        // for free. `connection_log_limiter` is consulted LAZILY at each
+        // actual warn site below instead, right when there's a real event
+        // to charge for.
+        let connection_log_limiter = connection_log_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
-            let result = handle_request(socket, metrics, peer, log_enabled).await;
+            let result =
+                handle_request(socket, metrics, peer, connection_log_limiter.clone()).await;
             // MAN-59 review round 3: successful requests are deliberately
             // not logged (Prometheus scrapes this every 10-30s -- pure
             // noise), so a connection that resets mid-response or times
             // out on write would otherwise produce no audit event at
             // all, unlike telnet/json_stream's equivalent catch-all.
-            if log_enabled {
-                if let Err(e) = &result {
+            if let Err(e) = &result {
+                if connection_log_limiter.allow(peer.ip()) {
                     tracing::warn!(peer = %peer, error = %e, "metrics_http: request task ended with an error");
                 }
             }
@@ -162,7 +181,7 @@ async fn handle_request(
     socket: tokio::net::TcpStream,
     metrics: Arc<Metrics>,
     peer: std::net::SocketAddr,
-    log_enabled: bool,
+    connection_log_limiter: IpRateLimiter,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
@@ -178,14 +197,16 @@ async fn handle_request(
         Ok(Err(e)) => {
             // MAN-59 review round 4: was previously ungated, unlike the
             // sibling 404-rejection warning below -- both now share the
-            // one connection-level budget.
-            if log_enabled {
+            // one connection-level budget. Round 5: charged lazily, right
+            // here, not pre-decided at connection-admission time -- see
+            // `serve`'s own comment for why.
+            if connection_log_limiter.allow(peer.ip()) {
                 tracing::warn!(peer = %peer, error = %e, "metrics_http: header read rejected (oversized/malformed line), disconnecting");
             }
             return Err(e);
         }
         Err(_) => {
-            if log_enabled {
+            if connection_log_limiter.allow(peer.ip()) {
                 tracing::warn!(peer = %peer, "metrics_http: header read timed out, disconnecting");
             }
             return Err(std::io::Error::new(
@@ -213,7 +234,7 @@ async fn handle_request(
         // didn't match. Debug (`?`), not Display, for the same reason the
         // telnet login field uses it: `request_line` is client-supplied
         // and unvalidated.
-        if log_enabled {
+        if connection_log_limiter.allow(peer.ip()) {
             tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
         }
         "404 Not Found"
