@@ -249,10 +249,15 @@ async fn connect_and_forward(
         }
     }
     if let Err(_e) = write_with_timeout(&mut wr, format!("{login_callsign}\r\n").as_bytes()).await {
-        // Same accounting gap as the login-prompt read above, closed the
-        // same way (PR #80 review pattern, round 7): `rx` was already
-        // subscribed, so a failed login write still abandons its backlog.
-        record_disconnect_loss(metrics, &rx, 0);
+        // A genuine write failure (PR #80 review, round 10, correcting
+        // round 7's own fix): unlike the login-PROMPT READ just above,
+        // this is the socket write itself failing/timing out, so it
+        // belongs in `record_write_failure_loss` (the counter reserved
+        // for actual write failures), not `record_disconnect_loss` --
+        // `extra = 0` since there's no queued bus spot being sent here,
+        // only the login line, but the backlog `rx` already accumulated
+        // during the handshake is still abandoned.
+        record_write_failure_loss(metrics, &rx, 0);
         return Err(ConnectAttemptError::NeverConnected);
     }
 
