@@ -326,15 +326,21 @@ async fn forward_loop(
                             _ = shutdown.changed() => {
                                 if *shutdown.borrow() {
                                     // Counted before returning (PR #80
-                                    // review, round 5): the write in
-                                    // flight when shutdown arrived is
-                                    // cancelled by dropping this select!
-                                    // arm's losing future -- otherwise
-                                    // this spot was silently lost during
-                                    // a clean shutdown, even though the
-                                    // equivalent timeout/error path above
-                                    // is already counted.
-                                    metrics.record_uplink_write_failed(1);
+                                    // review, round 5, tightened round 6):
+                                    // the write in flight when shutdown
+                                    // arrived is cancelled by dropping
+                                    // this select! arm's losing future --
+                                    // otherwise this spot was silently
+                                    // lost during a clean shutdown, even
+                                    // though the equivalent timeout/error
+                                    // path above is already counted.
+                                    // `1 + rx.len()`, not just `1`: the
+                                    // outer loop returns right after this,
+                                    // dropping `rx` and abandoning
+                                    // whatever else was already queued in
+                                    // its backlog too -- the round-5 fix
+                                    // only covered the one in-flight spot.
+                                    metrics.record_uplink_write_failed(1 + rx.len() as u64);
                                     return Ok(());
                                 }
                             }
@@ -373,6 +379,21 @@ async fn forward_loop(
                         // an unbounded stream of otherwise-harmless lines
                         // is still unbounded CPU/bandwidth work.
                         if !response_limiter.allow() {
+                            // Counted before returning (PR #80 review,
+                            // round 6): this disconnect drops `rx`
+                            // (a fresh subscription starts empty on
+                            // reconnect), abandoning whatever bus spots
+                            // were already queued in its backlog while
+                            // this read was pending -- no `1 +` here
+                            // (unlike the write-failure paths), since
+                            // the triggering event itself wasn't a
+                            // dropped spot write, only the retained
+                            // backlog is lost, matching telnet.rs's
+                            // identical `record_write_failed(rx.len()
+                            // as u64)` convention for a non-write-
+                            // triggered disconnect (round-15 review
+                            // finding there).
+                            metrics.record_uplink_write_failed(rx.len() as u64);
                             return Err(std::io::Error::other(
                                 "RBN uplink target exceeded the response-line rate budget",
                             ));
