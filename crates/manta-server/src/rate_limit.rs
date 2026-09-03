@@ -49,6 +49,47 @@ impl RateLimiter {
     }
 }
 
+/// Bound on `IpRateLimiterState::entries`' cardinality (MAN-68, PR #85
+/// review round 6). `spawn_stale_entry_reaper` bounds how long an IDLE
+/// entry survives (two full windows), not how many entries can
+/// accumulate before that reaper catches up -- a source with access to
+/// many distinct addresses (e.g. a routed IPv6 prefix, trivially
+/// available to any real ISP-assigned block) can insert a fresh entry per
+/// address at its own handshake rate, unbounded for up to those two
+/// windows' worth of accumulation. Same class of gap MAN-62 already fixed
+/// for `bus::SpotBus::occurrence_counts`, and the same capacity value --
+/// see `bus::MAX_OCCURRENCE_ENTRIES`'s doc comment for why 20,000 is
+/// generous headroom over real cardinality while still bounding a flood.
+const MAX_IP_RATE_LIMITER_ENTRIES: usize = 20_000;
+
+/// One tracked source's rate-limit window state plus an LRU touch tick,
+/// mirroring `bus::OccurrenceTracker`'s entry shape.
+struct IpRateLimiterEntry {
+    window_start: Instant,
+    count: u32,
+    last_touched: u64,
+}
+
+/// Bounded, LRU-on-touch state for `IpRateLimiter` (MAN-68) -- same design
+/// as `bus::OccurrenceTracker`: once at `MAX_IP_RATE_LIMITER_ENTRIES`
+/// capacity, inserting a genuinely NEW source IP evicts whichever tracked
+/// IP has gone longest untouched, so a real, currently-active source
+/// (repeatedly touched) stays protected while addresses that appear once
+/// under flood pressure and never again are what gets evicted first.
+struct IpRateLimiterState {
+    entries: HashMap<IpAddr, IpRateLimiterEntry>,
+    next_touch: u64,
+}
+
+impl IpRateLimiterState {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_touch: 0,
+        }
+    }
+}
+
 /// MAN-57: `RateLimiter` above is instantiated fresh per connection, so a
 /// source opening N connections gets N independent full budgets -- the
 /// effective per-IP rate is N x the intended single-connection budget, not
@@ -63,7 +104,7 @@ impl RateLimiter {
 pub struct IpRateLimiter {
     max_per_window: u32,
     window: Duration,
-    state: Arc<StdMutex<HashMap<IpAddr, (Instant, u32)>>>,
+    state: Arc<StdMutex<IpRateLimiterState>>,
 }
 
 impl IpRateLimiter {
@@ -71,7 +112,7 @@ impl IpRateLimiter {
         Self {
             max_per_window,
             window,
-            state: Arc::new(StdMutex::new(HashMap::new())),
+            state: Arc::new(StdMutex::new(IpRateLimiterState::new())),
         }
     }
 
@@ -105,13 +146,39 @@ impl IpRateLimiter {
     pub fn allow(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
-        let entry = state.entry(ip).or_insert((now, 0));
-        if now.duration_since(entry.0) >= self.window {
-            entry.0 = now;
-            entry.1 = 0;
+        state.next_touch += 1;
+        let touch = state.next_touch;
+        if let Some(entry) = state.entries.get_mut(&ip) {
+            if now.duration_since(entry.window_start) >= self.window {
+                entry.window_start = now;
+                entry.count = 0;
+            }
+            entry.count += 1;
+            entry.last_touched = touch;
+            return entry.count <= self.max_per_window;
         }
-        entry.1 += 1;
-        entry.1 <= self.max_per_window
+        // A genuinely new source IP (MAN-68): evict the longest-untouched
+        // tracked entry first if already at capacity, mirroring
+        // `bus::OccurrenceTracker::touch`.
+        if state.entries.len() >= MAX_IP_RATE_LIMITER_ENTRIES {
+            if let Some(lru_key) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_touched)
+                .map(|(key, _)| *key)
+            {
+                state.entries.remove(&lru_key);
+            }
+        }
+        state.entries.insert(
+            ip,
+            IpRateLimiterEntry {
+                window_start: now,
+                count: 1,
+                last_touched: touch,
+            },
+        );
+        1 <= self.max_per_window
     }
 }
 
@@ -136,9 +203,9 @@ pub fn spawn_stale_entry_reaper(limiter: IpRateLimiter) -> tokio::task::JoinHand
             tokio::time::sleep(IP_RATE_LIMITER_REAP_INTERVAL).await;
             let now = Instant::now();
             let mut state = limiter.state.lock().unwrap();
-            state.retain(|_, (window_start, _)| {
-                now.duration_since(*window_start) < limiter.window * 2
-            });
+            state
+                .entries
+                .retain(|_, entry| now.duration_since(entry.window_start) < limiter.window * 2);
         }
     })
 }
@@ -269,7 +336,7 @@ mod tests {
         let limiter = IpRateLimiter::new(1, Duration::from_secs(100));
         let ip = addr(1);
         assert!(limiter.allow(ip));
-        assert_eq!(limiter.state.lock().unwrap().len(), 1);
+        assert_eq!(limiter.state.lock().unwrap().entries.len(), 1);
 
         let _reaper = spawn_stale_entry_reaper(limiter.clone());
         tokio::task::yield_now().await;
@@ -278,7 +345,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            limiter.state.lock().unwrap().len(),
+            limiter.state.lock().unwrap().entries.len(),
             1,
             "an entry less than 2 windows (200s) idle must survive a reap pass"
         );
@@ -290,9 +357,57 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            limiter.state.lock().unwrap().len(),
+            limiter.state.lock().unwrap().entries.len(),
             0,
             "an entry idle past 2 full windows must be reaped"
+        );
+    }
+
+    /// MAN-68, PR #85 review round 6: a source with access to many
+    /// distinct addresses (a routed prefix) must not grow
+    /// `IpRateLimiter`'s tracked-entry count without bound between reaper
+    /// passes -- one more distinct source IP past capacity must evict the
+    /// LONGEST-UNTOUCHED entry, not simply be refused tracking or grow the
+    /// map past the cap.
+    #[tokio::test(start_paused = true)]
+    async fn ip_rate_limiter_caps_entry_cardinality_via_lru_eviction() {
+        let limiter = IpRateLimiter::new(1, Duration::from_secs(3600));
+        let ip_for = |i: usize| IpAddr::from((i as u32).to_be_bytes());
+
+        for i in 0..MAX_IP_RATE_LIMITER_ENTRIES {
+            assert!(limiter.allow(ip_for(i)));
+        }
+        assert_eq!(
+            limiter.state.lock().unwrap().entries.len(),
+            MAX_IP_RATE_LIMITER_ENTRIES
+        );
+
+        // LRU-on-touch (not FIFO-by-insertion) is what makes it hold:
+        // re-touch every existing entry EXCEPT the very first one, so it
+        // alone is now the longest-untouched.
+        for i in 1..MAX_IP_RATE_LIMITER_ENTRIES {
+            limiter.allow(ip_for(i));
+        }
+
+        // One more distinct source IP past capacity must evict the
+        // longest-untouched entry (index 0), not grow the map past the
+        // cap or refuse to track the new source.
+        let overflow_ip = ip_for(MAX_IP_RATE_LIMITER_ENTRIES);
+        limiter.allow(overflow_ip);
+
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.entries.len(), MAX_IP_RATE_LIMITER_ENTRIES);
+        assert!(
+            !state.entries.contains_key(&ip_for(0)),
+            "the longest-untouched entry must be the one evicted"
+        );
+        assert!(
+            state.entries.contains_key(&ip_for(1)),
+            "a recently re-touched entry must survive"
+        );
+        assert!(
+            state.entries.contains_key(&overflow_ip),
+            "the newly-inserted entry must be present"
         );
     }
 }
