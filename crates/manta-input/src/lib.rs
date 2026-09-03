@@ -30,6 +30,22 @@ pub trait IqSource {
     fn center_freq_hz(&self) -> f64;
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
+
+    /// A shared liveness flag for sources where successfully *opening* a
+    /// connection doesn't confirm a real, live device is actually present
+    /// on the other end (MAN-55) -- e.g. HPSDR's UDP `connect`/initial
+    /// `send` require no peer response at all, so `HpsdrDevice::open`
+    /// succeeding proves nothing about whether anything is listening.
+    /// Returns `None` (the default) for sources where opening already
+    /// implies liveness -- KiwiSDR's WebSocket handshake, SoapySDR's
+    /// hardware-open call, or a file both require a real response/handle
+    /// to succeed at all. A caller with `Some(handle)` should treat the
+    /// source as unconfirmed until `handle.load(Ordering::Relaxed)` first
+    /// reads `true`, rather than assuming liveness the instant `open()`
+    /// returns.
+    fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
 }
 
 /// JSON sidecar alongside a WAV fixture, carrying metadata the WAV format itself can't. ARCHITECTURE §3.

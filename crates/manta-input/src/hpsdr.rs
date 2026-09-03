@@ -26,6 +26,13 @@
 //! - The keepalive strategy (periodic re-send of the same start command) —
 //!   an implementation choice addressing the HL2 skimmer-gateware watchdog
 //!   issue the spike documents, not itself a pinned protocol fact.
+//! - The C&C tuning packet fields (sample rate, receiver count, per-RX
+//!   frequency) — the C0 ADDR/MOX bit layout and C1-C4 field encodings
+//!   below are cross-confirmed against three independent sources (see
+//!   `docs/DECISIONS/2026-09-03-man55-hpsdr-cc-tuning-protocol.md`,
+//!   MAN-55). The outbound Metis packet's own header framing (reusing the
+//!   inbound direction's already-pinned shape) is **not** independently
+//!   re-verified, same caveat as the start command above.
 //!
 //! ## Per-DDC demux (Metis packet layout)
 //!
@@ -64,6 +71,7 @@ use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use std::collections::VecDeque;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -357,8 +365,134 @@ impl HpsdrConfig {
                 self.ddc_count
             );
         }
+        // Protocol 1's C&C address space only has RX-frequency slots for
+        // 12 receivers (0x02-0x08, 0x12-0x16 -- MAN-55, see
+        // cc_rx_freq_addr); validate_ddc_config's bandwidth check alone
+        // permits more DDCs at low sample rates (e.g. 32 @ 48 kHz), which
+        // Finding 1's tuning packets could never actually address.
+        if self.ddc_count > 12 {
+            bail!(
+                "HPSDR Protocol 1 has C&C address space for at most 12 receivers, got {}",
+                self.ddc_count
+            );
+        }
+        // Fail fast at config-validate time rather than deep inside
+        // HpsdrDevice::open's C&C-frame construction (MAN-55).
+        cc_sample_rate_code(self.sample_rate_hz)?;
         Ok(())
     }
+}
+
+/// Sample-rate code for the ADDR=0x00 "General" C&C packet's `C1` bits
+/// [1:0] (MAN-55, `docs/DECISIONS/2026-09-03-man55-hpsdr-cc-tuning-protocol.md`
+/// — cross-confirmed against the Hermes-Lite2 protocol wiki and piHPSDR's
+/// `old_protocol.c` `SPEED_*` macros). An exact match against the only
+/// four rates Protocol 1 can encode -- an unsupported rate must fail
+/// loudly rather than silently rounding to the wrong device speed.
+fn cc_sample_rate_code(sample_rate_hz: f64) -> Result<u8> {
+    if (sample_rate_hz - 48_000.0).abs() < 0.5 {
+        Ok(0b00)
+    } else if (sample_rate_hz - 96_000.0).abs() < 0.5 {
+        Ok(0b01)
+    } else if (sample_rate_hz - 192_000.0).abs() < 0.5 {
+        Ok(0b10)
+    } else if (sample_rate_hz - 384_000.0).abs() < 0.5 {
+        Ok(0b11)
+    } else {
+        bail!(
+            "HPSDR Protocol 1 only encodes 48000/96000/192000/384000 Hz sample rates, got \
+             {sample_rate_hz}"
+        );
+    }
+}
+
+/// C&C `ADDR` value for receiver `rx_index`'s (0-based) NCO frequency
+/// field. Addresses 0x02-0x08 cover RX1-RX7; 0x09-0x11 is reserved for TX
+/// drive/Alex/CW settings this RX-only driver never sends, so RX8-RX12
+/// resume at 0x12-0x16, not 0x09 (MAN-55 decision doc, cross-confirmed
+/// against the Hermes-Lite2 protocol wiki's address table).
+fn cc_rx_freq_addr(rx_index: usize) -> Result<u8> {
+    match rx_index {
+        0..=6 => Ok(0x02 + rx_index as u8),
+        7..=11 => Ok(0x12 + (rx_index - 7) as u8),
+        _ => bail!("HPSDR Protocol 1 supports at most 12 receivers, got rx_index={rx_index}"),
+    }
+}
+
+/// C0 byte: 6-bit `ADDR` in bits[6:1], `MOX` (transmit-active) in bit0
+/// (MAN-55 decision doc -- cross-confirmed identically by the
+/// Hermes-Lite2 protocol wiki, piHPSDR's sender `old_protocol.c`, and
+/// piHPSDR's own protocol-simulator/decoder `hpsdrsim.c`: three
+/// independent codebases agree bit-for-bit, the highest-confidence claim
+/// in that research). This driver never transmits, so MOX is always 0.
+fn cc_c0(addr: u8) -> u8 {
+    (addr & 0x3F) << 1
+}
+
+/// Build the 5-byte C0-C4 "General" C&C header (`ADDR=0x00`) configuring
+/// sample rate and receiver count -- the two device-side settings
+/// `HpsdrConfig` needs actually applied rather than assumed (MAN-55
+/// Finding 1). Other `ADDR=0x00` fields (antenna select, open-collector
+/// outputs, duplex, ...) are left zero/default; this driver doesn't
+/// expose them. Caller must have already validated `num_receivers` is in
+/// 1..=12 and `sample_rate_hz` is encodable (`HpsdrConfig::validate`).
+fn build_general_cc(sample_rate_hz: f64, num_receivers: usize) -> Result<[u8; 5]> {
+    let rate_code = cc_sample_rate_code(sample_rate_hz)?;
+    if num_receivers == 0 || num_receivers > 12 {
+        bail!("HPSDR Protocol 1 supports 1-12 receivers, got {num_receivers}");
+    }
+    let mut cc = [0u8; 5];
+    cc[0] = cc_c0(0x00);
+    cc[1] = rate_code; // C1 bits[1:0]
+    cc[4] = ((num_receivers as u8 - 1) & 0x0F) << 3; // C4 bits[6:3]
+    Ok(cc)
+}
+
+/// Build the 5-byte C0-C4 header tuning receiver `rx_index` (0-based) to
+/// `freq_hz`: a big-endian 32-bit Hz value across C1-C4, no scaling
+/// (MAN-55 decision doc -- cross-confirmed against the wiki's
+/// `DATA[31:24]=C1..DATA[7:0]=C4` bit-range table and piHPSDR's literal
+/// `output_buffer[C1]=freq>>24` shift chain).
+fn build_rx_freq_cc(rx_index: usize, freq_hz: f64) -> Result<[u8; 5]> {
+    let addr = cc_rx_freq_addr(rx_index)?;
+    let freq = freq_hz.round().clamp(0.0, u32::MAX as f64) as u32;
+    let mut cc = [0u8; 5];
+    cc[0] = cc_c0(addr);
+    cc[1..5].copy_from_slice(&freq.to_be_bytes());
+    Ok(cc)
+}
+
+/// Embed one 5-byte C0-C4 C&C header into an otherwise-zeroed 512-byte USB
+/// frame (sync + header; no mic/TX-audio payload since this driver is
+/// RX-only).
+fn build_cc_usb_frame(cc: [u8; 5]) -> [u8; USB_FRAME_LEN] {
+    let mut frame = [0u8; USB_FRAME_LEN];
+    frame[0..3].copy_from_slice(&USB_SYNC);
+    frame[3..8].copy_from_slice(&cc);
+    frame
+}
+
+/// Build one outbound (host -> device) Metis "C&C" packet carrying two
+/// C&C USB frames, reusing this file's already-pinned inbound Metis
+/// packet framing (8-byte header + two 512-byte USB frames) for the send
+/// direction with endpoint byte `0x02`, mirroring `build_start_command`'s
+/// use of `0x04` for the start/stop command. The outbound header's exact
+/// byte layout is this function's own best-effort reuse of that framing
+/// -- **not independently re-verified against real hardware** (MAN-55
+/// decision doc), same caveat as `build_start_command`.
+fn build_cc_packet(
+    seq: u32,
+    frame_a: [u8; USB_FRAME_LEN],
+    frame_b: [u8; USB_FRAME_LEN],
+) -> [u8; METIS_PACKET_LEN] {
+    let mut pkt = [0u8; METIS_PACKET_LEN];
+    pkt[0] = 0xEF;
+    pkt[1] = 0xFE;
+    pkt[2] = 0x02;
+    pkt[3..7].copy_from_slice(&seq.to_be_bytes());
+    pkt[METIS_HEADER_LEN..METIS_HEADER_LEN + USB_FRAME_LEN].copy_from_slice(&frame_a);
+    pkt[METIS_HEADER_LEN + USB_FRAME_LEN..].copy_from_slice(&frame_b);
+    pkt
 }
 
 /// Best-effort encoding of the publicly documented OpenHPSDR "General"
@@ -392,6 +526,26 @@ struct Inner {
     /// previous, larger read are never observed -- reuse needs no
     /// re-zeroing between calls.
     recv_buf: [u8; RECV_BUF_LEN],
+    /// Shared with every `HpsdrIqSource` handle for this device (a clone
+    /// of the same `Arc`, MAN-55) -- flipped `true` the first time a
+    /// datagram actually demuxes as valid IQ. A caller checking this
+    /// *outside* this mutex-guarded struct (via `HpsdrIqSource`'s own
+    /// copy) never needs to lock `Inner` just to poll liveness.
+    confirmed_live: Arc<AtomicBool>,
+    /// Every C&C setting (ADDR=0x00 general + one per configured
+    /// receiver's frequency) this device needs configured, built once at
+    /// `open()` time from `HpsdrConfig` (MAN-55 Finding 1). Always has
+    /// `1 + ddc_count >= 2` entries (`HpsdrConfig::validate` requires
+    /// `ddc_count >= 1`), so the modulo indexing in
+    /// `send_next_cc_frames` never divides by a length < 2.
+    cc_frames: Vec<[u8; 5]>,
+    /// Round-robin position into `cc_frames` for the next keepalive tick's
+    /// C&C packet (module docs: real clients cycle settings continuously
+    /// rather than sending once).
+    cc_cursor: usize,
+    /// Outbound C&C packet sequence number (MAN-55) -- incremented on
+    /// every C&C send, mirroring piHPSDR's own per-frame sequence counter.
+    cc_seq: u32,
 }
 
 impl Inner {
@@ -436,6 +590,20 @@ impl Inner {
                             // resumes, and could itself spuriously
                             // increment the dropped/gap counters.
                             self.gap.observe(Instant::now());
+                            // MAN-55: the first VALID Metis packet is the
+                            // only real evidence a live device is on the
+                            // other end -- UdpSocket::connect()/the
+                            // initial start-command send() both succeed
+                            // with no peer response required at all, so
+                            // "HpsdrDevice::open didn't error" proves
+                            // nothing about actual liveness. store()'d
+                            // unconditionally on every success rather than
+                            // only the first (Relaxed, no ordering
+                            // requirement with anything else -- a plain
+                            // liveness flag) -- redundant after the first
+                            // time, cheap enough not to bother special-
+                            // casing.
+                            self.confirmed_live.store(true, Ordering::Relaxed);
                             for (queue, samples) in self.queues.iter_mut().zip(demuxed) {
                                 queue.extend(samples);
                             }
@@ -490,8 +658,29 @@ impl Inner {
             self.socket
                 .send(&build_start_command())
                 .context("send HPSDR keepalive")?;
+            self.send_next_cc_frames()?;
             self.last_keepalive = Instant::now();
         }
+        Ok(())
+    }
+
+    /// Send the next pair of C&C settings frames in `cc_frames`' rotation
+    /// (MAN-55 Finding 1): general settings (sample rate, receiver count)
+    /// and each configured receiver's tuned frequency, cycled continuously
+    /// on the keepalive cadence so the device's actual configuration
+    /// converges even across UDP loss, rather than relying on a single
+    /// fire-and-forget packet at connect time (module docs, "Sending
+    /// cadence" section of the MAN-55 decision doc).
+    fn send_next_cc_frames(&mut self) -> Result<()> {
+        let n = self.cc_frames.len();
+        let a = self.cc_frames[self.cc_cursor % n];
+        let b = self.cc_frames[(self.cc_cursor + 1) % n];
+        let pkt = build_cc_packet(self.cc_seq, build_cc_usb_frame(a), build_cc_usb_frame(b));
+        self.socket
+            .send(&pkt)
+            .context("send HPSDR C&C tuning packet")?;
+        self.cc_seq = self.cc_seq.wrapping_add(1);
+        self.cc_cursor = (self.cc_cursor + 2) % n;
         Ok(())
     }
 }
@@ -520,6 +709,26 @@ impl HpsdrDevice {
             .send(&build_start_command())
             .context("send HPSDR start command")?;
 
+        // MAN-55 Finding 1: build every C&C setting this device needs
+        // configured once, up front -- general settings plus one
+        // frequency entry per DDC. `cfg.validate()` above already
+        // guarantees these can't fail (encodable sample rate, ddc_count
+        // in 1..=12), so a failure here would be a real bug, not a
+        // reachable runtime condition.
+        let mut cc_frames = Vec::with_capacity(1 + cfg.ddc_count);
+        cc_frames.push(
+            build_general_cc(cfg.sample_rate_hz, cfg.ddc_count)
+                .context("build HPSDR general C&C frame")?,
+        );
+        for (rx_index, &freq_hz) in cfg.center_freq_hz.iter().enumerate() {
+            cc_frames.push(
+                build_rx_freq_cc(rx_index, freq_hz)
+                    .with_context(|| format!("build HPSDR RX{} C&C frame", rx_index + 1))?,
+            );
+        }
+
+        let confirmed_live = Arc::new(AtomicBool::new(false));
+
         let inner = Arc::new(Mutex::new(Inner {
             socket,
             queues: vec![VecDeque::new(); cfg.ddc_count],
@@ -527,6 +736,10 @@ impl HpsdrDevice {
             num_receivers: cfg.ddc_count,
             last_keepalive: Instant::now(),
             recv_buf: [0u8; RECV_BUF_LEN],
+            confirmed_live: confirmed_live.clone(),
+            cc_frames,
+            cc_cursor: 0,
+            cc_seq: 0,
         }));
 
         Ok((0..cfg.ddc_count)
@@ -535,6 +748,7 @@ impl HpsdrDevice {
                 ddc_index,
                 sample_rate_hz: cfg.sample_rate_hz,
                 center_freq_hz: cfg.center_freq_hz[ddc_index],
+                confirmed_live: confirmed_live.clone(),
             })
             .collect())
     }
@@ -547,6 +761,11 @@ pub struct HpsdrIqSource {
     ddc_index: usize,
     sample_rate_hz: f64,
     center_freq_hz: f64,
+    /// Same underlying flag as `Inner::confirmed_live` (a clone of the
+    /// same `Arc`, MAN-55) -- kept here too so `confirmed_live_handle()`
+    /// can hand it out without locking `inner`'s mutex just to read a
+    /// liveness bit.
+    confirmed_live: Arc<AtomicBool>,
 }
 
 impl HpsdrIqSource {
@@ -579,6 +798,10 @@ impl IqSource for HpsdrIqSource {
             *slot = queue.pop_front().expect("checked len above");
         }
         Ok(n)
+    }
+
+    fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.confirmed_live.clone())
     }
 }
 
@@ -733,6 +956,68 @@ mod tests {
     }
 
     #[test]
+    fn cc_sample_rate_code_matches_protocol_encoding() {
+        assert_eq!(cc_sample_rate_code(48_000.0).unwrap(), 0b00);
+        assert_eq!(cc_sample_rate_code(96_000.0).unwrap(), 0b01);
+        assert_eq!(cc_sample_rate_code(192_000.0).unwrap(), 0b10);
+        assert_eq!(cc_sample_rate_code(384_000.0).unwrap(), 0b11);
+        assert!(cc_sample_rate_code(44_100.0).is_err());
+    }
+
+    #[test]
+    fn cc_rx_freq_addr_matches_protocol_gap_at_0x09_through_0x11() {
+        assert_eq!(cc_rx_freq_addr(0).unwrap(), 0x02);
+        assert_eq!(cc_rx_freq_addr(6).unwrap(), 0x08);
+        assert_eq!(cc_rx_freq_addr(7).unwrap(), 0x12);
+        assert_eq!(cc_rx_freq_addr(11).unwrap(), 0x16);
+        assert!(cc_rx_freq_addr(12).is_err());
+    }
+
+    #[test]
+    fn build_general_cc_encodes_rate_and_receiver_count() {
+        let cc = build_general_cc(192_000.0, 3).unwrap();
+        assert_eq!(cc[0], cc_c0(0x00));
+        assert_eq!(cc[1] & 0x03, 0b10);
+        assert_eq!((cc[4] >> 3) & 0x0F, 2); // 3 receivers - 1
+    }
+
+    #[test]
+    fn build_rx_freq_cc_encodes_big_endian_hz_no_scaling() {
+        let cc = build_rx_freq_cc(0, 14_200_000.0).unwrap();
+        assert_eq!(cc[0], cc_c0(0x02));
+        let freq = u32::from_be_bytes([cc[1], cc[2], cc[3], cc[4]]);
+        assert_eq!(freq, 14_200_000);
+
+        // RX8 resumes at 0x12, skipping the 0x09-0x11 TX/Alex/CW gap.
+        let cc8 = build_rx_freq_cc(7, 21_050_000.0).unwrap();
+        assert_eq!(cc8[0], cc_c0(0x12));
+    }
+
+    #[test]
+    fn hpsdr_config_validate_rejects_unencodable_sample_rate() {
+        let cfg = HpsdrConfig {
+            host: "127.0.0.1".into(),
+            port: CONTROL_PORT,
+            ddc_count: 1,
+            sample_rate_hz: 44_100.0,
+            center_freq_hz: vec![14_025_000.0],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn hpsdr_config_validate_rejects_more_than_12_receivers() {
+        let cfg = HpsdrConfig {
+            host: "127.0.0.1".into(),
+            port: CONTROL_PORT,
+            ddc_count: 13,
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: vec![14_025_000.0; 13],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn config_validate_checks_center_freq_len() {
         let cfg = HpsdrConfig {
             host: "127.0.0.1".into(),
@@ -791,6 +1076,79 @@ mod tests {
         assert_eq!(sources[0].center_freq_hz(), 14_025_000.0);
         assert_eq!(sources[1].center_freq_hz(), 14_030_000.0);
         assert_eq!(sources[0].gap_stats(), GapStats::default());
+    }
+
+    /// MAN-55: `HpsdrDevice::open` succeeding must not be mistaken for
+    /// confirmed liveness -- `UdpSocket::connect`/the initial start-command
+    /// `send` both require no peer response at all, so a source pointed at
+    /// an address nothing is listening on "opens" successfully with zero
+    /// evidence anything real is there. `confirmed_live_handle()` must
+    /// start false and flip true only once a real Metis packet actually
+    /// demuxes -- both DDCs on the same device share one handle (the
+    /// underlying flag lives on the shared `Inner`, module docs), so
+    /// observing it via a DDC that never itself calls `read()` still
+    /// proves the shared state updated correctly, not just the reading
+    /// DDC's own local view.
+    #[test]
+    fn confirmed_live_handle_starts_false_and_flips_true_on_first_valid_packet() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 2,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+
+        let live0 = sources[0].confirmed_live_handle().expect(
+            "HpsdrIqSource must report Some(handle) -- open() alone never confirms liveness",
+        );
+        let live1 = sources[1]
+            .confirmed_live_handle()
+            .expect("every DDC on the same device shares the same liveness flag");
+        assert!(
+            !live0.load(Ordering::Relaxed),
+            "must start false immediately after open() -- nothing has responded yet"
+        );
+        assert!(!live1.load(Ordering::Relaxed));
+
+        let mut discard = [0u8; METIS_PACKET_LEN];
+        let (_, client_addr) = device_socket.recv_from(&mut discard).unwrap();
+
+        // Still false -- only a genuinely valid Metis packet counts.
+        device_socket
+            .send_to(&[0xFFu8; METIS_PACKET_LEN], client_addr)
+            .unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        // DDC 0's read() drives the shared pump; the malformed packet
+        // above is silently discarded (MAN-22) so this call blocks until
+        // a real one arrives below -- send it from a second thread so
+        // this call doesn't deadlock waiting on a packet the test hasn't
+        // sent yet.
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let pkt = synth_metis_packet(2, |_| Complex32::new(0.1, 0.1));
+            device_socket.send_to(&pkt, client_addr).unwrap();
+        });
+        let n = sources[0].read(&mut buf).unwrap();
+        sender.join().unwrap();
+        assert!(n > 0);
+
+        assert!(
+            live0.load(Ordering::Relaxed),
+            "must flip true once a valid packet is actually processed"
+        );
+        assert!(
+            live1.load(Ordering::Relaxed),
+            "DDC 1's handle must observe the same flip -- it's the same shared flag, \
+             even though DDC 1 itself never called read()"
+        );
     }
 
     /// MAN-22 regression: a malformed, truncated, or adversarially-crafted
@@ -930,8 +1288,6 @@ mod tests {
     /// does via `MAX_CONSECUTIVE_TIMEOUTS`.
     #[test]
     fn a_sustained_flood_of_malformed_packets_eventually_gives_up_cleanly() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let device_addr = device_socket.local_addr().unwrap();
         device_socket
@@ -982,6 +1338,79 @@ mod tests {
             MAX_CONSECUTIVE_MALFORMED as u64,
             "must have counted exactly the bound's worth of malformed packets before giving up"
         );
+    }
+
+    /// MAN-55 Finding 1: `send_keepalive_if_due` must actually transmit
+    /// C&C tuning packets (endpoint `0x02`) on its 1s cadence, not just
+    /// the start/stop keepalive (endpoint `0x04`) -- and the first such
+    /// packet's two USB frames must carry the general settings (ADDR
+    /// 0x00: rate + receiver count) and RX1's tuned frequency (ADDR
+    /// 0x02), matching `HpsdrConfig`. No explicit sleep: the background
+    /// thread just blocks on `recv_from` (inheriting `device_socket`'s
+    /// read timeout via `try_clone`) until `read()`'s internal pump loop
+    /// crosses `KEEPALIVE_INTERVAL` on its own and fires the C&C send.
+    #[test]
+    fn keepalive_sends_cc_tuning_packet_with_general_and_rx_frequency_frames() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 2,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+
+        // Drain the initial start command sent by open().
+        let mut discard = [0u8; METIS_PACKET_LEN];
+        device_socket.recv_from(&mut discard).unwrap();
+
+        let sender_socket = device_socket.try_clone().unwrap();
+        let sender = std::thread::spawn(move || loop {
+            let mut buf = [0u8; METIS_PACKET_LEN];
+            let (n, from) = sender_socket
+                .recv_from(&mut buf)
+                .expect("expected a C&C packet within the keepalive window");
+            if n == METIS_PACKET_LEN && buf[2] == 0x02 {
+                let pkt = synth_metis_packet(2, |_| Complex32::new(0.1, 0.1));
+                sender_socket.send_to(&pkt, from).unwrap();
+                return buf;
+            }
+            // n == METIS_PACKET_LEN && buf[2] == 0x04: the start/stop
+            // keepalive re-send -- keep waiting for the C&C packet.
+        });
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let n = sources[0].read(&mut buf).unwrap();
+        assert!(n > 0);
+        let cc_pkt = sender.join().unwrap();
+
+        assert_eq!(cc_pkt[2], 0x02, "C&C packets use Metis endpoint 0x02");
+
+        let frame0 = &cc_pkt[METIS_HEADER_LEN..METIS_HEADER_LEN + USB_FRAME_LEN];
+        assert_eq!(&frame0[0..3], &USB_SYNC);
+        assert_eq!(
+            frame0[3],
+            cc_c0(0x00),
+            "first frame is ADDR=0x00 general settings"
+        );
+        assert_eq!(frame0[4] & 0x03, 0b10, "192 kHz sample rate code");
+        assert_eq!((frame0[7] >> 3) & 0x0F, 1, "2 receivers encoded as (2-1)");
+
+        let frame1 = &cc_pkt[METIS_HEADER_LEN + USB_FRAME_LEN..];
+        assert_eq!(&frame1[0..3], &USB_SYNC);
+        assert_eq!(
+            frame1[3],
+            cc_c0(0x02),
+            "second frame is ADDR=0x02, RX1 frequency"
+        );
+        let freq = u32::from_be_bytes([frame1[4], frame1[5], frame1[6], frame1[7]]);
+        assert_eq!(freq, 14_025_000);
     }
 
     /// Real, live integration test against actual hardware. #[ignore]'d:
