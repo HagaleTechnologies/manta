@@ -379,6 +379,23 @@ impl HpsdrConfig {
         // Fail fast at config-validate time rather than deep inside
         // HpsdrDevice::open's C&C-frame construction (MAN-55).
         cc_sample_rate_code(self.sample_rate_hz)?;
+        // Every configured center frequency must be exactly representable
+        // as the wire's unsigned 32-bit Hz value (PR #79 review, round 1,
+        // P2) -- manta-cli's `--hpsdr-freq` parser only rejects
+        // non-finite/non-positive values, so an out-of-range value (e.g.
+        // > u32::MAX Hz) would otherwise reach `build_rx_freq_cc` deep
+        // inside `HpsdrDevice::open`, which used to silently clamp it
+        // instead of erroring -- caught here for every caller, not just
+        // the CLI, and before any device is opened.
+        for (i, &freq_hz) in self.center_freq_hz.iter().enumerate() {
+            if !freq_hz.is_finite() || !(0.0..=u32::MAX as f64).contains(&freq_hz) {
+                bail!(
+                    "center_freq_hz[{i}] ({freq_hz}) is outside HPSDR Protocol 1's \
+                     representable range (0..={} Hz)",
+                    u32::MAX
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -386,22 +403,28 @@ impl HpsdrConfig {
 /// Sample-rate code for the ADDR=0x00 "General" C&C packet's `C1` bits
 /// [1:0] (MAN-55, `docs/DECISIONS/2026-09-03-man55-hpsdr-cc-tuning-protocol.md`
 /// — cross-confirmed against the Hermes-Lite2 protocol wiki and piHPSDR's
-/// `old_protocol.c` `SPEED_*` macros). An exact match against the only
-/// four rates Protocol 1 can encode -- an unsupported rate must fail
-/// loudly rather than silently rounding to the wrong device speed.
+/// `old_protocol.c` `SPEED_*` macros). Requires an EXACT match against the
+/// only four rates Protocol 1 can encode (PR #79 review, round 1, P2): a
+/// tolerance-based near-match (e.g. 191999.75 Hz) used to silently
+/// configure the device for 192 kHz while `HpsdrIqSource::sample_rate()`
+/// kept reporting the original, subtly-wrong value -- `manta_engine`'s
+/// `Channelizer::new` then rejects that value's `fs / 93.75` power-of-two
+/// check only AFTER the device was already opened and calibration data
+/// consumed. An unsupported or near-miss rate must fail loudly at
+/// `HpsdrConfig::validate()` time instead.
 fn cc_sample_rate_code(sample_rate_hz: f64) -> Result<u8> {
-    if (sample_rate_hz - 48_000.0).abs() < 0.5 {
+    if sample_rate_hz == 48_000.0 {
         Ok(0b00)
-    } else if (sample_rate_hz - 96_000.0).abs() < 0.5 {
+    } else if sample_rate_hz == 96_000.0 {
         Ok(0b01)
-    } else if (sample_rate_hz - 192_000.0).abs() < 0.5 {
+    } else if sample_rate_hz == 192_000.0 {
         Ok(0b10)
-    } else if (sample_rate_hz - 384_000.0).abs() < 0.5 {
+    } else if sample_rate_hz == 384_000.0 {
         Ok(0b11)
     } else {
         bail!(
-            "HPSDR Protocol 1 only encodes 48000/96000/192000/384000 Hz sample rates, got \
-             {sample_rate_hz}"
+            "HPSDR Protocol 1 only encodes exactly 48000/96000/192000/384000 Hz sample rates, \
+             got {sample_rate_hz}"
         );
     }
 }
@@ -452,10 +475,23 @@ fn build_general_cc(sample_rate_hz: f64, num_receivers: usize) -> Result<[u8; 5]
 /// `freq_hz`: a big-endian 32-bit Hz value across C1-C4, no scaling
 /// (MAN-55 decision doc -- cross-confirmed against the wiki's
 /// `DATA[31:24]=C1..DATA[7:0]=C4` bit-range table and piHPSDR's literal
-/// `output_buffer[C1]=freq>>24` shift chain).
+/// `output_buffer[C1]=freq>>24` shift chain). Rejects (rather than
+/// silently clamping) a frequency outside the wire's representable range
+/// (PR #79 review, round 1, P2): a caller passing e.g. `u32::MAX + 1` Hz
+/// used to have the tuning word silently saturate to `u32::MAX` while
+/// `HpsdrIqSource::center_freq_hz()` kept reporting the original,
+/// unclamped value, so a published spot's frequency would disagree with
+/// what the hardware was actually tuned to.
 fn build_rx_freq_cc(rx_index: usize, freq_hz: f64) -> Result<[u8; 5]> {
     let addr = cc_rx_freq_addr(rx_index)?;
-    let freq = freq_hz.round().clamp(0.0, u32::MAX as f64) as u32;
+    if !freq_hz.is_finite() || !(0.0..=u32::MAX as f64).contains(&freq_hz) {
+        bail!(
+            "HPSDR Protocol 1 encodes RX frequency as an unsigned 32-bit Hz value in \
+             0..={}, got {freq_hz}",
+            u32::MAX
+        );
+    }
+    let freq = freq_hz.round() as u32;
     let mut cc = [0u8; 5];
     cc[0] = cc_c0(addr);
     cc[1..5].copy_from_slice(&freq.to_be_bytes());
@@ -473,13 +509,19 @@ fn build_cc_usb_frame(cc: [u8; 5]) -> [u8; USB_FRAME_LEN] {
 }
 
 /// Build one outbound (host -> device) Metis "C&C" packet carrying two
-/// C&C USB frames, reusing this file's already-pinned inbound Metis
+/// C&C USB frames: `0xEF 0xFE` sync, byte 2 = `0x01` (the USB-data-packet
+/// type identifier), byte 3 = `0x02` (endpoint 2, host -> device), then
+/// the 4-byte sequence number in bytes 4-7 (PR #79 review, round 1, P1 --
+/// the original encoding put `0x02` directly in byte 2 and shifted the
+/// sequence into bytes 3-6, leaving byte 7 always zero; every real
+/// Protocol 1 EP2 write starts `EF FE 01 02` followed by the sequence, so
+/// hardware would never have recognized the prior encoding as a valid
+/// C&C packet at all). Reuses this file's already-pinned inbound Metis
 /// packet framing (8-byte header + two 512-byte USB frames) for the send
-/// direction with endpoint byte `0x02`, mirroring `build_start_command`'s
-/// use of `0x04` for the start/stop command. The outbound header's exact
-/// byte layout is this function's own best-effort reuse of that framing
-/// -- **not independently re-verified against real hardware** (MAN-55
-/// decision doc), same caveat as `build_start_command`.
+/// direction, mirroring `build_start_command`'s use of `0x04` for the
+/// distinct start/stop command. Still **not independently re-verified
+/// against real hardware** (MAN-55 decision doc), same caveat as
+/// `build_start_command`.
 fn build_cc_packet(
     seq: u32,
     frame_a: [u8; USB_FRAME_LEN],
@@ -488,8 +530,9 @@ fn build_cc_packet(
     let mut pkt = [0u8; METIS_PACKET_LEN];
     pkt[0] = 0xEF;
     pkt[1] = 0xFE;
-    pkt[2] = 0x02;
-    pkt[3..7].copy_from_slice(&seq.to_be_bytes());
+    pkt[2] = 0x01;
+    pkt[3] = 0x02;
+    pkt[4..8].copy_from_slice(&seq.to_be_bytes());
     pkt[METIS_HEADER_LEN..METIS_HEADER_LEN + USB_FRAME_LEN].copy_from_slice(&frame_a);
     pkt[METIS_HEADER_LEN + USB_FRAME_LEN..].copy_from_slice(&frame_b);
     pkt
@@ -964,6 +1007,17 @@ mod tests {
         assert!(cc_sample_rate_code(44_100.0).is_err());
     }
 
+    /// PR #79 review, round 1, P2: a near-miss rate must be rejected, not
+    /// silently treated as the nearest canonical rate -- the prior
+    /// tolerance-based match accepted values like 191999.75 Hz as 192 kHz
+    /// while `sample_rate()` kept reporting the original, subtly-wrong
+    /// value.
+    #[test]
+    fn cc_sample_rate_code_rejects_a_near_miss_rate() {
+        assert!(cc_sample_rate_code(191_999.75).is_err());
+        assert!(cc_sample_rate_code(192_000.25).is_err());
+    }
+
     #[test]
     fn cc_rx_freq_addr_matches_protocol_gap_at_0x09_through_0x11() {
         assert_eq!(cc_rx_freq_addr(0).unwrap(), 0x02);
@@ -991,6 +1045,32 @@ mod tests {
         // RX8 resumes at 0x12, skipping the 0x09-0x11 TX/Alex/CW gap.
         let cc8 = build_rx_freq_cc(7, 21_050_000.0).unwrap();
         assert_eq!(cc8[0], cc_c0(0x12));
+    }
+
+    /// PR #79 review, round 1, P2: a frequency outside the wire's u32 Hz
+    /// range must be rejected, not silently clamped -- the prior
+    /// `.clamp(0.0, u32::MAX as f64)` saturated a too-large value to
+    /// `u32::MAX` while `HpsdrIqSource::center_freq_hz()` kept reporting
+    /// the original, unclamped value.
+    #[test]
+    fn build_rx_freq_cc_rejects_out_of_range_frequencies() {
+        assert!(build_rx_freq_cc(0, u32::MAX as f64 + 1.0).is_err());
+        assert!(build_rx_freq_cc(0, -1.0).is_err());
+        assert!(build_rx_freq_cc(0, f64::NAN).is_err());
+        assert!(build_rx_freq_cc(0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn build_cc_packet_uses_the_real_usb_data_endpoint_2_header() {
+        // PR #79 review, round 1, P1: every real Protocol 1 host->device
+        // USB data packet starts `EF FE 01 02` followed by the 4-byte
+        // sequence number -- not `0x02` directly in byte 2 with the
+        // sequence shifted into bytes 3-6 (the original, hardware-
+        // unrecognizable encoding).
+        let frame = [0u8; USB_FRAME_LEN];
+        let pkt = build_cc_packet(0x1234_5678, frame, frame);
+        assert_eq!(&pkt[0..4], &[0xEF, 0xFE, 0x01, 0x02]);
+        assert_eq!(&pkt[4..8], &0x1234_5678u32.to_be_bytes());
     }
 
     #[test]
@@ -1025,6 +1105,22 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0], // only one, need two
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    /// PR #79 review, round 1, P2: caught at config-validate time for
+    /// every caller (not just `manta-cli`'s own `--hpsdr-freq` parser,
+    /// which only rejects non-finite/non-positive values), before any
+    /// device is opened.
+    #[test]
+    fn config_validate_rejects_out_of_range_center_freq() {
+        let cfg = HpsdrConfig {
+            host: "127.0.0.1".into(),
+            port: CONTROL_PORT,
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![u32::MAX as f64 + 1.0],
         };
         assert!(cfg.validate().is_err());
     }
@@ -1376,7 +1472,7 @@ mod tests {
             let (n, from) = sender_socket
                 .recv_from(&mut buf)
                 .expect("expected a C&C packet within the keepalive window");
-            if n == METIS_PACKET_LEN && buf[2] == 0x02 {
+            if n == METIS_PACKET_LEN && buf[2] == 0x01 && buf[3] == 0x02 {
                 let pkt = synth_metis_packet(2, |_| Complex32::new(0.1, 0.1));
                 sender_socket.send_to(&pkt, from).unwrap();
                 return buf;
@@ -1390,7 +1486,14 @@ mod tests {
         assert!(n > 0);
         let cc_pkt = sender.join().unwrap();
 
-        assert_eq!(cc_pkt[2], 0x02, "C&C packets use Metis endpoint 0x02");
+        assert_eq!(
+            cc_pkt[2], 0x01,
+            "C&C packets are Metis USB-data-packet type 0x01"
+        );
+        assert_eq!(
+            cc_pkt[3], 0x02,
+            "C&C packets target endpoint 2 (host -> device)"
+        );
 
         let frame0 = &cc_pkt[METIS_HEADER_LEN..METIS_HEADER_LEN + USB_FRAME_LEN];
         assert_eq!(&frame0[0..3], &USB_SYNC);
