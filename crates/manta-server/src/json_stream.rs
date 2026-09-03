@@ -485,6 +485,24 @@ async fn handle_tcp_client(
     }
 }
 
+/// MAN-68 (PR #85 review round 8): classifies a `ws.next()` error as a
+/// genuine protocol violation (a malformed frame, oversized message, bad
+/// UTF-8, tungstenite's own attack detection -- worth charging to the
+/// dedicated rejection budget) versus a routine transport-level
+/// disconnect (`ConnectionClosed`/`AlreadyClosed`/`Io`/`Tls` -- an
+/// ordinary reset, unclean close, or I/O error: mobile-network/NAT/proxy
+/// churn, not a security-relevant rejection). Split out so this
+/// classification is unit-testable without a real WebSocket handshake,
+/// same as `uplink`'s own precedent for pulling policy logic out of an
+/// I/O-bound function.
+fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    matches!(
+        e,
+        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8 | WsError::AttackAttempt
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "ws_client",
@@ -644,11 +662,33 @@ async fn handle_ws_client(
                         return Ok(());
                     }
                     Some(Err(e)) => {
-                        // MAN-68 (round 7): the dedicated rejection
-                        // budget, not `log_enabled` -- see
-                        // REJECTION_LOG_MAX_PER_WINDOW's doc comment.
-                        if rejection_log_limiter.allow(peer_ip) {
-                            tracing::warn!(error = %e, "json_stream: malformed WS frame, disconnecting");
+                        // MAN-68 (round 8): `ws.next()` returning `Err`
+                        // covers BOTH a genuine protocol violation (a
+                        // malformed frame, oversized message, bad UTF-8)
+                        // AND an ordinary transport-level disconnect (a
+                        // reset, an unclean close, an I/O error) -- the
+                        // latter is routine mobile-network/NAT/proxy
+                        // churn, not a security-relevant rejection, and
+                        // charging it to the dedicated rejection budget
+                        // would let 30 routine disconnects from one IP
+                        // exhaust the very budget this change exists to
+                        // protect (the same class of gap round 7 already
+                        // fixed for the Ping-budget/malformed-frame
+                        // sites). Only a genuine protocol-shaped error
+                        // consumes the rejection budget; a transport error
+                        // is a routine lifecycle event.
+                        let is_protocol_violation = is_ws_protocol_violation(&e);
+                        let should_log = if is_protocol_violation {
+                            rejection_log_limiter.allow(peer_ip)
+                        } else {
+                            log_enabled
+                        };
+                        if should_log {
+                            if is_protocol_violation {
+                                tracing::warn!(error = %e, "json_stream: malformed WS frame, disconnecting");
+                            } else {
+                                tracing::info!(error = %e, "json_stream: WS client disconnected (transport error)");
+                            }
                         }
                         return Ok(());
                     }
@@ -694,5 +734,45 @@ async fn handle_ws_client(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::{
+        error::{CapacityError, ProtocolError},
+        Error as WsError,
+    };
+
+    /// MAN-68, PR #85 review round 8: a genuine protocol-shaped error
+    /// must be classified as a rejection worth its own audit budget.
+    #[test]
+    fn protocol_shaped_errors_are_classified_as_violations() {
+        assert!(is_ws_protocol_violation(&WsError::Protocol(
+            ProtocolError::WrongHttpMethod
+        )));
+        assert!(is_ws_protocol_violation(&WsError::Capacity(
+            CapacityError::MessageTooLong {
+                size: 100,
+                max_size: 10,
+            }
+        )));
+        assert!(is_ws_protocol_violation(&WsError::Utf8));
+        assert!(is_ws_protocol_violation(&WsError::AttackAttempt));
+    }
+
+    /// A transport-level disconnect must NOT be classified as a
+    /// violation -- these are routine mobile-network/NAT/proxy churn, and
+    /// charging them to the dedicated rejection budget would defeat the
+    /// whole point of round 7's fix (see `is_ws_protocol_violation`'s doc
+    /// comment).
+    #[test]
+    fn transport_level_errors_are_not_classified_as_violations() {
+        assert!(!is_ws_protocol_violation(&WsError::ConnectionClosed));
+        assert!(!is_ws_protocol_violation(&WsError::AlreadyClosed));
+        assert!(!is_ws_protocol_violation(&WsError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer")
+        )));
     }
 }

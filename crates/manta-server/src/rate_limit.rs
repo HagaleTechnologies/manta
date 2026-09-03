@@ -8,7 +8,7 @@
 //! client that's actually sending events FASTER than the allowed rate,
 //! no matter how long the connection has been open.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -70,14 +70,23 @@ struct IpRateLimiterEntry {
     last_touched: u64,
 }
 
-/// Bounded, LRU-on-touch state for `IpRateLimiter` (MAN-68) -- same design
-/// as `bus::OccurrenceTracker`: once at `MAX_IP_RATE_LIMITER_ENTRIES`
-/// capacity, inserting a genuinely NEW source IP evicts whichever tracked
-/// IP has gone longest untouched, so a real, currently-active source
-/// (repeatedly touched) stays protected while addresses that appear once
-/// under flood pressure and never again are what gets evicted first.
+/// Bounded, LRU-on-touch state for `IpRateLimiter` (MAN-68) -- same
+/// eviction POLICY as `bus::OccurrenceTracker` (once at
+/// `MAX_IP_RATE_LIMITER_ENTRIES` capacity, inserting a genuinely NEW
+/// source IP evicts whichever tracked IP has gone longest untouched), but
+/// a different underlying STRUCTURE (PR #85 review round 7):
+/// `OccurrenceTracker`'s O(capacity) linear scan for the oldest entry is
+/// fine for occasional callsign-flood pressure, but `IpRateLimiter::allow`
+/// is on the hot path of every accepted connection in `telnet::serve` and
+/// `json_stream::serve` -- at capacity, sustained churn from a routed
+/// prefix would turn every single accept into an O(capacity) scan under
+/// this type's own synchronous mutex, real enough to stall admission or
+/// pin a runtime worker. `touch_order` mirrors `entries` by touch tick
+/// instead (`last_touched -> ip`), so the oldest entry is `touch_order`'s
+/// first key -- O(log n) to find AND remove, never a full scan.
 struct IpRateLimiterState {
     entries: HashMap<IpAddr, IpRateLimiterEntry>,
+    touch_order: BTreeMap<u64, IpAddr>,
     next_touch: u64,
 }
 
@@ -85,6 +94,7 @@ impl IpRateLimiterState {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            touch_order: BTreeMap::new(),
             next_touch: 0,
         }
     }
@@ -145,32 +155,47 @@ impl IpRateLimiter {
     /// reset-on-elapsed-window semantics as `RateLimiter::allow`.
     pub fn allow(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
-        state.next_touch += 1;
-        let touch = state.next_touch;
-        if let Some(entry) = state.entries.get_mut(&ip) {
+        let mut guard = self.state.lock().unwrap();
+        // Named field bindings, not `state.entries`/`state.touch_order`
+        // projections: the two fields need independent mutable borrows in
+        // the same scope below (updating one on the strength of a value
+        // just read from the other), and destructuring like this is what
+        // lets the borrow checker see them as disjoint.
+        let IpRateLimiterState {
+            entries,
+            touch_order,
+            next_touch,
+        } = &mut *guard;
+        *next_touch += 1;
+        let touch = *next_touch;
+        if let Some(entry) = entries.get_mut(&ip) {
+            // Re-touching moves this IP's position in `touch_order` --
+            // remove the stale key first (O(log n)) before inserting the
+            // fresh one, or the old entry would linger as a dangling
+            // (touch, ip) pair with no corresponding `entries` update.
+            touch_order.remove(&entry.last_touched);
             if now.duration_since(entry.window_start) >= self.window {
                 entry.window_start = now;
                 entry.count = 0;
             }
             entry.count += 1;
             entry.last_touched = touch;
+            touch_order.insert(touch, ip);
             return entry.count <= self.max_per_window;
         }
-        // A genuinely new source IP (MAN-68): evict the longest-untouched
-        // tracked entry first if already at capacity, mirroring
-        // `bus::OccurrenceTracker::touch`.
-        if state.entries.len() >= MAX_IP_RATE_LIMITER_ENTRIES {
-            if let Some(lru_key) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_touched)
-                .map(|(key, _)| *key)
-            {
-                state.entries.remove(&lru_key);
+        // A genuinely new source IP (MAN-68 round 7): evict the
+        // longest-untouched tracked entry first if already at capacity --
+        // `touch_order`'s first key is that entry, O(log n) to find and
+        // remove, never the O(capacity) scan `bus::OccurrenceTracker`
+        // uses (fine there since callsign-flood eviction isn't on a
+        // per-accepted-connection hot path; this is).
+        if entries.len() >= MAX_IP_RATE_LIMITER_ENTRIES {
+            if let Some((&lru_touch, &lru_ip)) = touch_order.iter().next() {
+                touch_order.remove(&lru_touch);
+                entries.remove(&lru_ip);
             }
         }
-        state.entries.insert(
+        entries.insert(
             ip,
             IpRateLimiterEntry {
                 window_start: now,
@@ -178,6 +203,7 @@ impl IpRateLimiter {
                 last_touched: touch,
             },
         );
+        touch_order.insert(touch, ip);
         1 <= self.max_per_window
     }
 }
@@ -202,10 +228,19 @@ pub fn spawn_stale_entry_reaper(limiter: IpRateLimiter) -> tokio::task::JoinHand
         loop {
             tokio::time::sleep(IP_RATE_LIMITER_REAP_INTERVAL).await;
             let now = Instant::now();
-            let mut state = limiter.state.lock().unwrap();
-            state
-                .entries
-                .retain(|_, entry| now.duration_since(entry.window_start) < limiter.window * 2);
+            let mut guard = limiter.state.lock().unwrap();
+            let IpRateLimiterState {
+                entries,
+                touch_order,
+                ..
+            } = &mut *guard;
+            entries.retain(|_, entry| now.duration_since(entry.window_start) < limiter.window * 2);
+            // `touch_order` is a secondary index over the same keys --
+            // this reap runs at most once every `IP_RATE_LIMITER_REAP_INTERVAL`
+            // (60s), not per-connection, so an O(len) pass here doesn't
+            // reintroduce the hot-path cost `touch_order` itself exists to
+            // avoid in `allow`.
+            touch_order.retain(|_, ip| entries.contains_key(ip));
         }
     })
 }
