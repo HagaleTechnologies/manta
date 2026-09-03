@@ -368,7 +368,7 @@ async fn handle_tcp_client(
 
 #[tracing::instrument(
     name = "ws_client",
-    skip(socket, rx, ctx, ip_ping_limiter),
+    skip(socket, rx, ctx, peer_ip, ip_ping_limiter),
     fields(peer = %peer)
 )]
 async fn handle_ws_client(
