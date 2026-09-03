@@ -9,7 +9,7 @@ use manta_server::rbn;
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const SAMPLE_RATE_HZ: f64 = 96_000.0;
@@ -49,6 +49,7 @@ async fn spawn_server() -> (
             shutdown_rx,
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP),
         )
         .await;
     });
@@ -384,6 +385,62 @@ async fn connecting_client_is_counted_in_metrics() {
     assert!(metrics
         .render_prometheus_text()
         .contains("manta_telnet_clients_connected 1"));
+}
+
+/// MAN-61: `ConnectionLimiter` alone bounds only the total connection
+/// ceiling, not what one source can hold of it -- a source that opens
+/// `MAX_TELNET_CONNECTIONS_PER_IP` connections and stays logged in with
+/// nothing further to say (real, legitimate telnet client behavior --
+/// module docs) must have its NEXT connection attempt declined, without
+/// disturbing the ones it already holds.
+#[tokio::test]
+async fn a_source_past_its_per_ip_connection_cap_is_declined_without_disturbing_its_existing_connections(
+) {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+
+    let mut clients = Vec::new();
+    for _ in 0..manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP {
+        clients.push(connect_and_login(addr).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        metrics.render_prometheus_text().contains(&format!(
+            "manta_telnet_clients_connected {}",
+            manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP
+        )),
+        "all {} connections from this source must have been admitted",
+        manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP
+    );
+
+    // One more from the SAME source (127.0.0.1, like every connection in
+    // this test) must be declined outright: the socket closes with no
+    // login prompt at all, rather than being admitted and then later
+    // disconnected.
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf))
+        .await
+        .expect("a declined connection must close promptly, not hang");
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "a source past its per-IP cap must get EOF (no login prompt), not be admitted"
+    );
+
+    // The existing, already-admitted connections must be completely
+    // unaffected by the decline -- still logged in and still receiving
+    // spots normally.
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    bus.publish(spot);
+    for (reader, _wr) in clients.iter_mut() {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("an already-admitted client must be unaffected by a later decline")
+            .unwrap();
+        assert_eq!(line.trim_end(), expected);
+    }
 }
 
 #[tokio::test]

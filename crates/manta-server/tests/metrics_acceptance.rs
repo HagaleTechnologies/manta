@@ -25,7 +25,15 @@ async fn operator_get_request_sees_spot_count_active_tracks_and_source_health() 
         manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
     );
     tokio::spawn(async move {
-        manta_server::metrics_http::serve(listener, metrics2, limiter).await;
+        manta_server::metrics_http::serve(
+            listener,
+            metrics2,
+            limiter,
+            manta_server::tasks::IpQuota::new(
+                manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+            ),
+        )
+        .await;
     });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
