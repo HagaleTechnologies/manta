@@ -416,18 +416,27 @@ impl HpsdrConfig {
         // HpsdrDevice::open's C&C-frame construction (MAN-55).
         cc_sample_rate_code(self.sample_rate_hz)?;
         // Every configured center frequency must be exactly representable
-        // as the wire's unsigned 32-bit Hz value (PR #79 review, round 1,
-        // P2) -- manta-cli's `--hpsdr-freq` parser only rejects
-        // non-finite/non-positive values, so an out-of-range value (e.g.
-        // > u32::MAX Hz) would otherwise reach `build_rx_freq_cc` deep
-        // inside `HpsdrDevice::open`, which used to silently clamp it
-        // instead of erroring -- caught here for every caller, not just
-        // the CLI, and before any device is opened.
+        // as the wire's unsigned 32-bit Hz value (PR #79 review, round 1
+        // P2, tightened round 3 P2) -- manta-cli's `--hpsdr-freq` parser
+        // only rejects non-finite/non-positive values, so an out-of-range
+        // or fractional value would otherwise reach `build_rx_freq_cc`
+        // deep inside `HpsdrDevice::open`, which used to silently clamp
+        // (round 1) or round (round 3) it instead of erroring. A
+        // fractional Hz value (e.g. 14025000.5) is caught here too, not
+        // just an out-of-range one: `build_rx_freq_cc` rounds it to the
+        // nearest whole Hz for the wire, but `HpsdrIqSource::
+        // center_freq_hz()` reports the original unrounded value, so a
+        // caller's frequency claim would silently disagree with the
+        // actual tuning. Checked here for every caller, not just the CLI,
+        // and before any device is opened.
         for (i, &freq_hz) in self.center_freq_hz.iter().enumerate() {
-            if !freq_hz.is_finite() || !(0.0..=u32::MAX as f64).contains(&freq_hz) {
+            if !freq_hz.is_finite()
+                || !(0.0..=u32::MAX as f64).contains(&freq_hz)
+                || freq_hz.fract() != 0.0
+            {
                 bail!(
-                    "center_freq_hz[{i}] ({freq_hz}) is outside HPSDR Protocol 1's \
-                     representable range (0..={} Hz)",
+                    "center_freq_hz[{i}] ({freq_hz}) must be a whole number of Hz in HPSDR \
+                     Protocol 1's representable range (0..={} Hz)",
                     u32::MAX
                 );
             }
@@ -526,12 +535,16 @@ fn build_general_cc(sample_rate_hz: f64, num_receivers: usize) -> Result<[u8; 5]
 /// used to have the tuning word silently saturate to `u32::MAX` while
 /// `HpsdrIqSource::center_freq_hz()` kept reporting the original,
 /// unclamped value, so a published spot's frequency would disagree with
-/// what the hardware was actually tuned to.
+/// what the hardware was actually tuned to. Also rejects a fractional Hz
+/// value (PR #79 review, round 3, P2): rounding it for the wire while
+/// `HpsdrIqSource::center_freq_hz()` kept reporting the original,
+/// unrounded value would create the same kind of silent disagreement.
 fn build_rx_freq_cc(rx_index: usize, freq_hz: f64) -> Result<[u8; 5]> {
     let addr = cc_rx_freq_addr(rx_index)?;
-    if !freq_hz.is_finite() || !(0.0..=u32::MAX as f64).contains(&freq_hz) {
+    if !freq_hz.is_finite() || !(0.0..=u32::MAX as f64).contains(&freq_hz) || freq_hz.fract() != 0.0
+    {
         bail!(
-            "HPSDR Protocol 1 encodes RX frequency as an unsigned 32-bit Hz value in \
+            "HPSDR Protocol 1 encodes RX frequency as a whole-Hz unsigned 32-bit value in \
              0..={}, got {freq_hz}",
             u32::MAX
         );
@@ -793,9 +806,6 @@ impl HpsdrDevice {
         socket
             .connect((cfg.host.as_str(), cfg.port))
             .with_context(|| format!("connect HPSDR UDP socket to {}:{}", cfg.host, cfg.port))?;
-        socket
-            .send(&build_start_command())
-            .context("send HPSDR start command")?;
 
         // MAN-55 Finding 1: build every C&C setting this device needs
         // configured once, up front -- general settings plus one
@@ -831,21 +841,26 @@ impl HpsdrDevice {
             cc_seq: 0,
         }));
 
-        // PR #79 review, round 2, P1: send every C&C setting BEFORE
-        // returning any HpsdrIqSource, not deferred to the first
-        // keepalive tick (up to KEEPALIVE_INTERVAL later, longer under
-        // packet loss). Without this, the device keeps streaming under
-        // whatever rate/receiver-count/frequency it already had (a prior
-        // session's config, or factory default) for that whole window,
-        // and `manta_engine::listen`'s startup calibration buffer would
-        // consume and interpret that data using the NEWLY requested
-        // (wrong-for-this-data) demux parameters -- corrupting multi-DDC
-        // demux, frequency interpretation, and any spots emitted from
-        // that startup data, and letting `confirmed_live` flip true on
-        // pre-configuration data. `send_next_cc_frames` advances by 2
-        // frames per call, so `div_ceil(cc_frame_count, 2)` calls cover
-        // every entry at least once (a repeat on an odd count is
-        // harmless -- the same idempotent setting resent).
+        // PR #79 review, round 2 P1 + round 3 P1: send every C&C setting
+        // BEFORE the start command (not just before returning any
+        // HpsdrIqSource, and not deferred to the first keepalive tick).
+        // Round 2's fix alone still sent the start command FIRST -- since
+        // that's what tells the device to begin queuing/streaming IQ, a
+        // device retaining stale settings from a prior session could
+        // start producing data under those stale settings the instant it
+        // processes the start command, before it's processed the
+        // subsequent C&C packets. Sending C&C first means the device is
+        // already configured by the time it's told to start. Without
+        // this ordering, `manta_engine::listen`'s startup calibration
+        // buffer would consume and interpret pre-configuration data using
+        // the NEWLY requested (wrong-for-that-data) demux parameters --
+        // corrupting multi-DDC demux, frequency interpretation, and any
+        // spots emitted from that startup data, and letting
+        // `confirmed_live` flip true on pre-configuration data.
+        // `send_next_cc_frames` advances by 2 frames per call, so
+        // `div_ceil(cc_frame_count, 2)` calls cover every entry at least
+        // once (a repeat on an odd count is harmless -- the same
+        // idempotent setting resent).
         {
             let mut guard = inner.lock().unwrap();
             for _ in 0..cc_frame_count.div_ceil(2) {
@@ -853,6 +868,10 @@ impl HpsdrDevice {
                     .send_next_cc_frames()
                     .context("send initial HPSDR C&C tuning frames")?;
             }
+            guard
+                .socket
+                .send(&build_start_command())
+                .context("send HPSDR start command")?;
         }
 
         Ok((0..cfg.ddc_count)
@@ -1157,6 +1176,15 @@ mod tests {
         assert!(build_rx_freq_cc(0, f64::INFINITY).is_err());
     }
 
+    /// PR #79 review, round 3, P2: a fractional Hz value must be rejected,
+    /// not silently rounded for the wire while `center_freq_hz()` keeps
+    /// reporting the original unrounded value.
+    #[test]
+    fn build_rx_freq_cc_rejects_fractional_hz() {
+        assert!(build_rx_freq_cc(0, 14_025_000.5).is_err());
+        assert!(build_rx_freq_cc(0, 14_025_000.0).is_ok());
+    }
+
     #[test]
     fn build_cc_packet_uses_the_real_usb_data_endpoint_2_header() {
         // PR #79 review, round 1, P1: every real Protocol 1 host->device
@@ -1232,6 +1260,19 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![u32::MAX as f64 + 1.0],
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    /// PR #79 review, round 3, P2.
+    #[test]
+    fn config_validate_rejects_fractional_center_freq() {
+        let cfg = HpsdrConfig {
+            host: "127.0.0.1".into(),
+            port: CONTROL_PORT,
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.5],
         };
         assert!(cfg.validate().is_err());
     }
@@ -1644,6 +1685,50 @@ mod tests {
             .find(|f| f.addr == 0x03)
             .expect("RX2 frequency (ADDR 0x03) must appear in the initial burst");
         assert_eq!(u32::from_be_bytes(rx2.data), 14_030_000);
+    }
+
+    /// PR #79 review, round 3, P1: the start command (which tells the
+    /// device to begin queuing/streaming IQ) must be sent AFTER every
+    /// initial C&C setting, not before -- round 2's fix only guaranteed
+    /// C&C went out before `open()` RETURNED, which the start command
+    /// still preceded. A device retaining stale settings from a prior
+    /// session could otherwise start producing data under those stale
+    /// settings the instant it processes the start command, before it's
+    /// processed the C&C packets that follow it.
+    #[test]
+    fn open_sends_the_start_command_after_every_initial_cc_setting() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+        };
+        let _sources = HpsdrDevice::open(cfg).unwrap();
+
+        for i in 0..initial_open_packet_count(1) {
+            let mut buf = [0u8; METIS_PACKET_LEN];
+            device_socket.recv_from(&mut buf).unwrap();
+            let is_start_command = buf[2] == 0x04;
+            if i < initial_open_packet_count(1) - 1 {
+                assert!(
+                    !is_start_command,
+                    "packet {i} must be a C&C packet, not the start command -- \
+                     the start command must be last"
+                );
+            } else {
+                assert!(
+                    is_start_command,
+                    "the LAST packet of the initial burst must be the start command"
+                );
+            }
+        }
     }
 
     /// The keepalive cadence must keep resending C&C settings AFTER the
