@@ -72,6 +72,12 @@ pub struct SoakMetricsReport {
     pub gate_records_total: u64,
 }
 
+// Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
+// Cargo.toml for why windows-sys is target-gated in as the equivalent.
+// Duplicated from soak.rs's own peak_rss_bytes() (pre-existing
+// duplication, not introduced by this fix) rather than extracted into a
+// shared module -- out of scope for a build-bug fix.
+#[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
@@ -81,6 +87,28 @@ fn peak_rss_bytes() -> u64 {
             raw // macOS reports ru_maxrss in bytes
         } else {
             raw * 1024 // Linux (and most others) report it in KB
+        }
+    }
+}
+
+#[cfg(windows)]
+fn peak_rss_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        let ok = GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        );
+        if ok != 0 {
+            counters.PeakWorkingSetSize as u64
+        } else {
+            0
         }
     }
 }
