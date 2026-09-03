@@ -32,6 +32,29 @@ pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// appended to `buf` as a side effect before any cancellation point. A
 /// caller that clears `buf` before every call (a fresh line each time)
 /// gets the same behavior `read_line_bounded` had when it auto-cleared.
+///
+/// **Known limitation** (PR #80 review, round 3, P3): UTF-8 is validated
+/// per `fill_buf` chunk, not over the fully-assembled line -- a valid
+/// multi-byte character whose bytes are split exactly across two chunks
+/// (a rare TCP-segmentation artifact) is rejected as `InvalidData` even
+/// though the complete line would have been valid. A fully correct fix
+/// requires buffering unvalidated raw bytes somewhere that survives a
+/// `tokio::select!` cancellation -- the only thing that survives is `buf`
+/// itself (a local variable inside this function is lost the same way
+/// `pending` bytes would be), and `buf: &mut String` cannot hold
+/// not-yet-valid bytes by Rust's own invariant, so closing this
+/// completely means threading a raw `&mut Vec<u8>` through every caller
+/// (`telnet.rs`, `metrics_http.rs`, `uplink.rs`) instead. A cheaper-looking
+/// alternative -- leave the incomplete tail unconsumed and retry
+/// `fill_buf` for more -- is unsound as written: `tokio::io::BufReader`'s
+/// `poll_fill_buf` returns already-buffered-but-unconsumed bytes
+/// synchronously without polling the underlying reader, so a loop that
+/// consumes nothing new would spin without ever yielding or actually
+/// waiting for more data. Accepted as-is: every protocol using this
+/// function (telnet commands, the outbound RBN uplink's `DX de` wire
+/// format, HTTP request lines) is ASCII by spec, so the failure mode is a
+/// spurious reconnect/disconnect on essentially never-occurring non-ASCII
+/// input at an unlucky buffer boundary, not data loss or corruption.
 pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut String,

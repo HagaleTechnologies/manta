@@ -130,7 +130,25 @@ pub async fn serve(
 /// address that accepts, or the last error if every address failed or
 /// timed out.
 async fn connect_any_resolved_address(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    let addrs: Vec<_> = tokio::net::lookup_host((host, port)).await?.collect();
+    // Bounded (PR #80 review, round 3): a bare `lookup_host` has no
+    // timeout of its own -- a stalled system resolver would otherwise
+    // leave this attempt stuck in the resolution phase for however long
+    // the resolver takes, before `connect_first_reachable`'s own
+    // per-address `CONNECT_TIMEOUT` ever gets a chance to apply. Shutdown
+    // interruptibility is unaffected: this whole function is still one
+    // arm of `connect_and_forward`'s outer `tokio::select!`, which races
+    // it against `shutdown.changed()` regardless of where inside this
+    // function execution currently is.
+    let addrs: Vec<_> =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("resolving {host}:{port} timed out"),
+                )
+            })??
+            .collect();
     connect_first_reachable(addrs).await
 }
 
@@ -271,8 +289,38 @@ async fn forward_loop(
                         }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
                         let line = rbn::format_line(&bus_spot.spot, spotter_call, unix_ts);
-                        write_with_timeout(wr, format!("{line}\r\n").as_bytes()).await?;
-                        metrics.record_uplink_sent();
+                        let wire_line = format!("{line}\r\n");
+                        // Raced against shutdown too, not just bounded by
+                        // WRITE_TIMEOUT (PR #80 review, round 3): once
+                        // inside this branch, the outer select! is no
+                        // longer polling its own `shutdown.changed()` arm
+                        // -- without this inner race, a target that
+                        // stopped reading would leave shutdown
+                        // unobserved for up to the full WRITE_TIMEOUT
+                        // (10s), which can exceed a service manager's
+                        // graceful-shutdown window.
+                        tokio::select! {
+                            write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
+                                if write_result.is_err() {
+                                    // Counted before propagating (PR #80
+                                    // review, round 3): a spot lost to a
+                                    // failed/timed-out write was
+                                    // otherwise silently dropped --
+                                    // invisible on every other counter,
+                                    // since uplink_lagged_total is
+                                    // specifically broadcast-channel lag,
+                                    // not a network write failure.
+                                    metrics.record_uplink_write_failed();
+                                    write_result?;
+                                }
+                                metrics.record_uplink_sent();
+                            }
+                            _ = shutdown.changed() => {
+                                if *shutdown.borrow() {
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         metrics.record_uplink_lagged(n);

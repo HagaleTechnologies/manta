@@ -24,6 +24,7 @@ pub struct Metrics {
     uplink_sent_total: AtomicU64,
     uplink_suppressed_total: AtomicU64,
     uplink_lagged_total: AtomicU64,
+    uplink_write_failed_total: AtomicU64,
     uplink_reconnects_total: AtomicU64,
     /// Count of currently-connected uplink targets, not a single 0/1 flag
     /// -- MAN-42 can spawn multiple independent `uplink::serve` tasks
@@ -145,6 +146,22 @@ impl Metrics {
 
     pub fn uplink_lagged_total(&self) -> u64 {
         self.uplink_lagged_total.load(Ordering::Relaxed)
+    }
+
+    /// A write to the uplink target's socket timed out or failed (PR #80
+    /// review, round 3): distinct from `uplink_lagged_total`, which is
+    /// specifically broadcast-channel lag (the receiver falling behind),
+    /// not a network-level write failure. Without this, a spot lost to a
+    /// stalled/failed write is silently dropped -- invisible on every
+    /// existing counter, the same class of gap `record_write_failed`
+    /// already closed for the inbound telnet/JSON write path.
+    pub fn record_uplink_write_failed(&self) {
+        self.uplink_write_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn uplink_write_failed_total(&self) -> u64 {
+        self.uplink_write_failed_total.load(Ordering::Relaxed)
     }
 
     pub fn record_uplink_reconnect(&self) {
@@ -282,6 +299,15 @@ impl Metrics {
             self.uplink_lagged_total.load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_uplink_dropped_write_failed_total Spots dropped because a write to the RBN uplink target's socket timed out or failed.\n",
+        );
+        out.push_str("# TYPE manta_uplink_dropped_write_failed_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_dropped_write_failed_total {}\n",
+            self.uplink_write_failed_total.load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.\n");
         out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
         out.push_str(&format!(
@@ -395,6 +421,10 @@ mod tests {
         m.record_uplink_lagged(3);
         assert_eq!(m.uplink_lagged_total(), 3);
 
+        assert_eq!(m.uplink_write_failed_total(), 0);
+        m.record_uplink_write_failed();
+        assert_eq!(m.uplink_write_failed_total(), 1);
+
         assert_eq!(m.uplink_reconnects_total(), 0);
         m.record_uplink_reconnect();
         assert_eq!(m.uplink_reconnects_total(), 1);
@@ -413,11 +443,13 @@ mod tests {
         m.record_uplink_sent();
         m.record_uplink_suppressed();
         m.record_uplink_reconnect();
+        m.record_uplink_write_failed();
         m.mark_uplink_connected();
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_uplink_sent_total 2"));
         assert!(text.contains("manta_uplink_suppressed_total 1"));
         assert!(text.contains("manta_uplink_reconnects_total 1"));
+        assert!(text.contains("manta_uplink_dropped_write_failed_total 1"));
         assert!(text.contains("manta_uplink_connected 1"));
     }
 
