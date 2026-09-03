@@ -59,6 +59,12 @@ the binary fails to start.
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
 
+When running as a long-lived server (not `--help`), stop it with
+`docker stop -t 30 <container>` — Docker's own default 10-second grace
+period before SIGKILL is shorter than manta's supported drain window for
+a slow client's final write (up to 25s), so the default can cut a
+graceful shutdown off mid-drain.
+
 Both are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
 directly from each tagged release's commit — every published binary
 traces to a specific, auditable source revision. (If the image above

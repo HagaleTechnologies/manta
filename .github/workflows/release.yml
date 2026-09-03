@@ -181,12 +181,40 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  docker:
+  docker-build:
+    # Runs on every trigger, including pull_request -- build-only, never
+    # pushes, and deliberately has NO packages:write permission at all
+    # (see docker-publish below for why that has to be a separate job).
     # Gated on the native/cross build matrix (PR #78 review round 1) --
     # without this, a real tag push could publish Docker tags for a
-    # release where a Windows/macOS/Linux leg had already failed, since
-    # this job previously had no dependency on `build` at all.
+    # release where a Windows/macOS/Linux leg had already failed.
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+
+  docker-publish:
+    # A SEPARATE job, not a conditional step in docker-build, because
+    # `permissions:` is scoped to the whole job and cannot be gated by an
+    # `if:` (PR #78 review round 5) -- granting packages:write to a job
+    # that also runs on `pull_request` would hand that token to
+    # PR-controlled workflow/Dockerfile content, which isn't
+    # auto-downgraded for a same-repository PR the way a fork PR's token
+    # is. This job's own `if:` below is evaluated by GitHub against
+    # immutable built-in context (github.event_name), not anything a PR's
+    # diff can influence, so it structurally never runs for pull_request
+    # regardless of what the PR modifies in this very file.
+    needs: [build, docker-build]
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -198,11 +226,19 @@ jobs:
 
       - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
 
-      - name: Determine version, image, push flag, and tag list
+      - name: Determine version, image, and tag list
         id: version
         shell: bash
         run: |
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+          # Gated on the EVENT being a real push, not merely on
+          # github.ref_type == 'tag' (PR #78 review round 9 -- ref_type is
+          # ALSO 'tag' for `gh workflow run release.yml --ref <existing-
+          # tag> -f publish=true`, a workflow_dispatch run targeting an
+          # existing tag, not a push. The earlier ref_type-only check let
+          # a manual dispatch against an old release tag compute that
+          # tag's real version number and, unconditionally, overwrite the
+          # already-published immutable :$VERSION image with a rebuild).
+          if [[ "${{ github.event_name }}" == "push" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
             VERSION="dispatch-${{ github.run_id }}"
@@ -215,22 +251,6 @@ jobs:
           IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-          # Computed as an explicit true/false string here rather than
-          # inline in the `push:` input below (PR #78 review round 7):
-          # GitHub Actions' `||` returns whichever operand it evaluates,
-          # not a coerced boolean -- on a pull_request event, `inputs`
-          # doesn't exist at all, so `github.event_name == 'push' ||
-          # inputs.publish` evaluated to an empty string, which
-          # docker/build-push-action's strict YAML 1.2 Core Schema
-          # boolean-input validation rejects outright ("Input does not
-          # meet YAML 1.2 'Core Schema' specification: push"), failing
-          # every pull_request-triggered run of this job.
-          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.publish }}" == "true" ]]; then
-            echo "push=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "push=false" >> "$GITHUB_OUTPUT"
-          fi
-
           # `:latest` is reserved for real tag pushes only (PR #78 review
           # round 2) -- a workflow_dispatch run with publish=true can
           # target any branch, not just a release, and README's `docker
@@ -239,13 +259,6 @@ jobs:
           # happened to also push. The dispatch-<run_id> tag is still
           # pushed on a dispatch publish, for testing that path
           # specifically -- just never `:latest`.
-          #
-          # Gated on the EVENT being a real push, not merely on
-          # github.ref_type == 'tag' (PR #78 review round 9 -- ref_type is
-          # ALSO 'tag' for `gh workflow run release.yml --ref <existing-
-          # tag> -f publish=true`, a workflow_dispatch run, not a push; the
-          # earlier ref_type-only check let a manual re-run against an old
-          # tag silently overwrite :latest with an old rebuild).
           {
             echo "tags<<RELEASE_TAGS_EOF"
             echo "$IMAGE:$VERSION"
@@ -256,7 +269,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        if: steps.version.outputs.push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
@@ -267,11 +279,11 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ steps.version.outputs.push == 'true' }}
+          push: true
           tags: ${{ steps.version.outputs.tags }}
 
   release:
-    needs: [build, docker]
+    needs: [build, docker-publish]
     # Only ever from a real tag push -- see the top-of-file comment for
     # why workflow_dispatch/pull_request never reach this job.
     if: github.event_name == 'push'

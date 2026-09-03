@@ -52,5 +52,16 @@ EXPOSE 7300 7301 7302
 # separate, broader behavior change to the application itself.
 STOPSIGNAL SIGINT
 
+# `docker stop`'s own default grace period (10s on Linux) before SIGKILL
+# is SHORTER than manta-cli's own supported graceful-shutdown drain
+# window (SHUTDOWN_DRAIN_DEADLINE, 25s -- crates/manta-cli/src/main.rs)
+# for a legitimately-slow client's final write (PR #78 review round 5).
+# STOPSIGNAL alone sends the right signal, but the container can still be
+# SIGKILLed mid-drain, dropping the final spots this fix exists to
+# preserve. A Dockerfile has no way to change the CALLER's stop grace
+# period -- operators must pass it explicitly: `docker stop -t 30
+# <container>`, or `--stop-timeout 30` on `docker run`, or the
+# equivalent `stop_grace_period`/`terminationGracePeriodSeconds` on
+# Compose/Kubernetes. Documented in README's Docker install section too.
 ENTRYPOINT ["manta"]
 CMD ["--help"]
