@@ -109,3 +109,33 @@ granularity: the reverse-proxy scenario applies uniformly to whichever
 listeners are actually proxied, and per-listener TOML keys are unwarranted
 complexity until an operator needs the proxy in front of only one
 listener specifically.
+
+## Addendum: PR #81 review, round 3 (2026-09-03)
+
+Round 1's "unwarranted complexity" call above was wrong in practice, and
+the reviewer caught the actual scenario it dismissed: the runbook's own
+documented setup fronts the JSON/WS port ONLY -- telnet and metrics stay
+directly exposed. A single shared `max_connections_per_ip` override set
+to `0` (to serve JSON/WS clients behind the proxy) would ALSO silently
+disable the per-IP quota on telnet and metrics, which were never behind
+the proxy and still need it -- undoing MAN-61's protection on exactly the
+listeners it was supposed to keep protecting.
+
+Fixed by splitting the single field into three independent ones:
+`telnet_max_connections_per_ip`, `json_max_connections_per_ip`,
+`metrics_max_connections_per_ip` (each `Option<usize>`, same `None`
+default / `0`-disables / `Some(n)`-overrides semantics as before, just
+scoped per listener instead of shared). An operator following the
+documented JSON/WS-only reverse-proxy setup now sets only
+`json_max_connections_per_ip`, leaving telnet and metrics on their
+built-in defaults.
+
+Also corrected in the runbook (same review round): relying on the proxy's
+own connection-RATE limiting alone does not actually replace a disabled
+per-IP quota for these listeners -- JSON/WS and telnet connections are
+intentionally long-lived and may sit quiet forever, so a client opening
+connections slowly enough to stay under any rate budget can still retain
+every one of them and eventually occupy all of a listener's total
+capacity. The runbook now recommends a genuine per-client
+CONCURRENT-connection limit at the proxy, not just a rate limit, before
+disabling the backend's own per-IP quota.
