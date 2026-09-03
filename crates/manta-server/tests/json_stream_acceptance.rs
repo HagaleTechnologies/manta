@@ -517,6 +517,13 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    // Kept alongside the clone moved into `serve()` (PR #75 review, round
+    // 1, finding 3) so this test can directly inspect the malformed-frame
+    // client's own task result afterward, rather than only observing that
+    // the socket closed -- a panicking task also drops its socket, so
+    // `read_to_end` resolving the same way proves nothing about whether a
+    // panic occurred.
+    let tasks_handle = tasks.clone();
     let limiter = manta_server::tasks::new_connection_limiter(
         manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
     );
@@ -584,6 +591,26 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
         read_result.is_ok(),
         "server must close a malformed-frame connection, not hang indefinitely"
     );
+
+    // The socket closing is consistent with EITHER a clean protocol-error
+    // disconnect OR a panic in the client-handler task (dropping the task
+    // also drops the socket) -- so it alone doesn't distinguish them
+    // (PR #75 review, round 1, finding 3). Directly inspect the tracked
+    // task's own join result: a real panic must fail this assertion, not
+    // be silently indistinguishable from the intended clean-disconnect
+    // path.
+    let join_result = tokio::time::timeout(Duration::from_secs(5), async {
+        tasks_handle.lock().await.join_next().await
+    })
+    .await
+    .expect("client handler task did not complete in time")
+    .expect("client handler task set was unexpectedly empty");
+    if let Err(join_err) = join_result {
+        assert!(
+            !join_err.is_panic(),
+            "client handler task panicked on a malformed WS frame: {join_err}"
+        );
+    }
 
     // The listener itself must still be healthy after a malformed-frame
     // client -- a fresh connection must still be accepted, not left
