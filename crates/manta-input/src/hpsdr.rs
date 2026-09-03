@@ -148,6 +148,17 @@ const RECV_BUF_LEN: usize = 65536;
 /// needs no additional undocumented command type.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How many times `HpsdrDevice::open` repeats the full initial C&C
+/// rotation before sending the start command (PR #79 review, round 4,
+/// P2): UDP is lossy, and a single dropped datagram in a one-shot initial
+/// burst would leave that one setting unconfigured until the ongoing
+/// keepalive rotation eventually resent it, up to several seconds later
+/// with many DDCs -- long enough for `manta_engine::listen`'s startup
+/// calibration buffer to consume real IQ under a stale setting. 2 is the
+/// minimum redundancy that tolerates a single lost packet per setting;
+/// resending an already-applied setting is harmless and idempotent.
+const INITIAL_BURST_REPEATS: usize = 2;
+
 /// One 100 Mbps Ethernet link's practical DDC budget at 192 kHz: 8 DDCs x
 /// ~9.8 Mbps/DDC on-wire (spike doc "Bandwidth math" — 9.216 Mbps raw + ~6%
 /// framing overhead), leaving headroom rather than running the link at
@@ -841,29 +852,37 @@ impl HpsdrDevice {
             cc_seq: 0,
         }));
 
-        // PR #79 review, round 2 P1 + round 3 P1: send every C&C setting
-        // BEFORE the start command (not just before returning any
-        // HpsdrIqSource, and not deferred to the first keepalive tick).
-        // Round 2's fix alone still sent the start command FIRST -- since
-        // that's what tells the device to begin queuing/streaming IQ, a
-        // device retaining stale settings from a prior session could
-        // start producing data under those stale settings the instant it
-        // processes the start command, before it's processed the
-        // subsequent C&C packets. Sending C&C first means the device is
-        // already configured by the time it's told to start. Without
-        // this ordering, `manta_engine::listen`'s startup calibration
-        // buffer would consume and interpret pre-configuration data using
-        // the NEWLY requested (wrong-for-that-data) demux parameters --
-        // corrupting multi-DDC demux, frequency interpretation, and any
-        // spots emitted from that startup data, and letting
-        // `confirmed_live` flip true on pre-configuration data.
-        // `send_next_cc_frames` advances by 2 frames per call, so
-        // `div_ceil(cc_frame_count, 2)` calls cover every entry at least
-        // once (a repeat on an odd count is harmless -- the same
-        // idempotent setting resent).
+        // PR #79 review, round 2 P1 + round 3 P1 + round 4 P2: send every
+        // C&C setting BEFORE the start command (not just before returning
+        // any HpsdrIqSource, and not deferred to the first keepalive
+        // tick), repeated `INITIAL_BURST_REPEATS` times for UDP-loss
+        // tolerance. Round 2's fix alone still sent the start command
+        // FIRST -- since that's what tells the device to begin
+        // queuing/streaming IQ, a device retaining stale settings from a
+        // prior session could start producing data under those stale
+        // settings the instant it processes the start command, before
+        // it's processed the subsequent C&C packets. Sending C&C first
+        // (round 3) means the device is already configured by the time
+        // it's told to start -- but UDP is lossy, and a SINGLE dropped
+        // datagram among a one-shot burst would leave that one setting
+        // never reaching the device before the start command, with the
+        // ongoing keepalive rotation only catching up several seconds
+        // later (round 4). Repeating the full rotation
+        // `INITIAL_BURST_REPEATS` times means a single lost packet for
+        // any one setting still leaves it configured via its other
+        // transmission(s) -- redundant resends of an already-applied
+        // setting are harmless and idempotent. Without any of this,
+        // `manta_engine::listen`'s startup calibration buffer would
+        // consume and interpret pre-configuration data using the NEWLY
+        // requested (wrong-for-that-data) demux parameters -- corrupting
+        // multi-DDC demux, frequency interpretation, and any spots
+        // emitted from that startup data, and letting `confirmed_live`
+        // flip true on pre-configuration data. `send_next_cc_frames`
+        // advances by 2 frames per call, so `div_ceil(cc_frame_count, 2)`
+        // calls cover every entry at least once per repeat.
         {
             let mut guard = inner.lock().unwrap();
-            for _ in 0..cc_frame_count.div_ceil(2) {
+            for _ in 0..INITIAL_BURST_REPEATS * cc_frame_count.div_ceil(2) {
                 guard
                     .send_next_cc_frames()
                     .context("send initial HPSDR C&C tuning frames")?;
@@ -954,10 +973,11 @@ mod tests {
     /// verified byte-for-byte, mirroring `kiwi.rs`'s synthetic-frame tests.
     /// Number of datagrams `HpsdrDevice::open` sends before returning, for
     /// a device configured with `ddc_count` receivers (PR #79 review,
-    /// round 2, P1): one start command, plus enough C&C packets to cover
-    /// every general+per-RX setting at least once.
+    /// round 2 P1, round 4 P2): one start command, plus enough C&C
+    /// packets to cover every general+per-RX setting `INITIAL_BURST_REPEATS`
+    /// times over.
     fn initial_open_packet_count(ddc_count: usize) -> usize {
-        1 + (1 + ddc_count).div_ceil(2)
+        1 + INITIAL_BURST_REPEATS * (1 + ddc_count).div_ceil(2)
     }
 
     /// Drains exactly `initial_open_packet_count(ddc_count)` datagrams
@@ -1685,6 +1705,49 @@ mod tests {
             .find(|f| f.addr == 0x03)
             .expect("RX2 frequency (ADDR 0x03) must appear in the initial burst");
         assert_eq!(u32::from_be_bytes(rx2.data), 14_030_000);
+    }
+
+    /// PR #79 review, round 4, P2: UDP is lossy, so a setting sent only
+    /// ONCE in the initial burst could be dropped and never reach the
+    /// device before the start command -- each setting must appear
+    /// `INITIAL_BURST_REPEATS` times over, so a single lost packet still
+    /// leaves it configured via another transmission.
+    #[test]
+    fn open_repeats_every_cc_setting_for_udp_loss_tolerance() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 2,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+        };
+        let _sources = HpsdrDevice::open(cfg).unwrap();
+
+        let mut frames = Vec::new();
+        for _ in 0..initial_open_packet_count(2) {
+            let mut buf = [0u8; METIS_PACKET_LEN];
+            let (n, _) = device_socket.recv_from(&mut buf).unwrap();
+            if buf[2] == 0x04 {
+                continue; // the (single) start command
+            }
+            assert_eq!(n, METIS_PACKET_LEN);
+            frames.extend(decode_cc_packet(&buf));
+        }
+
+        for addr in [0x00u8, 0x02, 0x03] {
+            let count = frames.iter().filter(|f| f.addr == addr).count();
+            assert!(
+                count >= INITIAL_BURST_REPEATS,
+                "ADDR {addr:#04x} appeared {count} time(s) in the initial burst, \
+                 need at least {INITIAL_BURST_REPEATS} for single-packet-loss tolerance"
+            );
+        }
     }
 
     /// PR #79 review, round 3, P1: the start command (which tells the
