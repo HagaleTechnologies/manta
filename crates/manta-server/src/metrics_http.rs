@@ -60,6 +60,17 @@ pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 const QUOTA_REJECT_LOG_MAX_PER_WINDOW: u32 = 1;
 const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 
+/// MAN-59 review round 3: `QUOTA_REJECT_LOG_*` above bounds only the
+/// CONCURRENT per-IP quota-rejection log -- it doesn't cover this. A
+/// single peer sending sequential invalid requests (e.g. repeated `POST
+/// /metrics`) releases its connection permit after each `Connection:
+/// close` response, so it never holds enough concurrent connections to
+/// even hit that quota, yet each one still logged a "rejected request"
+/// warning with no limiter of its own. Separate limiter (same shape,
+/// same window) since this gates a different event.
+const REJECTED_REQUEST_LOG_MAX_PER_WINDOW: u32 = 1;
+const REJECTED_REQUEST_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 pub async fn serve(
     listener: TcpListener,
     metrics: Arc<Metrics>,
@@ -69,6 +80,11 @@ pub async fn serve(
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
+    let rejected_request_log_limiter = IpRateLimiter::new(
+        REJECTED_REQUEST_LOG_MAX_PER_WINDOW,
+        REJECTED_REQUEST_LOG_WINDOW,
+    );
+    crate::rate_limit::spawn_stale_entry_reaper(rejected_request_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -96,10 +112,19 @@ pub async fn serve(
             continue; // limiter closed: unreachable in practice, never panics
         };
         let metrics = metrics.clone();
+        let rejected_request_log_limiter = rejected_request_log_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
-            let _ = handle_request(socket, metrics, peer).await;
+            let result = handle_request(socket, metrics, peer, rejected_request_log_limiter).await;
+            // MAN-59 review round 3: successful requests are deliberately
+            // not logged (Prometheus scrapes this every 10-30s -- pure
+            // noise), so a connection that resets mid-response or times
+            // out on write would otherwise produce no audit event at
+            // all, unlike telnet/json_stream's equivalent catch-all.
+            if let Err(e) = &result {
+                tracing::warn!(peer = %peer, error = %e, "metrics_http: request task ended with an error");
+            }
         });
     }
 }
@@ -131,6 +156,7 @@ async fn handle_request(
     socket: tokio::net::TcpStream,
     metrics: Arc<Metrics>,
     peer: std::net::SocketAddr,
+    rejected_request_log_limiter: IpRateLimiter,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
@@ -174,7 +200,9 @@ async fn handle_request(
         // didn't match. Debug (`?`), not Display, for the same reason the
         // telnet login field uses it: `request_line` is client-supplied
         // and unvalidated.
-        tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
+        if rejected_request_log_limiter.allow(peer.ip()) {
+            tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
+        }
         "404 Not Found"
     };
 
