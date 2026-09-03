@@ -572,7 +572,18 @@ jobs:
               exit 0
             fi
             if ! poll=$(echo "$gh_poll_raw" | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(you exceeded your current quota|quota exceeded|rate limit reached|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                # "something went wrong" catches Codex'"'"'s generic internal-error
+                # wrapper ("Codex Review: Something went wrong... An unknown
+                # error occurred") — observed live stalling manta PR #84 and
+                # #85 a full ~70min poll cycle each (2026-09-03) because it
+                # matched none of the specific phrases below and so fell
+                # through as a "clean" comment instead of failing fast. Safe
+                # to match broadly: this exact wrapper text only ever appears
+                # on Codex'"'"'s own failure replies, never inside a real review
+                # body. Ported from credenza'"'"'s canonical template (PR #30) --
+                # this repo'"'"'s copy has no auto-sync, so port future template
+                # fixes here manually too.
+                def is_error_shaped: test("(you exceeded your current quota|quota exceeded|rate limit reached|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect|something went wrong)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
                 # plain issue comment (not a formal review, not a reaction) whose
                 # body embeds "**Reviewed commit:** `<10-hex-char prefix>`" — a
