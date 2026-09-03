@@ -198,9 +198,24 @@ jobs:
           # is case-preserving ("HagaleTechnologies/manta") and buildx
           # rejects a mixed-case tag outright (PR #78 review round 1).
           echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          # Computed as an explicit true/false string here rather than
+          # inline in the `push:` input below (PR #78 review round 7):
+          # GitHub Actions' `||` returns whichever operand it evaluates,
+          # not a coerced boolean -- on a pull_request event, `inputs`
+          # doesn't exist at all, so `github.event_name == 'push' ||
+          # inputs.publish` evaluated to an empty string, which
+          # docker/build-push-action's strict YAML 1.2 Core Schema
+          # boolean-input validation rejects outright ("Input does not
+          # meet YAML 1.2 'Core Schema' specification: push"), failing
+          # every pull_request-triggered run of this job.
+          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.publish }}" == "true" ]]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Log in to GHCR
-        if: github.event_name == 'push' || inputs.publish
+        if: steps.version.outputs.push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
@@ -211,7 +226,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' || inputs.publish }}
+          push: ${{ steps.version.outputs.push == 'true' }}
           tags: |
             ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
             ${{ steps.version.outputs.image }}:latest
