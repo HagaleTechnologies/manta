@@ -135,7 +135,7 @@ pub async fn serve(
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
             metrics.inc_telnet_clients();
-            let _ = handle_client(
+            let result = handle_client(
                 socket,
                 bus,
                 rx,
@@ -147,6 +147,14 @@ pub async fn serve(
                 ip_command_limiter,
             )
             .await;
+            // MAN-59 review: a socket error mid-session (e.g. a
+            // login-prompt write reset) returns Err, but every OTHER
+            // disconnect path already logs its own specific reason
+            // inline -- this is the one catch-all left uncovered without
+            // it, and the only place that needs the raw io::Error itself.
+            if let Err(e) = &result {
+                tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+            }
             metrics.dec_telnet_clients();
         });
     }
@@ -186,7 +194,12 @@ async fn handle_client(
             return Err(e);
         }
     }
-    tracing::info!(login = %login_line.trim(), "telnet: client logged in");
+    // MAN-59 review: the login line is client-supplied and unvalidated --
+    // Display (`%`) writes it into the log verbatim, letting an
+    // unauthenticated client embed CRs/ANSI escapes to forge additional
+    // bogus log lines or manipulate terminal output. Debug (`?`) escapes
+    // control characters instead.
+    tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
 
     write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
 
@@ -278,7 +291,19 @@ async fn handle_client(
                     tracing::warn!("telnet: client exceeded command rate budget, disconnecting");
                     return Ok(());
                 }
-                match command::parse(&cmd_line) {
+                // MAN-59 review: a client staying within the rate budget
+                // could otherwise disconnect with zero command activity
+                // recorded, leaving the audit trail unable to reconstruct
+                // what happened -- only the over-budget disconnect above
+                // was logged. Logs the PARSED, normalized command
+                // (`Command`'s own Debug -- an enum variant plus already-
+                // validated numeric fields, e.g. `ShowDx { count: Some(50) }`
+                // or bare `Unknown`), never the raw client-supplied line,
+                // which is unescaped and could otherwise inject the same
+                // way the login field could (see the fix just above).
+                let parsed_command = command::parse(&cmd_line);
+                tracing::info!(command = ?parsed_command, "telnet: command received");
+                match parsed_command {
                     Command::ShowDx { count } => {
                         let n = count.unwrap_or(DEFAULT_SHOW_DX_COUNT);
                         // Apply the SAME `min_unique` predicate the live

@@ -193,14 +193,25 @@ pub async fn serve(
         tasks.lock().await.spawn(async move {
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
+            // MAN-59 review: a socket error mid-session (a WS Pong write
+            // failing, a raw TCP read resetting) returns Err, but every
+            // OTHER disconnect path already logs its own specific reason
+            // inline -- this is the one catch-all left uncovered without
+            // it, and the only place that needs the raw error itself.
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
-                let _ =
+                let result =
                     handle_ws_client(socket, rx, ctx.clone(), peer, peer_ip, ip_ping_limiter).await;
+                if let Err(e) = &result {
+                    tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
+                }
                 ctx.metrics.dec_ws_clients();
             } else {
                 ctx.metrics.inc_json_clients();
-                let _ = handle_tcp_client(socket, rx, ctx.clone(), peer).await;
+                let result = handle_tcp_client(socket, rx, ctx.clone(), peer).await;
+                if let Err(e) = &result {
+                    tracing::warn!(peer = %peer, error = %e, "json_stream: raw TCP client task ended with an error");
+                }
                 ctx.metrics.dec_json_clients();
             }
         });
@@ -320,7 +331,13 @@ async fn handle_tcp_client(
                         tracing::warn!("json_stream: unexpected client data on pure-push stream, disconnecting");
                         return Ok(());
                     }
-                    Err(_) => return Ok(()),
+                    // MAN-59 review: a genuine socket read error (e.g. a
+                    // connection reset) was previously swallowed into
+                    // Ok(()) here with no log at all -- the task-boundary
+                    // catch-all this handler's caller now applies can only
+                    // report the disconnect reason when the error actually
+                    // propagates.
+                    Err(e) => return Err(e),
                 }
             }
             // Explicit shutdown: drain whatever's already queued rather

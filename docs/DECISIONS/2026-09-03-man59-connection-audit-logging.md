@@ -16,10 +16,18 @@ reconstruct what happened or from where.
 ## Design decisions (per the ticket's own explicit ask — not assumed)
 
 **Crate: `tracing` + `tracing-subscriber`.** The closest thing to a
-Rust-ecosystem default for structured, leveled logging; both already
-appear transitively in the dependency tree via `tokio`'s own
-instrumentation hooks, so this adds no new supply-chain surface, only
-promotes an existing transitive dependency to direct.
+Rust-ecosystem default for structured, leveled logging. **Correction**
+(review round 1): this DOES add new supply-chain surface, not zero as
+originally claimed here — `tokio`'s own optional instrumentation hooks
+are gated behind a feature this workspace doesn't enable, so neither
+crate was actually present in the dependency tree before this change.
+`Cargo.lock` gained 12 new packages: `tracing`, `tracing-attributes`,
+`tracing-core`, `tracing-log`, `tracing-subscriber`, plus their own
+transitive deps `matchers`, `nu-ansi-term`, `sharded-slab`,
+`thread_local`, `valuable`, `lazy_static`, `smallvec`. Accepted anyway:
+still the closest thing to a Rust-ecosystem default, all from
+well-maintained, widely-used crates, and the alternative (a hand-rolled
+logger) would be a worse trade for a repo this size.
 
 **Format: `tracing-subscriber`'s default `fmt` layer (plain text with
 key=value fields), not JSON.** `tracing`'s event macros already produce

@@ -154,6 +154,14 @@ async fn handle_request(
     let status = if request_line.starts_with("GET /metrics ") {
         "200 OK"
     } else {
+        // MAN-59 review: ordinary probing of this unauthenticated,
+        // internet-facing endpoint (a wrong method, an unknown path) was
+        // otherwise absent from the audit trail entirely -- only header
+        // read failures were logged, never a request that completed but
+        // didn't match. Debug (`?`), not Display, for the same reason the
+        // telnet login field uses it: `request_line` is client-supplied
+        // and unvalidated.
+        tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
         "404 Not Found"
     };
 

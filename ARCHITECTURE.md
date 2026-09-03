@@ -306,14 +306,18 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - Single TOML config (coppa convention): device, center freq, band plan
   (CW segment limits — don't decode/spot outside them), thresholds, track cap,
   server ports, cty/scp paths, station callsign (spotter ID).
-- **`tracing` throughout with `EnvFilter` is aspirational, not yet
-  implemented** — corrected 2026-09-03: neither `tracing` nor `log` is a
-  dependency of any crate in this workspace today (confirmed by a
-  workspace-wide grep while investigating
-  `docs/DECISIONS/2026-09-02-man23-threat-model.md`'s finding 9/MAN-59),
-  and there is no structured logging or audit trail anywhere in
-  `manta-server`/`manta-input`. `manta --status` hitting a local control
-  socket for live stats is similarly not yet implemented. Prometheus text
+- **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
+  `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
+  2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
+  connect/login/disconnect events, per-IP quota and rate-limit rejections,
+  `bounded_io` read rejections, malformed-WS-frame disconnects, and
+  rejected metrics-endpoint requests are all logged (plain `fmt` output,
+  `RUST_LOG`-controlled, default `info`) to give an operator a durable
+  record to reconstruct an abuse incident after the fact. Still
+  aspirational: `manta-input`/`manta-engine` carry no logging of their
+  own yet (decode-pipeline internals, not the network-facing surface
+  MAN-59 scoped to), and `manta --status` hitting a local control socket
+  for live stats is similarly not yet implemented. Prometheus text
   endpoint (feature `metrics`): input overruns, active tracks, evictions,
   decode rate, spots/min, per-stage queue depths, spot confidence
   histogram — also aspirational for several of these fields; the
