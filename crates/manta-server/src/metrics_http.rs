@@ -60,16 +60,20 @@ pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 const QUOTA_REJECT_LOG_MAX_PER_WINDOW: u32 = 1;
 const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 
-/// MAN-59 review round 3: `QUOTA_REJECT_LOG_*` above bounds only the
-/// CONCURRENT per-IP quota-rejection log -- it doesn't cover this. A
-/// single peer sending sequential invalid requests (e.g. repeated `POST
-/// /metrics`) releases its connection permit after each `Connection:
-/// close` response, so it never holds enough concurrent connections to
-/// even hit that quota, yet each one still logged a "rejected request"
-/// warning with no limiter of its own. Separate limiter (same shape,
-/// same window) since this gates a different event.
-const REJECTED_REQUEST_LOG_MAX_PER_WINDOW: u32 = 1;
-const REJECTED_REQUEST_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// MAN-59 review round 4: rounds 2-3 each found one more individually
+/// un-gated audit-log call site in this file (the quota-reject warning,
+/// then the 404-reject warning, and round 4 found the header-rejection
+/// warning STILL wasn't wired to the round-3 limiter, plus this file's
+/// own task-boundary catch-all was never covered either) -- see
+/// `telnet::CONNECTION_LOG_MAX_PER_WINDOW`'s doc comment for the full
+/// "reconsider the fix strategy" rationale. Replaces the narrower,
+/// round-3-only `REJECTED_REQUEST_LOG_*`/`rejected_request_log_limiter`:
+/// ONE budget decided once per admitted connection covers header
+/// rejections, the 404 rejection, and the task-boundary catch-all alike,
+/// so there's no longer a second limiter to remember to wire a future
+/// call site into.
+const CONNECTION_LOG_MAX_PER_WINDOW: u32 = 30;
+const CONNECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 
 pub async fn serve(
     listener: TcpListener,
@@ -80,11 +84,9 @@ pub async fn serve(
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
-    let rejected_request_log_limiter = IpRateLimiter::new(
-        REJECTED_REQUEST_LOG_MAX_PER_WINDOW,
-        REJECTED_REQUEST_LOG_WINDOW,
-    );
-    crate::rate_limit::spawn_stale_entry_reaper(rejected_request_log_limiter.clone());
+    let connection_log_limiter =
+        IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(connection_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -112,18 +114,22 @@ pub async fn serve(
             continue; // limiter closed: unreachable in practice, never panics
         };
         let metrics = metrics.clone();
-        let rejected_request_log_limiter = rejected_request_log_limiter.clone();
+        // Decided ONCE per admitted connection -- see
+        // CONNECTION_LOG_MAX_PER_WINDOW's doc comment above.
+        let log_enabled = connection_log_limiter.allow(peer.ip());
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
-            let result = handle_request(socket, metrics, peer, rejected_request_log_limiter).await;
+            let result = handle_request(socket, metrics, peer, log_enabled).await;
             // MAN-59 review round 3: successful requests are deliberately
             // not logged (Prometheus scrapes this every 10-30s -- pure
             // noise), so a connection that resets mid-response or times
             // out on write would otherwise produce no audit event at
             // all, unlike telnet/json_stream's equivalent catch-all.
-            if let Err(e) = &result {
-                tracing::warn!(peer = %peer, error = %e, "metrics_http: request task ended with an error");
+            if log_enabled {
+                if let Err(e) = &result {
+                    tracing::warn!(peer = %peer, error = %e, "metrics_http: request task ended with an error");
+                }
             }
         });
     }
@@ -156,7 +162,7 @@ async fn handle_request(
     socket: tokio::net::TcpStream,
     metrics: Arc<Metrics>,
     peer: std::net::SocketAddr,
-    rejected_request_log_limiter: IpRateLimiter,
+    log_enabled: bool,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
@@ -170,11 +176,18 @@ async fn handle_request(
     let eof = match headers_result {
         Ok(Ok(eof)) => eof,
         Ok(Err(e)) => {
-            tracing::warn!(peer = %peer, error = %e, "metrics_http: header read rejected (oversized/malformed line), disconnecting");
+            // MAN-59 review round 4: was previously ungated, unlike the
+            // sibling 404-rejection warning below -- both now share the
+            // one connection-level budget.
+            if log_enabled {
+                tracing::warn!(peer = %peer, error = %e, "metrics_http: header read rejected (oversized/malformed line), disconnecting");
+            }
             return Err(e);
         }
         Err(_) => {
-            tracing::warn!(peer = %peer, "metrics_http: header read timed out, disconnecting");
+            if log_enabled {
+                tracing::warn!(peer = %peer, "metrics_http: header read timed out, disconnecting");
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "header read timed out",
@@ -200,7 +213,7 @@ async fn handle_request(
         // didn't match. Debug (`?`), not Display, for the same reason the
         // telnet login field uses it: `request_line` is client-supplied
         // and unvalidated.
-        if rejected_request_log_limiter.allow(peer.ip()) {
+        if log_enabled {
             tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
         }
         "404 Not Found"

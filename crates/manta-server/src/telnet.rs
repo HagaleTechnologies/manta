@@ -84,6 +84,34 @@ pub const MAX_TELNET_CONNECTIONS_PER_IP: usize = 16;
 const QUOTA_REJECT_LOG_MAX_PER_WINDOW: u32 = 1;
 const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 
+/// MAN-59 review round 4: rounds 2-3 each found one more individually
+/// un-gated audit-log call site (the quota-reject warning, the 404
+/// warning, a missing task-boundary catch-all) -- a genuinely new shape
+/// of the SAME gap three rounds running, per
+/// `resolve-review-feedback`'s convergence policy's own "reconsider the
+/// fix strategy, not another point patch" signal. Round 4's own finding
+/// makes the underlying issue explicit: `QUOTA_REJECT_LOG_*` above only
+/// covers connections REJECTED for being over quota -- a source that
+/// stays under the concurrent quota by connecting and disconnecting
+/// quickly (e.g. right after the login prompt) was never gated by
+/// anything, and each such cycle unconditionally logs at least a
+/// `connected` and a `disconnected` event. Rather than hunting for and
+/// patching each individual log call in `handle_client` one at a time,
+/// ONE budget is decided once per ADMITTED connection (`serve` below,
+/// same instant the connection is spawned) and threaded through as
+/// `log_enabled` -- every tracing call in that connection's entire
+/// lifetime (connect, login, commands, disconnect, write failures, the
+/// task-boundary catch-all) checks the SAME decision, so a future call
+/// site can't be added without it needing an explicit unrated bypass, and
+/// a source combining several previously-separately-gated event types
+/// can no longer sum their individual budgets. 30 per window (not 1, like
+/// the pure-rejection limiter above) -- unlike a rejection, an admitted
+/// connection is legitimate use by construction, so this only needs to
+/// bound CHURN RATE, not suppress routine multi-connection activity from
+/// one real source (NAT, a monitoring tool).
+const CONNECTION_LOG_MAX_PER_WINDOW: u32 = 30;
+const CONNECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
 #[allow(clippy::too_many_arguments)]
@@ -101,6 +129,9 @@ pub async fn serve(
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(quota_reject_log_limiter.clone());
+    let connection_log_limiter =
+        IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(connection_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -144,6 +175,9 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         let peer_ip = peer.ip();
         let ip_command_limiter = ip_command_limiter.clone();
+        // Decided ONCE per admitted connection -- see
+        // CONNECTION_LOG_MAX_PER_WINDOW's doc comment above.
+        let log_enabled = connection_log_limiter.allow(peer_ip);
         // Tracked in the shared `ClientTasks` registry (not a bare
         // `tokio::spawn`) so a shutdown sequence can genuinely AWAIT this
         // task's completion instead of guessing a fixed grace period
@@ -162,6 +196,7 @@ pub async fn serve(
                 peer,
                 peer_ip,
                 ip_command_limiter,
+                log_enabled,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -169,8 +204,10 @@ pub async fn serve(
             // disconnect path already logs its own specific reason
             // inline -- this is the one catch-all left uncovered without
             // it, and the only place that needs the raw io::Error itself.
-            if let Err(e) = &result {
-                tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+            if log_enabled {
+                if let Err(e) = &result {
+                    tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
+                }
             }
             metrics.dec_telnet_clients();
         });
@@ -180,7 +217,17 @@ pub async fn serve(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "telnet_client",
-    skip(socket, bus, rx, metrics, station_call, shutdown, peer_ip, ip_command_limiter),
+    skip(
+        socket,
+        bus,
+        rx,
+        metrics,
+        station_call,
+        shutdown,
+        peer_ip,
+        ip_command_limiter,
+        log_enabled
+    ),
     fields(peer = %peer)
 )]
 async fn handle_client(
@@ -193,8 +240,11 @@ async fn handle_client(
     peer: std::net::SocketAddr,
     peer_ip: IpAddr,
     ip_command_limiter: IpRateLimiter,
+    log_enabled: bool,
 ) -> std::io::Result<()> {
-    tracing::info!("telnet: client connected");
+    if log_enabled {
+        tracing::info!("telnet: client connected");
+    }
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
 
@@ -202,12 +252,16 @@ async fn handle_client(
     let mut login_line = String::new();
     match read_line_bounded_with_timeout(&mut reader, &mut login_line).await {
         Ok(0) => {
-            tracing::info!("telnet: client disconnected before completing login");
+            if log_enabled {
+                tracing::info!("telnet: client disconnected before completing login");
+            }
             return Ok(());
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+            if log_enabled {
+                tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
+            }
             return Err(e);
         }
     }
@@ -216,7 +270,9 @@ async fn handle_client(
     // unauthenticated client embed CRs/ANSI escapes to forge additional
     // bogus log lines or manipulate terminal output. Debug (`?`) escapes
     // control characters instead.
-    tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
+    if log_enabled {
+        tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
+    }
 
     write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
 
@@ -256,7 +312,9 @@ async fn handle_client(
                             // MAN-59 review round 2: this returns Ok(()),
                             // not Err, so the task-boundary catch-all
                             // never sees it -- log it directly.
-                            tracing::warn!("telnet: spot write failed, disconnecting");
+                            if log_enabled {
+                                tracing::warn!("telnet: spot write failed, disconnecting");
+                            }
                             metrics.record_write_failed(1 + rx.len() as u64);
                             return Ok(());
                         }
@@ -269,7 +327,9 @@ async fn handle_client(
                         // `rx`'s own buffer that this disconnect abandons
                         // too (round-9 review finding).
                         let lost = crate::bus::total_lag_loss(n, &rx);
-                        tracing::warn!(lost, "telnet: client lagged behind broadcast, disconnecting");
+                        if log_enabled {
+                            tracing::warn!(lost, "telnet: client lagged behind broadcast, disconnecting");
+                        }
                         metrics.record_lagged(lost);
                         return Ok(());
                     }
@@ -290,12 +350,16 @@ async fn handle_client(
                 let n = match n {
                     Ok(n) => n,
                     Err(e) => {
-                        tracing::warn!(error = %e, "telnet: command read rejected (oversized/malformed line), disconnecting");
+                        if log_enabled {
+                            tracing::warn!(error = %e, "telnet: command read rejected (oversized/malformed line), disconnecting");
+                        }
                         return Err(e);
                     }
                 };
                 if n == 0 {
-                    tracing::info!("telnet: client disconnected");
+                    if log_enabled {
+                        tracing::info!("telnet: client disconnected");
+                    }
                     return Ok(()); // client disconnected
                 }
                 // Every completed command line counts against the budget,
@@ -309,7 +373,9 @@ async fn handle_client(
                 // full budget on each one, multiplying the intended
                 // per-source rate by however many connections it holds.
                 if !command_limiter.allow() || !ip_command_limiter.allow(peer_ip) {
-                    tracing::warn!("telnet: client exceeded command rate budget, disconnecting");
+                    if log_enabled {
+                        tracing::warn!("telnet: client exceeded command rate budget, disconnecting");
+                    }
                     return Ok(());
                 }
                 // MAN-59 review: a client staying within the rate budget
@@ -323,7 +389,9 @@ async fn handle_client(
                 // which is unescaped and could otherwise inject the same
                 // way the login field could (see the fix just above).
                 let parsed_command = command::parse(&cmd_line);
-                tracing::info!(command = ?parsed_command, "telnet: command received");
+                if log_enabled {
+                    tracing::info!(command = ?parsed_command, "telnet: command received");
+                }
                 match parsed_command {
                     Command::ShowDx { count } => {
                         let n = count.unwrap_or(DEFAULT_SHOW_DX_COUNT);
@@ -356,7 +424,9 @@ async fn handle_client(
                                 // retained on the live channel.
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
-                                tracing::warn!("telnet: sh/dx history write failed, disconnecting");
+                                if log_enabled {
+                                    tracing::warn!("telnet: sh/dx history write failed, disconnecting");
+                                }
                                 metrics.record_write_failed(
                                     1 + history.len() as u64 + rx.len() as u64,
                                 );
@@ -383,7 +453,9 @@ async fn handle_client(
                             // counts here (no `1 +`).
                             // MAN-59 review round 2: returns Ok(()), not
                             // Err -- log it directly.
-                            tracing::warn!("telnet: filter-ack write failed, disconnecting");
+                            if log_enabled {
+                                tracing::warn!("telnet: filter-ack write failed, disconnecting");
+                            }
                             metrics.record_write_failed(rx.len() as u64);
                             return Ok(());
                         }
@@ -429,7 +501,9 @@ async fn handle_client(
                                 // finding).
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
-                                tracing::warn!("telnet: shutdown-drain write failed, disconnecting");
+                                if log_enabled {
+                                    tracing::warn!("telnet: shutdown-drain write failed, disconnecting");
+                                }
                                 metrics.record_write_failed(1 + rx.len() as u64);
                                 return Ok(());
                             }
