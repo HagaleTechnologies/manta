@@ -50,6 +50,10 @@ async fn spawn_server() -> (
             tasks,
             limiter,
             manta_server::tasks::IpQuota::new(manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::telnet::MAX_TELNET_COMMANDS,
+                manta_server::telnet::COMMAND_RATE_WINDOW,
+            ),
         )
         .await;
     });
@@ -574,5 +578,54 @@ async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
     assert_eq!(
         n, 0,
         "expected the connection to close after exceeding the command budget, got: {extra:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_connection_from_the_same_ip_cannot_multiply_the_command_rate_budget() {
+    // MAN-57: the per-connection RateLimiter alone let a source multiply
+    // its effective command rate by opening more connections -- each one
+    // got its own full independent budget. A second connection from the
+    // SAME source IP must draw against the same shared aggregate budget
+    // as the first, not get a fresh one of its own.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader_a, mut wr_a) = connect_and_login(addr).await;
+    let (mut reader_b, mut wr_b) = connect_and_login(addr).await;
+
+    // Connection A alone consumes the ENTIRE shared per-source budget --
+    // each ack proves the command was accepted, well within what a lone
+    // connection's own per-connection budget would also allow.
+    for i in 0..manta_server::telnet::MAX_TELNET_COMMANDS {
+        wr_a.write_all(b"set dx filter unique > 1\r\n")
+            .await
+            .unwrap();
+        let mut ack = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader_a.read_line(&mut ack))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for ack #{i} on connection A"))
+            .unwrap_or_else(|_| panic!("read error waiting for ack #{i} on connection A"));
+        assert!(
+            ack.to_lowercase().contains("filter"),
+            "expected a filter ack within budget on connection A, got: {ack:?}"
+        );
+    }
+
+    // Connection B is a FRESH connection with its own untouched
+    // per-connection RateLimiter, so under the old (per-connection-only)
+    // behavior this command would succeed. It must instead be rejected,
+    // because the shared per-IP budget A already exhausted is checked
+    // too.
+    wr_b.write_all(b"set dx filter unique > 1\r\n")
+        .await
+        .unwrap();
+    let mut extra = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader_b.read_line(&mut extra))
+        .await
+        .expect("server never responded on connection B after the shared budget was exhausted")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "expected connection B to be disconnected once the SHARED per-IP budget \
+         (already exhausted by connection A) was exceeded, got: {extra:?}"
     );
 }

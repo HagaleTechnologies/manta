@@ -58,6 +58,10 @@ async fn spawn_server() -> (
             manta_server::tasks::IpQuota::new(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
             ),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+            ),
         )
         .await;
     });
@@ -410,6 +414,10 @@ async fn websocket_client_receives_spot_as_json_message() {
             manta_server::tasks::IpQuota::new(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
             ),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+            ),
         )
         .await;
     });
@@ -474,6 +482,10 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
             manta_server::tasks::IpQuota::new(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
             ),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+            ),
         )
         .await;
     });
@@ -535,6 +547,10 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
             limiter,
             manta_server::tasks::IpQuota::new(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
             ),
         )
         .await;
@@ -603,6 +619,10 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
             limiter,
             manta_server::tasks::IpQuota::new(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+            ),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
             ),
         )
         .await;
@@ -725,6 +745,10 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
             manta_server::tasks::IpQuota::new(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
             ),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::json_stream::MAX_INBOUND_PINGS,
+                manta_server::json_stream::PING_RATE_WINDOW,
+            ),
         )
         .await;
     });
@@ -758,5 +782,61 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
         Some(Err(_)) => {}                // protocol error surfaced to the client
         Some(Ok(Message::Close(_))) => {} // clean close frame
         other => panic!("expected exceeding the ping budget to end the connection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_second_ws_connection_from_the_same_ip_cannot_multiply_the_ping_rate_budget() {
+    // MAN-57: the per-connection ping_limiter alone let a source multiply
+    // its effective Ping rate by opening more WebSocket connections --
+    // each one got its own full independent budget. A second connection
+    // from the SAME source IP must draw against the same shared aggregate
+    // budget as the first, not get a fresh one of its own.
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, _bus, _metrics, _shutdown_tx) = spawn_server().await;
+
+    let url = format!("ws://{addr}");
+    let (mut ws_a, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect A failed");
+    let (mut ws_b, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect B failed");
+
+    // Connection A alone consumes the ENTIRE shared per-source budget --
+    // each Pong proves the Ping was accepted, well within what a lone
+    // connection's own per-connection budget would also allow.
+    for _ in 0..manta_server::json_stream::MAX_INBOUND_PINGS {
+        ws_a.send(Message::Ping(vec![].into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(5), ws_a.next())
+            .await
+            .expect("timed out waiting for a Pong on connection A")
+            .expect("stream ended before the budget was exhausted on connection A")
+            .expect("ws error before the budget was exhausted on connection A");
+        assert!(
+            matches!(pong, Message::Pong(_)),
+            "expected a Pong reply within budget on connection A, got {pong:?}"
+        );
+    }
+
+    // Connection B is a FRESH connection with its own untouched
+    // per-connection ping_limiter, so under the old (per-connection-only)
+    // behavior this Ping would succeed. It must instead be rejected,
+    // because the shared per-IP budget A already exhausted is checked
+    // too.
+    let _ = ws_b.send(Message::Ping(vec![].into())).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), ws_b.next())
+        .await
+        .expect("connection B never responded after the shared budget was exhausted");
+    match outcome {
+        None => {}                        // connection closed
+        Some(Err(_)) => {}                // protocol error surfaced to the client
+        Some(Ok(Message::Close(_))) => {} // clean close frame
+        other => panic!(
+            "expected connection B to be disconnected once the SHARED per-IP Ping \
+             budget (already exhausted by connection A) was exceeded, got {other:?}"
+        ),
     }
 }
