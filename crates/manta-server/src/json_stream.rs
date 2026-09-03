@@ -496,11 +496,23 @@ async fn handle_tcp_client(
 /// same as `uplink`'s own precedent for pulling policy logic out of an
 /// I/O-bound function.
 fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
-    use tokio_tungstenite::tungstenite::Error as WsError;
-    matches!(
-        e,
-        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8 | WsError::AttackAttempt
-    )
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
+    match e {
+        // MAN-68 (round 8): a peer that drops the raw TCP connection
+        // without sending a WS close frame surfaces as THIS specific
+        // `Protocol` sub-variant, not as `Io`/`ConnectionClosed` --
+        // tungstenite classifies it as a protocol-layer error even though
+        // it's exactly the same routine mobile/NAT/proxy disconnect the
+        // round-7/8 split already carves out for `Io`/`ConnectionClosed`.
+        // A blanket `Protocol(_)` match would still charge every one of
+        // these routine resets to the rejection budget, defeating the
+        // fix's own purpose.
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => false,
+        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8 | WsError::AttackAttempt => {
+            true
+        }
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,6 +785,19 @@ mod tests {
         assert!(!is_ws_protocol_violation(&WsError::AlreadyClosed));
         assert!(!is_ws_protocol_violation(&WsError::Io(
             std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer")
+        )));
+    }
+
+    /// MAN-68, PR #85 review round 8: a peer that drops the raw TCP
+    /// connection without a WS close frame surfaces as this SPECIFIC
+    /// `Protocol` sub-variant, not `Io`/`ConnectionClosed` -- a blanket
+    /// `Protocol(_)` match (this function's first version) would still
+    /// misclassify it as a rejection, letting routine disconnects exhaust
+    /// the budget the round-7/8 split exists to protect.
+    #[test]
+    fn reset_without_closing_handshake_is_not_classified_as_a_violation() {
+        assert!(!is_ws_protocol_violation(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
         )));
     }
 }
