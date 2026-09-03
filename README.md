@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/HagaleTechnologies/manta/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/HagaleTechnologies/manta/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/HagaleTechnologies/manta/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/HagaleTechnologies/manta"></a>
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg">
   <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
 </p>
@@ -36,6 +37,33 @@ testing. It runs almost entirely on **CW Skimmer**, a closed-source,
 Windows-only program maintained by a single author. That is a single point of
 failure for a shared resource. `manta` is an open, cross-platform replacement
 with documented, testable algorithms.
+
+## Installation
+
+No Rust toolchain, no cloning the source. Pick one:
+
+**Download a prebuilt binary** from the [Releases
+page](https://github.com/HagaleTechnologies/manta/releases) — macOS
+(Intel or Apple Silicon), Windows, or Linux (x86_64 or arm64, including
+Raspberry Pi OS 64-bit). Unpack the archive and run the `manta` binary
+inside it.
+
+**Or run the Docker image** (works anywhere Docker does, `linux/amd64` and
+`linux/arm64`):
+
+```sh
+docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
+```
+
+Both are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
+directly from each tagged release's commit — every published binary
+traces to a specific, auditable source revision.
+
+**Building from source** (if you're developing manta itself, or need a
+platform/feature combination the release matrix doesn't cover — the
+`soapy` feature below, for instance, isn't in the official release
+binaries since it needs the SoapySDR system library) still works exactly
+as before, and is what the rest of this Quickstart assumes:
 
 ## Quickstart
 

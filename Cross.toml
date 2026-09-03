@@ -1,0 +1,16 @@
+# Cross-compilation config for `cross` (cross-rs), used by
+# .github/workflows/release.yml for the aarch64-unknown-linux-gnu target.
+#
+# `cpal` (live audio input, crates/manta-input) is an unconditional
+# dependency -- not behind any feature flag -- and its Linux backend links
+# against ALSA (`libasound2-dev`) at build time. cross-rs's default
+# aarch64-unknown-linux-gnu image doesn't ship that header/lib for the
+# target architecture, so it has to be installed for the target arch
+# (arm64) specifically, not the host's own (amd64), inside the build
+# container before cargo ever runs.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install --assume-yes libasound2-dev:arm64",
+]

@@ -1,0 +1,195 @@
+name: Release
+
+# MAN-21: a tagged release (v*) publishes a GitHub Release with a prebuilt
+# `manta` binary for every committed platform, built from that exact
+# tagged commit, plus a multi-arch Docker image pushed to GHCR.
+#
+# `workflow_dispatch` exists so the full build matrix can be exercised
+# (and verified against real CI, not guessed at) from a branch/PR before
+# any real version tag is ever pushed -- it never creates a GitHub
+# Release or pushes a Docker tag unless `publish` is explicitly set.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a GitHub Release and push the Docker image (leave off to just build and verify)'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: manta
+
+# One release run per tag/dispatch; never cancel a real tag's build
+# because a later manual dispatch happened to fire (each dispatch run
+# gets its own group via run_id, tags key on the ref).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS x86_64: macos-13 is GitHub's last Intel runner --
+          # native build, no cross-compilation needed.
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: manta-macos-x86_64
+          # macOS arm64: macos-14+ runners are Apple Silicon natively.
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: manta-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: manta-windows-x86_64
+            exe_ext: .exe
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: manta-linux-x86_64
+          # Linux arm64: covers Raspberry Pi OS 64-bit and other ARM
+          # SBCs. Cross-compiled via `cross` (cross-rs) rather than a
+          # native runner -- GitHub has no arm64 Linux hosted runner in
+          # this repo's plan, and `cross` handles the ALSA
+          # (cpal's Linux backend, an unconditional dependency of
+          # manta-input) cross-linking via Cross.toml's pre-build hook.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: manta-linux-arm64
+            use_cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - if: runner.os == 'Linux' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      # `soapy` is deliberately excluded from every release binary in this
+      # matrix -- it links against the SoapySDR system library, which
+      # doesn't have a straightforward statically-linked or vendored
+      # cross-compilation story across 5 targets. Operators who need it
+      # build from source with --features soapy (unchanged, documented in
+      # README). `hpsdr` has no native-library dependency at all (pure
+      # UDP/std, see crates/manta-input/src/hpsdr.rs's own module docs)
+      # so it's safe and directly relevant (MAN-21's own motivating
+      # George/K5TR conversation is an HPSDR use case) to always enable.
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="dist/${{ matrix.artifact }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.exe_ext }}" "$dist/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dist/" 2>/dev/null || cp README.md "$dist/"
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $dist
+          Copy-Item README.md $dist
+          if (Test-Path LICENSE-MIT) { Copy-Item LICENSE-MIT $dist }
+          if (Test-Path LICENSE-APACHE) { Copy-Item LICENSE-APACHE $dist }
+          Compress-Archive -Path $dist -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Determine version tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dispatch-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' || inputs.publish
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' || inputs.publish }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+
+  release:
+    needs: [build, docker]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: find dist -type f
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
