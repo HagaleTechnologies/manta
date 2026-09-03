@@ -159,19 +159,32 @@ appropriate, without needing the harder cross-node reconciliation
 hasn't solved.
 
 **Correction (review round 1, chatgpt-codex-connector): MAN-29 alone is
-not sufficient for every source pair.** MAN-29 only *scales/corrects* an
-already-RF-referenced frequency value — it has nothing to put a source
-into a shared frequency coordinate system with if that source has no RF
-reference at all. `AudioIqSource::center_freq_hz()` always returns `0.0`
-(confirmed in the capability matrix as **MAN-34**'s gap, not MAN-29's) — an
-audio-input source reports baseband tone frequencies, not absolute RF Hz.
-Cross-source frequency matching between an audio source and any
-RF-referenced source (SDR/HPSDR/Kiwi) is **not possible at all** until
-MAN-34 lands, regardless of MAN-29's calibration correction. **MAN-16
-should either explicitly depend on MAN-34 for audio-source participation,
-or explicitly exclude unreferenced audio sources from cross-source dedup**
-— this needs a stated decision, not an assumption that MAN-29 alone
-resolves inter-source frequency alignment for every source type.
+not sufficient for every source pair — but this was itself over-corrected
+in that same round.** MAN-29 only *scales/corrects* an already-RF-referenced
+frequency value — it has nothing to put a source into a shared frequency
+coordinate system with if that source has no RF reference at all, and
+`AudioIqSource::center_freq_hz()` does always return `0.0` on its own.
+
+**Further correction (review round 2): "not possible at all until MAN-34"
+overstated the blocker.** `manta-cli` already has a working mechanism for
+exactly this, today: `--dial-freq-hz` wraps any non-RF-aware source
+(`crates/manta-cli/src/main.rs`'s `FixedCenterFreqSource`, confirmed by
+reading the current source) to report a fixed absolute RF center —
+verified via `main.rs`: it's already *required* whenever `--server-config`
+is used with a source that isn't otherwise RF-aware
+(`!has_rf_aware_source && dial_freq_hz.is_none()` at the CLI-argument
+validation site). MAN-34 (per the capability matrix) is about the built-in
+`listen`/`listen --device` command path specifically not having its own
+frequency flag — a narrower, already-partially-solved problem, not "audio
+sources have no path to an RF reference at all."
+
+**Corrected conclusion:** cross-source frequency matching against an audio
+source is possible today, provided that source's config carries a
+`--dial-freq-hz`-equivalent reference. MAN-16 doesn't need to depend on
+MAN-34 at all — it needs MAN-13's per-source configuration surface to
+carry (and, matching the existing CLI's own validation pattern, require)
+an RF reference for any source that isn't already RF-aware, the same
+requirement `--server-config` already enforces today for a single source.
 
 ### Correction 2 — retracted: manta's own `Dedupe` already IS the mechanism the community's ~10-minute figure describes; there is no external jitter to route around
 
@@ -296,6 +309,44 @@ surfaces the gap but the choice depends on the same upstream-vs-downstream
 question the next section covers, so it shouldn't be decided in isolation
 from that one.
 
+### Cross-source arrival order needs a deterministic tie-break (found in review round 2)
+
+Even with the normalized shared time basis from the previous gap, sources
+feeding a shared deduper via MAN-13 can still reach it in
+scheduler-dependent order when their real-world timestamps are equal or
+close — file-backed sources especially, since nothing about MAN-13's
+combination model as scoped so far guarantees one source's spot for a
+given instant is always processed before another's. This interacts badly
+with two things `Dedupe::should_emit` already does today, silently, per
+call order:
+
+- **The 6 dB SNR override is asymmetric.** A low-SNR report followed by a
+  high-SNR report for the same (callsign, frequency bucket, window) emits
+  twice (the second clears the override threshold); the *same two reports
+  in the opposite order* emit only once (the second, lower-SNR one, never
+  clears +6 dB over the first). Two runs of the identical recorded
+  multi-source input, differing only in which source's thread happened to
+  win a scheduling race, could legitimately produce different spot counts.
+- **Even without the override firing, the first-arriving report determines
+  the *emitted* frequency and SNR** — `should_emit` records whatever
+  arrived first as `LastSpot`. Two sources reporting slightly different
+  SNR (real, expected — different receivers/antennas hear a signal
+  differently) for what dedup treats as "the same" spot would non-
+  deterministically decide which SNR value ships, depending on arrival
+  order alone.
+
+Both directly threaten the replay-determinism requirement this document's
+own "shared time basis" gap already invokes (`SPEC-decode-core.md` §6,
+`dedupe.rs`'s own module doc). **MAN-16 needs a stable, deterministic
+cross-source ordering and tie-break rule** — e.g. sort by the normalized
+timestamp first, then by a fixed source identity/index as an explicit
+secondary key for exact ties — not an assumption that "arrives in some
+order" is good enough once multiple sources are involved. This is a
+second, independent design gap from the override-interaction question
+above (that one is "should overrides apply across sources at all," this
+one is "given that they might, what breaks the tie") — both need answers,
+neither substitutes for the other.
+
 ## Design question this spike surfaces but does not resolve
 
 ### Should manta dedup its own multi-source spots upstream at all?
@@ -369,9 +420,10 @@ multi-operator-multi-process case the RBN community objects to") rather
 than silently proceeding as if the objection doesn't exist. This doesn't
 block MAN-16 on its own — but combined with the integration gaps above
 (shared time basis, bucket-vs-tolerance decision, override interaction,
-MAN-34 dependency for audio sources), the matching *algorithm's overall
-shape* is validated while several concrete implementation questions remain
-genuinely open, not just this one. The *decision to consolidate at all*
+per-source RF-reference requirement, cross-source ordering/tie-break), the
+matching *algorithm's overall shape* is validated while several concrete
+implementation questions remain genuinely open, not just this one. The
+*decision to consolidate at all*
 (versus relying on MAN-14's per-source attribution instead, or offering
 both as a config choice) deserves a stated rationale in MAN-16's own spec,
 not silence — same as the others.
@@ -380,8 +432,10 @@ not silence — same as the others.
 
 1. **Frequency drift across sources** — addressed by Correction 1 above:
    not the wider RBN's unsolved cross-node problem; scoped to manta's own
-   *RF-referenced* sources (MAN-34 dependency noted above for audio
-   sources specifically), which MAN-29's calibration correction targets. A
+   *RF-referenced* sources (every source, once MAN-13's per-source config
+   carries a `--dial-freq-hz`-equivalent reference for whichever ones
+   aren't already RF-aware — no MAN-34 dependency, see the corrected
+   Correction 1 above), which MAN-29's calibration correction targets. A
    fixed tolerance in the 100–300 Hz range (SkimCon/WintelnetX-validated
    order of magnitude) is appropriate for post-calibration inputs — whether
    that's implemented as true distance-tolerance matching or as a
@@ -427,9 +481,10 @@ not silence — same as the others.
 - MAN-16 remains blocked until this ticket reaches Done, per its own
   invariant scenario — this doc is that closure, but MAN-16's own spec
   still needs a real update before implementation: the corrections above
-  (frequency drift scoping + MAN-34 dependency, the retracted
-  suppression-window change, bucket-vs-tolerance), the two integration
-  gaps (shared time basis, override interaction), and an explicit
-  answer to the design question) before it's picked up for implementation.
-  Filing that spec update is MAN-16's own next step, not a new ticket from
-  this one — MAN-53's job was validation, not rewriting MAN-16.
+  (frequency drift scoping + per-source RF-reference requirement, the
+  retracted suppression-window change, bucket-vs-tolerance), the three
+  integration gaps (shared time basis, override interaction, cross-source
+  ordering/tie-break), and an explicit answer to the design question)
+  before it's picked up for implementation. Filing that spec update is
+  MAN-16's own next step, not a new ticket from this one — MAN-53's job
+  was validation, not rewriting MAN-16.
