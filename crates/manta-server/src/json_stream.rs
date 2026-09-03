@@ -196,8 +196,7 @@ pub async fn serve(
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
                 let _ =
-                    handle_ws_client(socket, rx, ctx.clone(), peer, peer_ip, ip_ping_limiter)
-                        .await;
+                    handle_ws_client(socket, rx, ctx.clone(), peer, peer_ip, ip_ping_limiter).await;
                 ctx.metrics.dec_ws_clients();
             } else {
                 ctx.metrics.inc_json_clients();
@@ -367,7 +366,11 @@ async fn handle_tcp_client(
     }
 }
 
-#[tracing::instrument(name = "ws_client", skip(socket, rx, ctx), fields(peer = %peer))]
+#[tracing::instrument(
+    name = "ws_client",
+    skip(socket, rx, ctx, ip_ping_limiter),
+    fields(peer = %peer)
+)]
 async fn handle_ws_client(
     socket: TcpStream,
     mut rx: broadcast::Receiver<BusSpot>,

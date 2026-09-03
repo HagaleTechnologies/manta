@@ -155,7 +155,7 @@ pub async fn serve(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "telnet_client",
-    skip(socket, bus, rx, metrics, station_call, shutdown),
+    skip(socket, bus, rx, metrics, station_call, shutdown, ip_command_limiter),
     fields(peer = %peer)
 )]
 async fn handle_client(
