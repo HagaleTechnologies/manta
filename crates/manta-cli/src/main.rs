@@ -790,7 +790,16 @@ fn start_spot_server(
     // below are logged at `info`/`warn`, so an operator gets useful
     // output with zero configuration, and can raise verbosity for deeper
     // debugging without a code change.
+    //
+    // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
+    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
+    // byte-identical spot logs" hard requirement means any interleaved
+    // non-JSON tracing line corrupts that machine-readable stream for
+    // real consumers and breaks deterministic-replay byte-identity.
+    // stderr is a separate stream a JSON-Lines consumer never reads.
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
