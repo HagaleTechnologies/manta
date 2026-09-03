@@ -124,6 +124,27 @@ pub struct ServerConfig {
     /// are separate, per-listener fields.
     #[serde(default)]
     pub metrics_max_connections_per_ip: Option<usize>,
+    /// Overrides the telnet listener's per-source-IP AGGREGATE command
+    /// rate budget (MAN-57) -- separate from `telnet_max_connections_per_ip`
+    /// above, which bounds concurrent connections, not command rate.
+    /// `None` (default, field omitted) uses the built-in default
+    /// (`telnet::MAX_TELNET_COMMANDS` per `telnet::COMMAND_RATE_WINDOW`).
+    /// `0` means no per-IP aggregate cap (only each connection's own
+    /// per-connection budget still applies). Needed for the same
+    /// reverse-proxy deployment `json_max_connections_per_ip` documents:
+    /// see `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
+    #[serde(default)]
+    pub telnet_max_commands_per_ip: Option<u32>,
+    /// Overrides the JSON/WS listener's per-source-IP AGGREGATE Ping rate
+    /// budget (MAN-57) -- separate from `json_max_connections_per_ip`
+    /// above, which bounds concurrent connections, not Ping rate. `None`
+    /// (default, field omitted) uses the built-in default
+    /// (`json_stream::MAX_INBOUND_PINGS` per `json_stream::PING_RATE_WINDOW`).
+    /// `0` means no per-IP aggregate cap (only each connection's own
+    /// per-connection budget still applies). See
+    /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
+    #[serde(default)]
+    pub json_max_pings_per_ip: Option<u32>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -256,6 +277,32 @@ mod tests {
         assert_eq!(cfg.telnet_max_connections_per_ip, None);
         assert_eq!(cfg.json_max_connections_per_ip, Some(0));
         assert_eq!(cfg.metrics_max_connections_per_ip, None);
+    }
+
+    /// MAN-57: separate from the per-IP connection quota above --
+    /// `telnet_max_commands_per_ip`/`json_max_pings_per_ip` override the
+    /// per-IP AGGREGATE rate budget, not the connection count. Independent
+    /// fields for the same reason the connection quota overrides are.
+    #[test]
+    fn per_ip_rate_overrides_default_to_none_and_are_independent() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.telnet_max_commands_per_ip, None);
+        assert_eq!(cfg.json_max_pings_per_ip, None);
+
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            json_max_pings_per_ip = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.telnet_max_commands_per_ip, None);
+        assert_eq!(cfg.json_max_pings_per_ip, Some(0));
     }
 
     #[test]
