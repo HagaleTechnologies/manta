@@ -9,8 +9,10 @@ use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
+use crate::rate_limit::IpRateLimiter;
 use crate::rbn;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -59,6 +61,17 @@ pub const MAX_TELNET_CONNECTIONS: usize = 512;
 /// sources to exhaust the full 512-connection ceiling.
 pub const MAX_TELNET_CONNECTIONS_PER_IP: usize = 16;
 
+// MAN-57: `command_limiter` below is per-CONNECTION, so a source opening
+// several connections (up to `MAX_TELNET_CONNECTIONS_PER_IP`) gets that
+// many independent full command budgets -- the aggregate effective rate
+// from one IP is up to 16x the intended single-connection budget, not the
+// budget itself. `serve`'s `ip_command_limiter` parameter below is a
+// shared, IP-keyed sibling checked in addition to each connection's own,
+// using the SAME budget: the intent (from
+// `MAX_TELNET_COMMANDS`/`COMMAND_RATE_WINDOW`'s own reasoning) was always
+// "this many commands per source in this window", not "per connection" --
+// opening more connections must not multiply it.
+
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
 #[allow(clippy::too_many_arguments)]
@@ -71,6 +84,7 @@ pub async fn serve(
     tasks: ClientTasks,
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
+    ip_command_limiter: IpRateLimiter,
 ) {
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -111,6 +125,8 @@ pub async fn serve(
         let metrics = metrics.clone();
         let station_call = station_call.clone();
         let shutdown = shutdown.clone();
+        let peer_ip = peer.ip();
+        let ip_command_limiter = ip_command_limiter.clone();
         // Tracked in the shared `ClientTasks` registry (not a bare
         // `tokio::spawn`) so a shutdown sequence can genuinely AWAIT this
         // task's completion instead of guessing a fixed grace period
@@ -127,6 +143,8 @@ pub async fn serve(
                 station_call,
                 shutdown,
                 peer,
+                peer_ip,
+                ip_command_limiter,
             )
             .await;
             metrics.dec_telnet_clients();
@@ -148,6 +166,8 @@ async fn handle_client(
     station_call: String,
     mut shutdown: watch::Receiver<bool>,
     peer: std::net::SocketAddr,
+    peer_ip: IpAddr,
+    ip_command_limiter: IpRateLimiter,
 ) -> std::io::Result<()> {
     tracing::info!("telnet: client connected");
     let (rd, mut wr) = socket.into_split();
@@ -249,7 +269,12 @@ async fn handle_client(
                 // still costs a parse + a select! iteration) -- an
                 // unlimited sequence of e.g. `sh/dx/50` is real CPU/
                 // bandwidth work, not free (round-14 review finding).
-                if !command_limiter.allow() {
+                // Checked in addition to (never instead of) the
+                // per-connection budget above -- MAN-57: without this, a
+                // source opening several connections gets an independent
+                // full budget on each one, multiplying the intended
+                // per-source rate by however many connections it holds.
+                if !command_limiter.allow() || !ip_command_limiter.allow(peer_ip) {
                     tracing::warn!("telnet: client exceeded command rate budget, disconnecting");
                     return Ok(());
                 }

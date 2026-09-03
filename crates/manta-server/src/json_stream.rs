@@ -9,9 +9,11 @@
 
 use crate::bus::{BusSpot, SpotBus};
 use crate::metrics::Metrics;
+use crate::rate_limit::IpRateLimiter;
 use crate::spot_message::SpotMessage;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
 use manta_spot::cty::Table;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
@@ -76,6 +78,15 @@ pub const MAX_JSON_STREAM_CONNECTIONS: usize = 512;
 /// `telnet::MAX_TELNET_CONNECTIONS_PER_IP`.
 pub const MAX_JSON_STREAM_CONNECTIONS_PER_IP: usize = 16;
 
+// MAN-57: `ping_limiter` inside `handle_ws_client` is per-CONNECTION, so a
+// source opening several connections (up to
+// `MAX_JSON_STREAM_CONNECTIONS_PER_IP`) gets that many independent full
+// Ping budgets. `serve`'s `ip_ping_limiter` parameter below is a shared
+// sibling checked in addition to each connection's own budget, using the
+// same `MAX_INBOUND_PINGS`/`PING_RATE_WINDOW` values -- the intent was
+// always "this many Pings per source", not "per connection". Same fix and
+// reasoning as `telnet::serve`'s `ip_command_limiter`.
+
 /// Everything a per-connection handler needs besides the socket and its
 /// broadcast subscription -- grouped so `handle_tcp_client`/
 /// `handle_ws_client` stay at a sane arity as this crate's shared-context
@@ -127,6 +138,7 @@ pub async fn serve(
     tasks: ClientTasks,
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
+    ip_ping_limiter: IpRateLimiter,
 ) {
     let ctx = ClientCtx {
         bus: config.bus,
@@ -172,6 +184,8 @@ pub async fn serve(
         // same fix applied to the telnet accept path below).
         let rx = ctx.bus.subscribe();
         let ctx = ctx.clone();
+        let peer_ip = peer.ip();
+        let ip_ping_limiter = ip_ping_limiter.clone();
         // Tracked in the shared `ClientTasks` registry (not a bare
         // `tokio::spawn`) so a shutdown sequence can genuinely AWAIT this
         // task's completion instead of guessing a fixed grace period
@@ -181,7 +195,9 @@ pub async fn serve(
             let _ip_guard = ip_guard; // held for the connection's lifetime
             if looks_like_websocket_handshake(&socket).await {
                 ctx.metrics.inc_ws_clients();
-                let _ = handle_ws_client(socket, rx, ctx.clone(), peer).await;
+                let _ =
+                    handle_ws_client(socket, rx, ctx.clone(), peer, peer_ip, ip_ping_limiter)
+                        .await;
                 ctx.metrics.dec_ws_clients();
             } else {
                 ctx.metrics.inc_json_clients();
@@ -357,6 +373,8 @@ async fn handle_ws_client(
     mut rx: broadcast::Receiver<BusSpot>,
     mut ctx: ClientCtx,
     peer: std::net::SocketAddr,
+    peer_ip: IpAddr,
+    ip_ping_limiter: IpRateLimiter,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
@@ -429,7 +447,13 @@ async fn handle_ws_client(
                         // a well-behaved long-running client just for
                         // staying connected a long time (round-14 review
                         // finding).
-                        if !ping_limiter.allow() {
+                        // Checked in addition to (never instead of) the
+                        // per-connection budget above -- MAN-57: without
+                        // this, a source opening several connections gets
+                        // an independent full Ping budget on each one,
+                        // multiplying the intended per-source rate by
+                        // however many connections it holds.
+                        if !ping_limiter.allow() || !ip_ping_limiter.allow(peer_ip) {
                             tracing::warn!("json_stream: client exceeded Ping rate budget, disconnecting");
                             return Ok(());
                         }

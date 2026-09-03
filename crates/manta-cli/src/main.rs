@@ -822,6 +822,12 @@ fn start_spot_server(
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
 
+        let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+            manta_server::telnet::MAX_TELNET_COMMANDS,
+            manta_server::telnet::COMMAND_RATE_WINDOW,
+            cfg.telnet_max_commands_per_ip,
+        );
+        manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
         tokio::spawn(manta_server::telnet::serve(
             telnet_listener,
             bus.clone(),
@@ -836,7 +842,14 @@ fn start_spot_server(
                 manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
                 cfg.telnet_max_connections_per_ip,
             ),
+            telnet_ip_command_limiter,
         ));
+        let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+            manta_server::json_stream::MAX_INBOUND_PINGS,
+            manta_server::json_stream::PING_RATE_WINDOW,
+            cfg.json_max_pings_per_ip,
+        );
+        manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
         tokio::spawn(manta_server::json_stream::serve(
             json_listener,
             manta_server::json_stream::JsonStreamConfig {
@@ -858,6 +871,7 @@ fn start_spot_server(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
                 cfg.json_max_connections_per_ip,
             ),
+            json_ip_ping_limiter,
         ));
         // Reaps completed per-client tasks continuously, independent of
         // shutdown -- without this, `tasks` only ever shrinks at
