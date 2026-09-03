@@ -5,18 +5,47 @@
 //! format and this repo's own reference implementation of that protocol
 //! from the server side.
 
+use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::config::RbnUplinkConfig;
 use crate::metrics::Metrics;
+use crate::rate_limit::RateLimiter;
 use crate::rbn;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Bounds `TcpStream::connect` (MAN-58 comment finding 1): a target that
+/// silently black-holes SYNs (e.g. a firewall drop, not a refusal) would
+/// otherwise leave this attempt pending for the OS's own connect timeout
+/// (commonly minutes), blocking shutdown the whole time -- this attempt
+/// is additionally raced against `shutdown.changed()` below, but the
+/// timeout still bounds worst-case time when shutdown never fires.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Every outbound write to the uplink target gets this long before being
+/// treated as stalled (MAN-58 comment finding 2) -- matches `telnet.rs`'s
+/// identical `WRITE_TIMEOUT` for the same class of risk on the inbound
+/// side: a target that completes login but stops reading (TCP receive
+/// window fills, then the local send buffer fills) must not block this
+/// task indefinitely.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Response-line rate budget for the target's post-login discard read
+/// (MAN-58 comment finding 3): RBN's collection server isn't expected to
+/// send anything meaningful back after login, but with no budget at all
+/// a misbehaving, compromised, or MITM'd target sending an endless stream
+/// of short, valid, newline-terminated lines would keep this task hot
+/// indefinitely with no CPU/bandwidth bound -- mirrors `telnet.rs`'s
+/// `MAX_TELNET_COMMANDS`/`COMMAND_RATE_WINDOW` budget for the same class
+/// of risk on the inbound side. A RATE, not a lifetime total: a
+/// long-running connection where the target occasionally sends a stray
+/// line must never be disconnected just for staying connected a long
+/// time.
+const MAX_TARGET_RESPONSE_LINES: u32 = 30;
+const TARGET_RESPONSE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Whether a connection attempt got far enough to matter for backoff:
 /// a connection that completed login before dropping was healthy, so the
@@ -96,9 +125,31 @@ async fn connect_and_forward(
     metrics: &Arc<Metrics>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), ConnectAttemptError> {
-    let stream = TcpStream::connect((config.target_host.as_str(), config.target_port))
-        .await
-        .map_err(|_| ConnectAttemptError::NeverConnected)?;
+    // Raced against shutdown, not just time-bounded (MAN-58 comment
+    // finding 1): a target that silently black-holes SYNs would otherwise
+    // block shutdown for up to CONNECT_TIMEOUT even when shutdown fires
+    // immediately. Looping rather than a single select arm: cancelling and
+    // retrying a half-open `connect()` attempt has no partial state to
+    // lose (unlike a buffered line read), so a spurious `changed()` wakeup
+    // with `*shutdown.borrow() == false` just tries the connect again.
+    let stream = loop {
+        tokio::select! {
+            result = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                TcpStream::connect((config.target_host.as_str(), config.target_port)),
+            ) => {
+                match result {
+                    Ok(Ok(stream)) => break stream,
+                    Ok(Err(_)) | Err(_) => return Err(ConnectAttemptError::NeverConnected),
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    };
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
 
@@ -107,12 +158,30 @@ async fn connect_and_forward(
     // must not be lost to the broadcast channel's no-history semantics.
     let mut rx = bus.subscribe();
 
+    // Bounded (MAX_LINE_BYTES cap, via bounded_io) AND raced against
+    // shutdown (MAN-58 finding 1): the prior bare `.await` had neither --
+    // a target that accepted the connection but never sent a line hung
+    // this task indefinitely and ignored shutdown signals. Looping, not a
+    // single select arm: `read_line_bounded`'s own contract guarantees
+    // bytes already consumed survive a losing race un-cleared in
+    // `prompt_line`, so a spurious `changed()` wakeup with
+    // `*shutdown.borrow() == false` resumes the same line rather than
+    // losing progress.
     let mut prompt_line = String::new();
-    reader
-        .read_line(&mut prompt_line)
-        .await
-        .map_err(|_| ConnectAttemptError::NeverConnected)?;
-    wr.write_all(format!("{login_callsign}\r\n").as_bytes())
+    loop {
+        tokio::select! {
+            result = read_line_bounded_with_timeout(&mut reader, &mut prompt_line) => {
+                result.map_err(|_| ConnectAttemptError::NeverConnected)?;
+                break;
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    write_with_timeout(&mut wr, format!("{login_callsign}\r\n").as_bytes())
         .await
         .map_err(|_| ConnectAttemptError::NeverConnected)?;
 
@@ -150,6 +219,8 @@ async fn forward_loop(
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut discard = String::new();
+    let mut response_limiter =
+        RateLimiter::new(MAX_TARGET_RESPONSE_LINES, TARGET_RESPONSE_RATE_WINDOW);
     loop {
         tokio::select! {
             recv = rx.recv() => {
@@ -161,7 +232,7 @@ async fn forward_loop(
                         }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
                         let line = rbn::format_line(&bus_spot.spot, spotter_call, unix_ts);
-                        wr.write_all(format!("{line}\r\n").as_bytes()).await?;
+                        write_with_timeout(wr, format!("{line}\r\n").as_bytes()).await?;
                         metrics.record_uplink_sent();
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -171,15 +242,38 @@ async fn forward_loop(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            read_result = reader.read_line(&mut discard) => {
-                match read_result? {
-                    0 => {
+            // Bounded via bounded_io (MAN-58 finding 2): an unterminated
+            // long line from the remote used to grow `discard` without
+            // bound while this read was pending. No idle timeout here,
+            // unlike the login-prompt read -- this branch is already
+            // covered by the surrounding `select!`'s shutdown race, and
+            // this connection is expected to sit quietly with nothing to
+            // read for long stretches (a live spot uplink, not a
+            // request/response protocol), matching telnet.rs's own
+            // established/logged-in-client read (round-5 review finding
+            // there against reusing the timed variant post-login).
+            read_result = read_line_bounded(reader, &mut discard) => {
+                match read_result {
+                    Ok(0) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionReset,
                             "RBN uplink target closed the connection",
                         ));
                     }
-                    _ => discard.clear(), // unexpected but harmless input; ignore and keep going
+                    Ok(_) => {
+                        discard.clear();
+                        // Every completed response line counts against
+                        // the budget (MAN-58 comment finding 3), whether
+                        // or not the target was expected to send it --
+                        // an unbounded stream of otherwise-harmless lines
+                        // is still unbounded CPU/bandwidth work.
+                        if !response_limiter.allow() {
+                            return Err(std::io::Error::other(
+                                "RBN uplink target exceeded the response-line rate budget",
+                            ));
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             _ = shutdown.changed() => {
@@ -189,6 +283,17 @@ async fn forward_loop(
             }
         }
     }
+}
+
+/// `wr.write_all` bounded by `WRITE_TIMEOUT` (MAN-58 comment finding 2),
+/// matching `telnet.rs`'s identically-named helper for the inbound side.
+async fn write_with_timeout(
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    buf: &[u8],
+) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "uplink write timed out"))?
 }
 
 #[cfg(test)]

@@ -271,6 +271,100 @@ async fn shutdown_signal_stops_the_reconnect_loop_without_a_new_attempt() {
     );
 }
 
+/// MAN-58 finding 1: a target that accepts the connection but never sends
+/// a login prompt line used to hang this task's `read_line` indefinitely
+/// and ignore shutdown. The bounded, shutdown-raced replacement must
+/// close the connection promptly once shutdown fires, even mid-wait.
+#[tokio::test]
+async fn shutdown_signal_interrupts_a_hanging_login_prompt_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (socket, _peer) = listener.accept().await.unwrap();
+    let (rd, _wr) = socket.into_split();
+    let mut reader = BufReader::new(rd);
+    // Deliberately never send a login prompt.
+
+    let _ = harness.shutdown_tx.send(true);
+
+    let mut buf = String::new();
+    let read_result = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut buf))
+        .await
+        .expect(
+            "uplink did not close the connection promptly after shutdown while \
+             still waiting on the login prompt",
+        );
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "expected EOF (client closed) after shutdown, not more data"
+    );
+}
+
+/// MAN-58 finding 2: an unterminated response line from the target past
+/// `bounded_io`'s length cap used to grow the discard buffer without
+/// bound. It must instead be rejected, tearing down the connection (and
+/// therefore triggering the normal reconnect/backoff path) rather than
+/// hanging or leaking memory.
+#[tokio::test]
+async fn an_oversized_unterminated_response_line_forces_a_reconnect_instead_of_hanging() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, _reader, mut wr) = mock_rbn_accept_and_login(&listener).await;
+
+    // Past bounded_io::MAX_LINE_BYTES (1024), no newline.
+    wr.write_all(&vec![b'A'; 2000]).await.unwrap();
+
+    let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.metrics.uplink_reconnects_total() < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconnected.is_ok(),
+        "an oversized unterminated response line must force a reconnect, not hang forever"
+    );
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-58 comment finding 3: with no rate budget on the target's post-
+/// login response reads, a misbehaving or MITM'd target sending an
+/// endless stream of short, valid, newline-terminated lines could keep
+/// the uplink task hot indefinitely. A flood past the budget must instead
+/// tear the connection down.
+#[tokio::test]
+async fn a_flood_of_short_response_lines_past_the_rate_budget_forces_a_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, _reader, mut wr) = mock_rbn_accept_and_login(&listener).await;
+
+    // Comfortably past the response-line rate budget within one window --
+    // individually harmless lines, unbounded only in aggregate.
+    for _ in 0..40 {
+        wr.write_all(b"noise\r\n").await.unwrap();
+    }
+
+    let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.metrics.uplink_reconnects_total() < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconnected.is_ok(),
+        "a flood of response lines past the rate budget must force a reconnect"
+    );
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
 #[tokio::test]
 async fn disabled_uplink_makes_no_connection_attempt() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
