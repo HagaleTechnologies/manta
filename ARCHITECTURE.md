@@ -331,6 +331,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   production daemon run reports a constant `0`, not a real track count.
   Listed separately from the "currently-implemented" set above so an
   operator doesn't read a served-but-frozen placeholder as live data.
+  **`manta_source_health` is one-sided** (corrected 2026-09-03, review
+  round 7, filed as **MAN-64**): the only production call site
+  (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
+  on a later failure, and a fatal source read tears the daemon down
+  instead. It's a startup-success marker, not live health reporting —
+  don't read it as the latter until MAN-64 either wires real transitions
+  or this note is the accepted-permanent behavior.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
