@@ -294,6 +294,55 @@ async fn a_websocket_handshake_arriving_slower_than_the_old_peek_timeout_is_stil
 }
 
 #[tokio::test]
+async fn a_websocket_handshake_flooded_past_65536_bytes_is_rejected_not_buffered_forever() {
+    // MAN-63: verified against tungstenite 0.26.2's actual handshake
+    // internals (handshake::machine::AttackCheck) that every server
+    // handshake -- including ours via accept_async_with_config, which has
+    // no size-bound knob of its own in WebSocketConfig -- is already
+    // capped at 65536 cumulative bytes before the request line/headers
+    // complete, independent of our own HANDSHAKE_TIMEOUT. A client that
+    // never sends the terminating blank line must be disconnected once
+    // that cap is crossed, not held open buffering forever up to the 10s
+    // timeout.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    // Header lines that never terminate the request (no blank CRLFCRLF),
+    // comfortably past tungstenite's hardcoded 65536-byte handshake cap.
+    let padding_line = format!("X-Pad: {}\r\n", "a".repeat(2000));
+    let mut sent = 0usize;
+    while sent < 80_000 {
+        if stream.write_all(padding_line.as_bytes()).await.is_err() {
+            break; // server may have already closed its read side
+        }
+        sent += padding_line.len();
+    }
+    let _ = stream.flush().await;
+
+    // The server must reject/close well before its own 10s
+    // HANDSHAKE_TIMEOUT -- tungstenite's internal cap fires as soon as the
+    // cumulative byte count is checked, not at a time boundary.
+    let mut buf = [0u8; 16];
+    tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("server never closed the flooded handshake connection")
+        .ok();
+
+    assert!(
+        !metrics
+            .render_prometheus_text()
+            .contains("manta_ws_clients_connected 1"),
+        "a flooded, never-completed handshake must not be counted as a connected client"
+    );
+}
+
+#[tokio::test]
 async fn tcp_and_websocket_clients_share_the_same_port() {
     // ARCHITECTURE §7 documents one shared "tcp/ws :7301" port -- prove a
     // raw TCP client and a WebSocket client can both connect to the exact
