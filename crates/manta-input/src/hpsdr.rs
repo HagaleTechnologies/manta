@@ -98,6 +98,41 @@ const READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// `MAX_CONSECUTIVE_TIMEOUTS` convention (~10 s at 250 ms/timeout).
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
 
+/// Bound on consecutive malformed datagrams (PR #75 review, round 1) before
+/// `pump_one_packet` gives up with a real `Err`, the same way
+/// `MAX_CONSECUTIVE_TIMEOUTS` bounds *silence*. Without this, a peer that
+/// continuously sends length-correct-but-bad-sync-bytes packets (corrupt
+/// hardware, or a spoofed stream) never trips the stall check -- that only
+/// advances on `WouldBlock`/`TimedOut` -- so `pump_one_packet` loops
+/// forever holding `Inner`'s mutex (blocking every other DDC's `read()` on
+/// the same device), never re-checking the keepalive after its single
+/// call at function entry, and consuming a core the whole time. No
+/// wall-clock deadline is used here (unlike `READ_TIMEOUT`) because
+/// malformed-packet arrival rate is attacker/peer-controlled and
+/// unbounded, unlike a timeout's fixed cadence -- a count bound is what
+/// actually caps worst-case work here.
+const MAX_CONSECUTIVE_MALFORMED: u32 = 10_000;
+
+/// Socket receive buffer size (PR #75 review, round 1): deliberately larger
+/// than [`METIS_PACKET_LEN`], not equal to it. A buffer sized exactly to
+/// the expected packet length can't tell a merely-oversized datagram apart
+/// from a same-or-larger one that overflowed it: on POSIX, `recv()`
+/// silently truncates an oversized datagram to fit and returns
+/// `Ok(buf.len())` -- indistinguishable from a genuine `METIS_PACKET_LEN`
+/// packet, so a garbage flood at exactly that length boundary could slip
+/// past the wrong-length check entirely. On Windows, Winsock instead
+/// returns a fatal `WSAEMSGSIZE` `Err` for the identical oversized
+/// datagram, which used to propagate out of `pump_one_packet` as a real
+/// I/O error and tear down the whole source -- undoing this file's own
+/// oversized-datagram hardening on a platform this driver claims to
+/// support (`AGENTS.md`). Sized to the maximum possible UDP payload
+/// (65507 bytes, rounded up) so `recv()` can never truncate or hit
+/// `WSAEMSGSIZE` for any datagram a peer could actually send, regardless
+/// of platform -- an oversized datagram is now always visible as
+/// `Ok(n)` with `n != METIS_PACKET_LEN`, handled by the same malformed
+/// path as every other length mismatch.
+const RECV_BUF_LEN: usize = 65536;
+
 /// How often the start command is re-sent as a keepalive. The spike doc
 /// flags the HL2 skimmer gateware's FPGA watchdog as timing out without
 /// periodic host traffic; re-sending the start command is this driver's
@@ -222,6 +257,7 @@ pub struct GapDetector {
     last_arrival: Option<Instant>,
     dropped_packets: u64,
     gaps_detected: u64,
+    malformed_packets: u64,
 }
 
 impl GapDetector {
@@ -240,7 +276,16 @@ impl GapDetector {
             last_arrival: None,
             dropped_packets: 0,
             gaps_detected: 0,
+            malformed_packets: 0,
         }
+    }
+
+    /// Record a datagram discarded because it wasn't a valid Metis/Hermes IQ
+    /// packet (wrong length, or a length-correct packet that failed sync/
+    /// framing validation) — MAN-22: a malformed or adversarially-crafted
+    /// UDP packet must be counted, not silently dropped.
+    pub fn record_malformed(&mut self) {
+        self.malformed_packets += 1;
     }
 
     /// Record a packet's arrival at `now`, returning `true` if this arrival
@@ -266,18 +311,25 @@ impl GapDetector {
         GapStats {
             dropped_packets: self.dropped_packets,
             gaps_detected: self.gaps_detected,
+            malformed_packets: self.malformed_packets,
         }
     }
 }
 
-/// Loss/reorder counters for a device stream (module docs: "gap is visible
-/// in metrics"). Matching `manta-engine::soak`'s documented deviation, this
-/// is exposed as a plain getter rather than wired into a project-wide
-/// metrics system, which doesn't exist yet for live-hardware sources.
+/// Loss/reorder/malformed-packet counters for a device stream. Matching
+/// `manta-engine::soak`'s documented deviation, this is exposed as a plain
+/// getter rather than wired into a project-wide metrics system, which
+/// doesn't exist yet for live-hardware sources (tracked as a MAN-22
+/// follow-up: manta-input counters, `malformed_packets` included, aren't
+/// reachable from manta-server's Prometheus `/metrics` endpoint yet).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GapStats {
     pub dropped_packets: u64,
     pub gaps_detected: u64,
+    /// Datagrams discarded because they weren't a valid Metis/Hermes IQ
+    /// packet: wrong length, or correct length but failed sync/framing
+    /// validation (MAN-22).
+    pub malformed_packets: u64,
 }
 
 /// Configuration for one HPSDR/Hermes device connection.
@@ -329,22 +381,84 @@ struct Inner {
     gap: GapDetector,
     num_receivers: usize,
     last_keepalive: Instant,
+    /// Reused across every `pump_one_packet` call (PR #75 review, round 3)
+    /// rather than declared fresh per call: at the supported 8-DDC/192 kHz
+    /// ceiling this runs ~9,600 times/sec, so a fresh `[0u8; RECV_BUF_LEN]`
+    /// stack array each time zero-initializes ~600 MiB/s merely to receive
+    /// ~10 MiB/s of real UDP data -- real memory-bandwidth pressure on the
+    /// Pi4 CPU budget this driver has to fit (AGENTS.md). `recv()`
+    /// overwrites however many bytes it returns each call and every reader
+    /// only ever looks at `recv_buf[..n]`, so stale trailing bytes from a
+    /// previous, larger read are never observed -- reuse needs no
+    /// re-zeroing between calls.
+    recv_buf: [u8; RECV_BUF_LEN],
 }
 
 impl Inner {
-    /// Receive and demux exactly one Metis packet, filling every DDC's
-    /// queue and updating the gap detector. All consumer threads share
-    /// this single socket, so whichever `HpsdrIqSource::read` finds its own
-    /// queue empty drives the pump.
+    /// Receive and demux Metis packets until one yields real IQ samples,
+    /// filling every DDC's queue and updating the gap detector. All
+    /// consumer threads share this single socket, so whichever
+    /// `HpsdrIqSource::read` finds its own queue empty drives the pump.
+    ///
+    /// MAN-22: a malformed, truncated, or adversarially-crafted UDP
+    /// datagram must not take the input pipeline down. Before this fix, a
+    /// length-correct-but-bad-sync-bytes datagram propagated a `bail!` out
+    /// of `demux_metis_packet` through this function's `?`, which unwound
+    /// all the way out of `manta-engine::listen`'s read loop and killed the
+    /// whole process — a single crafted 1032-byte packet was a full DoS.
+    /// Both malformed-length and malformed-content packets are now counted
+    /// and discarded, and the pump keeps going.
     fn pump_one_packet(&mut self) -> Result<()> {
-        self.send_keepalive_if_due()?;
-
         let mut consecutive_timeouts = 0u32;
-        let packet = loop {
-            let mut buf = [0u8; METIS_PACKET_LEN];
-            match self.socket.recv(&mut buf) {
-                Ok(n) if n == METIS_PACKET_LEN => break buf,
-                Ok(_) => continue, // short/oversized datagram; not a Metis IQ packet
+        let mut consecutive_malformed = 0u32;
+        loop {
+            // Re-checked every iteration (not just once at function entry)
+            // so a sustained run of timeouts or malformed packets doesn't
+            // starve the HL2 gateware watchdog of the periodic traffic it
+            // needs (PR #75 review, round 1) -- `send_keepalive_if_due`
+            // itself is a cheap no-op except once per `KEEPALIVE_INTERVAL`.
+            self.send_keepalive_if_due()?;
+
+            match self.socket.recv(&mut self.recv_buf) {
+                Ok(n) if n == METIS_PACKET_LEN => {
+                    let mut demuxed = vec![Vec::new(); self.num_receivers];
+                    match demux_metis_packet(&self.recv_buf[..n], self.num_receivers, &mut demuxed)
+                    {
+                        Ok(()) => {
+                            // Cadence is observed only for packets that
+                            // pass framing validation (PR #75 review,
+                            // round 3) -- `GapStats`'s dropped/gap counters
+                            // describe the arrival cadence of valid Metis
+                            // packets specifically. Observing here on every
+                            // length-correct arrival, malformed or not,
+                            // would let malformed traffic during a real
+                            // device gap mask that gap once valid IQ
+                            // resumes, and could itself spuriously
+                            // increment the dropped/gap counters.
+                            self.gap.observe(Instant::now());
+                            for (queue, samples) in self.queues.iter_mut().zip(demuxed) {
+                                queue.extend(samples);
+                            }
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            // Right length, but failed sync/framing
+                            // validation (e.g. adversarial or corrupt
+                            // payload). Discard and keep pumping rather
+                            // than propagating a fatal error for one bad
+                            // packet.
+                            self.gap.record_malformed();
+                            consecutive_malformed += 1;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Length mismatch -- too short, or too long (now always
+                    // reported as a length mismatch rather than truncated
+                    // or WSAEMSGSIZE'd, per RECV_BUF_LEN's doc comment).
+                    self.gap.record_malformed();
+                    consecutive_malformed += 1;
+                }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -360,15 +474,15 @@ impl Inner {
                 }
                 Err(e) => return Err(e).context("HPSDR UDP read"),
             }
-        };
 
-        self.gap.observe(Instant::now());
-        let mut demuxed = vec![Vec::new(); self.num_receivers];
-        demux_metis_packet(&packet, self.num_receivers, &mut demuxed)?;
-        for (queue, samples) in self.queues.iter_mut().zip(demuxed) {
-            queue.extend(samples);
+            if consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED {
+                bail!(
+                    "HPSDR device stalled: {} consecutive malformed datagrams with no valid \
+                     Metis packet -- corrupt hardware or a spoofed/non-Metis stream",
+                    MAX_CONSECUTIVE_MALFORMED
+                );
+            }
         }
-        Ok(())
     }
 
     fn send_keepalive_if_due(&mut self) -> Result<()> {
@@ -412,6 +526,7 @@ impl HpsdrDevice {
             gap: GapDetector::new(cfg.sample_rate_hz, cfg.ddc_count, 1.5),
             num_receivers: cfg.ddc_count,
             last_keepalive: Instant::now(),
+            recv_buf: [0u8; RECV_BUF_LEN],
         }));
 
         Ok((0..cfg.ddc_count)
@@ -676,6 +791,197 @@ mod tests {
         assert_eq!(sources[0].center_freq_hz(), 14_025_000.0);
         assert_eq!(sources[1].center_freq_hz(), 14_030_000.0);
         assert_eq!(sources[0].gap_stats(), GapStats::default());
+    }
+
+    /// MAN-22 regression: a malformed, truncated, or adversarially-crafted
+    /// UDP datagram must not crash or wedge the input pipeline, and the
+    /// rejection must be counted rather than silent. Sends a mix of
+    /// too-short, too-long, and correct-length-but-bad-sync-bytes datagrams
+    /// (the exact shape that used to `bail!` out of `demux_metis_packet`
+    /// and kill the whole read via `?` propagation) at a live loopback
+    /// `HpsdrDevice`, then confirms the source is still alive and correctly
+    /// reads a subsequent genuine packet.
+    #[test]
+    fn malformed_udp_packets_are_discarded_and_counted_not_fatal() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+        assert_eq!(sources.len(), 1);
+
+        // Consume the start command so it isn't mistaken for a datagram.
+        let mut discard = [0u8; METIS_PACKET_LEN];
+        let (_, client_addr) = device_socket.recv_from(&mut discard).unwrap();
+
+        // 1. Too short.
+        device_socket.send_to(&[0u8; 10], client_addr).unwrap();
+        // 2. Too long.
+        device_socket
+            .send_to(&[0u8; METIS_PACKET_LEN + 50], client_addr)
+            .unwrap();
+        // 3. Correct length, but adversarial garbage (all 0xFF) -- fails
+        //    the USB sync-byte check inside demux_metis_packet, which used
+        //    to be fatal via `?`.
+        device_socket
+            .send_to(&[0xFFu8; METIS_PACKET_LEN], client_addr)
+            .unwrap();
+        // 4. Correct length, all-zero -- also fails the sync-byte check.
+        device_socket
+            .send_to(&[0u8; METIS_PACKET_LEN], client_addr)
+            .unwrap();
+
+        // Now a genuine packet -- the pipeline must still be able to
+        // produce real samples after four malformed/adversarial datagrams.
+        let value = Complex32::new(0.42, -0.17);
+        let pkt = synth_metis_packet(1, |_| value);
+        device_socket.send_to(&pkt, client_addr).unwrap();
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let n = sources[0]
+            .read(&mut buf)
+            .expect("read must succeed despite preceding malformed packets");
+        assert!(n > 0, "expected real samples after malformed packets");
+        assert!((buf[0].re - value.re).abs() < 1e-4);
+        assert!((buf[0].im - value.im).abs() < 1e-4);
+
+        let stats = sources[0].gap_stats();
+        assert_eq!(
+            stats.malformed_packets, 4,
+            "all four malformed/adversarial datagrams must be counted, not silently dropped"
+        );
+    }
+
+    /// PR #75 review, round 1, finding 1: a receive buffer sized exactly to
+    /// `METIS_PACKET_LEN` can't tell an oversized datagram apart from a
+    /// truncated read of it. Craft a datagram whose FIRST `METIS_PACKET_LEN`
+    /// bytes are a perfectly valid Metis packet, with extra garbage bytes
+    /// appended past that boundary. With the old exactly-sized buffer, this
+    /// would truncate on read and be silently ACCEPTED as valid IQ -- the
+    /// trailing tampering invisible. It must now be rejected outright as a
+    /// length mismatch instead.
+    #[test]
+    fn an_oversized_datagram_with_a_valid_prefix_is_rejected_not_silently_truncated() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+
+        let mut discard = [0u8; METIS_PACKET_LEN];
+        let (_, client_addr) = device_socket.recv_from(&mut discard).unwrap();
+
+        // A genuinely valid packet, content-wise -- but with 50 extra
+        // tampered bytes appended, which a truncating read would silently
+        // drop, making this indistinguishable from the clean packet sent
+        // right after it.
+        let tampered_value = Complex32::new(0.11, 0.22);
+        let mut tampered = synth_metis_packet(1, |_| tampered_value);
+        tampered.extend_from_slice(&[0xAAu8; 50]);
+        assert_eq!(tampered.len(), METIS_PACKET_LEN + 50);
+        device_socket.send_to(&tampered, client_addr).unwrap();
+
+        let clean_value = Complex32::new(-0.33, 0.44);
+        let clean_pkt = synth_metis_packet(1, |_| clean_value);
+        device_socket.send_to(&clean_pkt, client_addr).unwrap();
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let n = sources[0]
+            .read(&mut buf)
+            .expect("read must succeed via the clean packet");
+        assert!(n > 0);
+        assert!(
+            (buf[0].re - clean_value.re).abs() < 1e-4,
+            "must have skipped the tampered/oversized packet's samples entirely, got {:?} \
+             (would equal the tampered packet's {:?} if it were silently truncated and accepted)",
+            buf[0],
+            tampered_value
+        );
+
+        assert_eq!(
+            sources[0].gap_stats().malformed_packets,
+            1,
+            "the oversized tampered packet must be counted as malformed, not accepted"
+        );
+    }
+
+    /// PR #75 review, round 1, finding 2: a continuous flood of
+    /// length-correct-but-bad-sync-bytes packets must not loop forever --
+    /// `read()` (and therefore `pump_one_packet`) must eventually give up
+    /// with a clear error, the same way a silent/stalled device already
+    /// does via `MAX_CONSECUTIVE_TIMEOUTS`.
+    #[test]
+    fn a_sustained_flood_of_malformed_packets_eventually_gives_up_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+
+        let mut discard = [0u8; METIS_PACKET_LEN];
+        let (_, client_addr) = device_socket.recv_from(&mut discard).unwrap();
+
+        // A background sender keeps the socket continuously fed rather
+        // than one giant up-front burst, which would overflow the OS's UDP
+        // receive buffer long before `read()` starts draining it and make
+        // the exact malformed count below unreliable. Never sends a single
+        // valid packet -- purely a malformed flood.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_sender = stop.clone();
+        let sender_socket = device_socket.try_clone().unwrap();
+        let sender = std::thread::spawn(move || {
+            let garbage = [0xFFu8; METIS_PACKET_LEN];
+            while !stop_sender.load(Ordering::Relaxed) {
+                let _ = sender_socket.send_to(&garbage, client_addr);
+            }
+        });
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let err = sources[0].read(&mut buf).expect_err(
+            "a sustained malformed flood must eventually surface as a clear error, not hang",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+
+        assert!(
+            err.to_string().contains("malformed"),
+            "expected a malformed-flood stall error, got: {err}"
+        );
+        assert_eq!(
+            sources[0].gap_stats().malformed_packets,
+            MAX_CONSECUTIVE_MALFORMED as u64,
+            "must have counted exactly the bound's worth of malformed packets before giving up"
+        );
     }
 
     /// Real, live integration test against actual hardware. #[ignore]'d:
