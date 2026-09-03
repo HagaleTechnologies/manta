@@ -11,7 +11,7 @@ use crate::config::RbnUplinkConfig;
 use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
 use crate::rbn;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -101,13 +101,34 @@ pub async fn serve(
         .effective_login_callsign(&station_callsign)
         .to_string();
     let mut backoff = INITIAL_BACKOFF;
+    // MAN-67 (PR #80 review round 11): scoped to THIS target's own `serve`
+    // invocation, never a process-wide static -- `main.rs` spawns one
+    // independent `serve` task per configured `[[rbn_uplink]]` entry
+    // specifically so one target's problems can't affect another's
+    // delivery or retry timing. A shared static here would let a stuck
+    // resolver on one target permanently WouldBlock every OTHER target
+    // too, including an IP-literal one that never even needs DNS. `Arc`,
+    // not a bare `Semaphore`, so `try_acquire_owned()` can hand the
+    // spawned lookup task (see `connect_any_resolved_address`) a `'static`
+    // permit -- a plain borrowed permit can't outlive this stack frame the
+    // way a detached `tokio::spawn` task requires.
+    let resolver_slot = Arc::new(Semaphore::new(1));
 
     loop {
         if *shutdown.borrow() {
             return;
         }
 
-        match connect_and_forward(&config, &login_callsign, &bus, &metrics, &mut shutdown).await {
+        match connect_and_forward(
+            &config,
+            &login_callsign,
+            &bus,
+            &metrics,
+            &mut shutdown,
+            &resolver_slot,
+        )
+        .await
+        {
             Ok(()) => return, // clean shutdown-signaled exit
             Err(outcome) => {
                 // No mark_uplink_disconnected() here: connect_and_forward
@@ -144,7 +165,11 @@ pub async fn serve(
 /// after it) could stay permanently unreachable. Returns the first
 /// address that accepts, or the last error if every address failed or
 /// timed out.
-async fn connect_any_resolved_address(host: &str, port: u16) -> std::io::Result<TcpStream> {
+async fn connect_any_resolved_address(
+    host: &str,
+    port: u16,
+    resolver_slot: &Arc<Semaphore>,
+) -> std::io::Result<TcpStream> {
     // Bounded (PR #80 review, round 3): a bare `lookup_host` has no
     // timeout of its own -- a stalled system resolver would otherwise
     // leave this attempt stuck in the resolution phase for however long
@@ -162,12 +187,15 @@ async fn connect_any_resolved_address(host: &str, port: u16) -> std::io::Result<
     // regardless (MAN-67, PR #80 review round 10). Left unbounded, a
     // sustained resolver stall means every reconnect attempt (each
     // eventually retried by `serve`'s backoff loop) piles another
-    // abandoned lookup onto the blocking pool. `resolver_slot()` bounds
-    // this to at most one outstanding lookup at a time: the permit is
+    // abandoned lookup onto the blocking pool. `resolver_slot` (owned per
+    // target -- see `serve`, PR #80 review round 11) bounds this to at
+    // most one outstanding lookup PER TARGET at a time: the permit is
     // acquired here but held inside the spawned task until the real
     // `getaddrinfo` call actually finishes, so it survives this function
-    // timing out or being dropped by the outer shutdown race.
-    let Ok(permit) = resolver_slot().try_acquire() else {
+    // timing out or being dropped by the outer shutdown race. `_owned`:
+    // the spawned task must be `'static`, which a permit borrowed from a
+    // non-static `&Semaphore` can't satisfy.
+    let Ok(permit) = resolver_slot.clone().try_acquire_owned() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             format!(
@@ -201,16 +229,6 @@ async fn connect_any_resolved_address(host: &str, port: u16) -> std::io::Result<
     connect_first_reachable(addrs).await
 }
 
-/// Process-wide cap of one outstanding DNS resolution at a time -- see the
-/// comment in `connect_any_resolved_address` (MAN-67). A plain static
-/// rather than a field threaded through `RbnUplinkConfig`: the resource
-/// being bounded (the OS resolver's blocking-thread pool) is genuinely
-/// process-global, not per-uplink-target.
-fn resolver_slot() -> &'static Semaphore {
-    static SLOT: OnceLock<Semaphore> = OnceLock::new();
-    SLOT.get_or_init(|| Semaphore::new(1))
-}
-
 /// Tries each address in `addrs`, in order, returning the first one that
 /// accepts within `CONNECT_TIMEOUT`, or the last error if every address
 /// failed, timed out, or the loop as a whole exceeded
@@ -219,22 +237,36 @@ fn resolver_slot() -> &'static Semaphore {
 /// behavior is testable directly against a caller-supplied address list,
 /// without depending on real DNS resolving to more than one address.
 async fn connect_first_reachable(addrs: Vec<std::net::SocketAddr>) -> std::io::Result<TcpStream> {
-    connect_first_reachable_bounded(addrs, CONNECT_TIMEOUT, OVERALL_CONNECT_TIMEOUT).await
+    connect_first_reachable_bounded(addrs, CONNECT_TIMEOUT, OVERALL_CONNECT_TIMEOUT, |addr| {
+        TcpStream::connect(addr)
+    })
+    .await
 }
 
-/// `connect_first_reachable`'s real logic, with both timeouts as
-/// parameters so the overall-deadline behavior (MAN-67) is unit-testable
-/// against real (but tiny) durations, rather than needing to wait out the
-/// real multi-second constants.
-async fn connect_first_reachable_bounded(
+/// `connect_first_reachable`'s real logic, with both timeouts AND the
+/// per-address connect operation itself as parameters. The connect
+/// operation is injectable (PR #80 review round 11) so the overall-deadline
+/// behavior is unit-testable with a fake, instantly-controllable "hangs
+/// forever" attempt under paused tokio time -- the original version dialed
+/// real TEST-NET-1 (192.0.2.0/24) addresses to simulate a black hole, which
+/// depends on undocumented host/network behavior: a host with no route to
+/// that block (or a gateway that rejects it) gets an immediate
+/// `NetworkUnreachable` instead of a hang, silently turning the deadline
+/// test into a no-op everywhere that's true.
+async fn connect_first_reachable_bounded<T, F, Fut>(
     addrs: Vec<std::net::SocketAddr>,
     per_addr_timeout: Duration,
     overall_timeout: Duration,
-) -> std::io::Result<TcpStream> {
+    connect: F,
+) -> std::io::Result<T>
+where
+    F: Fn(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
     let attempt_all = async {
         let mut last_err = None;
         for addr in addrs {
-            match tokio::time::timeout(per_addr_timeout, TcpStream::connect(addr)).await {
+            match tokio::time::timeout(per_addr_timeout, connect(addr)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => last_err = Some(e),
                 Err(_) => {
@@ -264,6 +296,7 @@ async fn connect_and_forward(
     bus: &Arc<SpotBus>,
     metrics: &Arc<Metrics>,
     shutdown: &mut watch::Receiver<bool>,
+    resolver_slot: &Arc<Semaphore>,
 ) -> Result<(), ConnectAttemptError> {
     // Raced against shutdown, not just time-bounded (MAN-58 comment
     // finding 1): a target that silently black-holes SYNs would otherwise
@@ -275,7 +308,7 @@ async fn connect_and_forward(
     // `*shutdown.borrow() == false` just tries again.
     let stream = loop {
         tokio::select! {
-            result = connect_any_resolved_address(config.target_host.as_str(), config.target_port) => {
+            result = connect_any_resolved_address(config.target_host.as_str(), config.target_port, resolver_slot) => {
                 match result {
                     Ok(stream) => break stream,
                     Err(_) => return Err(ConnectAttemptError::NeverConnected),
@@ -708,30 +741,50 @@ mod tests {
         assert_ne!(err.kind(), std::io::ErrorKind::NotFound); // a real connect error, not the empty-list fallback
     }
 
-    /// MAN-67, PR #80 review round 9: a long list of black-holed candidate
-    /// addresses must not grant the loop an unbounded total budget
-    /// (`address_count * per_addr_timeout`) -- it must give up once
-    /// `overall_timeout` elapses, even with addresses left untried. Uses
-    /// TEST-NET-1 (RFC 5737, 192.0.2.0/24) addresses, which reliably
-    /// black-hole (no response at all, not an immediate refusal) in a
-    /// normal network environment -- unlike the refused-port trick the
-    /// other tests here use, which fails instantly and so can't exercise
-    /// a real per-address timeout.
-    #[tokio::test]
+    /// MAN-67, PR #80 review round 9 (and round 11's follow-up on the
+    /// original test's host-dependence): a long list of black-holed
+    /// candidate addresses must not grant the loop an unbounded total
+    /// budget (`address_count * per_addr_timeout`) -- it must give up once
+    /// `overall_timeout` elapses, even with addresses left untried. Uses a
+    /// fake `connect` that never resolves on its own (`std::future::pending`)
+    /// under paused tokio time, instead of dialing real TEST-NET-1
+    /// addresses: a real black-hole target depends on undocumented
+    /// host/network behavior (a host with no route to that block, or a
+    /// gateway that rejects it, gets an immediate `NetworkUnreachable`
+    /// instead of a hang, which would silently turn this test into a
+    /// no-op). The fake hangs unconditionally, so this test exercises the
+    /// deadline logic itself regardless of the host's own networking.
+    #[tokio::test(start_paused = true)]
     async fn connect_first_reachable_bounded_stops_at_the_overall_deadline() {
-        let per_addr_timeout = Duration::from_millis(300);
-        let overall_timeout = Duration::from_millis(500);
+        let per_addr_timeout = Duration::from_secs(10);
+        // Between 1x and 2x per_addr_timeout: address 1 exhausts its own
+        // 10s budget at t=10s, address 2 starts then -- but the overall
+        // deadline at t=15s cuts address 2 off 5s into its own budget,
+        // before address 3 ever starts (which would begin at t=20s).
+        let overall_timeout = Duration::from_secs(15);
         let addrs: Vec<std::net::SocketAddr> = vec![
-            "192.0.2.1:9".parse().unwrap(),
-            "192.0.2.2:9".parse().unwrap(),
-            "192.0.2.3:9".parse().unwrap(),
-        ]; // 3 * 300ms = 900ms of per-address budget if every address were tried
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            "127.0.0.1:3".parse().unwrap(),
+        ]; // never actually dialed -- `connect` below is faked, so the
+           // specific addresses are only distinct placeholders
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_connect = attempts.clone();
 
-        let started = std::time::Instant::now();
-        let err = connect_first_reachable_bounded(addrs, per_addr_timeout, overall_timeout)
-            .await
-            .expect_err("every address black-holing must still be a real error");
+        let connect = move |_addr: std::net::SocketAddr| {
+            let attempts = attempts_for_connect.clone();
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<std::io::Result<()>>().await
+            }
+        };
+
+        let started = tokio::time::Instant::now();
+        let result: std::io::Result<()> =
+            connect_first_reachable_bounded(addrs, per_addr_timeout, overall_timeout, connect)
+                .await;
         let elapsed = started.elapsed();
+        let err = result.expect_err("every address hanging forever must still be a real error");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(
@@ -740,6 +793,12 @@ mod tests {
              (elapsed {elapsed:?}, would-be full per-address budget {:?})",
             per_addr_timeout * 3
         );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the third address must never have been attempted -- the overall deadline should \
+             have cut the loop off mid-way through the second address's own per-address budget"
+        );
     }
 
     /// MAN-67, PR #80 review round 10: an outstanding (still-running)
@@ -747,18 +806,22 @@ mod tests {
     /// sustained resolver stall can never pile up more than one abandoned
     /// `getaddrinfo` job on the blocking pool, however many times
     /// `serve`'s backoff loop retries in the meantime. Holds the slot's
-    /// only permit directly (no real DNS activity needed, and none
-    /// happens here: the early `WouldBlock` return fires before
-    /// `connect_any_resolved_address` ever calls `lookup_host`) -- this is
-    /// the only test in this module that touches `resolver_slot()`, so
-    /// there's no cross-test contention over the shared static.
+    /// only permit directly (no real DNS activity needed, and none happens
+    /// here: the early `WouldBlock` return fires before
+    /// `connect_any_resolved_address` ever calls `lookup_host`) -- a fresh
+    /// `Semaphore` local to this test, not the shared production one (round
+    /// 11 made the real resolver slot per-target rather than a shared
+    /// static, so there's no longer a process-wide instance to contend
+    /// over here either).
     #[tokio::test]
     async fn connect_any_resolved_address_skips_a_new_lookup_while_one_is_outstanding() {
-        let permit = resolver_slot()
-            .try_acquire()
-            .expect("test must run before any other test holds the resolver slot");
+        let resolver_slot = Arc::new(Semaphore::new(1));
+        let permit = resolver_slot
+            .clone()
+            .try_acquire_owned()
+            .expect("a freshly created semaphore must have its permit available");
 
-        let err = connect_any_resolved_address("example.invalid", 7300)
+        let err = connect_any_resolved_address("example.invalid", 7300, &resolver_slot)
             .await
             .expect_err("must not start a second lookup while one is outstanding");
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
