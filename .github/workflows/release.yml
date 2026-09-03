@@ -239,10 +239,17 @@ jobs:
           # happened to also push. The dispatch-<run_id> tag is still
           # pushed on a dispatch publish, for testing that path
           # specifically -- just never `:latest`.
+          #
+          # Gated on the EVENT being a real push, not merely on
+          # github.ref_type == 'tag' (PR #78 review round 9 -- ref_type is
+          # ALSO 'tag' for `gh workflow run release.yml --ref <existing-
+          # tag> -f publish=true`, a workflow_dispatch run, not a push; the
+          # earlier ref_type-only check let a manual re-run against an old
+          # tag silently overwrite :latest with an old rebuild).
           {
             echo "tags<<RELEASE_TAGS_EOF"
             echo "$IMAGE:$VERSION"
-            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            if [[ "${{ github.event_name }}" == "push" ]]; then
               echo "$IMAGE:latest"
             fi
             echo "RELEASE_TAGS_EOF"
