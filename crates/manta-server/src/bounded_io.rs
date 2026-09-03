@@ -14,7 +14,13 @@ pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// an unterminated line as a protocol violation (an `InvalidData` error)
 /// rather than growing `buf` without bound. Returns the number of bytes
 /// read (including whatever `buf` already held on entry), `0` meaning EOF
-/// with `buf` empty on entry.
+/// with `buf` empty on entry. A chunk containing invalid UTF-8 is also an
+/// `InvalidData` error, matching `AsyncBufReadExt::read_line`'s own
+/// behavior rather than silently lossy-converting it (MAN-58/PR #80
+/// review, round 2: `manta-server/src/uplink.rs`'s use of this function
+/// had regressed `docs/DECISIONS/2026-09-02-man23-threat-model.md`
+/// finding 19's "non-UTF8 from the target errors cleanly" disposition,
+/// which the raw `read_line` it replaced had already covered).
 ///
 /// Deliberately does **not** clear `buf` itself -- this future is not
 /// cancellation-safe against losing already-consumed bytes (nothing async
@@ -48,7 +54,12 @@ pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
                 "line exceeds maximum length",
             ));
         }
-        buf.push_str(&String::from_utf8_lossy(&available[..chunk_len]));
+        buf.push_str(std::str::from_utf8(&available[..chunk_len]).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line contains invalid UTF-8",
+            )
+        })?);
         reader.consume(chunk_len);
         if found_newline {
             return Ok(total);
@@ -98,6 +109,24 @@ mod tests {
         let err = read_line_bounded(&mut reader, &mut buf)
             .await
             .expect_err("must reject an unbounded line");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// MAN-58/PR #80 review, round 2: invalid UTF-8 must error, not be
+    /// silently lossy-converted -- `docs/DECISIONS/2026-09-02-man23-
+    /// threat-model.md` finding 19 already commits to this disposition
+    /// for the outbound uplink, which the raw `AsyncBufReadExt::read_line`
+    /// it originally used already provided.
+    #[tokio::test]
+    async fn rejects_invalid_utf8() {
+        let mut bytes = b"before ".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xFE]); // never valid UTF-8
+        bytes.extend_from_slice(b" after\n");
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut buf = String::new();
+        let err = read_line_bounded(&mut reader, &mut buf)
+            .await
+            .expect_err("must reject invalid UTF-8, not lossy-convert it");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 

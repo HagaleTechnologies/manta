@@ -118,6 +118,47 @@ pub async fn serve(
     }
 }
 
+/// Resolves `host:port` to every candidate address and gives each one its
+/// own `CONNECT_TIMEOUT` attempt in turn (PR #80 review, round 2, finding
+/// 2): `TcpStream::connect` alone tries every resolved address
+/// internally, but a single timeout wrapped around the whole operation
+/// can expire mid-attempt on the FIRST address, before Tokio ever
+/// advances to a later, reachable one -- and since every retry
+/// re-resolves and restarts from the first address again, a target whose
+/// first resolved address black-holes SYNs (with a real one available
+/// after it) could stay permanently unreachable. Returns the first
+/// address that accepts, or the last error if every address failed or
+/// timed out.
+async fn connect_any_resolved_address(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port)).await?.collect();
+    connect_first_reachable(addrs).await
+}
+
+/// Tries each address in `addrs`, in order, returning the first one that
+/// accepts within `CONNECT_TIMEOUT`, or the last error if every address
+/// failed or timed out. Split out from `connect_any_resolved_address` so
+/// the "keep trying later addresses" behavior is testable directly
+/// against a caller-supplied address list, without depending on real DNS
+/// resolving to more than one address.
+async fn connect_first_reachable(addrs: Vec<std::net::SocketAddr>) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in addrs {
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connect to {addr} timed out"),
+                ))
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses to try")
+    }))
+}
+
 async fn connect_and_forward(
     config: &RbnUplinkConfig,
     login_callsign: &str,
@@ -127,20 +168,18 @@ async fn connect_and_forward(
 ) -> Result<(), ConnectAttemptError> {
     // Raced against shutdown, not just time-bounded (MAN-58 comment
     // finding 1): a target that silently black-holes SYNs would otherwise
-    // block shutdown for up to CONNECT_TIMEOUT even when shutdown fires
-    // immediately. Looping rather than a single select arm: cancelling and
-    // retrying a half-open `connect()` attempt has no partial state to
-    // lose (unlike a buffered line read), so a spurious `changed()` wakeup
-    // with `*shutdown.borrow() == false` just tries the connect again.
+    // block shutdown for up to CONNECT_TIMEOUT (per address -- see
+    // connect_any_resolved_address) even when shutdown fires immediately.
+    // Looping rather than a single select arm: cancelling and retrying a
+    // half-open `connect()` attempt has no partial state to lose (unlike
+    // a buffered line read), so a spurious `changed()` wakeup with
+    // `*shutdown.borrow() == false` just tries again.
     let stream = loop {
         tokio::select! {
-            result = tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                TcpStream::connect((config.target_host.as_str(), config.target_port)),
-            ) => {
+            result = connect_any_resolved_address(config.target_host.as_str(), config.target_port) => {
                 match result {
-                    Ok(Ok(stream)) => break stream,
-                    Ok(Err(_)) | Err(_) => return Err(ConnectAttemptError::NeverConnected),
+                    Ok(stream) => break stream,
+                    Err(_) => return Err(ConnectAttemptError::NeverConnected),
                 }
             }
             _ = shutdown.changed() => {
@@ -299,6 +338,7 @@ async fn write_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener as StdTcpListener;
 
     #[test]
     fn backoff_resets_after_a_connection_that_reached_login() {
@@ -338,5 +378,46 @@ mod tests {
             dry_run: false,
         };
         assert_eq!(cfg.effective_login_callsign("W3XYZ"), "W3XYZ");
+    }
+
+    /// PR #80 review, round 2, finding 2: if the FIRST address in the
+    /// list can't be connected to, `connect_first_reachable` must still
+    /// try the next one rather than giving up entirely -- the actual bug
+    /// this fixes (a single timeout wrapped around `TcpStream::connect`'s
+    /// own internal multi-address fallback could expire on address 1
+    /// before Tokio ever reached a reachable address 2). Uses a refused
+    /// connection (a bound-then-dropped port) for "unreachable" rather
+    /// than a real SYN black-hole, which would need the full
+    /// `CONNECT_TIMEOUT` to fail -- both are address-1-fails-immediately-
+    /// try-address-2 from this function's perspective.
+    #[tokio::test]
+    async fn connect_first_reachable_falls_through_to_a_later_working_address() {
+        let refused_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let refused_addr = refused_listener.local_addr().unwrap();
+        drop(refused_listener); // now nothing listens on this port: connection refused
+
+        let good_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let good_addr = good_listener.local_addr().unwrap();
+
+        let accept_task = std::thread::spawn(move || good_listener.accept().unwrap());
+
+        let stream = connect_first_reachable(vec![refused_addr, good_addr])
+            .await
+            .expect("must fall through to the second, reachable address");
+        assert_eq!(stream.peer_addr().unwrap(), good_addr);
+
+        accept_task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_first_reachable_errors_when_every_address_fails() {
+        let refused_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let refused_addr = refused_listener.local_addr().unwrap();
+        drop(refused_listener);
+
+        let err = connect_first_reachable(vec![refused_addr])
+            .await
+            .expect_err("every address failing must be a real error, not a silent success");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound); // a real connect error, not the empty-list fallback
     }
 }
