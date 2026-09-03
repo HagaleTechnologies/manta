@@ -81,3 +81,54 @@ call).
 Per this project's established policy (MAN-10, MAN-11), this remains
 hardware-control code pending confirmation against George's (K5TR) real
 HPSDR units before shipping as verified.
+
+## Addendum: PR #79 review, round 2 (2026-09-03)
+
+Three corrections/hardenings from the reviewer, applied:
+
+1. **Outbound EP2 header was wrong** (P1): the initial implementation put
+   `0x02` directly in the Metis header's byte 2 with the sequence number
+   shifted into bytes 3-6. Every real Protocol 1 host->device USB data
+   packet actually starts `EF FE 01 02` — byte 2 is the data-packet type
+   (`0x01`), byte 3 is the endpoint (`0x02` = EP2), sequence in bytes 4-7.
+   The original encoding meant real hardware would never have recognized
+   these as C&C packets at all. Fixed in `build_cc_packet`.
+
+2. **Initial C&C settings were sent too late** (P1): `HpsdrDevice::open`
+   started streaming (the start command) and returned live `HpsdrIqSource`
+   handles before any C&C tuning packet had gone out — the first one only
+   followed `KEEPALIVE_INTERVAL` (1s) later, on the first `read()`'s pump
+   cycle. For that window, the device kept streaming under whatever
+   rate/receiver-count/frequency it already had (a prior session's state,
+   or factory default), and `manta_engine::listen`'s startup calibration
+   buffer would consume and interpret that data using the NEWLY requested
+   (wrong-for-this-data) parameters. Fixed: `open()` now sends every C&C
+   setting synchronously before returning any source, with the keepalive
+   loop continuing to resend on its existing cadence for loss resilience.
+
+3. **Receiver-count field width is genuinely disputed, not just
+   unverified** (P2): this doc's original research (§ above) placed the
+   ADDR=0x00 general packet's receiver-count field at C4 bits[6:3] (4
+   bits, 1-12 receivers), cross-confirmed by 3 independent sources. PR #79's
+   reviewer instead asserts C4 bits[5:3] (3 bits, 1-8), with bit 6 as a
+   separate duplex flag. Neither this research session nor the reviewer's
+   finding cites a primary source pinning which is correct, and it cannot
+   be resolved without real hardware. Resolution: cap `ddc_count` at 8,
+   not 12. For 1-8 receivers, `(n-1)` fits in 3 bits regardless of which
+   model is right, so the encoded byte is IDENTICAL either way and bit 6
+   is always 0 — this sidesteps the dispute entirely rather than betting
+   on either unverified side. Only 9-12 was ever at risk (silently
+   enabling duplex under the reviewer's model), and nothing currently
+   targeted by this driver needs more than 8 receivers regardless (HL2
+   firmware tops out around 2). Revisit once real hardware settles which
+   model is correct.
+
+Also confirmed (not corrected, just newly validated): the inbound IQ
+packet's own outer Metis header is now checked in `demux_metis_packet`
+(`METIS_IQ_ENDPOINT_HEADER = [0xEF, 0xFE, 0x01, 0x06]`, per the reviewer's
+finding text) before treating a packet as real IQ data or flipping
+`confirmed_live` — previously only the packet length and the INNER USB
+frame sync bytes were checked, so a non-IQ 1032-byte datagram with sync
+markers at the right offsets (an endpoint echo, the wrong packet type)
+could have been misread as valid IQ and confirmed liveness on data that
+was never actually a Metis IQ read.
