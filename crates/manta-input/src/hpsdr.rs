@@ -381,6 +381,17 @@ struct Inner {
     gap: GapDetector,
     num_receivers: usize,
     last_keepalive: Instant,
+    /// Reused across every `pump_one_packet` call (PR #75 review, round 3)
+    /// rather than declared fresh per call: at the supported 8-DDC/192 kHz
+    /// ceiling this runs ~9,600 times/sec, so a fresh `[0u8; RECV_BUF_LEN]`
+    /// stack array each time zero-initializes ~600 MiB/s merely to receive
+    /// ~10 MiB/s of real UDP data -- real memory-bandwidth pressure on the
+    /// Pi4 CPU budget this driver has to fit (AGENTS.md). `recv()`
+    /// overwrites however many bytes it returns each call and every reader
+    /// only ever looks at `recv_buf[..n]`, so stale trailing bytes from a
+    /// previous, larger read are never observed -- reuse needs no
+    /// re-zeroing between calls.
+    recv_buf: [u8; RECV_BUF_LEN],
 }
 
 impl Inner {
@@ -408,13 +419,23 @@ impl Inner {
             // itself is a cheap no-op except once per `KEEPALIVE_INTERVAL`.
             self.send_keepalive_if_due()?;
 
-            let mut buf = [0u8; RECV_BUF_LEN];
-            match self.socket.recv(&mut buf) {
+            match self.socket.recv(&mut self.recv_buf) {
                 Ok(n) if n == METIS_PACKET_LEN => {
-                    self.gap.observe(Instant::now());
                     let mut demuxed = vec![Vec::new(); self.num_receivers];
-                    match demux_metis_packet(&buf[..n], self.num_receivers, &mut demuxed) {
+                    match demux_metis_packet(&self.recv_buf[..n], self.num_receivers, &mut demuxed)
+                    {
                         Ok(()) => {
+                            // Cadence is observed only for packets that
+                            // pass framing validation (PR #75 review,
+                            // round 3) -- `GapStats`'s dropped/gap counters
+                            // describe the arrival cadence of valid Metis
+                            // packets specifically. Observing here on every
+                            // length-correct arrival, malformed or not,
+                            // would let malformed traffic during a real
+                            // device gap mask that gap once valid IQ
+                            // resumes, and could itself spuriously
+                            // increment the dropped/gap counters.
+                            self.gap.observe(Instant::now());
                             for (queue, samples) in self.queues.iter_mut().zip(demuxed) {
                                 queue.extend(samples);
                             }
@@ -505,6 +526,7 @@ impl HpsdrDevice {
             gap: GapDetector::new(cfg.sample_rate_hz, cfg.ddc_count, 1.5),
             num_receivers: cfg.ddc_count,
             last_keepalive: Instant::now(),
+            recv_buf: [0u8; RECV_BUF_LEN],
         }));
 
         Ok((0..cfg.ddc_count)

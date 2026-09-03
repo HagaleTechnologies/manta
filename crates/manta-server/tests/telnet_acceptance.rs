@@ -20,6 +20,7 @@ async fn spawn_server() -> (
     Arc<SpotBus>,
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
 ) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
@@ -31,6 +32,12 @@ async fn spawn_server() -> (
     let metrics2 = metrics.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    // Kept alongside the clone moved into `serve()` (PR #75 review, round
+    // 3) so a caller can directly inspect a client task's own join result
+    // afterward -- a panicking task also drops its socket, so observing
+    // the socket close alone can't distinguish a clean disconnect from a
+    // handler panic.
+    let tasks_handle = tasks.clone();
     let limiter =
         manta_server::tasks::new_connection_limiter(manta_server::telnet::MAX_TELNET_CONNECTIONS);
     tokio::spawn(async move {
@@ -46,7 +53,7 @@ async fn spawn_server() -> (
         .await;
     });
 
-    (addr, bus, metrics, shutdown_tx)
+    (addr, bus, metrics, shutdown_tx, tasks_handle)
 }
 
 fn sample_spot() -> Spot {
@@ -96,7 +103,7 @@ async fn connect_and_login(
 
 #[tokio::test]
 async fn standard_client_receives_spot_in_rbn_format_after_login() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     let spot = sample_spot();
@@ -114,7 +121,7 @@ async fn standard_client_receives_spot_in_rbn_format_after_login() {
 
 #[tokio::test]
 async fn sh_dx_command_does_not_disconnect_the_client() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"sh/dx\r\n").await.unwrap();
@@ -134,7 +141,7 @@ async fn sh_dx_command_does_not_disconnect_the_client() {
 
 #[tokio::test]
 async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
 
     // History predates the client's connection entirely -- `sh/dx` reads
     // the bus's retained history, not the live broadcast subscription.
@@ -172,7 +179,7 @@ async fn sh_dx_history_replay_honors_the_unique_filter() {
     // stream by `set dx filter unique > n` must stay suppressed when the
     // same client replays it via `sh/dx` -- the filter must apply
     // consistently to both paths, not just the live one.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
 
     // Published BEFORE the client connects, so this is pure history --
     // sh/dx's replay path, not the live broadcast path.
@@ -216,7 +223,7 @@ async fn sh_dx_history_replay_honors_the_unique_filter() {
 
 #[tokio::test]
 async fn set_dx_filter_unique_suppresses_below_threshold_occurrences() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
@@ -263,7 +270,7 @@ async fn filter_evaluates_each_spot_at_its_own_publication_time_not_drain_time()
     // time the client gets around to checking it -- otherwise both the
     // first (which should be suppressed) and second occurrence would pass
     // a `unique > 1` filter once the count had already reached 2.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
@@ -301,7 +308,7 @@ async fn a_command_split_across_writes_survives_a_spot_arriving_mid_command() {
     // spot branch, then resume reading the command's remainder. The full
     // command must still be recognized, not corrupted into "x" (parsed as
     // Command::Unknown, silently producing no history replay at all).
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     let mut history_spot = sample_spot();
@@ -346,7 +353,7 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
     // (e.g. from TrackManager::finish() just before exit) must still
     // reach the client, not be dropped when the runtime tears the
     // connection's task down.
-    let (addr, bus, _metrics, shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     bus.publish(sample_spot());
@@ -369,7 +376,7 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
 
 #[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
-    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, _bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (_reader, _wr) = connect_and_login(addr).await;
 
     // Give the accept/login task a moment to run and increment the gauge.
@@ -395,7 +402,7 @@ async fn a_logged_in_client_that_sends_no_commands_survives_past_the_login_idle_
     // paused-time auto-advance doesn't coexist safely with real socket
     // I/O on this runtime, so a real (if slow) wait is the trustworthy
     // option here.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     tokio::time::sleep(manta_server::bounded_io::IDLE_READ_TIMEOUT + Duration::from_secs(1)).await;
@@ -425,7 +432,7 @@ async fn a_line_with_no_newline_past_the_max_length_is_disconnected_not_crashed(
     // handling ever sees it. Send one over a real socket and confirm: the
     // offending connection is cleanly closed, and the server (and other
     // clients) keep working afterward.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     let oversized = vec![b'A'; manta_server::bounded_io::MAX_LINE_BYTES + 1];
@@ -442,6 +449,25 @@ async fn a_line_with_no_newline_past_the_max_length_is_disconnected_not_crashed(
         n, 0,
         "expected the offending connection to be closed, got: {trailing:?}"
     );
+
+    // The socket closing is consistent with EITHER a clean protocol-error
+    // disconnect OR a panic in the client-handler task (dropping the task
+    // also drops the socket) -- so it alone doesn't distinguish them
+    // (PR #75 review, round 3). Directly inspect the tracked task's own
+    // join result, before spawning the second client below so there's no
+    // ambiguity about which task's result this is.
+    let join_result = tokio::time::timeout(Duration::from_secs(5), async {
+        tasks.lock().await.join_next().await
+    })
+    .await
+    .expect("oversized-line client handler task did not complete in time")
+    .expect("client handler task set was unexpectedly empty");
+    if let Err(join_err) = join_result {
+        assert!(
+            !join_err.is_panic(),
+            "client handler task panicked on an oversized line: {join_err}"
+        );
+    }
 
     // The server itself must still be healthy: a fresh client can connect,
     // log in, and receive a spot.
@@ -464,7 +490,7 @@ async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
     // (or worse, repeated `sh/dx/50`) is real CPU/bandwidth work. A
     // client must be disconnected once it exceeds a small per-window
     // command budget.
-    let (addr, _bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     for i in 0..manta_server::telnet::MAX_TELNET_COMMANDS {
