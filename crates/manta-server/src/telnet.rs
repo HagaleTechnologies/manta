@@ -112,6 +112,53 @@ const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 const CONNECTION_LOG_MAX_PER_WINDOW: u32 = 30;
 const CONNECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 
+/// MAN-68 (PR #85 review round 7): `log_enabled` above is a single budget
+/// covering BOTH routine connection-lifecycle noise (connect/disconnect/
+/// login/command-received) AND genuinely security-relevant rejections
+/// (a client exceeding its command-rate budget). Ordinary churn --
+/// opening and closing many harmless connections quickly, e.g. behind the
+/// documented reverse-proxy deployment where every downstream client
+/// shares one IP -- can exhaust that shared budget on its own, after
+/// which a genuinely malicious 31st+ connection's rejection goes entirely
+/// unrecorded even though rejections are the LOW-volume, high-value half
+/// of the audit trail (a real rejection IS the disconnect reason; it's
+/// not noise to be throttled alongside routine churn). This separate,
+/// per-IP budget is checked ONLY at the command-rate-budget-exceeded site
+/// (`handle_client` below) -- independent of `log_enabled` -- so that
+/// site keeps logging even once ordinary lifecycle churn has exhausted
+/// the shared budget above. Same cap/window as `CONNECTION_LOG_*`: this
+/// budget is never touched by harmless churn at all (only an actual
+/// command-rate violation decrements it), so it doesn't need to be
+/// larger to stay effective.
+const REJECTION_LOG_MAX_PER_WINDOW: u32 = 30;
+const REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// MAN-68 (PR #85 review round 6): the login-read and command-read Err
+/// branches in `handle_client` already log a specific rejection warning
+/// before returning `Err` -- `serve`'s task-boundary catch-all then logged
+/// a SECOND, generic warning for the same `Err`, so one real rejection
+/// produced two audit lines. `ClientError` lets the catch-all tell the
+/// two cases apart: `Logged` for an error a specific branch already
+/// reported (the catch-all skips it), `Unlogged` for anything else. The
+/// blanket `From<std::io::Error>` impl below defaults every OTHER
+/// fallible site (the bare `?` writes) to `Unlogged`, so they keep
+/// reaching the catch-all exactly as before -- a future fallible call
+/// site added without an explicit `Logged` wrap still gets caught by it,
+/// preserving MAN-59's original "no disconnect goes unrecorded" guarantee
+/// rather than silently losing it along with the double-log fix.
+enum ClientError {
+    /// The specific branch that produced this already logged it -- no
+    /// error payload carried, since nothing downstream needs it.
+    Logged,
+    Unlogged(std::io::Error),
+}
+
+impl From<std::io::Error> for ClientError {
+    fn from(e: std::io::Error) -> Self {
+        ClientError::Unlogged(e)
+    }
+}
+
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
 #[allow(clippy::too_many_arguments)]
@@ -132,6 +179,9 @@ pub async fn serve(
     let connection_log_limiter =
         IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(connection_log_limiter.clone());
+    let rejection_log_limiter =
+        IpRateLimiter::new(REJECTION_LOG_MAX_PER_WINDOW, REJECTION_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(rejection_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -175,6 +225,7 @@ pub async fn serve(
         let shutdown = shutdown.clone();
         let peer_ip = peer.ip();
         let ip_command_limiter = ip_command_limiter.clone();
+        let rejection_log_limiter = rejection_log_limiter.clone();
         // Decided ONCE per admitted connection -- see
         // CONNECTION_LOG_MAX_PER_WINDOW's doc comment above.
         let log_enabled = connection_log_limiter.allow(peer_ip);
@@ -197,6 +248,7 @@ pub async fn serve(
                 peer_ip,
                 ip_command_limiter,
                 log_enabled,
+                rejection_log_limiter,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -204,8 +256,12 @@ pub async fn serve(
             // disconnect path already logs its own specific reason
             // inline -- this is the one catch-all left uncovered without
             // it, and the only place that needs the raw io::Error itself.
+            // MAN-68 (round 6): only the Unlogged variant reaches here --
+            // Logged means a specific branch (login/command read
+            // rejection) already reported this exact error, and a second
+            // generic warning for it would just double the audit record.
             if log_enabled {
-                if let Err(e) = &result {
+                if let Err(ClientError::Unlogged(e)) = &result {
                     tracing::warn!(peer = %peer, error = %e, "telnet: client task ended with an error");
                 }
             }
@@ -226,7 +282,8 @@ pub async fn serve(
         shutdown,
         peer_ip,
         ip_command_limiter,
-        log_enabled
+        log_enabled,
+        rejection_log_limiter
     ),
     fields(peer = %peer)
 )]
@@ -241,7 +298,8 @@ async fn handle_client(
     peer_ip: IpAddr,
     ip_command_limiter: IpRateLimiter,
     log_enabled: bool,
-) -> std::io::Result<()> {
+    rejection_log_limiter: IpRateLimiter,
+) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
     }
@@ -262,7 +320,7 @@ async fn handle_client(
             if log_enabled {
                 tracing::warn!(error = %e, "telnet: login read rejected (oversized/malformed line or timeout), disconnecting");
             }
-            return Err(e);
+            return Err(ClientError::Logged);
         }
     }
     // MAN-59 review: the login line is client-supplied and unvalidated --
@@ -353,7 +411,7 @@ async fn handle_client(
                         if log_enabled {
                             tracing::warn!(error = %e, "telnet: command read rejected (oversized/malformed line), disconnecting");
                         }
-                        return Err(e);
+                        return Err(ClientError::Logged);
                     }
                 };
                 if n == 0 {
@@ -373,7 +431,13 @@ async fn handle_client(
                 // full budget on each one, multiplying the intended
                 // per-source rate by however many connections it holds.
                 if !command_limiter.allow() || !ip_command_limiter.allow(peer_ip) {
-                    if log_enabled {
+                    // MAN-68 (round 7): checked against the dedicated
+                    // rejection budget, NOT `log_enabled` -- this is a
+                    // genuine security-relevant rejection, which must not
+                    // go unrecorded just because unrelated routine
+                    // connection churn already exhausted the shared
+                    // lifecycle log budget.
+                    if rejection_log_limiter.allow(peer_ip) {
                         tracing::warn!("telnet: client exceeded command rate budget, disconnecting");
                     }
                     return Ok(());

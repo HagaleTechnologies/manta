@@ -78,6 +78,25 @@ pub const MAX_JSON_STREAM_CONNECTIONS: usize = 512;
 /// `telnet::MAX_TELNET_CONNECTIONS_PER_IP`.
 pub const MAX_JSON_STREAM_CONNECTIONS_PER_IP: usize = 16;
 
+/// MAN-68 (PR #85 review round 6): `handle_ws_client`'s WS handshake
+/// rejection/timeout branches already log a specific warning before
+/// returning `Err` -- `serve`'s task-boundary catch-all then logged a
+/// SECOND, generic warning for the same `Err`. Same fix and reasoning as
+/// `telnet::ClientError`: `Logged` for an error a specific branch already
+/// reported (the catch-all skips it), `Unlogged` for anything else, so a
+/// future fallible site that doesn't opt into `Logged` still reaches the
+/// catch-all rather than silently going unrecorded.
+enum WsClientError {
+    Logged,
+    Unlogged(anyhow::Error),
+}
+
+impl From<anyhow::Error> for WsClientError {
+    fn from(e: anyhow::Error) -> Self {
+        WsClientError::Unlogged(e)
+    }
+}
+
 // MAN-57: `ping_limiter` inside `handle_ws_client` is per-CONNECTION, so a
 // source opening several connections (up to
 // `MAX_JSON_STREAM_CONNECTIONS_PER_IP`) gets that many independent full
@@ -148,6 +167,15 @@ const QUOTA_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 const CONNECTION_LOG_MAX_PER_WINDOW: u32 = 30;
 const CONNECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 
+/// MAN-68 (PR #85 review round 7): see `telnet::REJECTION_LOG_MAX_PER_WINDOW`'s
+/// doc comment for the full rationale -- a separate, per-IP budget for
+/// genuinely security-relevant rejections (WS Ping-rate-budget-exceeded,
+/// a malformed WS frame), checked independently of `log_enabled` so
+/// ordinary connection churn exhausting the shared lifecycle log budget
+/// can never suppress one of these.
+const REJECTION_LOG_MAX_PER_WINDOW: u32 = 30;
+const REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 /// Accepts connections on `listener`, dispatching each to the plain-TCP or
 /// WebSocket handler based on a non-destructive peek of its first bytes.
 pub async fn serve(
@@ -172,6 +200,9 @@ pub async fn serve(
     let connection_log_limiter =
         IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
     crate::rate_limit::spawn_stale_entry_reaper(connection_log_limiter.clone());
+    let rejection_log_limiter =
+        IpRateLimiter::new(REJECTION_LOG_MAX_PER_WINDOW, REJECTION_LOG_WINDOW);
+    crate::rate_limit::spawn_stale_entry_reaper(rejection_log_limiter.clone());
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -212,6 +243,7 @@ pub async fn serve(
         let ctx = ctx.clone();
         let peer_ip = peer.ip();
         let ip_ping_limiter = ip_ping_limiter.clone();
+        let rejection_log_limiter = rejection_log_limiter.clone();
         // Decided ONCE per admitted connection -- see
         // CONNECTION_LOG_MAX_PER_WINDOW's doc comment above.
         let log_enabled = connection_log_limiter.allow(peer_ip);
@@ -237,10 +269,14 @@ pub async fn serve(
                     peer_ip,
                     ip_ping_limiter,
                     log_enabled,
+                    rejection_log_limiter,
                 )
                 .await;
+                // MAN-68 (round 6): only the Unlogged variant reaches here
+                // -- Logged means the handshake reject/timeout branch
+                // already reported this exact error.
                 if log_enabled {
-                    if let Err(e) = &result {
+                    if let Err(WsClientError::Unlogged(e)) = &result {
                         tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
                     }
                 }
@@ -449,9 +485,48 @@ async fn handle_tcp_client(
     }
 }
 
+/// MAN-68 (PR #85 review round 8): classifies a `ws.next()` error as a
+/// genuine protocol violation (a malformed frame, oversized message, bad
+/// UTF-8, tungstenite's own attack detection -- worth charging to the
+/// dedicated rejection budget) versus a routine transport-level
+/// disconnect (`ConnectionClosed`/`AlreadyClosed`/`Io`/`Tls` -- an
+/// ordinary reset, unclean close, or I/O error: mobile-network/NAT/proxy
+/// churn, not a security-relevant rejection). Split out so this
+/// classification is unit-testable without a real WebSocket handshake,
+/// same as `uplink`'s own precedent for pulling policy logic out of an
+/// I/O-bound function.
+fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
+    match e {
+        // MAN-68 (round 8): a peer that drops the raw TCP connection
+        // without sending a WS close frame surfaces as THIS specific
+        // `Protocol` sub-variant, not as `Io`/`ConnectionClosed` --
+        // tungstenite classifies it as a protocol-layer error even though
+        // it's exactly the same routine mobile/NAT/proxy disconnect the
+        // round-7/8 split already carves out for `Io`/`ConnectionClosed`.
+        // A blanket `Protocol(_)` match would still charge every one of
+        // these routine resets to the rejection budget, defeating the
+        // fix's own purpose.
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => false,
+        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8 | WsError::AttackAttempt => {
+            true
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "ws_client",
-    skip(socket, rx, ctx, peer_ip, ip_ping_limiter, log_enabled),
+    skip(
+        socket,
+        rx,
+        ctx,
+        peer_ip,
+        ip_ping_limiter,
+        log_enabled,
+        rejection_log_limiter
+    ),
     fields(peer = %peer)
 )]
 async fn handle_ws_client(
@@ -462,7 +537,8 @@ async fn handle_ws_client(
     peer_ip: IpAddr,
     ip_ping_limiter: IpRateLimiter,
     log_enabled: bool,
-) -> anyhow::Result<()> {
+    rejection_log_limiter: IpRateLimiter,
+) -> Result<(), WsClientError> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 
@@ -480,13 +556,13 @@ async fn handle_ws_client(
             if log_enabled {
                 tracing::warn!(error = %e, "json_stream: WS handshake rejected");
             }
-            return Err(e.into());
+            return Err(WsClientError::Logged);
         }
         Err(_) => {
             if log_enabled {
                 tracing::warn!("json_stream: WS handshake timed out");
             }
-            return Err(anyhow::anyhow!("WS handshake timed out"));
+            return Err(WsClientError::Logged);
         }
     };
     if log_enabled {
@@ -556,14 +632,18 @@ async fn handle_ws_client(
                         // multiplying the intended per-source rate by
                         // however many connections it holds.
                         if !ping_limiter.allow() || !ip_ping_limiter.allow(peer_ip) {
-                            if log_enabled {
+                            // MAN-68 (round 7): the dedicated rejection
+                            // budget, not `log_enabled` -- see
+                            // REJECTION_LOG_MAX_PER_WINDOW's doc comment.
+                            if rejection_log_limiter.allow(peer_ip) {
                                 tracing::warn!("json_stream: client exceeded Ping rate budget, disconnecting");
                             }
                             return Ok(());
                         }
                         tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
                             .await
-                            .map_err(|_| anyhow::anyhow!("write timed out"))??;
+                            .map_err(|_| anyhow::anyhow!("write timed out"))?
+                            .map_err(anyhow::Error::from)?;
                     }
                     // This server never sends Ping, so ANY inbound Pong is
                     // unsolicited -- treat it the same as Text/Binary
@@ -594,8 +674,33 @@ async fn handle_ws_client(
                         return Ok(());
                     }
                     Some(Err(e)) => {
-                        if log_enabled {
-                            tracing::warn!(error = %e, "json_stream: malformed WS frame, disconnecting");
+                        // MAN-68 (round 8): `ws.next()` returning `Err`
+                        // covers BOTH a genuine protocol violation (a
+                        // malformed frame, oversized message, bad UTF-8)
+                        // AND an ordinary transport-level disconnect (a
+                        // reset, an unclean close, an I/O error) -- the
+                        // latter is routine mobile-network/NAT/proxy
+                        // churn, not a security-relevant rejection, and
+                        // charging it to the dedicated rejection budget
+                        // would let 30 routine disconnects from one IP
+                        // exhaust the very budget this change exists to
+                        // protect (the same class of gap round 7 already
+                        // fixed for the Ping-budget/malformed-frame
+                        // sites). Only a genuine protocol-shaped error
+                        // consumes the rejection budget; a transport error
+                        // is a routine lifecycle event.
+                        let is_protocol_violation = is_ws_protocol_violation(&e);
+                        let should_log = if is_protocol_violation {
+                            rejection_log_limiter.allow(peer_ip)
+                        } else {
+                            log_enabled
+                        };
+                        if should_log {
+                            if is_protocol_violation {
+                                tracing::warn!(error = %e, "json_stream: malformed WS frame, disconnecting");
+                            } else {
+                                tracing::info!(error = %e, "json_stream: WS client disconnected (transport error)");
+                            }
                         }
                         return Ok(());
                     }
@@ -641,5 +746,58 @@ async fn handle_ws_client(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::{
+        error::{CapacityError, ProtocolError},
+        Error as WsError,
+    };
+
+    /// MAN-68, PR #85 review round 8: a genuine protocol-shaped error
+    /// must be classified as a rejection worth its own audit budget.
+    #[test]
+    fn protocol_shaped_errors_are_classified_as_violations() {
+        assert!(is_ws_protocol_violation(&WsError::Protocol(
+            ProtocolError::WrongHttpMethod
+        )));
+        assert!(is_ws_protocol_violation(&WsError::Capacity(
+            CapacityError::MessageTooLong {
+                size: 100,
+                max_size: 10,
+            }
+        )));
+        assert!(is_ws_protocol_violation(&WsError::Utf8));
+        assert!(is_ws_protocol_violation(&WsError::AttackAttempt));
+    }
+
+    /// A transport-level disconnect must NOT be classified as a
+    /// violation -- these are routine mobile-network/NAT/proxy churn, and
+    /// charging them to the dedicated rejection budget would defeat the
+    /// whole point of round 7's fix (see `is_ws_protocol_violation`'s doc
+    /// comment).
+    #[test]
+    fn transport_level_errors_are_not_classified_as_violations() {
+        assert!(!is_ws_protocol_violation(&WsError::ConnectionClosed));
+        assert!(!is_ws_protocol_violation(&WsError::AlreadyClosed));
+        assert!(!is_ws_protocol_violation(&WsError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer")
+        )));
+    }
+
+    /// MAN-68, PR #85 review round 8: a peer that drops the raw TCP
+    /// connection without a WS close frame surfaces as this SPECIFIC
+    /// `Protocol` sub-variant, not `Io`/`ConnectionClosed` -- a blanket
+    /// `Protocol(_)` match (this function's first version) would still
+    /// misclassify it as a rejection, letting routine disconnects exhaust
+    /// the budget the round-7/8 split exists to protect.
+    #[test]
+    fn reset_without_closing_handshake_is_not_classified_as_a_violation() {
+        assert!(!is_ws_protocol_violation(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
     }
 }
