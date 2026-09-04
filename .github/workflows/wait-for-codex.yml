@@ -47,7 +47,7 @@ on:
   # context — this workflow's PR-specific job never matches that event, so
   # a required "Wait for Codex Review" check would sit permanently pending
   # on the queue SHA and stall the queue (Codex P1, flagged reviewing this
-  # file on skimmer, the first repo in this rollout using a merge queue).
+  # file on manta, the first repo in this rollout using a merge queue).
   # Handled by an event-gated pass-through step in the job below (not a
   # separate job — an earlier version split this into two jobs sharing the
   # same check name, which Codex flagged as relying on undocumented
@@ -455,7 +455,7 @@ jobs:
           # event whose baseline already contains an unresolved finding could
           # still auto-resolve it with zero remediation commit if Codex
           # didn't repeat the finding on the rerun (Codex P1, flagged
-          # reviewing this file on skimmer's own sync PR — direct follow-up
+          # reviewing this file on manta's own sync PR — direct follow-up
           # to the IS_GENUINE_SYNC fix above, which this twin predicate had
           # been missed by).
           IS_REMEDIATION: ${{ github.event.action == 'synchronize' && github.run_attempt == 1 }}
@@ -519,7 +519,7 @@ jobs:
             # assignment) is required under this step's default `bash -e`:
             # an unguarded failing command here kills the whole step instantly
             # instead of reaching the next iteration (observed live on
-            # skimmer#45: the very first poll hit "Could not resolve to a
+            # manta#45: the very first poll hit "Could not resolve to a
             # node" for a comment created less than a second earlier, and the
             # required check failed in 6 seconds instead of retrying).
             if ! gh_poll_raw=$(gh api graphql -f query='
@@ -562,7 +562,7 @@ jobs:
             # run for a superseded head could keep polling for up to 70
             # minutes and eventually execute the thread-resolution mutations
             # below using a review tied to a commit that's no longer HEAD
-            # (Codex P2, flagged reviewing this file on skimmer's sync PR).
+            # (Codex P2, flagged reviewing this file on manta's sync PR).
             # Re-checked every iteration (cheap next to the poll query
             # itself), not just once before the loop starts — a push landing
             # mid-poll must be caught here too, not just at step entry.

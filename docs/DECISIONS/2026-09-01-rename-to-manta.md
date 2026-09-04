@@ -41,8 +41,18 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
   in MAN-24, once `thoughts.directory` here already said `manta`.
 - Historical DECISIONS and plan documents keep their original filenames.
 - Comments inside the fleet-synced workflow files (`.github/workflows/
-  wait-for-codex.yml`, `ci.yml`) and `.mergify.yml` are left as they are to
-  avoid drift against their upstream source.
+  wait-for-codex.yml`, `ci.yml`) and `.mergify.yml` were initially left as they
+  were, to avoid drift against their upstream source.
+
+  **Superseded by MAN-25 (2026-09-04):** those copies have no automated sync --
+  `wait-for-codex.yml`'s own note reads "this repo's copy has no auto-sync, so
+  port future template fixes here manually too", and `.github/workflows/`
+  contains no sync workflow -- so a local edit is not reverted by machinery. The
+  six remaining comment references were renamed to `manta` (a `manta#45` issue
+  ref resolves through GitHub's rename redirect), and
+  `crates/manta-cli/tests/synced_ci_files_repo_name.rs` fails CI if a future
+  manual port reintroduces the old name. Editing the upstream template as well
+  (see Follow-ups) is what stops a port from carrying it back in the first place.
 
 ## Follow-ups
 
@@ -50,3 +60,7 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
 - Set the GitHub repository description and topics.
 - Sibling repos that link to `HagaleTechnologies/skimmer` (cqdx, coppa,
   dispensa) rely on the redirect until touched for other reasons.
+- MAN-25: apply the same rename in the upstream `wait-for-codex.yml` /
+  `ci.yml` / `.mergify.yml` template (canonical copy cited as `credenza`,
+  PR #30) so the next manual port carries the new name. Requires access to
+  that repo; tracked separately from the manta-side fix.

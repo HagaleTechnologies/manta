@@ -1,5 +1,5 @@
 # Self-contained (no `extends:` pulling in a shared/reusable config) --
-# skimmer is a public repo, and an externally-sourced config's real content
+# manta is a public repo, and an externally-sourced config's real content
 # renders into THIS repo's own public Action logs when it's pulled in,
 # which would leak incident history or other detail embedded in a shared
 # config's own comments (some of which may live in a private repo) straight

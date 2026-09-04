@@ -71,7 +71,7 @@ jobs:
           REPO: ${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          # skimmer's wait-for-codex.yml PRE-DATES this migration -- it
+          # manta's wait-for-codex.yml PRE-DATES this migration -- it
           # already exists at every reachable base.sha, so a mere-existence
           # check (a bare 404-vs-200 on the file path) can NEVER resolve to
           # "absent" and would provide zero protection against the
