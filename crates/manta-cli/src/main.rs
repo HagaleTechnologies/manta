@@ -412,6 +412,10 @@ impl IqSource for FixedCenterFreqSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
     }
+
+    fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
+        self.inner.health_counters()
+    }
 }
 
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
@@ -771,6 +775,30 @@ fn shutdown_runtime_after_drain(
         SHUTDOWN_DRAIN_DEADLINE,
     ));
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
+}
+
+/// How often the daemon samples an input source's `InputHealthCounters`
+/// into `Metrics` (MAN-56). An order of magnitude below any realistic
+/// Prometheus scrape interval, so a scrape never sees more than ~1 s of
+/// staleness; the tick itself is three relaxed atomic loads and one
+/// `BTreeMap` insert. Deliberately slower than the `confirmed_live` poll
+/// (200 ms, see the `confirmed_live_handle` wiring below), which is tuned
+/// for a single startup transition rather than a forever-loop.
+const INPUT_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Snapshot `manta-input`'s counters into `manta-server`'s own,
+/// dependency-free mirror struct. The two crates deliberately share no
+/// type -- that disjointness is what keeps `manta-server` free of any
+/// `manta-input` dependency (ARCHITECTURE §3/§8) -- so `manta-cli`, which
+/// depends on both, is where the translation belongs.
+fn input_health_of(
+    counters: &manta_input::InputHealthCounters,
+) -> manta_server::metrics::InputHealth {
+    manta_server::metrics::InputHealth {
+        dropped_packets: counters.dropped_packets(),
+        gaps_detected: counters.gaps_detected(),
+        malformed_packets: counters.malformed_packets(),
+    }
 }
 
 fn start_spot_server(
@@ -1160,6 +1188,33 @@ fn main() -> Result<()> {
                         }
                         None => server.metrics.set_source_health(source_name, true),
                     }
+
+                    // MAN-56: HPSDR's packet loss/malformed counters are
+                    // input-layer state manta-server cannot compute itself
+                    // (it has no manta-input dependency). Sample them into
+                    // Metrics on a timer, the same wiring-layer-injection
+                    // shape `set_source_health` uses above -- and read the
+                    // handle HERE, before `listen(src, ..)` below takes
+                    // ownership of the source for the rest of the run.
+                    // Sources with no wire-packet loss model return None
+                    // and publish no series at all, which is deliberate:
+                    // a permanently-zero counter reads as "no loss" rather
+                    // than "not measured" (cf. ARCHITECTURE §8's
+                    // manta_active_tracks caveat).
+                    if let Some(counters) = src.health_counters() {
+                        let metrics = server.metrics.clone();
+                        // Published once eagerly so the series exists (at
+                        // 0) from the very first scrape rather than only
+                        // after one poll interval.
+                        metrics.set_input_health(source_name, input_health_of(&counters));
+                        rt.spawn(async move {
+                            loop {
+                                tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                                metrics.set_input_health(source_name, input_health_of(&counters));
+                            }
+                        });
+                    }
+
                     (Some(rt), Some(server))
                 }
                 None => (None, None),
@@ -1730,5 +1785,99 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    // MAN-56: input-layer health counters wiring.
+
+    /// A wrapper `IqSource` that forgets to forward `health_counters`
+    /// silently swallows the inner source's counters via the trait's
+    /// `None` default -- the metrics would just be absent, with nothing
+    /// failing loudly. Same hazard `confirmed_live_handle` carries; both
+    /// are asserted here.
+    #[test]
+    fn fixed_center_freq_source_forwards_both_optional_trait_signals() {
+        use manta_input::InputHealthCounters;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        struct StubSource {
+            counters: Arc<InputHealthCounters>,
+            live: Arc<AtomicBool>,
+        }
+        impl IqSource for StubSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
+                Some(self.live.clone())
+            }
+            fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+                Some(self.counters.clone())
+            }
+        }
+
+        let counters = Arc::new(InputHealthCounters::new());
+        let live = Arc::new(AtomicBool::new(false));
+        let wrapped = FixedCenterFreqSource {
+            inner: Box::new(StubSource {
+                counters: counters.clone(),
+                live: live.clone(),
+            }),
+            freq_hz: 14_025_000.0,
+        };
+
+        assert!(Arc::ptr_eq(&wrapped.health_counters().unwrap(), &counters));
+        assert!(Arc::ptr_eq(
+            &wrapped.confirmed_live_handle().unwrap(),
+            &live
+        ));
+    }
+
+    #[test]
+    fn input_health_of_snapshots_all_three_counters_without_transposing_them() {
+        // Three same-typed u64s: a transposition would be invisible to any
+        // test that used equal values (MAN-56 D7).
+        let c = manta_input::InputHealthCounters::new();
+        c.record_dropped(7);
+        c.record_gap();
+        c.record_gap();
+        c.record_malformed();
+        let h = input_health_of(&c);
+        assert_eq!(h.dropped_packets, 7);
+        assert_eq!(h.gaps_detected, 2);
+        assert_eq!(h.malformed_packets, 1);
+    }
+
+    #[test]
+    fn a_source_without_counters_publishes_no_input_health_series() {
+        struct StubSourceNoCounters;
+        impl IqSource for StubSourceNoCounters {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let m = manta_server::metrics::Metrics::new();
+        // Mirrors the wiring above: `None` means we never call
+        // set_input_health.
+        let src: Box<dyn IqSource> = Box::new(StubSourceNoCounters);
+        if let Some(c) = src.health_counters() {
+            m.set_input_health("file", input_health_of(&c));
+        }
+        assert!(!m
+            .render_prometheus_text()
+            .contains("manta_input_malformed_packets_total{"));
     }
 }

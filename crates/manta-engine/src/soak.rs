@@ -2,12 +2,17 @@
 //! panic and bounded memory growth. ROADMAP M1 accept criterion; reused by
 //! M2/M3's longer soaks (design doc §7).
 //!
-//! Deviation from the design doc: input-overrun tracking is NOT
+//! Deviation from the design doc: input-*ring*-overrun tracking is NOT
 //! implemented. coppa-audio's CpalSource doesn't expose its internal
 //! ring's overflow_count() publicly, and file-replay sources (what this
 //! harness runs against in CI) have no ring and cannot overrun by
 //! construction. Live-hardware overrun observability needs a coppa-audio
-//! API addition -- a real upstream ask, not made unilaterally here.
+//! API addition -- a real upstream ask, not made unilaterally here. This
+//! is a different, still-open gap from MAN-56 (closed 2026-09-04), which
+//! wired HPSDR's wire-level UDP packet loss/malformed-datagram counters
+//! (`manta_input::InputHealthCounters`) into manta-server's Prometheus
+//! endpoint -- lost/rejected datagrams before demux, not ring
+//! backpressure after it.
 
 use crate::{listen, PipelineConfig};
 use anyhow::Result;
