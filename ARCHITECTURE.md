@@ -127,6 +127,14 @@ instances, not one instance retuning — simpler, and SDRs are cheap.
 
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
+This ring-overrun counting is still aspirational (`manta-engine::soak`'s module
+doc tracks the blocker: `coppa-audio::CpalSource` doesn't expose its ring's
+`overflow_count()` publicly). Distinct and already shipped (MAN-56): HPSDR's
+wire-level UDP packet loss/malformed-datagram counters
+(`manta_input::InputHealthCounters`, §8) reach the Prometheus `/metrics`
+endpoint today — a different layer (lost/rejected datagrams before demux, not
+ring backpressure after it), not a partial implementation of the ring gauge
+above.
 
 ## 4. Channelizer (`manta-dsp`)
 
@@ -318,16 +326,28 @@ validation (MAN-28). Dedupe (step 5) still applies.
   own yet (decode-pipeline internals, not the network-facing surface
   MAN-59 scoped to), and `manta --status` hitting a local control socket
   for live stats is similarly not yet implemented. Prometheus text
-  endpoint (feature `metrics`): input overruns, active tracks, evictions,
-  decode rate, spots/min, per-stage queue depths, spot confidence
-  histogram — also aspirational for several of these fields; the
-  currently-implemented subset is `manta_spots_total`,
-  `manta_spots_dropped_lagged_total`,
+  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
+  doc was stale — no Cargo `metrics` feature has ever existed; the
+  endpoint is unconditionally compiled and served whenever
+  `--server-config` is set): active tracks, evictions, decode rate,
+  spots/min, per-stage queue depths, spot confidence histogram — still
+  aspirational for several of these fields; the currently-implemented
+  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
+  gauges, `manta_source_health`, the uplink counters, and (MAN-56,
+  landed 2026-09-04) `manta_input_dropped_packets_total`/
+  `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
+  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
+  per-stage queue depths, decode rate, spots/min, spot-confidence
+  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  deviation, a different gap from MAN-56's wire-level packet counters).
+  The three `manta_input_*` series are published only for sources that
+  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
+  report none) and are **absent**, not a frozen zero, for every other
+  source — same "absent means not measured" distinction as
+  `manta_active_tracks` below.
   **`manta_active_tracks` is served but not populated** (corrected
   2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
   `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
