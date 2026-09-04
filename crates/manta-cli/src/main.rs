@@ -265,6 +265,27 @@ enum Command {
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
     },
+    /// Query a running manta daemon's health (MAN-44). Reads the same
+    /// `/status` document the metrics listener serves on `GET /status` --
+    /// no separate control socket, so this works identically on every
+    /// platform manta builds for.
+    Status {
+        /// Daemon config to read the metrics bind address/port from. A
+        /// wildcard `bind_addr` (e.g. `0.0.0.0`) resolves to loopback for
+        /// dialing purposes -- see `resolve_status_addr`.
+        #[arg(long, conflicts_with = "addr")]
+        server_config: Option<PathBuf>,
+        /// Explicit `host:port` of the daemon's metrics listener (default
+        /// 127.0.0.1:7302, the documented default metrics port).
+        #[arg(long)]
+        addr: Option<String>,
+        /// Emit the raw status JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+        /// Give up after this many seconds if the daemon doesn't respond.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
@@ -699,6 +720,12 @@ fn build_pipeline_config(
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+    /// The metrics/status HTTP listener's real bound address (MAN-44) --
+    /// captured from `TcpListener::local_addr()` so a port-0 (OS-assigned)
+    /// bind is still reachable by `manta status`/tests without guessing or
+    /// binding a fixed port (CLAUDE.md multi-agent hygiene: don't bind
+    /// fixed ports).
+    metrics_addr: std::net::SocketAddr,
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
@@ -823,13 +850,16 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let metrics_addr = rt.block_on(async {
         let telnet_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
         let json_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
+        // Captured before the listener moves into metrics_http::serve
+        // below (MAN-44) -- see SpotServer::metrics_addr's doc comment.
+        let metrics_addr = metrics_listener.local_addr()?;
 
         let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::telnet::MAX_TELNET_COMMANDS,
@@ -899,26 +929,32 @@ fn start_spot_server(
                 cfg.metrics_max_connections_per_ip,
             ),
         ));
-        // MAN-32/MAN-42: one independent uplink::serve task per configured
-        // [[rbn_uplink]] entry -- the common case for existing single-node
-        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
-        // body never runs), and uplink::serve itself also no-ops when
-        // `enabled = false` (belt-and-suspenders, not a duplicate check:
-        // this loop additionally avoids spawning a task at all when the
-        // Vec is empty). Each task owns its own SpotBus subscription and
-        // backoff state, so one target being down never affects another's
-        // delivery or retry timing.
-        for uplink_cfg in rbn_uplink_cfgs {
+        // MAN-32/MAN-42/MAN-44: one independent uplink::serve task per
+        // configured [[rbn_uplink]] entry -- the common case for existing
+        // single-node operators is no [[rbn_uplink]] tables at all (empty
+        // Vec, loop body never runs), and uplink::serve itself also
+        // no-ops when `enabled = false` (belt-and-suspenders, not a
+        // duplicate check: this loop additionally avoids spawning a task
+        // at all when the Vec is empty). Each task owns its own SpotBus
+        // subscription and backoff state, so one target being down never
+        // affects another's delivery or retry timing. Registered BEFORE
+        // spawning (MAN-44) -- so a target that is disabled, or that
+        // never manages a single successful connection, still appears in
+        // `manta status`: an operator must be able to tell "configured
+        // and stuck" from "not configured at all".
+        let uplink_specs = manta_server::uplink::target_specs(&rbn_uplink_cfgs);
+        for (uplink_cfg, spec) in rbn_uplink_cfgs.into_iter().zip(uplink_specs) {
+            let target = metrics.register_uplink_target(spec);
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
                 bus.clone(),
-                metrics.clone(),
+                target,
                 shutdown_rx.clone(),
             ));
         }
 
-        anyhow::Ok(())
+        anyhow::Ok(metrics_addr)
     })?;
 
     Ok((
@@ -926,10 +962,120 @@ fn start_spot_server(
         SpotServer {
             bus,
             metrics,
+            metrics_addr,
             shutdown_tx,
             tasks,
         },
     ))
+}
+
+/// Resolves the address `manta status` should DIAL to reach a running
+/// daemon's metrics/status listener (MAN-44). An explicit `--addr` always
+/// wins; otherwise a `--server-config`'s `[server]` table supplies the
+/// port, with its `bind_addr` translated to a real dialable address --
+/// `0.0.0.0`/`::` mean "listening on every interface," which isn't itself
+/// something a client can connect TO, so those collapse to loopback (the
+/// one address guaranteed to reach a same-host daemon). With neither,
+/// falls back to the documented default metrics port on loopback.
+fn resolve_status_addr(
+    addr: Option<&str>,
+    server: Option<&manta_server::config::ServerConfig>,
+) -> Result<std::net::SocketAddr> {
+    if let Some(addr) = addr {
+        return addr
+            .parse()
+            .with_context(|| format!("invalid --addr {addr:?}"));
+    }
+    let Some(server) = server else {
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 7302)));
+    };
+    let host: std::net::IpAddr = match server.bind_addr.as_str() {
+        "0.0.0.0" => std::net::Ipv4Addr::LOCALHOST.into(),
+        "::" => std::net::Ipv6Addr::LOCALHOST.into(),
+        other => other
+            .parse()
+            .with_context(|| format!("invalid server.bind_addr {other:?}"))?,
+    };
+    Ok(std::net::SocketAddr::new(host, server.metrics_port))
+}
+
+/// Exit code contract for scripting (cron/Nagios-style): `0` when every
+/// enabled uplink target is connected, or there's no uplink configured at
+/// all; `1` when the daemon was reached but the uplink is unhealthy. (A
+/// third case -- `2`, "could not reach or parse the daemon's status at
+/// all" -- is returned directly by `Command::Status`'s handler, since it
+/// never gets as far as a `StatusDoc` to pass here.)
+fn status_exit_code(doc: &manta_server::status::StatusDoc) -> i32 {
+    use manta_server::metrics::OverallUplinkHealth;
+    match doc.uplink.health {
+        OverallUplinkHealth::Ok | OverallUplinkHealth::Disabled => 0,
+        OverallUplinkHealth::Degraded | OverallUplinkHealth::Down => 1,
+    }
+}
+
+/// Bounds a fetched status document's body size (MAN-44): a real status
+/// document is kilobytes at most, but a wrong or hostile endpoint
+/// answering `GET /status` must not be able to make this allocate without
+/// bound.
+const MAX_STATUS_BODY_BYTES: u64 = 256 * 1024;
+
+/// Fetches and parses `GET /status` from a running daemon's metrics
+/// listener (MAN-44) -- a small hand-rolled HTTP/1.1 GET, matching
+/// `manta_server::metrics_http`'s own hand-rolled precedent rather than
+/// adding an HTTP client dependency for one request. The whole operation
+/// (connect, write, read) is bounded by `timeout` so a silent or
+/// half-open peer can't hang `manta status` indefinitely.
+async fn fetch_status(
+    addr: std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> Result<manta_server::status::StatusDoc> {
+    tokio::time::timeout(timeout, fetch_status_inner(addr))
+        .await
+        .map_err(|_| anyhow!("timed out talking to {addr}"))?
+}
+
+async fn fetch_status_inner(addr: std::net::SocketAddr) -> Result<manta_server::status::StatusDoc> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    stream
+        .write_all(
+            format!("GET /status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .context("writing the status request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .context("reading the status line")?;
+    if !status_line.starts_with("HTTP/1.1 200") {
+        bail!("daemon returned {}", status_line.trim_end());
+    }
+
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("reading response headers")?;
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+    }
+
+    let mut body = Vec::new();
+    reader
+        .take(MAX_STATUS_BODY_BYTES)
+        .read_to_end(&mut body)
+        .await
+        .context("reading the status body")?;
+    let body = String::from_utf8(body).context("status body was not valid UTF-8")?;
+    serde_json::from_str(&body).context("status body was not a valid status document")
 }
 
 fn main() -> Result<()> {
@@ -1313,6 +1459,45 @@ fn main() -> Result<()> {
             if !manta_engine::soak_passed(&report) {
                 std::process::exit(1);
             }
+        }
+        Command::Status {
+            server_config,
+            addr,
+            json,
+            timeout_secs,
+        } => {
+            let file = server_config
+                .as_deref()
+                .map(|path| -> Result<manta_server::config::DaemonConfigFile> {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+                })
+                .transpose()?;
+            let target = resolve_status_addr(addr.as_deref(), file.as_ref().map(|f| &f.server))?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let doc = match rt.block_on(fetch_status(
+                target,
+                std::time::Duration::from_secs(timeout_secs),
+            )) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    // Exit 2 = "couldn't ask", distinct from exit 1 =
+                    // "asked, unhealthy" (status_exit_code) -- a cron job
+                    // must be able to tell a broken uplink from a stopped
+                    // daemon.
+                    eprintln!("manta status: could not reach daemon at {target}: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            if json {
+                print!("{}", doc.to_json());
+            } else {
+                print!("{}", manta_server::status::render_human(&doc));
+            }
+            std::process::exit(status_exit_code(&doc));
         }
     }
     Ok(())
@@ -1730,5 +1915,293 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    // MAN-44: uplink health at a glance -- `manta status` + `GET /status`.
+
+    #[test]
+    fn every_configured_uplink_target_is_registered_even_when_disabled() {
+        // Two [[rbn_uplink]] entries, one enabled=false: the daemon's
+        // Metrics must report BOTH, the disabled one as
+        // UplinkHealth::Disabled -- an operator must be able to see
+        // "configured but off", not an empty list.
+        let cfg_file = write_temp_file(
+            br#"
+            [server]
+            station_callsign = "W3XYZ"
+            bind_addr = "127.0.0.1"
+            telnet_port = 0
+            json_port = 0
+            metrics_port = 0
+
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "127.0.0.1"
+            target_port = 1
+
+            [[rbn_uplink]]
+            enabled = false
+            target_host = "127.0.0.1"
+            target_port = 2
+            "#,
+        );
+
+        let (_rt, server) = start_spot_server(
+            cfg_file.path(),
+            96_000.0,
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        let snap = server.metrics.uplink_snapshot();
+        assert_eq!(
+            snap.len(),
+            2,
+            "both configured targets must be registered, including the disabled one"
+        );
+        assert!(snap.iter().any(|t| t.label == "127.0.0.1:1" && t.enabled));
+        assert!(snap.iter().any(|t| t.label == "127.0.0.1:2" && !t.enabled));
+    }
+
+    /// MAN-44 end-to-end: a real daemon (port 0, discovered via
+    /// SpotServer::metrics_addr) answers `manta status`'s own fetch path.
+    #[test]
+    fn status_reports_a_configured_uplink_target_from_a_live_daemon() {
+        let cfg_file = write_temp_file(
+            br#"
+            [server]
+            station_callsign = "W3XYZ"
+            bind_addr = "127.0.0.1"
+            telnet_port = 0
+            json_port = 0
+            metrics_port = 0
+
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "127.0.0.1"
+            target_port = 1
+            "#,
+        );
+
+        let (rt, server) = start_spot_server(
+            cfg_file.path(),
+            96_000.0,
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        let doc = rt
+            .block_on(fetch_status(
+                server.metrics_addr,
+                std::time::Duration::from_secs(5),
+            ))
+            .unwrap();
+
+        assert!(
+            doc.uplink.targets.iter().any(|t| t.label == "127.0.0.1:1"),
+            "expected the configured target to be visible, got: {doc:?}"
+        );
+        assert_eq!(
+            status_exit_code(&doc),
+            1,
+            "a never-yet-connected enabled target must not read as healthy"
+        );
+
+        let _ = server.shutdown_tx.send(true);
+        shutdown_runtime_after_drain(rt, &server.tasks);
+    }
+
+    fn cfg_with(bind_addr: &str, metrics_port: u16) -> manta_server::config::ServerConfig {
+        manta_server::config::ServerConfig {
+            station_callsign: "W3XYZ".to_string(),
+            bind_addr: bind_addr.to_string(),
+            telnet_port: 7300,
+            json_port: 7301,
+            metrics_port,
+            telnet_max_connections_per_ip: None,
+            json_max_connections_per_ip: None,
+            metrics_max_connections_per_ip: None,
+            telnet_max_commands_per_ip: None,
+            json_max_pings_per_ip: None,
+        }
+    }
+
+    #[test]
+    fn status_address_prefers_explicit_addr_then_config_then_default() {
+        assert_eq!(
+            resolve_status_addr(Some("1.2.3.4:9999"), None)
+                .unwrap()
+                .to_string(),
+            "1.2.3.4:9999"
+        );
+        // bind_addr 0.0.0.0 in config means "listening everywhere"; the
+        // CLI still has to DIAL something, and loopback is the only
+        // address guaranteed to reach the local daemon.
+        assert_eq!(
+            resolve_status_addr(None, Some(&cfg_with("0.0.0.0", 17302)))
+                .unwrap()
+                .to_string(),
+            "127.0.0.1:17302"
+        );
+        assert_eq!(
+            resolve_status_addr(None, Some(&cfg_with("::", 17302)))
+                .unwrap()
+                .to_string(),
+            "[::1]:17302"
+        );
+        assert_eq!(
+            resolve_status_addr(None, Some(&cfg_with("10.0.0.5", 17302)))
+                .unwrap()
+                .to_string(),
+            "10.0.0.5:17302"
+        );
+        assert_eq!(
+            resolve_status_addr(None, None).unwrap().to_string(),
+            "127.0.0.1:7302"
+        );
+    }
+
+    fn doc_with(
+        health: manta_server::metrics::OverallUplinkHealth,
+    ) -> manta_server::status::StatusDoc {
+        manta_server::status::StatusDoc {
+            schema_version: 1,
+            version: "test".to_string(),
+            uptime_seconds: 0,
+            spots_total: 0,
+            telnet_clients: 0,
+            json_clients: 0,
+            ws_clients: 0,
+            active_tracks: None,
+            uplink: manta_server::status::UplinkStatus {
+                health,
+                connected_targets: 0,
+                enabled_targets: 0,
+                sent_total: 0,
+                suppressed_total: 0,
+                reconnects_total: 0,
+                reconnect_window_seconds: 300,
+                flapping_threshold: 3,
+                targets: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn status_exit_code_is_zero_when_healthy_one_when_degraded() {
+        use manta_server::metrics::OverallUplinkHealth;
+        assert_eq!(status_exit_code(&doc_with(OverallUplinkHealth::Ok)), 0);
+        assert_eq!(
+            status_exit_code(&doc_with(OverallUplinkHealth::Disabled)),
+            0
+        );
+        assert_eq!(
+            status_exit_code(&doc_with(OverallUplinkHealth::Degraded)),
+            1
+        );
+        assert_eq!(status_exit_code(&doc_with(OverallUplinkHealth::Down)), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_parses_a_chunk_split_http_response() {
+        // A body assembled from one read() would pass trivially and hide
+        // a real framing bug -- the status line, headers, and body are
+        // deliberately written in three separate writes here.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let body = doc_with(manta_server::metrics::OverallUplinkHealth::Disabled).to_json();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            socket
+                .write_all(
+                    format!(
+                        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            socket.write_all(body.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let doc = fetch_status(addr, std::time::Duration::from_secs(5))
+            .await
+            .expect("must parse a response split across several writes");
+        assert_eq!(doc.schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_status_errors_cleanly_on_a_404_and_on_a_non_json_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+        let err = fetch_status(addr, std::time::Duration::from_secs(5))
+            .await
+            .expect_err("a 404 must be a clean error, not a panic");
+        assert!(format!("{err:#}").contains("404"));
+
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = listener2.accept().await.unwrap();
+            let body = "not json";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+        let err = fetch_status(addr2, std::time::Duration::from_secs(5))
+            .await
+            .expect_err("a non-JSON body must be a clean error, not a panic");
+        assert!(format!("{err:#}").contains("status document"));
+    }
+
+    #[tokio::test]
+    async fn fetch_status_times_out_instead_of_hanging_on_a_silent_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _peer) = listener.accept().await.unwrap();
+            // Accepts, then never writes anything -- the socket stays open.
+            std::future::pending::<()>().await
+        });
+
+        let started = std::time::Instant::now();
+        let err = fetch_status(addr, std::time::Duration::from_millis(200))
+            .await
+            .expect_err("a silent server must time out, not hang forever");
+        assert!(err.to_string().contains("timed out"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must not have hung past the configured timeout"
+        );
     }
 }

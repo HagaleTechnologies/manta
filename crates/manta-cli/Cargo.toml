@@ -27,7 +27,7 @@ manta-server = { workspace = true }
 num-complex = { workspace = true }
 manta-spot = { workspace = true }
 manta-testkit = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

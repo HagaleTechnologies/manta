@@ -8,9 +8,10 @@
 use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::config::RbnUplinkConfig;
-use crate::metrics::Metrics;
+use crate::metrics::{UplinkTarget, UplinkTargetSpec};
 use crate::rate_limit::RateLimiter;
 use crate::rbn;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -43,10 +44,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Every outbound write to the uplink target gets this long before being
 /// treated as stalled (MAN-58 comment finding 2) -- matches `telnet.rs`'s
-/// identical `WRITE_TIMEOUT` for the same class of risk on the inbound
-/// side: a target that completes login but stops reading (TCP receive
-/// window fills, then the local send buffer fills) must not block this
-/// task indefinitely.
+/// identically-named helper for the inbound side.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Response-line rate budget for the target's post-login discard read
 /// (MAN-58 comment finding 3): RBN's collection server isn't expected to
@@ -82,6 +80,36 @@ fn next_backoff(current: Duration, outcome: &ConnectAttemptError) -> Duration {
     }
 }
 
+/// Assigns each configured target its stable display label (MAN-44).
+/// Plain `host:port` in the common case; `#<index>` is appended only to
+/// the second and later occurrences of an identical `host:port`, so a
+/// duplicated entry is still individually addressable without making
+/// every ordinary label ugly. Deterministic from config order, so the
+/// same config always produces the same labels.
+pub fn target_specs(configs: &[RbnUplinkConfig]) -> Vec<UplinkTargetSpec> {
+    let mut seen_counts: HashMap<String, usize> = HashMap::new();
+    configs
+        .iter()
+        .map(|cfg| {
+            let base = format!("{}:{}", cfg.target_host, cfg.target_port);
+            let count = seen_counts.entry(base.clone()).or_insert(0);
+            *count += 1;
+            let label = if *count == 1 {
+                base
+            } else {
+                format!("{base}#{count}")
+            };
+            UplinkTargetSpec {
+                label,
+                host: cfg.target_host.clone(),
+                port: cfg.target_port,
+                enabled: cfg.enabled,
+                dry_run: cfg.dry_run,
+            }
+        })
+        .collect()
+}
+
 /// Reconnect-with-backoff loop around one uplink connection. Never
 /// returns while `config.enabled` and the shutdown signal hasn't fired --
 /// a dropped connection must not permanently silence the uplink, since
@@ -91,7 +119,7 @@ pub async fn serve(
     config: RbnUplinkConfig,
     station_callsign: String,
     bus: Arc<SpotBus>,
-    metrics: Arc<Metrics>,
+    target: Arc<UplinkTarget>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     if !config.enabled {
@@ -123,7 +151,7 @@ pub async fn serve(
             &config,
             &login_callsign,
             &bus,
-            &metrics,
+            &target,
             &mut shutdown,
             &resolver_slot,
         )
@@ -131,14 +159,12 @@ pub async fn serve(
         {
             Ok(()) => return, // clean shutdown-signaled exit
             Err(outcome) => {
-                // No mark_uplink_disconnected() here: connect_and_forward
-                // already paired its own mark_uplink_connected() with a
-                // mark_uplink_disconnected() before returning Err (or
-                // never marked connected at all, if it failed before
-                // login completed) -- an extra call here would double-
-                // decrement the shared count once other targets are also
-                // marking it (MAN-42).
-                metrics.record_uplink_reconnect();
+                // No mark_disconnected() here: connect_and_forward
+                // already paired its own mark_connected() with a
+                // mark_disconnected() before returning Err (or never
+                // marked connected at all, if it failed before login
+                // completed).
+                target.record_reconnect();
                 let sleep_for = backoff;
                 backoff = next_backoff(backoff, &outcome);
                 tokio::select! {
@@ -294,7 +320,7 @@ async fn connect_and_forward(
     config: &RbnUplinkConfig,
     login_callsign: &str,
     bus: &Arc<SpotBus>,
-    metrics: &Arc<Metrics>,
+    target: &Arc<UplinkTarget>,
     shutdown: &mut watch::Receiver<bool>,
     resolver_slot: &Arc<Semaphore>,
 ) -> Result<(), ConnectAttemptError> {
@@ -349,14 +375,14 @@ async fn connect_and_forward(
                     // prompt still abandons whatever was published during
                     // the wait -- the next connection attempt subscribes
                     // fresh with no history.
-                    record_disconnect_loss(metrics, &rx, 0);
+                    record_disconnect_loss(target, &rx, 0);
                 }
                 result.map_err(|_| ConnectAttemptError::NeverConnected)?;
                 break;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    record_disconnect_loss(metrics, &rx, 0);
+                    record_disconnect_loss(target, &rx, 0);
                     return Ok(());
                 }
             }
@@ -371,11 +397,11 @@ async fn connect_and_forward(
         // `extra = 0` since there's no queued bus spot being sent here,
         // only the login line, but the backlog `rx` already accumulated
         // during the handshake is still abandoned.
-        record_write_failure_loss(metrics, &rx, 0);
+        record_write_failure_loss(target, &rx, 0);
         return Err(ConnectAttemptError::NeverConnected);
     }
 
-    metrics.mark_uplink_connected();
+    target.mark_connected();
     let result = forward_loop(
         &mut reader,
         &mut wr,
@@ -383,11 +409,11 @@ async fn connect_and_forward(
         config,
         login_callsign,
         bus,
-        metrics,
+        target,
         shutdown,
     )
     .await;
-    metrics.mark_uplink_disconnected();
+    target.mark_disconnected();
     result.map_err(|_| ConnectAttemptError::Disconnected)
 }
 
@@ -407,13 +433,13 @@ async fn connect_and_forward(
 /// failed, plus whatever else was still queued in `rx`'s own backlog and
 /// is now abandoned alongside it when the caller drops `rx` on reconnect.
 fn record_write_failure_loss(
-    metrics: &Metrics,
+    target: &UplinkTarget,
     rx: &broadcast::Receiver<crate::bus::BusSpot>,
     extra: u64,
 ) {
     let n = extra + rx.len() as u64;
     if n > 0 {
-        metrics.record_uplink_write_failed(n);
+        target.record_write_failed(n);
     }
 }
 
@@ -436,13 +462,13 @@ fn record_write_failure_loss(
 /// helpers make the correct call (into the correct counter) the path of
 /// least resistance at any exit site added in the future.
 fn record_disconnect_loss(
-    metrics: &Metrics,
+    target: &UplinkTarget,
     rx: &broadcast::Receiver<crate::bus::BusSpot>,
     extra: u64,
 ) {
     let n = extra + rx.len() as u64;
     if n > 0 {
-        metrics.record_uplink_disconnected(n);
+        target.record_disconnected(n);
     }
 }
 
@@ -454,7 +480,7 @@ async fn forward_loop(
     config: &RbnUplinkConfig,
     spotter_call: &str,
     bus: &Arc<SpotBus>,
-    metrics: &Arc<Metrics>,
+    target: &Arc<UplinkTarget>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut discard = String::new();
@@ -466,7 +492,7 @@ async fn forward_loop(
                 match recv {
                     Ok(bus_spot) => {
                         if config.dry_run {
-                            metrics.record_uplink_suppressed();
+                            target.record_suppressed();
                             continue;
                         }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
@@ -484,25 +510,25 @@ async fn forward_loop(
                         tokio::select! {
                             write_result = write_with_timeout(wr, wire_line.as_bytes()) => {
                                 if write_result.is_err() {
-                                    record_write_failure_loss(metrics, rx, 1);
+                                    record_write_failure_loss(target, rx, 1);
                                     write_result?;
                                 }
-                                metrics.record_uplink_sent();
+                                target.record_sent();
                             }
                             _ = shutdown.changed() => {
                                 if *shutdown.borrow() {
-                                    record_disconnect_loss(metrics, rx, 1);
+                                    record_disconnect_loss(target, rx, 1);
                                     return Ok(());
                                 }
                             }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        metrics.record_uplink_lagged(n);
+                        target.record_lagged(n);
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        record_disconnect_loss(metrics, rx, 0);
+                        record_disconnect_loss(target, rx, 0);
                         return Ok(());
                     }
                 }
@@ -520,7 +546,7 @@ async fn forward_loop(
             read_result = read_line_bounded(reader, &mut discard) => {
                 match read_result {
                     Ok(0) => {
-                        record_disconnect_loss(metrics, rx, 0);
+                        record_disconnect_loss(target, rx, 0);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::ConnectionReset,
                             "RBN uplink target closed the connection",
@@ -534,21 +560,21 @@ async fn forward_loop(
                         // an unbounded stream of otherwise-harmless lines
                         // is still unbounded CPU/bandwidth work.
                         if !response_limiter.allow() {
-                            record_disconnect_loss(metrics, rx, 0);
+                            record_disconnect_loss(target, rx, 0);
                             return Err(std::io::Error::other(
                                 "RBN uplink target exceeded the response-line rate budget",
                             ));
                         }
                     }
                     Err(e) => {
-                        record_disconnect_loss(metrics, rx, 0);
+                        record_disconnect_loss(target, rx, 0);
                         return Err(e);
                     }
                 }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    record_disconnect_loss(metrics, rx, 0);
+                    record_disconnect_loss(target, rx, 0);
                     return Ok(());
                 }
             }
@@ -571,6 +597,48 @@ async fn write_with_timeout(
 mod tests {
     use super::*;
     use std::net::TcpListener as StdTcpListener;
+
+    fn cfg(host: &str, port: u16) -> RbnUplinkConfig {
+        RbnUplinkConfig {
+            enabled: true,
+            target_host: host.to_string(),
+            target_port: port,
+            login_callsign: None,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn target_labels_are_host_port_and_disambiguate_only_actual_duplicates() {
+        let specs = target_specs(&[
+            cfg("rbn.example", 7000),
+            cfg("other.example", 7000),
+            cfg("rbn.example", 7000), // exact duplicate of #0
+            cfg("rbn.example", 7001), // different port -> not a duplicate
+        ]);
+        let labels: Vec<&str> = specs.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "rbn.example:7000",
+                "other.example:7000",
+                "rbn.example:7000#2",
+                "rbn.example:7001",
+            ]
+        );
+    }
+
+    #[test]
+    fn target_specs_carry_enabled_and_dry_run_through_from_config() {
+        let mut disabled_dry_run = cfg("a.example", 7000);
+        disabled_dry_run.enabled = false;
+        disabled_dry_run.dry_run = true;
+        let specs = target_specs(&[cfg("b.example", 7000), disabled_dry_run]);
+        assert!(specs[0].enabled);
+        assert!(!specs[0].dry_run);
+        assert!(!specs[1].enabled);
+        assert!(specs[1].dry_run);
+    }
 
     #[test]
     fn backoff_resets_after_a_connection_that_reached_login() {
@@ -609,6 +677,16 @@ mod tests {
         }
     }
 
+    fn test_target() -> Arc<UplinkTarget> {
+        crate::metrics::Metrics::new().register_uplink_target(UplinkTargetSpec {
+            label: "test.example:7300".to_string(),
+            host: "test.example".to_string(),
+            port: 7300,
+            enabled: true,
+            dry_run: false,
+        })
+    }
+
     /// PR #80 review, rounds 3-8: `record_write_failure_loss` and
     /// `record_disconnect_loss` are the two places every disconnect-
     /// causing exit from `forward_loop`/`connect_and_forward` must go
@@ -622,7 +700,7 @@ mod tests {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
-        let metrics = Metrics::new();
+        let target = test_target();
 
         // 3 spots queued in the backlog, none yet drained by `rx`.
         let spot = sample_spot_for_loss_tests();
@@ -631,16 +709,16 @@ mod tests {
         bus.publish(spot);
         assert_eq!(rx.len(), 3);
 
-        record_write_failure_loss(&metrics, &rx, 1); // the failed spot + backlog
-        assert_eq!(metrics.uplink_write_failed_total(), 4);
+        record_write_failure_loss(&target, &rx, 1); // the failed spot + backlog
+        assert_eq!(target.snapshot().write_failed, 4);
         assert_eq!(
-            metrics.uplink_disconnected_total(),
+            target.snapshot().disconnected,
             0,
             "a write failure must not also count against the disconnect counter"
         );
 
-        record_write_failure_loss(&metrics, &rx, 1); // called again: still counts the same still-queued backlog
-        assert_eq!(metrics.uplink_write_failed_total(), 8);
+        record_write_failure_loss(&target, &rx, 1); // called again: still counts the same still-queued backlog
+        assert_eq!(target.snapshot().write_failed, 8);
     }
 
     #[test]
@@ -648,23 +726,23 @@ mod tests {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
-        let metrics = Metrics::new();
+        let target = test_target();
 
         let spot = sample_spot_for_loss_tests();
         bus.publish(spot.clone());
         bus.publish(spot);
         assert_eq!(rx.len(), 2);
 
-        record_disconnect_loss(&metrics, &rx, 0); // e.g. a rate-limit disconnect: no single spot to blame
-        assert_eq!(metrics.uplink_disconnected_total(), 2);
+        record_disconnect_loss(&target, &rx, 0); // e.g. a rate-limit disconnect: no single spot to blame
+        assert_eq!(target.snapshot().disconnected, 2);
         assert_eq!(
-            metrics.uplink_write_failed_total(),
+            target.snapshot().write_failed,
             0,
             "a non-write disconnect must not also count against the write-failure counter"
         );
 
-        record_disconnect_loss(&metrics, &rx, 1); // e.g. shutdown cancelling an in-flight write
-        assert_eq!(metrics.uplink_disconnected_total(), 5);
+        record_disconnect_loss(&target, &rx, 1); // e.g. shutdown cancelling an in-flight write
+        assert_eq!(target.snapshot().disconnected, 5);
     }
 
     #[test]
@@ -672,16 +750,16 @@ mod tests {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
-        let metrics = Metrics::new();
+        let target = test_target();
 
-        record_write_failure_loss(&metrics, &rx, 0);
-        record_disconnect_loss(&metrics, &rx, 0);
+        record_write_failure_loss(&target, &rx, 0);
+        record_disconnect_loss(&target, &rx, 0);
         assert_eq!(
-            metrics.uplink_write_failed_total(),
+            target.snapshot().write_failed,
             0,
             "must not record a spurious 0-count event"
         );
-        assert_eq!(metrics.uplink_disconnected_total(), 0);
+        assert_eq!(target.snapshot().disconnected, 0);
     }
 
     #[test]

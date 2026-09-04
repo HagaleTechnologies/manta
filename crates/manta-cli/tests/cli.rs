@@ -523,3 +523,32 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
         "expected a clap conflict error, got: {stderr}"
     );
 }
+
+/// MAN-44: `manta status` against an address nothing is listening on must
+/// fail cleanly with exit code 2 ("couldn't ask", distinct from exit 1
+/// "asked, unhealthy") and a plain, non-panicking message naming the
+/// address -- not hang, and not a backtrace.
+#[test]
+fn status_against_a_dead_address_fails_with_exit_code_two_and_a_plain_message() {
+    // Bind a listener, note the port, drop it -> nothing is listening
+    // there anymore.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let out = manta()
+        .args(["status", "--addr", &addr.to_string(), "--timeout-secs", "2"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&addr.to_string()),
+        "expected the dead address in the error message, got: {stderr}"
+    );
+}
