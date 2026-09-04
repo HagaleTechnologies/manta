@@ -315,6 +315,25 @@ the preceding character. `1.6` was chosen empirically (500-case sweep, two
 independent seeds) as the value that captures the available fix with the
 smallest deviation from the nominal `2.0`.
 
+**[DEVIATION]** The implementation uses `3.5`, not `5.0`, for the
+character/word boundary used in gap **classification** (`WORD_GAP_DITS` in
+`crates/manta-decode/src/timing.rs`) — see
+`docs/DECISIONS/2026-09-04-word-gap-threshold-fix.md` (MAN-2,
+`HagaleTechnologies/manta#11`: "RN XJ0Z" decoded "RNXJ0Z" — characters
+correct, the inter-word space dropped). Same mechanism as the
+`CHAR_GAP_DITS` deviation above, hitting the word boundary instead: at high
+WPM (~30–40) the §3.3 overshoot compresses a true 7-dit inter-word gap to
+roughly 4.25–4.9 dits, below the nominal `5.0`, so real word boundaries in
+that band were classified inter-character and the space lost. `3.5` was
+chosen by static analysis rather than the sweep methodology used for
+`CHAR_GAP_DITS` — the session that landed this fix had no network egress to
+build this workspace (pinned `coppa-dsp` git dependency unreachable); see
+the decision doc for the two estimation models used, their margins, and the
+recommended live-instrumentation + sweep follow-up. The **flush** trigger
+(the paragraph below) is unaffected and stays anchored to the unmodified
+nominal `5.0` (`SPEC_WORD_GAP_DITS` in the same file) — the two were split
+specifically so this classification deviation cannot silently rescale it.
+
 **Farnsworth decoupling** (ARCHITECTURE §5.3): run the same 2-means machinery
 on gaps with `u ≥ 1.5` (the "long gaps"), yielding `μ_cgap` (character gap)
 and `μ_wgap` (word gap) when bimodal. Once ≥ 8 long gaps have been observed
@@ -564,6 +583,8 @@ timing_sigma = 0.25    beam_width = 4
 debounce_ms = 12       hyst_up = 1.25       hyst_down = 0.80
 tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
 mu_ratio_bounds = [2.2, 4.5]
+# Nominal values below; §4.2 documents [DEVIATION]s the implementation uses
+# for char_gap_dits (1.6) and word_gap_dits (3.5) instead.
 char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
 cluster_alpha = 0.15
 

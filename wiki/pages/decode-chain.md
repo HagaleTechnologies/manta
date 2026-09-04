@@ -20,7 +20,7 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 
 - Envelope + per-track fixed reference scale (coppa's block AGC is deliberately *not* used — SPEC §3.1, §10.2): `manta-decode::envelope`.
 - Dual-EMA threshold + hysteresis/debounce key decisions: SPEC §3.2–3.4.
-- Online 2-means speed tracking of dit/dah durations, Farnsworth-tolerant gap classification: SPEC §4.1–4.2 (`manta-decode::timing`).
+- Online 2-means speed tracking of dit/dah durations, Farnsworth-tolerant gap classification: SPEC §4.1–4.2 (`manta-decode::timing`). Gotcha: the word-gap dits constant has two call sites with different semantics (`classify()`'s classification threshold vs. `flush_threshold_dits()`'s flush-scaling divisor) — they were split into `WORD_GAP_DITS`/`SPEC_WORD_GAP_DITS` after MAN-2 so a classification-threshold tune can't silently rescale the unrelated flush trigger; see `docs/DECISIONS/2026-09-04-word-gap-threshold-fix.md`.
 - Beam search over the Morse tree keeps marginal dit/dah hypotheses alive to the character boundary: SPEC §4.3–4.5 (`manta-decode::beam`, `::tree`). Beam is **character-local** — greedy across characters; word context belongs to the validator (SPEC §10.3).
 - Per-character and per-callsign confidence feed [[spot-validation]]: SPEC §4.5–4.6.
 
