@@ -99,6 +99,13 @@ pub struct DecodeReport {
     /// Validated spots (`manta-spot::Validator`, ARCHITECTURE §6), run
     /// over the full multi-track event stream above.
     pub spots: Vec<Spot>,
+    /// Issue #26: per-`CloseReason` close counts from the run's
+    /// `TrackManager`, for MAN-9's V8w fragmentation diagnostic. Reuses
+    /// `SoakCloseCounts`'s shape (rather than exposing the crate-private
+    /// `track::CloseCounts` type directly) so this doesn't introduce a
+    /// second public type for the same data. Additive field: serialized
+    /// into `decode --json` output alongside `events`/`spots`.
+    pub close_counts: SoakCloseCounts,
 }
 
 /// M0 pipeline: estimate frequency, extract one channel, decode. SPEC
@@ -174,6 +181,7 @@ pub fn decode_samples(
         bail!("no signal found (input shorter than one filter length or empty)");
     }
     events.extend(tm.finish());
+    let close_counts = tm.close_counts();
 
     if events.is_empty() {
         bail!("no signal found (input shorter than one filter length or empty)");
@@ -230,6 +238,7 @@ pub fn decode_samples(
         freq_hz,
         wpm,
         text,
+        close_counts,
         events,
         spots,
     })
