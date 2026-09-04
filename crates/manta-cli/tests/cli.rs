@@ -552,3 +552,38 @@ fn status_against_a_dead_address_fails_with_exit_code_two_and_a_plain_message() 
         "expected the dead address in the error message, got: {stderr}"
     );
 }
+
+/// MAN-44 CR-A regression: an invalid `--addr` must exit 2 ("couldn't
+/// ask"), not 1 -- exit 1 is the documented "reached the daemon, uplink is
+/// unhealthy" code (`docs/RUNBOOKS/uplink-health.md`), and a typo'd
+/// address must not be indistinguishable from a genuinely degraded uplink.
+#[test]
+fn status_with_an_invalid_addr_fails_with_exit_code_two_not_one() {
+    let out = manta()
+        .args(["status", "--addr", "not-an-addr"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// MAN-44 CR-A regression: an unreadable `--server-config` must exit 2, not
+/// 1, for the same reason -- this used to `?`-propagate out of `main` and
+/// exit 1, colliding with the "unhealthy uplink" code.
+#[test]
+fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
+    let out = manta()
+        .args(["status", "--server-config", "/nonexistent/manta.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

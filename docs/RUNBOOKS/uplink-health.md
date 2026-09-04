@@ -55,9 +55,17 @@ daemon runs on a different host than the one you're checking from, use
     connected windows; `flapping` exists specifically so that doesn't
     read as healthy.
   - `down` — not connected, and not (yet) flapping by the above
-    threshold. A target that has *never* connected still appears here,
-    not silently omitted — "configured and stuck" must be distinguishable
-    from "not configured at all."
+    threshold. This is a brief, transitional state: with the uplink's
+    `INITIAL_BACKOFF` = 1s, an unreachable target's first three reconnect
+    attempts land at roughly t=0s/1s/3s, crossing the flapping threshold
+    within a few seconds — so a target that has *never* connected reads
+    `down` only for that initial window, then `flapping` for as long as it
+    stays unreachable (the same "reconnecting repeatedly" signal a target
+    that was once connected and dropped also produces). Either way it
+    stays visible, not silently omitted — "configured and stuck" must be
+    distinguishable from "not configured at all." `SENT` = 0 alongside a
+    climbing `RECONN` is what tells you the target has never once worked,
+    as opposed to a target that dropped after sending plenty.
   - `disabled` — `enabled = false` in that target's `[[rbn_uplink]]`
     entry. Still listed, so an operator can see it's intentionally off.
 - **`RECENT(5m)`** is the reconnect count within a rolling 5-minute
@@ -98,3 +106,11 @@ Both endpoints share `/metrics`'s exposure posture — unauthenticated,
 bound to `[server].bind_addr` (`0.0.0.0` by default) — see
 `docs/RUNBOOKS/network-exposure.md` if you need to restrict access.
 Design rationale: `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`.
+
+**`/metrics`'s `manta_uplink_connected`/`manta_uplink_target_connected` are
+the raw, instantaneous connected bool — they can briefly read `1` for a
+target that `manta status`/`GET /status` correctly reports as `flapping`,
+because a target reconnecting every ~60s is momentarily connected any time
+you happen to scrape it. Trust `/status`'s verdict, not `/metrics`'s raw
+gauge, for "is this target actually healthy" — see the ADR above for why
+the two surfaces are allowed to disagree here.

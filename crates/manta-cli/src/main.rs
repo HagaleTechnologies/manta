@@ -990,14 +990,62 @@ fn resolve_status_addr(
     let Some(server) = server else {
         return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 7302)));
     };
-    let host: std::net::IpAddr = match server.bind_addr.as_str() {
-        "0.0.0.0" => std::net::Ipv4Addr::LOCALHOST.into(),
-        "::" => std::net::Ipv6Addr::LOCALHOST.into(),
-        other => other
-            .parse()
-            .with_context(|| format!("invalid server.bind_addr {other:?}"))?,
-    };
-    Ok(std::net::SocketAddr::new(host, server.metrics_port))
+    match server.bind_addr.as_str() {
+        "0.0.0.0" => Ok(std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            server.metrics_port,
+        )),
+        "::" => Ok(std::net::SocketAddr::new(
+            std::net::Ipv6Addr::LOCALHOST.into(),
+            server.metrics_port,
+        )),
+        other => match other.parse::<std::net::IpAddr>() {
+            Ok(ip) => Ok(std::net::SocketAddr::new(ip, server.metrics_port)),
+            // CR-B: the daemon itself binds `bind_addr` through
+            // `TcpListener::bind((host, port))`, which resolves a
+            // hostname via `ToSocketAddrs` (main.rs's `start_spot_server`)
+            // rather than requiring a literal IP -- so `bind_addr =
+            // "localhost"` is a config the daemon happily runs on. `manta
+            // status` must resolve the same way instead of rejecting a
+            // config the daemon itself accepts.
+            Err(_) => {
+                use std::net::ToSocketAddrs;
+                (other, server.metrics_port)
+                    .to_socket_addrs()
+                    .with_context(|| format!("resolving server.bind_addr {other:?}"))?
+                    .next()
+                    .with_context(|| format!("server.bind_addr {other:?} resolved to no addresses"))
+            }
+        },
+    }
+}
+
+/// The full pre-render `manta status` flow: read/parse an optional
+/// `--server-config`, resolve the dial address, and fetch+parse the
+/// daemon's `/status` document. Extracted so every failure along this path
+/// -- not just `fetch_status`'s -- goes through the same exit-2 handling
+/// (CR-A).
+fn run_status(
+    server_config: Option<&std::path::Path>,
+    addr: Option<&str>,
+    timeout_secs: u64,
+) -> Result<manta_server::status::StatusDoc> {
+    let file = server_config
+        .map(|path| -> Result<manta_server::config::DaemonConfigFile> {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        })
+        .transpose()?;
+    let target = resolve_status_addr(addr, file.as_ref().map(|f| &f.server))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(fetch_status(
+        target,
+        std::time::Duration::from_secs(timeout_secs),
+    ))
+    .with_context(|| format!("could not reach daemon at {target}"))
 }
 
 /// Exit code contract for scripting (cron/Nagios-style): `0` when every
@@ -1019,6 +1067,14 @@ fn status_exit_code(doc: &manta_server::status::StatusDoc) -> i32 {
 /// answering `GET /status` must not be able to make this allocate without
 /// bound.
 const MAX_STATUS_BODY_BYTES: u64 = 256 * 1024;
+/// Bounds the status line plus header block the same way
+/// `manta_server::metrics_http`'s own `MAX_HEADER_LINES` bounds its side of
+/// the identical parsing job (CR-E) -- without this, an unbounded
+/// `read_line`-per-line loop against a hostile or misbehaving peer that
+/// never terminates a line, or never ends its header block, could grow a
+/// buffer or spin without bound; the body already had `MAX_STATUS_BODY_BYTES`
+/// but the status line and headers did not.
+const MAX_STATUS_HEADER_LINES: usize = 100;
 
 /// Fetches and parses `GET /status` from a running daemon's metrics
 /// listener (MAN-44) -- a small hand-rolled HTTP/1.1 GET, matching
@@ -1036,7 +1092,8 @@ async fn fetch_status(
 }
 
 async fn fetch_status_inner(addr: std::net::SocketAddr) -> Result<manta_server::status::StatusDoc> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use manta_server::bounded_io::read_line_bounded;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -1050,18 +1107,16 @@ async fn fetch_status_inner(addr: std::net::SocketAddr) -> Result<manta_server::
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
+    read_line_bounded(&mut reader, &mut status_line)
         .await
         .context("reading the status line")?;
     if !status_line.starts_with("HTTP/1.1 200") {
         bail!("daemon returned {}", status_line.trim_end());
     }
 
-    loop {
+    for _ in 0..MAX_STATUS_HEADER_LINES {
         let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
+        let n = read_line_bounded(&mut reader, &mut line)
             .await
             .context("reading response headers")?;
         if n == 0 || line == "\r\n" {
@@ -1467,29 +1522,20 @@ fn main() -> Result<()> {
             json,
             timeout_secs,
         } => {
-            let file = server_config
-                .as_deref()
-                .map(|path| -> Result<manta_server::config::DaemonConfigFile> {
-                    let text = std::fs::read_to_string(path)
-                        .with_context(|| format!("reading {}", path.display()))?;
-                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-                })
-                .transpose()?;
-            let target = resolve_status_addr(addr.as_deref(), file.as_ref().map(|f| &f.server))?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let doc = match rt.block_on(fetch_status(
-                target,
-                std::time::Duration::from_secs(timeout_secs),
-            )) {
+            // CR-A: EVERY failure short of a parsed StatusDoc -- an
+            // unreadable/unparseable --server-config, a bad --addr, or a
+            // daemon that couldn't be reached -- exits 2 ("couldn't ask"),
+            // distinct from exit 1 ("asked, the uplink is unhealthy",
+            // `status_exit_code`). Letting the first two `?`-propagate out
+            // of `main` used to exit 1 for those cases too, which is the
+            // documented "uplink unhealthy" code
+            // (`docs/RUNBOOKS/uplink-health.md`'s exit-code table) -- a
+            // typo'd config path was indistinguishable from a genuinely
+            // degraded uplink.
+            let doc = match run_status(server_config.as_deref(), addr.as_deref(), timeout_secs) {
                 Ok(doc) => doc,
                 Err(e) => {
-                    // Exit 2 = "couldn't ask", distinct from exit 1 =
-                    // "asked, unhealthy" (status_exit_code) -- a cron job
-                    // must be able to tell a broken uplink from a stopped
-                    // daemon.
-                    eprintln!("manta status: could not reach daemon at {target}: {e:#}");
+                    eprintln!("manta status: {e:#}");
                     std::process::exit(2);
                 }
             };
@@ -2062,6 +2108,22 @@ mod tests {
             resolve_status_addr(None, None).unwrap().to_string(),
             "127.0.0.1:7302"
         );
+    }
+
+    /// MAN-44 CR-B regression: the daemon binds `bind_addr` via
+    /// `TcpListener::bind((host, port))`, which resolves a hostname (not
+    /// just a literal IP) through `ToSocketAddrs` -- so `bind_addr =
+    /// "localhost"` is a config the daemon runs on happily. `manta status
+    /// --server-config` must resolve it the same way instead of rejecting
+    /// a config the daemon itself accepts.
+    #[test]
+    fn status_address_resolves_a_hostname_bind_addr_like_the_daemon_does() {
+        let addr = resolve_status_addr(None, Some(&cfg_with("localhost", 17302))).unwrap();
+        assert!(
+            addr.ip().is_loopback(),
+            "expected localhost to resolve to a loopback address, got {addr}"
+        );
+        assert_eq!(addr.port(), 17302);
     }
 
     fn doc_with(

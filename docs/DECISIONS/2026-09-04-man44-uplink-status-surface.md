@@ -133,6 +133,30 @@ labels already expose.
   spec — both come from operator-supplied config strings, not manta's own
   validated callsign grammar.
 
+## `/metrics` reports raw connectedness; `/status` reports the health verdict (CR-C)
+
+`manta_uplink_connected`/`manta_uplink_target_connected` (Prometheus) are the
+target's raw, instantaneous `connected` bool, unchanged in meaning from
+before MAN-44 (decision 6/7: the existing aggregate's rendered name and
+value stay exactly as they were). `/status`'s `connected_targets` and the
+CLI's per-target `STATE` column, by contrast, use the debounced
+`UplinkHealth` verdict, where `flapping` deliberately outranks `connected`
+(see above). For a target reconnecting every ~60s, that means the two
+surfaces can disagree at the exact instant it is momentarily connected:
+`GET /metrics` reports `manta_uplink_connected 1` while `GET /status`/
+`manta status` reports it as `flapping`, not connected.
+
+This is intentional, not a bug: Prometheus exports the raw fact for anyone
+building their own alerting on top of it (an external tool may want its own
+debounce window), while `/status`/`manta status` exist specifically to
+apply MAN-44's windowed judgment so an operator doesn't have to. Changing
+`manta_uplink_connected`'s existing meaning to match `/status` would break
+decision 6/7's "existing series unchanged" guarantee and any scrape
+config/alert already built against its current, simpler semantics. An
+operator comparing the two surfaces during a flapping episode should trust
+`/status`'s verdict, not `/metrics`'s raw gauge, for "is this target
+healthy" — that split is why `/status` exists at all.
+
 ## What this does not do
 
 No control socket, no daemon control verbs (reload/stop/reconnect-now) —
