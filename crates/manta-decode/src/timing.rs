@@ -46,6 +46,37 @@ const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
 const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
 
+/// **[DEVIATION from SPEC §4.1]** MAN-9: bounds, as a ratio to the nearest
+/// centroid, outside which a mark is excluded from `SpeedTracker`'s
+/// centroid EMA update. SPEC §4.1 admits every mark unconditionally.
+/// Under Watterson-Poor fading a fade-truncated mark drags `mu_dit` for
+/// roughly `1/CLUSTER_ALPHA` (~6.7) marks afterwards, so corruption
+/// outlives the fade that caused it and degrades *subsequent* characters'
+/// gap classification and beam likelihoods, not just the one coincident
+/// with the fade. Excluded marks are still counted for the §4.1
+/// drift/regime-change rule (`SpeedTracker::check_drift`), so a genuine,
+/// sustained speed change still re-anchors normally -- only isolated
+/// outliers are rejected. Default `(0.0, INFINITY)` admits every mark (=
+/// SPEC behavior). Scoped to `SpeedTracker`'s `ClusterPair` (marks in ms)
+/// only -- `GapClassifier`'s `ClusterPair` (dit-ratio-typed values, not
+/// milliseconds) always uses this inert default; see `unimodal_ceiling`'s
+/// doc comment for the same units distinction already made for that
+/// field. See docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarkAdmission {
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl Default for MarkAdmission {
+    fn default() -> Self {
+        MarkAdmission {
+            lo: 0.0,
+            hi: f32::INFINITY,
+        }
+    }
+}
+
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
     for &x in xs {
@@ -79,10 +110,14 @@ struct ClusterPair {
     /// and can misfire on long real-audio silence gaps) preserves the original
     /// "always assume the low cluster is real" default.
     unimodal_ceiling: Option<f32>,
+    /// MAN-9: see `MarkAdmission`'s doc comment. `GapClassifier` always
+    /// passes the inert default; `SpeedTracker` passes whatever
+    /// `with_admission` was constructed with.
+    admission: MarkAdmission,
 }
 
 impl ClusterPair {
-    fn new(unimodal_ceiling: Option<f32>) -> Self {
+    fn new(unimodal_ceiling: Option<f32>, admission: MarkAdmission) -> Self {
         ClusterPair {
             lo: 0.0,
             hi: 0.0,
@@ -91,6 +126,7 @@ impl ClusterPair {
             confirmed: false,
             placeholder_is_lo: false,
             unimodal_ceiling,
+            admission,
         }
     }
 
@@ -132,10 +168,18 @@ impl ClusterPair {
                 return false;
             }
         }
-        if v < self.boundary() {
-            self.lo += CLUSTER_ALPHA * (v - self.lo);
-        } else {
-            self.hi += CLUSTER_ALPHA * (v - self.hi);
+        let is_dit = v < self.boundary();
+        let nearest = if is_dit { self.lo } else { self.hi };
+        // MAN-9: reject an implausible mark from the EMA update only --
+        // the caller (`SpeedTracker::on_mark`) still counts it toward the
+        // §4.1 drift/regime-change bookkeeping either way, so a sustained
+        // speed change still re-anchors (`MarkAdmission`'s doc comment).
+        if (self.admission.lo..=self.admission.hi).contains(&(v / nearest)) {
+            if is_dit {
+                self.lo += CLUSTER_ALPHA * (v - self.lo);
+            } else {
+                self.hi += CLUSTER_ALPHA * (v - self.hi);
+            }
         }
         false
     }
@@ -223,11 +267,19 @@ pub struct SpeedTracker {
 }
 
 impl SpeedTracker {
-    /// A tracker with no marks observed yet. SPEC §4.1.
+    /// A tracker with no marks observed yet, admitting every mark (SPEC
+    /// §4.1 behavior). SPEC §4.1.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::with_admission(MarkAdmission::default())
+    }
+
+    /// A tracker with no marks observed yet, rejecting marks outside
+    /// `admission`'s bounds from the centroid EMA update (MAN-9; see
+    /// `MarkAdmission`'s doc comment).
+    pub fn with_admission(admission: MarkAdmission) -> Self {
         SpeedTracker {
-            pair: ClusterPair::new(Some(DIT_CLAMP_MS.1)),
+            pair: ClusterPair::new(Some(DIT_CLAMP_MS.1), admission),
             ring: VecDeque::with_capacity(DRIFT_LEN),
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
@@ -355,7 +407,7 @@ impl GapClassifier {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         GapClassifier {
-            pair: ClusterPair::new(None),
+            pair: ClusterPair::new(None, MarkAdmission::default()),
             long_seen: 0,
         }
     }
@@ -588,7 +640,7 @@ mod tests {
     #[test]
     fn unimodal_init_respects_ceiling_config() {
         // With a ceiling (SpeedTracker's use case): mean > ceiling assumes dahs.
-        let mut with_ceiling = ClusterPair::new(Some(150.0));
+        let mut with_ceiling = ClusterPair::new(Some(150.0), MarkAdmission::default());
         for &v in &[180.0, 182.0, 178.0, 180.0, 181.0] {
             with_ceiling.observe(v);
         }
@@ -601,13 +653,73 @@ mod tests {
         // whose mean would exceed 150 if it were milliseconds must NOT trip the
         // dah-assumed branch, since GapClassifier's values are dit-ratios, not
         // milliseconds -- pinned decision 20 follow-up.
-        let mut no_ceiling = ClusterPair::new(None);
+        let mut no_ceiling = ClusterPair::new(None, MarkAdmission::default());
         for &v in &[200.0, 202.0, 198.0, 200.0, 201.0] {
             no_ceiling.observe(v);
         }
         assert!(
             !no_ceiling.placeholder_is_lo,
             "GapClassifier must always assume the low cluster is real"
+        );
+    }
+
+    /// A single fade-truncated mark must not move `mu_dit` measurably: its
+    /// ratio to the current dit centroid (12/50 = 0.24) falls below the
+    /// admission floor, so it is excluded from the EMA update entirely.
+    /// Expected RED on `main`: at `CLUSTER_ALPHA = 0.15` one 0.24x outlier
+    /// moves the dit centroid by ~11%, since SPEC §4.1 admits every mark.
+    #[test]
+    fn an_isolated_outlier_mark_does_not_move_the_centroids() {
+        let mut t = SpeedTracker::with_admission(MarkAdmission { lo: 0.45, hi: 2.20 });
+        for _ in 0..20 {
+            t.on_mark(50.0);
+            t.on_mark(150.0);
+        }
+        let before = t.mu_dit_ms();
+        t.on_mark(12.0); // fade-truncated dit
+        assert!(
+            (t.mu_dit_ms() - before).abs() / before < 0.01,
+            "an isolated outlier moved mu_dit from {before} to {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    /// A genuine, sustained speed change must still re-anchor via the SPEC
+    /// §4.1 drift/regime-change rule, even though every individual mark
+    /// of the new regime is, on its own, rejected by the admission gate
+    /// (50 -> 22 ms is a 0.44x ratio to the old centroid, just below the
+    /// 0.45 admission floor, so plain EMA updates alone could never get
+    /// there) -- outlier rejection must not defeat a real speed change.
+    /// `check_drift`'s bookkeeping (the `ring`) is fed unconditionally by
+    /// `on_mark`, independent of whether `observe` admitted the mark into
+    /// the EMA, which is exactly what makes this possible.
+    #[test]
+    fn a_sustained_speed_change_still_reinitializes_the_tracker() {
+        let mut t = SpeedTracker::with_admission(MarkAdmission { lo: 0.45, hi: 2.20 });
+        for _ in 0..20 {
+            t.on_mark(50.0);
+            t.on_mark(150.0);
+        }
+        for _ in 0..14 {
+            t.on_mark(22.0);
+        }
+        assert!(
+            (t.mu_dit_ms() - 22.0).abs() < 2.0,
+            "tracker must follow a real regime change despite per-mark admission rejection, got {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    /// Default admission is wide open: byte-identical to today (SPEC §4.1
+    /// admits every mark).
+    #[test]
+    fn default_admission_admits_every_mark() {
+        assert_eq!(
+            MarkAdmission::default(),
+            MarkAdmission {
+                lo: 0.0,
+                hi: f32::INFINITY
+            }
         );
     }
 }
