@@ -7,14 +7,42 @@ use crate::tree::{Element, Glyph, MorseTree, NodeId, Prosign};
 pub struct BeamConfig {
     /// SPEC §9 decode.beam_width
     pub width: usize,
+    /// **[DEVIATION from SPEC §9 decode.beam_width]** MAN-9 rung 2: beam
+    /// width used when the per-character channel-quality term `q` (SPEC
+    /// §4.5) is below `q_low`. Under fading, distorted mark durations push
+    /// the correct dit/dah assignment out of the top `width` survivors at
+    /// an intermediate beam step, after which it can never be recovered
+    /// (the beam is character-local and greedy across characters, SPEC
+    /// §4.3-4.5). Widening only for low-q characters buys that back
+    /// without paying the cost on every clean character (Pi 4 CPU budget,
+    /// ROADMAP.md M2). Defaults to `width` (= SPEC behavior, inert). See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+    pub width_low_q: usize,
+    /// Threshold on `q`, exclusive-below (SPEC §4.5 clamps `q` to
+    /// [0.3, 1.0]).
+    pub q_low: f32,
     /// SPEC §9 decode.timing_sigma — "the riskiest constant in the spec"
     pub sigma: f32,
+}
+
+impl BeamConfig {
+    /// The beam width to use for a character decoded at channel quality
+    /// `q`. MAN-9 rung 2.
+    pub fn effective_width(&self, q: f32) -> usize {
+        if q < self.q_low {
+            self.width_low_q
+        } else {
+            self.width
+        }
+    }
 }
 
 impl Default for BeamConfig {
     fn default() -> Self {
         BeamConfig {
             width: 4,
+            width_low_q: 4,
+            q_low: 0.6,
             sigma: 0.25,
         }
     }
@@ -101,7 +129,7 @@ pub fn decode_char(
                 .total_cmp(&a.score)
                 .then_with(|| a.path.cmp(&b.path))
         });
-        next.truncate(cfg.width);
+        next.truncate(cfg.effective_width(q));
         hyps = next;
     }
 

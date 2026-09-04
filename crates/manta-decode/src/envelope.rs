@@ -13,6 +13,24 @@ pub struct DemodConfig {
     pub tau_lo_ms: f64,
     pub tau_hi_init_ms: f64,
     pub tau_hi_bounds_ms: (f64, f64),
+    /// **[DEVIATION from SPEC §3.3]** MAN-9 rung 1: debounce as a fraction
+    /// of the tracked dit, floored by `debounce_ms` and capped by
+    /// `debounce_ceiling_ms`. SPEC §3.3 pins a fixed, WPM-independent 12 ms
+    /// debounce -- the only timescale in the decode chain that does not
+    /// scale with keying speed. A Watterson-Poor fade excursion of 15-40 ms
+    /// splits a 10 WPM dah (360 ms) while an excursion of the same absolute
+    /// length is correctly ignored inside a 35 WPM dah (102 ms). 0.0
+    /// disables (= SPEC behavior, the default). See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+    pub debounce_dits: f32,
+    /// Absolute ceiling on the proportional term, in ms. Guards the
+    /// shortest measured inter-element gap at high WPM (hysteresis +
+    /// debounce add a roughly constant ~15-20 ms overshoot to every
+    /// measured mark -- see manta-decode::timing's `CHAR_GAP_DITS`
+    /// deviation note -- so at 35 WPM, mu_dit ~34 ms, a real inter-element
+    /// gap can measure as little as ~16 ms; 30 ms leaves it comfortable
+    /// headroom).
+    pub debounce_ceiling_ms: f64,
 }
 
 impl Default for DemodConfig {
@@ -24,6 +42,8 @@ impl Default for DemodConfig {
             tau_lo_ms: 500.0,
             tau_hi_init_ms: 200.0,
             tau_hi_bounds_ms: (100.0, 400.0),
+            debounce_dits: 0.0,
+            debounce_ceiling_ms: 30.0,
         }
     }
 }
@@ -120,10 +140,17 @@ impl Demod {
     }
 
     /// SPEC §3.2: tau_hi = clamp(5 * dit_ms, 100, 400) ms once speed is tracked.
+    /// MAN-9 rung 1: also recomputes `debounce_hops` when `debounce_dits`
+    /// is enabled -- see `DemodConfig::debounce_dits`.
     pub fn set_dit_ms(&mut self, dit_ms: f32) {
         let tau =
             (5.0 * dit_ms as f64).clamp(self.cfg.tau_hi_bounds_ms.0, self.cfg.tau_hi_bounds_ms.1);
         self.alpha_hi = alpha_from_tau_ms(tau);
+        if self.cfg.debounce_dits > 0.0 {
+            let prop_ms =
+                (self.cfg.debounce_dits as f64 * dit_ms as f64).min(self.cfg.debounce_ceiling_ms);
+            self.debounce_hops = ms_to_hops(self.cfg.debounce_ms).max(ms_to_hops(prop_ms));
+        }
     }
 
     /// Duration of the currently-open space run, if one is open. SPEC §3.4.
@@ -390,6 +417,89 @@ mod tests {
             first.start_ts, 0,
             "first mark must be recovered from replay"
         );
+    }
+
+    /// Same shape as `run_segments`, but calls `set_dit_ms` first so
+    /// `debounce_dits` (MAN-9 rung 1) takes effect, simulating a
+    /// `SpeedTracker` already locked at `dit_ms` (as `TrackDecoder` does
+    /// after its first 5 marks).
+    fn run_segments_with_dit(cfg: DemodConfig, dit_ms: f32, segs: &[(f32, u32)]) -> Vec<Run> {
+        let mut d = Demod::new(cfg);
+        d.set_dit_ms(dit_ms);
+        let mut out = Vec::new();
+        let mut ts = 0u64;
+        for &(level, hops) in segs {
+            for _ in 0..hops {
+                out.extend(d.push(level, ts));
+                ts += 256;
+            }
+        }
+        out.extend(d.finish());
+        out
+    }
+
+    /// A fade dropout proportional to the element must not split a mark: a
+    /// 25 ms dropout (9 hops) inside a 360 ms dah (135 hops) at 10 WPM
+    /// (mu_dit = 120 ms, 45 hops) is 7% of the element and must merge --
+    /// the fixed 12 ms (5-hop) debounce on `main` cannot absorb a 9-hop
+    /// dropout, so this is RED until `debounce_dits` lands.
+    #[test]
+    fn proportional_debounce_merges_a_sub_element_dropout_at_slow_speeds() {
+        let cfg = DemodConfig {
+            debounce_dits: 0.30,
+            ..Default::default()
+        };
+        let mut segs = Vec::new();
+        for _ in 0..10 {
+            segs.push((1.0f32, 45u32));
+            segs.push((0.01f32, 45u32));
+        }
+        segs.push((1.0, 63));
+        segs.push((0.01, 9)); // 25 ms dropout mid-dah
+        segs.push((1.0, 63));
+        segs.push((0.01, 60));
+        let runs = run_segments_with_dit(cfg, 120.0, &segs);
+        let long_marks = runs
+            .iter()
+            .filter(|r| r.mark && r.hops >= ms_to_hops(300.0))
+            .count();
+        assert_eq!(
+            long_marks, 1,
+            "25 ms dropout must merge into one dah: {runs:?}"
+        );
+    }
+
+    /// The proportional term must stay small enough, even at its highest
+    /// configured fraction, that a genuine inter-element gap at high WPM is
+    /// never absorbed: 35 WPM (mu_dit ~34.3 ms) with debounce_dits = 0.35
+    /// still yields alternating runs, not a run of merged marks.
+    #[test]
+    fn proportional_debounce_never_swallows_an_inter_element_gap_at_high_wpm() {
+        let cfg = DemodConfig {
+            debounce_dits: 0.35,
+            ..Default::default()
+        };
+        let dit_hops = 13u32; // round(34.29 ms / HOP_MS)
+        let mut segs = Vec::new();
+        for _ in 0..40 {
+            segs.push((1.0f32, dit_hops));
+            segs.push((0.01f32, dit_hops));
+        }
+        let runs = run_segments_with_dit(cfg, 1200.0 / 35.0, &segs);
+        assert!(!runs.is_empty(), "no runs emitted");
+        for w in runs.windows(2) {
+            assert_ne!(
+                w[0].mark, w[1].mark,
+                "inter-element gaps must survive at 35 WPM: {runs:?}"
+            );
+        }
+    }
+
+    /// Default config must be byte-identical to today (SPEC §3.3's fixed
+    /// 12 ms debounce, unaffected by `set_dit_ms`).
+    #[test]
+    fn debounce_dits_defaults_to_disabled() {
+        assert_eq!(DemodConfig::default().debounce_dits, 0.0);
     }
 
     #[test]
