@@ -24,6 +24,29 @@ pub fn new_client_tasks() -> ClientTasks {
     Arc::new(Mutex::new(JoinSet::new()))
 }
 
+/// How long ONE client's shutdown-drain loop may spend writing its own
+/// queued backlog before it stops, records everything still abandoned, and
+/// disconnects.
+///
+/// MAN-45 / PR #63 round-16 finding. Rounds 10 and 15 both adjusted the
+/// single OUTER deadline (`manta-cli`'s `SHUTDOWN_DRAIN_DEADLINE`, applied
+/// registry-wide by `await_all`); round 16's point is that no constant
+/// value of one flat outer deadline can bound a per-client backlog of
+/// unbounded depth -- a client may have up to the broadcast channel's full
+/// retention queued and drains it SEQUENTIALLY, so two slow-but-compliant
+/// spots already exceed any budget sized for one. The bound has to live
+/// where the loop is.
+///
+/// 20s: still covers one worst-case telnet spot (two separately-timed
+/// `WRITE_TIMEOUT` (10s) writes -- the property round 15 established), while
+/// leaving `SHUTDOWN_DRAIN_DEADLINE` a scheduling margin above it so the
+/// outer backstop provably never fires first (asserted by a test in
+/// `manta-cli`). A healthy client drains a full backlog in milliseconds;
+/// this only ever binds for a genuinely stalled peer -- and now counts what
+/// it abandons instead of letting `Runtime::shutdown_timeout` truncate it
+/// silently.
+pub const CLIENT_DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
 /// Awaits every currently-tracked task to completion, bounded by
 /// `deadline`. Returns once the set is empty or `deadline` elapses,
 /// whichever comes first -- a caller relying on strict cleanup should

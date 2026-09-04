@@ -10,12 +10,37 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
+/// Spots abandoned when a client connection terminates on a failed write.
+/// `in_flight_spot` is true when the write that just failed was carrying a
+/// spot (that spot is lost too) and false for a control-frame write --
+/// telnet's `Filter set:` acknowledgement, the WebSocket Pong reply --
+/// where nothing was in flight but the receiver's queue is abandoned all
+/// the same. `still_queued` is `rx.len()`, plus (at the `sh/dx` site) the
+/// remaining history entries that replay also abandons.
+///
+/// One function rather than the arithmetic open-coded at each site: rounds
+/// 11-16 each found one more write path with this accounting missing or
+/// subtly different, and the differences between `1 + rx.len()`,
+/// `1 + history.len() + rx.len()` and bare `rx.len()` are exactly what made
+/// each one easy to get wrong. Extracted for the same reason
+/// `json_stream::is_ws_protocol_violation` was: so the policy is testable
+/// without a live socket.
+pub fn abandoned_spot_count(in_flight_spot: bool, still_queued: usize) -> u64 {
+    still_queued as u64 + u64::from(in_flight_spot)
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
+    /// MAN-45 (round-6 review finding): a spot whose `dxContinent`/
+    /// `dxCqZone` fell back to the `spot_message::UNKNOWN_*` sentinels
+    /// because `cty.lookup` couldn't resolve the (possibly Watch-List-
+    /// allowlisted) callsign. Counted once per SPOT at publish time, not
+    /// once per connected client -- see the call site's doc comment.
+    spots_unresolved_geography_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -81,6 +106,22 @@ impl Metrics {
     pub fn record_write_failed(&self, n: u64) {
         self.spots_dropped_write_failed_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Read accessor for the write-failure counter, mirroring the
+    /// `uplink_*_total` getters -- lets an acceptance test assert the
+    /// "delivered + counted == published" invariant (ARCHITECTURE §8)
+    /// without parsing the Prometheus text body.
+    pub fn spots_dropped_write_failed_total(&self) -> u64 {
+        self.spots_dropped_write_failed_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// MAN-45 (round-6 review finding): see `spots_unresolved_geography_total`'s
+    /// doc comment.
+    pub fn record_unresolved_geography(&self) {
+        self.spots_unresolved_geography_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_telnet_clients(&self) {
@@ -257,6 +298,16 @@ impl Metrics {
                 .load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_spots_unresolved_geography_total Spots emitted with unknown dxContinent/dxCqZone because cty.lookup could not resolve the (possibly Watch-List-allowlisted) callsign.\n",
+        );
+        out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_unresolved_geography_total {}\n",
+            self.spots_unresolved_geography_total
+                .load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
         out.push_str("# TYPE manta_telnet_clients_connected gauge\n");
         out.push_str(&format!(
@@ -370,6 +421,25 @@ impl Metrics {
 mod tests {
     use super::*;
 
+    /// MAN-45 (PR #63 round-16 finding): the three shapes every
+    /// write-failure site in `telnet`/`json_stream` needs, in one place: a
+    /// failed SPOT write loses the in-flight spot too, a failed
+    /// CONTROL-frame write (telnet's filter ack, the WS Pong reply) loses
+    /// only the queue, and `sh/dx` additionally abandons the rest of its
+    /// history iterator (by summing that into `still_queued` at the call
+    /// site).
+    #[test]
+    fn abandoned_spot_count_covers_all_three_write_failure_shapes() {
+        // Spot write: the in-flight spot plus everything still retained.
+        assert_eq!(abandoned_spot_count(true, 7), 8);
+        // Control-frame write: nothing was in flight, the queue is still lost.
+        assert_eq!(abandoned_spot_count(false, 7), 7);
+        // Nothing queued, control frame: nothing to charge.
+        assert_eq!(abandoned_spot_count(false, 0), 0);
+        // `sh/dx`: caller sums its remaining history into `still_queued`.
+        assert_eq!(abandoned_spot_count(true, 3 + 7), 11);
+    }
+
     #[test]
     fn renders_spot_count_as_a_prometheus_counter() {
         let m = Metrics::new();
@@ -430,6 +500,17 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_dropped_write_failed_total counter"));
         assert!(text.contains("manta_spots_dropped_write_failed_total 7"));
+    }
+
+    /// MAN-45 (round-6 review finding).
+    #[test]
+    fn unresolved_geography_is_counted_and_exposed() {
+        let m = Metrics::new();
+        m.record_unresolved_geography();
+        m.record_unresolved_geography();
+        assert!(m
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 2"));
     }
 
     #[test]

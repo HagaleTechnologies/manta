@@ -29,6 +29,21 @@ async fn spawn_server() -> (
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
 ) {
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+}
+
+/// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
+/// shutdown-drain deadline directly (e.g. `Duration::ZERO`, to make an
+/// expiry exact rather than timing-dependent) instead of always waiting on
+/// the production `CLIENT_DRAIN_DEADLINE`.
+async fn spawn_server_with_drain_deadline(
+    drain_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
@@ -52,6 +67,7 @@ async fn spawn_server() -> (
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline,
             },
             tasks,
             limiter,
@@ -132,6 +148,47 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
     assert_eq!(value["dxCall"], "JA1ABC");
+}
+
+/// MAN-45 (PR #63 round-16 finding): a drain that cannot finish inside its
+/// own deadline must COUNT everything it abandons, never truncate silently
+/// (ARCHITECTURE §8). Driven with a zero deadline so the expiry is exact
+/// rather than timing-dependent -- the property under test is the
+/// accounting, not the duration.
+///
+/// The assertion is the invariant, not a fixed split: `select!` may still
+/// deliver some spots through the LIVE arm before the shutdown arm wins, so
+/// what must hold is that every published spot is either delivered or
+/// counted, never neither.
+#[tokio::test]
+async fn tcp_shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx) = spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    tokio::time::sleep(Duration::from_millis(600)).await; // past the WS-detection peek window
+
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => delivered += 1,
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
 }
 
 #[tokio::test]
@@ -408,6 +465,7 @@ async fn websocket_client_receives_spot_as_json_message() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -444,6 +502,40 @@ async fn websocket_client_receives_spot_as_json_message() {
     let _ = ws.close(None).await;
 }
 
+/// MAN-45 (PR #63 round-16 finding): the WS drain loop's own deadline, same
+/// invariant as `tcp_shutdown_drain_deadline_counts_the_backlog_it_could_not_write`.
+#[tokio::test]
+async fn ws_shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx) = spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(msg)) if msg.is_text() => delivered += 1,
+                _ => return, // Close/None/error: the connection ended
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
 #[tokio::test]
 async fn websocket_client_sending_an_oversized_message_is_disconnected() {
     // Regression test (round-5 review): the WS handshake used to accept
@@ -476,6 +568,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -542,6 +635,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -614,6 +708,7 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -739,6 +834,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,

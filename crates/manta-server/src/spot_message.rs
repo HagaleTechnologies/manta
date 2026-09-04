@@ -11,6 +11,17 @@ use manta_spot::cty;
 use manta_spot::Spot;
 use serde::Serialize;
 
+/// Emitted for `dxContinent`/`deContinent` when `cty.lookup` cannot resolve
+/// the callsign. Deliberately outside the field's real domain -- the seven
+/// two-letter continent codes -- so it reads as "unknown", never as
+/// geography. See `from_spot`'s comment for why this is a sentinel rather
+/// than JSON `null`.
+pub const UNKNOWN_CONTINENT: &str = "";
+/// Emitted for `dxCqZone` when `cty.lookup` cannot resolve the callsign
+/// (there is no `deCqZone` field on the wire). Real CQ zones are 1-40, so 0
+/// is unambiguously "unknown", not a fabricated zone.
+pub const UNKNOWN_CQ_ZONE: u16 = 0;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotMessage {
@@ -65,20 +76,30 @@ impl SpotMessage {
         unix_ts_secs: i64,
         session_nonce: u128,
     ) -> Self {
-        // Falls back to empty-string/zero when `dx_call` isn't
-        // cty-allocated. Reachable in practice, not just a defensive
-        // fallback: MAN-28's Watch List lets an operator allowlist a call
-        // that bypasses `cty.is_allocated()` entirely (e.g. a deliberately
-        // unallocated or malformed test callsign), so `Validator` can emit
-        // a spot for a callsign `cty.lookup` genuinely can't resolve.
+        // Falls back to the UNKNOWN_* sentinels below when `dx_call` isn't
+        // cty-allocated. Reachable in practice, not defensive: MAN-28's
+        // Watch List lets an operator allowlist a call that bypasses
+        // `cty.is_allocated()` entirely, so `Validator` can emit a spot for
+        // a callsign `cty.lookup` genuinely can't resolve.
+        //
+        // MAN-45 (round-6 review finding), resolved as follows.
         // dxContinent/dxCqZone (and their de* counterparts) are REQUIRED,
-        // non-nullable fields on dispensa's spots.v1 wire contract, unlike
-        // dxDxcc/deDxcc (declared nullable there) -- there is currently no
-        // contract-defined "unknown" representation for these two fields,
-        // so this fallback stays a real (if honestly imperfect) value
-        // rather than null, which the contract would reject outright. See
-        // the follow-up ticket linked from this PR's round-6 review thread
-        // for the cross-repo contract question this raises.
+        // non-nullable on dispensa's spots.v1 wire contract, unlike
+        // dxDxcc/deDxcc -- emitting JSON `null` for them would FAIL cqdx's
+        // own ingest validation, not satisfy it, so the reviewer's
+        // suggested fix is unavailable without a cross-repo contract change
+        // (proposed in
+        // docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md).
+        // What IS true today and was previously undocumented: `dxLat`/
+        // `dxLon` ARE nullable on the contract and DO serialize as `null`
+        // here, so a consumer already has a contract-defined way to detect
+        // unresolved geography -- null coordinates -- without waiting on
+        // any schema change. The UNKNOWN_* sentinels are additionally
+        // chosen outside each field's real domain (CQ zone 0 is not a real
+        // zone; "" is not a continent code) so neither can be misread as
+        // data. Occurrences are counted as
+        // `manta_spots_unresolved_geography_total` so an operator can see
+        // how often this happens.
         let dx = cty.lookup(&spot.callsign);
         let de = cty.lookup(station_call);
         // `band` must be derived from the SAME rounded value reported as
@@ -106,14 +127,18 @@ impl SpotMessage {
             dx_lat: dx.map(|e| e.lat),
             dx_lon: dx.map(|e| e.lon),
             dx_dxcc: None,
-            dx_continent: dx.map(|e| e.continent.clone()).unwrap_or_default(),
-            dx_cq_zone: dx.map(|e| e.cq_zone).unwrap_or(0),
+            dx_continent: dx
+                .map(|e| e.continent.clone())
+                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
+            dx_cq_zone: dx.map(|e| e.cq_zone).unwrap_or(UNKNOWN_CQ_ZONE),
             de_call: station_call.to_string(),
             de_grid: None,
             de_lat: de.map(|e| e.lat),
             de_lon: de.map(|e| e.lon),
             de_dxcc: None,
-            de_continent: de.map(|e| e.continent.clone()).unwrap_or_default(),
+            de_continent: de
+                .map(|e| e.continent.clone())
+                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
             snr: Some(spot.snr_db.round() as i32),
             wpm: Some(spot.wpm.round() as i32),
             decode_confidence: Some(spot.confidence),
@@ -205,6 +230,48 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(msg.dx_continent, "AS");
         assert_eq!(msg.dx_cq_zone, 25);
         assert_eq!(msg.de_continent, "NA");
+    }
+
+    /// MAN-45 (PR #63 round-6 finding): MAN-28's Watch List allowlist lets
+    /// an operator emit a spot for a call `cty.lookup` genuinely cannot
+    /// resolve (the reviewer's example: a deliberately unallocated
+    /// `QQ9ZZZ`). This path is REACHABLE, not defensive, and had no test at
+    /// all.
+    ///
+    /// What it must emit: values outside each field's valid domain, so a
+    /// consumer can never mistake them for real geography -- CQ zone 0
+    /// (real zones are 1-40) and an empty continent (real continents are
+    /// the seven two-letter codes) -- plus JSON `null` lat/lon, which IS a
+    /// contract-defined unknown on dispensa's spots.v1 and is the signal a
+    /// consumer should key on.
+    #[test]
+    fn an_unresolvable_callsign_emits_out_of_domain_sentinels_not_fabricated_geography() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.callsign = "QQ9ZZZ".to_string(); // not in CTY_FIXTURE
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-test", 0, 0);
+
+        assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE);
+        assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT);
+        assert!(
+            !(1..=40).contains(&msg.dx_cq_zone),
+            "must be outside the real CQ-zone domain"
+        );
+        // The contract-legal unknown signal, available to consumers today.
+        assert!(msg.dx_lat.is_none());
+        assert!(msg.dx_lon.is_none());
+
+        // `de` geography is unaffected -- the station's own call still resolves.
+        assert_eq!(msg.de_continent, "NA");
+    }
+
+    /// The resolvable case must be untouched by the sentinel refactor.
+    #[test]
+    fn a_resolvable_callsign_still_carries_its_real_geography() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-test", 0, 0);
+        assert_eq!(msg.dx_continent, "AS");
+        assert_eq!(msg.dx_cq_zone, 25);
     }
 
     #[test]
