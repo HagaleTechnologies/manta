@@ -85,6 +85,8 @@ distinct failure patterns, out of scope for this fix (not lowered by any
    `"VE"`, `"DA"`, `"Z5"`, `"D5"` → `""`, zero `CharDecoded` events):
    reproduces identically at both 2.0 and 1.6, so unrelated to this fix.
    Not investigated further — a separate root-cause pass is needed.
+   **Resolved by MAN-3**, see
+   `docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md`.
 
 Both are new findings, not previously tracked; flagging here so they aren't
 lost.

@@ -20,6 +20,8 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 
 - Floor estimator + neighborhood/effective floor + gate: SPEC §2.1–2.3 (`manta-dsp::floor`).
 - Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`manta-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`).
+- CANDIDATE confirmation counts rise hops cumulatively within a bounded window, not consecutively — a short, fast (34–40 WPM) signal could otherwise fail to confirm any track at all. Normative deviation + measurements: `docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md`.
+- `decode_samples`'s single-track `.text`/`.wpm`/`.freq_hz` report the track with the most `CharDecoded` events, not the lowest `track_id` — same DECISIONS doc as above.
 - Adjacent-channel ownership so one signal yields exactly one track (no cross-channel ghost decodes): SPEC §2.5. This invariant is a V7/V8w pass criterion — see [[golden-vector-freeze]].
 - Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though external exposition as Prometheus metrics is explicit M3 scope (ARCHITECTURE §8), not yet wired.
 - Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id }` (`process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.

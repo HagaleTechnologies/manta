@@ -19,6 +19,7 @@ use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
 use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Applies the calibration factor to a `TrackMeta` event's `freq_hz`,
@@ -101,6 +102,42 @@ pub struct DecodeReport {
     pub spots: Vec<Spot>,
 }
 
+/// Deterministically pick the single `track_id` whose event slice becomes
+/// `DecodeReport`'s headline `.text`/`.wpm`/`.freq_hz`.
+///
+/// MAN-3: the previous rule -- lowest `track_id` present -- silently
+/// discarded a complete decode whenever an earlier, doomed track (promoted,
+/// emitted one or two periodic `TrackMeta`, then closed before its own
+/// `SpeedTracker` reached SPEC §4.1's 5-mark quorum) held a lower id than
+/// the track that actually decoded the signal. `TrackManager::spawn`'s
+/// `next_id` is spawn-ordered and has no relation to which track captures
+/// the real signal; a short, fast signal routinely produces several
+/// short-lived tracks in succession for one physical carrier (measured:
+/// `track_ids: [6, 16]` for the ticket's "D5" case, both decoding the same
+/// looped text). The correct decode was never lost -- it stayed in
+/// `DecodeReport::events` -- it was just excluded from `.text`.
+///
+/// Rule: most `CharDecoded` events wins; ties break to the lowest
+/// `track_id`. The all-tied-at-zero case (no track decoded anything) is a
+/// tie, so a telemetry-only stream still reports the lowest id exactly as
+/// before. `BTreeMap` gives a fixed ascending scan and the key is a total
+/// order, so the result depends only on the event multiset -- not on
+/// iteration order (SPEC §8 determinism).
+fn select_report_track(events: &[DecoderEvent]) -> u32 {
+    let mut chars_per_track: BTreeMap<u32, usize> = BTreeMap::new();
+    for e in events {
+        let entry = chars_per_track.entry(track::event_track_id(e)).or_insert(0);
+        if matches!(e, DecoderEvent::CharDecoded { .. }) {
+            *entry += 1;
+        }
+    }
+    chars_per_track
+        .into_iter()
+        .max_by_key(|&(id, chars)| (chars, std::cmp::Reverse(id)))
+        .map(|(id, _)| id)
+        .expect("select_report_track requires a non-empty event stream")
+}
+
 /// M0 pipeline: estimate frequency, extract one channel, decode. SPEC
 /// §1.3–§1.4, §3–§5.
 pub fn decode_samples(
@@ -164,24 +201,34 @@ pub fn decode_samples(
     // continuously-decoding track's GC timer never falsely expires.
     const CHUNK_SAMPLES: usize = 4096;
     let mut events = Vec::new();
-    let mut any_hops = false;
+    let mut total_hops: u64 = 0;
     for chunk in padded_iq.chunks(CHUNK_SAMPLES) {
         let hops = ch.process(chunk);
-        any_hops |= !hops.is_empty();
+        total_hops += hops.len() as u64;
         events.extend(tm.process_hops(&hops, |m| (m.saturating_sub(pad_hops)) * hop));
     }
-    if !any_hops {
+    if total_hops == 0 {
         bail!("no signal found (input shorter than one filter length or empty)");
     }
     events.extend(tm.finish());
 
+    // MAN-3: distinct from the length bail above -- the channelizer ran fine
+    // and produced hops, but no track ever promoted *and* emitted. That is a
+    // detection outcome (signal below `detector.on_snr_db`, or entirely
+    // inside SPEC §2.1's warmup+confirm floor), not an input-length problem,
+    // and reporting it as one sent this ticket's investigation down the
+    // wrong path once already.
     if events.is_empty() {
-        bail!("no signal found (input shorter than one filter length or empty)");
+        bail!(
+            "no signal found: {total_hops} hops processed, but no track was ever \
+             promoted and emitted (SPEC §2.4) -- signal below detector.on_snr_db, \
+             or shorter than the ~2.05 s warmup+confirm floor"
+        );
     }
-    let min_track_id = events.iter().map(track::event_track_id).min().unwrap();
+    let report_track_id = select_report_track(&events);
     let this_track: Vec<DecoderEvent> = events
         .iter()
-        .filter(|e| track::event_track_id(e) == min_track_id)
+        .filter(|e| track::event_track_id(e) == report_track_id)
         .cloned()
         .collect();
     let freq_hz = this_track
@@ -248,6 +295,52 @@ pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manta_decode::tree::Glyph;
+
+    fn meta(track_id: u32) -> DecoderEvent {
+        DecoderEvent::TrackMeta {
+            track_id,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000.0,
+        }
+    }
+    fn ch(track_id: u32, sample_ts: u64) -> DecoderEvent {
+        DecoderEvent::CharDecoded {
+            track_id,
+            sample_ts,
+            glyph: Glyph::Char('A'),
+            confidence: 0.9,
+        }
+    }
+
+    /// MAN-3, the "D5" shape: track 6 emits telemetry then dies; track 16
+    /// carries the real decode. The old `min_track_id` rule reported track
+    /// 6's empty history.
+    #[test]
+    fn report_track_is_the_one_that_decoded_not_the_lowest_id() {
+        let events = vec![meta(6), meta(6), ch(16, 100), ch(16, 200), meta(16)];
+        assert_eq!(select_report_track(&events), 16);
+    }
+
+    /// Ties (including the all-zero case: no track decoded anything
+    /// anywhere) break to the lowest id -- preserving the historical
+    /// behaviour exactly where the old rule was not wrong, so a
+    /// telemetry-only stream still reports a stable, lowest-id track.
+    #[test]
+    fn report_track_ties_break_to_the_lowest_id() {
+        assert_eq!(select_report_track(&[meta(9), meta(4), meta(7)]), 4);
+        assert_eq!(select_report_track(&[ch(9, 1), ch(4, 2), meta(7)]), 4);
+    }
+
+    /// SPEC §8: selection must be a pure function of the event stream, with
+    /// no dependence on iteration/insertion order.
+    #[test]
+    fn report_track_selection_is_order_independent() {
+        let mut events = vec![meta(6), ch(16, 100), ch(16, 200), meta(6), meta(16)];
+        let first = select_report_track(&events);
+        events.reverse();
+        assert_eq!(select_report_track(&events), first);
+    }
 
     /// MAN-31: `decode_samples` is one of the two production call sites
     /// that must apply an operator-supplied suppression list -- proves the

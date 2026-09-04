@@ -436,6 +436,7 @@ fn main() -> Result<()> {
                 "merged": s.close_counts.merged,
                 "evicted": s.close_counts.evicted,
             },
+            "promoted_count": s.promoted_count,
         });
         let text = match serde_json::to_string(&line) {
             Ok(t) => t,
@@ -559,6 +560,7 @@ fn main() -> Result<()> {
             "merged": report.final_close_counts.merged,
             "evicted": report.final_close_counts.evicted,
         },
+        "promoted_count": report.promoted_count,
         "man19_criteria": {
             "no_crash": no_crash,
             "no_input_overrun_by_construction": no_input_overrun,
