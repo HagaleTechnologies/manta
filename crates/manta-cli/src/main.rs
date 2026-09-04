@@ -699,6 +699,10 @@ fn build_pipeline_config(
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+    /// MAN-45 (round-6 review finding): shared with the JSON/WS listener's
+    /// own copy so the `on_spot` callback below can count a spot whose
+    /// geography `cty.lookup` can't resolve, without re-parsing `cty.dat`.
+    cty: std::sync::Arc<manta_spot::cty::Table>,
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
@@ -744,7 +748,26 @@ struct SpotServer {
 /// one spot. The previous 2s value was shorter than even a single one of
 /// those 10s writes, so a genuinely slow-but-completing client was
 /// routinely cut off mid-drain for no reason (round-15 review finding).
+///
+/// MAN-45 (round-16 finding): as of this change, the value that actually
+/// bounds ONE client's drain is `manta_server::tasks::CLIENT_DRAIN_DEADLINE`
+/// -- each of the three per-client drain loops (telnet's, json_stream's TCP
+/// and WS) now enforces its own inner deadline and counts whatever it
+/// abandons when that fires, so a healthy handler always returns from
+/// `await_all` well within its own budget. This constant is now a
+/// registry-wide *scheduling backstop* above that per-client bound (see the
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// test below) -- it no longer needs sizing against any particular spot
+/// count, only against `CLIENT_DRAIN_DEADLINE` plus scheduling margin.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// How often the server runtime copies the engine's live track count into
+/// the `manta_active_tracks` gauge. The decode loop runs on the MAIN
+/// thread, outside the tokio runtime that owns `Metrics`, so a poller is
+/// the bridge -- the same shape MAN-55's `confirmed_live_handle` watcher
+/// already uses. 4 Hz is far finer than any Prometheus scrape interval and
+/// costs one relaxed atomic load per tick.
+const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
@@ -852,6 +875,7 @@ fn start_spot_server(
                 cfg.telnet_max_connections_per_ip,
             ),
             telnet_ip_command_limiter,
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
         ));
         let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::json_stream::MAX_INBOUND_PINGS,
@@ -864,13 +888,14 @@ fn start_spot_server(
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus.clone(),
                 metrics: metrics.clone(),
-                cty,
+                cty: cty.clone(),
                 station_call: cfg.station_callsign.clone(),
                 decoder_version,
                 // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
                 // need shutdown_rx -- can't let this be the moving consumer
                 // anymore now that there are more consumers.
                 shutdown: shutdown_rx.clone(),
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks.clone(),
             manta_server::tasks::new_connection_limiter(
@@ -926,6 +951,7 @@ fn start_spot_server(
         SpotServer {
             bus,
             metrics,
+            cty,
             shutdown_tx,
             tasks,
         },
@@ -1095,7 +1121,7 @@ fn main() -> Result<()> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match server_config {
+            let (server_runtime, spot_server, active_tracks) = match server_config {
                 Some(path) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
                     // JSON `timestamp`/RBN Zulu field a client observes) --
@@ -1131,12 +1157,25 @@ fn main() -> Result<()> {
 
                     let (rt, server) =
                         start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
-                    // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` has no equivalent
-                    // hook yet -- manta-engine exposes no live track-count
-                    // API for `listen()`'s callbacks to read, so it stays
-                    // at Metrics::default()'s 0 until that surface exists.
-                    //
+                    // MAN-45 (round-9 finding): the daemon's own copy of the
+                    // gauge `manta_engine::listen_with_observers` updates as
+                    // it runs (on the MAIN thread, outside this tokio
+                    // runtime) -- polled into `Metrics` below, the same
+                    // bridge shape MAN-55's `confirmed_live_handle` watcher
+                    // uses for source liveness.
+                    let active_tracks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    {
+                        let gauge = active_tracks.clone();
+                        let track_metrics = server.metrics.clone();
+                        rt.spawn(async move {
+                            loop {
+                                track_metrics.set_active_tracks(
+                                    gauge.load(std::sync::atomic::Ordering::Relaxed),
+                                );
+                                tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
+                            }
+                        });
+                    }
                     // MAN-55: for a source where `open()` succeeding
                     // doesn't confirm a live device (HPSDR's UDP
                     // connect/send need no peer response at all),
@@ -1160,9 +1199,9 @@ fn main() -> Result<()> {
                         }
                         None => server.metrics.set_source_health(source_name, true),
                     }
-                    (Some(rt), Some(server))
+                    (Some(rt), Some(server), Some(active_tracks))
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1170,10 +1209,13 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            let listen_result = manta_engine::listen(
+            let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
                 stop,
+                manta_engine::ListenObservers {
+                    active_tracks: active_tracks.clone(),
+                },
                 |ev| {
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
@@ -1203,6 +1245,14 @@ fn main() -> Result<()> {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
                         server.metrics.record_spot();
+                        // MAN-45: counted ONCE per spot at publish time, not
+                        // inside `SpotMessage::from_spot` -- that runs once
+                        // per connected JSON/WS client, which would scale
+                        // the count with client count instead of spot
+                        // count.
+                        if server.cty.lookup(&spot.callsign).is_none() {
+                            server.metrics.record_unresolved_geography();
+                        }
                     }
                     if json {
                         println!("{}", serde_json::json!({ "spot": spot }));
@@ -1229,6 +1279,12 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
+                // MAN-45: the engine's own gauge is already 0 (TrackManager::
+                // finish() closed every track before `listen_with_observers`
+                // returned), but the 250ms poller may not have run since --
+                // a metrics scrape racing shutdown must not see a stale
+                // nonzero count.
+                server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -1328,6 +1384,22 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
+    /// must never fire before a handler's own drain deadline, or
+    /// `shutdown_timeout` aborts a drain that was still inside its budget
+    /// and the abandoned queue goes uncounted again -- the exact failure
+    /// rounds 15 and 16 both landed on from different directions. The
+    /// margin covers task scheduling, not another spot's write.
+    #[test]
+    fn the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline() {
+        assert!(
+            SHUTDOWN_DRAIN_DEADLINE > manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+            "SHUTDOWN_DRAIN_DEADLINE ({SHUTDOWN_DRAIN_DEADLINE:?}) must exceed \
+             CLIENT_DRAIN_DEADLINE ({:?})",
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
     }
 
     #[test]

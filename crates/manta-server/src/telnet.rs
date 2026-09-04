@@ -172,6 +172,7 @@ pub async fn serve(
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
     ip_command_limiter: IpRateLimiter,
+    drain_deadline: Duration,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -249,6 +250,7 @@ pub async fn serve(
                 ip_command_limiter,
                 log_enabled,
                 rejection_log_limiter,
+                drain_deadline,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -299,6 +301,7 @@ async fn handle_client(
     ip_command_limiter: IpRateLimiter,
     log_enabled: bool,
     rejection_log_limiter: IpRateLimiter,
+    drain_deadline: Duration,
 ) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
@@ -373,7 +376,10 @@ async fn handle_client(
                             if log_enabled {
                                 tracing::warn!("telnet: spot write failed, disconnecting");
                             }
-                            metrics.record_write_failed(1 + rx.len() as u64);
+                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                true,
+                                rx.len(),
+                            ));
                             return Ok(());
                         }
                     }
@@ -491,9 +497,10 @@ async fn handle_client(
                                 if log_enabled {
                                     tracing::warn!("telnet: sh/dx history write failed, disconnecting");
                                 }
-                                metrics.record_write_failed(
-                                    1 + history.len() as u64 + rx.len() as u64,
-                                );
+                                metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                    true,
+                                    history.len() + rx.len(),
+                                ));
                                 return Ok(());
                             }
                         }
@@ -520,7 +527,10 @@ async fn handle_client(
                             if log_enabled {
                                 tracing::warn!("telnet: filter-ack write failed, disconnecting");
                             }
-                            metrics.record_write_failed(rx.len() as u64);
+                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                false,
+                                rx.len(),
+                            ));
                             return Ok(());
                         }
                     }
@@ -537,38 +547,72 @@ async fn handle_client(
             // published right before the daemon exited -- rather than
             // dropping them unsent.
             _ = shutdown.changed() => {
+                // MAN-45 (round-16 finding): this loop's OWN deadline. The
+                // outer `SHUTDOWN_DRAIN_DEADLINE`/`await_all` bound is
+                // registry-wide and cannot scale with any one client's
+                // backlog depth -- and when it expired,
+                // `Runtime::shutdown_timeout` aborted this task mid-write
+                // with everything abandoned uncounted. Same monotonic
+                // remaining-budget idiom `looks_like_websocket_handshake`
+                // already uses in `json_stream`.
+                //
                 // A `Lagged(n)` mid-drain means this subscriber missed `n`
                 // spots, not that the channel is empty -- there can still
                 // be spots queued after the gap. Stopping on the first
                 // `Err` (the prior behavior) silently dropped everything
                 // from that point on without even recording the loss
                 // (round-6 review finding).
+                let drain_deadline = tokio::time::Instant::now() + drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
-                                    continue;
+                                    continue; // a filtered spot costs no budget
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
-                                .await
-                                .is_err()
-                            {
-                                // The client's socket is presumably dead --
-                                // further writes would just fail too. A
-                                // bare `?` here (the prior behavior)
-                                // propagated the error out of the whole
-                                // handler, abandoning the rest of the
+                            // Checked BEFORE the write, not around it: this
+                            // spot has already left `rx`, so a `timeout`
+                            // wrapped around the whole loop would drop it
+                            // mid-write -- neither delivered nor counted,
+                            // reintroducing the silent loss this fix exists
+                            // to end. `true` (in-flight) is exactly that
+                            // spot.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(
+                                        remaining,
+                                        write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot),
+                                    )
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
+                                // The client's socket is presumably dead
+                                // (or hopelessly slow) -- further writes
+                                // would just fail or exhaust the budget
+                                // too. A bare `?` here (the pre-round-12
+                                // behavior) propagated the error out of the
+                                // whole handler, abandoning the rest of the
                                 // drain loop uncounted (round-12 review
-                                // finding).
-                                // MAN-59 review round 2: returns Ok(()),
-                                // not Err -- log it directly.
+                                // finding); a flat outer deadline alone
+                                // (the pre-round-16 behavior) let
+                                // `Runtime::shutdown_timeout` abort this
+                                // task mid-write once a multi-spot backlog
+                                // exceeded it, also uncounted (round-16
+                                // review finding).
                                 if log_enabled {
-                                    tracing::warn!("telnet: shutdown-drain write failed, disconnecting");
+                                    tracing::warn!(
+                                        "telnet: shutdown-drain write failed or ran out of budget, disconnecting"
+                                    );
                                 }
-                                metrics.record_write_failed(1 + rx.len() as u64);
+                                metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                    true,
+                                    rx.len(),
+                                ));
                                 return Ok(());
                             }
                         }

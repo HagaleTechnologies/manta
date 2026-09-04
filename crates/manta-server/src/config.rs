@@ -25,14 +25,53 @@ fn default_dry_run() -> bool {
     false
 }
 
-/// Shared by `deserialize_station_callsign` (required) and
-/// `deserialize_optional_callsign` (MAN-32's `login_callsign`, optional) so
-/// the plausibility rule -- and the line-injection concern it guards
-/// against, see `ServerConfig::station_callsign`'s doc comment -- can't
-/// drift between the two call sites.
-fn check_plausible(call: &str) -> Result<(), String> {
-    if !manta_spot::grammar::is_plausible(call) {
-        return Err(format!("{call:?} is not a plausible callsign"));
+/// Validates an operator-supplied station identity -- `[server].station_callsign`
+/// and MAN-32's `login_callsign`. Shared by both so the rule, and the
+/// line-injection concern it guards against (see
+/// `ServerConfig::station_callsign`'s doc comment), can't drift between them.
+///
+/// MAN-45 (PR #63 round-8 finding): this deliberately does NOT reuse
+/// `manta_spot::grammar::is_plausible`. That grammar is a cheap prefilter for
+/// garbled DECODER OUTPUT (ARCHITECTURE §6.2) -- 3-7 alphanumerics with a
+/// fixed portable-suffix allowlist -- and it rejects real operator callsigns
+/// the bundled `cty.dat` itself recognizes: `JW/LB2PG` (DXCC prefix
+/// override, base too short once split) and `GB3LER/B` (beacon suffix, not
+/// in the allowlist) are both in the table. Being over-narrow is correct for
+/// the decoder (a false accept there costs a bogus spot) and wrong here (a
+/// false reject means the station cannot start at all).
+///
+/// What this still guarantees, which is the actual reason this field is
+/// validated: the value contains nothing but ASCII alphanumerics and `/`, so
+/// it can never carry a control character, whitespace, or the server's own
+/// generated `-#` RBN suffix into a telnet line or a JSON `deCall`.
+///
+/// Deliberately NOT gated on `cty.dat`: a newly-issued callsign absent from
+/// the bundled snapshot would be rejected, a worse failure than the one this
+/// fixes, and it would couple config deserialization to table loading.
+fn check_operator_callsign(call: &str) -> Result<(), String> {
+    // Total length: 3 (shortest real base) to 20 (a prefix/base/suffix
+    // triple with room to spare) -- an outer bound on what gets interpolated
+    // into every output line, not a claim about callsign structure.
+    if call.len() < 3 || call.len() > 20 {
+        return Err(format!("{call:?} is not a plausible callsign (length)"));
+    }
+    if !call.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
+        // Covers control characters, CR/LF, whitespace, non-ASCII, and the
+        // server's own `-#` suffix in one rule.
+        return Err(format!(
+            "{call:?} is not a plausible callsign (only A-Z, 0-9 and '/' are allowed)"
+        ));
+    }
+    // At most prefix/base/suffix, each non-empty and no longer than any real
+    // designator.
+    let segments: Vec<&str> = call.split('/').collect();
+    if segments.len() > 3 || segments.iter().any(|s| s.is_empty() || s.len() > 10) {
+        return Err(format!("{call:?} is not a plausible callsign (structure)"));
+    }
+    if !call.chars().any(|c| c.is_ascii_digit()) || !call.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Err(format!(
+            "{call:?} is not a plausible callsign (needs at least one letter and one digit)"
+        ));
     }
     Ok(())
 }
@@ -42,9 +81,14 @@ where
     D: Deserializer<'de>,
 {
     let call = String::deserialize(deserializer)?;
-    check_plausible(&call)
+    check_operator_callsign(&call)
         .map_err(|e| serde::de::Error::custom(format!("station_callsign {e}")))?;
-    Ok(call)
+    // Normalized here so config casing never reaches the wire:
+    // `cty::Table::lookup` and `Validator::allowlist` both uppercase
+    // internally, and RBN cluster lines are conventionally uppercase --
+    // `deCall: "w3xyz"` would be this one boundary leaking its own
+    // formatting downstream.
+    Ok(call.to_ascii_uppercase())
 }
 
 fn deserialize_optional_callsign<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -52,11 +96,14 @@ where
     D: Deserializer<'de>,
 {
     let call: Option<String> = Option::deserialize(deserializer)?;
-    if let Some(call) = &call {
-        check_plausible(call)
-            .map_err(|e| serde::de::Error::custom(format!("login_callsign {e}")))?;
+    match call {
+        Some(call) => {
+            check_operator_callsign(&call)
+                .map_err(|e| serde::de::Error::custom(format!("login_callsign {e}")))?;
+            Ok(Some(call.to_ascii_uppercase()))
+        }
+        None => Ok(None),
     }
-    Ok(call)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -65,12 +112,14 @@ pub struct ServerConfig {
     /// The spotter's own callsign, used as the telnet `DX de <call>-#:`
     /// identity and the JSON stream's `deCall`. No sensible default --
     /// every real cluster/spot-stream node identifies itself. Validated
-    /// (via `manta_spot::grammar::is_plausible`, the same grammar the
-    /// decode pipeline itself uses) at deserialize time: an empty,
-    /// control-character-laden, or malformed value would otherwise be
-    /// interpolated straight into every telnet line and JSON `deCall`
-    /// unescaped -- e.g. a callsign containing `\r\n` could forge
-    /// additional bogus cluster lines.
+    /// (via `check_operator_callsign` -- MAN-45: deliberately NOT the
+    /// decoder's `manta_spot::grammar::is_plausible`, which is too narrow
+    /// for real operator callsigns like `JW/LB2PG` or `GB3LER/B`) at
+    /// deserialize time: an empty, control-character-laden, or malformed
+    /// value would otherwise be interpolated straight into every telnet
+    /// line and JSON `deCall` unescaped -- e.g. a callsign containing
+    /// `\r\n` could forge additional bogus cluster lines. Normalized to
+    /// ASCII uppercase so config casing never reaches the wire.
     #[serde(deserialize_with = "deserialize_station_callsign")]
     pub station_callsign: String,
     #[serde(default = "default_bind_addr")]
@@ -311,13 +360,85 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// MAN-45 (PR #63 round-8 finding): `station_callsign` was validated
+    /// with `manta_spot::grammar::is_plausible`, a deliberately narrow
+    /// prefilter for GARBLED DECODER OUTPUT (3-7 alphanumerics, a fixed
+    /// portable-suffix allowlist). Real operator callsigns use DXCC prefix
+    /// overrides and suffixes that grammar was never meant to model and
+    /// that the bundled `cty.dat` recognizes outright -- configuration must
+    /// not reject a call the station legitimately holds.
     #[test]
-    fn implausible_station_callsign_is_rejected() {
-        for bad in ["", "W3XYZ-#", "W3XYZ\r\nEVIL LINE", "not a callsign"] {
+    fn real_world_operator_callsigns_are_accepted() {
+        for good in [
+            "W3XYZ",     // plain
+            "JW/LB2PG",  // DXCC prefix override (Svalbard) -- in cty.dat
+            "GB3LER/B",  // beacon suffix -- in cty.dat
+            "K5ARH/QRP", // still accepted (the old allowlist's cases)
+            "K5ARH/P",
+            "VP2E/K5ARH/M", // prefix AND suffix
+            "3DA0RS",       // digit-leading prefix
+            "w3xyz",        // lowercase accepted (as before) ...
+        ] {
+            let cfg: ServerConfig = toml::from_str(&format!(r#"station_callsign = {good:?}"#))
+                .unwrap_or_else(|e| panic!("{good:?} should be accepted: {e}"));
+            // ... and normalized, so config casing never reaches the wire.
+            assert_eq!(cfg.station_callsign, good.to_ascii_uppercase());
+        }
+    }
+
+    /// The true positives the old grammar caught must STILL be rejected --
+    /// the point of validating this field at all is that it is
+    /// interpolated unescaped into every telnet line and JSON `deCall` (see
+    /// `ServerConfig::station_callsign`'s doc comment), so a `\r\n` in it
+    /// could forge cluster lines. The server's own generated `-#` RBN
+    /// suffix must not be configurable either. Supersedes the old
+    /// `implausible_station_callsign_is_rejected` -- this is a strict
+    /// superset of its fixtures.
+    #[test]
+    fn malformed_or_injecting_station_callsigns_are_still_rejected() {
+        for bad in [
+            "",                   // empty
+            "W3XYZ-#",            // the server's own generated suffix
+            "W3XYZ\r\nEVIL LINE", // CRLF injection
+            "not a callsign",     // whitespace
+            "W3XYZ\u{0}",         // NUL
+            "ZZ",                 // too short, no digit
+            "12345",              // no letter
+            "ABCDEF",             // no digit
+            "W1AW/",              // empty segment
+            "/W1AW",              // empty segment
+            "W1AW//P",            // empty segment
+            "A/B/C/D",            // more segments than prefix/base/suffix
+            "W1AW/ABCDEFGHIJK",   // segment far longer than any real designator
+            "W3XYZ\u{00c9}",      // non-ASCII
+        ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));
             assert!(result.is_err(), "{bad:?} should have been rejected");
         }
+    }
+
+    /// MAN-32's `login_callsign` is the same class of value -- an
+    /// operator's own station identity, not decoder output -- so it gets
+    /// the same validator.
+    #[test]
+    fn login_callsign_accepts_the_same_real_world_callsigns() {
+        let file: DaemonConfigFile = toml::from_str(
+            r#"
+            [server]
+            station_callsign = "W3XYZ"
+            [[rbn_uplink]]
+            enabled = true
+            target_host = "example.invalid"
+            target_port = 7300
+            login_callsign = "JW/LB2PG"
+            "#,
+        )
+        .expect("JW/LB2PG should be accepted as a login_callsign");
+        assert_eq!(
+            file.rbn_uplink[0].login_callsign.as_deref(),
+            Some("JW/LB2PG")
+        );
     }
 
     #[test]
