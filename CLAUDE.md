@@ -8,12 +8,16 @@ Network currently depends on.
 ## Status
 
 M1 implemented (live audio decode; manual W1AW live-copy run still
-outstanding). All M2 sub-projects implemented (PFB channelizer;
-detector/track manager + decoder pool; V8/V8w pileup + CPU-budget bench;
-SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
-2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2/V5/V6/V8w are tracked
-known classical-decoder fading-robustness limitations (`#[ignore]`d,
-issues #25/#28), deferred to M4 ML fusion by design, not M2 blockers. **M2
+outstanding — its blocker, MAN-4's spurious-track bug, is now fixed; see
+docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md — but the run itself
+still needs real rig hardware and an operator, per
+docs/RUNBOOKS/m1-w1aw-live-copy.md). All M2 sub-projects implemented (PFB
+channelizer; detector/track manager + decoder pool; V8/V8w pileup +
+CPU-budget bench; SoapySDR input; KiwiSDR input) — see
+docs/DECISIONS/2026-07-1[7-9]*.md and 2026-07-2[4-5]*.md.
+V1/V3/V4/V7/V8/V9/V10 green; V2/V5/V6/V8w are tracked known
+classical-decoder fading-robustness limitations (`#[ignore]`d, issues
+#25/#28), deferred to M4 ML fusion by design, not M2 blockers. **M2
 acceptance is still open**: Pi4 CPU-budget leg and 24 h live-SDR soak are
 unmet — both need physical hardware not reachable from this environment.
 `manta-dsp::single`/`freqest` deprecated in place.

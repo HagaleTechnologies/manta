@@ -142,7 +142,9 @@ grep — no others exist):
   scope for this sub-project.
 - `crates/manta-engine/tests/listen_audio.rs`: `|_spot| {}` — test is
   already `#[ignore]`d (pre-existing Hilbert near-DC issue, issue #21,
-  unrelated to this change); just needs to keep compiling.
+  unrelated to this change); just needs to keep compiling. [Resolved by
+  MAN-4 (2026-09-04): the test is no longer `#[ignore]`d — see
+  docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md.]
 - `manta-cli`'s `Listen` command: real handling, below.
 
 ### `manta-cli`
@@ -237,7 +239,9 @@ infallible (matches `manta-spot`'s existing API — no `Result` anywhere in
   precautions `listen_audio.rs` documents, or a direct `decode_samples`-
   style complex-IQ source that bypasses `AudioIqSource`'s Hilbert
   transformer (per that file's own note on issue #21) so this new test
-  isn't blocked by an unrelated, already-tracked bug.
+  isn't blocked by an unrelated, already-tracked bug. [issue #21 fixed by
+  MAN-4 (2026-09-04); `listen_spots.rs`'s raw-IQ source choice is now kept
+  for isolation/speed only, not to dodge an open defect.]
 - Full existing suite (V1–V10, V8/V8w, V2–V6, `manta-spot`'s own
   V11–V15) re-run to confirm no regressions from the golden-test rewrite.
 - CPU-budget Mac leg (`cpu_budget_mac_under_half_core`, `--release`,

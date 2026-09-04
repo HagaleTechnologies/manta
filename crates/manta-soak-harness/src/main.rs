@@ -318,6 +318,11 @@ impl IqSource for LoopingAudioIqSource {
         buf.copy_from_slice(&analytic);
         Ok(buf.len())
     }
+
+    /// MAN-4: same Hilbert front end, same guard as `AudioIqSource`.
+    fn analytic_guard_hz(&self) -> f64 {
+        manta_dsp::hilbert::HILBERT_GUARD_HZ
+    }
 }
 
 fn write_mono_wav(path: &std::path::Path, real: &[f32]) -> Result<()> {

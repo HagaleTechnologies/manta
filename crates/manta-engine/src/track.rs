@@ -22,6 +22,15 @@ pub struct DetectorConfig {
     pub warmup_hops: u64,
     /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
     pub track_cap: usize,
+    /// MAN-4: refuse to *spawn* tracks on channels whose baseband offset is
+    /// within `guard_hz` of DC or of +/-Nyquist. `0.0` (the default) is no
+    /// guard at all -- complex-IQ paths, including every golden vector, are
+    /// unaffected. `listen()` raises it to the source's declared
+    /// `analytic_guard_hz` floor (MAN-4 D6). Floor/gate estimation still
+    /// runs on all channels; only spawning is gated (D7), so the
+    /// neighborhood-median clamp (`floor.rs`'s `effective_floor_db`) keeps
+    /// working undisturbed.
+    pub guard_hz: f64,
 }
 
 impl Default for DetectorConfig {
@@ -62,6 +71,7 @@ impl Default for DetectorConfig {
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
+            guard_hz: 0.0,
         }
     }
 }
@@ -413,6 +423,11 @@ pub struct TrackManager {
     channel_spacing_hz: f64,
     /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
     close_counts: CloseCounts,
+    /// MAN-4: per-channel count of tracks ever spawned there, read via
+    /// `spawns_by_channel`/`total_spawns`. Companion to `close_counts` on
+    /// the same "exposed for the future M3 metrics endpoint" rationale,
+    /// and the assertion surface MAN-4's regression tests use.
+    spawns_by_channel: Vec<u32>,
 }
 
 impl TrackManager {
@@ -438,11 +453,44 @@ impl TrackManager {
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
+            spawns_by_channel: vec![0; n_channels],
         }
     }
 
     fn n_channels(&self) -> usize {
         self.owner_of.len()
+    }
+
+    /// MAN-4: per-channel count of tracks ever spawned on that channel.
+    pub fn spawns_by_channel(&self) -> &[u32] {
+        &self.spawns_by_channel
+    }
+
+    /// MAN-4: total tracks ever spawned (`spawns_by_channel`'s sum) -- the
+    /// regression surface proving a clean single signal spawns exactly
+    /// once, not just that it eventually settles to one open track.
+    pub fn total_spawns(&self) -> u32 {
+        self.spawns_by_channel.iter().sum()
+    }
+
+    /// MAN-4: signed baseband offset of channel `k`, Hz -- the same
+    /// circular FFT-bin convention as `Channelizer::channel_freq_hz` (SPEC
+    /// §1.1), via the same `wrapped_channel_offset` helper `Track::freq_hz`
+    /// uses.
+    fn channel_offset_hz(&self, k: usize) -> f64 {
+        wrapped_channel_offset(k, self.n_channels()) * self.channel_spacing_hz
+    }
+
+    /// MAN-4: is `k` inside the configured DC/Nyquist guard band? Always
+    /// `false` when `guard_hz <= 0.0` (the default), so every complex-IQ
+    /// path is unaffected by construction.
+    fn is_guarded(&self, k: usize) -> bool {
+        if self.cfg.guard_hz <= 0.0 {
+            return false;
+        }
+        let off = self.channel_offset_hz(k).abs();
+        let nyquist = self.channel_spacing_hz * self.n_channels() as f64 / 2.0;
+        off < self.cfg.guard_hz || off > nyquist - self.cfg.guard_hz
     }
 
     /// Issue #26: per-`CloseReason` counts of every track closed so far
@@ -590,9 +638,13 @@ impl TrackManager {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
-                if rise[k] && self.owner_of[k].is_none() {
+                if rise[k] && self.owner_of[k].is_none() && !self.is_guarded(k) {
                     let mut winner = k;
-                    if k + 1 < n && rise[k + 1] && self.owner_of[k + 1].is_none() {
+                    if k + 1 < n
+                        && rise[k + 1]
+                        && self.owner_of[k + 1].is_none()
+                        && !self.is_guarded(k + 1)
+                    {
                         if hop.power[k + 1] > hop.power[winner] {
                             winner = k + 1;
                         }
@@ -630,6 +682,7 @@ impl TrackManager {
         for ch in track.owned(self.n_channels()) {
             self.owner_of[ch] = Some(id);
         }
+        self.spawns_by_channel[birth_channel] += 1;
         self.tracks.insert(id, track);
     }
 
@@ -1079,6 +1132,81 @@ mod tests {
             tm.step_hop(&hop(m, power.clone()), m);
         }
         assert_eq!(tm.tracks.len(), 2);
+    }
+
+    #[test]
+    fn guard_hz_defaults_to_zero_so_complex_iq_paths_are_unchanged() {
+        assert_eq!(DetectorConfig::default().guard_hz, 0.0);
+    }
+
+    /// MAN-4: at the audio path's real N=512/fs=48000 dimensions, a 300 Hz
+    /// guard must block spawning on a near-DC channel (k=1, 93.75 Hz) and
+    /// the Nyquist midpoint (k=n/2), while leaving the ticket's own 750 Hz
+    /// signal channel (k=8) free to spawn.
+    #[test]
+    fn guard_band_blocks_spawning_near_dc_and_nyquist() {
+        let n = 512;
+        let fs = 48_000.0;
+        // No warmup_hops override: feed_warmup's 3750 quiet hops must run
+        // past the default 750-hop warmup with the floor already settled,
+        // exactly like the existing spawn tests above -- otherwise the
+        // still-cold floor (HIST_MIN_DB until the ring fills) would read
+        // every quiet channel as "risen" and pollute the very channels
+        // this test probes.
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[1] = 1e-9 * 10f32.powf(20.0 / 10.0); // 93.75 Hz -- inside the guard
+        power[8] = 1e-9 * 10f32.powf(20.0 / 10.0); // 750 Hz -- outside the guard
+        power[n / 2] = 1e-9 * 10f32.powf(20.0 / 10.0); // Nyquist midpoint -- guarded
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.spawns_by_channel()[1],
+            0,
+            "k=1 (93.75 Hz) is inside the guard"
+        );
+        assert_eq!(
+            tm.spawns_by_channel()[n / 2],
+            0,
+            "k=n/2 (Nyquist midpoint) is guarded"
+        );
+        assert!(
+            tm.spawns_by_channel()[8] > 0,
+            "k=8 (750 Hz) is outside the guard and must still spawn"
+        );
+    }
+
+    /// MAN-4: k = n-1 is a *negative* 93.75 Hz offset at the *highest*
+    /// index -- the exact circular-index trap at the heart of this bug
+    /// (the negative-frequency Hilbert image of a near-DC tone wraps to a
+    /// high channel index). The guard must follow the same circular
+    /// convention as `Channelizer::channel_freq_hz`, not raw index order.
+    #[test]
+    fn guard_band_wraps_circularly_like_channel_freq_hz() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[n - 1] = 1e-9 * 10f32.powf(20.0 / 10.0); // -93.75 Hz, at the highest index
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.spawns_by_channel()[n - 1],
+            0,
+            "k=n-1 is -93.75 Hz, inside a 300 Hz guard despite its high index"
+        );
     }
 
     #[test]
