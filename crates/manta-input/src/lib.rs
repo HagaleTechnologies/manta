@@ -46,6 +46,20 @@ pub trait IqSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         None
     }
+
+    /// Offset from baseband DC (and, symmetrically, from +/-Nyquist) inside
+    /// which this source cannot deliver a trustworthy spectrum, in Hz.
+    ///
+    /// Non-zero only for sources that synthesize an analytic signal from
+    /// real input: `AudioIqSource`'s Hilbert FIR leaks the negative-
+    /// frequency image of a real tone near DC/Nyquist, and the detector
+    /// would otherwise spawn tracks on that leakage (MAN-4). Sources that
+    /// supply genuine complex IQ -- files, SoapySDR, KiwiSDR, HPSDR --
+    /// return the default `0.0`: their channel 0 is a real RF frequency
+    /// that must never be suppressed.
+    fn analytic_guard_hz(&self) -> f64 {
+        0.0
+    }
 }
 
 /// JSON sidecar alongside a WAV fixture, carrying metadata the WAV format itself can't. ARCHITECTURE §3.
@@ -176,6 +190,17 @@ mod tests {
         assert_eq!(src.center_freq_hz(), 14_000_000.0);
         let all = read_all(&mut src).unwrap();
         assert_eq!(all, samples());
+    }
+
+    #[test]
+    fn complex_iq_sources_declare_no_analytic_guard() {
+        // WavIqSource carries no Hilbert stage, so channel 0 is a real RF
+        // frequency and must not be suppressed (MAN-4).
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let src = WavIqSource::open(&wav).unwrap();
+        assert_eq!(src.analytic_guard_hz(), 0.0);
     }
 
     #[test]

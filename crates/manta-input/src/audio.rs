@@ -88,6 +88,14 @@ impl IqSource for AudioIqSource {
         buf[..got].copy_from_slice(&analytic);
         Ok(got)
     }
+
+    /// MAN-4: this source's Hilbert front end leaks the negative-frequency
+    /// image of a real tone near DC/Nyquist; report the same guard the
+    /// transformer's own tests hold it to so `listen()` can decline to
+    /// spawn tracks there.
+    fn analytic_guard_hz(&self) -> f64 {
+        manta_dsp::hilbert::HILBERT_GUARD_HZ
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +121,19 @@ mod tests {
             (buf[2000].norm() - 1.0).abs() < 0.1,
             "norm={}",
             buf[2000].norm()
+        );
+    }
+
+    #[test]
+    fn audio_source_declares_the_hilbert_guard() {
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 64],
+            TARGET_RATE_HZ,
+        ));
+        let aiq = AudioIqSource::new(src).unwrap();
+        assert_eq!(
+            aiq.analytic_guard_hz(),
+            manta_dsp::hilbert::HILBERT_GUARD_HZ
         );
     }
 
