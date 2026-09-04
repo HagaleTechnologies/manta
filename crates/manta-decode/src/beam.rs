@@ -9,13 +9,43 @@ pub struct BeamConfig {
     pub width: usize,
     /// SPEC §9 decode.timing_sigma — "the riskiest constant in the spec"
     pub sigma: f32,
+    /// **[DEVIATION from SPEC §9 decode.beam_width]** MAN-9: beam width
+    /// used instead of `width` when the per-character channel-quality term
+    /// `q` (SPEC §4.5) is below `q_low`. Under fading, distorted mark
+    /// durations push the correct dit/dah hypothesis out of the top
+    /// `width` survivors at an intermediate truncation step, after which
+    /// it can never recover (the beam is character-local and greedy
+    /// across characters, SPEC §4.3-4.5) -- widening only for low-quality
+    /// characters buys that back without paying the extra `O(width·marks)`
+    /// cost on every clean character (Pi 4 CPU budget, ROADMAP M2).
+    /// Defaults to `width` (inert = SPEC behavior). See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+    pub width_low_q: usize,
+    /// Threshold on `q`, exclusive-below (`q < q_low` selects
+    /// `width_low_q`). SPEC §4.5 clamps `q` to `[0.3, 1.0]`.
+    pub q_low: f32,
 }
 
 impl Default for BeamConfig {
     fn default() -> Self {
+        let width = 4;
         BeamConfig {
-            width: 4,
+            width,
             sigma: 0.25,
+            width_low_q: width, // inert: SPEC behavior, see the field's doc comment
+            q_low: 0.6,
+        }
+    }
+}
+
+impl BeamConfig {
+    /// The beam width to use for a character decoded at channel quality
+    /// `q`. MAN-9: `width_low_q` below `q_low`, `width` otherwise.
+    pub fn effective_width(&self, q: f32) -> usize {
+        if q < self.q_low {
+            self.width_low_q
+        } else {
+            self.width
         }
     }
 }
@@ -101,7 +131,7 @@ pub fn decode_char(
                 .total_cmp(&a.score)
                 .then_with(|| a.path.cmp(&b.path))
         });
-        next.truncate(cfg.width);
+        next.truncate(cfg.effective_width(q));
         hyps = next;
     }
 
@@ -137,6 +167,8 @@ mod tests {
     const CFG: BeamConfig = BeamConfig {
         width: 4,
         sigma: 0.25,
+        width_low_q: 4,
+        q_low: 0.6,
     };
 
     #[test]
@@ -147,6 +179,55 @@ mod tests {
         let expected = -(2.0f32.ln().powi(2)) / (2.0 * 0.25 * 0.25);
         assert!((l - expected).abs() < 1e-5);
         assert!((log_likelihood(30.0, 60.0, 0.25) - l).abs() < 1e-5);
+    }
+
+    /// A distorted mark sequence whose correct glyph is pruned at width 4
+    /// must be recovered at width 12. '5' = `.....`; the marks below are a
+    /// real found-by-search instance (element durations perturbed as a
+    /// Watterson-style fade might) where the 3rd mark stretches into
+    /// dah-ish territory (114.1 ms, above the 86.6 ms dit/dah boundary at
+    /// mu_dit=50/mu_dah=150), pushing the true `.....` hypothesis out of
+    /// the top 4 survivors by the time the beam reaches it -- width 4
+    /// commits to '2' (`..---`) instead, which width 12 avoids.
+    #[test]
+    fn wider_beam_recovers_a_glyph_pruned_at_width_4() {
+        let marks = [46.55, 83.05, 114.1, 86.25, 63.75];
+        let narrow_cfg = BeamConfig {
+            width: 4,
+            width_low_q: 4,
+            ..CFG
+        };
+        let wide_cfg = BeamConfig {
+            width: 12,
+            width_low_q: 12,
+            ..CFG
+        };
+        let narrow = decode_char(&marks, 50.0, 150.0, 0.4, &narrow_cfg).unwrap();
+        let wide = decode_char(&marks, 50.0, 150.0, 0.4, &wide_cfg).unwrap();
+        assert_ne!(narrow.glyph, wide.glyph);
+        assert_eq!(wide.glyph, Glyph::Char('5'));
+    }
+
+    /// Width selection must be deterministic and depend only on `q`.
+    #[test]
+    fn low_q_selects_the_wide_beam_and_high_q_does_not() {
+        let cfg = BeamConfig {
+            width: 4,
+            width_low_q: 12,
+            q_low: 0.6,
+            sigma: 0.25,
+        };
+        assert_eq!(cfg.effective_width(0.95), 4);
+        assert_eq!(cfg.effective_width(0.40), 12);
+        assert_eq!(cfg.effective_width(0.60), 4); // boundary is exclusive-below
+    }
+
+    /// Defaults reproduce today exactly: `width_low_q` starts equal to
+    /// `width`, so `effective_width` is constant regardless of `q`.
+    #[test]
+    fn beam_width_low_q_defaults_to_the_base_width() {
+        let d = BeamConfig::default();
+        assert_eq!(d.width_low_q, d.width);
     }
 
     #[test]
