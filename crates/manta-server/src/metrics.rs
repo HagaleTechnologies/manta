@@ -471,7 +471,7 @@ impl Metrics {
             .read()
             .expect("uplink_targets lock poisoned")
             .iter()
-            .map(|t| f(t))
+            .map(f)
             .sum()
     }
 
@@ -895,7 +895,7 @@ mod tests {
             2
         );
         // Cumulative never decays; the window does.
-        let later = t0 + RECONNECT_WINDOW + Duration::from_secs(1);
+        let later = t0 + Duration::from_secs(10) + RECONNECT_WINDOW + Duration::from_secs(1);
         assert_eq!(t.snapshot_at(later).recent_reconnects, 0);
         assert_eq!(t.snapshot_at(later).reconnects, 2);
     }

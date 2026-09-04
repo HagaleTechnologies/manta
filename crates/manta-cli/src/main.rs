@@ -725,6 +725,7 @@ struct SpotServer {
     /// bind is still reachable by `manta status`/tests without guessing or
     /// binding a fixed port (CLAUDE.md multi-agent hygiene: don't bind
     /// fixed ports).
+    #[cfg_attr(not(test), allow(dead_code))]
     metrics_addr: std::net::SocketAddr,
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
