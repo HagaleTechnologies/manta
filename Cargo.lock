@@ -343,7 +343,6 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 [[package]]
 name = "coppa-audio"
 version = "0.1.0"
-source = "git+https://github.com/HagaleTechnologies/coppa.git?rev=f8a4d16df7e5776a0756943c05712038774e6c70#f8a4d16df7e5776a0756943c05712038774e6c70"
 dependencies = [
  "anyhow",
  "coppa-dsp",
@@ -355,7 +354,6 @@ dependencies = [
 [[package]]
 name = "coppa-channel"
 version = "0.1.0"
-source = "git+https://github.com/HagaleTechnologies/coppa.git?rev=f8a4d16df7e5776a0756943c05712038774e6c70#f8a4d16df7e5776a0756943c05712038774e6c70"
 dependencies = [
  "coppa-dsp",
  "num-complex",
@@ -365,7 +363,6 @@ dependencies = [
 [[package]]
 name = "coppa-dsp"
 version = "0.1.0"
-source = "git+https://github.com/HagaleTechnologies/coppa.git?rev=f8a4d16df7e5776a0756943c05712038774e6c70#f8a4d16df7e5776a0756943c05712038774e6c70"
 dependencies = [
  "num-complex",
  "rustfft",

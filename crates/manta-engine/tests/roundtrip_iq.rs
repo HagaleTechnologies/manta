@@ -104,6 +104,14 @@ proptest! {
     // isn't a real fix, just whack-a-mole -- re-ignoring instead of forcing
     // a pass, per this plan's escalation guidance. Un-ignore once #12/#22/#23
     // (or their eventual root cause, possibly shared) are resolved.
+    //
+    // MAN-3 update: the short (2-char), high-WPM total-decode-failure family
+    // this doc comment used to lump under #12 (zero `CharDecoded` events,
+    // e.g. "VE"/"DA"/"Z5"/"D5") is root-caused and fixed -- see
+    // docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md. #12 as
+    // literally described above (offset_hz == 0, dead DC channel) is
+    // untouched by that fix and remains open, as do #22 and #23; this
+    // proptest stays `#[ignore]`d until all three clear.
     #[test]
     #[ignore]
     fn iq_roundtrip_with_noise(

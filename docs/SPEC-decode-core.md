@@ -164,8 +164,8 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | Transition | Condition |
 |---|---|
 | IDLE → CANDIDATE | rise condition first met on channel `k`, and `k` is not owned by an existing track (§2.5) |
-| CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool |
-| CANDIDATE → IDLE | rise condition lost before 19 hops |
+| CANDIDATE → ACTIVE | `confirm_hops` (19) rise hops accumulated within `confirm_window_hops` (75, i.e. 200 ms) of CANDIDATE birth → lease decoder from pool. **[DEVIATION — widened from literal "19 *consecutive*" per MAN-3]**, see below. |
+| CANDIDATE → IDLE | `confirm_window_hops` elapses with fewer than `confirm_hops` rise hops accumulated |
 | ACTIVE → HANG | drop condition met (below off threshold) |
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
@@ -173,6 +173,23 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
 
 All timers are hop-counted (integers), never wall-clock.
+
+**CANDIDATE confirmation deviation (MAN-3).** The literal "19 *consecutive*
+rise hops" rule made CANDIDATE confirmation depend on lucky phase alignment
+at high WPM: 19 consecutive hops is 50.7 ms of sustained smoothed key-down,
+but at 34–40 WPM a dit is only 30–35 ms, and the Gate's τ = 40 ms EMA (§2.3)
+decays back below the on-threshold across the following inter-element gap —
+so only a *dah* could ever hold the rise condition for 19 straight hops, and
+only if the CANDIDATE happened to be born exactly on its leading edge.
+Everything else (most CANDIDATEs, empirically) died `Unconfirmed` before
+ever reaching a decoder. The implemented rule instead accumulates
+`confirm_hops` rise hops **cumulatively** within a bounded
+`confirm_window_hops` (200 ms) window from CANDIDATE birth — a strict
+relaxation: any signal slow enough that 19 rise hops already arrive
+consecutively promotes on the identical hop as the literal rule (V1–V10's
+promotion hops are unchanged). See
+`docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md` for the
+window-size derivation and the measured false-track/CPU-budget impact.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
@@ -554,8 +571,9 @@ All normative constants above, with defaults:
 ```toml
 [detector]
 on_snr_db = 6.0        off_snr_db = 3.0
-confirm_ms = 50        hang_ms = 5000
-gc_ms = 30000          warmup_ms = 2000
+confirm_ms = 50        confirm_window_ms = 200  # MAN-3, §2.4
+hang_ms = 5000         gc_ms = 30000
+warmup_ms = 2000
 floor_quantile = 0.25  floor_window_ms = 10000
 block_channels = 32    block_allowance_db = 3.0
 

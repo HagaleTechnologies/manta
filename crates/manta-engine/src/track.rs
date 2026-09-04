@@ -14,6 +14,19 @@ pub struct DetectorConfig {
     pub off_snr_db: f32,
     /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
     pub confirm_hops: u64,
+    /// MAN-3: hop window, counted from CANDIDATE birth, inside which
+    /// `confirm_hops` rise hops must accumulate for promotion.
+    /// **Deviation from SPEC §2.4's literal wording** ("rise sustained 19
+    /// hops" / "rise condition lost before 19 hops", i.e. *consecutive*) --
+    /// see docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md.
+    /// 19 consecutive hops is 50.7 ms of sustained smoothed key-down; at
+    /// 34-40 WPM a dit is only 30-35 ms and the Gate's tau=40 ms EMA decays
+    /// below the on-threshold across the inter-element gap, so only a dah
+    /// could ever confirm a track -- and only when the candidate happened to
+    /// be born on its leading edge. Values below `confirm_hops` are clamped
+    /// up to it (`Lifecycle::new`); a window shorter than the required count
+    /// would make promotion impossible.
+    pub confirm_window_hops: u64,
     /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED.
     pub hang_hops: u64,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
@@ -58,6 +71,7 @@ impl Default for DetectorConfig {
             on_snr_db: 12.0,
             off_snr_db: 3.0,
             confirm_hops: 19,
+            confirm_window_hops: 75, // 200 ms at the 375 Hz hop rate
             hang_hops: 1875,
             gc_hops: 11250,
             warmup_hops: 750,
@@ -138,9 +152,12 @@ pub(crate) enum LifecycleEvent {
 pub(crate) struct Lifecycle {
     state: LifecycleState,
     confirm_count: u64,
+    /// Hops since birth, used only by CANDIDATE (MAN-3's confirm window).
+    candidate_age: u64,
     hang_count: u64,
     silent_count: u64,
     confirm_hops: u64,
+    confirm_window_hops: u64,
     hang_hops: u64,
     gc_hops: u64,
 }
@@ -151,9 +168,13 @@ impl Lifecycle {
         Lifecycle {
             state: LifecycleState::Candidate,
             confirm_count: 1, // this hop's rise already counts as the first
+            candidate_age: 1, // the birth hop, matching confirm_count above
             hang_count: 0,
             silent_count: 0,
             confirm_hops: cfg.confirm_hops,
+            // A window shorter than confirm_hops would make promotion
+            // impossible -- clamped, not honoured (MAN-3).
+            confirm_window_hops: cfg.confirm_window_hops.max(cfg.confirm_hops),
             hang_hops: cfg.hang_hops,
             gc_hops: cfg.gc_hops,
         }
@@ -191,13 +212,20 @@ impl Lifecycle {
     pub(crate) fn on_hop(&mut self, rise: bool, drop: bool, char_emitted: bool) -> LifecycleEvent {
         match self.state {
             LifecycleState::Candidate => {
+                self.candidate_age += 1;
                 if rise {
                     self.confirm_count += 1;
                     if self.confirm_count >= self.confirm_hops {
                         self.state = LifecycleState::Active;
                         return LifecycleEvent::Promoted;
                     }
-                } else {
+                }
+                // MAN-3: a non-rise hop no longer kills the candidate --
+                // only running out of window does. A dit at 39 WPM cannot
+                // hold the tau=40 ms smoothed gate up for 19 consecutive
+                // hops, so the old zero-tolerance rule made short, fast
+                // texts undetectable except by lucky dah alignment.
+                if self.candidate_age >= self.confirm_window_hops {
                     return LifecycleEvent::Closed(CloseReason::Unconfirmed);
                 }
                 LifecycleEvent::None
@@ -413,6 +441,8 @@ pub struct TrackManager {
     channel_spacing_hz: f64,
     /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
     close_counts: CloseCounts,
+    /// MAN-3: total CANDIDATE -> ACTIVE promotions, read via `promoted_count`.
+    promoted_count: u64,
 }
 
 impl TrackManager {
@@ -438,6 +468,7 @@ impl TrackManager {
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
+            promoted_count: 0,
         }
     }
 
@@ -453,6 +484,15 @@ impl TrackManager {
     /// (MAN-19) ahead of the real M3 Prometheus endpoint.
     pub fn close_counts(&self) -> CloseCounts {
         self.close_counts
+    }
+
+    /// Total CANDIDATE -> ACTIVE promotions over this manager's lifetime
+    /// (MAN-3). Complements `close_counts` (issue #26): a track that
+    /// promotes and dies before emitting anything is invisible in both the
+    /// event stream (`has_emitted` gating) and in `active_track_count`, so
+    /// promotions are the only measurable handle on false-track pressure.
+    pub fn promoted_count(&self) -> u64 {
+        self.promoted_count
     }
 
     /// Count of tracks currently open (`self.tracks`, SPEC §2.5). Alongside
@@ -531,6 +571,7 @@ impl TrackManager {
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
+                    self.promoted_count += 1;
                 }
                 LifecycleEvent::None => {
                     // Feed the decoder every hop once it exists (ACTIVE *or*
@@ -646,7 +687,27 @@ impl TrackManager {
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
                 if (ca - cb).abs() < 1.0 {
-                    let loser = if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db
+                    // MAN-3: strict `<`, not `<=`. `a` is always the older
+                    // (lower-id, earlier-promoted) track here (`ids` is a
+                    // BTreeMap-ordered ascending scan). Two tracks whose
+                    // owned windows overlap (e.g. centers 149.x and 150.x,
+                    // windows {148,149,150} and {149,150,151}) routinely
+                    // `select_channel` onto the SAME physical peak channel
+                    // and so read *bit-identical* `current_snr_db` -- a
+                    // boundary-straddling signal (any true center whose
+                    // fractional channel offset isn't near 0/1) produces
+                    // this on nearly every convergence. The old `<=` broke
+                    // that tie in favor of `b` (the newer track) every
+                    // single time, so the established track was evicted by
+                    // its own newly-spawned neighbor over and over --
+                    // confirmed live for MAN-3's "DA"/"Z5" cases: dozens of
+                    // promotions across a 12 s scene, every one merged away
+                    // within a few hundred hops, none ever surviving the
+                    // ~375-hop `Demod` init window. `<` keeps the
+                    // incumbent on an exact tie (no evidence it's actually
+                    // weaker); only a track reading a STRICTLY lower SNR
+                    // now loses.
+                    let loser = if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db
                     {
                         a
                     } else {
@@ -908,13 +969,16 @@ mod tests {
     }
 
     #[test]
-    fn candidate_closes_unconfirmed_on_any_non_rise_hop() {
+    fn candidate_survives_a_single_non_rise_hop_within_the_window() {
+        // MAN-3: the old zero-tolerance rule closed a CANDIDATE on the
+        // first non-rise hop; this test used to assert exactly that. Now a
+        // non-rise hop is tolerated as long as the confirm window (default
+        // 200 ms, clamped up from `confirm_hops` here) hasn't expired --
+        // see `candidate_closes_unconfirmed_when_the_window_expires` for
+        // the window-bound behavior this replaces it with.
         let mut lc = Lifecycle::new(&cfg());
         assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
-        assert_eq!(
-            lc.on_hop(false, true, false),
-            LifecycleEvent::Closed(CloseReason::Unconfirmed)
-        );
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None);
     }
 
     #[test]
@@ -980,6 +1044,146 @@ mod tests {
         for _ in 0..19 {
             assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
         }
+    }
+
+    /// MAN-3: at 34-39 WPM the Gate's tau=40 ms EMA decays below the
+    /// on-threshold across each inter-element gap, so no dit can ever hold
+    /// 19 *consecutive* rise hops -- only a dah can, and only if the
+    /// candidate was born on its leading edge. This pattern (11 rise, 6
+    /// non-rise, 12 rise: two dits at ~37 WPM) must confirm; before this
+    /// fix it closed `Unconfirmed` on hop 13.
+    #[test]
+    fn candidate_confirms_on_cumulative_rise_across_a_gap() {
+        let cfg = DetectorConfig::default();
+        let mut lc = Lifecycle::new(&cfg); // birth hop counts as rise #1
+        let pattern = [(true, 11), (false, 6), (true, 12)];
+        let mut promoted = false;
+        for (rise, n) in pattern {
+            for _ in 0..n {
+                match lc.on_hop(rise, false, false) {
+                    LifecycleEvent::Promoted => {
+                        promoted = true;
+                        break;
+                    }
+                    LifecycleEvent::Closed(r) => panic!("closed {r:?} -- must survive the gap"),
+                    LifecycleEvent::None => {}
+                }
+            }
+            if promoted {
+                break;
+            }
+        }
+        assert!(promoted, "19 cumulative rise hops inside the window must promote");
+    }
+
+    /// The window is a real bound, not an unbounded accumulator: sparse
+    /// noise rises must still close the candidate.
+    #[test]
+    fn candidate_closes_unconfirmed_when_the_window_expires() {
+        let cfg = DetectorConfig::default();
+        let mut lc = Lifecycle::new(&cfg);
+        // One rise every 5th hop: 15 rises over the whole 75-hop window < 19.
+        for hop in 1..cfg.confirm_window_hops {
+            let rise = hop % 5 == 0;
+            if let LifecycleEvent::Closed(reason) = lc.on_hop(rise, false, false) {
+                assert_eq!(reason, CloseReason::Unconfirmed);
+                assert_eq!(hop, cfg.confirm_window_hops - 1, "must close exactly at window expiry");
+                return;
+            }
+        }
+        panic!("candidate never closed -- confirm_window_hops is not bounding it");
+    }
+
+    /// Slow signals are bit-unchanged: 19 consecutive rise hops still
+    /// promote on exactly the 19th hop, so V1-V10's promotion hops do not
+    /// move.
+    #[test]
+    fn consecutive_rise_still_promotes_on_the_nineteenth_hop() {
+        let cfg = DetectorConfig::default();
+        let mut lc = Lifecycle::new(&cfg);
+        for hop in 2..cfg.confirm_hops {
+            assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None, "hop {hop}");
+        }
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted);
+    }
+
+    /// A misconfigured window shorter than `confirm_hops` would make
+    /// promotion impossible -- it is clamped, not honoured.
+    #[test]
+    fn confirm_window_shorter_than_confirm_hops_is_clamped() {
+        let cfg = DetectorConfig {
+            confirm_window_hops: 5,
+            ..DetectorConfig::default()
+        };
+        let mut lc = Lifecycle::new(&cfg);
+        let mut promoted = false;
+        for _ in 0..cfg.confirm_hops {
+            if lc.on_hop(true, false, false) == LifecycleEvent::Promoted {
+                promoted = true;
+            }
+        }
+        assert!(promoted, "window must clamp up to confirm_hops, never below it");
+    }
+
+    /// MAN-3 measurement gate: a looser CANDIDATE confirmation rule must
+    /// not buy short-signal detection with false tracks. `on_snr_db = 12.0`
+    /// is the lever that drives noise-only promotions to zero (see `impl
+    /// Default for DetectorConfig`); this test proves the window change
+    /// did not undo that.
+    #[test]
+    fn noise_only_scene_promotes_no_tracks() {
+        use manta_dsp::channelizer::Channelizer;
+        let fs = 96_000.0;
+        for seed in [1u64, 2, 3] {
+            let (iq, _) = manta_testkit::scene::render_scene(&[], fs, 60.0, Some(seed)).unwrap();
+            let mut ch = Channelizer::new(fs, 0.0).unwrap();
+            let hop_samples = ch.hop() as u64;
+            let mut tm = TrackManager::new(
+                ch.n_channels(),
+                fs,
+                0.0,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            );
+            for chunk in iq.chunks(4096) {
+                let hops = ch.process(chunk);
+                tm.process_hops(&hops, |m| m * hop_samples);
+            }
+            tm.finish();
+            assert_eq!(
+                tm.promoted_count(),
+                0,
+                "seed {seed}: pure AWGN must promote zero tracks (58 s past the 2 s \
+                 warmup, 1024 channels)"
+            );
+        }
+    }
+
+    /// V1 (one clean +20 dB signal, 1024 channels, 120 s) must still
+    /// promote exactly one track -- the same invariant
+    /// `active_track_decodes_real_text` asserts on the event stream, but
+    /// measured at promotion time so a track that promotes and dies before
+    /// emitting anything cannot hide.
+    #[test]
+    fn v1_promotes_exactly_one_track() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            tm.process_hops(&hops, |m| m * hop_samples);
+        }
+        tm.finish();
+        assert_eq!(tm.promoted_count(), 1, "V1 is single-signal");
     }
 
     use manta_decode::decoder::DecodeConfig;

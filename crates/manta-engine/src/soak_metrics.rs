@@ -41,6 +41,12 @@ pub struct SoakMetricsSample {
     pub spots_emitted: usize,
     pub active_tracks: usize,
     pub close_counts: CloseCounts,
+    /// MAN-3: total CANDIDATE -> ACTIVE promotions so far -- the only
+    /// measurable handle on false-track pressure from a looser CANDIDATE
+    /// confirmation rule (a track that promotes and dies before emitting
+    /// anything is invisible to both `active_tracks` and `close_counts`'s
+    /// `unconfirmed` bucket, which only counts CANDIDATE closes).
+    pub promoted_count: u64,
 }
 
 #[derive(Debug)]
@@ -70,6 +76,10 @@ pub struct SoakMetricsReport {
     /// close -- satisfying `track_closed_events > 0` while
     /// `RepetitionGate::record` was never called (round 3 review).
     pub gate_records_total: u64,
+    /// MAN-3: `TrackManager::promoted_count()` at the end of the run -- see
+    /// `SoakMetricsSample::promoted_count`'s doc for why this exists
+    /// alongside `final_close_counts`.
+    pub promoted_count: u64,
 }
 
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
@@ -151,6 +161,7 @@ pub fn soak_with_metrics(
     let mut peak_active_tracks = 0usize;
     let mut final_close_counts = CloseCounts::default();
     let mut gate_records_total = 0u64;
+    let mut final_promoted_count = 0u64;
     let mut last_sample = Instant::now();
 
     let watchdog = std::thread::spawn(move || {
@@ -270,6 +281,7 @@ pub fn soak_with_metrics(
                     spots_emitted: spot_count,
                     active_tracks: active,
                     close_counts: final_close_counts,
+                    promoted_count: tm.promoted_count(),
                 });
             }
         }
@@ -289,6 +301,7 @@ pub fn soak_with_metrics(
         }
         final_close_counts = tm.close_counts();
         gate_records_total = validator.gate_records_total();
+        final_promoted_count = tm.promoted_count();
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
         // growth after the last tick (or the whole run, if
@@ -328,6 +341,7 @@ pub fn soak_with_metrics(
         final_close_counts,
         track_closed_events: track_closed_count,
         gate_records_total,
+        promoted_count: final_promoted_count,
     })
 }
 
