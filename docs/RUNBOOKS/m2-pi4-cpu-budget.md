@@ -175,9 +175,47 @@ the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
 ```
-# Debian/Ubuntu build host — add the arm64 architecture, then both the
-# linker toolchain and arm64 ALSA dev headers:
+# Debian build host -- Debian's mirrors serve every release architecture,
+# including arm64, from the same tree, so this is all it needs:
 sudo dpkg --add-architecture arm64
+sudo apt update
+sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+
+# Ubuntu build host -- do THIS FIRST instead. Unlike Debian, Ubuntu's
+# default mirrors (archive.ubuntu.com / security.ubuntu.com) carry only
+# amd64/i386; arm64 lives on a separate mirror, ports.ubuntu.com. Without
+# this block, `sudo apt update` FAILS (exit 100, "E: Failed to fetch
+# .../binary-arm64/Packages 404 Not Found") as soon as arm64 is added, and
+# never reaches the install/build steps below. Two things are needed: point
+# apt at ports for arm64, AND restrict the existing default sources to
+# amd64 so they stop being asked for an arm64 index they will never have.
+sudo dpkg --add-architecture arm64
+codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+  # 24.04 (noble) and later: deb822 stanza format.
+  grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources ||
+    sudo sed -i.bak '/^URIs:/a Architectures: amd64' \
+      /etc/apt/sources.list.d/ubuntu.sources
+  sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: ${codename} ${codename}-updates ${codename}-security
+Components: main
+Architectures: arm64
+Signed-By: ${keyring}
+EOF
+else
+  # 22.04 (jammy) and earlier, and in-place upgrades that kept this format:
+  # classic one-line format.
+  sudo sed -i.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch=amd64] \2|' \
+    /etc/apt/sources.list
+  sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
+deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
+deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main
+deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main
+EOF
+fi
 sudo apt update
 sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 
@@ -204,6 +242,32 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 #   [target.aarch64-unknown-linux-gnu]
 #   linker = "aarch64-linux-gnu-gcc"
 ```
+
+Notes on the Ubuntu block above (verified 2026-09-04 against the live Ubuntu
+mirrors from an x86_64 host, apt 3.0.3, using isolated apt roots rather than a
+mutated host):
+
+- Only `main` is listed for ports: `libasound2-dev` arm64 is in `main` on
+  focal/jammy/noble and is *absent* from `universe` on all three, so the
+  other components add index-fetch time and nothing else. Add them if some
+  other arm64 `-dev` package you need turns out to live outside `main`.
+- The branch keys on whether `/etc/apt/sources.list.d/ubuntu.sources` exists,
+  not on the release number, so a 22.04-to-24.04 in-place upgrade that kept
+  the classic format is still handled correctly.
+- Both `sed`s are safe to run twice: the deb822 one is guarded by the `grep`,
+  and the classic one only matches a `deb ` line whose next token is a URI
+  scheme, so it skips `# deb-src` comments and lines that already carry
+  `[arch=...]`. Both write a `.bak` beside the file they edit.
+- `gcc-aarch64-linux-gnu` is an amd64 package from the host's own archive
+  (`main`), so it installs fine even when the arm64 half is broken -- which
+  is exactly how this failure hides itself if the `apt install` output is
+  only skimmed.
+- Unverified as of 2026-09-04: a full `apt install` + `cargo test --target
+  aarch64-unknown-linux-gnu` run on a stock Ubuntu desktop/server host. What
+  *was* verified is that apt resolves `libasound2-dev:arm64` to a real
+  ports candidate in both sources formats and that `apt update` exits 0
+  afterwards; the link step itself carries the same "verify before relying
+  on it" status as Option A above.
 
 Either way, `--no-run` only *builds* the test binary — it does not embed
 `--ignored --nocapture` into it (those are libtest flags interpreted at
