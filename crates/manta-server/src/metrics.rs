@@ -78,6 +78,32 @@ fn classify_uplink_health(enabled: bool, connected: bool, recent_reconnects: u32
     }
 }
 
+/// Pure function over an already-taken snapshot, so a caller that also
+/// needs per-target rows (`status::StatusDoc::from_metrics`) can derive
+/// both from the SAME snapshot at the SAME `now` instead of walking the
+/// registry twice at two different instants (MAN-44 code review CR-3) --
+/// which is also what previously let `connected_targets` (raw
+/// `connected` bool) disagree with this verdict (`health ==
+/// UplinkHealth::Connected`) for a target that is flapping but
+/// momentarily connected (CR-1).
+pub(crate) fn overall_uplink_health_of(snapshot: &[UplinkTargetSnapshot]) -> OverallUplinkHealth {
+    let enabled: Vec<&UplinkTargetSnapshot> = snapshot.iter().filter(|t| t.enabled).collect();
+    if enabled.is_empty() {
+        return OverallUplinkHealth::Disabled;
+    }
+    let connected = enabled
+        .iter()
+        .filter(|t| t.health == UplinkHealth::Connected)
+        .count();
+    if connected == enabled.len() {
+        OverallUplinkHealth::Ok
+    } else if connected == 0 {
+        OverallUplinkHealth::Down
+    } else {
+        OverallUplinkHealth::Degraded
+    }
+}
+
 fn prune_reconnects(recent: &mut VecDeque<Instant>, now: Instant) {
     while let Some(front) = recent.front() {
         // saturating: a synthetic `now` earlier than an entry (possible
@@ -448,22 +474,7 @@ impl Metrics {
     /// visible, not paper over. `Disabled` when there are no enabled
     /// targets at all (including zero configured targets).
     pub fn uplink_overall_health(&self) -> OverallUplinkHealth {
-        let snapshot = self.uplink_snapshot();
-        let enabled: Vec<&UplinkTargetSnapshot> = snapshot.iter().filter(|t| t.enabled).collect();
-        if enabled.is_empty() {
-            return OverallUplinkHealth::Disabled;
-        }
-        let connected = enabled
-            .iter()
-            .filter(|t| t.health == UplinkHealth::Connected)
-            .count();
-        if connected == enabled.len() {
-            OverallUplinkHealth::Ok
-        } else if connected == 0 {
-            OverallUplinkHealth::Down
-        } else {
-            OverallUplinkHealth::Degraded
-        }
+        overall_uplink_health_of(&self.uplink_snapshot())
     }
 
     fn sum_uplink_u64<F: Fn(&Arc<UplinkTarget>) -> u64>(&self, f: F) -> u64 {

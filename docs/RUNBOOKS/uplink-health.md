@@ -12,13 +12,17 @@ manta status — daemon up 3h 12m
 
 RBN uplink: DEGRADED — 1 of 2 enabled targets connected
 
-  TARGET                         STATE       SENT  SUPPRESSED  RECONNECTS  RECENT(5m)
-  telnet.reversebeacon.net:7000  connected  18001           0           0           0
-  backup.example.net:7000        flapping       0           0          37          14
+  TARGET                         STATE       SENT    SUPPR   RECONN RECENT(5m)
+  telnet.reversebeacon.net:7000  connected  18001        0        0          0
+  backup.example.net:7000        flapping       0        0       37         14
 
 $ echo $?
 1
 ```
+
+(`SUPPR` and `RECONN` are the suppressed and lifetime-reconnects counts,
+abbreviated so the table stays inside 80 columns even with a long RBN
+hostname.)
 
 Or against an explicit address (e.g. from another host, or when you don't
 have the daemon's config file to hand):
@@ -57,8 +61,9 @@ daemon runs on a different host than the one you're checking from, use
   - `disabled` — `enabled = false` in that target's `[[rbn_uplink]]`
     entry. Still listed, so an operator can see it's intentionally off.
 - **`RECENT(5m)`** is the reconnect count within a rolling 5-minute
-  window (`RECONNECT_WINDOW`), not since daemon start — `RECONNECTS` is
-  the lifetime cumulative count. 3 or more recent reconnects
+  window (`RECONNECT_WINDOW`), not since daemon start — `RECONN` (the
+  table's lifetime-reconnects column) is the cumulative count since the
+  daemon started. 3 or more recent reconnects
   (`FLAPPING_RECONNECTS`) is what flips a target to `flapping`; this is
   sized against the uplink's own backoff cap (`uplink::MAX_BACKOFF` =
   60s), so a target that's simply, persistently down produces roughly 5

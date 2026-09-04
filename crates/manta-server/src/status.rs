@@ -12,10 +12,11 @@
 //! independently-drifting definition of the wire shape.
 
 use crate::metrics::{
-    Metrics, OverallUplinkHealth, UplinkHealth, UplinkTargetSnapshot, FLAPPING_RECONNECTS,
-    RECONNECT_WINDOW,
+    overall_uplink_health_of, Metrics, OverallUplinkHealth, UplinkHealth, UplinkTargetSnapshot,
+    FLAPPING_RECONNECTS, RECONNECT_WINDOW,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusDoc {
@@ -58,9 +59,21 @@ pub struct UplinkStatus {
 
 impl StatusDoc {
     pub fn from_metrics(metrics: &Metrics) -> Self {
-        let targets = metrics.uplink_snapshot();
+        // One `now`, one registry walk: `targets`, `connected_targets` and
+        // `health` all come from the SAME snapshot, so they can no longer
+        // disagree with each other (MAN-44 code review CR-1, CR-3). Before
+        // this, `connected_targets` counted the raw `connected` bool while
+        // `health` counted `health == Connected` from a second, later
+        // snapshot -- for a target that is flapping but momentarily
+        // connected, that produced a self-contradictory "DOWN -- 1 of 1
+        // enabled targets connected".
+        let targets = metrics.uplink_snapshot_at(Instant::now());
         let enabled_targets = targets.iter().filter(|t| t.enabled).count();
-        let connected_targets = targets.iter().filter(|t| t.connected).count();
+        let connected_targets = targets
+            .iter()
+            .filter(|t| t.health == UplinkHealth::Connected)
+            .count();
+        let health = overall_uplink_health_of(&targets);
         StatusDoc {
             schema_version: 1,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -71,7 +84,7 @@ impl StatusDoc {
             ws_clients: metrics.ws_clients(),
             active_tracks: None,
             uplink: UplinkStatus {
-                health: metrics.uplink_overall_health(),
+                health,
                 connected_targets,
                 enabled_targets,
                 sent_total: metrics.uplink_sent_total(),
@@ -108,8 +121,11 @@ fn target_health_label(health: UplinkHealth) -> &'static str {
 }
 
 /// One screen an operator can read without a manual (MAN-44). Fixed-width
-/// columns; the uplink verdict comes first because that is the question
-/// `manta status` exists to answer.
+/// columns, kept inside 80 (the target table renders 78 for the plan's own
+/// worked example -- `telnet.reversebeacon.net:7000`, the longest
+/// realistic RBN hostname, plus a 5-digit sent count); the uplink verdict
+/// comes first because that is the question `manta status` exists to
+/// answer.
 pub fn render_human(doc: &StatusDoc) -> String {
     let mut out = String::new();
     let hours = doc.uptime_seconds / 3600;
@@ -144,12 +160,12 @@ pub fn render_human(doc: &StatusDoc) -> String {
         doc.uplink.enabled_targets
     ));
     out.push_str(&format!(
-        "  {:<30} {:<10} {:>8} {:>11} {:>11} {:>11}\n",
-        "TARGET", "STATE", "SENT", "SUPPRESSED", "RECONNECTS", "RECENT(5m)"
+        "  {:<30} {:<9} {:>6} {:>8} {:>8} {:>10}\n",
+        "TARGET", "STATE", "SENT", "SUPPR", "RECONN", "RECENT(5m)"
     ));
     for t in &doc.uplink.targets {
         out.push_str(&format!(
-            "  {:<30} {:<10} {:>8} {:>11} {:>11} {:>11}\n",
+            "  {:<30} {:<9} {:>6} {:>8} {:>8} {:>10}\n",
             t.label,
             target_health_label(t.health),
             t.sent,
@@ -257,5 +273,74 @@ mod tests {
         assert_eq!(doc.uplink.enabled_targets, 1);
         let out = render_human(&doc);
         assert!(out.contains("RBN uplink: OK"));
+    }
+
+    #[test]
+    fn a_target_that_is_flapping_and_momentarily_connected_does_not_count_as_connected() {
+        // CR-1 regression: `connected_targets` must come from the same
+        // classification as `health` (health == Connected), not the raw
+        // `connected` bool -- otherwise a target that is flapping AND
+        // currently connected made `from_metrics` say both "DOWN" and "1
+        // of 1 enabled targets connected" at once. That is exactly
+        // scenario 2's steady state (plan decision 5): a target
+        // reconnecting every 60s is momentarily connected whenever you
+        // happen to look.
+        let m = Metrics::new();
+        let a = m.register_uplink_target(UplinkTargetSpec {
+            label: "a.example:7000".to_string(),
+            host: "a.example".to_string(),
+            port: 7000,
+            enabled: true,
+            dry_run: false,
+        });
+        a.mark_connected();
+        let t0 = std::time::Instant::now();
+        for _ in 0..FLAPPING_RECONNECTS {
+            a.record_reconnect_at(t0);
+        }
+
+        let doc = StatusDoc::from_metrics(&m);
+        assert_eq!(doc.uplink.targets[0].health, UplinkHealth::Flapping);
+        assert_eq!(doc.uplink.health, OverallUplinkHealth::Down);
+        assert_eq!(
+            doc.uplink.connected_targets, 0,
+            "a flapping target must not count toward connected_targets even though its raw `connected` bit is set"
+        );
+
+        let out = render_human(&doc);
+        assert!(
+            out.contains("RBN uplink: DOWN — 0 of 1 enabled targets connected"),
+            "summary must not name a connected count that contradicts the DOWN verdict: {out}"
+        );
+    }
+
+    #[test]
+    fn rendered_target_table_fits_in_eighty_columns_for_the_longest_documented_hostname() {
+        // D3: the plan's manual verification step is "confirm the summary
+        // fits in 80 columns with a long RBN hostname" -- exercised here
+        // with the real hostname the runbook and ADR both use as that
+        // "long" example, plus a 5-digit sent count matching the
+        // runbook's own sample.
+        let m = Metrics::new();
+        let a = m.register_uplink_target(UplinkTargetSpec {
+            label: "telnet.reversebeacon.net:7000".to_string(),
+            host: "telnet.reversebeacon.net".to_string(),
+            port: 7000,
+            enabled: true,
+            dry_run: false,
+        });
+        a.mark_connected();
+        for _ in 0..18001 {
+            a.record_sent();
+        }
+        let doc = StatusDoc::from_metrics(&m);
+        let out = render_human(&doc);
+        for line in out.lines() {
+            let width = line.chars().count();
+            assert!(
+                width <= 80,
+                "line exceeds 80 columns ({width} chars): {line:?}"
+            );
+        }
     }
 }

@@ -165,8 +165,17 @@ pub async fn serve(
                 // marked connected at all, if it failed before login
                 // completed).
                 target.record_reconnect();
-                let sleep_for = backoff;
+                // Compute the new backoff BEFORE sleeping (MAN-44 code
+                // review CR-2): the old order slept the STALE `backoff`
+                // value first and only reset it afterward, so a healthy
+                // connection that dropped after login (`Disconnected`,
+                // whose whole point is "retry quickly") still slept
+                // whatever backoff an earlier, unrelated outage had grown
+                // to -- up to `MAX_BACKOFF` (60s) -- before its first
+                // retry got the fast 1s `INITIAL_BACKOFF` this outcome is
+                // supposed to produce immediately.
                 backoff = next_backoff(backoff, &outcome);
+                let sleep_for = backoff;
                 tokio::select! {
                     _ = tokio::time::sleep(sleep_for) => {}
                     _ = shutdown.changed() => {
