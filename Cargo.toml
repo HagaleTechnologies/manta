@@ -65,13 +65,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
-
-# TEMPORARY (MAN-3, network-restricted build environment): libgit2's fetch of
-# the pinned coppa rev fails with a network Eof in this container even though
-# a manual `git fetch` of the same rev succeeds. Points at a manual clone of
-# the exact pinned commit instead. MUST be reverted before this work is
-# committed -- see CLAUDE.md / the MAN-3 plan's "Build prerequisite" section.
-[patch."https://github.com/HagaleTechnologies/coppa.git"]
-coppa-dsp = { path = "/tmp/coppa-manual/crates/coppa-dsp" }
-coppa-audio = { path = "/tmp/coppa-manual/crates/coppa-audio" }
-coppa-channel = { path = "/tmp/coppa-manual/crates/coppa-channel" }

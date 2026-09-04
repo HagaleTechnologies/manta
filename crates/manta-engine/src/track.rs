@@ -12,7 +12,8 @@ pub struct DetectorConfig {
     pub on_snr_db: f32,
     /// SPEC §9: off (drop) threshold in dB SNR.
     pub off_snr_db: f32,
-    /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
+    /// SPEC §2.3/§2.4: rise hops that must cumulatively accumulate within
+    /// `confirm_window_hops` before CANDIDATE -> ACTIVE.
     pub confirm_hops: u64,
     /// MAN-3: hop window, counted from CANDIDATE birth, inside which
     /// `confirm_hops` rise hops must accumulate for promotion.
@@ -94,7 +95,7 @@ pub(crate) enum LifecycleState {
 /// SPEC §2.4/§2.5: reason for track closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReason {
-    /// Rise never confirmed within `confirm_hops` (SPEC §2.4: CANDIDATE -> IDLE).
+    /// Rise never confirmed within `confirm_window_hops` (SPEC §2.4: CANDIDATE -> IDLE).
     Unconfirmed,
     /// Hang timer expired (SPEC §2.4: HANG -> CLOSED).
     HangExpired,
@@ -613,9 +614,10 @@ impl TrackManager {
         // without ever being promoted never appeared in the event stream
         // either; surfacing a `TrackClosed` for either case would
         // introduce a track_id into the stream that callers like
-        // `decode_samples` (which picks the *lowest* track_id present as
-        // its single-track report) never used to see, silently changing
-        // which track gets reported.
+        // `decode_samples` (which picks the track_id with the most
+        // `CharDecoded` events via `select_report_track`, ties broken to
+        // the lowest id) never used to see, silently changing which track
+        // gets reported.
         closed.retain(|id| {
             self.tracks
                 .remove(id)
@@ -707,8 +709,7 @@ impl TrackManager {
                     // incumbent on an exact tie (no evidence it's actually
                     // weaker); only a track reading a STRICTLY lower SNR
                     // now loses.
-                    let loser = if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db
-                    {
+                    let loser = if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db {
                         a
                     } else {
                         b
@@ -1073,7 +1074,10 @@ mod tests {
                 break;
             }
         }
-        assert!(promoted, "19 cumulative rise hops inside the window must promote");
+        assert!(
+            promoted,
+            "19 cumulative rise hops inside the window must promote"
+        );
     }
 
     /// The window is a real bound, not an unbounded accumulator: sparse
@@ -1087,7 +1091,11 @@ mod tests {
             let rise = hop % 5 == 0;
             if let LifecycleEvent::Closed(reason) = lc.on_hop(rise, false, false) {
                 assert_eq!(reason, CloseReason::Unconfirmed);
-                assert_eq!(hop, cfg.confirm_window_hops - 1, "must close exactly at window expiry");
+                assert_eq!(
+                    hop,
+                    cfg.confirm_window_hops - 1,
+                    "must close exactly at window expiry"
+                );
                 return;
             }
         }
@@ -1102,7 +1110,11 @@ mod tests {
         let cfg = DetectorConfig::default();
         let mut lc = Lifecycle::new(&cfg);
         for hop in 2..cfg.confirm_hops {
-            assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None, "hop {hop}");
+            assert_eq!(
+                lc.on_hop(true, false, false),
+                LifecycleEvent::None,
+                "hop {hop}"
+            );
         }
         assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted);
     }
@@ -1122,7 +1134,10 @@ mod tests {
                 promoted = true;
             }
         }
-        assert!(promoted, "window must clamp up to confirm_hops, never below it");
+        assert!(
+            promoted,
+            "window must clamp up to confirm_hops, never below it"
+        );
     }
 
     /// MAN-3 measurement gate: a looser CANDIDATE confirmation rule must

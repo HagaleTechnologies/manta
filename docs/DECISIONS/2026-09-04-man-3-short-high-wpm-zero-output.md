@@ -214,12 +214,63 @@ noise-only and V1 tests are permanent regression gates
 (`track::tests::noise_only_scene_promotes_no_tracks`,
 `track::tests::v1_promotes_exactly_one_track`), not one-off measurements.
 
-**CPU budget:** `cpu_budget_mac_under_half_core` is `#[ignore]`d in this
-environment (no reachable macOS/Pi4 hardware -- ROADMAP.md's M2 acceptance
-already tracks the Pi4 leg as unmet for reasons unrelated to this ticket).
-Not re-measured here; a CANDIDATE can now live up to 200 ms instead of
-dying on its first non-rise hop, which raises peak concurrent `Lifecycle`
-count -- flagged for whoever next runs the Pi4 bench.
+**Duration sweep (the honest measure of whether the fix is general or
+duration-lucky):** the regression test pins `duration_s = 12.0`; the plan
+called for sweeping all four cases at 250 ms resolution to check the fix
+isn't tuned to that one point. Run via a throwaway `cargo run --release
+--example` harness (same four tuples/seeds, `render_scene` +
+`decode_samples`, durations `2.0..=19.5 s` in 0.25 s steps; deleted before
+commit, not shipped code) with the full set of changes (parts 1-3) in
+place:
+
+| case | first duration with verbatim decode | durations that still fail (of 71 swept, 2.0-19.5 s) |
+|---|---|---|
+| DA | 3.25 s | 2.0, 2.25, 2.5, 2.75, 3.0 s |
+| VE | 3.25 s | 2.0, 2.25, 2.5, 2.75, 3.0 s |
+| Z5 | 3.75 s | 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5 s |
+| D5 | 3.50 s | 2.0, 2.25, 2.5, 2.75, 3.0, 3.25 s |
+
+All four cases decode their keyed text verbatim at every duration >= 4.0 s,
+including "Z5" (which the regression test itself does not hold to the
+verbatim bar -- see "What this does not fix" below; the sweep shows it
+*can* decode verbatim, just not asserted as a permanent guarantee). The
+short failures below ~3.5-3.75 s are structural, not a fix regression: they
+sit below the ~2 s AGC/noise-floor warmup plus the confirm-window and
+`Demod` init-continuity floor every case needs regardless of WPM, the same
+floor the regression test's own 12.0 s pin and `roundtrip_iq.rs`'s
+`max(keyed_len/fs + 1.5, 12.0)` formula both clear by a wide margin. The
+fix is general across duration, not tuned to the regression test's 12.0 s
+point.
+
+**CPU budget:** `cpu_budget_mac_under_half_core` (`tests/cpu_budget.rs`) is
+`#[ignore]`d in this environment (no reachable macOS/Pi4 hardware --
+ROADMAP.md's M2 acceptance already tracks the Pi4 leg as unmet for reasons
+unrelated to this ticket) and was not run. The separate criterion bench the
+plan actually asked for, `cargo bench -p manta-engine --bench cpu_budget`
+(`benches/cpu_budget.rs`, 300 concurrent tracks at 192 kS/s), **is**
+runnable on Linux and was run with the full set of changes (parts 1-3) in
+place:
+
+```
+cpu_budget/192khz_300tracks
+                        time:   [16.519 s 16.777 s 17.073 s]
+                        (10 samples, 15.0 s of 192 kS/s audio decoded per iteration)
+```
+
+That is this container's core, not Mac-series or Pi4 hardware, so it is not
+a pass/fail measurement against ROADMAP.md's M2 acceptance criterion (<50%
+of one M-series core, <1 Pi4 core) -- only a relative data point. It is
+close to 1x real-time here (16.8 s to decode 15.0 s of audio on one shared
+container core), with no crash, panic, or runaway allocation across 10
+samples despite the 300 concurrent tracks all confirming under the new
+windowed rule. A CANDIDATE can now live up to 200 ms instead of dying on
+its first non-rise hop, which raises peak concurrent `Lifecycle` count;
+this result is at least evidence that the relaxation does not blow up cost
+catastrophically at the pileup scale, though it is not a substitute for the
+actual Mac/Pi4 measurement. The Pi4-specific pass/fail threshold in
+`cpu_budget_mac_under_half_core` remains unmeasured (no Pi4 hardware here)
+and is unrelated to this ticket's change -- flagged for whoever next runs
+it, consistent with ROADMAP.md's existing open M2 Pi4 acceptance leg.
 
 **Chunking/determinism:** `chunking_determinism` and
 `channelizer_chunking_determinism` both pass unchanged -- the confirm

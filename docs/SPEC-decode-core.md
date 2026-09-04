@@ -207,7 +207,12 @@ window-size derivation and the measured false-track/CPU-budget impact.
 - Two tracks whose centers converge within 1.0 channel (interference or
   drift-collision) are merged: the lower-SNR track is CLOSED with reason
   `merged` (counted); its decoder state is discarded (text already emitted
-  stands).
+  stands). **[DEVIATION — tie-break added per MAN-3]** On an exact
+  `current_snr_db` tie (the common case for two tracks whose owned windows
+  overlap and so read the same max-power channel, not an edge case) the
+  *incumbent* (older) track survives; a track only loses a merge when it
+  reads a **strictly** lower SNR than its competitor. See
+  docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md.
 
 ---
 

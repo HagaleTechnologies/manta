@@ -85,8 +85,12 @@ fn run(case: &Case) -> (String, Vec<DecoderEvent>) {
     };
     let (iq, _texts) =
         render_scene(std::slice::from_ref(&sig), FS, DURATION_S, Some(case.seed)).unwrap();
-    let report = decode_samples(&iq, FS, 0.0, &PipelineConfig::default())
-        .unwrap_or_else(|e| panic!("{} @ {} WPM: decode_samples failed: {e}", case.text, case.wpm));
+    let report = decode_samples(&iq, FS, 0.0, &PipelineConfig::default()).unwrap_or_else(|e| {
+        panic!(
+            "{} @ {} WPM: decode_samples failed: {e}",
+            case.text, case.wpm
+        )
+    });
     (report.text, report.events)
 }
 
