@@ -1,11 +1,13 @@
 //! Minimal HTTP server exposing `Metrics::render_prometheus_text` on
-//! `GET /metrics`. ARCHITECTURE §8: "Prometheus text endpoint (feature
-//! `metrics`)." Hand-rolled rather than pulling in a full HTTP framework --
-//! one static text response to one path is the entire surface.
+//! `GET /metrics` and `status::StatusDoc` (MAN-44) on `GET /status`.
+//! ARCHITECTURE §8: "Prometheus text endpoint (feature `metrics`)... manta
+//! status ... GET /status." Hand-rolled rather than pulling in a full HTTP
+//! framework -- two static routes is the entire surface.
 
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
+use crate::status::StatusDoc;
 use crate::tasks::{ConnectionLimiter, IpQuota};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,26 +33,27 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `accept()` return immediately, and retrying with no delay turns this
 /// into a tight loop that starves other tasks on the same runtime.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-/// Upper bound on concurrently in-flight `/metrics` requests. Each is
-/// short-lived (one request, one response, connection closed), but with no
-/// cap at all an unauthenticated client could still open connections
-/// without bound, each holding a socket and a tracked task open for up to
-/// `HEADER_READ_TIMEOUT` (round-15 review finding). A much smaller budget
-/// than the spot-stream listeners -- legitimate traffic here is a
-/// low-cardinality set of Prometheus scrapers, not end-user clients.
+/// Upper bound on concurrently in-flight `/metrics`/`/status` requests.
+/// Each is short-lived (one request, one response, connection closed), but
+/// with no cap at all an unauthenticated client could still open
+/// connections without bound, each holding a socket and a tracked task
+/// open for up to `HEADER_READ_TIMEOUT` (round-15 review finding). A much
+/// smaller budget than the spot-stream listeners -- legitimate traffic
+/// here is a low-cardinality set of Prometheus scrapers and `manta status`
+/// invocations, not end-user clients.
 pub const MAX_METRICS_CONNECTIONS: usize = 64;
-/// Upper bound on concurrently admitted `/metrics` connections from a
-/// SINGLE source IP (MAN-61, `docs/DECISIONS/2026-09-03-man61-per-ip-
+/// Upper bound on concurrently admitted `/metrics`/`/status` connections
+/// from a SINGLE source IP (MAN-61, `docs/DECISIONS/2026-09-03-man61-per-ip-
 /// connection-quota.md`, scope-expanded from the telnet/JSON finding in
 /// PR #76 review round 2): each permit is held for up to
 /// `HEADER_READ_TIMEOUT` even for a client sending an incomplete request,
 /// so one unauthenticated peer continuously opening and holding
 /// connections just under that deadline could occupy all
-/// `MAX_METRICS_CONNECTIONS` permits, denying every legitimate Prometheus
-/// scrape. A smaller value than the spot-stream listeners' per-IP cap --
-/// legitimate traffic here is a low-cardinality set of scrapers, not
-/// end-user clients (matching `MAX_METRICS_CONNECTIONS`'s own,
-/// proportionally smaller, total ceiling).
+/// `MAX_METRICS_CONNECTIONS` permits, denying every legitimate scrape/
+/// status check. A smaller value than the spot-stream listeners' per-IP
+/// cap -- legitimate traffic here is a low-cardinality set of scrapers/
+/// operators, not end-user clients (matching `MAX_METRICS_CONNECTIONS`'s
+/// own, proportionally smaller, total ceiling).
 pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 
 /// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
@@ -177,6 +180,46 @@ async fn read_headers<R: AsyncBufRead + Unpin>(
     Ok(false)
 }
 
+/// One routed response: status line, `Content-Type`, and body.
+pub(crate) struct Response {
+    pub status: &'static str,
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+/// Extracts the request path from an HTTP request line
+/// (`"GET /status?x=1 HTTP/1.1\r\n"` -> `Some("/status")`), requiring GET
+/// and tolerating a trailing query string -- the pre-MAN-44 route check
+/// (`starts_with("GET /metrics ")`) rejected `GET /metrics?x=1`, and some
+/// scrapers append a query string.
+fn parse_get_path(request_line: &str) -> Option<&str> {
+    let rest = request_line.strip_prefix("GET ")?;
+    let raw_path = rest.split(' ').next()?;
+    Some(raw_path.split('?').next().unwrap_or(raw_path))
+}
+
+/// Pure routing: request line in, response out (MAN-44). Split from
+/// `handle_request` so both routes are unit-testable without a socket.
+pub(crate) fn route(request_line: &str, metrics: &Metrics) -> Response {
+    match parse_get_path(request_line) {
+        Some("/metrics") => Response {
+            status: "200 OK",
+            content_type: "text/plain; version=0.0.4",
+            body: metrics.render_prometheus_text(),
+        },
+        Some("/status") => Response {
+            status: "200 OK",
+            content_type: "application/json",
+            body: StatusDoc::from_metrics(metrics).to_json(),
+        },
+        _ => Response {
+            status: "404 Not Found",
+            content_type: "text/plain; version=0.0.4",
+            body: String::new(),
+        },
+    }
+}
+
 async fn handle_request(
     socket: tokio::net::TcpStream,
     metrics: Arc<Metrics>,
@@ -219,14 +262,8 @@ async fn handle_request(
         return Ok(());
     }
 
-    let body = if request_line.starts_with("GET /metrics ") {
-        metrics.render_prometheus_text()
-    } else {
-        String::new()
-    };
-    let status = if request_line.starts_with("GET /metrics ") {
-        "200 OK"
-    } else {
+    let response = route(&request_line, &metrics);
+    if response.status == "404 Not Found" {
         // MAN-59 review: ordinary probing of this unauthenticated,
         // internet-facing endpoint (a wrong method, an unknown path) was
         // otherwise absent from the audit trail entirely -- only header
@@ -237,15 +274,17 @@ async fn handle_request(
         if connection_log_limiter.allow(peer.ip()) {
             tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
         }
-        "404 Not Found"
-    };
+    }
 
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+    let wire = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response.status,
+        response.content_type,
+        response.body.len(),
+        response.body
     );
     tokio::time::timeout(WRITE_TIMEOUT, async {
-        wr.write_all(response.as_bytes()).await?;
+        wr.write_all(wire.as_bytes()).await?;
         wr.shutdown().await
     })
     .await
@@ -256,6 +295,27 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_serves_status_json_metrics_text_and_404s_everything_else() {
+        let m = Metrics::new();
+        assert_eq!(
+            route("GET /status HTTP/1.1", &m).content_type,
+            "application/json"
+        );
+        assert_eq!(route("GET /metrics HTTP/1.1", &m).status, "200 OK");
+        assert_eq!(route("GET /statuses HTTP/1.1", &m).status, "404 Not Found");
+        assert_eq!(route("POST /status HTTP/1.1", &m).status, "404 Not Found");
+        assert_eq!(route("GET /status?x=1 HTTP/1.1", &m).status, "200 OK");
+    }
+
+    #[test]
+    fn status_route_body_parses_as_the_status_doc_json() {
+        let m = Metrics::new();
+        let response = route("GET /status HTTP/1.1", &m);
+        let doc: crate::status::StatusDoc = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(doc.schema_version, 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn header_block_honors_one_absolute_deadline_not_a_per_line_reset() {

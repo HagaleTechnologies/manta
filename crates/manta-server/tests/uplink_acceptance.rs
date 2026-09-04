@@ -31,7 +31,7 @@
 
 use manta_server::bus::SpotBus;
 use manta_server::config::RbnUplinkConfig;
-use manta_server::metrics::Metrics;
+use manta_server::metrics::{Metrics, UplinkTarget};
 use manta_server::rbn;
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
@@ -68,6 +68,10 @@ fn uplink_config(target_port: u16, dry_run: bool) -> RbnUplinkConfig {
 struct Harness {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
+    /// One registered per-target handle per configured `[[rbn_uplink]]`
+    /// entry, in config order (MAN-44) -- lets a test assert on a SPECIFIC
+    /// target's own state instead of only the metrics-wide aggregate.
+    targets: Vec<Arc<UplinkTarget>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -75,54 +79,36 @@ struct Harness {
 /// test itself controls) and returns the shared bus/metrics/shutdown
 /// handles the test drives.
 fn spawn_uplink(target_port: u16, dry_run: bool) -> Harness {
-    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
-    let metrics = Arc::new(Metrics::new());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    let cfg = uplink_config(target_port, dry_run);
-    let bus2 = bus.clone();
-    let metrics2 = metrics.clone();
-    tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, metrics2, shutdown_rx)
-            .await;
-    });
-
-    Harness {
-        bus,
-        metrics,
-        shutdown_tx,
-    }
+    spawn_uplinks(vec![uplink_config(target_port, dry_run)])
 }
 
 /// Spawns one `uplink::serve` task per config, all sharing the same
-/// bus/metrics/shutdown -- mirroring `start_spot_server`'s real MAN-42
-/// wiring (one independent task per configured `[[rbn_uplink]]` target).
+/// bus/metrics/shutdown -- mirroring `start_spot_server`'s real MAN-42/
+/// MAN-44 wiring (one independent task per configured `[[rbn_uplink]]`
+/// target, each registered against `metrics` before it's spawned).
 fn spawn_uplinks(configs: Vec<RbnUplinkConfig>) -> Harness {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    for cfg in configs {
+    let specs = manta_server::uplink::target_specs(&configs);
+    let mut targets = Vec::with_capacity(configs.len());
+    for (cfg, spec) in configs.into_iter().zip(specs) {
+        let target = metrics.register_uplink_target(spec);
+        targets.push(target.clone());
         let bus2 = bus.clone();
-        let metrics2 = metrics.clone();
         let shutdown_rx2 = shutdown_rx.clone();
         tokio::spawn(async move {
-            manta_server::uplink::serve(
-                cfg,
-                STATION_CALL.to_string(),
-                bus2,
-                metrics2,
-                shutdown_rx2,
-            )
-            .await;
+            manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx2)
+                .await;
         });
     }
 
     Harness {
         bus,
         metrics,
+        targets,
         shutdown_tx,
     }
 }
@@ -377,8 +363,13 @@ async fn disabled_uplink_makes_no_connection_attempt() {
 
     let mut cfg = uplink_config(addr.port(), false);
     cfg.enabled = false;
+    let spec = manta_server::uplink::target_specs(std::slice::from_ref(&cfg))
+        .into_iter()
+        .next()
+        .unwrap();
+    let target = metrics.register_uplink_target(spec);
     tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, metrics, shutdown_rx).await;
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, target, shutdown_rx).await;
     });
 
     let attempt = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
@@ -494,6 +485,115 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
         .expect("reachable target stopped receiving spots while the other target retried")
         .unwrap();
     assert_eq!(line2.trim_end(), expected2);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+// MAN-44 acceptance scenarios:
+//   Scenario: An operator checks whether the uplink is currently connected
+//     Given the RBN uplink is enabled
+//     When an operator checks manta's status
+//     Then they can see whether the uplink is currently connected to its
+//       RBN target, and how many spots have been sent/suppressed
+//
+//   Scenario: An operator notices a stuck reconnect loop
+//     Given the RBN uplink has been reconnecting repeatedly
+//     When an operator checks manta's status
+//     Then they can see WHICH target is unhealthy, without reading logs
+
+/// MAN-44 scenario 1: an operator can see THIS target is connected and how
+/// much it has sent since start.
+#[tokio::test]
+async fn per_target_state_reports_connection_and_sent_counts_for_that_target() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    harness.bus.publish(sample_spot());
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the forwarded spot")
+        .unwrap();
+
+    let snap = harness.targets[0].snapshot();
+    assert!(
+        snap.connected,
+        "the target's own snapshot must read connected"
+    );
+    assert_eq!(snap.sent, 1);
+    assert_eq!(snap.suppressed, 0);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-44 scenario 1, dry-run leg: suppressed is attributed to the right
+/// target, not just the metrics-wide aggregate.
+#[tokio::test]
+async fn dry_run_target_reports_suppressed_not_sent_on_its_own_snapshot() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), true);
+
+    let (_login_line, _reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    harness.bus.publish(sample_spot());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.targets[0].snapshot().suppressed < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("target snapshot never reflected the suppressed spot");
+
+    let snap = harness.targets[0].snapshot();
+    assert_eq!(snap.sent, 0);
+    assert_eq!(snap.suppressed, 1);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-44 scenario 2, the whole point of per-target state: with one
+/// healthy and one dead target, the snapshot names WHICH one is
+/// unhealthy, and the reachable target's own reading is untouched.
+#[tokio::test]
+async fn one_dead_target_is_individually_identifiable_while_the_other_stays_connected() {
+    let listener_up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_up = listener_up.local_addr().unwrap().port();
+
+    // Bind then immediately drop to get a port nothing listens on.
+    let temp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_down = temp.local_addr().unwrap().port();
+    drop(temp);
+
+    let harness = spawn_uplinks(vec![
+        uplink_config(port_up, false),
+        uplink_config(port_down, false),
+    ]);
+
+    let (login_up, _reader_up, _wr_up) = mock_rbn_accept_and_login(&listener_up).await;
+    assert_eq!(login_up.trim_end(), STATION_CALL);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.targets[1].snapshot().reconnects < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dead target never recorded a reconnect attempt");
+
+    let up = harness.targets[0].snapshot();
+    let down = harness.targets[1].snapshot();
+    assert!(
+        up.connected,
+        "the reachable target must still read connected"
+    );
+    assert_eq!(up.reconnects, 0);
+    assert!(!down.connected, "the dead target must not read connected");
+    assert!(down.reconnects >= 1);
 
     let _ = harness.shutdown_tx.send(true);
 }
