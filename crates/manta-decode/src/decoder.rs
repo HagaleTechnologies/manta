@@ -45,6 +45,24 @@ pub struct TrackDecoder {
     freq_hz: f64,
     hop_count: u64,
     last_ts: u64,
+    /// True until this decoder has processed its first `Run` (MAN-5). A
+    /// fresh `Demod`'s init-window replay (`envelope.rs::push`) always
+    /// starts `step()` from `open: None`, with no notion of whatever the
+    /// physical signal was doing before this `Demod` started observing it.
+    /// If that window happens to begin mid-element, the run in progress is
+    /// detected as starting fresh at the window's first sample, so its
+    /// measured duration under-reports the true element length -- sometimes
+    /// drastically (a real ~360 ms dah truncated to an 8-hop/21 ms "mark").
+    /// `on_run` excludes only this one run from `SpeedTracker::on_mark`:
+    /// otherwise a single truncated leading mark permanently poisons the
+    /// mu_dit/mu_dah 2-means bootstrap (every later real mark is 3x+ larger
+    /// and only ever updates the *other* cluster), producing exactly the
+    /// all-dah ("TTTT...") garble this ticket reports. The run is still
+    /// kept in `cur_marks`/the decoded character stream unchanged -- this
+    /// only protects the speed estimate, and any resulting first-character
+    /// decode error falls within the pre-existing warmup-floor CER
+    /// tolerance the round-trip tests already allow.
+    first_run: bool,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
 }
@@ -66,6 +84,7 @@ impl TrackDecoder {
             freq_hz: 0.0,
             hop_count: 0,
             last_ts: 0,
+            first_run: true,
             garble_count: 0,
         }
     }
@@ -117,8 +136,9 @@ impl TrackDecoder {
     }
 
     fn on_run(&mut self, run: Run, events: &mut Vec<DecoderEvent>) {
+        let left_censored = std::mem::replace(&mut self.first_run, false);
         if !self.tracker.ready() {
-            if run.mark {
+            if run.mark && !left_censored {
                 self.tracker.on_mark(run.hops as f32 * HOP_MS as f32);
             }
             self.pending.push(run);
@@ -424,13 +444,23 @@ mod tests {
         // averages 192 ms -- unambiguously over the SPEC §4.1 150 ms dit
         // ceiling, so unimodal init must assume dahs, not the pre-fix
         // default of dits (which decoded "TTTTT" as "5").
-        let env = rect_envelope("TTTTT", 24);
+        //
+        // Six dahs, not five (MAN-5): `on_run` now excludes this decoder's
+        // very first run from the speed-tracker bootstrap on the (here,
+        // false) assumption it might be a left-censored fragment of an
+        // already-in-progress element -- `TrackDecoder` cannot tell this
+        // synthetic, exactly-t=0-aligned envelope apart from the real
+        // pipeline case where a track's `Demod` is created well after the
+        // signal it's observing already started. So the cluster's 5-sample
+        // quorum now needs 6 raw marks; five leaves it permanently short
+        // and nothing ever decodes.
+        let env = rect_envelope("TTTTTT", 24);
         let mut dec = TrackDecoder::new(1, DecodeConfig::default());
         let mut events = Vec::new();
         for (i, &a) in env.iter().enumerate() {
             events.extend(dec.push_envelope(a, i as u64 * 256));
         }
         events.extend(dec.finish());
-        assert_eq!(events_to_text(&events), "TTTTT");
+        assert_eq!(events_to_text(&events), "TTTTTT");
     }
 }
