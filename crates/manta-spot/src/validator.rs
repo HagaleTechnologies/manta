@@ -172,6 +172,19 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
 pub struct SuppressionCounts {
     pub blocklist: u64,
     pub notch: u64,
+    /// Power-step beacon occurrences (MAN-37 `<call> T`) discarded by the
+    /// coarse whole-window CQ/DE framing guard -- see `context::parse`'s own
+    /// docs for why that guard is deliberately coarse. Counted once per
+    /// OCCURRENCE, on the burn that first marks its decoded word attempted:
+    /// `try_spot` re-discovers and re-burns the same occurrence on every word
+    /// boundary until the triggering token ages out of the 16-word window, so
+    /// counting per burn call would report one missed beacon many times over
+    /// (MAN-48, deferred from Codex review on PR #65, round 9). A word
+    /// already attempted through another route (e.g. an accepted `CQ <call>`
+    /// named match on the same word) is deliberately NOT counted here -- it
+    /// was evaluated, not silently lost, so counting it would overstate the
+    /// guard's missed-beacon rate.
+    pub power_step_guard: u64,
 }
 
 pub struct Validator {
@@ -527,21 +540,35 @@ impl Validator {
     /// stale, already-suppressed match's callsign could get bound to a
     /// brand-new, unrelated word decoded later that merely shares the same
     /// callsign string (Codex review on PR #65, round 9).
+    ///
+    /// The first burn that marks a word attempted also counts the occurrence
+    /// against `SuppressionCounts::power_step_guard` (ARCHITECTURE §8: every
+    /// suppressed item is counted). The `attempted` gate is what makes that
+    /// once-per-occurrence rather than once-per-word-boundary -- the same
+    /// idiom `evaluate_candidate` already uses to keep the blocklist/notch
+    /// counters from double-counting across repeated re-evaluations (MAN-48).
     fn burn_suppressed_power_step_candidate(
         &mut self,
         track_id: u32,
         exact_seq: u64,
         involved_max_seq: u64,
     ) {
-        let Some(track) = self.tracks.get_mut(&track_id) else {
-            return;
+        let first_suppression = {
+            let Some(track) = self.tracks.get_mut(&track_id) else {
+                return;
+            };
+            let Some(word) = track.words.iter_mut().find(|w| w.seq == exact_seq) else {
+                return;
+            };
+            let involved_max_seq = involved_max_seq.max(word.seq);
+            let first_suppression = !word.attempted;
+            word.attempted = true;
+            word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
+            first_suppression
         };
-        let Some(word) = track.words.iter_mut().find(|w| w.seq == exact_seq) else {
-            return;
-        };
-        let involved_max_seq = involved_max_seq.max(word.seq);
-        word.attempted = true;
-        word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
+        if first_suppression {
+            self.suppression_counts.power_step_guard += 1;
+        }
     }
 
     fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {

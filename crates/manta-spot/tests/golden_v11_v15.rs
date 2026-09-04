@@ -814,3 +814,105 @@ fn power_step_beacon_with_unmapped_exact_range_is_discarded_not_resolved_by_text
          standalone K5ARH by text, got {spots:?}"
     );
 }
+
+/// MAN-48 (deferred from Codex review on PR #65, round 9): the coarse CQ/DE
+/// guard used `\b`-delimited tokens, so punctuation glued to a decoded word
+/// ("DE/NOISE", "-CQ") satisfied it and suppressed -- and `Validator`
+/// permanently burned -- a perfectly valid power-step occurrence, losing the
+/// beacon outright if the transmission ended there. The framing token must be
+/// a complete decoded word.
+#[test]
+fn a_glued_cq_de_substring_does_not_suppress_a_power_step_beacon() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["DE/NOISE", "W1AW", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
+        "W1AW must spot as Beacon -- \"DE/NOISE\" is one garbled decoded word, \
+         not the bare DE framing token the guard looks for, got {spots:?}"
+    );
+}
+
+/// MAN-48 (deferred from Codex review on PR #65, round 9). ARCHITECTURE §8:
+/// "Every dropped/evicted/suppressed item is counted. No silent loss anywhere
+/// in the pipeline." A power-step occurrence the coarse CQ/DE guard burns is
+/// permanently discarded with no spot, so it must be counted -- otherwise the
+/// deliberately coarse guard's missed-beacon rate is invisible to an
+/// operator. Exactly ONCE per occurrence: `try_spot` re-discovers and
+/// re-burns the same occurrence on every word boundary for as long as the
+/// triggering token stays in the 16-word window (~15 times here), so a naive
+/// increment inside the burn would report one missed beacon as fifteen.
+#[test]
+fn power_step_guard_suppressions_are_counted_once_per_occurrence() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    // "DX" (not a bare "CQ K5ARH") is deliberate: it's the round-1
+    // motivating case (see any_bare_cq_anywhere_suppresses_the_power_step_
+    // fallback) specifically because "DX" breaks CQ_CALL_RE's adjacency
+    // requirement, so K5ARH's word is untouched by any named pattern here --
+    // the power-step guard is the ONLY thing that ever marks it attempted.
+    // A bare "CQ K5ARH T" would instead have CQ_CALL_RE mark K5ARH attempted
+    // (as an unspotted Cq candidate, reps=1<2) one word boundary before the
+    // burn ever runs, which is the already-attempted-via-another-route case
+    // the next test covers -- not what this test is isolating.
+    let words = ["CQ", "DX", "K5ARH", "T"];
+    run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        1,
+        "the burned K5ARH occurrence must be counted once"
+    );
+
+    // 14 more words: the guard keeps firing (and re-burning the same
+    // occurrence) on every boundary until CQ (and DX) finally age out of
+    // the window.
+    let filler: Vec<String> = (1..=14).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    run(&transmission_events(1, &filler_refs, 100_000), &mut v);
+
+    let counts = v.suppression_counts();
+    assert_eq!(
+        counts.power_step_guard, 1,
+        "re-burning the SAME occurrence on later boundaries must not recount it"
+    );
+    assert_eq!(counts.blocklist, 0);
+    assert_eq!(counts.notch, 0);
+}
+
+/// MAN-48: the counter measures occurrences the guard ALONE discarded -- it
+/// must not fire when the same decoded word was already evaluated through
+/// another route. "CQ K5ARH K5ARH T" spots K5ARH as Cq via CQ_CALL_RE before
+/// the burn runs in that same `try_spot` pass; nothing was silently lost, so
+/// counting it would overstate the guard's miss rate.
+#[test]
+fn an_already_evaluated_word_is_not_counted_as_a_guard_suppression() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "K5ARH", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "K5ARH must still spot as Cq, got {spots:?}"
+    );
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        0,
+        "the word was already attempted and spotted via the CQ named match"
+    );
+}
+
+/// MAN-48: a clean beacon window trips no guard at all, so nothing is
+/// counted -- the counter must not read as "suppressed" on the happy path.
+#[test]
+fn an_unsuppressed_power_step_beacon_counts_nothing() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    assert_eq!(spots.len(), 1);
+    assert_eq!(v.suppression_counts().power_step_guard, 0);
+}
