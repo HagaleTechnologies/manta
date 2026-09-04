@@ -27,3 +27,7 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 ## Why it is shaped this way
 
 Beam search rather than hard thresholding is what makes a marginal element recoverable — a small-Viterbi, not a guess. A separate tone-finder stage is dropped here because the PFB ([[pfb-channelizer]]) already did the frequency selection. ML fusion is gated on beating this baseline (ROADMAP M4), not assumed.
+
+## Gotcha: a freshly-promoted track's first demod run has no real leading edge
+
+`Demod`'s rail-init window opens at the arbitrary hop `TrackManager` promoted the track on, not at a keying edge — so its first run, if left unsuppressed, is a fabricated element duration that could poison `SpeedTracker`'s 5-mark bootstrap into a stable, self-consistent wrong timing lock (MAN-6 / issue #23: persistent, non-converging garbled decode, CER growing rather than stabilizing with scene duration). Fixed by discarding that leading partial run plus a bimodal bad-lock recovery branch in `check_drift`. Full mechanism, worked numeric example, and rejected alternatives: `docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
