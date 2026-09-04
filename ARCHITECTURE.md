@@ -335,13 +335,24 @@ validation (MAN-28). Dedupe (step 5) still applies.
   production daemon run reports a constant `0`, not a real track count.
   Listed separately from the "currently-implemented" set above so an
   operator doesn't read a served-but-frozen placeholder as live data.
-  **`manta_source_health` is one-sided** (corrected 2026-09-03, review
-  round 7, filed as **MAN-64**): the only production call site
-  (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
-  on a later failure, and a fatal source read tears the daemon down
-  instead. It's a startup-success marker, not live health reporting —
-  don't read it as the latter until MAN-64 either wires real transitions
-  or this note is the accepted-permanent behavior.
+  **`manta_source_health` reports startup and terminal state only, not
+  live health** (corrected 2026-09-03, review round 7; updated 2026-09-04
+  under **MAN-64**). Three production call sites exist
+  (`crates/manta-cli/src/main.rs`, `Command::Listen`): a source whose
+  `open()` doesn't itself prove liveness starts `false` and flips `true`
+  on its first genuinely valid packet (MAN-55's `confirmed_live_handle`,
+  a one-time startup-pending placeholder, not a re-armable signal); every
+  other source is `true` immediately; and MAN-64 added a `false` write
+  when `manta_engine::listen` returns an error, recorded before the
+  shutdown-drain signal so a scraper reaching the still-running metrics
+  listener during that window can observe it. What is still **not**
+  reported: a source that degrades *while the daemon keeps running* —
+  `listen` exposes no per-read progress hook, so there is nothing to
+  watch. Don't read a `1` as "receiving data right now"; read it as
+  "opened, confirmed once, and hasn't failed fatally yet." A live
+  staleness signal is deferred to MAN-56 (input-layer metrics) / MAN-13
+  (multi-source orchestration), which need that same engine hook — see
+  `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-and-source-health.md`.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 

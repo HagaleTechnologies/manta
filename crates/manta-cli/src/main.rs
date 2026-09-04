@@ -773,6 +773,34 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
+/// MAN-64: the one source-health FAILURE transition this daemon can
+/// actually observe today. `manta_engine::listen` returning `Err` means the
+/// source read (or the pipeline behind it) failed fatally and the process
+/// is about to exit; the metrics listener outlives that by the whole
+/// shutdown-drain window (`SHUTDOWN_DRAIN_DEADLINE`, since it's spawned
+/// bare and takes neither `ClientTasks` nor the shutdown watch), so
+/// recording it here -- BEFORE `shutdown_tx.send(true)` -- gives a scraper
+/// a real chance to see `manta_source_health{...} 0` before the daemon is
+/// gone. Previously the gauge read `1` right up to process exit.
+///
+/// Deliberately silent on the `Ok` path: a clean end of stream (file replay
+/// finished, operator Ctrl-C) is normal termination, not a source failure,
+/// and reporting it as unhealthy would make the gauge lie in the opposite
+/// direction. This does NOT make the gauge live health reporting -- a
+/// source that degrades while `listen` keeps running still can't be
+/// detected, because `listen` exposes no per-read progress hook. See
+/// ARCHITECTURE.md §8 and
+/// `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-and-source-health.md`.
+fn record_terminal_source_health(
+    metrics: &manta_server::metrics::Metrics,
+    source_name: &str,
+    listen_result: &Result<()>,
+) {
+    if listen_result.is_err() {
+        metrics.set_source_health(source_name, false);
+    }
+}
+
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
@@ -888,6 +916,12 @@ fn start_spot_server(
         // connect/disconnect churn grows it without bound for the life of
         // the process (round-11 review finding).
         manta_server::tasks::spawn_reaper(tasks.clone());
+        let metrics_ip_request_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+            manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
+            manta_server::metrics_http::METRICS_REQUEST_RATE_WINDOW,
+            cfg.metrics_max_requests_per_ip,
+        );
+        manta_server::rate_limit::spawn_stale_entry_reaper(metrics_ip_request_limiter.clone());
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
             metrics.clone(),
@@ -898,6 +932,7 @@ fn start_spot_server(
                 manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
                 cfg.metrics_max_connections_per_ip,
             ),
+            metrics_ip_request_limiter,
         ));
         // MAN-32/MAN-42: one independent uplink::serve task per configured
         // [[rbn_uplink]] entry -- the common case for existing single-node
@@ -1229,6 +1264,12 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
+                // Before `shutdown_tx.send(true)`, not after: ordering is
+                // what makes this observable (MAN-64) -- the drain starts
+                // here, and the metrics listener keeps serving throughout
+                // it, so a scraper hitting it during the drain window sees
+                // the transition instead of a stale `1`.
+                record_terminal_source_health(&server.metrics, source_name, &listen_result);
                 let _ = server.shutdown_tx.send(true);
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -1372,6 +1413,39 @@ mod tests {
             drained.load(Ordering::SeqCst),
             "the tracked task must have been genuinely awaited to completion before the runtime shut down"
         );
+    }
+
+    /// MAN-64 (PR #76 review round 7): `manta_source_health` had no failure
+    /// transition at all -- a fatal source read tore the daemon down with
+    /// the gauge still reading 1. The metrics listener is spawned bare (it
+    /// takes neither `ClientTasks` nor the shutdown watch), so it keeps
+    /// serving through `shutdown_runtime_after_drain`'s `await_all` --
+    /// writing 0 here, BEFORE the drain signal, is observable rather than
+    /// cosmetic.
+    #[test]
+    fn fatal_listen_error_flips_source_health_to_zero() {
+        let metrics = manta_server::metrics::Metrics::new();
+        metrics.set_source_health("hpsdr", true);
+        record_terminal_source_health(&metrics, "hpsdr", &Err(anyhow!("source read failed")));
+        assert!(
+            metrics
+                .render_prometheus_text()
+                .contains("manta_source_health{source=\"hpsdr\"} 0"),
+            "a fatal listen error must be reported as unhealthy"
+        );
+    }
+
+    /// A clean end of stream is NOT a source failure: file replay reaching
+    /// EOF and a Ctrl-C stop both return `Ok(())`, and reporting those as
+    /// unhealthy would make the gauge lie in the opposite direction.
+    #[test]
+    fn clean_listen_completion_leaves_source_health_untouched() {
+        let metrics = manta_server::metrics::Metrics::new();
+        metrics.set_source_health("file", true);
+        record_terminal_source_health(&metrics, "file", &Ok(()));
+        assert!(metrics
+            .render_prometheus_text()
+            .contains("manta_source_health{source=\"file\"} 1"));
     }
 
     #[test]

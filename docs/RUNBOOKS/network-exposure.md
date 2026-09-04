@@ -103,6 +103,31 @@ same way (`0` disables it; only each connection's own per-connection
 Ping budget still applies). Same reasoning for telnet's
 `telnet_max_commands_per_ip` if telnet is ever put behind a proxy too.
 
+**The metrics listener also has its own per-IP AGGREGATE completed-request
+rate budget (MAN-64, `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-
+and-source-health.md`), separate from every field above.** `IpQuota`
+(`metrics_max_connections_per_ip`) and `ConnectionLimiter` bound how many
+connections one source may hold *at once* — they do not bound how many
+complete `GET /metrics` requests a fast, cooperative peer can drive through
+the listener by opening, scraping, and closing a connection over and over.
+`[server].metrics_max_requests_per_ip` bounds exactly that: the default is
+60 completed requests per 60 seconds per source IP, roughly 5x the load of
+the tightest realistic single scraper (a 5s scrape interval is 12/min).
+Raise it if several independent scrapers, a federation setup, or a proxy in
+front of the metrics port cause more than one real client to collapse into
+a single `peer.ip()`. Set it to `0` to disable request-rate bounding on
+this listener **entirely** — unlike telnet/JSON's rate overrides, there is
+no per-connection budget left underneath it once the per-IP tier is
+disabled, because this endpoint answers exactly one request per connection
+(`Connection: close` on every response) and a per-connection budget of one
+would bound nothing the connection-level tiers above don't already bound.
+Only the total `MAX_METRICS_CONNECTIONS` ceiling and the per-IP connection
+quota still apply once this is set to `0`. Observable symptom of hitting
+the default budget: scrapes returning `429 Too Many Requests` with a
+`Retry-After: 60` header, and one `WARN` line per source IP per log window
+(not one per rejection — the same log-budget rule as every other rejection
+path in this file).
+
 **Known limitation (MAN-59, review round 5): per-client audit-log
 attribution is unavailable for WS traffic behind this same reverse-proxy
 deployment.** `json_stream.rs`'s connect/disconnect/rejection logging

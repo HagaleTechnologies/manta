@@ -53,6 +53,36 @@ pub const MAX_METRICS_CONNECTIONS: usize = 64;
 /// proportionally smaller, total ceiling).
 pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 
+/// Aggregate per-source-IP budget on COMPLETED requests (MAN-64, PR #76
+/// review round 7). `ConnectionLimiter`/`IpQuota` above bound how many
+/// connections one source holds AT ONCE, and `HEADER_READ_TIMEOUT` bounds
+/// how long an INCOMPLETE request may hold one -- neither bounds how many
+/// complete requests a fast, COOPERATIVE client drives through this
+/// listener over time: `handle_request` releases its permit the instant
+/// the response closes, so a peer that reopens, scrapes, and closes as
+/// fast as the network allows never occupies a permit long enough to be
+/// declined by either of those, while still costing one full
+/// `render_prometheus_text()` plus response write per round trip. The
+/// opposite failure mode to MAN-61's quiet, permit-holding client on this
+/// same listener.
+///
+/// Unlike telnet/JSON (MAN-57) there is deliberately NO per-connection
+/// `RateLimiter` tier here: this endpoint answers exactly one request per
+/// connection (`Connection: close`, see `handle_request`), so a
+/// per-connection budget would be a budget of one and bound nothing
+/// `IpQuota` doesn't already bound. The shared, IP-keyed tier below is the
+/// entire mechanism.
+///
+/// 60 per 60s is roughly 5x the tightest realistic scrape load (a 5s-
+/// interval Prometheus scraper is 12/min), leaving room for several
+/// independent scrapers or a federation setup behind one IP while cutting
+/// a flood by orders of magnitude. A 60s window rather than telnet's 10s
+/// because scrape traffic is periodic at minute granularity -- a short
+/// window with a small count would false-positive whenever two scrapers'
+/// intervals happen to align.
+pub const MAX_METRICS_REQUESTS_PER_IP: u32 = 60;
+pub const METRICS_REQUEST_RATE_WINDOW: Duration = Duration::from_secs(60);
+
 /// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
 /// -- this warning runs on every rejected socket, before any request rate
 /// limiter, so a source completing repeated handshakes despite holding
@@ -90,6 +120,7 @@ pub async fn serve(
     metrics: Arc<Metrics>,
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
+    ip_request_limiter: IpRateLimiter,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -135,11 +166,18 @@ pub async fn serve(
         // actual warn site below instead, right when there's a real event
         // to charge for.
         let connection_log_limiter = connection_log_limiter.clone();
+        let ip_request_limiter = ip_request_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime
             let _ip_guard = ip_guard; // held for the connection's lifetime
-            let result =
-                handle_request(socket, metrics, peer, connection_log_limiter.clone()).await;
+            let result = handle_request(
+                socket,
+                metrics,
+                peer,
+                connection_log_limiter.clone(),
+                ip_request_limiter,
+            )
+            .await;
             // MAN-59 review round 3: successful requests are deliberately
             // not logged (Prometheus scrapes this every 10-30s -- pure
             // noise), so a connection that resets mid-response or times
@@ -182,6 +220,7 @@ async fn handle_request(
     metrics: Arc<Metrics>,
     peer: std::net::SocketAddr,
     connection_log_limiter: IpRateLimiter,
+    ip_request_limiter: IpRateLimiter,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
@@ -219,6 +258,38 @@ async fn handle_request(
         return Ok(());
     }
 
+    // MAN-64: charged on every COMPLETE request, including one that goes
+    // on to get a 404 below -- the finding names "task, formatting, TCP,
+    // and bandwidth work" as the cost being driven, and the unit of that
+    // work is a request, not a successful scrape. Metering only
+    // `GET /metrics` would hand a prober the same task/socket/write cost
+    // for free. Matches `telnet.rs`'s command budget, which charges a
+    // line whether or not it parses. Header-read failures above are
+    // deliberately NOT charged: they never reach this point at all, and
+    // `IpQuota` + `HEADER_READ_TIMEOUT` (MAN-61) already bound them.
+    if !ip_request_limiter.allow(peer.ip()) {
+        // Lazily, at the warn site, on the single connection-level log
+        // budget -- MAN-59 rounds 4/5: one budget for every warn site in
+        // this file, spent only when there is a real event to charge for.
+        if connection_log_limiter.allow(peer.ip()) {
+            tracing::warn!(peer = %peer, "metrics_http: per-IP request rate exceeded, returning 429");
+        }
+        write_response(
+            &mut wr,
+            "429 Too Many Requests",
+            &format!("Retry-After: {}\r\n", METRICS_REQUEST_RATE_WINDOW.as_secs()),
+            "",
+        )
+        .await?;
+        // `Ok(())`, not `Err`: this rejection has already been logged
+        // above, and `serve`'s task-boundary catch-all logs every `Err` --
+        // returning `Err` here would print two lines per rejection, the
+        // exact double-logging pattern 5b9e747 removed from telnet/WS. A
+        // failed WRITE below still propagates as `Err`, which is a
+        // genuinely different (and still-unlogged-elsewhere) event.
+        return Ok(());
+    }
+
     let body = if request_line.starts_with("GET /metrics ") {
         metrics.render_prometheus_text()
     } else {
@@ -240,8 +311,23 @@ async fn handle_request(
         "404 Not Found"
     };
 
+    write_response(&mut wr, status, "", &body).await
+}
+
+/// One place that knows this endpoint's response shape, shared by the 200,
+/// 404, and 429 paths above so the three don't drift out of sync with each
+/// other (MAN-64). `extra_headers` must be empty or a CRLF-terminated
+/// header block. Generic over `W` (rather than the concrete write half)
+/// purely so tests can drive it over an in-memory buffer the same way
+/// `read_headers` above is driven over `tokio::io::duplex`.
+async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
+    wr: &mut W,
+    status: &str,
+    extra_headers: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
         body.len()
     );
     tokio::time::timeout(WRITE_TIMEOUT, async {
@@ -297,5 +383,89 @@ mod tests {
             result.is_err(),
             "40s of cumulative header-read time (two 20s gaps) must exceed the single 30s deadline"
         );
+    }
+
+    /// MAN-64: the 429 path's `Retry-After` header must reach the client
+    /// intact, and the response must still be a complete, well-formed HTTP
+    /// response an operator's scraper can parse and act on -- not a bare
+    /// socket close, which reads as a network fault rather than "you are
+    /// over budget, retry later."
+    #[tokio::test]
+    async fn write_response_carries_extra_headers_and_closes_cleanly() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(4096);
+        write_response(
+            &mut write_half,
+            "429 Too Many Requests",
+            "Retry-After: 60\r\n",
+            "",
+        )
+        .await
+        .unwrap();
+
+        let mut reader = BufReader::new(read_half);
+        let mut out = String::new();
+        reader.read_to_string(&mut out).await.unwrap();
+        assert!(
+            out.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "response: {out:?}"
+        );
+        assert!(out.contains("Retry-After: 60\r\n"), "response: {out:?}");
+        assert!(out.contains("Content-Length: 0\r\n"), "response: {out:?}");
+        assert!(out.contains("Connection: close\r\n"), "response: {out:?}");
+    }
+
+    /// Charging only `GET /metrics` would let a prober drive the same
+    /// task, socket, and response-write cost for free; `telnet.rs`'s
+    /// command budget charges a line whether or not it parses, and this
+    /// matches it. Budget of 1/window: the first request (an unmatched
+    /// path, itself a 404) consumes the single slot, so the SECOND
+    /// request -- a well-formed `GET /metrics` -- must be refused too.
+    #[tokio::test]
+    async fn unmatched_paths_are_charged_against_the_request_budget() {
+        use tokio::io::AsyncBufReadExt;
+
+        let metrics = Arc::new(Metrics::new());
+        let ip_request_limiter = IpRateLimiter::new(1, Duration::from_secs(60));
+        let connection_log_limiter =
+            IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, peer) = listener.accept().await.unwrap();
+                let metrics = metrics.clone();
+                let ip_request_limiter = ip_request_limiter.clone();
+                let connection_log_limiter = connection_log_limiter.clone();
+                tokio::spawn(async move {
+                    let _ = handle_request(
+                        socket,
+                        metrics,
+                        peer,
+                        connection_log_limiter,
+                        ip_request_limiter,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        for (path, expected) in [("/nope", "HTTP/1.1 404"), ("/metrics", "HTTP/1.1 429")] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut status_line = String::new();
+            reader.read_line(&mut status_line).await.unwrap();
+            assert!(
+                status_line.starts_with(expected),
+                "expected {expected}, got {status_line:?}"
+            );
+        }
     }
 }
