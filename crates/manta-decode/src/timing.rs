@@ -46,6 +46,47 @@ const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
 const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
 
+// SPEC §4.1 reports PARIS WPM as 1200/mu_dit_ms. **[DEVIATION]** manta divides
+// by a boundary-bias-corrected dit estimate instead -- see
+// docs/DECISIONS/2026-09-04-man7-element-gap-symmetric-wpm.md (MAN-7).
+//
+// SPEC §3.3's hysteresis is asymmetric by design (key-down at 1.25*T, key-up
+// at 0.80*T), so Demod reports a rising edge earlier in the transition than a
+// falling one. Every measured mark is therefore longer than the true keyed
+// mark by delta = (fall-crossing delay - rise-crossing delay) >= 0, and --
+// because threshold crossings only move the mark/space *boundary*, they
+// neither create nor destroy time -- every inter-element gap is shorter by
+// the same delta. So mu_dit + mu_egap = 2 * true_dit regardless of how large
+// delta is, and (mu_dit + mu_egap)/2 is an unbiased estimate of the true dit
+// period.
+//
+// delta scales with the envelope's transition time, which is why this shows
+// up most sharply for signals sitting near a channelizer channel edge (SPEC
+// §1.2: adjacent channels cross at -6 dB, so a near-edge carrier's keying
+// sidebands are asymmetrically shaped by the prototype filter's transition
+// band and the recovered envelope moves slowly). Measured on the V2 vector
+// (-8200 Hz, -0.4667 channels): delta ~= 6.9 ms against a 34.3 ms true dit,
+// reporting 29.1 WPM for a 35 WPM signal. An on-center control at the same
+// speed/text/SNR measures delta ~= 1.1 ms. The correction is offset-agnostic
+// -- it removes the same bias whatever slowed the envelope (channel edge,
+// QSB trough, weak SNR).
+//
+// Deliberately scoped to the WPM *report*: mu_dit_ms() itself keeps its
+// uncorrected value, because its four downstream consumers (beam log-normal
+// likelihood §4.3, GapClassifier's u = gap_ms/mu_dit_ms §4.2, Demod's
+// tau_hi = 5*dit_ms §3.2, and the 7*mu_dit flush §4.2) were all tuned against
+// the biased value -- most explicitly CHAR_GAP_DITS = 1.6 above, whose
+// 500-case sweep exists precisely because mu_dit runs high. Those consumers
+// want a centroid consistent with the marks being classified; only the
+// report wants an absolute physical estimate.
+//
+// Maximum fraction of mu_dit the correction may remove. delta/mu_dit
+// measures 0.168 on V2's worst case, so 0.35 leaves ~2x headroom while
+// bounding the reportable inflation at 1/(1-0.35) = 1.54x if the mark/gap
+// pairing ever breaks down (e.g. element gaps swallowed by the 12 ms
+// debounce at extreme WPM).
+const DIT_BIAS_CAP_FRAC: f32 = 0.35;
+
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
     for &x in xs {
@@ -220,6 +261,10 @@ pub struct SpeedTracker {
     ring: VecDeque<(f32, bool, f32, f32)>, // (dur_ms, assigned_dit, pre_lo, pre_hi)
     wpm_ema: Option<f32>,
     recent: VecDeque<f32>, // last 5 marks, reinit source
+    /// EMA of measured inter-element gap durations, ms; `None` until the
+    /// first one is classified. SPEC §4.1 **[DEVIATION]**, see
+    /// `DIT_BIAS_CAP_FRAC`.
+    mu_egap_ms: Option<f32>,
 }
 
 impl SpeedTracker {
@@ -231,6 +276,7 @@ impl SpeedTracker {
             ring: VecDeque::with_capacity(DRIFT_LEN),
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
+            mu_egap_ms: None,
         }
     }
 
@@ -259,6 +305,40 @@ impl SpeedTracker {
         self.wpm_ema
     }
 
+    /// Current inter-element-gap centroid, ms. `None` until one has been
+    /// seen. SPEC §4.1 **[DEVIATION]**, see `DIT_BIAS_CAP_FRAC`.
+    pub fn mu_egap_ms(&self) -> Option<f32> {
+        self.mu_egap_ms
+    }
+
+    /// Feed one gap that `GapClassifier` classified as inter-element. EMA'd
+    /// at the same `CLUSTER_ALPHA` as the mark centroids so both halves of
+    /// the dit estimate share a time constant. SPEC §4.1 **[DEVIATION]**.
+    pub fn on_element_gap(&mut self, dur_ms: f32) {
+        if !dur_ms.is_finite() || dur_ms <= 0.0 {
+            return;
+        }
+        self.mu_egap_ms = Some(match self.mu_egap_ms {
+            None => dur_ms,
+            Some(g) => g + CLUSTER_ALPHA * (dur_ms - g),
+        });
+    }
+
+    /// The dit period used for PARIS WPM reporting: `mu_dit` with the SPEC
+    /// §3.3 threshold-crossing bias removed. Falls back to `mu_dit_ms()`
+    /// exactly when no inter-element gap has been seen yet, or when the
+    /// measured bias is negative (which the asymmetric hysteresis makes
+    /// physically impossible, so it signals broken mark/gap pairing rather
+    /// than a fast envelope). SPEC §4.1 **[DEVIATION]**.
+    pub fn dit_estimate_ms(&self) -> f32 {
+        let mu_dit = self.pair.lo;
+        let Some(g) = self.mu_egap_ms else {
+            return mu_dit;
+        };
+        let delta = (0.5 * (mu_dit - g)).clamp(0.0, DIT_BIAS_CAP_FRAC * mu_dit);
+        (mu_dit - delta).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1)
+    }
+
     /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
     pub fn on_mark(&mut self, dur_ms: f32) {
         self.recent.push_back(dur_ms);
@@ -280,7 +360,7 @@ impl SpeedTracker {
             }
             self.check_drift();
         }
-        let raw = 1200.0 / self.pair.lo;
+        let raw = 1200.0 / self.dit_estimate_ms();
         self.wpm_ema = Some(match self.wpm_ema {
             None => raw,
             Some(w) => w + WPM_ALPHA * (raw - w),
@@ -330,6 +410,9 @@ impl SpeedTracker {
             self.pair.reinit_from(&vals);
             self.apply_constraints();
             self.ring.clear();
+            // The gap centroid belongs to the *old* speed regime; keeping it
+            // would apply a stale delta to the new one.
+            self.mu_egap_ms = None;
         }
     }
 }
@@ -452,6 +535,130 @@ mod tests {
         for &d in durs {
             t.on_mark(d);
         }
+    }
+
+    /// Helper: the physical model MAN-7 fixes. A detector with threshold
+    /// overshoot `delta` measures every mark `delta` ms too long and every gap
+    /// `delta` ms too short; the true keying is unchanged.
+    fn feed_biased(t: &mut SpeedTracker, true_dit: f32, delta: f32, chars: usize) {
+        for _ in 0..chars {
+            // "A" = dit dah, with one inter-element gap between them.
+            t.on_mark(true_dit + delta);
+            t.on_element_gap(true_dit - delta);
+            t.on_mark(3.0 * true_dit + delta);
+        }
+    }
+
+    #[test]
+    fn wpm_is_uncorrected_until_an_element_gap_is_seen() {
+        // No gaps fed: behavior must be bit-identical to the pre-MAN-7 estimator.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        assert!(t.mu_egap_ms().is_none());
+        assert!((t.dit_estimate_ms() - t.mu_dit_ms()).abs() < 1e-6);
+        assert!((t.wpm().unwrap() - 20.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn element_gap_cancels_a_large_near_edge_mark_bias() {
+        // V2's measured case: 35 WPM (dit 34.286 ms) with delta = 6.92 ms.
+        // Pre-fix this reports 1200/41.21 = 29.1 WPM.
+        let mut t = SpeedTracker::new();
+        feed_biased(&mut t, 34.286, 6.92, 60);
+        assert!(
+            (t.wpm().unwrap() - 35.0).abs() < 1.0,
+            "wpm {} (mu_dit {}, mu_egap {:?})",
+            t.wpm().unwrap(),
+            t.mu_dit_ms(),
+            t.mu_egap_ms()
+        );
+        // mu_dit itself must be untouched -- downstream consumers depend on it.
+        assert!(
+            (t.mu_dit_ms() - 41.21).abs() < 1.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn element_gap_also_corrects_the_small_on_center_bias() {
+        // The ticket's on-center control: delta = 1.07 ms, pre-fix 33.94 WPM.
+        let mut t = SpeedTracker::new();
+        feed_biased(&mut t, 34.286, 1.07, 60);
+        assert!(
+            (t.wpm().unwrap() - 35.0).abs() < 0.7,
+            "wpm {}",
+            t.wpm().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_zero_bias_detector_reports_the_same_wpm_as_before() {
+        // delta = 0 (ideal rectangular envelope): the correction must be a no-op.
+        let mut t = SpeedTracker::new();
+        feed_biased(&mut t, 48.0, 0.0, 60);
+        assert!(
+            (t.wpm().unwrap() - 25.0).abs() < 0.3,
+            "wpm {}",
+            t.wpm().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_negative_measured_bias_falls_back_to_the_uncorrected_estimate() {
+        // Gaps longer than marks implies delta < 0, which the SPEC §3.3 hysteresis
+        // (up 1.25T > down 0.80T) makes physically impossible -- it means the
+        // mark/gap pairing broke (merged or dropped runs). Clamp to no correction
+        // rather than inflating the report.
+        let mut t = SpeedTracker::new();
+        feed_biased(&mut t, 48.0, -8.0, 60);
+        assert!(
+            (t.dit_estimate_ms() - t.mu_dit_ms()).abs() < 1e-6,
+            "expected fallback, got dit_estimate {} vs mu_dit {}",
+            t.dit_estimate_ms(),
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn the_bias_correction_is_capped() {
+        // Pathologically short gaps (e.g. element gaps mostly eaten by the 12 ms
+        // debounce at very high WPM) must not be able to inflate WPM without bound.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..40 {
+            t.on_element_gap(1.0);
+            t.on_mark(60.0);
+        }
+        assert!(
+            t.dit_estimate_ms() >= 0.65 * t.mu_dit_ms() - 1e-3,
+            "correction exceeded the cap: {} vs mu_dit {}",
+            t.dit_estimate_ms(),
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn a_speed_regime_change_discards_the_stale_gap_centroid() {
+        // check_drift reinitializes the mark clusters on a QRQ/QRS step; a gap
+        // centroid from the old speed would produce a badly wrong delta during the
+        // transition, so it must be dropped at the same moment.
+        let mut t = SpeedTracker::new();
+        feed_biased(&mut t, 60.0, 4.0, 20); // 20 WPM
+        assert!(t.mu_egap_ms().is_some());
+        for _ in 0..14 {
+            t.on_mark(34.0); // step to 35 WPM, all far below the old dit centroid
+        }
+        assert!(
+            (t.mu_dit_ms() - 34.0).abs() < 1.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            t.mu_egap_ms().is_none(),
+            "stale gap centroid survived a regime change: {:?}",
+            t.mu_egap_ms()
+        );
     }
 
     #[test]

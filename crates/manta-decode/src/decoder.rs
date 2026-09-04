@@ -164,7 +164,13 @@ impl TrackDecoder {
                 return;
             }
             match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
-                GapClass::InterElement => {}
+                // MAN-7: the inter-element gap is the bias-cancelling half of
+                // the dit estimate (SpeedTracker::dit_estimate_ms). Fed on
+                // both the live and the retroactive-drain path: unlike marks
+                // (which already fed the tracker in `on_run` before the
+                // pending buffer drained), gaps have never been observed at
+                // this point, so there is no double-counting either way.
+                GapClass::InterElement => self.tracker.on_element_gap(dur_ms),
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
@@ -307,6 +313,46 @@ mod tests {
         env
     }
 
+    /// `rect_envelope` with MAN-7's threshold-crossing skew applied: every mark
+    /// runs `skew` hops long and every gap `skew` hops short, leaving the true
+    /// element period unchanged. This is exactly what Demod measures for a
+    /// signal whose recovered envelope transitions slowly (SPEC §3.3
+    /// hysteresis: key-down at 1.25*T, key-up at 0.80*T).
+    fn rect_envelope_skewed(text: &str, dit_hops: u32, skew: u32) -> Vec<f32> {
+        let mut env = Vec::new();
+        let mut push = |level: f32, hops: u32| {
+            for _ in 0..hops {
+                env.push(level);
+            }
+        };
+        let words: Vec<&str> = text.split_whitespace().collect();
+        for (wi, word) in words.iter().enumerate() {
+            let chars: Vec<char> = word.chars().collect();
+            for (ci, c) in chars.iter().enumerate() {
+                let pat = pattern_for(*c).unwrap();
+                let els: Vec<char> = pat.chars().collect();
+                for (ei, e) in els.iter().enumerate() {
+                    push(
+                        1.0,
+                        (if *e == '.' { dit_hops } else { 3 * dit_hops }) + skew,
+                    );
+                    if ei < els.len() - 1 {
+                        push(0.0, dit_hops - skew);
+                    }
+                }
+                if ci < chars.len() - 1 {
+                    push(0.0, 3 * dit_hops - skew);
+                }
+            }
+            if wi < words.len() - 1 {
+                push(0.0, 7 * dit_hops - skew);
+            }
+        }
+        // The trailing flush tail is left unskewed.
+        push(0.0, 8 * dit_hops); // tail so the last word flushes by timeout
+        env
+    }
+
     fn decode(text: &str) -> (String, Vec<DecoderEvent>) {
         let env = rect_envelope(text, 18);
         let mut dec = TrackDecoder::new(1, DecodeConfig::default());
@@ -347,6 +393,45 @@ mod tests {
         ));
         assert!(events.iter().any(
             |e| matches!(e, DecoderEvent::TrackMeta { freq_hz, .. } if *freq_hz == 14_012_340.0)
+        ));
+    }
+
+    #[test]
+    fn reported_wpm_is_not_inflated_by_threshold_crossing_skew() {
+        // 18 hops/dit = 48 ms = 25 WPM. skew = 3 hops = 8 ms: the pre-MAN-7
+        // estimator reports 1200/56 = 21.4 WPM; the corrected one reports 25.
+        let env = rect_envelope_skewed("CQ CQ DE W1AW W1AW K", 18, 3);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let wpm = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .expect("no SpeedUpdate emitted");
+        assert!(
+            (wpm - 25.0).abs() < 1.5,
+            "skewed envelope reported {wpm} WPM, expected ~25 (pre-fix: ~21.4)"
+        );
+        // The decode itself must be unaffected: mu_dit is deliberately left
+        // biased, so gap ratios are unchanged.
+        assert_eq!(events_to_text(&events), "CQ CQ DE W1AW W1AW K");
+    }
+
+    #[test]
+    fn an_unskewed_envelope_reports_the_same_wpm_as_before_man7() {
+        // Regression guard on the no-op case: with skew = 0, marks and element
+        // gaps are equal, delta = 0, and the estimate is byte-identical to
+        // 1200/mu_dit.
+        let (_, events) = decode("CQ CQ DE W1AW W1AW K");
+        assert!(events.iter().any(
+            |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - 25.0).abs() < 1.0)
         ));
     }
 
