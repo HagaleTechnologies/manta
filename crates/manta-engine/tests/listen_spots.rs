@@ -1,9 +1,9 @@
 //! `listen()`'s new `on_spot` callback: a real `manta-spot::Validator`
 //! run over the streamed event sequence. Uses a raw-complex-IQ in-memory
-//! source (not `AudioIqSource`) to avoid the pre-existing near-DC Hilbert
-//! leakage tracked as issue #21 (see `listen_audio.rs`'s doc comment) --
-//! unrelated to this task, and this test doesn't need real audio hardware
-//! semantics to exercise `on_spot`.
+//! source (not `AudioIqSource`) for isolation and speed -- this test
+//! doesn't need real audio-hardware semantics to exercise `on_spot`. The
+//! near-DC Hilbert leakage this file's sources used to dodge (issue #21)
+//! is fixed as of MAN-4; see `listen_audio.rs`'s doc comment.
 
 use manta_engine::{listen, PipelineConfig, Spot};
 use manta_testkit::scene::{render_scene, SignalSpec};

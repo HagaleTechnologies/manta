@@ -117,7 +117,13 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
 - **Audio passband** (via `coppa-audio`): 48 kHz real audio from a rig's RX audio,
   Hilbert-transformed to analytic. Degenerate ~3 kHz "wideband" mode; exists
   because it makes manta useful to people with zero SDR hardware, and it is the
-  M1 bring-up path.
+  M1 bring-up path. **Usable band (MAN-4):** no finite Hilbert FIR delivers
+  trustworthy image rejection arbitrarily close to DC or +/-Nyquist, so the
+  audio path's real signal band is `[HILBERT_GUARD_HZ, fs/2 - HILBERT_GUARD_HZ]`
+  (300 Hz .. 23,700 Hz at 48 kHz) -- the detector will not spawn a track
+  outside it (`manta_input::IqSource::analytic_guard_hz`,
+  `DetectorConfig::guard_hz`). See
+  docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md.
 
 **Sample-rate assumptions.** Design center: 96–192 kS/s complex (covers any HF CW
 band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s

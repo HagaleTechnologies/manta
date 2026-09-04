@@ -26,7 +26,13 @@ copying speed for a first pass.
 4. Watch stdout. Expected: readable text tracking the code practice
    transmission (callsigns, "CQ", punctuation-adjacent prosigns) --- not
    necessarily perfect, but clearly *recognizable*, matching ROADMAP's M1
-   bar.
+   bar. **Expected, by design (MAN-4):** no track will ever appear for
+   audio content below ~300 Hz or above ~fs/2 - 300 Hz (23.7 kHz at
+   48 kHz) -- the detector's DC/Nyquist guard band refuses to spawn there,
+   since no finite Hilbert front end can deliver trustworthy image
+   rejection that close to DC/Nyquist. If your rig audio places CW tones
+   outside that band, retune your radio's sidetone/pitch offset into it
+   (any normal 400-1000 Hz CW pitch is comfortably inside).
 5. Let it run at least several minutes to also eyeball basic stability
    (no panic, no runaway CPU/memory in Activity Monitor / htop).
 6. Record the result (date, band, rough accuracy impression, any issues)

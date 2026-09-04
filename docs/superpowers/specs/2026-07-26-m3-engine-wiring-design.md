@@ -142,7 +142,9 @@ grep — no others exist):
   scope for this sub-project.
 - `crates/manta-engine/tests/listen_audio.rs`: `|_spot| {}` — test is
   already `#[ignore]`d (pre-existing Hilbert near-DC issue, issue #21,
-  unrelated to this change); just needs to keep compiling.
+  unrelated to this change); just needs to keep compiling. **Resolved by
+  MAN-4** (2026-09-04): the test is no longer `#[ignore]`d; see
+  docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md.
 - `manta-cli`'s `Listen` command: real handling, below.
 
 ### `manta-cli`

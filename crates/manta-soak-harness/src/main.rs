@@ -301,6 +301,13 @@ impl IqSource for LoopingAudioIqSource {
         0.0 // audio has no RF reference, matches AudioIqSource
     }
 
+    /// MAN-4: this source applies the identical Hilbert conversion
+    /// `AudioIqSource` does (this struct's own doc comment above), so it
+    /// has the identical near-DC/Nyquist image-leakage guard requirement.
+    fn analytic_guard_hz(&self) -> f64 {
+        manta_dsp::hilbert::HILBERT_GUARD_HZ
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let mut real = vec![0.0f32; buf.len()];
         let mut filled = 0;

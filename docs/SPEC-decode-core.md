@@ -142,6 +142,17 @@ Startup: for the first 10 s the ring is partially filled; the quantile is
 taken over whatever is present, and track creation is inhibited for the first
 **2 s** (`detector.warmup_ms = 2000`) to avoid floor-transient garbage.
 
+**DC/Nyquist spawn guard (MAN-4):** track creation is also inhibited on any
+channel whose signed baseband offset is within `detector.guard_hz` of DC or
+of +/-Nyquist (`0.0` by default -- no guard at all). Floor/gate estimation
+still runs on every channel regardless; only spawning is gated. Sources that
+synthesize an analytic signal from real input (`manta-input::AudioIqSource`,
+whose Hilbert front end cannot deliver usable image rejection arbitrarily
+close to DC/Nyquist) declare their own floor via `IqSource::analytic_guard_hz`,
+and `listen()` raises the configured `guard_hz` to at least that floor —
+never below it. Sources that supply genuine complex IQ (file/SDR) declare
+`0.0` and are unaffected.
+
 ### 2.3 Gate
 
 Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
@@ -558,6 +569,7 @@ confirm_ms = 50        hang_ms = 5000
 gc_ms = 30000          warmup_ms = 2000
 floor_quantile = 0.25  floor_window_ms = 10000
 block_channels = 32    block_allowance_db = 3.0
+guard_hz = 0.0         # MAN-4: DC/+-Nyquist spawn-exclusion band, Hz
 
 [decode]
 timing_sigma = 0.25    beam_width = 4

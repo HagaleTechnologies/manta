@@ -195,11 +195,18 @@ pub fn soak_with_metrics(
         let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
             .map_err(|e| anyhow::anyhow!(e))?;
         let hop = ch.hop() as u64;
+        // MAN-4/D6: same guard-raising rule as listen.rs -- this loop is a
+        // deliberate duplicate of listen()'s construction (module doc
+        // above), so it must independently apply the source's declared
+        // analytic_guard_hz floor, or the guard is silently dead for the
+        // MAN-19 soak harness's LoopingAudioIqSource.
+        let mut detector = cfg.detector;
+        detector.guard_hz = crate::listen::effective_guard_hz(detector.guard_hz, src.analytic_guard_hz());
         let mut tm = TrackManager::new(
             ch.n_channels(),
             fs,
             center_freq_hz,
-            cfg.detector,
+            detector,
             cfg.decode.clone(),
         );
         let mut validator = Validator::bundled(fs)

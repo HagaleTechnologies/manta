@@ -21,6 +21,15 @@ const CHUNK_SAMPLES: usize = 2048;
 /// startup lead-in padding below it.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
+/// MAN-4/D6: the operator may widen the detector's DC/Nyquist guard but
+/// never narrow it below what the source's front end physically requires
+/// (`configured_hz.max(source_hz)`). Also used by `soak_with_metrics`
+/// (`soak_metrics.rs`), which duplicates this loop's construction rather
+/// than calling `listen()` directly (see that module's doc comment).
+pub(crate) fn effective_guard_hz(configured_hz: f64, source_hz: f64) -> f64 {
+    configured_hz.max(source_hz)
+}
+
 /// Run the streaming decode loop against `src` until `read` returns 0 (EOF,
 /// file replay) or `stop` is set (Ctrl-C, live audio). Each decoded event is
 /// passed to `on_event` as it's produced. Design doc §4.
@@ -52,11 +61,13 @@ pub fn listen(
     let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
+    let mut detector = cfg.detector;
+    detector.guard_hz = effective_guard_hz(detector.guard_hz, src.analytic_guard_hz());
     let mut tm = crate::track::TrackManager::new(
         ch.n_channels(),
         fs,
         center_freq_hz,
-        cfg.detector,
+        detector,
         cfg.decode.clone(),
     );
     let mut validator = Validator::bundled(fs)
@@ -139,6 +150,17 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
+    }
+
+    #[test]
+    fn listen_raises_the_configured_guard_to_the_sources_floor() {
+        // An operator config of 0.0 with an AudioIqSource must end up at
+        // HILBERT_GUARD_HZ; an operator config of 1000.0 must stay at
+        // 1000.0; a configured value below the source's floor is raised,
+        // never lowered (MAN-4/D6).
+        assert_eq!(effective_guard_hz(0.0, 300.0), 300.0);
+        assert_eq!(effective_guard_hz(1000.0, 300.0), 1000.0);
+        assert_eq!(effective_guard_hz(100.0, 300.0), 300.0);
     }
 
     #[test]
@@ -314,6 +336,88 @@ mod tests {
         assert!(
             spots.is_empty(),
             "blocklisted callsign must never be spotted, got {spots:?}"
+        );
+    }
+
+    /// MAN-4's Gherkin, at the level where it can actually be measured.
+    /// `listen()`'s callback API cannot reach `TrackManager` internals, so
+    /// this drives `Channelizer` + `TrackManager` directly over
+    /// `AudioIqSource`-produced IQ, which is exactly the pipeline
+    /// `listen()` runs (including this same `effective_guard_hz` raise).
+    #[test]
+    fn a_clean_audio_tone_spawns_one_track_and_no_churn() {
+        let fs = 48_000.0;
+        let tone_hz = 750.0; // 750 Hz = 8 * 93.75 Hz -- an exact channel-8 center.
+        let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
+        let (env, _keyed_text) =
+            manta_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs, 15.0).unwrap();
+
+        // MAN-4 Phase 4 contingency ladder branch 2: a strictly noiseless
+        // fixture gives the 25th-percentile floor estimator nothing but the
+        // f32 numerical floor to lock onto, so ordinary filter sidelobes
+        // ~100 dB down still clear a +12 dB gate -- a fixture artifact, not
+        // a filter defect (confirmed: without noise, spurious spawns were
+        // spread broadly across channels 4..44 and 504, not clustered near
+        // channel 8/504 the way a residual image leak would be). A
+        // realistic noise floor at +20 dB SNR-in-2500, matching
+        // `scene::render_scene`'s convention, fixes it.
+        let amp = manta_testkit::noise::amplitude_for_snr_2500(20.0, fs);
+        let mut real = vec![0.0f32; env.len()];
+        let dphi = std::f64::consts::TAU * tone_hz / fs;
+        let mut phi = 0.0f64;
+        for (i, r) in real.iter_mut().enumerate() {
+            *r = env.get(i).copied().unwrap_or(0.0) * amp * phi.cos() as f32;
+            phi += dphi;
+        }
+        manta_testkit::noise::add_real_unit_awgn(&mut real, 4);
+
+        let mut src = manta_input::AudioIqSource::new(Box::new(
+            coppa_audio::WavSource::from_samples(real, 48_000),
+        ))
+        .unwrap();
+        let all = manta_input::read_all(&mut src).unwrap();
+
+        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let detector = crate::track::DetectorConfig {
+            guard_hz: effective_guard_hz(0.0, src.analytic_guard_hz()),
+            ..crate::track::DetectorConfig::default()
+        };
+        let mut tm = crate::track::TrackManager::new(
+            ch.n_channels(),
+            fs,
+            0.0,
+            detector,
+            manta_decode::decoder::DecodeConfig::default(),
+        );
+        for chunk in all.chunks(4096) {
+            let hops = ch.process(chunk);
+            tm.process_hops(&hops, |m| m * hop_samples);
+        }
+        tm.finish();
+
+        let census = tm.spawns_by_channel();
+        let spawned: Vec<(usize, u32)> = census
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(k, c)| (k, *c))
+            .collect();
+        // The tone is at 750 Hz = channel 8 exactly; +/-1 is the ownership window.
+        assert!(
+            spawned.iter().all(|(k, _)| (7..=9).contains(k)),
+            "tracks spawned away from channel 8: {spawned:?}"
+        );
+        assert_eq!(
+            tm.total_spawns(),
+            1,
+            "spurious respawns; census {spawned:?}"
+        );
+        assert_eq!(
+            tm.close_counts().unconfirmed,
+            0,
+            "CANDIDATE churn (the 'churning track IDs' symptom): {:?}",
+            tm.close_counts()
         );
     }
 }
