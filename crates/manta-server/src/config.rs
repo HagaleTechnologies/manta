@@ -145,6 +145,22 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
+    /// Overrides the metrics listener's per-source-IP AGGREGATE completed-
+    /// request rate budget (MAN-64) -- separate from
+    /// `metrics_max_connections_per_ip` above, which bounds concurrent
+    /// connections, not request rate. `None` (default, field omitted) uses
+    /// the built-in default (`metrics_http::MAX_METRICS_REQUESTS_PER_IP`
+    /// per `metrics_http::METRICS_REQUEST_RATE_WINDOW`). `0` means no
+    /// per-IP cap -- and note that UNLIKE telnet/JSON there is no
+    /// per-connection budget left underneath it (this endpoint serves one
+    /// request per connection, see `metrics_http::write_response`'s
+    /// `Connection: close`), so `0` disables request-rate bounding on this
+    /// listener entirely; only the total connection ceiling and the
+    /// per-IP connection quota still apply. Raise it for a federated or
+    /// multi-scraper deployment where every scrape reaches manta from one
+    /// address; see `docs/RUNBOOKS/network-exposure.md`.
+    #[serde(default)]
+    pub metrics_max_requests_per_ip: Option<u32>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -303,6 +319,33 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.telnet_max_commands_per_ip, None);
         assert_eq!(cfg.json_max_pings_per_ip, Some(0));
+    }
+
+    /// MAN-64: separate from `metrics_max_connections_per_ip` (connections)
+    /// and from telnet/JSON's rate overrides (different listeners) -- the
+    /// runbook's proxy/federation guidance is per-listener, so a shared knob
+    /// would disable protection on listeners that were never behind a proxy
+    /// (PR #81 review round 3's correction, applied to this field too).
+    #[test]
+    fn metrics_request_rate_override_defaults_to_none_and_is_independent() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.metrics_max_requests_per_ip, None);
+
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            metrics_max_requests_per_ip = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.metrics_max_requests_per_ip, Some(0));
+        assert_eq!(cfg.metrics_max_connections_per_ip, None);
+        assert_eq!(cfg.telnet_max_commands_per_ip, None);
     }
 
     #[test]
