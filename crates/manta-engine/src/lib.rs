@@ -99,6 +99,13 @@ pub struct DecodeReport {
     /// Validated spots (`manta-spot::Validator`, ARCHITECTURE §6), run
     /// over the full multi-track event stream above.
     pub spots: Vec<Spot>,
+    /// MAN-9/issue #26: per-`CloseReason` close counts from this run's
+    /// `TrackManager`, additive alongside `events`/`spots` in `decode
+    /// --json` output. Lets an offline diagnostic (e.g.
+    /// `v8w_fading_diagnostics.rs`) corroborate a track-fragmentation
+    /// hypothesis (a nonzero `hang_expired` count) without needing a
+    /// separate metrics endpoint.
+    pub close_counts: SoakCloseCounts,
 }
 
 /// M0 pipeline: estimate frequency, extract one channel, decode. SPEC
@@ -226,12 +233,14 @@ pub fn decode_samples(
             *freq_hz *= calibration_factor;
         }
     }
+    let close_counts = tm.close_counts();
     Ok(DecodeReport {
         freq_hz,
         wpm,
         text,
         events,
         spots,
+        close_counts,
     })
 }
 

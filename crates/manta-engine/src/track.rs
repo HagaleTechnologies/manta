@@ -22,6 +22,31 @@ pub struct DetectorConfig {
     pub warmup_hops: u64,
     /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
     pub track_cap: usize,
+    /// **[DEVIATION from SPEC §2.5]** MAN-9/issue #26: merge radius, in
+    /// channels. SPEC §2.5 pins a fixed 1.0-channel radius; under
+    /// Watterson-Poor fading, CCIR-poor's 2 ms delay spread and 1 Hz
+    /// Doppler smear a single signal across several 93.75 Hz channels,
+    /// which a 1.0-channel radius fails to converge back into one track
+    /// (measured on V8w: 5-15 `track_id`s within 300 Hz of one signal).
+    /// Widening recovers that at the cost of merge selectivity -- must
+    /// stay strictly under the golden vectors' guaranteed minimum
+    /// separation (`MIN_SEPARATION_HZ = 300.0` Hz = 3.2 channels at
+    /// 93.75 Hz spacing, `manta-testkit::vectors::pileup_scene`) or it
+    /// starts eating genuine neighbors.
+    ///
+    /// Promoted to `1.5` (from the SPEC `1.0`): a sweep over
+    /// `{1.0, 1.5, 2.0, 2.5}` against the V8w fragmentation cluster (idx
+    /// 25/41/44, all classified F2 -- concurrent spectral spread, not
+    /// sequential drop/reacquire -- by
+    /// `v8w_fragmentation_is_sequential_or_concurrent`) found `1.5`
+    /// resolves idx 25 and 41; `2.0` and `2.5` resolve nothing further
+    /// (idx 44's 15-track cluster is not a radius-fixable case -- its
+    /// centers span further than the 2.5-channel safety ceiling allows
+    /// widening to). `1.5` is the smallest value achieving the maximal
+    /// (2/3) fix, the repo's own tie-break convention (least behavior
+    /// change for the same benefit). See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+    pub merge_radius_channels: f64,
 }
 
 impl Default for DetectorConfig {
@@ -62,6 +87,7 @@ impl Default for DetectorConfig {
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
+            merge_radius_channels: 1.5,
         }
     }
 }
@@ -99,7 +125,7 @@ pub(crate) enum CloseReason {
 /// Exposed via `TrackManager::close_counts` for the future M3 metrics
 /// endpoint to read; nothing wires it externally yet, since the Prometheus
 /// text endpoint itself is explicit M3 scope (ROADMAP.md).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CloseCounts {
     pub unconfirmed: u64,
     pub hang_expired: u64,
@@ -645,7 +671,7 @@ impl TrackManager {
                     continue;
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
-                if (ca - cb).abs() < 1.0 {
+                if (ca - cb).abs() < self.cfg.merge_radius_channels {
                     let loser = if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db
                     {
                         a
@@ -1196,6 +1222,101 @@ mod tests {
             1,
             "issue #26: merge must be counted"
         );
+    }
+
+    // MAN-9 Phase 5, branch F2 (concurrent spectral spread): CCIR-poor's
+    // 2 ms delay spread and 1 Hz Doppler smear a signal across several
+    // 93.75 Hz channels; the SPEC §2.5 default 1.0-channel merge radius is
+    // too narrow to converge them, so one transmission fragments into
+    // several `track_id`s (measured on V8w idx 25/41/44: 5-15 tracks
+    // within 300 Hz of one signal, all classified F2 -- overlapping event
+    // spans -- by `v8w_fragmentation_is_sequential_or_concurrent`, 0 as
+    // F1). See docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+
+    /// Two tracks 2.0 channels apart (within a widened radius, outside the
+    /// SPEC §2.5 default 1.0) must converge, and the survivor must be the
+    /// higher-SNR one.
+    #[test]
+    fn tracks_within_the_configured_merge_radius_converge() {
+        let cfg = DetectorConfig {
+            merge_radius_channels: 2.5,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.center = 20.0;
+            weak.current_snr_db = 8.0;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.center = 22.0; // 2.0 channels apart
+            strong.current_snr_db = 18.0;
+        }
+
+        tm.merge_converged();
+
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "2.0-channel-apart centers must merge at a 2.5-channel radius"
+        );
+        assert_eq!(
+            tm.tracks.values().next().unwrap().current_snr_db,
+            18.0,
+            "the higher-SNR track must survive"
+        );
+    }
+
+    /// Two genuinely distinct signals at V8/V8w's guaranteed minimum
+    /// separation (300 Hz = 3.2 channels at 93.75 Hz spacing,
+    /// `MIN_SEPARATION_HZ` in `manta-testkit::vectors::pileup_scene`) must
+    /// NEVER merge, even at the widened radius -- the safety bound a wider
+    /// merge radius must respect.
+    #[test]
+    fn distinct_signals_at_the_scene_minimum_separation_do_not_merge() {
+        let cfg = DetectorConfig {
+            merge_radius_channels: 2.5,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (a, b) = (ids[0], ids[1]);
+        {
+            let ta = tm.tracks.get_mut(&a).unwrap();
+            ta.center = 10.0;
+            ta.current_snr_db = 10.0;
+        }
+        {
+            let tb = tm.tracks.get_mut(&b).unwrap();
+            tb.center = 13.2; // 3.2 channels: the scene's guaranteed minimum
+            tb.current_snr_db = 10.0;
+        }
+
+        tm.merge_converged();
+
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "distinct signals at the scene's 300 Hz minimum separation must never merge"
+        );
+    }
+
+    /// Promoted default: `1.5`, not the SPEC §2.5 literal `1.0` -- see
+    /// `merge_radius_channels`'s doc comment for the sweep that promoted
+    /// it. Still strictly under the golden vectors' 300 Hz / 3.2-channel
+    /// guaranteed minimum separation.
+    #[test]
+    fn merge_radius_channels_default_is_the_promoted_value() {
+        assert_eq!(DetectorConfig::default().merge_radius_channels, 1.5);
     }
 
     /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render

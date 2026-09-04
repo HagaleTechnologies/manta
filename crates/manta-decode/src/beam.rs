@@ -7,6 +7,16 @@ use crate::tree::{Element, Glyph, MorseTree, NodeId, Prosign};
 pub struct BeamConfig {
     /// SPEC §9 decode.beam_width
     pub width: usize,
+    /// **[DEVIATION from SPEC §9 decode.beam_width]** MAN-9: beam width
+    /// used when the per-character channel-quality term `q` (SPEC §4.5) is
+    /// below `q_low`. Fading distorts mark durations enough to prune the
+    /// correct hypothesis at width 4; widening only for low-q characters
+    /// buys that back without paying for it on every clean character (Pi 4
+    /// CPU budget, ROADMAP M2). Defaults to `width` (= SPEC behavior). See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+    pub width_low_q: usize,
+    /// Threshold on `q`, exclusive-below. SPEC §4.5 clamps q to [0.3, 1.0].
+    pub q_low: f32,
     /// SPEC §9 decode.timing_sigma — "the riskiest constant in the spec"
     pub sigma: f32,
 }
@@ -15,7 +25,21 @@ impl Default for BeamConfig {
     fn default() -> Self {
         BeamConfig {
             width: 4,
+            width_low_q: 4,
+            q_low: 0.6,
             sigma: 0.25,
+        }
+    }
+}
+
+impl BeamConfig {
+    /// The beam width to use for a character decoded at channel quality
+    /// `q`. MAN-9 Rung 2.
+    pub fn effective_width(&self, q: f32) -> usize {
+        if q < self.q_low {
+            self.width_low_q
+        } else {
+            self.width
         }
     }
 }
@@ -101,7 +125,7 @@ pub fn decode_char(
                 .total_cmp(&a.score)
                 .then_with(|| a.path.cmp(&b.path))
         });
-        next.truncate(cfg.width);
+        next.truncate(cfg.effective_width(q));
         hyps = next;
     }
 
@@ -136,6 +160,8 @@ mod tests {
 
     const CFG: BeamConfig = BeamConfig {
         width: 4,
+        width_low_q: 4,
+        q_low: 0.6,
         sigma: 0.25,
     };
 
@@ -210,5 +236,63 @@ mod tests {
         let b = decode_char(&marks, 60.0, 180.0, 0.8, &CFG).unwrap();
         assert_eq!(a.glyph, b.glyph);
         assert_eq!(a.confidence.to_bits(), b.confidence.to_bits());
+    }
+
+    // MAN-9 Phase 3: quality-gated beam width (Rung 2). Under fading,
+    // distorted mark durations push the correct dit/dah assignment out of
+    // the top `width` at an intermediate truncation step, after which it
+    // can never be recovered (the beam is character-local and greedy
+    // across characters, SPEC §4.3-4.5). See
+    // docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+
+    /// A distorted mark sequence whose correct glyph is pruned at width 4
+    /// must be recovered at width 12. Found by a computational search over
+    /// `TABLE`'s patterns (>= 5 elements) for width-4/width-12 divergence
+    /// under severe (0.25x-3.5x) per-mark jitter -- "0" (-----) here, not
+    /// the plan's illustrative "7", because that was the first clean
+    /// real-glyph-vs-real-glyph confusion (narrow prunes to '7') the
+    /// search found; both demonstrate the same width-sensitivity property
+    /// against a real Morse-tree path, not a hand-waved one.
+    #[test]
+    fn wider_beam_recovers_a_glyph_pruned_at_width_4() {
+        let marks = [136.8525, 435.83624, 64.06875, 57.6825, 356.0325];
+        let narrow = BeamConfig {
+            width: 4,
+            width_low_q: 4,
+            q_low: 0.6,
+            sigma: 0.25,
+        };
+        let wide = BeamConfig {
+            width: 12,
+            width_low_q: 12,
+            q_low: 0.6,
+            sigma: 0.25,
+        };
+        let n = decode_char(&marks, 50.0, 150.0, 0.4, &narrow).unwrap();
+        let w = decode_char(&marks, 50.0, 150.0, 0.4, &wide).unwrap();
+        assert_eq!(n.glyph, Glyph::Char('7'));
+        assert_ne!(n.glyph, w.glyph);
+        assert_eq!(w.glyph, Glyph::Char('0'));
+    }
+
+    /// Width selection must be deterministic and depend only on q.
+    #[test]
+    fn low_q_selects_the_wide_beam_and_high_q_does_not() {
+        let cfg = BeamConfig {
+            width: 4,
+            width_low_q: 12,
+            q_low: 0.6,
+            sigma: 0.25,
+        };
+        assert_eq!(cfg.effective_width(0.95), 4);
+        assert_eq!(cfg.effective_width(0.40), 12);
+        assert_eq!(cfg.effective_width(0.60), 4); // boundary is exclusive-below
+    }
+
+    /// Defaults reproduce today exactly.
+    #[test]
+    fn beam_width_low_q_defaults_to_the_base_width() {
+        let d = BeamConfig::default();
+        assert_eq!(d.width_low_q, d.width);
     }
 }

@@ -9,6 +9,17 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
+use std::sync::OnceLock;
+
+/// One V8w render+decode shared by every test in this binary. `cargo test`
+/// runs a binary's tests as threads in one process, so a `OnceLock` is
+/// honored across them; the 120 s / 96 kS/s / 50-signal scene under
+/// Watterson-Poor fading is far too expensive (measured ~200 s) to pay for
+/// per test.
+fn v8w_decode() -> &'static (serde_json::Value, manta_testkit::vectors::Manifest) {
+    static CACHE: OnceLock<(serde_json::Value, manta_testkit::vectors::Manifest)> = OnceLock::new();
+    CACHE.get_or_init(|| decode_report(&manta_testkit::vectors::v8w()))
+}
 
 fn decode_report(
     spec: &manta_testkit::vectors::VectorSpec,
@@ -90,6 +101,46 @@ fn match_tracks_by_freq<'a>(
                 .unwrap()
         })
         .collect()
+}
+
+/// Count of decoded tracks whose last-reported `freq_hz` lies within
+/// `within_hz` of `expected_freq_hz` -- the fragmentation-cluster-size
+/// column of the Phase 1 diagnostic table.
+fn tracks_near(
+    tracks: &BTreeMap<u64, (String, Option<f64>)>,
+    expected_freq_hz: f64,
+    within_hz: f64,
+) -> usize {
+    tracks
+        .values()
+        .filter(|(_, f)| f.is_some_and(|f| (f - expected_freq_hz).abs() <= within_hz))
+        .count()
+}
+
+/// One row of the Phase 1 per-signal diagnostic table.
+#[derive(Debug, serde::Serialize)]
+struct SignalRow {
+    idx: usize,
+    call: String,
+    snr_2500_db: f32,
+    wpm: f32,
+    expected_freq_hz: f64,
+    cer: f64,
+    len_ratio: f64,
+    tracks_within_300hz: usize,
+}
+
+fn print_table(rows: &[SignalRow]) {
+    println!(
+        "{:>3} {:<10} {:>7} {:>5} {:>9} {:>6} {:>4}",
+        "idx", "call", "snr_db", "wpm", "cer", "len_r", "trks"
+    );
+    for r in rows {
+        println!(
+            "{:>3} {:<10} {:>7.1} {:>5.1} {:>9.3} {:>6.2} {:>4}",
+            r.idx, r.call, r.snr_2500_db, r.wpm, r.cer, r.len_ratio, r.tracks_within_300hz
+        );
+    }
 }
 
 /// `(callsign, track_id)` pairs from `report["spots"]` -- the real
@@ -181,15 +232,15 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 #[ignore]
 fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
     let spec = manta_testkit::vectors::v8w();
-    let (report, manifest) = decode_report(&spec);
-    let tracks = per_track(&report);
+    let (report, manifest) = v8w_decode();
+    let tracks = per_track(report);
     let known_calls: HashSet<&str> = manifest
         .keyed_texts
         .iter()
         .map(|t| call_from_keyed_text(t))
         .collect();
 
-    let matched = match_tracks_by_freq(&manifest, &tracks);
+    let matched = match_tracks_by_freq(manifest, &tracks);
     let strong: Vec<usize> = spec
         .signals
         .iter()
@@ -218,7 +269,7 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
         pct * 100.0
     );
 
-    let spots = spotted_calls(&report);
+    let spots = spotted_calls(report);
     let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
     let bogus: Vec<&str> = spotted
         .iter()
@@ -244,4 +295,54 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
             track_ids.len()
         );
     }
+}
+
+/// Diagnostic, not a gate: prints the full per-signal V8w table and writes a
+/// machine-readable summary to `$MANTA_V8W_REPORT` if set. This is the
+/// artifact `ROADMAP.md`'s M4 acceptance criterion ("fusion beats
+/// classical-only CER by a measured, documented margin") has to diff
+/// against -- MAN-9 Phase 1.
+///
+/// cargo test -p manta-cli --test golden_v8_v8w -- --ignored --nocapture \
+///     v8w_per_signal_cer_report
+#[test]
+#[ignore]
+fn v8w_per_signal_cer_report() {
+    let spec = manta_testkit::vectors::v8w();
+    let (report, manifest) = v8w_decode();
+    let tracks = per_track(report);
+    let matched = match_tracks_by_freq(manifest, &tracks);
+
+    let mut rows = Vec::new();
+    for (i, sig) in spec.signals.iter().enumerate() {
+        let (decoded, _freq) = matched[i];
+        let expected = &manifest.keyed_texts[i];
+        let expected_freq_hz = manifest.expected_freqs_hz[i];
+        rows.push(SignalRow {
+            idx: i,
+            call: call_from_keyed_text(expected).to_string(),
+            snr_2500_db: sig.snr_2500_db,
+            wpm: sig.wpm,
+            expected_freq_hz,
+            cer: manta_testkit::cer::cer(expected, decoded),
+            len_ratio: decoded.chars().count() as f64 / expected.chars().count() as f64,
+            tracks_within_300hz: tracks_near(&tracks, expected_freq_hz, 300.0),
+        });
+    }
+    print_table(&rows);
+    if let Ok(path) = std::env::var("MANTA_V8W_REPORT") {
+        std::fs::write(path, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+    }
+
+    // Deliberately weak: this test exists to report, and to fail loudly only
+    // if the decode collapses or the scene stops matching the ticket's
+    // premise -- it is not the golden gate (that stays
+    // `v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts`, whose
+    // thresholds this test never touches).
+    let strong: Vec<&SignalRow> = rows.iter().filter(|r| r.snr_2500_db >= 6.0).collect();
+    assert_eq!(strong.len(), 34, "V8w strong-signal count must stay 34");
+    assert!(
+        strong.iter().filter(|r| r.cer < 0.10).count() >= 1,
+        "V8w regressed below its recorded 1/34 baseline"
+    );
 }

@@ -79,6 +79,14 @@ struct ClusterPair {
     /// and can misfire on long real-audio silence gaps) preserves the original
     /// "always assume the low cluster is real" default.
     unimodal_ceiling: Option<f32>,
+    /// MAN-9 Rung 3: `Some(admission)` gates the EMA centroid update below
+    /// (not the init or unconfirmed-re-anchor paths -- see `observe`) by
+    /// `admission`'s bounds on `v`'s ratio to the centroid it would move.
+    /// `SpeedTracker` always sets this (defaulting to
+    /// `MarkAdmission::default()`, wide open = SPEC behavior);
+    /// `GapClassifier` leaves it `None` -- outlier admission is a mark-
+    /// duration concern, not a gap-classification one.
+    admission: Option<MarkAdmission>,
 }
 
 impl ClusterPair {
@@ -91,6 +99,7 @@ impl ClusterPair {
             confirmed: false,
             placeholder_is_lo: false,
             unimodal_ceiling,
+            admission: None,
         }
     }
 
@@ -133,11 +142,27 @@ impl ClusterPair {
             }
         }
         if v < self.boundary() {
-            self.lo += CLUSTER_ALPHA * (v - self.lo);
-        } else {
+            if self.admitted(v, self.lo) {
+                self.lo += CLUSTER_ALPHA * (v - self.lo);
+            }
+        } else if self.admitted(v, self.hi) {
             self.hi += CLUSTER_ALPHA * (v - self.hi);
         }
         false
+    }
+
+    /// MAN-9 Rung 3: whether `v` is close enough to `centroid` (the
+    /// centroid `v` would move) to be trusted for the EMA update.
+    /// `admission == None` (GapClassifier, or a `SpeedTracker` at the
+    /// default wide-open bounds) always admits.
+    fn admitted(&self, v: f32, centroid: f32) -> bool {
+        match self.admission {
+            None => true,
+            Some(a) => {
+                let ratio = v / centroid;
+                ratio >= a.lo && ratio <= a.hi
+            }
+        }
     }
 
     /// Pinned decision 20 (`docs/DECISIONS/2026-07-11-m0-implementation-pins.md`),
@@ -213,6 +238,29 @@ impl ClusterPair {
     }
 }
 
+/// **[DEVIATION from SPEC §4.1]** MAN-9: bounds, as a ratio to the nearest
+/// centroid, outside which a mark is excluded from the centroid EMA
+/// update. SPEC §4.1 admits every mark. Under Watterson-Poor fading a
+/// truncated mark drags mu_dit for ~1/CLUSTER_ALPHA marks afterwards, so
+/// corruption outlives the fade that caused it. Excluded marks are still
+/// counted for the §4.1 drift/regime-change rule, so a genuine speed
+/// change re-anchors normally. Default `(0.0, INFINITY)` = SPEC behavior.
+/// See docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarkAdmission {
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl Default for MarkAdmission {
+    fn default() -> Self {
+        MarkAdmission {
+            lo: 0.0,
+            hi: f32::INFINITY,
+        }
+    }
+}
+
 /// Mark-duration speed tracker. SPEC §4.1.
 #[derive(Debug, Clone)]
 pub struct SpeedTracker {
@@ -223,11 +271,21 @@ pub struct SpeedTracker {
 }
 
 impl SpeedTracker {
-    /// A tracker with no marks observed yet. SPEC §4.1.
+    /// A tracker with no marks observed yet, mark admission wide open
+    /// (SPEC §4.1 behavior). SPEC §4.1.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::with_admission(MarkAdmission::default())
+    }
+
+    /// MAN-9 Rung 3: a tracker with no marks observed yet, gating its
+    /// centroid EMA updates by `admission`. `MarkAdmission::default()`
+    /// (wide open) is byte-identical to `new()`.
+    pub fn with_admission(admission: MarkAdmission) -> Self {
+        let mut pair = ClusterPair::new(Some(DIT_CLAMP_MS.1));
+        pair.admission = Some(admission);
         SpeedTracker {
-            pair: ClusterPair::new(Some(DIT_CLAMP_MS.1)),
+            pair,
             ring: VecDeque::with_capacity(DRIFT_LEN),
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
@@ -519,6 +577,74 @@ mod tests {
             (t.mu_dit_ms() - 34.0).abs() < 1.0,
             "mu_dit {}",
             t.mu_dit_ms()
+        );
+    }
+
+    // MAN-9 Phase 4: speed-tracker outlier admission (Rung 3). A
+    // fade-truncated mark drags `mu_dit`/`mu_dah` for ~1/CLUSTER_ALPHA
+    // marks afterward, so corruption outlives the fade that caused it --
+    // distinct from MAN-8's `CLUSTER_ALPHA` rung, which changes how fast
+    // centroids move; this changes which samples are allowed to move them
+    // at all. See docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+
+    /// A single fade-truncated mark must not move mu_dit measurably.
+    /// Without admission (SPEC default), one 0.24x outlier (12 ms against
+    /// a 50 ms centroid) moves mu_dit by ~11%; with `lo: 0.45` it is
+    /// rejected outright.
+    #[test]
+    fn an_isolated_outlier_mark_does_not_move_the_centroids() {
+        let mut t = SpeedTracker::with_admission(MarkAdmission { lo: 0.45, hi: 2.20 });
+        for _ in 0..20 {
+            t.on_mark(50.0);
+            t.on_mark(150.0);
+        }
+        let before = t.mu_dit_ms();
+        t.on_mark(12.0); // fade-truncated dit
+        assert!(
+            (t.mu_dit_ms() - before).abs() / before < 0.01,
+            "mu_dit moved from {before} to {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    /// A genuine, sustained speed change must still re-anchor: outlier
+    /// rejection must not defeat the SPEC §4.1 regime-change rule (a 2x
+    /// speed-up's ratio, 0.5, sits inside the admission band, so the EMA
+    /// -- or, if it doesn't converge fast enough on its own, the drift
+    /// rule -- still tracks it).
+    #[test]
+    fn a_sustained_speed_change_still_reinitializes_the_tracker() {
+        // Same shape as the sibling `step_speed_change_reinitializes`
+        // (bimodal init, then a homogeneous burst of fast marks): a mark
+        // at 25 ms against the old 50 ms dit centroid has ratio 0.5, which
+        // is inside the (0.45, 2.20) admission band, so nothing here is
+        // ever rejected -- this proves outlier admission is not what
+        // recovers the regime change (that's still the SPEC §4.1 drift
+        // rule), only that admission doesn't block it from working.
+        let mut t = SpeedTracker::with_admission(MarkAdmission { lo: 0.45, hi: 2.20 });
+        for _ in 0..20 {
+            t.on_mark(50.0);
+            t.on_mark(150.0);
+        }
+        for _ in 0..14 {
+            t.on_mark(25.0); // fast dits, all far below the old dit centroid
+        }
+        assert!(
+            (t.mu_dit_ms() - 25.0).abs() < 1.0,
+            "tracker must follow a real regime change, got {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    /// Default admission is wide open: byte-identical to today.
+    #[test]
+    fn default_admission_admits_every_mark() {
+        assert_eq!(
+            MarkAdmission::default(),
+            MarkAdmission {
+                lo: 0.0,
+                hi: f32::INFINITY
+            }
         );
     }
 
