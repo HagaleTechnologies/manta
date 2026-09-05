@@ -3,10 +3,13 @@
 # rust-toolchain.toml pins, on whatever machine is running.
 #
 # Why a guard at all: rustup honours rust-toolchain.toml silently. A pin that
-# stops being honoured (someone sets `channel = "stable"`, a CI step runs
-# `cargo +stable`, a runner image ships a rustc outside rustup) degrades back to
-# the floating behaviour MAN-36 removed, with no visible symptom until two
-# builds disagree. This turns that into a failed required check.
+# stops being honoured (someone sets `channel = "stable"`, a runner image
+# ships a rustc outside rustup) degrades back to the floating behaviour
+# MAN-36 removed, with no visible symptom until two builds disagree. This
+# turns that into a failed required check. NOTE: this only asserts the
+# AMBIENT default rustc this guard itself resolves to -- a one-off `cargo
+# +stable` elsewhere in the same job explicitly overrides the pin for that
+# single invocation and is not, and cannot be, caught here.
 #
 # Deliberately needs NO network and NO jq -- unlike
 # scripts/check-dependabot-cargo-unlock.sh, so it IS wired into required CI
@@ -54,6 +57,13 @@ awk -v a="$pinned" -v b="$msrv" '
     }
     exit 0;
   }' || fail "$PIN_FILE pins $pinned, below Cargo.toml's rust-version MSRV floor of $msrv."
+
+# Checked explicitly, not left to fail via `set -e`: an unguarded `rustc
+# --version` on a machine with no rustc at all on PATH dies with a bare
+# shell "command not found" and exit 127 -- before this script's own,
+# more actionable diagnostic below ever runs.
+command -v rustc >/dev/null 2>&1 ||
+  fail "no rustc on PATH. If rustup is managing this checkout, run any cargo command from the repo root to let it install the pin; if rustc is not rustup-managed, install $pinned."
 
 # rustc, not cargo: cargo's own version numbering is a separate series (the
 # release-channel manifest lists [pkg.cargo] version = "0.99.0" for Rust

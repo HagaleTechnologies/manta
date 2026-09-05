@@ -30,8 +30,14 @@
 channel = "1.98.1"
 # Mirrors exactly what ci.yml's toolchain step installs (`components: rustfmt,
 # clippy`), so a fresh clone can run the same fmt/clippy gate CI runs.
-# `minimal` keeps CI runners and the Docker builder from pulling rust-docs that
-# no build step reads; IDE users who want std sources run
-# `rustup component add rust-src`.
+# `minimal` keeps rust-docs (which no build step here reads) out of every
+# install this file drives; IDE users who want std sources run `rustup
+# component add rust-src`. The `components` line below still pulls rustfmt
+# and clippy into every install this file drives too, including the Docker
+# builder stage and `cross`'s container, neither of which runs fmt/clippy --
+# accepted, not fixed: both land in a discarded/ephemeral layer (see this
+# ticket's plan, "Performance Considerations"), so the cost is a few extra
+# seconds of install time, not image size, and the fresh-clone convenience is
+# worth that.
 profile = "minimal"
 components = ["rustfmt", "clippy"]
