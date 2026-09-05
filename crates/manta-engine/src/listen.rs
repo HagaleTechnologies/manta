@@ -313,6 +313,16 @@ mod tests {
     /// `AudioIqSource`-produced IQ, exactly the pipeline `listen()` runs,
     /// and asserts the per-channel spawn census rather than just the
     /// decoded text.
+    ///
+    /// **Remediation round finding, not in the original plan:** the
+    /// Hilbert widening and guard band alone were not enough -- see this
+    /// module's doc comment on `is_guarded` and
+    /// docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md pins 12-13 for
+    /// the two additional, measured mechanisms this fixture now exercises:
+    /// a strictly noiseless fixture giving `FloorBank` no real percentile
+    /// floor to find, and a keyed (not steady) tone's image surviving at
+    /// its own Hilbert-mirror channel long enough to promote and decode in
+    /// parallel with the real signal.
     #[test]
     fn a_clean_audio_tone_spawns_one_track_and_no_churn() {
         use manta_input::AudioIqSource;
@@ -330,6 +340,13 @@ mod tests {
             *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
             phi += dphi;
         }
+        // MAN-4 remediation: a real receiver never delivers digital
+        // silence during key-up -- see `is_guarded`'s doc comment.
+        manta_testkit::noise::add_real_awgn(
+            &mut real,
+            manta_testkit::noise::real_noise_sigma_for_snr_2500(30.0, fs),
+            0xC0FFEE,
+        );
 
         let mut src =
             AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000)))
@@ -354,7 +371,14 @@ mod tests {
             let hops = ch.process(chunk);
             tm.process_hops(&hops, |m| m * hop_samples);
         }
-        tm.finish();
+
+        // The ticket's own Gherkin: exactly one track is still open (and so
+        // still decoding) once the whole signal has been fed through.
+        assert_eq!(
+            tm.active_track_count(),
+            1,
+            "exactly one track (the real 750 Hz signal) must still be open"
+        );
 
         let census = tm.spawns_by_channel();
         let spawned: Vec<(usize, u32)> = census
@@ -363,22 +387,26 @@ mod tests {
             .filter(|(_, c)| **c > 0)
             .map(|(k, c)| (k, *c))
             .collect();
-        // The tone is at 750 Hz = channel 8 exactly; +/-1 is the ownership window.
+        // The tone is at 750 Hz = channel 8 exactly. Channels 6/7/9/10 are
+        // the already-pinned, out-of-scope ~2.5-channel separation-floor
+        // artifact (docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md
+        // item 4), not a MAN-4 regression -- every one of them must close
+        // Unconfirmed, never promote (checked below).
         assert!(
-            spawned.iter().all(|(k, _)| (7..=9).contains(k)),
-            "tracks spawned away from channel 8: {spawned:?}"
+            spawned.iter().all(|(k, _)| (6..=10).contains(k)),
+            "tracks spawned outside the signal's separation-floor neighborhood: {spawned:?}"
         );
+        let cc = tm.close_counts();
         assert_eq!(
-            tm.total_spawns(),
-            1,
-            "spurious respawns; census {spawned:?}"
+            cc.unconfirmed,
+            u64::from(tm.total_spawns() - 1),
+            "every spawn except the one real signal must close Unconfirmed, never sustain \
+             (the 'churning track IDs' symptom); census {spawned:?}, close_counts {cc:?}"
         );
-        assert_eq!(
-            tm.close_counts().unconfirmed,
-            0,
-            "CANDIDATE churn (the 'churning track IDs' symptom): {:?}",
-            tm.close_counts()
-        );
+        assert_eq!(cc.merged, 0, "no merges expected for one clean tone: {cc:?}");
+        assert_eq!(cc.hang_expired, 0, "no hang-expiry expected: {cc:?}");
+
+        tm.finish();
     }
 
     /// MAN-31: `listen()` is the other production call site that must

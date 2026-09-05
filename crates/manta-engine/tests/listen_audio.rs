@@ -16,11 +16,25 @@ use std::sync::{Arc, Mutex};
 /// rejection across `[HILBERT_GUARD_HZ, fs/2 - HILBERT_GUARD_HZ]`, asserted
 /// by `manta-dsp::hilbert`'s `image_rejection_meets_the_guaranteed_band_contract`)
 /// plus a source-declared DC/Nyquist spawn guard
-/// (`IqSource::analytic_guard_hz`, `DetectorConfig::guard_hz`). See
-/// docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md and
+/// (`IqSource::analytic_guard_hz`, `DetectorConfig::guard_hz`).
+///
+/// **Remediation round finding, not in the original plan:** those two
+/// fixes alone left a second, dominant cluster of spurious CANDIDATE
+/// spawns spread broadly across the audio band (~500 for this fixture),
+/// unrelated to Hilbert image rejection (present identically at 129 and
+/// 511 taps). Root cause: this fixture's "key up" gaps are exact digital
+/// silence, so `manta-dsp::floor::FloorBank`'s percentile estimator clamps
+/// every quiet channel to its histogram minimum (-140 dBFS) -- no real
+/// receiver ever produces that. Ordinary keying-edge transient splatter,
+/// many dB under any real noise floor, then reads as tens of dB above
+/// that clamp and clears the 12 dB rise gate. `manta_testkit::noise::add_real_awgn`
+/// at a realistic +30 dB SNR-in-2500 floor (`real_noise_sigma_for_snr_2500`)
+/// gives every channel a real percentile floor and collapses that cluster
+/// to a couple of already-understood, bounded residuals (see
 /// `manta_engine::listen`'s `a_clean_audio_tone_spawns_one_track_and_no_churn`
-/// unit test for the per-channel spawn census this end-to-end test can't
-/// directly observe. Formerly tracked at
+/// unit test for the per-channel census). See
+/// docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md pin 12 for the
+/// full measurement. Formerly tracked at
 /// <https://github.com/HagaleTechnologies/manta/issues/21>.
 #[test]
 fn listen_decodes_a_clean_real_audio_signal() {
@@ -36,6 +50,13 @@ fn listen_decodes_a_clean_real_audio_signal() {
         *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
         phi += dphi;
     }
+    // MAN-4 remediation: a real receiver never delivers digital silence
+    // during key-up -- see this test's doc comment.
+    manta_testkit::noise::add_real_awgn(
+        &mut real,
+        manta_testkit::noise::real_noise_sigma_for_snr_2500(30.0, fs),
+        0xC0FFEE,
+    );
 
     let src: Box<dyn manta_input::IqSource> = Box::new(
         AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap(),

@@ -481,16 +481,40 @@ impl TrackManager {
         wrapped_channel_offset(k, self.n_channels()) * self.channel_spacing_hz
     }
 
-    /// MAN-4: is `k` inside the configured DC/Nyquist guard band? Always
-    /// `false` when `guard_hz <= 0.0` (the default), so every complex-IQ
-    /// path is unaffected by construction.
+    /// MAN-4: is `k` inside the configured DC/Nyquist guard band, or is it
+    /// the Hilbert-mirror of a channel some other track already owns?
+    /// Always `false` when `guard_hz <= 0.0` (the default), so every
+    /// complex-IQ path is unaffected by construction.
+    ///
+    /// **Remediation round finding, not in the original plan:** widening
+    /// the Hilbert FIR to 511 taps (measured >= 70 dB image rejection for
+    /// a *steady* tone) does not fully suppress a *keyed* tone's image --
+    /// every rise/fall transition is a brief broadband transient the
+    /// steady-state rejection figure does not cover, and repeated
+    /// transitions (one per CW element) can still confirm and promote a
+    /// second track at the wraparound-mirror channel of a real, already-
+    /// owned signal, which then decodes the same keying in parallel
+    /// (doubled characters). Measured tap-count- and noise-floor-
+    /// independent (511 vs 1023 taps; every SNR tested): see
+    /// docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md pin 13.
+    /// Refusing to spawn on a channel whose mirror is already owned closes
+    /// this without touching complex-IQ paths, where two independent
+    /// signals may legitimately sit at mirror-symmetric offsets --
+    /// `guard_hz` is nonzero only for analytic-front-end sources
+    /// (`AudioIqSource`/`LoopingAudioIqSource`, MAN-4 D5), so this branch
+    /// is reached only there.
     fn is_guarded(&self, k: usize) -> bool {
         if self.cfg.guard_hz <= 0.0 {
             return false;
         }
         let off = self.channel_offset_hz(k).abs();
         let nyquist = self.channel_spacing_hz * self.n_channels() as f64 / 2.0;
-        off < self.cfg.guard_hz || off > nyquist - self.cfg.guard_hz
+        if off < self.cfg.guard_hz || off > nyquist - self.cfg.guard_hz {
+            return true;
+        }
+        let n = self.n_channels();
+        let mirror = (n - k) % n;
+        self.owner_of[mirror].is_some()
     }
 
     /// Issue #26: per-`CloseReason` counts of every track closed so far
