@@ -475,19 +475,20 @@ mod tests {
         // correctly and only the space is at risk, precisely the reported
         // symptom.
         //
-        // Unverified against a live build: this repo could not be built in
-        // the session that wrote this test (no network egress to fetch the
-        // pinned coppa-dsp revision -- see
-        // docs/DECISIONS/2026-09-04-word-gap-threshold-fix.md's
-        // Environmental constraint section), so the plan's `ramp_hops`
-        // calibration rule (raise ramp_hops until this goes red on the
-        // pre-fix tree, capping at 8, else delete the test) could not be
-        // run. A build-capable session should confirm this is red before
-        // the WORD_GAP_DITS fix and green after, and adjust `ramp_hops`
-        // per that rule if it is not.
+        // Calibration rule applied (per the plan): measured live at
+        // ramp_hops=6 on the pre-fix tree (WORD_GAP_DITS=5.0), this decodes
+        // to "CQCQDE TEST RN XJ0Z" -- the leading "CQ CQ DE" fuses, exactly
+        // the reported defect, though confined to the *leading* words
+        // rather than the trailing "RN XJ0Z" the original weak
+        // `ends_with("RN XJ0Z")` assertion checked (that assertion is
+        // vacuous: the tail is already correct pre-fix at ramp_hops 6, 7,
+        // and 8, so it never went red). Asserting full-string equality
+        // instead is red pre-fix and green post-fix at WORD_GAP_DITS=4.5,
+        // both measured live, so ramp_hops=6 is kept and the assertion is
+        // strengthened rather than raising ramp_hops or deleting the test.
         let text = decode_ramped("CQ CQ DE TEST RN XJ0Z", 13, 6);
-        assert!(
-            text.ends_with("RN XJ0Z"),
+        assert_eq!(
+            text, "CQ CQ DE TEST RN XJ0Z",
             "inter-word space dropped at ~34.6 WPM (MAN-2), got {text:?}"
         );
     }

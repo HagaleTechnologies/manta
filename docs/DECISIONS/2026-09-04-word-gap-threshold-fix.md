@@ -1,5 +1,68 @@
 # WORD_GAP_DITS threshold fix (high-WPM inter-word gap misclassification)
 
+## Remediate update (live-verified, supersedes the static analysis below)
+
+A later remediate session **could** build this workspace (`cargo fetch
+--config net.git-fetch-with-cli=true` plus `apt-get install
+libasound2-dev` route around the environment's libgit2/ALSA-dev
+limitations that blocked every prior session — no code or dependency
+change needed). This let every step the **Environmental constraint**
+section below says could not run, actually run:
+
+- **Phase 1 instrumentation, live**: raw Demod → `GapClassifier` `eprintln!`
+  traces on the ticket's six pinned cases (temporary, reverted after
+  capture) found the static analysis's central premise was **only
+  sometimes true**. On the headline `rn_xj0z_at_39wpm` case, real word gaps
+  measured `u = 5.19–5.82` — **never** compressed below the SPEC nominal
+  5.0 — while real char gaps measured `u = 2.06–2.41`; this case decodes
+  its space correctly even at the unmodified `WORD_GAP_DITS = 5.0` and is
+  byte-identical before and after this fix. On `dztx_p2pkwz_at_37wpm`,
+  by contrast, a real word gap **did** measure `u = 4.7059` — below 5.0,
+  confirming the compression mechanism is real in at least one realization.
+  The other four pinned cases fail via near-total decode garbling
+  (`Err("no signal found")`, or recall 0.0–0.33 against unrelated
+  characters) that is byte-identical at `WORD_GAP_DITS = 3.5`, `4.5`, and
+  the unmodified `5.0` — i.e. independent of this fix, and not MAN-2's
+  signature. This looks like issue #23 territory (the same "some
+  (WPM, offset, SNR) combinations produce persistent, non-converging
+  garbled decode" bug `roundtrip_iq.rs` already tracks), not a word-gap
+  misclassification.
+- **Value revised from 3.5 to 4.5.** The originally-shipped `3.5` was
+  reachable evidence that it over-corrects: a 360-case low-WPM (8/10/12
+  WPM) probe with 25% keying jitter found spurious over-splitting in
+  80/360 cases at the nominal 5.0, rising to 95/360 at 4.5, 130/360 at 4.0,
+  and 190/360 at 3.5 — nearly 2.4x the nominal rate, for a threshold that
+  only needed to move as far as the one confirmed compressed gap (4.7) to
+  fix it. `4.5` is the smallest deviation that classifies that confirmed
+  gap as `InterWord` while costing much less at the slow end of the band.
+  See `crates/manta-decode/src/timing.rs`'s `WORD_GAP_DITS` doc comment for
+  the full numbers.
+- **`cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo fmt --all --check` all now run and are green.**
+- `regression_word_gap_high_wpm.rs` was rebuilt: `rn_xj0z_at_39wpm` (the
+  only pinned case that reproduces cleanly) is the sole always-on test,
+  with `min_recall`/`max_recall` set from its measured, confirmed-
+  deterministic recall (0.888889 → `[0.66, 1.2]`, per the plan's Phase 4
+  rule and its own over-splitting risk). The other five pinned cases are
+  kept `#[ignore]`d with their measured failure strings, per the plan's
+  "never delete a ticket-pinned case silently" rule — not forced to pass,
+  since no `WORD_GAP_DITS` value changes their outcome.
+- `decoder::tests::word_gap_survives_at_high_wpm` was strengthened to a
+  full-string equality assertion (verified live: red pre-fix at
+  `WORD_GAP_DITS=5.0`, decoding `"CQCQDE TEST RN XJ0Z"`; green post-fix at
+  `4.5`) instead of the original `ends_with("RN XJ0Z")` check, which was
+  vacuous — the tail was already correct pre-fix at every `ramp_hops` the
+  plan's calibration rule allowed (6, 7, 8).
+- A full 500-case × two-seed sweep (the plan's Phase 2) was **not** run in
+  this remediate pass; the 360-case low-WPM probe above is a smaller,
+  targeted check of the code-review-flagged risk, not a replacement for it.
+  `4.5` should be revisited if that sweep is later run.
+
+The rest of this document (Background through the original
+**Environmental constraint** section) is kept as the historical record of
+the static-analysis-only session; read the **Fix** and **Verified**
+sections below with the above superseding update in mind.
+
 ## Background
 
 MAN-2 (source: `HagaleTechnologies/manta#11`): at ~30–40 WPM the decoder
