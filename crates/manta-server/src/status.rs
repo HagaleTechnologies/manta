@@ -59,20 +59,27 @@ pub struct UplinkStatus {
 
 impl StatusDoc {
     pub fn from_metrics(metrics: &Metrics) -> Self {
-        // One `now`, one registry walk: `targets`, `connected_targets` and
-        // `health` all come from the SAME snapshot, so they can no longer
-        // disagree with each other (MAN-44 code review CR-1, CR-3). Before
-        // this, `connected_targets` counted the raw `connected` bool while
+        // One `now`, one registry walk: every uplink field below --
+        // `targets`, `connected_targets`, `health`, and the three
+        // aggregate totals -- is derived from this SAME snapshot, so none
+        // of them can disagree with each other or with the rows in
+        // `targets` (MAN-44 code review CR-1, CR-2, CR-3). Before this,
+        // `connected_targets` counted the raw `connected` bool while
         // `health` counted `health == Connected` from a second, later
-        // snapshot -- for a target that is flapping but momentarily
-        // connected, that produced a self-contradictory "DOWN -- 1 of 1
-        // enabled targets connected".
+        // snapshot (CR-1); and the three `_total` fields each called a
+        // `Metrics` getter that took its own fresh registry read at its
+        // own later instant (CR-2), so `/status` could report totals that
+        // disagreed with `sum(targets[].sent/suppressed/reconnects)` for a
+        // spot forwarded in between.
         let targets = metrics.uplink_snapshot_at(Instant::now());
         let enabled_targets = targets.iter().filter(|t| t.enabled).count();
         let connected_targets = targets
             .iter()
             .filter(|t| t.health == UplinkHealth::Connected)
             .count();
+        let sent_total = targets.iter().map(|t| t.sent).sum();
+        let suppressed_total = targets.iter().map(|t| t.suppressed).sum();
+        let reconnects_total = targets.iter().map(|t| t.reconnects).sum();
         let health = overall_uplink_health_of(&targets);
         StatusDoc {
             schema_version: 1,
@@ -87,9 +94,9 @@ impl StatusDoc {
                 health,
                 connected_targets,
                 enabled_targets,
-                sent_total: metrics.uplink_sent_total(),
-                suppressed_total: metrics.uplink_suppressed_total(),
-                reconnects_total: metrics.uplink_reconnects_total(),
+                sent_total,
+                suppressed_total,
+                reconnects_total,
                 reconnect_window_seconds: RECONNECT_WINDOW.as_secs(),
                 flapping_threshold: FLAPPING_RECONNECTS,
                 targets,

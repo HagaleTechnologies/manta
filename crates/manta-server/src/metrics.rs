@@ -657,7 +657,7 @@ impl Metrics {
             self.uplink_disconnected_total()
         ));
 
-        out.push_str("# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.\n");
+        out.push_str("# HELP manta_uplink_reconnects_total Reconnect attempts made by the RBN uplink after a connection attempt failed or dropped, including targets that have never once connected.\n");
         out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
         out.push_str(&format!(
             "manta_uplink_reconnects_total {}\n",
@@ -717,7 +717,7 @@ impl Metrics {
         }
 
         out.push_str(
-            "# HELP manta_uplink_target_reconnects_total Times this RBN uplink target's connection was reestablished after dropping.\n",
+            "# HELP manta_uplink_target_reconnects_total Reconnect attempts made by this RBN uplink target after a connection attempt failed or dropped, including a target that has never once connected.\n",
         );
         out.push_str("# TYPE manta_uplink_target_reconnects_total counter\n");
         for t in &targets {

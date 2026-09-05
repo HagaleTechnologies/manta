@@ -165,17 +165,36 @@ pub async fn serve(
                 // marked connected at all, if it failed before login
                 // completed).
                 target.record_reconnect();
-                // Compute the new backoff BEFORE sleeping (MAN-44 code
-                // review CR-2): the old order slept the STALE `backoff`
-                // value first and only reset it afterward, so a healthy
-                // connection that dropped after login (`Disconnected`,
-                // whose whole point is "retry quickly") still slept
-                // whatever backoff an earlier, unrelated outage had grown
-                // to -- up to `MAX_BACKOFF` (60s) -- before its first
-                // retry got the fast 1s `INITIAL_BACKOFF` this outcome is
-                // supposed to produce immediately.
-                backoff = next_backoff(backoff, &outcome);
-                let sleep_for = backoff;
+                // `Disconnected` resets AND sleeps the reset value
+                // immediately (MAN-44 code review CR-2): the old code
+                // slept the STALE `backoff` value first and only reset it
+                // afterward, so a healthy connection that dropped after
+                // login (`Disconnected`, whose whole point is "retry
+                // quickly") still slept whatever backoff an earlier,
+                // unrelated outage had grown to -- up to `MAX_BACKOFF`
+                // (60s) -- before its first retry got the fast
+                // `INITIAL_BACKOFF` this outcome is supposed to produce
+                // immediately.
+                //
+                // `NeverConnected` keeps the ORIGINAL ordering -- sleep
+                // the CURRENT rung, then grow it for next time -- and must
+                // NOT be folded into the same "compute-then-sleep" step as
+                // `Disconnected` above (MAN-44 remediate, code review
+                // finding CR-1): doing so skipped the first
+                // `INITIAL_BACKOFF` rung entirely and shifted the whole
+                // never-connected ladder to 2s/4s/8s/... instead of
+                // 1s/2s/4s/..., desyncing the shipped code from
+                // `docs/RUNBOOKS/uplink-health.md`'s documented
+                // "roughly t=0s/1s/3s" timeline. A target that has never
+                // connected hasn't demonstrated anything new, so it sleeps
+                // the ladder rung it already earned before that rung
+                // grows -- the plan's "no change to uplink backoff policy"
+                // exclusion applies to this path.
+                let sleep_for = match outcome {
+                    ConnectAttemptError::Disconnected => INITIAL_BACKOFF,
+                    ConnectAttemptError::NeverConnected => backoff,
+                };
+                backoff = next_backoff(sleep_for, &outcome);
                 tokio::select! {
                     _ = tokio::time::sleep(sleep_for) => {}
                     _ = shutdown.changed() => {
