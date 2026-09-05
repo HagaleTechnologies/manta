@@ -98,7 +98,12 @@ manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
 # Copy from a local SDR via SoapySDR (build with --features soapy)
 manta listen --soapy-driver driver=rtlsdr --soapy-freq 7030000 --soapy-rate 240000
 
-# Copy from the default audio input (rig audio passband, 48 kHz)
+# Copy from the default audio input (rig audio passband, 48 kHz),
+# reporting absolute frequencies -- pass the rig's dial frequency once
+manta listen --dial-freq-hz 14030000
+
+# Same, but watching decoded text locally with no frequency reference --
+# reported frequencies are then baseband offsets within the audio passband
 manta listen
 
 # Any of the above as JSON Lines instead of text
@@ -111,8 +116,8 @@ manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
 
 | Source | How | Status |
 | --- | --- | --- |
-| IQ / audio WAV file | `decode`, `listen --source` | Working |
-| Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
+| IQ / audio WAV file | `decode` (center freq from `<stem>.json` sidecar), `listen --source` (`--dial-freq-hz` for absolute frequencies) | Working |
+| Sound card (rig audio passband) | `listen --device`, `--dial-freq-hz` for absolute frequencies | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` | Working |
 | RTL-SDR, Airspy, SDRplay, HackRF, and anything else SoapySDR drives | `listen --soapy-driver`, feature `soapy` | Working, needs hardware soak |
 
@@ -163,13 +168,18 @@ criteria.
 - Not a multi-process Windows orchestrator. `manta` is a single Rust binary;
   there is no companion-program sprawl to sequence-launch.
 - No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
-  CAT/rig control to align a narrowband receiver with the channelizer.
-  `manta` does ingest a local audio device (`listen`/`listen --device`,
-  rig-audio passband) — this is about the legacy Windows driver-selection
-  and band-scope-alignment machinery around that, not the input itself,
-  which the wideband sources (OpenHPSDR/Hermes, SoapySDR, KiwiSDR) don't
-  need at all since the channelizer already covers the whole passband at
-  once.
+  CAT/rig control (OmniRig, live rig polling) to align a narrowband
+  receiver with the channelizer. `manta` does ingest a local audio device
+  (`listen`/`listen --device`, rig-audio passband), and that input mode
+  accepts a manually-supplied dial frequency (`--dial-freq-hz`, MAN-34) so
+  its spots report an absolute RF frequency rather than a baseband offset
+  — entering the dial frequency once, not live rig polling. What remains a
+  non-goal is CAT/OmniRig's live rig polling and the legacy Windows
+  driver-selection and band-scope-alignment machinery around it, not the
+  frequency reference itself. None of this applies to the wideband sources
+  (OpenHPSDR/Hermes, SoapySDR, KiwiSDR), which already report their own
+  tuned frequency and don't need CAT at all since the channelizer covers
+  the whole passband at once.
 
 ## Documentation
 
