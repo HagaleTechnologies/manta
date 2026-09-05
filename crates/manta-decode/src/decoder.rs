@@ -319,6 +319,93 @@ mod tests {
         (events_to_text(&events), events)
     }
 
+    /// MAN-6 regression, hermetic. A track promoted mid-element makes the
+    /// demod's init window open mid-dah; the resulting un-anchored fragment
+    /// becomes sample #1 of SpeedTracker's 5-mark bootstrap, tipping
+    /// ClusterPair::initialize's largest-ratio-gap split onto a bad,
+    /// self-consistent fixed point: mu_dit collapses, every mark
+    /// reclassifies as a dah, every inter-element gap promotes to
+    /// inter-character. Pre-fix this became an endless "TT TTT TT TTT ..."
+    /// that never re-synced; `SpeedTracker`'s bimodal bad-lock recovery
+    /// bounds it to a fixed-size garbled prefix (15 non-space characters for
+    /// this tuple) that recovers after `DRIFT_LEN` (12) marks and never
+    /// grows, however long the stream runs -- see
+    /// `mid_element_start_error_does_not_grow_with_duration` below and
+    /// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+    /// (A companion fix that discarded the fabricated leading fragment in
+    /// `Demod` outright was tried and reverted: it also discards genuine
+    /// leading elements on ordinary decodes whenever the demod's init window
+    /// happens to open on a real edge, regressing golden V1/V10 -- see that
+    /// doc.) Reproduced here with ZERO noise, which is the point: this is a
+    /// deterministic timing-bootstrap defect, not a noise-robustness limit.
+    ///
+    /// `skip_hops` starts the fresh `TrackDecoder` (simulating a
+    /// track-promotion attach) partway through a real element: at
+    /// `dit_hops = 25`, "A" = dit(25) gap(25) dah(75), so its dah spans
+    /// hops [50, 125). `skip_hops = 125 - 7` starts 7 hops before that dah
+    /// ends, leaving a 7-hop fragment: above the 5-hop debounce floor, and
+    /// (66.67/18.7 ~= 3.6 > 200/66.67 = 3.0) large enough to win
+    /// `ClusterPair::initialize`'s largest-ratio-gap split against the real
+    /// dit/dah population.
+    fn decode_from_hop(text: &str, dit_hops: u32, skip_hops: usize) -> (String, Vec<DecoderEvent>) {
+        let env = rect_envelope(text, dit_hops);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().skip(skip_hops).enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        (events_to_text(&events), events)
+    }
+
+    #[test]
+    fn mid_element_start_does_not_lock_bad_timing() {
+        // 10 repetitions of "AU"; start 7 hops before the end of A's first
+        // dah (see decode_from_hop's doc comment for the derivation). The
+        // bad lock produces a fixed-size garbled prefix, then recovers and
+        // decodes "AU" cleanly for the remainder of the stream.
+        let text = "AU AU AU AU AU AU AU AU AU AU";
+        let (decoded, events) = decode_from_hop(text, 25, 125 - 7);
+        assert!(
+            decoded.matches("AU").count() >= 5,
+            "expected clean recovery after the garbled prefix -- {decoded:?}"
+        );
+        // 25 hops/dit = 66.67 ms = 18.0 WPM.
+        let wpm = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .next_back()
+            .expect("no SpeedUpdate emitted");
+        assert!((wpm - 18.0).abs() < 2.0, "wpm {wpm}");
+    }
+
+    #[test]
+    fn mid_element_start_error_does_not_grow_with_duration() {
+        // The ticket's actual acceptance criterion: error must stabilize or
+        // shrink as the scene lengthens, not accumulate. The bad-lock
+        // recovery bounds the garbled run to a fixed-size prefix (15
+        // non-space characters for this tuple, measured directly below) that
+        // does not grow as more repetitions are appended -- it does not
+        // eliminate the garbled prefix outright (that would require
+        // discarding the fabricated leading fragment in `Demod`, which was
+        // tried and reverted for regressing ordinary decodes; see
+        // docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md).
+        for reps in [4usize, 10, 24, 60] {
+            let text = std::iter::repeat_n("AU", reps)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (decoded, _) = decode_from_hop(&text, 25, 125 - 7);
+            let t_count = decoded.chars().filter(|&c| c == 'T').count();
+            assert!(
+                t_count <= 15,
+                "reps {reps}: garbled prefix grew past its fixed bound ({t_count} > 15) -- {decoded:?}"
+            );
+        }
+    }
+
     #[test]
     fn decodes_single_word() {
         let (text, _) = decode("PARIS");

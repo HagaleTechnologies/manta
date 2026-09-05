@@ -45,6 +45,17 @@ const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
                                // needs its own full-suite/multi-WPM validation, out of this task's scope.
 const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
+// MAN-6 bad-lock recovery. `check_drift`'s regime-change rule requires
+// CV < DRIFT_CV_MAX, which makes it structurally blind to a *self-consistent*
+// bad lock: when mu_dit is seeded far too low, every real mark -- dits and dahs
+// alike -- lands in the `hi` cluster, so there is no "off-centroid" anomaly to
+// detect, and the streak's CV is high (~0.47 for a 3-dit/2-dah mixture)
+// precisely because the streak is a mixture. That high-CV, single-cluster
+// region is unoccupied by the SPEC §4.1 rule, so it is claimed here as an
+// explicit recovery trigger, gated on the streak itself splitting into two
+// Morse-plausible clusters. See
+// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+const BADLOCK_MIN_CLUSTER: usize = 3; // of DRIFT_LEN = 12, per side
 
 fn mean(xs: &[f32]) -> f32 {
     let mut acc = 0.0f64;
@@ -52,6 +63,51 @@ fn mean(xs: &[f32]) -> f32 {
         acc += x as f64;
     }
     (acc / xs.len() as f64) as f32
+}
+
+/// Index of the largest ratio gap between consecutive values of a
+/// (ascending-)sorted slice: `sorted[i+1] / sorted[i]` maximized over `i`.
+/// Shared by `ClusterPair::initialize`'s one-shot bimodal split and the
+/// MAN-6 bad-lock guard `is_credible_bimodal`, so both agree on exactly
+/// where a population splits into two clusters. `sorted` must have at
+/// least 2 elements.
+fn largest_ratio_gap(sorted: &[f32]) -> usize {
+    let mut best_i = 0;
+    let mut best_r = 0.0f32;
+    for i in 0..sorted.len() - 1 {
+        let r = sorted[i + 1] / sorted[i];
+        if r > best_r {
+            best_r = r;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+/// Whether `durs` splits into two clusters that are plausibly dits and
+/// dahs: a largest-ratio-gap split with at least `BADLOCK_MIN_CLUSTER`
+/// members on each side and a centroid ratio inside SPEC §4.1's
+/// `[2.2, 4.5]` window. Used only by the MAN-6 bad-lock check; deliberately
+/// stricter than `ClusterPair::initialize`'s own `>= 2.0` gate so that a
+/// merely jittery homogeneous run can never be mistaken for a bad lock.
+fn is_credible_bimodal(durs: &[f32]) -> bool {
+    if durs.len() < 2 * BADLOCK_MIN_CLUSTER {
+        return false;
+    }
+    let mut s = durs.to_vec();
+    s.sort_by(f32::total_cmp);
+    let best_i = largest_ratio_gap(&s);
+    let lo_n = best_i + 1;
+    let hi_n = s.len() - lo_n;
+    if lo_n < BADLOCK_MIN_CLUSTER || hi_n < BADLOCK_MIN_CLUSTER {
+        return false;
+    }
+    let lo = mean(&s[..lo_n]);
+    let hi = mean(&s[lo_n..]);
+    if lo <= 0.0 {
+        return false;
+    }
+    (RATIO_MIN..=RATIO_MAX).contains(&(hi / lo))
 }
 
 /// Shared 2-means machinery: init-after-5 with largest-ratio-gap split,
@@ -174,15 +230,7 @@ impl ClusterPair {
         s.sort_by(f32::total_cmp);
         if s[s.len() - 1] / s[0] >= 2.0 {
             // Split at the largest ratio gap between consecutive sorted values.
-            let mut best_i = 0;
-            let mut best_r = 0.0f32;
-            for i in 0..s.len() - 1 {
-                let r = s[i + 1] / s[i];
-                if r > best_r {
-                    best_r = r;
-                    best_i = i;
-                }
-            }
+            let best_i = largest_ratio_gap(&s);
             self.lo = mean(&s[..=best_i]);
             self.hi = mean(&s[best_i + 1..]);
             self.confirmed = true;
@@ -330,6 +378,22 @@ impl SpeedTracker {
             self.pair.reinit_from(&vals);
             self.apply_constraints();
             self.ring.clear();
+            return;
+        }
+        // MAN-6: self-consistent bad lock. Twelve consecutive marks all
+        // assigned to one cluster, yet those twelve durations themselves split
+        // into two Morse-plausible clusters -- the boundary is on the wrong
+        // side of a bimodal population and no amount of EMA will move it,
+        // because the wrong centroid is what produced the assignments it is
+        // being compared against. Reinitialize from the full 12-mark ring (not
+        // `recent`'s 5) so the re-split has the most evidence available.
+        if cv >= DRIFT_CV_MAX {
+            let durs: Vec<f32> = self.ring.iter().map(|&(d, _, _, _)| d).collect();
+            if is_credible_bimodal(&durs) {
+                self.pair.reinit_from(&durs);
+                self.apply_constraints();
+                self.ring.clear();
+            }
         }
     }
 }
@@ -518,6 +582,80 @@ mod tests {
         assert!(
             (t.mu_dit_ms() - 34.0).abs() < 1.0,
             "mu_dit {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    #[test]
+    fn bimodal_badlock_recovers() {
+        // MAN-6: force the exact self-consistent bad lock -- a fabricated 30 ms
+        // first sample isolates itself as the whole dit cluster, so mu_dit = 30 and
+        // the boundary lands below every real element. check_drift's existing rule
+        // is blind to this (the 12-mark streak's CV is ~0.47, over DRIFT_CV_MAX),
+        // so the new bimodal-lock branch must catch it.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[30.0, 84.0, 217.0, 84.0, 84.0]);
+        assert!(
+            t.boundary_ms() < 84.0,
+            "precondition: bad lock not reproduced (boundary {})",
+            t.boundary_ms()
+        );
+        // Now a long stream of genuine, correctly-measured elements.
+        for _ in 0..6 {
+            feed(&mut t, &[84.0, 217.0, 84.0, 84.0, 217.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 84.0).abs() < 12.0,
+            "mu_dit failed to recover: {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            84.0 < t.boundary_ms() && t.boundary_ms() < 217.0,
+            "boundary must separate dits from dahs: {}",
+            t.boundary_ms()
+        );
+    }
+
+    #[test]
+    fn healthy_stream_never_triggers_badlock_recovery() {
+        // A correctly-locked tracker sees marks in BOTH clusters, so the
+        // all-one-cluster precondition never holds. 20 WPM, 60 marks.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..11 {
+            feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        }
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 3.0,
+            "mu_dit {}",
+            t.mu_dit_ms()
+        );
+        assert!(
+            (t.mu_dah_ms() - 180.0).abs() < 8.0,
+            "mu_dah {}",
+            t.mu_dah_ms()
+        );
+    }
+
+    #[test]
+    fn jittery_single_cluster_does_not_trigger_badlock_recovery() {
+        // A genuinely homogeneous but noisy run of dits must NOT be mistaken
+        // for a bad lock. This data's CV is ~0.39 -- deliberately pushed past
+        // DRIFT_CV_MAX (0.35) so check_drift's `cv >= DRIFT_CV_MAX` branch is
+        // actually reached (a prior version of this data had CV 0.34 and
+        // never reached that branch at all, passing vacuously) -- and its
+        // largest-ratio-gap split gives a centroid ratio of ~1.98, below
+        // RATIO_MIN (2.2), so the guard must reject it and leave the
+        // (correct) 60 ms dit centroid alone.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        let jittered = [
+            24.5, 32.6, 20.1, 26.6, 28.9, 29.4, 44.4, 43.9, 53.0, 41.4, 67.2, 70.6,
+        ];
+        feed(&mut t, &jittered);
+        assert!(
+            (t.mu_dit_ms() - 60.0).abs() < 20.0,
+            "mu_dit should stay near 60, got {}",
             t.mu_dit_ms()
         );
     }

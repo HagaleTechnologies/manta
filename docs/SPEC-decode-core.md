@@ -258,6 +258,15 @@ leading edge. A space is not emitted until the next mark begins (open-ended
 trailing space is flushed as a word boundary by the 7-dit timeout rule,
 §4.2).
 
+Note: the run open when this stage's rails first initialize has no observed
+leading edge — it starts at whatever arbitrary hop the rails happened to
+finish warming up on, not a genuine keying transition. Discarding it
+unconditionally was investigated (MAN-6) and rejected: this stage cannot
+distinguish that case from a window that happens to open exactly on a
+genuine mark/space transition, so the discard also drops real leading
+elements on ordinary decodes. See
+`docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
+
 ---
 
 ## 4. Element classification & Morse decoding
@@ -294,6 +303,17 @@ re-anchor `μ_dah = 3·μ_dit`. Clamp `μ_dit` to `[20 ms, 150 ms]`
 centroid by > 40 %, the operator has changed speed (QRQ/QRS): reinitialize
 from the last 5 marks. (Plain EMA tracking already follows ≤ ~20 % gradual
 drift; this rule catches step changes.)
+
+**[DEVIATION — added]** A second reinitialization trigger covers the
+complementary case the rule above is structurally blind to: if 12 consecutive
+marks assign to a single cluster *and* their coefficient of variation is
+**≥ 0.35** *and* those 12 durations themselves split (largest ratio gap, ≥ 3
+members per side) into two clusters whose centroid ratio is inside
+`[2.2, 4.5]`, the boundary is on the wrong side of a genuinely bimodal
+population — reinitialize from those 12 marks. Without this, a `μ_dit` seeded
+too low is a stable fixed point: every real mark, dit and dah alike, is
+assigned to the dah cluster, so no "off that centroid" anomaly ever appears.
+See `docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
 
 ### 4.2 Gap classification (spaces)
 
