@@ -639,14 +639,18 @@ mod tests {
 
     #[test]
     fn jittery_single_cluster_does_not_trigger_badlock_recovery() {
-        // A genuinely homogeneous but noisy run of dits (CV ~0.4) must NOT be
-        // mistaken for a bad lock: it has no credible 2.2:1 bimodal split with
-        // >= 3 members per side, so the guard must reject it and leave the
+        // A genuinely homogeneous but noisy run of dits must NOT be mistaken
+        // for a bad lock. This data's CV is ~0.39 -- deliberately pushed past
+        // DRIFT_CV_MAX (0.35) so check_drift's `cv >= DRIFT_CV_MAX` branch is
+        // actually reached (a prior version of this data had CV 0.34 and
+        // never reached that branch at all, passing vacuously) -- and its
+        // largest-ratio-gap split gives a centroid ratio of ~1.98, below
+        // RATIO_MIN (2.2), so the guard must reject it and leave the
         // (correct) 60 ms dit centroid alone.
         let mut t = SpeedTracker::new();
         feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
         let jittered = [
-            38.0, 92.0, 45.0, 78.0, 41.0, 88.0, 52.0, 70.0, 36.0, 95.0, 48.0, 82.0,
+            24.5, 32.6, 20.1, 26.6, 28.9, 29.4, 44.4, 43.9, 53.0, 41.4, 67.2, 70.6,
         ];
         feed(&mut t, &jittered);
         assert!(

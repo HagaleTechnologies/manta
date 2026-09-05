@@ -83,16 +83,6 @@ pub struct Demod {
     held: Option<Run>,
     reest_done: bool,
     debounce_hops: u32,
-    /// MAN-6: true until the first *observed* polarity flip. SPEC §3.4 times
-    /// runs by their leading edge; the run that is open when the rails
-    /// initialize has no observed leading edge -- it is whatever fraction of
-    /// an element remained at the (arbitrary, noise-seed-dependent) hop
-    /// where `TrackManager` promoted this track. Emitting it injects a
-    /// fabricated element duration into `SpeedTracker`'s 5-mark bootstrap,
-    /// which `ClusterPair::initialize`'s largest-ratio-gap split has no
-    /// outlier rejection against. See
-    /// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
-    leading_partial: bool,
 }
 
 impl Demod {
@@ -120,7 +110,6 @@ impl Demod {
             held: None,
             reest_done: false,
             debounce_hops,
-            leading_partial: true,
         }
     }
 
@@ -231,15 +220,6 @@ impl Demod {
     /// EOF flush: closes the open run and emits everything held. SPEC §3.4.
     pub fn finish(&mut self) -> Vec<Run> {
         let mut out = Vec::new();
-        if self.leading_partial {
-            // MAN-6: no polarity flip was ever observed, so whatever is
-            // open (if anything) is the un-anchored leading fragment, not a
-            // genuine element -- discard it. (`held` is None by
-            // construction in this state: nothing has completed yet.)
-            self.leading_partial = false;
-            self.open = None;
-            return out;
-        }
         if let Some(open) = self.open.take() {
             if open.hops >= self.debounce_hops {
                 if let Some(h) = self.held.take() {
@@ -321,9 +301,7 @@ impl Demod {
                         }
                         None => {
                             // Short leading run: absorbed into the new run
-                            // (pinned decision 5). `leading_partial`
-                            // deliberately stays set -- the absorbed run
-                            // still starts at the un-anchored window origin.
+                            // (pinned decision 5).
                             self.open = Some(Run {
                                 mark: self.key_down,
                                 start_ts: open.start_ts,
@@ -331,20 +309,6 @@ impl Demod {
                             });
                         }
                     }
-                } else if self.leading_partial {
-                    // MAN-6: `open` is the un-anchored leading fragment --
-                    // its "leading edge" is really just the arbitrary hop
-                    // this Demod's rails happened to initialize on, not a
-                    // genuine polarity transition. Discard it rather than
-                    // promoting it to `held`; the next run is the first one
-                    // with a real observed leading edge. `held` is
-                    // necessarily None here (nothing has completed yet).
-                    self.leading_partial = false;
-                    self.open = Some(Run {
-                        mark: self.key_down,
-                        start_ts: sample_ts,
-                        hops: 1,
-                    });
                 } else {
                     if let Some(h) = self.held.take() {
                         out.push(h);
@@ -414,53 +378,15 @@ mod tests {
     #[test]
     fn init_replay_recovers_first_second() {
         // Pinned decision 4: elements inside the first 375-hop init window
-        // must be decoded after replay. MAN-6: the window now opens on
-        // silence, so the first mark has a real observed rising edge at hop
-        // 10 and is a full, trustworthy element -- previously this asserted
-        // start_ts == 0, which was the un-anchored leading fragment MAN-6
-        // removes (see `leading_partial_run_is_suppressed` below).
-        let mut segs = vec![(0.0f32, 10u32)];
+        // must be decoded after replay.
+        let mut segs = Vec::new();
         for _ in 0..10 {
             segs.push((1.0f32, 30u32));
             segs.push((0.01f32, 30u32));
         }
         let runs = run_segments(&segs);
         let first = runs.iter().find(|r| r.mark).unwrap();
-        assert_eq!(
-            first.start_ts,
-            10 * 256,
-            "first mark must be recovered from replay"
-        );
-        assert_eq!(first.hops, 30, "first mark must be a full element");
-    }
-
-    #[test]
-    fn leading_partial_run_is_suppressed() {
-        // MAN-6: the demod's init window opens at the track-promotion hop,
-        // an arbitrary phase relative to the signal. The run between that
-        // hop and the first OBSERVED polarity flip has no leading edge
-        // (SPEC §3.4 defines runs by their leading edge), so its duration
-        // is a fabricated element length. It must never be emitted.
-        let mut segs = vec![(1.0f32, 7u32)]; // 7 hops = 18.7 ms of a dah already in progress
-        for _ in 0..40 {
-            segs.push((0.0, 25));
-            segs.push((1.0, 25));
-        }
-        let runs = run_segments(&segs);
-        assert!(!runs.is_empty(), "no runs emitted");
-        assert!(
-            runs.iter().all(|r| r.start_ts != 0),
-            "leading partial run (start_ts 0) must not be emitted: {:?}",
-            &runs[..runs.len().min(4)]
-        );
-        // Nothing downstream should ever see a sub-element mark duration.
-        for r in runs.iter().filter(|r| r.mark) {
-            assert!(
-                r.hops >= 20,
-                "fabricated short mark of {} hops leaked",
-                r.hops
-            );
-        }
+        assert_eq!(first.start_ts, 0, "first mark must be recovered from replay");
     }
 
     #[test]

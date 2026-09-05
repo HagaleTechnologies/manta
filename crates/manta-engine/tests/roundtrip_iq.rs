@@ -93,9 +93,15 @@ proptest! {
     //      <https://github.com/HagaleTechnologies/manta/issues/22>.
     // A third failure mode -- persistent, non-converging garbled decode on
     // some (text, wpm, offset, snr, seed) tuples, issue #23 / MAN-6 -- is
-    // **FIXED** (leading-partial-run suppression in `Demod` plus bimodal
-    // bad-lock recovery in `SpeedTracker`; see
-    // docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md).
+    // **MITIGATED**: bimodal bad-lock recovery in `SpeedTracker` bounds the
+    // garbled run to a fixed-size prefix that stops growing with scene
+    // duration (the ticket's actual Gherkin criterion). A companion fix
+    // (discarding `Demod`'s un-anchored leading run at track promotion) was
+    // tried and reverted: it also discards genuine leading elements whenever
+    // the demod's init window happens to open on a real edge, regressing
+    // golden V1/V10 and any ordinary decode whose leading character starts
+    // with a mark — see
+    // docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
     // Its regression coverage lives in
     // `crates/manta-engine/tests/regression_man6_persistent_garble.rs`, which
     // samples this same parameter space on a fixed deterministic grid --

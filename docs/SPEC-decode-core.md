@@ -258,11 +258,13 @@ leading edge. A space is not emitted until the next mark begins (open-ended
 trailing space is flushed as a word boundary by the 7-dit timeout rule,
 §4.2).
 
-**[DEVIATION — added]** The run open when this stage's rails first
-initialize has no observed leading edge — it starts at whatever arbitrary
-hop the rails happened to finish warming up on, not a genuine keying
-transition — so it is not an element under the definition above and is
-discarded rather than emitted. See
+Note: the run open when this stage's rails first initialize has no observed
+leading edge — it starts at whatever arbitrary hop the rails happened to
+finish warming up on, not a genuine keying transition. Discarding it
+unconditionally was investigated (MAN-6) and rejected: this stage cannot
+distinguish that case from a window that happens to open exactly on a
+genuine mark/space transition, so the discard also drops real leading
+elements on ordinary decodes. See
 `docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
 
 ---
