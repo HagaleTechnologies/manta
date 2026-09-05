@@ -201,6 +201,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
+      # MAN-36: fail loudly if this runner is not compiling with the exact
+      # release rust-toolchain.toml pins. Placed before Swatinem/rust-cache
+      # (which itself invokes cargo to fingerprint the cache key) so this is
+      # the first rustup-proxy call made from inside the checkout, and thus
+      # where the pinned toolchain actually gets auto-installed -- a
+      # toolchain mismatch is reported as itself rather than as a confusing
+      # downstream fmt/clippy diff or cache-key anomaly.
+      - run: scripts/check-rust-toolchain-pin.sh
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
