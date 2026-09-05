@@ -17,7 +17,13 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      # MAN-65: 'v*' also matched non-release tags (e.g. `vendor-freeze`),
+      # each of which used to spend five platform builds just to fail. The
+      # glob language can't express SemVer, so it only filters the obvious
+      # non-releases; validate-tag below gives the explicit, readable
+      # failure for near-misses (v1.2.3+linux and friends) -- a near-miss
+      # must FAIL loudly, not be silently ignored.
+      - 'v[0-9]*'
   pull_request:
     paths:
       - '.github/workflows/release.yml'
@@ -28,6 +34,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      # MAN-65: these are release-critical too -- a PR that changes only
+      # the version-validation helper should still run this workflow's
+      # validation.
+      - 'scripts/release-version.sh'
+      - 'scripts/tests/release-version.test.sh'
   workflow_dispatch: {}
 
 env:
@@ -42,6 +53,20 @@ permissions:
   contents: read
 
 jobs:
+  # MAN-65: same gate as release-publish.yml's, so a bad tag is reported by
+  # the build-and-validate workflow too. Deliberately NOT a `needs:` of
+  # `build`: a job skipped by its own `if:` also skips everything that
+  # needs it, which would silently skip the entire build matrix on every
+  # `pull_request` run (this job's `if:` is push-only; `pull_request` and
+  # `workflow_dispatch` never touch a tag at all).
+  validate-tag:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - shell: bash
+        run: scripts/release-version.sh validate "$GITHUB_REF_NAME"
+
   build:
     strategy:
       fail-fast: false
@@ -61,6 +86,34 @@ jobs:
             os: windows-latest
             artifact: manta-windows-x86_64
             exe_ext: .exe
+            # MAN-65 finding 2: x86_64-pc-windows-msvc links the MSVC C
+            # runtime DYNAMICALLY by default, so manta.exe cannot start on
+            # a clean Windows install that has never had the Visual C++
+            # 2015-2022 Redistributable -- and this ZIP ships only
+            # manta.exe, README.md and the licences, nothing that would fix
+            # that. Static CRT rather than bundling Microsoft's
+            # redistributable installer: bundling adds a redistribution
+            # question and an install step to the one path whose entire
+            # point is unpack-and-run. Safe for this dependency graph:
+            # `cargo build -p manta-cli` compiles no C code on Windows (the
+            # only cc-using crate in Cargo.lock, `alloca`, is reachable
+            # only through criterion, a dev-dependency), and Windows
+            # platform access goes through windows-sys import libraries
+            # against system DLLs.
+            #
+            # Set as a per-matrix-entry RUSTFLAGS rather than
+            # .cargo/config.toml (kept identical to release-publish.yml's
+            # copy of this comment on purpose -- both files build this
+            # target and must not drift): a repo-wide cargo config file
+            # changes every contributor's local Windows build by default,
+            # a bigger blast radius than this fix needs, and this way the
+            # flag is visibly scoped to exactly the one target it's for.
+            # The trade-off, accepted: a contributor building locally on
+            # Windows does not get the static CRT automatically and would
+            # need to set this RUSTFLAGS themselves. The "Assert the
+            # Windows binary is statically CRT-linked" step below is what
+            # keeps this true in CI regardless.
+            rustflags: '-C target-feature=+crt-static'
           # Linux x86_64: built via `cross` rather than natively on
           # ubuntu-latest (PR #78 review round 1) -- a native build on
           # the current runner's glibc would raise the binary's minimum
@@ -104,6 +157,8 @@ jobs:
 
       - name: Build (native)
         if: "!matrix.use_cross"
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
 
       # `soapy` is deliberately excluded from every release binary in this
@@ -118,6 +173,41 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      # MAN-65 finding 2 (PR #78 review): on a clean Windows install without
+      # the VC++ 2015-2022 Redistributable, a dynamically-CRT-linked
+      # manta.exe cannot start -- and this ZIP contains only the exe, the
+      # README and the licences, contradicting README's unpack-and-run
+      # install path. The matrix's `rustflags` entry above links the CRT
+      # statically for this target; this step is what keeps that true,
+      # since nothing else in CI would notice if the flag were dropped or
+      # overridden by a RUSTFLAGS environment variable.
+      #
+      # Substring scan of the raw bytes rather than `dumpbin /dependents`:
+      # dumpbin needs the VS developer environment imported (an extra
+      # third-party action to pin and audit), while PE import-table DLL
+      # names are stored as plain ASCII, so their ABSENCE is conclusive.
+      # The KERNEL32 assertion below is what makes that argument valid --
+      # it proves the scan can see import names at all, so "no
+      # VCRUNTIME140" means "not imported" rather than "scan looked at the
+      # wrong thing".
+      - name: Assert the Windows binary is statically CRT-linked
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}"
+          $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          if ($ascii -notmatch 'KERNEL32\.dll') {
+            Write-Error "import-name scan found no KERNEL32.dll -- the scan itself is broken, not the binary"
+            exit 1
+          }
+          foreach ($dll in @('VCRUNTIME140', 'MSVCP140', 'api-ms-win-crt-')) {
+            if ($ascii -match [regex]::Escape($dll)) {
+              Write-Error "$exe imports $dll -- the dynamic MSVC runtime is back (MAN-65 finding 2). Check the release matrix's Windows rustflags entry and any RUSTFLAGS override."
+              exit 1
+            }
+          }
+          Write-Host "OK: no dynamic MSVC CRT imports."
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
