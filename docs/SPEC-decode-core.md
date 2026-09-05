@@ -313,7 +313,13 @@ members per side) into two clusters whose centroid ratio is inside
 population — reinitialize from those 12 marks. Without this, a `μ_dit` seeded
 too low is a stable fixed point: every real mark, dit and dah alike, is
 assigned to the dah cluster, so no "off that centroid" anomaly ever appears.
-See `docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
+When this trigger fires, the gap classifier (§4.2) is also reinitialized
+from scratch: its own 2-means state was bootstrapped from `gap_ms / μ_dit`
+ratios computed against the bad `μ_dit`, has no drift-detection of its own,
+and would otherwise keep misclassifying every inter-word gap as
+inter-character indefinitely, even after this reinitialization corrects
+`μ_dit`/`μ_dah`. See
+`docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md`.
 
 ### 4.2 Gap classification (spaces)
 

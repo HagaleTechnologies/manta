@@ -141,6 +141,17 @@ impl TrackDecoder {
         if run.mark {
             if live {
                 self.tracker.on_mark(dur_ms);
+                if self.tracker.take_badlock_recovered() {
+                    // MAN-6: the tracker just re-seeded mu_dit/mu_dah from a
+                    // self-consistent bad lock. `GapClassifier`'s own
+                    // cluster pair was bootstrapped from gap/mu_dit ratios
+                    // computed against the bad mu_dit and has no
+                    // self-correction path of its own, so its boundary
+                    // would otherwise stay wrong forever, permanently
+                    // misclassifying every inter-word gap as inter-char
+                    // (see SpeedTracker::badlock_recovered's doc comment).
+                    self.gaps = GapClassifier::new();
+                }
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
                 if let Some(w) = self.tracker.wpm() {
                     let report = match self.last_reported_wpm {
@@ -363,12 +374,20 @@ mod tests {
         // 10 repetitions of "AU"; start 7 hops before the end of A's first
         // dah (see decode_from_hop's doc comment for the derivation). The
         // bad lock produces a fixed-size garbled prefix, then recovers and
-        // decodes "AU" cleanly for the remainder of the stream.
+        // decodes "AU" cleanly -- as its own space-bounded word, not merely
+        // as a substring -- for the remainder of the stream. MAN-6 F3: a
+        // `matches("AU")` substring count also passes on a run that has
+        // recovered its 'T'/'E' garbling but lost every word boundary
+        // (e.g. "UAUAUAUAUAUAU" contains "AU" six times too), because
+        // `GapClassifier`'s own stale cluster state kept misclassifying
+        // every inter-word gap as inter-char. Counting whitespace-delimited
+        // "AU" tokens instead only passes once spacing is genuinely intact.
         let text = "AU AU AU AU AU AU AU AU AU AU";
         let (decoded, events) = decode_from_hop(text, 25, 125 - 7);
+        let au_words = decoded.split_whitespace().filter(|&w| w == "AU").count();
         assert!(
-            decoded.matches("AU").count() >= 5,
-            "expected clean recovery after the garbled prefix -- {decoded:?}"
+            au_words >= 5,
+            "expected clean, word-bounded recovery after the garbled prefix -- {decoded:?}"
         );
         // 25 hops/dit = 66.67 ms = 18.0 WPM.
         let wpm = events
@@ -386,24 +405,52 @@ mod tests {
     fn mid_element_start_error_does_not_grow_with_duration() {
         // The ticket's actual acceptance criterion: error must stabilize or
         // shrink as the scene lengthens, not accumulate. The bad-lock
-        // recovery bounds the garbled run to a fixed-size prefix (15
-        // non-space characters for this tuple, measured directly below) that
-        // does not grow as more repetitions are appended -- it does not
+        // recovery bounds the garbled run to a fixed-size prefix that does
+        // not grow as more repetitions are appended -- it does not
         // eliminate the garbled prefix outright (that would require
         // discarding the fabricated leading fragment in `Demod`, which was
         // tried and reverted for regressing ordinary decodes; see
         // docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md).
-        for reps in [4usize, 10, 24, 60] {
+        //
+        // Assert against a measured baseline (reps=4, the shortest case
+        // whose prefix is already complete) rather than a hard-coded count:
+        // the bound is a property of where `is_credible_bimodal` first
+        // fires on this tuple, not a number worth freezing independent of
+        // the mechanism that produces it.
+        let baseline_text = std::iter::repeat_n("AU", 4usize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (baseline_decoded, _) = decode_from_hop(&baseline_text, 25, 125 - 7);
+        let baseline_t = baseline_decoded.chars().filter(|&c| c == 'T').count();
+        assert!(baseline_t > 0, "precondition: bad lock not reproduced");
+        for reps in [10usize, 24, 60] {
             let text = std::iter::repeat_n("AU", reps)
                 .collect::<Vec<_>>()
                 .join(" ");
             let (decoded, _) = decode_from_hop(&text, 25, 125 - 7);
             let t_count = decoded.chars().filter(|&c| c == 'T').count();
-            assert!(
-                t_count <= 15,
-                "reps {reps}: garbled prefix grew past its fixed bound ({t_count} > 15) -- {decoded:?}"
+            assert_eq!(
+                t_count, baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size (baseline {baseline_t}) -- {decoded:?}"
             );
         }
+        // MAN-6 F3: the 'T' prefix staying flat is necessary but not
+        // sufficient -- `GapClassifier`'s own stale cluster state could
+        // still silently delete every word boundary after the recovery
+        // point even while the 'T' count stayed bounded. Assert the
+        // recovered tail is genuinely word-separated, not glued together.
+        let long_text = std::iter::repeat_n("AU", 60usize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (long_decoded, _) = decode_from_hop(&long_text, 25, 125 - 7);
+        let au_words = long_decoded
+            .split_whitespace()
+            .filter(|&w| w == "AU")
+            .count();
+        assert!(
+            au_words >= 50,
+            "recovered decode must keep word boundaries -- {long_decoded:?}"
+        );
     }
 
     #[test]

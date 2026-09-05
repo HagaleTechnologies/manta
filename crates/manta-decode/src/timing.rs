@@ -268,6 +268,20 @@ pub struct SpeedTracker {
     ring: VecDeque<(f32, bool, f32, f32)>, // (dur_ms, assigned_dit, pre_lo, pre_hi)
     wpm_ema: Option<f32>,
     recent: VecDeque<f32>, // last 5 marks, reinit source
+    /// MAN-6: set for exactly one `on_mark()` call after the bimodal
+    /// bad-lock branch below reinitializes `pair`, then cleared by
+    /// `take_badlock_recovered()`. `GapClassifier` has its own `ClusterPair`
+    /// bootstrapped from `gap_ms / mu_dit_ms` ratios computed against
+    /// whatever `mu_dit_ms` was in effect at the time -- during a bad lock
+    /// that is the corrupted value, so its cluster boundary latches onto a
+    /// wrong scale and never self-corrects even after this tracker recovers
+    /// (`ClusterPair` has no drift/reinit machinery of its own; only
+    /// `SpeedTracker::check_drift` calls `reinit_from`). Without a signal to
+    /// reset it too, every inter-word gap keeps misclassifying as
+    /// inter-char forever, silently deleting every word boundary from the
+    /// recovery point on. See
+    /// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+    badlock_recovered: bool,
 }
 
 impl SpeedTracker {
@@ -279,6 +293,7 @@ impl SpeedTracker {
             ring: VecDeque::with_capacity(DRIFT_LEN),
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
+            badlock_recovered: false,
         }
     }
 
@@ -305,6 +320,14 @@ impl SpeedTracker {
     /// EMA-smoothed PARIS WPM (SPEC §4.1: 1200/mu_dit, alpha 0.1). None until ready.
     pub fn wpm(&self) -> Option<f32> {
         self.wpm_ema
+    }
+
+    /// True exactly once after the MAN-6 bimodal bad-lock branch has fired
+    /// since the last call; cleared on read. See `badlock_recovered`'s doc
+    /// comment for why callers (`TrackDecoder`) need this to also reset
+    /// `GapClassifier`.
+    pub fn take_badlock_recovered(&mut self) -> bool {
+        std::mem::take(&mut self.badlock_recovered)
     }
 
     /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
@@ -393,6 +416,7 @@ impl SpeedTracker {
                 self.pair.reinit_from(&durs);
                 self.apply_constraints();
                 self.ring.clear();
+                self.badlock_recovered = true;
             }
         }
     }

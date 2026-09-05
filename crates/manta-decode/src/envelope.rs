@@ -386,7 +386,10 @@ mod tests {
         }
         let runs = run_segments(&segs);
         let first = runs.iter().find(|r| r.mark).unwrap();
-        assert_eq!(first.start_ts, 0, "first mark must be recovered from replay");
+        assert_eq!(
+            first.start_ts, 0,
+            "first mark must be recovered from replay"
+        );
     }
 
     #[test]
