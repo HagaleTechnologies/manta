@@ -12,3 +12,4 @@
 - [What spot-output contracts does manta expose (telnet RBN + JSON)?](pages/spot-output-contract.md) — manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting s...
 - [Why is the weekly Cargo Dependabot run red with `unknown_error` / `null`?](pages/dependabot-cargo-unlock.md) — Diagnose Cargo updates that Dependabot cannot reach through its single-package unlock scope.
 - [What's the PR review convergence policy?](../docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md) — P1 findings get fixed every review round; P2-and-lower findings raised after round one are tracked in a follow-up ticket instead of chased inline, so PRs converge instead of oscillating.
+- [Why doesn't KiwiSDR's input hardening look like HPSDR's?](pages/kiwi-input-hardening.md) — A WebSocket protocol violation is connection-terminal (unlike a bad UDP datagram), so KiwiSDR recovers via bounded reconnect + zero-fill, not discard-and-continue.

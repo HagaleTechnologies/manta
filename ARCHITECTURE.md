@@ -110,7 +110,11 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   native SoapySDR library (CI, contributors without hardware).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
-  low-budget nodes contribute spots.
+  low-budget nodes contribute spots. Survives adversarial/malformed frames from
+  the connected (operator-chosen, third-party) receiver via counted discards
+  and a bounded, zero-fill-compensated reconnect, matching the guarantee
+  MAN-22 established for the HPSDR driver — see
+  `docs/DECISIONS/2026-09-04-man60-kiwi-threat-model.md`.
 - **File playback**: WAV (via `hound`, matching coppa) and raw interleaved
   `f32`/`i16` IQ with a small JSON sidecar for rate/center-freq. Drives the entire
   test strategy; the daemon must run identically from file and live SDR.

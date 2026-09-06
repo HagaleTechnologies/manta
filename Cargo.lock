@@ -950,6 +950,7 @@ dependencies = [
  "serde_json",
  "soapysdr",
  "tempfile",
+ "tracing",
  "tungstenite 0.30.0",
 ]
 

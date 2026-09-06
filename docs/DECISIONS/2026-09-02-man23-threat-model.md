@@ -32,7 +32,9 @@ server-controlled WebSocket/MSG/SND frames — a same-shaped risk to
 MAN-11/12 that was never named in MAN-23's own ticket scope) and
 `soapy.rs`/`audio.rs` (manta's other existing input drivers). KiwiSDR is
 filed as its own follow-up, **MAN-60**, rather than folded in here after
-the fact. **MAN-13** (multi-source orchestration) is explicitly out of
+the fact. **MAN-60 has since landed** its own STRIDE pass and hardening —
+see `docs/DECISIONS/2026-09-04-man60-kiwi-threat-model.md`; `soapy.rs`/
+`audio.rs` remain uncovered by any pass. **MAN-13** (multi-source orchestration) is explicitly out of
 scope — it doesn't exist yet, so there's nothing to adversarially review;
 this pass should be re-run once it lands, the same caveat MAN-23's own
 ticket body already states about MAN-11/MAN-12.

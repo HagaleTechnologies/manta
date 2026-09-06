@@ -86,6 +86,30 @@ fn kiwi_host_without_freq_is_a_clean_error() {
 }
 
 #[test]
+fn exporting_the_kiwi_password_env_var_does_not_break_a_non_kiwi_listen() {
+    // MAN-60 finding 4b: MANTA_KIWI_PASSWORD is read manually
+    // (resolve_kiwi_password), deliberately NOT via clap's `env` feature --
+    // that feature treats a merely-exported variable as "the argument was
+    // passed", which would fire --kiwi-password's `requires = "kiwi_host"`
+    // and turn an unrelated `--source` replay into a clap parse error just
+    // because the env var happened to be set in the shell.
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav"])
+        .env("MANTA_KIWI_PASSWORD", "s3cr3t")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure (nonexistent file), not success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("--kiwi-host"),
+        "MANTA_KIWI_PASSWORD must not force --kiwi-host to be required: {stderr}"
+    );
+}
+
+#[test]
 fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
     // Validated before any file I/O (open_source/start_spot_server), so
     // nonexistent paths are fine for provoking this specific error.
