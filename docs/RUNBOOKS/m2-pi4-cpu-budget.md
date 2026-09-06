@@ -227,11 +227,12 @@ if case " $(. /etc/os-release && printf '%s %s' "$ID" "$ID_LIKE") " in
      *" ubuntu "*) true ;;
      *) false ;;
    esac; then
-  sudo dpkg --add-architecture arm64
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
   if [ -z "$codename" ]; then
-    echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on this ID=ubuntu (or ID_LIKE containing ubuntu) host -- refusing to write an arm64 ports source with an empty Suites field, which breaks apt parsing on every subsequent invocation, not just this one. Find your release codename by hand (lsb_release -cs) and investigate why /etc/os-release is missing it before proceeding; nothing below has been touched." >&2
+    echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on this ID=ubuntu (or ID_LIKE containing ubuntu) host -- refusing to write an arm64 ports source with an empty Suites field, which breaks apt parsing on every subsequent invocation, not just this one. Find your release codename by hand (lsb_release -cs) and investigate why /etc/os-release is missing it before proceeding; nothing below has been touched, including dpkg's architecture list -- no dpkg --remove-architecture cleanup is needed for this path." >&2
+    false
   else
+    sudo dpkg --add-architecture arm64
     keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
       # 24.04 (noble) and later: deb822 stanza format.
@@ -375,10 +376,14 @@ mutated host):
   these, add `arch-=arm64` (classic) or `Architectures-Remove: arm64`
   (deb822) to the affected line(s) by hand -- on Mint/Pop!_OS, to their own
   separate sources file instead.
-- `gcc-aarch64-linux-gnu` is an amd64 package from the host's own archive
-  (`main`), so it installs fine even when the arm64 half is broken -- which
-  is exactly how this failure hides itself if the `apt install` output is
-  only skimmed.
+- `apt install`'s package list is resolved as one transaction: when
+  `libasound2-dev:arm64` has no candidate, apt aborts and installs
+  *nothing* -- not even `gcc-aarch64-linux-gnu`, an amd64 package from the
+  host's own archive (`main`) that would otherwise have resolved fine on
+  its own. So this failure is loud (`E: Unable to locate package
+  libasound2-dev:arm64`, exit 100), not one that hides itself -- but the
+  toolchain is genuinely absent afterwards, so re-running the `apt install`
+  once the arm64 source is fixed is required, not optional cleanup.
 - Unverified as of 2026-09-06: a full `apt install` + `cargo test --target
   aarch64-unknown-linux-gnu` run on a stock Ubuntu desktop/server host. What
   *was* verified is that apt resolves `libasound2-dev:arm64` to a real
