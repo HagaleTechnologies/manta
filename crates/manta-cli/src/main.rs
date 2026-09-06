@@ -983,9 +983,20 @@ fn resolve_status_addr(
     server: Option<&manta_server::config::ServerConfig>,
 ) -> Result<std::net::SocketAddr> {
     if let Some(addr) = addr {
+        if let Ok(sock) = addr.parse() {
+            return Ok(sock);
+        }
+        // CR-B applies equally here: the daemon accepts a hostname in its
+        // own `bind_addr` (resolved via `ToSocketAddrs` in
+        // `start_spot_server`), and the runbook tells operators to reach a
+        // remote daemon with `--addr <host>:<metrics_port>` -- rejecting a
+        // literal-IP-only `--addr` would contradict both.
+        use std::net::ToSocketAddrs;
         return addr
-            .parse()
-            .with_context(|| format!("invalid --addr {addr:?}"));
+            .to_socket_addrs()
+            .with_context(|| format!("invalid --addr {addr:?}"))?
+            .next()
+            .with_context(|| format!("--addr {addr:?} resolved to no addresses"));
     }
     let Some(server) = server else {
         return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 7302)));
@@ -2108,6 +2119,22 @@ mod tests {
             resolve_status_addr(None, None).unwrap().to_string(),
             "127.0.0.1:7302"
         );
+    }
+
+    /// MAN-44 remediate regression: `--addr` must accept a hostname too,
+    /// the same way the `--server-config`/`bind_addr` path already does
+    /// (`status_address_resolves_a_hostname_bind_addr_like_the_daemon_does`
+    /// below) -- an explicit `--addr localhost:PORT` was being rejected
+    /// outright by a literal `SocketAddr` parse, contradicting
+    /// `docs/RUNBOOKS/uplink-health.md`'s documented cross-host invocation.
+    #[test]
+    fn status_address_resolves_a_hostname_passed_via_addr() {
+        let addr = resolve_status_addr(Some("localhost:17302"), None).unwrap();
+        assert!(
+            addr.ip().is_loopback(),
+            "expected localhost to resolve to a loopback address, got {addr}"
+        );
+        assert_eq!(addr.port(), 17302);
     }
 
     /// MAN-44 CR-B regression: the daemon binds `bind_addr` via

@@ -43,8 +43,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hard bound otherwise.
 const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Every outbound write to the uplink target gets this long before being
-/// treated as stalled (MAN-58 comment finding 2) -- matches `telnet.rs`'s
-/// identically-named helper for the inbound side.
+/// treated as stalled (MAN-58 comment finding 2): if the target stops
+/// reading -- a stalled peer, a full TCP receive window, a half-open
+/// connection the OS hasn't noticed yet -- `write_all` would otherwise
+/// block indefinitely with no back-pressure signal, quietly wedging this
+/// target's whole `serve` task. Mirrors `telnet.rs`'s identically-named
+/// constant, which bounds the same failure mode for the inbound side
+/// (ARCHITECTURE §7's "slow clients are disconnected, never
+/// back-pressured").
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Response-line rate budget for the target's post-login discard read
 /// (MAN-58 comment finding 3): RBN's collection server isn't expected to

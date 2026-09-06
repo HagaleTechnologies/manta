@@ -531,6 +531,17 @@ impl Metrics {
 
     pub fn render_prometheus_text(&self) -> String {
         let mut out = String::new();
+        // MAN-44 remediate: one snapshot for BOTH the aggregate
+        // `manta_uplink_*` lines below and the per-target
+        // `manta_uplink_target_*` block -- the aggregates used to be read
+        // via separate `sum_uplink_*` calls, each its own `RwLock`
+        // acquisition at a different instant from the per-target block's,
+        // so a spot forwarded mid-render could make
+        // `sum(manta_uplink_target_sent_total) != manta_uplink_sent_total`
+        // within a single scrape body. `StatusDoc::from_metrics` already
+        // took exactly this precaution (CR-2/CR-3); this brings the
+        // Prometheus renderer in line with it.
+        let targets = self.uplink_snapshot();
         out.push_str("# HELP manta_spots_total Total spots published to the broadcast bus.\n");
         out.push_str("# TYPE manta_spots_total counter\n");
         out.push_str(&format!(
@@ -618,7 +629,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
         out.push_str(&format!(
             "manta_uplink_sent_total {}\n",
-            self.uplink_sent_total()
+            targets.iter().map(|t| t.sent).sum::<u64>()
         ));
 
         out.push_str(
@@ -627,7 +638,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_suppressed_total counter\n");
         out.push_str(&format!(
             "manta_uplink_suppressed_total {}\n",
-            self.uplink_suppressed_total()
+            targets.iter().map(|t| t.suppressed).sum::<u64>()
         ));
 
         out.push_str(
@@ -636,7 +647,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_dropped_lagged_total counter\n");
         out.push_str(&format!(
             "manta_uplink_dropped_lagged_total {}\n",
-            self.uplink_lagged_total()
+            targets.iter().map(|t| t.lagged).sum::<u64>()
         ));
 
         out.push_str(
@@ -645,7 +656,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_dropped_write_failed_total counter\n");
         out.push_str(&format!(
             "manta_uplink_dropped_write_failed_total {}\n",
-            self.uplink_write_failed_total()
+            targets.iter().map(|t| t.write_failed).sum::<u64>()
         ));
 
         out.push_str(
@@ -654,14 +665,14 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_dropped_disconnected_total counter\n");
         out.push_str(&format!(
             "manta_uplink_dropped_disconnected_total {}\n",
-            self.uplink_disconnected_total()
+            targets.iter().map(|t| t.disconnected).sum::<u64>()
         ));
 
         out.push_str("# HELP manta_uplink_reconnects_total Reconnect attempts made by the RBN uplink after a connection attempt failed or dropped, including targets that have never once connected.\n");
         out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
         out.push_str(&format!(
             "manta_uplink_reconnects_total {}\n",
-            self.uplink_reconnects_total()
+            targets.iter().map(|t| t.reconnects).sum::<u64>()
         ));
 
         out.push_str(
@@ -670,7 +681,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_connected gauge\n");
         out.push_str(&format!(
             "manta_uplink_connected {}\n",
-            self.uplink_connected_count()
+            targets.iter().filter(|t| t.connected).count()
         ));
 
         // MAN-44: per-target uplink series, additive to the aggregate
@@ -678,8 +689,6 @@ impl Metrics {
         // NAMES, not labels bolted onto the existing ones, so an existing
         // scrape config/dashboard built against the pre-MAN-44 series
         // shape keeps working untouched.
-        let targets = self.uplink_snapshot();
-
         out.push_str(
             "# HELP manta_uplink_target_connected Whether this RBN uplink target is currently connected (1/0).\n",
         );
