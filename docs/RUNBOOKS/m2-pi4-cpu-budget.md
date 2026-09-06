@@ -174,21 +174,21 @@ equivalent) or Option B is the fallback. Requires Docker (or Podman) on
 the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
-```
-# Debian build host -- Debian's mirrors serve every release architecture,
-# including arm64, from the same tree, so this is all it needs:
-sudo dpkg --add-architecture arm64
-sudo apt update
-sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 
-# Ubuntu build host -- do THIS FIRST instead. Unlike Debian, Ubuntu's
-# default mirrors (archive.ubuntu.com / security.ubuntu.com) carry only
-# amd64/i386; arm64 lives on a separate mirror, ports.ubuntu.com. Without
-# this block, `sudo apt update` FAILS (exit 100, "E: Failed to fetch
-# .../binary-arm64/Packages 404 Not Found") as soon as arm64 is added, and
-# never reaches the install/build steps below. Two things are needed: point
-# apt at ports for arm64, AND restrict the existing default sources to
-# amd64 so they stop being asked for an arm64 index they will never have.
+Ubuntu and Debian need different apt setup here. Check which one your host
+is *before* running anything below, and run only the matching block —
+pasting both is what causes the Ubuntu ports failure this section exists to
+avoid.
+
+**Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
+(archive.ubuntu.com / security.ubuntu.com) carry only amd64/i386; arm64
+lives on a separate mirror, ports.ubuntu.com. Without this block, `sudo apt
+update` FAILS (exit 100, "E: Failed to fetch .../binary-arm64/Packages 404
+Not Found") as soon as arm64 is added, and never reaches the install/build
+steps below. Two things are needed: point apt at ports for arm64, AND
+restrict the existing default sources to amd64 so they stop being asked for
+an arm64 index they will never have.
+```
 sudo dpkg --add-architecture arm64
 codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
@@ -207,9 +207,18 @@ Signed-By: ${keyring}
 EOF
 else
   # 22.04 (jammy) and earlier, and in-place upgrades that kept this format:
-  # classic one-line format.
-  sudo sed -i.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch=amd64] \2|' \
-    /etc/apt/sources.list
+  # classic one-line format. The substitution itself is already safe to
+  # re-run (it only matches a still-unprefixed `deb ` line), but `sed -i.bak`
+  # is not: it backs up whatever is on disk at that invocation, so a second
+  # bare run would overwrite the pristine backup with the already-edited
+  # file. Take the backup only once, on the first run:
+  if [ -e /etc/apt/sources.list.bak ]; then
+    sudo sed -i -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch=amd64] \2|' \
+      /etc/apt/sources.list
+  else
+    sudo sed -i.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch=amd64] \2|' \
+      /etc/apt/sources.list
+  fi
   sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main
@@ -218,7 +227,20 @@ EOF
 fi
 sudo apt update
 sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+```
 
+**Debian build host** -- Debian's mirrors serve every release architecture,
+including arm64, from the same tree, so this is all it needs (skip this if
+you ran the Ubuntu block above -- it is unnecessary on Debian, and the
+`ubuntu.sources` layout it checks for doesn't apply there):
+```
+sudo dpkg --add-architecture arm64
+sudo apt update
+sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+```
+
+Either host, once packages are installed:
+```
 # Rust's own target standard library -- gcc-aarch64-linux-gnu above gives
 # a linker, not this; skipping it fails before linking with a missing-
 # target/`core` error:
@@ -254,10 +276,24 @@ mutated host):
 - The branch keys on whether `/etc/apt/sources.list.d/ubuntu.sources` exists,
   not on the release number, so a 22.04-to-24.04 in-place upgrade that kept
   the classic format is still handled correctly.
-- Both `sed`s are safe to run twice: the deb822 one is guarded by the `grep`,
-  and the classic one only matches a `deb ` line whose next token is a URI
-  scheme, so it skips `# deb-src` comments and lines that already carry
-  `[arch=...]`. Both write a `.bak` beside the file they edit.
+- Both branches are now safe to run twice *and* keep a pristine `.bak`. The
+  deb822 sed was already content-idempotent (guarded by the `grep`) and only
+  ever runs once, so its `.bak` was always pristine. The classic sed's
+  substitution was already content-idempotent too (it only matches a
+  still-unprefixed `deb ` line), but `sed -i.bak` itself is not: run bare a
+  second time, it backs up whatever is on disk *at that invocation* --
+  already-edited content -- and overwrites the pristine backup. The classic
+  branch above now takes the `.bak` only on its first run (checking whether
+  `sources.list.bak` already exists) and uses a plain `-i` on any later run,
+  so the pristine copy survives regardless of how many times the block is
+  run.
+- This only restricts the *default* sources file (`/etc/apt/sources.list` or
+  `sources.list.d/ubuntu.sources`) to amd64. A host that also carries a PPA
+  or other third-party `.list`/`.sources` file under
+  `/etc/apt/sources.list.d/` (e.g. Docker's own apt repo) needs the same
+  `[arch=amd64]` restriction applied to that file too, or it will still be
+  queried for an arm64 index it doesn't have and reproduce the same
+  `binary-arm64/Packages 404` / exit-100 failure this block exists to avoid.
 - `gcc-aarch64-linux-gnu` is an amd64 package from the host's own archive
   (`main`), so it installs fine even when the arm64 half is broken -- which
   is exactly how this failure hides itself if the `apt install` output is
