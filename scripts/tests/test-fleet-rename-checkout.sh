@@ -784,5 +784,61 @@ grep -q "link-build-cache.sh" <<<"$out" && ok "T50 accepts a file as --scan-root
   || bad "T50 accepts a file as --scan-root" "$out"
 [[ -d "$R/org/skimmer" ]] && ok "T50 nothing moved" || bad "T50 nothing moved"
 
+# --- T51: --check --apply together is refused (validation-round finding
+#     C1) — the two mode flags used to share one case arm with no
+#     mutual-exclusion guard, so the mode was last-wins and this exact
+#     invocation silently performed the migration despite --check's entire
+#     safety story being "mutates nothing" ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+out=$("$SUT" --check --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T51 exit" "$rc" "2"
+grep -qi "mutually exclusive" <<<"$out" && ok "T51 refuses conflicting mode flags" \
+  || bad "T51 refuses conflicting mode flags" "$out"
+[[ -d "$R/org/skimmer" ]] && ok "T51 nothing moved" || bad "T51 nothing moved"
+# Repeating the SAME flag twice is not a conflict.
+out=$("$SUT" --check --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T51 repeated same flag exit" "$rc" "1"
+
+# --- T52: a dead worktree entry sharing a basename with an unrelated
+#     FOREIGN repository's worktree (not one of $MAIN's own) must not be
+#     adopted as that dead entry's repaired counterpart (validation-round
+#     finding C2) — `git worktree repair` correctly refuses to rewrite a
+#     foreign .git, so the old fallback made the host FAIL identically on
+#     every re-run with a remedy line that does nothing ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+mkdir -p "$R/org/manta-worktrees" "$R/wt" "$R/foreign"
+addwt "$C" "$R/wt/w1" w1-dead; rm -rf "$R/wt/w1"
+git -c init.defaultBranch=main init -q "$R/foreign/repo"
+git -C "$R/foreign/repo" config user.email t@example.invalid
+git -C "$R/foreign/repo" config user.name  test
+: > "$R/foreign/repo/README"; git -C "$R/foreign/repo" add README
+git -C "$R/foreign/repo" -c commit.gpgsign=false commit -qm init
+addwt "$R/foreign/repo" "$R/org/manta-worktrees/w1" w1-foreign
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+grep -q "was not repaired" <<<"$out" && bad "T52 must not adopt a foreign worktree" "$out" \
+  || ok "T52 does not adopt a foreign worktree"
+check "T52 exit" "$rc" "0"
+grep -q "pre-existing prunable" <<<"$out" && ok "T52 dead entry reported informational" \
+  || bad "T52 dead entry reported informational" "$out"
+
+# --- T53: a stray FILE (not a directory) named `skimmer` must not make the
+#     host fail forever (validation-round finding C3) — classify() and the
+#     move paths test $OLD_MAIN/$OLD_WTP with -d, so this file was invisible
+#     to migration, yet verify() tested the same paths with -e and reported
+#     "legacy directory still present" — misdescribing a file as a directory
+#     — on every subsequent re-run with no way to converge. It must now
+#     refuse once, clearly, instead of looping ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+touch "$R/org/skimmer"
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T53 exit" "$rc" "2"
+grep -qi "is not a directory" <<<"$out" && ok "T53 refuses stray non-directory 'skimmer'" \
+  || bad "T53 refuses stray non-directory 'skimmer'" "$out"
+grep -qi "legacy .skimmer. directory still present" <<<"$out" \
+  && bad "T53 must not loop with a misleading directory FAIL" "$out" \
+  || ok "T53 must not loop with a misleading directory FAIL"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
