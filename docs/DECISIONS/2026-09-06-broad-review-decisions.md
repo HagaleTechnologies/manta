@@ -120,9 +120,10 @@ three.
 "deferred to M4 ML fusion by design, not M2 blockers." That framing is now wrong for exactly the
 fading-related subset of those vectors (V5, V6, V8w): D8 says fix them with classical DSP work first,
 gated on the tickets above, before M4 rather than deferring to M4. It does not change V2's own disposition (V2's issue is the near-channel-edge WPM-estimation bug
-tracked as MAN-7 and MAN-103, unrelated to fading). AGENTS.md's Status paragraph should be updated
-to match once MAN-107 through MAN-113 land, or sooner if that gap causes real confusion in the
-meantime.
+tracked as MAN-7 and MAN-103, unrelated to fading). **AGENTS.md's Status section has been updated in
+this same PR** to reflect this reclassification now rather than after MAN-107 through MAN-113 land —
+leaving the entrypoint document telling agents to defer these vectors to M4 while this decision says
+otherwise would have undermined the decision the moment it was recorded.
 
 ### D9 — Contester persona: in scope
 
