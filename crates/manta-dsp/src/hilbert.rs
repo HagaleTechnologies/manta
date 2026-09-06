@@ -44,16 +44,26 @@ pub const HILBERT_MIN_IMAGE_REJECTION_DB: f64 = 70.0;
 /// `hist[i]` (oldest-first), which reverses the convolution index order
 /// relative to standard causal FIR. Since the ideal Hilbert kernel is
 /// antisymmetric, this index reversal is algebraically equivalent to
-/// negating the kernel. `taps` must be odd -- asserted here directly (MAN-4
-/// remediate, code-review finding 4, round 3): this function is `pub` and
+/// negating the kernel. `taps` must be odd and >= 3 -- asserted here
+/// directly (MAN-4 remediate, code-review finding 4, round 3; bound
+/// widened to >= 3, round 4): this function is `pub` and
 /// `design_hilbert_fir()` is a second, in-crate caller, so the invariant
 /// cannot live solely in `HilbertTransformer::with_taps`. An even `taps`
 /// left unchecked would give a half-integer `center`, silently zeroing the
 /// wrong offsets in the loop below (no panic) rather than the intended
-/// error, and `taps == 0` would underflow `len - 1`; asserting oddness
-/// up front rejects both.
+/// error. `taps == 0` would underflow `len - 1`. `taps == 1` is odd and
+/// nonzero, so it survives an oddness-only check, but `len - 1 == 0` makes
+/// `t = 2*i/(len-1) - 1` divide by zero: `i == 0` gives `0.0/0.0 = NaN`,
+/// `(1.0 - NaN*NaN).sqrt()` is `NaN`, and `bessel_i0(NaN)`'s convergence
+/// test `term < sum * 1e-16` is `NaN < NaN`, which is `false` on every
+/// iteration -- the design hangs forever rather than panicking. Asserting
+/// `taps >= 3` up front rejects all three degenerate lengths (0, 1, and any
+/// even value).
 pub fn design_hilbert_fir_n(taps: usize) -> Vec<f32> {
-    assert!(taps % 2 == 1, "Hilbert FIR length must be odd, got {taps}");
+    assert!(
+        taps % 2 == 1 && taps >= 3,
+        "Hilbert FIR length must be odd and >= 3, got {taps}"
+    );
     let len = taps;
     let center = (len - 1) as f64 / 2.0; // integer-valued since len is odd
     let i0_beta = bessel_i0(KAISER_BETA);
@@ -114,9 +124,10 @@ impl HilbertTransformer {
         Self::with_taps(HILBERT_TAPS)
     }
 
-    /// A transformer with an explicit (odd) tap count. Panics on an even
-    /// length (via `design_hilbert_fir_n`'s own assertion): the design
-    /// relies on an integer center tap.
+    /// A transformer with an explicit (odd, >= 3) tap count. Panics on an
+    /// even length or on 0/1 (via `design_hilbert_fir_n`'s own assertion):
+    /// the design relies on an integer center tap and a nonzero `len - 1`
+    /// divisor.
     pub fn with_taps(taps: usize) -> Self {
         let taps_vec = design_hilbert_fir_n(taps);
         let nz = taps_vec
@@ -264,6 +275,20 @@ mod tests {
         // an external caller of this pub fn has no other guard.
         assert!(std::panic::catch_unwind(|| design_hilbert_fir_n(128)).is_err());
         assert!(std::panic::catch_unwind(|| design_hilbert_fir_n(0)).is_err());
+    }
+
+    #[test]
+    fn design_hilbert_fir_n_rejects_length_one_instead_of_hanging() {
+        // MAN-4 remediate (code-review finding 1, round 4): `taps == 1` is
+        // odd, so an oddness-only check let it through. `len - 1 == 0` then
+        // makes the Kaiser window's `t` divide by zero, producing NaN that
+        // `bessel_i0` never converges on (`NaN < NaN` is always false), so
+        // the design hung forever instead of panicking. This must return
+        // (via panic) promptly, not loop -- if the `taps >= 3` bound
+        // regresses, this test hangs rather than fails, which is still a
+        // signal, but catch_unwind lets it report cleanly when the bound
+        // holds.
+        assert!(std::panic::catch_unwind(|| design_hilbert_fir_n(1)).is_err());
     }
 
     #[test]
