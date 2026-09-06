@@ -51,6 +51,13 @@ and conversion tooling notes, not the bytes.
   samples need a bit-depth conversion first (`WavIqSource` only reads
   Float32/Int16), and at 1.0 GB it's ~2.6x further past the "<~100 MB"
   eager-load design assumption than that file already was.
+  `WavIqSource` also ignores the WAV's own embedded center-frequency
+  metadata — it only reads a same-stem `<name>.json` sidecar
+  (`crates/manta-input/src/lib.rs`) and silently defaults to 0.0 Hz when
+  absent — so decoding the converted file needs a
+  `B2_20251129_000000_7080kHz.json` sidecar with
+  `{"center_freq_hz": 7080000}` alongside it, or spots/events will carry
+  baseband-relative rather than correct RF frequencies.
 
 ## Ground truth
 
