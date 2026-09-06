@@ -294,18 +294,83 @@ jobs:
           # specifically -- just never `:latest`.
           tags: ${{ needs.validate-tag.outputs.image }}:${{ needs.validate-tag.outputs.version }}
 
+      # MAN-65 finding 4 (remediate round 7, finding 3.B): this used to be
+      # the last step of `publish-latest`, gated on
+      # `steps.recency.outputs.newest == 'true'` -- but `is-newest-stable`
+      # returns `false` for EVERY pre-release by design, so the very first
+      # tag a maintainer plausibly pushes (`v0.1.0-rc.1`) skipped this
+      # probe entirely, on exactly the publish that first creates the
+      # private GHCR package. Visibility is a property of THIS PUSH, not
+      # of the `:latest` decision, so it belongs here, gated on the same
+      # condition that gates the push above -- and this is also where
+      # `version` already lives, with no cross-job output needed.
+      #
+      # Never fails the job: the release itself is fine, and the fix is an
+      # out-of-band human action. A hard failure here would report a
+      # successful release as broken.
+      - name: Verify the image is anonymously pullable
+        if: always() && (github.event_name == 'push' || inputs.publish == true)
+        env:
+          IMAGE_PATH: ${{ github.repository }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -uo pipefail
+          REPO_LC="$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')"
+          TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO_LC}:pull&service=ghcr.io" | jq -r .token || true)"
+          CODE="$(curl -sSL -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN:-}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${REPO_LC}/manifests/${VERSION}" || true)"
+          if [ "$CODE" = "200" ]; then
+            echo "OK: ghcr.io/${REPO_LC}:${VERSION} is anonymously pullable." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### :warning: GHCR package is not anonymously pullable (HTTP ${CODE})"
+              echo
+              echo "README's \`docker run ghcr.io/${REPO_LC}:latest\` will return an"
+              echo "authorization error for everyone until this one-time step is done:"
+              echo
+              # MAN-65 remediate round 7, finding 3.D: derived rather than
+              # hardcoded -- this repo has already been renamed once
+              # (docs/DECISIONS/2026-09-01-rename-to-manta.md), and a
+              # hardcoded name would 404 after the next rename or in a fork.
+              echo "1. https://github.com/${IMAGE_PATH}/pkgs/container/${REPO_LC##*/}"
+              echo "2. **Package settings** -> **Danger Zone** -> **Change visibility** -> **Public**"
+              echo
+              echo "See docs/RUNBOOKS/release.md. This is a deliberate human step (MAN-65 finding 4)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=GHCR package not public::anonymous pull of ${REPO_LC}:${VERSION} returned ${CODE}; see the job summary"
+          fi
+
   # MAN-65 finding 3. Two properties, both required:
   #
-  # 1. A REPO-WIDE concurrency group (deliberately NOT keyed on github.ref,
-  #    which is what made every tag its own group and let two tag builds
-  #    race on the shared `:latest` write). Scoped to THIS JOB rather than
-  #    the whole workflow on purpose: GitHub keeps at most one PENDING
-  #    run/job per concurrency group and cancels the previous one, so a
-  #    repo-wide group on the whole workflow would silently cancel a middle
-  #    tag's ENTIRE release (binaries, GitHub Release, everything). Here,
-  #    the only thing a cancellation can ever drop is a `:latest` write
-  #    from a run that was about to decline it anyway -- exactly the
-  #    ordering we want.
+  # 1. Correctness must not depend on GitHub Actions' concurrency-group
+  #    ordering. This job previously carried a repo-wide
+  #    `concurrency: group: release-publish-latest` block, on the theory
+  #    that "the only thing a cancellation can ever drop is a `:latest`
+  #    write from a run that was about to decline it anyway" -- confirmed
+  #    FALSE in review (remediate round 7, finding 3.A). GitHub cancels the
+  #    previously PENDING run in a concurrency group whenever a new one
+  #    arrives, regardless of `cancel-in-progress` -- that setting only
+  #    protects the run already IN PROGRESS. Pending order is ARRIVAL
+  #    order (this job's `needs: docker-publish`, so arrival order is
+  #    build-completion order), not tag-version order: with three
+  #    overlapping releases, the run for the actual newest tag can be the
+  #    one sitting pending, cancelled by a release that is neither the
+  #    newest nor the one still in progress -- and then `:latest` is never
+  #    written for the newest release at all.
+  #
+  #    Fix: no concurrency group here, at all. Each run instead answers a
+  #    GLOBAL question from a fresh `git fetch --tags` -- "what is the
+  #    newest STABLE tag in the whole repo right now?" -- rather than "is
+  #    MY tag newer than the specific run it happens to race against".
+  #    Tag creation (`git push origin vX.Y.Z`) takes seconds, at the very
+  #    START of a release, while this check runs AFTER the multi-arch
+  #    build (minutes later); any tag genuinely "overlapping" this one is
+  #    therefore already visible by the time either release reaches this
+  #    step. Whichever run actually executes reaches the same, correct
+  #    answer, independent of execution or completion order -- no run
+  #    needs to "survive" anything for the outcome to be right.
   #
   # 2. A recency re-check performed AFTER the build, not at job start, then
   #    a manifest-only copy. `docker buildx imagetools create` re-points a
@@ -315,13 +380,14 @@ jobs:
   #    accepted and recorded in
   #    docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md: two
   #    tags pushed within that few-second window could still resolve out
-  #    of order. Closing it completely would need an external lock or a
-  #    reconciler workflow -- disproportionate for a project where one
-  #    maintainer pushes one release tag at a time, and recoverable in one
-  #    command (the runbook documents it).
+  #    of order -- this is now the ONLY residual race (point 1 above
+  #    removed the other one). Closing it completely would need an
+  #    external lock or a reconciler workflow -- disproportionate for a
+  #    project where one maintainer pushes one release tag at a time, and
+  #    recoverable in one command (the runbook documents it).
   #
-  # `release` below deliberately does NOT depend on this job: a declined or
-  # concurrency-cancelled `:latest` write must never block a GitHub Release.
+  # `release` below deliberately does NOT depend on this job: a declined
+  # `:latest` write must never block a GitHub Release.
   publish-latest:
     needs: [validate-tag, docker-publish]
     if: github.event_name == 'push'
@@ -329,9 +395,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    concurrency:
-      group: release-publish-latest
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -364,51 +427,6 @@ jobs:
           IMAGE: ${{ needs.validate-tag.outputs.image }}
           VERSION: ${{ needs.validate-tag.outputs.version }}
         run: docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
-
-      # MAN-65 finding 4: GHCR creates a container package with PRIVATE
-      # visibility on its first push, and there is no supported REST
-      # endpoint for GITHUB_TOKEN to change that -- so README's anonymous
-      # `docker run ghcr.io/...` returns an authorization error until a
-      # maintainer flips it by hand, once, in the web UI. Deliberately not
-      # automated (that would mean a long-lived admin:packages PAT stored
-      # in this repo to flip one switch once -- a worse posture than one
-      # click; same "flag it to a human" disposition as MAN-66). What IS
-      # automated is NOTICING: this probe runs on the very release that
-      # first publishes the package and puts the click-path in the run
-      # summary.
-      #
-      # Never fails the job: the release itself is fine, and the fix is an
-      # out-of-band human action. A hard failure here would report a
-      # successful release as broken.
-      - name: Verify the image is anonymously pullable
-        if: always() && steps.recency.outputs.newest == 'true'
-        env:
-          IMAGE_PATH: ${{ github.repository }}
-          VERSION: ${{ needs.validate-tag.outputs.version }}
-        run: |
-          set -uo pipefail
-          REPO_LC="$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')"
-          TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO_LC}:pull&service=ghcr.io" | jq -r .token || true)"
-          CODE="$(curl -sSL -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${TOKEN:-}" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://ghcr.io/v2/${REPO_LC}/manifests/${VERSION}" || true)"
-          if [ "$CODE" = "200" ]; then
-            echo "OK: ghcr.io/${REPO_LC}:${VERSION} is anonymously pullable." >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "### :warning: GHCR package is not anonymously pullable (HTTP ${CODE})"
-              echo
-              echo "README's \`docker run ghcr.io/${REPO_LC}:latest\` will return an"
-              echo "authorization error for everyone until this one-time step is done:"
-              echo
-              echo "1. https://github.com/${IMAGE_PATH}/pkgs/container/manta"
-              echo "2. **Package settings** -> **Danger Zone** -> **Change visibility** -> **Public**"
-              echo
-              echo "See docs/RUNBOOKS/release.md. This is a deliberate human step (MAN-65 finding 4)."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning title=GHCR package not public::anonymous pull of ${REPO_LC}:${VERSION} returned ${CODE}; see the job summary"
-          fi
 
   release:
     needs: [build, docker-publish]

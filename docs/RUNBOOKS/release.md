@@ -74,9 +74,11 @@ a human, don't silently work around it" disposition this repo already
 applies to MAN-66, `.github/workflows/release-publish.yml`'s own header
 comment).
 
-What *is* automated is noticing: the `publish-latest` job's "Verify the
+What *is* automated is noticing: the `docker-publish` job's "Verify the
 image is anonymously pullable" step performs an anonymous pull probe on
-every release and writes to the run's own step summary:
+every release — including a pre-release's first publish, which is when
+this package is most likely to be created — and writes to the run's own
+step summary:
 
 - If the probe succeeds, an "OK" line.
 - If it fails, a warning block with the exact click-path:

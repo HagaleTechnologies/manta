@@ -129,16 +129,42 @@ either way. This is recorded as a manual verification step
    repo-wide concurrency group, that the current tag is still the newest
    release.
 
-**Decision: (2).** GitHub Actions keeps at most one *pending* run/job per
-concurrency group and cancels the previous pending one on a new arrival.
-Making the whole workflow's group repo-wide (1) would mean a middle tag's
-entire release — every platform build, the GitHub Release, everything —
-could be silently cancelled by a later tag arriving before it finishes,
-not just its `:latest` write. Scoping a repo-wide group to a job
-(`publish-latest`) that does nothing BUT write `:latest` makes that same
-cancellation semantics correct instead of harmful: the only thing a
-cancellation can ever drop is a `:latest` write from a run that was about
-to decline it anyway.
+**Decision: (2), and later corrected again in remediation.** GitHub Actions
+keeps at most one *pending* run/job per concurrency group and cancels the
+previous pending one on a new arrival. Making the whole workflow's group
+repo-wide (1) would mean a middle tag's entire release — every platform
+build, the GitHub Release, everything — could be silently cancelled by a
+later tag arriving before it finishes, not just its `:latest` write.
+
+The first implementation scoped a repo-wide concurrency group to a
+dedicated job (`publish-latest`) that does nothing BUT write `:latest`, on
+the theory that "the only thing a cancellation can ever drop is a
+`:latest` write from a run that was about to decline it anyway." **PR
+review (round 7, chatgpt-codex-connector, finding 3.A) showed that claim
+is false**: `cancel-in-progress: false` only protects the run currently
+*in progress* — GitHub still cancels the previously *pending* run in the
+group whenever a new one arrives, and pending order is arrival order
+(build-completion order, since the job `needs: docker-publish`), not
+tag-version order. With three overlapping releases, the run for the
+actual *newest* tag can be the one sitting pending, cancelled by a release
+that is neither the newest nor the one still in progress — and then
+`:latest` is never written for the newest release at all, reproducing the
+exact symptom this finding describes, through the fix's own mechanism.
+
+**Corrected decision: no concurrency group on `publish-latest` at all.**
+Correctness does not need to depend on which run survives a GitHub
+Actions race, because each run already answers a GLOBAL question — "what
+is the newest stable tag in the whole repo right now?" — from a fresh
+`git fetch --tags`, not "is my tag newer than the one it happens to race
+against." Tag creation (`git push origin vX.Y.Z`) takes seconds, at the
+very start of a release, while the recency check below runs *after* the
+multi-arch build (minutes later); any tag genuinely "overlapping" this one
+is therefore already visible by the time either release reaches that
+check. Whichever run actually executes reaches the same, correct answer
+regardless of execution or completion order — nothing needs to survive a
+race for the outcome to be right. The only remaining race is the
+already-accepted one described two paragraphs down (two tags within the
+same few-second window).
 
 `publish-latest` re-fetches tags and re-runs
 `scripts/release-version.sh is-newest-stable` immediately before writing
@@ -156,8 +182,8 @@ pushes one release tag at a time — and recoverable in one command
 (`docs/RUNBOOKS/release.md`'s recovery section).
 
 `release` (the GitHub Release job) deliberately does **not** depend on
-`publish-latest` — a declined or concurrency-cancelled `:latest` write must
-never block a GitHub Release from being created.
+`publish-latest` — a declined `:latest` write must never block a GitHub
+Release from being created.
 
 **An unnamed second defect, fixed here in the same three lines:**
 `is-newest-stable` treats any pre-release (`v1.3.0-rc.1`) as never eligible
@@ -176,6 +202,21 @@ never blocks. The reasoning: a malformed tag might still get corrected and
 re-pushed as the real next release, so it's treated conservatively; a
 pre-release is intentionally non-final and blocking on it would freeze
 `:latest` for as long as an RC cycle runs.
+
+**A silent-failure bug found in the same function (remediation round 7,
+finding 3.C):** `is-newest-stable` read the tag list via
+`< <(git tag --list 'v[0-9]*')`, a process substitution whose exit status
+is invisible to the loop and to `set -e`. A failed or empty listing was
+therefore indistinguishable from "nothing is newer": the function printed
+`false` and returned 0, so `publish-latest` declined and went green having
+silently never updated `:latest`. The caller's own tag is always fetched
+and pushed before this function runs, so it must always appear in the
+listing — an empty result is a hard failure, not a legitimate decline.
+The fix captures the listing via command substitution (`tags="$(git tag
+--list ...)"`), which makes the exit status observable, and `die`s both on
+a failed listing and on an empty one, instead of falling through to a
+`false` whose own stderr message named the version under test as its own
+blocker (`${newest:-$version}`).
 
 ## Finding 4 — New GHCR package defaults to private
 
@@ -199,12 +240,27 @@ ticket's own open "or an explicit decision to automate it via the GitHub
 API in a future PR" option — it is not deferred, it is decided against.**
 
 What this PR fixes is the finding's other half: "neither changes that
-visibility **nor documents the required one-time package setting**." The
-`publish-latest` job's final step performs an anonymous-pull probe against
-the just-published version tag on every release and writes the result to
-the run's own `$GITHUB_STEP_SUMMARY` — either an "OK" line, or a warning
-block naming the exact click-path (package settings → Danger Zone → Change
-visibility → Public) and pointing at `docs/RUNBOOKS/release.md`. The step
+visibility **nor documents the required one-time package setting**." An
+anonymous-pull probe against the just-published version tag runs on every
+release and writes the result to the run's own `$GITHUB_STEP_SUMMARY` —
+either an "OK" line, or a warning block naming the exact click-path
+(package settings → Danger Zone → Change visibility → Public) and pointing
+at `docs/RUNBOOKS/release.md`.
+
+**Corrected placement (remediation round 7, finding 3.B):** the probe
+originally lived at the end of `publish-latest`, gated on
+`steps.recency.outputs.newest == 'true'`. `is-newest-stable` returns
+`false` for *every* pre-release by design (the paragraph above), so that
+gate skipped the probe entirely on exactly the release most likely to be
+this package's first publish — a maintainer's first tag is plausibly
+`v0.1.0-rc.1`, which creates the private GHCR package (finding 4's whole
+premise) while `publish-latest` correctly declines `:latest` and, with it,
+silently skipped the probe too. GHCR visibility is a property of *this
+push*, not of the `:latest` decision, so the probe now runs as the last
+step of `docker-publish` — gated on the same condition that gates the
+image push itself, so it runs on every real publish including
+pre-releases, and the version/image strings it needs already live in that
+job's own `needs.validate-tag.outputs`. The step
 is written to never fail the job: the release itself is fine either way,
 and the fix is an out-of-band human action, so a hard failure here would
 misreport a successful release as broken. `README.md`'s parenthetical

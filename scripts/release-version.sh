@@ -71,7 +71,7 @@ version_gt() {  # version_gt A B -> 0 if A > B
 }
 
 cmd_is_newest_stable() {
-  local version newest="" tag candidate triple rest
+  local version newest="" tag candidate triple rest tags
   version="$(cmd_validate "$1")" || exit 2
   case "$version" in
     *-*) printf 'false\n'
@@ -81,6 +81,14 @@ cmd_is_newest_stable() {
   # `git tag --list` over the tags fetched by the CALLER, immediately
   # before this call -- see the workflow step's own comment for why the
   # fetch must not happen at job start.
+  #
+  # Captured via command substitution, NOT `< <(git tag --list ...)`: a
+  # process substitution's exit status is invisible to the loop and to
+  # `set -e`, so a failing `git tag --list` used to look identical to "no
+  # tag is newer" -- printing `false` and exiting 0. Command substitution
+  # makes the failure observable and `die`-able below.
+  tags="$(git tag --list 'v[0-9]*')" || die \
+    "'git tag --list' failed -- cannot determine release recency for ${version}"
   while IFS= read -r tag; do
     [ -n "$tag" ] || continue
     candidate="${tag#v}"
@@ -103,12 +111,21 @@ cmd_is_newest_stable() {
     if [ -z "$newest" ] || version_gt "$triple" "$newest"; then
       newest="$triple"
     fi
-  done < <(git tag --list 'v[0-9]*')
+  done <<< "$tags"
+  # The caller's own tag was fetched and pushed before this ever runs, so
+  # it must always appear in `$tags` itself -- an empty `$newest` here
+  # means the fetch/listing silently saw nothing, not that "nothing is
+  # newer". That is a hard failure, not a legitimate `false`: the old
+  # behaviour printed `false` with a message naming `$version` as its own
+  # blocker (`${newest:-$version}`), which is self-contradictory rather
+  # than informative.
+  [ -n "$newest" ] || die \
+    "no stable release tags found while checking recency for ${version} -- expected at least ${version} itself to be visible after 'git fetch --tags'; refusing to silently decide"
   if [ "$newest" = "$version" ]; then
     printf 'true\n'
   else
     printf 'false\n'
-    printf 'a release with version prefix %s exists or is newer; leaving :latest alone\n' "${newest:-$version}" >&2
+    printf 'a release with version prefix %s exists or is newer; leaving :latest alone\n' "$newest" >&2
   fi
 }
 

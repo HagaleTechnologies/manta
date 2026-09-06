@@ -135,6 +135,33 @@ newest_case false v1.2.3 v1.2.3 v1.2.4+meta     # a tag this pipeline would
                                                  # refuse to publish must not
                                                  # be treated as a release
 
+echo "== is-newest-stable: hard failure on an unreadable/empty tag list =="
+# MAN-65 remediate round 7, finding 3.C: an empty tag listing used to be
+# indistinguishable from "nothing is newer" -- printed false, exited 0. The
+# caller's own tag is always fetched before this ever runs, so a listing
+# that doesn't even contain it is a hard failure, not a legitimate decline.
+newest_case_dies() {  # newest_case_dies <ref>
+  local ref="$1" repo rc
+  repo="$(mktemp -d)"
+  (
+    cd "$repo" || exit 2
+    git init -q .
+    git -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m x
+    # deliberately no tags at all -- not even $ref itself
+  ) >/dev/null
+  (
+    cd "$repo" || exit 2
+    "$SCRIPT" is-newest-stable "$ref"
+  ) >/dev/null 2>&1
+  rc=$?
+  rm -rf "$repo"
+  if [ "$rc" -ne 2 ]; then
+    fail "is-newest-stable $ref with no tags at all: expected exit 2, got $rc"
+  fi
+}
+
+newest_case_dies v1.2.3
+
 if [ "$failures" -ne 0 ]; then
   echo "$failures failure(s)" >&2
   exit 1
