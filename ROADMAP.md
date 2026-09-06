@@ -112,11 +112,15 @@ repetition gate, dedupe) is complete as a standalone crate -- see
 -decode-core.md §7.1 (V11-V15). It is now wired into `manta-engine`'s
 batch (`decode_samples`/`decode_wav`) and streaming (`listen`) pipelines,
 both emitting real `Spot`s -- see
-`docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`. Remaining
-M3 sub-projects: `manta-server` (telnet + JSON/WebSocket output, TOML
-config, metrics), and the RBN parity benchmark (needs ≥ 2 h of recorded
-contest-weekend IQ with RBN reference spots -- a data dependency not yet
-resolved).
+`docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`.
+**TOML config is now implemented** (MAN-74,
+`docs/DECISIONS/2026-09-06-man74-config-surface.md`): `manta run --config
+<path>` covers `[server]`/`[[rbn_uplink]]`/`[input]`/`[spot]`/`[detector]`/
+`[decode]`, with CLI > env > file > default precedence -- see
+SPEC-decode-core.md §9. Remaining M3 sub-projects: the RBN parity
+benchmark (needs ≥ 2 h of recorded contest-weekend IQ with RBN reference
+spots -- a data dependency not yet resolved), and the still-aspirational
+metrics endpoint gaps tracked in ARCHITECTURE §8.
 
 ## M4 — ML decoder stage (research-dependent)
 

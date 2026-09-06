@@ -1,6 +1,8 @@
 //! `manta` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
 //! The daemon (SDR input, servers) arrives at M2/M3 (ROADMAP).
 
+mod config;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use manta_engine::{decode_wav, PipelineConfig};
@@ -63,6 +65,12 @@ enum Command {
         out: PathBuf,
     },
     /// Decode a live off-air CW signal continuously from real audio.
+    ///
+    /// `run` is the D11/MAN-77 daemon verb name; shipped here as a
+    /// `visible_alias` so `manta run --config manta.toml` works today
+    /// (MAN-74) without waiting on MAN-77's full promotion of `run` to
+    /// canonical and retirement of `listen`.
+    #[command(visible_alias = "run")]
     Listen {
         /// Input device name substring (default input device if omitted).
         #[arg(long, conflicts_with = "source")]
@@ -93,13 +101,17 @@ enum Command {
         /// emission. Corrects a drifted source clock/LO -- legacy
         /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
         /// (a raw multiplier; this flag is ppm, per the spec's contract).
+        /// `None` (flag not passed) falls through to `input.freq_correction_ppm`
+        /// in `--config`'s file, then to 0.0 (MAN-74) -- unlike `decode`
+        /// (which has no config-file tier), this can't be a bare `f64`
+        /// with `default_value_t`, since that makes "typed 0" and "typed
+        /// nothing" indistinguishable.
         #[arg(
             long,
-            default_value_t = 0.0,
             value_parser = parse_freq_correction_ppm,
             allow_negative_numbers = true
         )]
-        freq_correction_ppm: f64,
+        freq_correction_ppm: Option<f64>,
         /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
         /// bypasses grammar/cty validation and the repetition gate
         /// entirely -- legacy precedent: CW Skimmer's Watch List
@@ -150,12 +162,16 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
-        /// TOML config with a `[server]`-shaped `ServerConfig` (station
-        /// callsign + ports). When given, also starts the telnet cluster
-        /// server, JSON Lines/WebSocket stream, and metrics endpoint
-        /// (ARCHITECTURE §7-§8) alongside the decode loop.
-        #[arg(long)]
-        server_config: Option<PathBuf>,
+        /// The daemon TOML config (SPEC §9: `[server]`, `[[rbn_uplink]]`,
+        /// `[input]`, `[spot]`, `[detector]`, `[decode]`) -- MAN-74. The
+        /// telnet cluster server, JSON Lines/WebSocket stream, and metrics
+        /// endpoint (ARCHITECTURE §7-§8) start alongside the decode loop
+        /// iff the resolved config has a `[server]` table; a
+        /// `[server]`-free file is a valid decode-only tuning config.
+        /// `--server-config` is kept as a deprecated alias for existing
+        /// unit files/scripts.
+        #[arg(long, alias = "server-config")]
+        config: Option<PathBuf>,
         /// RF dial frequency in Hz, overriding the source's own
         /// `center_freq_hz()`. Required with --server-config when the
         /// source is a plain audio device or --source WAV file, since
@@ -207,13 +223,16 @@ enum Command {
         /// emission. Corrects a drifted source clock/LO -- legacy
         /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
         /// (a raw multiplier; this flag is ppm, per the spec's contract).
+        /// `None` falls through to `input.freq_correction_ppm` in
+        /// `--config`'s file, then 0.0 (MAN-74) -- see `Listen`'s copy of
+        /// this field for why it's `Option<f64>` rather than
+        /// `default_value_t`.
         #[arg(
             long,
-            default_value_t = 0.0,
             value_parser = parse_freq_correction_ppm,
             allow_negative_numbers = true
         )]
-        freq_correction_ppm: f64,
+        freq_correction_ppm: Option<f64>,
         /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
         /// bypasses grammar/cty validation and the repetition gate
         /// entirely -- legacy precedent: CW Skimmer's Watch List
@@ -227,6 +246,12 @@ enum Command {
         /// range per line (MAN-31).
         #[arg(long)]
         notch: Option<PathBuf>,
+        /// The daemon TOML config (SPEC §9 `[input]`/`[spot]`/`[detector]`/
+        /// `[decode]` tables; `soak` never starts the telnet/JSON/metrics
+        /// servers, so `[server]`/`[[rbn_uplink]]` are parsed but unused
+        /// here). MAN-74.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
@@ -384,6 +409,71 @@ fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<
         Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
         None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
+}
+
+/// Opens a `[input]`-table-derived `config::SourceSpec` (MAN-74) -- the
+/// config-file counterpart to `open_source`/`open_hpsdr_source`'s
+/// CLI-flag-driven chain. `InputSource`/`SourceSpec` are never
+/// feature-gated (a config naming `type = "soapy"`/`"hpsdr"` always
+/// parses, on every build -- MAN-74 Decision 3), so a build missing the
+/// matching Cargo feature fails HERE, at source-open time, with a message
+/// naming the required `--features` flag, rather than being unable to
+/// represent the variant at all.
+fn open_source_spec(spec: config::SourceSpec) -> Result<Box<dyn IqSource>> {
+    match spec {
+        config::SourceSpec::Audio { device } => open_audio_source(device, None),
+        config::SourceSpec::File { path } => open_audio_source(None, Some(path)),
+        config::SourceSpec::Kiwi {
+            host,
+            port,
+            freq_hz,
+            password,
+        } => Ok(Box::new(manta_input::kiwi::KiwiIqSource::connect(
+            &host, port, freq_hz, &password,
+        )?)),
+        config::SourceSpec::Soapy {
+            driver,
+            freq_hz,
+            rate_hz,
+            gain_db,
+        } => {
+            #[cfg(feature = "soapy")]
+            {
+                Ok(Box::new(manta_input::soapy::SoapySdrIqSource::open(
+                    &driver, rate_hz, freq_hz, gain_db,
+                )?))
+            }
+            #[cfg(not(feature = "soapy"))]
+            {
+                let _ = (driver, freq_hz, rate_hz, gain_db);
+                bail!("[input] type = \"soapy\" requires building manta with --features soapy");
+            }
+        }
+        config::SourceSpec::Hpsdr {
+            host,
+            port,
+            freq_hz,
+            rate_hz,
+        } => {
+            #[cfg(feature = "hpsdr")]
+            {
+                let hpsdr_cfg = manta_input::hpsdr::HpsdrConfig {
+                    host,
+                    port,
+                    ddc_count: 1,
+                    sample_rate_hz: rate_hz,
+                    center_freq_hz: vec![freq_hz],
+                };
+                let mut sources = manta_input::hpsdr::HpsdrDevice::open(hpsdr_cfg)?;
+                Ok(Box::new(sources.remove(0)))
+            }
+            #[cfg(not(feature = "hpsdr"))]
+            {
+                let _ = (host, port, freq_hz, rate_hz);
+                bail!("[input] type = \"hpsdr\" requires building manta with --features hpsdr");
+            }
+        }
+    }
 }
 
 /// Overrides an inner source's `center_freq_hz()` with a fixed value --
@@ -662,7 +752,7 @@ fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
 /// files -- `str::trim` does not remove it, so left unstripped it corrupts
 /// the first line's parse (a blocklist callsign that never matches, or a
 /// notch range silently rejected).
-fn strip_bom(text: &str) -> &str {
+pub(crate) fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
@@ -774,7 +864,8 @@ fn shutdown_runtime_after_drain(
 }
 
 fn start_spot_server(
-    config_path: &std::path::Path,
+    cfg: manta_server::config::ServerConfig,
+    rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
     sample_rate_hz: f64,
     epoch: std::time::SystemTime,
     session_nonce: u128,
@@ -805,11 +896,6 @@ fn start_spot_server(
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
-
-    let cfg_text = std::fs::read_to_string(config_path)?;
-    let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
-    let rbn_uplink_cfgs = file.rbn_uplink.clone();
-    let cfg = file.server;
 
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
         sample_rate_hz,
@@ -1001,14 +1087,10 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
-            server_config,
+            config: config_path,
             dial_freq_hz,
             replay_epoch,
         } => {
-            let is_file_replay = source.is_some();
-            // Captured before `open_source` consumes `source` below --
-            // needed to derive a recording-specific replay epoch.
-            let replay_path = source.clone();
             #[cfg(feature = "soapy")]
             let has_soapy_source = soapy_driver.is_some();
             #[cfg(not(feature = "soapy"))]
@@ -1017,68 +1099,137 @@ fn main() -> Result<()> {
             let has_hpsdr_source = hpsdr_host.is_some();
             #[cfg(not(feature = "hpsdr"))]
             let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
-            let source_name = if kiwi_host.is_some() {
-                "kiwi"
-            } else if has_soapy_source {
-                "soapy"
-            } else if has_hpsdr_source {
-                "hpsdr"
-            } else if is_file_replay {
-                "file"
+            // MAN-74: any CLI source-selection flag wins over `[input]`
+            // entirely -- mixing fields across source TYPES field-by-field
+            // has no coherent meaning, and this leaves clap's existing
+            // conflicts_with_all/requires groups untouched.
+            let cli_has_source_flags = device.is_some()
+                || source.is_some()
+                || kiwi_host.is_some()
+                || has_soapy_source
+                || has_hpsdr_source;
+
+            let base_dir = config_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let file = config::load(config_path.as_deref())?;
+            let file_source = if cli_has_source_flags {
+                None
             } else {
-                "audio"
+                config::resolve_source(&file, &base_dir)
             };
 
-            if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            let is_file_replay =
+                source.is_some() || matches!(&file_source, Some(config::SourceSpec::File { .. }));
+            // Captured before `open_source`/`open_source_spec` consumes
+            // `source`/`file_source` below -- needed to derive a
+            // recording-specific replay epoch. A `[input] type = "file"`
+            // source (MAN-74) replays exactly like `--source`, so it feeds
+            // the same epoch/session-nonce derivation.
+            let replay_path = source.clone().or_else(|| match &file_source {
+                Some(config::SourceSpec::File { path }) => Some(path.clone()),
+                _ => None,
+            });
+            let has_rf_aware_source = if cli_has_source_flags {
+                kiwi_host.is_some() || has_soapy_source || has_hpsdr_source
+            } else {
+                file_source
+                    .as_ref()
+                    .is_some_and(config::SourceSpec::is_rf_aware)
+            };
+            let source_name = if cli_has_source_flags {
+                if kiwi_host.is_some() {
+                    "kiwi"
+                } else if has_soapy_source {
+                    "soapy"
+                } else if has_hpsdr_source {
+                    "hpsdr"
+                } else if is_file_replay {
+                    "file"
+                } else {
+                    "audio"
+                }
+            } else {
+                match &file_source {
+                    Some(config::SourceSpec::Kiwi { .. }) => "kiwi",
+                    Some(config::SourceSpec::Soapy { .. }) => "soapy",
+                    Some(config::SourceSpec::Hpsdr { .. }) => "hpsdr",
+                    Some(config::SourceSpec::File { .. }) => "file",
+                    Some(config::SourceSpec::Audio { .. }) | None => "audio",
+                }
+            };
+
+            // The resolved dial frequency: an explicit CLI flag wins over
+            // `[input].dial_freq_hz` (MAN-74).
+            let resolved_dial_freq_hz = dial_freq_hz.or_else(|| {
+                file.input
+                    .as_ref()
+                    .and_then(config::InputSource::dial_freq_hz)
+            });
+
+            if file.server.is_some() && !has_rf_aware_source && resolved_dial_freq_hz.is_none() {
                 bail!(
-                    "--dial-freq-hz is required with --server-config when using a plain \
-                     audio device or --source WAV file -- neither reports a real RF \
-                     frequency (KiwiSDR/SoapySDR already know theirs from \
-                     --kiwi-freq/--soapy-freq)"
+                    "--dial-freq-hz (or input.dial_freq_hz in your config file) is required \
+                     with a [server] table when using a plain audio device or a WAV file \
+                     source -- neither reports a real RF frequency (KiwiSDR/SoapySDR already \
+                     know theirs from --kiwi-freq/--soapy-freq or the [input] table)"
                 );
             }
 
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq,
-                password: kiwi_password,
+            let cli_overrides = config::CliOverrides {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
-            #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq,
-                rate: hpsdr_rate,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
-                    #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq,
-                                rate: soapy_rate,
-                                gain: soapy_gain,
-                            },
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, kiwi)?
+            let cfg = config::resolve_pipeline(&file, &base_dir, &cli_overrides)?;
+
+            let src: Box<dyn IqSource> = match (&file_source, cli_has_source_flags) {
+                (Some(spec), false) => open_source_spec(spec.clone())?,
+                _ => {
+                    let kiwi = KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq,
+                        password: kiwi_password,
+                    };
+                    #[cfg(feature = "hpsdr")]
+                    let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq,
+                        rate: hpsdr_rate,
+                    })?;
+                    #[cfg(not(feature = "hpsdr"))]
+                    let hpsdr_source: Option<Box<dyn IqSource>> = None;
+                    match hpsdr_source {
+                        Some(src) => src,
+                        None => {
+                            #[cfg(feature = "soapy")]
+                            {
+                                open_source(
+                                    device,
+                                    source,
+                                    kiwi,
+                                    SoapyOpts {
+                                        driver: soapy_driver,
+                                        freq: soapy_freq,
+                                        rate: soapy_rate,
+                                        gain: soapy_gain,
+                                    },
+                                )?
+                            }
+                            #[cfg(not(feature = "soapy"))]
+                            {
+                                open_source(device, source, kiwi)?
+                            }
+                        }
                     }
                 }
             };
-            let src: Box<dyn IqSource> = match dial_freq_hz {
+            let src: Box<dyn IqSource> = match resolved_dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
                     freq_hz,
@@ -1087,16 +1238,18 @@ fn main() -> Result<()> {
             };
 
             // Kept alive for the process lifetime: dropping it would stop
-            // the spawned server tasks. `None` when --server-config wasn't
-            // given, in which case `spot_server` stays None too. `epoch`/
+            // the spawned server tasks. `None` when the resolved config has
+            // no `[server]` table, in which case `spot_server` stays None
+            // too (MAN-74 Decision 6: servers start iff `[server]` is
+            // present, not merely because `--config` was given). `epoch`/
             // `session_nonce` are deliberately computed IN this branch, not
-            // above it -- `--source`-only replay (no --server-config) never
+            // above it -- a source-only replay (no `[server]`) never
             // consumes either, and computing `session_nonce` means hashing
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match server_config {
-                Some(path) => {
+            let (server_runtime, spot_server) = match file.server.clone() {
+                Some(server_cfg) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
                     // JSON `timestamp`/RBN Zulu field a client observes) --
                     // a live session's epoch is this process's real start
@@ -1129,8 +1282,13 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                    let (rt, server) = start_spot_server(
+                        server_cfg,
+                        file.rbn_uplink.clone(),
+                        src.sample_rate(),
+                        epoch,
+                        session_nonce,
+                    )?;
                     // Real, if coarse, health signal: this source opened
                     // and is running. `active_tracks` has no equivalent
                     // hook yet -- manta-engine exposes no live track-count
@@ -1268,43 +1426,82 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
+            config: config_path,
         } => {
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq,
-                password: kiwi_password,
-            };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            #[cfg(feature = "soapy")]
+            let has_soapy_source = soapy_driver.is_some();
+            #[cfg(not(feature = "soapy"))]
+            let has_soapy_source = false;
             #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq,
-                rate: hpsdr_rate,
-            })?;
+            let has_hpsdr_source = hpsdr_host.is_some();
             #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
-                    #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq,
-                                rate: soapy_rate,
-                                gain: soapy_gain,
-                            },
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, kiwi)?
+            let has_hpsdr_source = false;
+            let cli_has_source_flags = device.is_some()
+                || source.is_some()
+                || kiwi_host.is_some()
+                || has_soapy_source
+                || has_hpsdr_source;
+
+            let base_dir = config_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let file = config::load(config_path.as_deref())?;
+            let file_source = if cli_has_source_flags {
+                None
+            } else {
+                config::resolve_source(&file, &base_dir)
+            };
+
+            let cli_overrides = config::CliOverrides {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+            };
+            let cfg = config::resolve_pipeline(&file, &base_dir, &cli_overrides)?;
+
+            let src: Box<dyn IqSource> = match (&file_source, cli_has_source_flags) {
+                (Some(spec), false) => open_source_spec(spec.clone())?,
+                _ => {
+                    let kiwi = KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq,
+                        password: kiwi_password,
+                    };
+                    #[cfg(feature = "hpsdr")]
+                    let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq,
+                        rate: hpsdr_rate,
+                    })?;
+                    #[cfg(not(feature = "hpsdr"))]
+                    let hpsdr_source: Option<Box<dyn IqSource>> = None;
+                    match hpsdr_source {
+                        Some(src) => src,
+                        None => {
+                            #[cfg(feature = "soapy")]
+                            {
+                                open_source(
+                                    device,
+                                    source,
+                                    kiwi,
+                                    SoapyOpts {
+                                        driver: soapy_driver,
+                                        freq: soapy_freq,
+                                        rate: soapy_rate,
+                                        gain: soapy_gain,
+                                    },
+                                )?
+                            }
+                            #[cfg(not(feature = "soapy"))]
+                            {
+                                open_source(device, source, kiwi)?
+                            }
+                        }
                     }
                 }
             };
@@ -1597,8 +1794,10 @@ mod tests {
             .as_bytes(),
         );
 
+        let parsed = config::load(Some(cfg_file.path())).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
+            parsed.server.clone().unwrap(),
+            parsed.rbn_uplink.clone(),
             96_000.0,
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -1647,8 +1846,10 @@ mod tests {
             .as_bytes(),
         );
 
+        let parsed = config::load(Some(cfg_file.path())).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
+            parsed.server.clone().unwrap(),
+            parsed.rbn_uplink.clone(),
             96_000.0,
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -1706,8 +1907,10 @@ mod tests {
             .as_bytes(),
         );
 
+        let parsed = config::load(Some(cfg_file.path())).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
+            parsed.server.clone().unwrap(),
+            parsed.rbn_uplink.clone(),
             96_000.0,
             std::time::SystemTime::UNIX_EPOCH,
             0,

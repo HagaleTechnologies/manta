@@ -87,16 +87,17 @@ fn kiwi_host_without_freq_is_a_clean_error() {
 
 #[test]
 fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
-    // Validated before any file I/O (open_source/start_spot_server), so
-    // nonexistent paths are fine for provoking this specific error.
+    // MAN-74: the server now starts iff the resolved config has a
+    // [server] table (Decision 6), so this check needs an actual,
+    // parseable file with [server] present -- a nonexistent path (the
+    // pre-MAN-74 fixture) fails at config::load's file-read instead of
+    // ever reaching the dial-freq-hz check.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[server]\nstation_callsign = \"W3XYZ\"\n").unwrap();
     let out = manta()
-        .args([
-            "listen",
-            "--source",
-            "/nonexistent.wav",
-            "--server-config",
-            "/nonexistent.toml",
-        ])
+        .args(["listen", "--source", "/nonexistent.wav", "--config"])
+        .arg(&cfg_path)
         .output()
         .unwrap();
     assert!(
@@ -347,6 +348,155 @@ fn decode_blocklist_flag_tolerates_a_leading_bom() {
         report["spots"].as_array().unwrap().len(),
         0,
         "a BOM-prefixed blocklist's first entry must still match, got: {report}"
+    );
+}
+
+/// Writes a real (non-IQ) mono 48 kHz WAV of a keyed CW tone -- the format
+/// `AudioIqSource::from_wav_file`/`--source`/`[input] type = "file"`
+/// actually consume, distinct from `manta_testkit::vectors::write_fixture_set`'s
+/// stereo IQ WAV (`decode`'s format). Mirrors
+/// `tests/soak_ci.rs`'s in-process technique, but written to disk since
+/// these tests drive the real `manta` binary as a subprocess.
+fn write_real_audio_wav(path: &std::path::Path, text: &str, duration_s: f64) {
+    let fs = manta_input::TARGET_RATE_HZ;
+    let spec = manta_testkit::keyer::KeyerSpec::new(25.0);
+    let (env, _keyed) =
+        manta_testkit::keyer::key_text_loop(text, &spec, fs as f64, duration_s).unwrap();
+    let dphi = std::f64::consts::TAU * 700.0 / fs as f64;
+    let mut phi = 0.0f64;
+    let samples: Vec<f32> = env
+        .iter()
+        .map(|&e| {
+            let s = e * phi.cos() as f32;
+            phi += dphi;
+            s
+        })
+        .collect();
+    let wav_spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: fs,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(path, wav_spec).unwrap();
+    for s in samples {
+        w.write_sample(s).unwrap();
+    }
+    w.finalize().unwrap();
+}
+
+/// MAN-74 scenario 1, end to end: `manta listen --config manta.toml` with
+/// an `[input] type = "file"` table and NO CLI source flags at all must
+/// decode using exactly that source configuration.
+#[test]
+fn listen_runs_from_a_config_file_with_no_source_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
+
+    let out = manta()
+        .args(["listen", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "must have decoded something from the config-only [input] source"
+    );
+}
+
+/// MAN-74 scenario 2, end to end: a config file with a table `manta`
+/// doesn't model exits non-zero, naming the table.
+#[test]
+fn unknown_top_level_config_table_is_rejected_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[server]\nstation_callsign = \"W3XYZ\"\n\n[completely_bogus_table]\nnonsense = 42\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an unmodeled table must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("completely_bogus_table"),
+        "stderr must name the table: {stderr}"
+    );
+}
+
+/// MAN-74 scenario 3, end to end: an explicit `--freq-correction-ppm 0`
+/// must win over a nonzero file value -- the exact `default_value_t = 0.0`
+/// trap this ticket's flag redesign (`Option<f64>`) exists to avoid. Uses
+/// `input.dial_freq_hz = 14025000.0` so 10 ppm is a ~140 Hz shift, well
+/// above decode jitter -- at audio baseband alone (~700 Hz) 10 ppm is
+/// ~0.007 Hz, undetectable against real estimator noise.
+fn last_track_meta_freq_hz(stdout: &[u8]) -> f64 {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("TrackMeta"))
+        .filter_map(|v| v.get("freq_hz").and_then(|f| f.as_f64()))
+        .next_back()
+        .expect("expected at least one TrackMeta event")
+}
+
+#[test]
+fn cli_freq_correction_ppm_beats_the_config_file_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[input]\ntype = \"audio\"\nfreq_correction_ppm = 10.0\ndial_freq_hz = 14025000.0\n",
+    )
+    .unwrap();
+
+    let run = |extra_args: &[&str]| {
+        let out = manta()
+            .args(["listen", "--json", "--source"])
+            .arg(&wav_path)
+            .args(["--config"])
+            .arg(&cfg_path)
+            .args(extra_args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        last_track_meta_freq_hz(&out.stdout)
+    };
+
+    let from_file_ppm = run(&[]);
+    // cli_zero_ppm is the raw, uncorrected frequency: --freq-correction-ppm 0
+    // must win over the file's 10.0, not be mistaken for "flag absent".
+    let cli_zero_ppm = run(&["--freq-correction-ppm", "0"]);
+
+    let expected_from_file = cli_zero_ppm * (1.0 + 10.0 * 1e-6);
+    assert!(
+        (from_file_ppm - expected_from_file).abs() < 1.0,
+        "file's freq_correction_ppm = 10.0 should have scaled freq_hz {cli_zero_ppm} to \
+         {expected_from_file}, got {from_file_ppm} -- if the CLI's explicit 0 had been \
+         mistaken for 'flag absent', both runs would report the same (scaled) frequency"
+    );
+    assert!(
+        (from_file_ppm - cli_zero_ppm).abs() > 10.0,
+        "the two runs should differ by ~140 Hz (10 ppm at 14 MHz); got from_file={from_file_ppm} cli_zero={cli_zero_ppm}"
     );
 }
 
