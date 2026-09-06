@@ -470,7 +470,15 @@ async fn forward_loop(
                             continue;
                         }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
-                        let line = rbn::format_line(&bus_spot.spot, spotter_call, unix_ts);
+                        // MAN-88 Decision 1: the uplink always emits the RBN
+                        // relay layout, independent of [server].line_format
+                        // -- see that key's doc comment in config.rs.
+                        let line = rbn::format_line(
+                            &bus_spot.spot,
+                            spotter_call,
+                            unix_ts,
+                            rbn::LineFormat::Rbn,
+                        );
                         let wire_line = format!("{line}\r\n");
                         // Raced against shutdown too, not just bounded by
                         // WRITE_TIMEOUT (PR #80 review, round 3): once

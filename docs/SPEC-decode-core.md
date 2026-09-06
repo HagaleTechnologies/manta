@@ -99,8 +99,10 @@ Per hop, for a track with peak channel `k₀`:
 - Only **key-down** hops (§3.4) with `SNR ≥ 6 dB` contribute.
 - Track centroid: power-weighted running mean over the track lifetime:
   `C = Σ (k₀ + δ_m)·P₀[m] / Σ P₀[m]` (accumulate in `f64`).
-- Spot frequency: `f_spot = f(0) + C·Δ` rounded to 0.1 kHz for the telnet
-  output, full precision (Hz) in the JSON stream.
+- Spot frequency: `f_spot = f(0) + C·Δ` rounded to **0.01 kHz** for the
+  telnet output (MAN-88 — RBN's live feed carries 2 decimals of kHz; the
+  previous one-decimal rounding discarded 10 Hz of the estimator's real
+  precision), full precision (Hz) in the JSON stream.
 
 With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
 error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference

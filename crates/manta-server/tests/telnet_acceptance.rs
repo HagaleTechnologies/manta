@@ -22,6 +22,18 @@ async fn spawn_server() -> (
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
+    spawn_server_with_format(rbn::LineFormat::Rbn).await
+}
+
+async fn spawn_server_with_format(
+    line_format: rbn::LineFormat,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
@@ -54,6 +66,7 @@ async fn spawn_server() -> (
                 manta_server::telnet::MAX_TELNET_COMMANDS,
                 manta_server::telnet::COMMAND_RATE_WINDOW,
             ),
+            line_format,
         )
         .await;
     });
@@ -112,7 +125,12 @@ async fn standard_client_receives_spot_in_rbn_format_after_login() {
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     bus.publish(spot);
 
     let mut line = String::new();
@@ -154,9 +172,18 @@ async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
     first.callsign = "K5ARH".to_string();
     let mut second = sample_spot();
     second.callsign = "N0CALL".to_string();
-    let expected_first = rbn::format_line(&first, STATION_CALL, bus.unix_ts_for(first.sample_ts));
-    let expected_second =
-        rbn::format_line(&second, STATION_CALL, bus.unix_ts_for(second.sample_ts));
+    let expected_first = rbn::format_line(
+        &first,
+        STATION_CALL,
+        bus.unix_ts_for(first.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
+    let expected_second = rbn::format_line(
+        &second,
+        STATION_CALL,
+        bus.unix_ts_for(second.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     bus.publish(first);
     bus.publish(second);
 
@@ -435,7 +462,12 @@ async fn a_source_past_its_per_ip_connection_cap_is_declined_without_disturbing_
     // unaffected by the decline -- still logged in and still receiving
     // spots normally.
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     bus.publish(spot);
     for (reader, _wr) in clients.iter_mut() {
         let mut line = String::new();
@@ -628,4 +660,78 @@ async fn a_second_connection_from_the_same_ip_cannot_multiply_the_command_rate_b
         "expected connection B to be disconnected once the SHARED per-IP budget \
          (already exhausted by connection A) was exceeded, got: {extra:?}"
     );
+}
+
+/// MAN-88 Scenario 1, end to end: the bytes on the wire, not just the
+/// renderer's return value. Asserts against literal column numbers, so a
+/// regression in any layer between `format_line` and the socket is caught --
+/// the other tests in this file build their expectation by calling
+/// `format_line` themselves and would not.
+#[tokio::test]
+async fn a_live_spot_arrives_in_the_fixed_column_ak1a_layout() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for spot line")
+        .unwrap();
+    let line = line.trim_end();
+
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(line.find(&zulu).unwrap() + 1, 71, "line was: {line:?}");
+    assert_eq!(line.find("CW").unwrap() + 1, 42, "line was: {line:?}");
+    assert!(line.contains("14027.10"), "line was: {line:?}");
+}
+
+/// MAN-88 Scenario 2, end to end.
+#[tokio::test]
+async fn a_skimmer_mode_server_emits_the_no_mode_column_layout() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) =
+        spawn_server_with_format(rbn::LineFormat::Skimmer).await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for spot line")
+        .unwrap();
+    let line = line.trim_end();
+
+    assert!(
+        !line.contains(" CW "),
+        "mode column still present: {line:?}"
+    );
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(line.find(&zulu).unwrap() + 1, 67, "line was: {line:?}");
+}
+
+/// The `sh/dx` replay path renders through the same function -- confirm it
+/// honours the configured format rather than defaulting.
+#[tokio::test]
+async fn sh_dx_history_also_honours_the_configured_line_format() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) =
+        spawn_server_with_format(rbn::LineFormat::Skimmer).await;
+    bus.publish(sample_spot());
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"sh/dx\r\n").await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for history line")
+        .unwrap();
+    assert!(!line.contains(" CW "), "line was: {line:?}");
 }
