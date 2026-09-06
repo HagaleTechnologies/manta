@@ -558,6 +558,18 @@ confirm_ms = 50        hang_ms = 5000
 gc_ms = 30000          warmup_ms = 2000
 floor_quantile = 0.25  floor_window_ms = 10000
 block_channels = 32    block_allowance_db = 3.0
+# [DEVIATION from SPEC §2.4] MAN-9 / issue #26: hang window (ms) for a track
+# that has decoded at least one real character, instead of the single
+# hang_ms above. Equal to hang_ms by default (= SPEC behavior); see
+# manta-engine::track::DetectorConfig::hang_hops_emitting and
+# docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+hang_emitting_ms = 5000
+# [DEVIATION from SPEC §2.5] MAN-9 / issue #26: merge radius in channels,
+# instead of the literal 1.0-channel threshold, used by TrackManager's
+# convergence merge. 1.0 by default (= SPEC behavior); hard ceiling 2.5 (the
+# V8/V8w scene's 300 Hz minimum separation = 3.2 channels). See
+# manta-engine::track::DetectorConfig::merge_radius_channels and the pin doc.
+merge_radius_channels = 1.0
 
 [decode]
 timing_sigma = 0.25    beam_width = 4
@@ -566,6 +578,23 @@ tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
 mu_ratio_bounds = [2.2, 4.5]
 char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
 cluster_alpha = 0.15
+# [DEVIATION from SPEC §3.3] MAN-9: debounce as a fraction of the tracked
+# dit (`debounce_dits · mu_dit_ms`, floored by debounce_ms, capped by
+# debounce_ceiling_ms), instead of the single WPM-independent debounce_ms
+# above. 0.0 disables (= SPEC behavior). See
+# manta-decode::envelope::DemodConfig::{debounce_dits,debounce_ceiling_ms}.
+debounce_dits = 0.0    debounce_ceiling_ms = 30.0
+# [DEVIATION from SPEC §4.4/§9] MAN-9: beam width used instead of beam_width
+# above when a character's channel-quality term q (§4.5) is below q_low.
+# width_low_q defaults to beam_width (= SPEC behavior, inert). See
+# manta-decode::beam::BeamConfig::{width_low_q,q_low}.
+width_low_q = 4        q_low = 0.6
+# [DEVIATION from SPEC §4.1] MAN-9: bounds, as a ratio to the nearest speed
+# centroid, outside which a mark is excluded from the centroid EMA update
+# (still counted for the drift/regime-change rule). (0.0, inf) admits every
+# mark (= SPEC behavior, inert). See
+# manta-decode::timing::MarkAdmission, manta-decode::decoder::DecodeConfig::mark_admission.
+mark_admission_lo = 0.0  mark_admission_hi = inf
 
 [input]
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]

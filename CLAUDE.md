@@ -13,9 +13,15 @@ detector/track manager + decoder pool; V8/V8w pileup + CPU-budget bench;
 SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
 2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2/V5/V6/V8w are tracked
 known classical-decoder fading-robustness limitations (`#[ignore]`d,
-issues #25/#28), deferred to M4 ML fusion by design, not M2 blockers. **M2
-acceptance is still open**: Pi4 CPU-budget leg and 24 h live-SDR soak are
-unmet — both need physical hardware not reachable from this environment.
+issues #25/#28), deferred to M4 ML fusion by design, not M2 blockers. MAN-9
+walked a bounded classical-mitigation ladder against V8w and pinned the
+measured baseline (still 1/34 strong signals, median CER ≈ 0.276) plus a
+non-regression ratchet — see
+docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md and
+`v8w_classical_baseline_does_not_regress`
+(`crates/manta-cli/tests/golden_v8_v8w.rs`). **M2 acceptance is still
+open**: Pi4 CPU-budget leg and 24 h live-SDR soak are unmet — both need
+physical hardware not reachable from this environment.
 `manta-dsp::single`/`freqest` deprecated in place.
 
 ## Documents (read in this order)

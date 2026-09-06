@@ -350,3 +350,65 @@ fn v8w_per_signal_cer_report() {
         "V8w regressed below its recorded 1/34 baseline"
     );
 }
+
+/// MAN-9: the classical-only V8w baseline M4's own acceptance criterion has
+/// to beat ("fusion beats classical-only CER by a measured, documented
+/// margin", `ROADMAP.md` M4). This is NOT a relaxed copy of
+/// `v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts` -- that
+/// gate keeps its 90%/0.10 thresholds untouched and stays `#[ignore]`d
+/// pending real fading-robustness work. This is a regression FLOOR pinned
+/// to what the classical chain measurably achieves TODAY (commit `826bdd8`,
+/// MAN-8's rungs -- `K_ANCHOR`, `Demod::duty`, a moved `CLUSTER_ALPHA` --
+/// all absent; see docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md),
+/// so the baseline cannot rot silently between now and M4. Raise these
+/// numbers when the decoder improves; never lower them to make this pass.
+///
+/// `#[ignore]`d per the pin doc's CI-cost rule: one full V8w render+decode
+/// measures ~367 s in this environment, over the 180 s cutoff for a second
+/// full-50-signal-scene run in CI (`golden_v8_v8w.rs` already runs one, the
+/// V8 AWGN test above). Run before release:
+/// `cargo test -p manta-cli --test golden_v8_v8w -- --ignored
+/// v8w_classical_baseline_does_not_regress`.
+#[test]
+#[ignore]
+fn v8w_classical_baseline_does_not_regress() {
+    const MEASURED_PASSES: usize = 1;
+    const MEASURED_MEDIAN_CER: f64 = 0.2755;
+
+    let spec = manta_testkit::vectors::v8w();
+    let (report, manifest) = v8w_decode();
+    let tracks = per_track(report);
+    let matched = match_tracks_by_freq(manifest, &tracks);
+    let strong: Vec<usize> = spec
+        .signals
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.snr_2500_db >= 6.0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut cers: Vec<f64> = strong
+        .iter()
+        .map(|&i| {
+            let (decoded_text, _freq) = matched[i];
+            manta_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text)
+        })
+        .collect();
+    let passes = cers.iter().filter(|&&c| c < 0.10).count();
+    cers.sort_by(f64::total_cmp);
+    let n = cers.len();
+    let median = if n % 2 == 0 {
+        (cers[n / 2 - 1] + cers[n / 2]) / 2.0
+    } else {
+        cers[n / 2]
+    };
+
+    assert!(
+        passes >= MEASURED_PASSES,
+        "V8w strong-signal passes regressed: {passes} < {MEASURED_PASSES}"
+    );
+    assert!(
+        median <= MEASURED_MEDIAN_CER + 0.01,
+        "V8w median CER regressed: {median:.4} > {MEASURED_MEDIAN_CER:.4} + 0.01"
+    );
+}

@@ -17,9 +17,12 @@ pub struct DetectorConfig {
     /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED.
     pub hang_hops: u64,
     /// **[DEVIATION from SPEC §2.4]** MAN-9 / issue #26: hang window used
-    /// instead of `hang_hops` for a track that has already emitted a real
-    /// `DecoderEvent` (`Track::has_emitted` / `Lifecycle::note_emitting`).
-    /// SPEC §2.4 pins a single 5000 ms hang for every track; a
+    /// instead of `hang_hops` for a track that has already decoded a real
+    /// character (`Lifecycle::note_emitting`, driven by `CharDecoded`
+    /// only -- narrower than `Track::has_emitted`'s any-event-kind
+    /// criterion; see `note_emitting`'s doc comment for why `TrackMeta`
+    /// does not qualify). SPEC §2.4 pins a single 5000 ms hang for every
+    /// track; a
     /// Watterson-Poor fade can hold a real signal below `off_snr_db`
     /// longer than that, closing the track and forcing a new,
     /// sequentially-numbered `track_id` on reacquisition -- measured on
@@ -225,13 +228,16 @@ impl Lifecycle {
     /// `DecoderEvent`, switching `on_hop`'s HANG-state timer from
     /// `hang_hops` to `hang_hops_emitting` from here on. Idempotent, and
     /// never reversed -- once proven, a track stays proven for its whole
-    /// life. `TrackManager::process_hops` calls this alongside
-    /// `note_char_decoded` (same "did `drain_pool` produce a real event
-    /// for this track" set MAN-19's `has_emitted`/`TrackClosed` filter
-    /// already tracks), for every event kind, not just `CharDecoded` --
-    /// unlike the GC timer, a `TrackMeta`/`SpeedUpdate`-only track (no
-    /// `CharDecoded` yet) is still real output worth coasting a longer
-    /// hang for.
+    /// life. `TrackManager::process_hops` calls this only on
+    /// `CharDecoded`, the SAME criterion `note_char_decoded`'s GC timer
+    /// uses -- deliberately narrower than MAN-19's `has_emitted`, which
+    /// fires on any event kind. `TrackMeta` is an unconditional ~1 Hz
+    /// heartbeat (`TrackDecoder::push_envelope`, `META_INTERVAL_HOPS`)
+    /// gated only on having an SNR reading, not on decoded output -- every
+    /// ACTIVE track emits one within about a second, promoted or noise, so
+    /// treating it as "proven" would make the base `hang_hops` window
+    /// effectively unreachable (round-1 review finding, CR-1). Only an
+    /// actual decoded character is evidence this track is a real signal.
     pub(crate) fn note_emitting(&mut self) {
         self.emitting = true;
     }
@@ -798,15 +804,18 @@ impl TrackManager {
         for e in &events {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
-                // MAN-9 / issue #26: same "did this track ever actually
-                // emit anything" set as `has_emitted` above, driving
-                // `hang_hops_emitting` (`Lifecycle::note_emitting`'s doc
-                // comment) instead of MAN-19's `TrackClosed` filter.
-                t.lifecycle.note_emitting();
             }
+            // MAN-9 / issue #26 (CR-1 fix): `note_emitting` -- which
+            // drives `hang_hops_emitting` -- fires ONLY on `CharDecoded`,
+            // not on `has_emitted`'s broader any-event-kind criterion.
+            // `TrackMeta` is an unconditional ~1 Hz heartbeat gated only
+            // on an SNR reading (see `note_emitting`'s doc comment), so
+            // including it here would flag every ACTIVE track as "proven"
+            // within about a second, noise included.
             if let DecoderEvent::CharDecoded { track_id, .. } = e {
                 if let Some(t) = self.tracks.get_mut(track_id) {
                     t.lifecycle.note_char_decoded();
+                    t.lifecycle.note_emitting();
                 }
             }
         }
@@ -1470,6 +1479,114 @@ mod tests {
             "the surviving track must be the SAME track_id, not a new one"
         );
         assert_eq!(tm.close_counts().hang_expired, 0);
+    }
+
+    /// CR-1 fix (round-2 review of MAN-9 / issue #26): a track whose ONLY
+    /// output is the `TrackMeta` heartbeat -- never a `CharDecoded` -- must
+    /// keep the BASE `hang_hops`, not `hang_hops_emitting`. Unlike the
+    /// sibling test above (which pokes `has_emitted`/`note_emitting`
+    /// directly), this one drives a real `TrackDecoder` through
+    /// `TrackManager::process_hops` so `note_emitting`'s actual call site
+    /// is exercised: before the fix, `process_hops` called
+    /// `lifecycle.note_emitting()` for every drained event kind, so the
+    /// unconditional ~1 Hz `TrackMeta` heartbeat alone (SPEC §5,
+    /// `META_INTERVAL_HOPS`) would have flagged this track "proven" and it
+    /// would have survived the dropout below.
+    ///
+    /// Envelope design: post-promotion, feed 285 hops at a "high" level
+    /// (channel power +20 dB over the floor, same as promotion) followed
+    /// by 90 hops at a "low" level (+6 dB, still comfortably above
+    /// `off_snr_db=3.0` so the track stays ACTIVE) -- 375 total, exactly
+    /// `Demod`'s `INIT_HOPS`/`META_INTERVAL_HOPS`. The high/low amplitude
+    /// ratio (~5x) clears `Demod`'s `MIN_KEYING_RATIO=2.0` so the demod
+    /// initializes and reports one `TrackMeta` on this very hop -- but the
+    /// single high-to-low transition is confirmed into `Demod`'s `held`
+    /// slot and never evicted to a returned `Run` (that needs a SECOND
+    /// flip), so `on_run`/the beam decoder never see a mark and
+    /// `CharDecoded` never fires.
+    #[test]
+    fn a_trackmeta_only_track_keeps_the_base_hang_window_under_process_hops() {
+        let cfg = DetectorConfig {
+            confirm_hops: 5,
+            hang_hops: 10,
+            hang_hops_emitting: 30,
+            gc_hops: 10_000, // large: keep the GC silent-timer from interfering
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, 64);
+
+        const FLOOR_POWER: f32 = 1e-9;
+        let high_power = FLOOR_POWER * 10f32.powf(20.0 / 10.0); // +20 dB: promote + demod "mark" level
+        let low_power = FLOOR_POWER * 10f32.powf(6.0 / 10.0); // +6 dB: still ACTIVE, demod "space" level
+
+        let mut m = 250u64 * 15;
+        let mut all_events: Vec<DecoderEvent> = Vec::new();
+        let feed = |tm: &mut TrackManager,
+                    m: &mut u64,
+                    power_at_10: f32,
+                    all_events: &mut Vec<DecoderEvent>| {
+            let mut power = quiet_power(64);
+            power[10] = power_at_10;
+            all_events.extend(tm.process_hops(&[hop(*m, power)], |ts| ts));
+            *m += 1;
+        };
+
+        // Promote on channel 10, feeding the decoder pool one hop at a time
+        // so the post-promotion pending-hop count is exactly trackable.
+        let mut pending_hops_fed = 0u32;
+        while !tm
+            .tracks
+            .values()
+            .any(|t| t.state() == LifecycleState::Active)
+        {
+            feed(&mut tm, &mut m, high_power, &mut all_events);
+        }
+        pending_hops_fed += 1; // the promotion hop itself is already queued
+        let id = *tm
+            .tracks
+            .keys()
+            .next()
+            .expect("a strong channel should have spawned and promoted a track");
+
+        // Complete the 285-hop "mark" segment.
+        while pending_hops_fed < 285 {
+            feed(&mut tm, &mut m, high_power, &mut all_events);
+            pending_hops_fed += 1;
+        }
+        // The 90-hop "space" segment, completing the demod's 375-hop window.
+        while pending_hops_fed < 375 {
+            feed(&mut tm, &mut m, low_power, &mut all_events);
+            pending_hops_fed += 1;
+        }
+
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { track_id, .. } if *track_id == id)),
+            "expected a TrackMeta heartbeat once the demod initializes, got {all_events:?}"
+        );
+        assert!(
+            !all_events.iter().any(
+                |e| matches!(e, DecoderEvent::CharDecoded { track_id, .. } if *track_id == id)
+            ),
+            "this track must never decode a character -- TrackMeta must be the only \
+             output for the base-hang property to be under test, got {all_events:?}"
+        );
+
+        // Real dropout: hang_hops(10) < 20 < hang_hops_emitting(30). Unlike
+        // `an_emitting_track_survives_a_dropout_under_a_real_track_manager`'s
+        // CharDecoded-backed track, this TrackMeta-only track must NOT
+        // survive -- it never earned `note_emitting`.
+        for _ in 0..20 {
+            feed(&mut tm, &mut m, FLOOR_POWER, &mut all_events);
+        }
+        assert!(
+            !tm.tracks.contains_key(&id),
+            "a track that only ever emitted TrackMeta must close on the base hang_hops, \
+             not survive on hang_hops_emitting"
+        );
+        assert_eq!(tm.close_counts().hang_expired, 1);
     }
 
     /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render

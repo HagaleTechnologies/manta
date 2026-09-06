@@ -128,6 +128,25 @@ fn fragmented_signal_indices(
         .collect()
 }
 
+/// `(first_ts, last_ts)` for every track in `cluster` that actually has a
+/// timestamped event (`CharDecoded`/`WordBoundary`). CR-2 (round-2 review):
+/// `TrackMeta` carries no `sample_ts`, so a TrackMeta-only track -- exactly
+/// what a short fading fragment produces -- has `first_ts`/`last_ts` both
+/// `None`. Defaulting those to `(0, 0)` would make every such track
+/// trivially overlap every other one at the origin, flipping the F1/F2
+/// verdict to "F2 concurrent" regardless of the tracks' real relationship.
+/// Excluding them (rather than defaulting) means the span set only ever
+/// contains tracks whose overlap is actually measured.
+fn timestamped_spans(cluster: &[&TrackSummary]) -> Vec<(u64, u64)> {
+    cluster
+        .iter()
+        .filter_map(|t| match (t.first_ts, t.last_ts) {
+            (Some(first), Some(last)) => Some((first, last)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Count of pairs in `spans` whose `[first_ts, last_ts]` intervals
 /// overlap -- evidence for F2 (concurrent spectral spread) over F1
 /// (sequential drop/reacquire, which predicts disjoint spans).
@@ -163,10 +182,7 @@ fn v8w_fragmentation_is_sequential_or_concurrent() {
     for &idx in &fragmented {
         let expected = expected_freq(&spec, idx);
         let cluster = tracks_near(&tracks, expected, NEAR_HZ);
-        let spans: Vec<(u64, u64)> = cluster
-            .iter()
-            .map(|t| (t.first_ts.unwrap_or(0), t.last_ts.unwrap_or(0)))
-            .collect();
+        let spans = timestamped_spans(&cluster);
         let overlaps = count_overlapping_pairs(&spans);
         let centers: Vec<Option<f64>> = cluster.iter().map(|t| t.freq_hz).collect();
         println!(
