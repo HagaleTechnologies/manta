@@ -45,15 +45,43 @@ two different capabilities:
    `record_terminal_source_health` (`crates/manta-cli/src/main.rs`) writes
    `manta_source_health{source=...} 0` on that `Err`, called *before*
    `shutdown_tx.send(true)` in the `Command::Listen` shutdown sequence —
-   ordering matters here: `metrics_http::serve` is spawned bare (no
-   `ClientTasks`, no shutdown watch), so it keeps answering scrapes for the
-   whole `SHUTDOWN_DRAIN_DEADLINE` (25s) drain window. Writing the `false`
-   before the drain signal, rather than after or not at all, is what makes
-   it observable to a scraper reaching the daemon during that window rather
-   than purely cosmetic. Silent on the `Ok(())` path — a clean end of
-   stream (file replay finishing, an operator's Ctrl-C) is normal
+   ordering matters here: writing the `false` before the drain signal,
+   rather than after or not at all, is a precondition for it ever being
+   observable, since `shutdown_tx.send(true)` starts the sequence that ends
+   in the runtime tearing down. Silent on the `Ok(())` path — a clean end
+   of stream (file replay finishing, an operator's Ctrl-C) is normal
    termination, not a source failure, and flipping the gauge there would
    make it lie in the opposite direction.
+
+   **Correction (2026-09-06, validate-plan round):** this section originally
+   claimed the drain window itself was a reliable observation opportunity —
+   that `metrics_http::serve`, being spawned bare (no `ClientTasks`, no
+   shutdown watch), "keeps answering scrapes for the whole
+   `SHUTDOWN_DRAIN_DEADLINE` (25s) drain window." That is only true when a
+   telnet/JSON/WS client is genuinely still draining underneath
+   `shutdown_runtime_after_drain`'s `tasks::await_all` — which returns as
+   soon as its tracked `JoinSet` is empty, not after the full deadline. With
+   no such client connected (the ordinary state for a scrape-only
+   deployment), `await_all` returns in microseconds, `rt.shutdown_timeout`
+   tears the runtime down immediately after, and no scrape can ever reach
+   the `0`. The write is real and correct; the claim that it is reliably
+   observable was not, and is corrected here rather than left standing.
+   Making the metric useful in the no-client case (e.g. a deliberate
+   bounded post-failure serving window) is left as future work, not
+   undertaken by this ticket — the same "smaller, honest correction over a
+   larger behavioral change" call this document already makes for Finding
+   1's second half below.
+
+   Separately, this write is made race-proof (round 7, V-2): for a source
+   with a `confirmed_live_handle` (HPSDR today), the liveness watcher task
+   spawned alongside it can still be pending when a fatal read happens
+   moments after the source's first valid packet, and — running on an
+   independent task with no ordering relative to this write — can wake and
+   set the gauge back to `true` afterward, inverting the very failure this
+   finding asked to make visible. `record_terminal_source_health` now
+   writes through `Metrics::set_source_health_terminal`, which marks the
+   entry final so no subsequent regular `set_source_health` call for that
+   source can overwrite it, regardless of which task runs last.
 
 2. **Documented as a known limitation, not fixed**: a source that degrades
    *while `listen` keeps running* still cannot be detected. `listen`

@@ -345,7 +345,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   other source is `true` immediately; and MAN-64 added a `false` write
   when `manta_engine::listen` returns an error, recorded before the
   shutdown-drain signal so a scraper reaching the still-running metrics
-  listener during that window can observe it. What is still **not**
+  listener during that window can observe it — **but that window is not
+  guaranteed** (corrected 2026-09-06, validate-plan round): the metrics
+  listener is spawned bare and only outlives this write for as long as a
+  telnet/JSON/WS client is genuinely still draining underneath
+  `shutdown_runtime_after_drain`'s bounded wait (up to 25s); with no such
+  client connected — the ordinary state for a scrape-only deployment — the
+  runtime tears down microseconds later and no scrape can ever observe the
+  `0`. The write itself is also made race-proof against MAN-55's liveness
+  watcher (a still-pending "confirmed live" poll cannot flip it back to
+  `true` after this write lands). What is still **not**
   reported: a source that degrades *while the daemon keeps running* —
   `listen` exposes no per-read progress hook, so there is nothing to
   watch. Don't read a `1` as "receiving data right now"; read it as

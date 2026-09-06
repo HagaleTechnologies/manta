@@ -776,12 +776,25 @@ fn shutdown_runtime_after_drain(
 /// MAN-64: the one source-health FAILURE transition this daemon can
 /// actually observe today. `manta_engine::listen` returning `Err` means the
 /// source read (or the pipeline behind it) failed fatally and the process
-/// is about to exit; the metrics listener outlives that by the whole
-/// shutdown-drain window (`SHUTDOWN_DRAIN_DEADLINE`, since it's spawned
-/// bare and takes neither `ClientTasks` nor the shutdown watch), so
-/// recording it here -- BEFORE `shutdown_tx.send(true)` -- gives a scraper
-/// a real chance to see `manta_source_health{...} 0` before the daemon is
-/// gone. Previously the gauge read `1` right up to process exit.
+/// is about to exit; recording it here -- BEFORE `shutdown_tx.send(true)`
+/// -- gives a scraper a chance to see `manta_source_health{...} 0` before
+/// the daemon is gone, PROVIDED the metrics listener is still alive to
+/// answer it. That is conditional, not guaranteed (validate-plan round,
+/// V-1): `metrics_http::serve` is spawned bare (no `ClientTasks`, no
+/// shutdown watch), so it survives past this point only for as long as
+/// `shutdown_runtime_after_drain`'s `tasks::await_all` keeps the runtime
+/// alive -- which is the whole `SHUTDOWN_DRAIN_DEADLINE` (25s) window when
+/// a telnet/JSON/WS client is genuinely still draining, but returns almost
+/// immediately (and the runtime is torn down microseconds later) when no
+/// such client is connected, the ordinary state for a scrape-only
+/// deployment. Previously the gauge read `1` right up to process exit; now
+/// it reads `0` for whatever fraction of a second-to-25s window a client
+/// happens to be draining, and for zero time otherwise. Written through
+/// `set_source_health_terminal` (round 7, V-2), not the regular
+/// `set_source_health`: an HPSDR-style `confirmed_live_handle` watcher
+/// (below) runs on an independent task and can wake after this write lands
+/// and try to set the gauge back to `true` -- `terminal` makes this write
+/// win regardless of scheduling order.
 ///
 /// Deliberately silent on the `Ok` path: a clean end of stream (file replay
 /// finished, operator Ctrl-C) is normal termination, not a source failure,
@@ -797,7 +810,7 @@ fn record_terminal_source_health(
     listen_result: &Result<()>,
 ) {
     if listen_result.is_err() {
-        metrics.set_source_health(source_name, false);
+        metrics.set_source_health_terminal(source_name, false);
     }
 }
 
@@ -1265,10 +1278,17 @@ fn main() -> Result<()> {
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
                 // Before `shutdown_tx.send(true)`, not after: ordering is
-                // what makes this observable (MAN-64) -- the drain starts
-                // here, and the metrics listener keeps serving throughout
-                // it, so a scraper hitting it during the drain window sees
-                // the transition instead of a stale `1`.
+                // what makes this observable at all (MAN-64) -- writing it
+                // after the drain would guarantee no scraper still
+                // connected to the (by-then bare-torn-down) metrics
+                // listener could ever see it. Even before the drain, this
+                // is a best-effort window, not a guarantee: the metrics
+                // listener only outlives this call for as long as a
+                // telnet/JSON/WS client is genuinely draining underneath
+                // `shutdown_runtime_after_drain`'s `await_all` (up to
+                // `SHUTDOWN_DRAIN_DEADLINE`); with none connected the
+                // runtime tears down microseconds later and no scrape can
+                // land (see `record_terminal_source_health`'s doc comment).
                 record_terminal_source_health(&server.metrics, source_name, &listen_result);
                 let _ = server.shutdown_tx.send(true);
             }

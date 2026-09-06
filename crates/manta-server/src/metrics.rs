@@ -10,6 +10,22 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
+/// MAN-64 round 7 (V-2): a source's health value, plus whether that value
+/// is final. A liveness watcher (`Command::Listen`'s `confirmed_live_handle`
+/// poll loop, `manta-cli/src/main.rs`) and the fatal-exit write in
+/// `record_terminal_source_health` run on independent tasks with no shared
+/// ordering -- without a `terminal` marker, whichever one happens to land
+/// last wins, so a watcher that wakes and observes liveness *after* the
+/// fatal-exit `false` has already been written silently flips the gauge
+/// back to healthy moments before the daemon exits. Marking the fatal
+/// write `terminal` makes it win regardless of scheduling order: see
+/// `set_source_health_terminal`.
+#[derive(Clone, Copy)]
+struct SourceHealthEntry {
+    healthy: bool,
+    terminal: bool,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -20,7 +36,7 @@ pub struct Metrics {
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
-    source_health: RwLock<BTreeMap<String, bool>>,
+    source_health: RwLock<BTreeMap<String, SourceHealthEntry>>,
     uplink_sent_total: AtomicU64,
     uplink_suppressed_total: AtomicU64,
     uplink_lagged_total: AtomicU64,
@@ -114,10 +130,42 @@ impl Metrics {
     }
 
     pub fn set_source_health(&self, source: &str, healthy: bool) {
+        let mut map = self
+            .source_health
+            .write()
+            .expect("source_health lock poisoned");
+        match map.get_mut(source) {
+            // A terminal entry is this source's final word for the rest of
+            // the process's life -- see `set_source_health_terminal`.
+            Some(entry) if entry.terminal => {}
+            Some(entry) => entry.healthy = healthy,
+            None => {
+                map.insert(
+                    source.to_string(),
+                    SourceHealthEntry {
+                        healthy,
+                        terminal: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The definitive, final health value for `source`: once written, no
+    /// later `set_source_health` call for the same source can change it.
+    /// See `SourceHealthEntry`'s doc comment for why this is needed instead
+    /// of always taking the most recent write.
+    pub fn set_source_health_terminal(&self, source: &str, healthy: bool) {
         self.source_health
             .write()
             .expect("source_health lock poisoned")
-            .insert(source.to_string(), healthy);
+            .insert(
+                source.to_string(),
+                SourceHealthEntry {
+                    healthy,
+                    terminal: true,
+                },
+            );
     }
 
     // MAN-32: RBN uplink counters. ARCHITECTURE §8's "every
@@ -291,7 +339,7 @@ impl Metrics {
             "# HELP manta_source_health Per-input-source health (1 = healthy, 0 = unhealthy).\n",
         );
         out.push_str("# TYPE manta_source_health gauge\n");
-        for (source, healthy) in self
+        for (source, entry) in self
             .source_health
             .read()
             .expect("source_health lock poisoned")
@@ -299,7 +347,7 @@ impl Metrics {
         {
             out.push_str(&format!(
                 "manta_source_health{{source=\"{source}\"}} {}\n",
-                if *healthy { 1 } else { 0 }
+                if entry.healthy { 1 } else { 0 }
             ));
         }
 
@@ -440,6 +488,22 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    /// MAN-64 round 7 (V-2): a liveness watcher's `set_source_health(true)`
+    /// racing against the fatal-exit `set_source_health_terminal(false)`
+    /// must never win, regardless of which one happens to run last.
+    #[test]
+    fn terminal_source_health_cannot_be_overwritten_by_a_later_regular_write() {
+        let m = Metrics::new();
+        m.set_source_health("hpsdr", true);
+        m.set_source_health_terminal("hpsdr", false);
+        // The regular (non-terminal) write a still-pending watcher would
+        // make after the terminal write has already landed.
+        m.set_source_health("hpsdr", true);
+        assert!(m
+            .render_prometheus_text()
+            .contains(r#"manta_source_health{source="hpsdr"} 0"#));
     }
 
     // MAN-32: RBN uplink counters.
