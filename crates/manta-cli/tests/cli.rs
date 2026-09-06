@@ -167,8 +167,8 @@ fn listen_with_dial_freq_hz_reports_absolute_frequency_for_an_audio_source() {
     .unwrap();
     let dphi = std::f64::consts::TAU * TONE_HZ / fs as f64;
     let mut phi = 0.0f64;
-    for i in 0..env.len() {
-        w.write_sample(env[i] * phi.cos() as f32).unwrap();
+    for e in env.iter() {
+        w.write_sample(e * phi.cos() as f32).unwrap();
         phi += dphi;
     }
     w.finalize().unwrap();
@@ -191,7 +191,10 @@ fn listen_with_dial_freq_hz_reports_absolute_frequency_for_an_audio_source() {
         .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("TrackMeta"))
         .filter_map(|v| v.get("freq_hz").and_then(|f| f.as_f64()))
         .collect();
-    assert!(!freqs.is_empty(), "expected TrackMeta events, got: {stdout}");
+    assert!(
+        !freqs.is_empty(),
+        "expected TrackMeta events, got: {stdout}"
+    );
     for f in &freqs {
         assert!(
             (f - CENTER_HZ).abs() < fs as f64 / 2.0,

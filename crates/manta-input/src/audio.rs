@@ -169,15 +169,19 @@ mod tests {
 
     #[test]
     fn center_freq_hz_defaults_to_zero_without_an_rf_reference() {
-        let src: Box<dyn AudioSource> =
-            Box::new(coppa_audio::WavSource::from_samples(vec![0.0; 10], TARGET_RATE_HZ));
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 10],
+            TARGET_RATE_HZ,
+        ));
         assert_eq!(AudioIqSource::new(src).unwrap().center_freq_hz(), 0.0);
     }
 
     #[test]
     fn with_center_freq_hz_is_reported_as_the_sources_rf_reference() {
-        let src: Box<dyn AudioSource> =
-            Box::new(coppa_audio::WavSource::from_samples(vec![0.0; 10], TARGET_RATE_HZ));
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 10],
+            TARGET_RATE_HZ,
+        ));
         let aiq = AudioIqSource::new(src)
             .unwrap()
             .with_center_freq_hz(14_030_000.0)
@@ -187,11 +191,22 @@ mod tests {
 
     #[test]
     fn with_center_freq_hz_rejects_non_finite_and_non_positive_values() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -14_030_000.0] {
-            let src: Box<dyn AudioSource> =
-                Box::new(coppa_audio::WavSource::from_samples(vec![0.0; 10], TARGET_RATE_HZ));
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -14_030_000.0,
+        ] {
+            let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+                vec![0.0; 10],
+                TARGET_RATE_HZ,
+            ));
             assert!(
-                AudioIqSource::new(src).unwrap().with_center_freq_hz(bad).is_err(),
+                AudioIqSource::new(src)
+                    .unwrap()
+                    .with_center_freq_hz(bad)
+                    .is_err(),
                 "with_center_freq_hz({bad}) should have been rejected"
             );
         }

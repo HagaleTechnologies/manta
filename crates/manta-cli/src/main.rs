@@ -1148,7 +1148,8 @@ fn main() -> Result<()> {
             // with_center_freq_hz, MAN-34). This override remains for the
             // RF-aware sources, which report a tuned frequency of their own
             // that --dial-freq-hz is allowed to supersede.
-            let src: Box<dyn IqSource> = apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
+            let src: Box<dyn IqSource> =
+                apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --server-config wasn't
