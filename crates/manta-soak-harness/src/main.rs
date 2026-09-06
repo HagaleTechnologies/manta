@@ -180,7 +180,7 @@ fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, Stri
 }
 
 /// A crowded 40m CW sub-band as heard in a receiver's audio passband:
-/// ~20 simultaneous stations spread 400-2700 Hz, a couple of close pairs
+/// ~20 simultaneous stations spread 650-2950 Hz, a couple of close pairs
 /// (deliberately within a channel or two of each other) to exercise
 /// adjacent-channel merge/eviction, varied speed/SNR/jitter, plus one
 /// deliberately clean, isolated, high-SNR caller (matching soak.rs's own
@@ -203,27 +203,36 @@ fn pileup_signals() -> Vec<SignalSpec> {
         "W1AW", "K3LR", "N4ZZ", "VE3EJ", "W6YX", "K9CT", "W5AU", "N2IC", "K1TTT", "W3LPL", "VE7CC",
         "K5TR", "N6RO", "W4AN", "K8AZ", "W2GD", "N5DX", "K4XS", "W9RE", "VA3RJ",
     ];
+    // MAN-4 remediate: this harness drives LoopingAudioIqSource, the same
+    // real-to-analytic (Hilbert) front end AudioIqSource uses, through
+    // `soak_metrics::soak_with_metrics` -- which now (see the MAN-4 pin
+    // doc's remediate addendum) applies the front end's declared
+    // `analytic_guard_hz` (HILBERT_GUARD_HZ = 600.0) exactly like
+    // `listen()` does. Every offset below is shifted up by 250 Hz from
+    // its original value so the lowest (was 420 Hz) clears the guard
+    // with margin, without touching the pileup's relative spacing/design.
+    const GUARD_SAFE_SHIFT_HZ: f64 = 250.0;
     let offsets_hz: [f64; 20] = [
-        420.0,
-        560.0,
-        560.0 + 70.0, // close pair around 560-630 Hz
-        780.0,
-        940.0,
-        1120.0,
-        1120.0 + 55.0, // close pair around 1120-1175 Hz
-        1300.0,
-        1470.0,
-        1640.0,
-        1810.0,
-        1980.0,
-        2150.0,
-        2150.0 + 60.0, // close pair
-        2320.0,
-        2490.0,
-        2660.0,
-        700.0,
-        1550.0,
-        2000.0,
+        420.0 + GUARD_SAFE_SHIFT_HZ,
+        560.0 + GUARD_SAFE_SHIFT_HZ,
+        560.0 + GUARD_SAFE_SHIFT_HZ + 70.0, // close pair around 810-880 Hz
+        780.0 + GUARD_SAFE_SHIFT_HZ,
+        940.0 + GUARD_SAFE_SHIFT_HZ,
+        1120.0 + GUARD_SAFE_SHIFT_HZ,
+        1120.0 + GUARD_SAFE_SHIFT_HZ + 55.0, // close pair around 1370-1425 Hz
+        1300.0 + GUARD_SAFE_SHIFT_HZ,
+        1470.0 + GUARD_SAFE_SHIFT_HZ,
+        1640.0 + GUARD_SAFE_SHIFT_HZ,
+        1810.0 + GUARD_SAFE_SHIFT_HZ,
+        1980.0 + GUARD_SAFE_SHIFT_HZ,
+        2150.0 + GUARD_SAFE_SHIFT_HZ,
+        2150.0 + GUARD_SAFE_SHIFT_HZ + 60.0, // close pair
+        2320.0 + GUARD_SAFE_SHIFT_HZ,
+        2490.0 + GUARD_SAFE_SHIFT_HZ,
+        2660.0 + GUARD_SAFE_SHIFT_HZ,
+        700.0 + GUARD_SAFE_SHIFT_HZ,
+        1550.0 + GUARD_SAFE_SHIFT_HZ,
+        2000.0 + GUARD_SAFE_SHIFT_HZ,
     ];
     let mut signals: Vec<SignalSpec> = CALLS
         .iter()
@@ -564,6 +573,8 @@ fn main() -> Result<()> {
             "merged": report.final_close_counts.merged,
             "evicted": report.final_close_counts.evicted,
         },
+        "total_spawns": report.total_spawns,
+        "final_spawns_by_channel": report.final_spawns_by_channel,
         "man19_criteria": {
             "no_crash": no_crash,
             "no_input_overrun_by_construction": no_input_overrun,

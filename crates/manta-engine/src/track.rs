@@ -493,6 +493,105 @@ impl TrackManager {
         off < self.cfg.guard_hz || off > nyquist - self.cfg.guard_hz
     }
 
+    /// MAN-4 remediate (pin doc D7 addendum): should a rise at `k` be
+    /// blocked because its circular mirror channel (`n_channels - k`, the
+    /// same reflection `wrapped_channel_offset` uses) is already owned,
+    /// and `k`'s own instantaneous power this hop isn't already the
+    /// larger of the pair? A real-to-analytic (Hilbert) front end's
+    /// residual image leakage is a coherent, deterministic copy of the
+    /// SAME signal at that exact mirror channel -- unlike ordinary noise,
+    /// widening the filter thins it but never removes it, and it carries
+    /// enough of the real signal's own modulation to independently
+    /// promote and decode, duplicating output exactly as the ticket
+    /// describes ("locking onto the same real signal in parallel"). No
+    /// fixed frequency guard can suppress it without also suppressing the
+    /// real signal itself (the image sits at the same `|offset|` from DC
+    /// as the real signal).
+    ///
+    /// Compares raw per-hop `hop.power` (not the EMA-smoothed
+    /// `gate.smoothed_db`/`current_snr_db` used elsewhere) deliberately:
+    /// the smoothed statistics ramp up over several hops at the start of
+    /// every new mark, so two channels whose *steady-state* power differs
+    /// by ~90 dB can still cross paths transiently right at mark-onset,
+    /// which flip-flopped this decision every keying edge in testing
+    /// (hundreds of spurious spawn/merge cycles). Raw instantaneous power
+    /// has no such ramp-up and reflects the ~90 dB gap immediately.
+    /// Comparing at all (rather than unconditionally blocking whichever
+    /// channel loses the race to spawn) matters because a keying-edge
+    /// broadband click can occasionally cross the image channel's own
+    /// much lower threshold before the real channel's own next mark
+    /// begins -- measured happening at exactly the first post-warmup hop
+    /// in `a_clean_audio_tone_spawns_one_track_and_no_churn`. Blocking
+    /// unconditionally would let that one lucky click permanently lock
+    /// out the real signal for the rest of the run; a candidate that
+    /// spawns anyway because it's instantaneously the stronger side
+    /// leaves its now-weaker mirror to `merge_mirror_images` to close.
+    /// Always `false` when `guard_hz <= 0.0` (every complex-IQ path), so
+    /// no golden vector is affected.
+    fn is_image_of_owned(&self, k: usize, hop_power: &[f32]) -> bool {
+        if self.cfg.guard_hz <= 0.0 {
+            return false;
+        }
+        let n = self.n_channels();
+        let mirror = (n - k) % n;
+        mirror != k && self.owner_of[mirror].is_some() && hop_power[k] <= hop_power[mirror]
+    }
+
+    /// MAN-4 remediate (pin doc D7 addendum): `is_image_of_owned` blocks
+    /// most mirror-image duplicates before they ever spawn, but a
+    /// keying-edge click can occasionally let the weaker side of a pair
+    /// win the race to spawn first (see that function's doc comment) --
+    /// once the real signal's own next mark lets the stronger side spawn
+    /// too, close whichever of the pair has the lower instantaneous
+    /// `hop.power` at its own current channel, mirroring
+    /// `merge_converged`'s SPEC §2.5 convergence rule (there by
+    /// `current_snr_db`; here by raw power, for the same ramp-up reason
+    /// `is_image_of_owned` uses it), just keyed on the circular mirror
+    /// channel instead of raw distance. Always a no-op when
+    /// `guard_hz <= 0.0` (every complex-IQ path), so no golden vector is
+    /// affected, and a no-op once a pair has already been resolved (the
+    /// loser's channel stays blocked by `is_image_of_owned` from then on,
+    /// since its own power does not exceed the survivor's).
+    fn merge_mirror_images(&mut self, hop_power: &[f32]) -> Vec<u32> {
+        if self.cfg.guard_hz <= 0.0 {
+            return Vec::new();
+        }
+        let n = self.n_channels();
+        let ids: Vec<u32> = self.tracks.keys().copied().collect();
+        let mut to_close = Vec::new();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let (a, b) = (ids[i], ids[j]);
+                if to_close.contains(&a) || to_close.contains(&b) {
+                    continue;
+                }
+                let ka = self.tracks[&a].select_channel(hop_power, n);
+                let kb = self.tracks[&b].select_channel(hop_power, n);
+                let mirror_of_ka = (n - ka) % n;
+                if mirror_of_ka == kb {
+                    let loser = if hop_power[ka] <= hop_power[kb] { a } else { b };
+                    to_close.push(loser);
+                }
+            }
+        }
+        // MAN-19: only report a merge-loser as `TrackClosed`-worthy if it
+        // actually emitted a real event -- see the matching comment in
+        // `step_hop`/`merge_converged`.
+        let ever_emitted_closed = to_close
+            .into_iter()
+            .filter(|id| {
+                self.close_counts.record(CloseReason::Merged);
+                self.tracks
+                    .remove(id)
+                    .is_some_and(|track| track.has_emitted)
+            })
+            .collect();
+        if !ids.is_empty() {
+            self.recompute_ownership();
+        }
+        ever_emitted_closed
+    }
+
     /// Issue #26: per-`CloseReason` counts of every track closed so far
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
@@ -638,12 +737,17 @@ impl TrackManager {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
-                if rise[k] && self.owner_of[k].is_none() && !self.is_guarded(k) {
+                if rise[k]
+                    && self.owner_of[k].is_none()
+                    && !self.is_guarded(k)
+                    && !self.is_image_of_owned(k, &hop.power)
+                {
                     let mut winner = k;
                     if k + 1 < n
                         && rise[k + 1]
                         && self.owner_of[k + 1].is_none()
                         && !self.is_guarded(k + 1)
+                        && !self.is_image_of_owned(k + 1, &hop.power)
                     {
                         if hop.power[k + 1] > hop.power[winner] {
                             winner = k + 1;
@@ -661,6 +765,7 @@ impl TrackManager {
         }
         self.recompute_ownership();
         closed.extend(self.merge_converged());
+        closed.extend(self.merge_mirror_images(&hop.power));
         closed.extend(self.evict_over_cap());
         closed
     }
@@ -1206,6 +1311,126 @@ mod tests {
             tm.spawns_by_channel()[n - 1],
             0,
             "k=n-1 is -93.75 Hz, inside a 300 Hz guard despite its high index"
+        );
+    }
+
+    /// MAN-4 remediate (pin doc D7 addendum): a real-to-analytic front
+    /// end's residual image leakage at a signal's circular mirror channel
+    /// (outside any guard band, since it sits at the same `|offset|` as
+    /// the real signal) must not spawn a second, permanently co-existing
+    /// track -- the stronger of the mirror pair must survive, and the
+    /// weaker must be closed via `Merged`, not left flooding the census.
+    #[test]
+    fn mirror_image_of_a_strong_channel_does_not_spawn_a_second_track() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[8] = 1e-9 * 10f32.powf(60.0 / 10.0); // 750 Hz, strong real signal
+        power[n - 8] = 1e-9 * 10f32.powf(15.0 / 10.0); // -750 Hz, weak mirror image
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "the weak mirror image must not persist alongside the real signal"
+        );
+        let survivor = tm.tracks.values().next().unwrap();
+        assert!(
+            (7..=9).contains(&survivor.birth_channel) || survivor.birth_channel == n - 8,
+            "survivor must be one of the mirror pair's two channels, got {}",
+            survivor.birth_channel
+        );
+        assert_eq!(
+            tm.spawns_by_channel()[n - 8],
+            0,
+            "since both channels are strong from the very first hop, is_image_of_owned must \
+             block the weaker mirror outright rather than let it spawn and need a later merge"
+        );
+    }
+
+    /// MAN-4 remediate: the companion race case to the test above --
+    /// `is_image_of_owned` can only block a channel whose mirror is
+    /// ALREADY owned, so when the weaker side of a mirror pair happens to
+    /// rise first (a keying-edge click, or here, a deliberately delayed
+    /// strong signal), it spawns unblocked; once the stronger side also
+    /// rises, `merge_mirror_images` must close the weaker one rather than
+    /// leaving both to co-exist and both decode the same signal.
+    #[test]
+    fn mirror_image_that_spawns_first_is_merged_away_once_the_real_signal_spawns() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[n - 8] = 1e-9 * 10f32.powf(15.0 / 10.0); // -750 Hz, weak mirror image, alone first
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "the weak mirror image spawns unblocked while it's the only one rising"
+        );
+        power[8] = 1e-9 * 10f32.powf(60.0 / 10.0); // 750 Hz real signal now also rises
+        for m in (250 * 15 + 60)..(250 * 15 + 120) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "once the real signal also spawns, the weaker mirror must be merged away"
+        );
+        let survivor = tm.tracks.values().next().unwrap();
+        assert!(
+            (7..=9).contains(&survivor.birth_channel),
+            "the surviving track must be the real signal, not the image it out-raced; got {}",
+            survivor.birth_channel
+        );
+        assert!(
+            tm.close_counts().merged >= 1,
+            "the early-arriving weaker image must be closed via merge: {:?}",
+            tm.close_counts()
+        );
+    }
+
+    /// MAN-4 remediate: `is_image_of_owned`/`merge_mirror_images` must be
+    /// complete no-ops when `guard_hz <= 0.0` (every complex-IQ path) --
+    /// two mirror-channel signals of very different strength must both
+    /// spawn and both survive, exactly like any other unrelated pair of
+    /// signals (`two_well_separated_strong_channels_yield_two_tracks`).
+    #[test]
+    fn mirror_image_guard_is_a_no_op_when_guard_hz_is_zero() {
+        let n = 512;
+        let fs = 48_000.0;
+        let mut tm = TrackManager::new(
+            n,
+            fs,
+            0.0,
+            DetectorConfig::default(), // guard_hz: 0.0
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[8] = 1e-9 * 10f32.powf(60.0 / 10.0);
+        power[n - 8] = 1e-9 * 10f32.powf(15.0 / 10.0);
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "with guard_hz == 0.0, a mirror-channel pair is just two unrelated signals"
         );
     }
 

@@ -28,7 +28,7 @@ pub const HILBERT_TAPS_M1_LEGACY: usize = 129;
 /// `image_rejection_meets_the_guaranteed_band_contract`. Sources built on
 /// this transformer report it via `IqSource::analytic_guard_hz` so the
 /// detector declines to spawn tracks there (MAN-4).
-pub const HILBERT_GUARD_HZ: f64 = 300.0;
+pub const HILBERT_GUARD_HZ: f64 = 600.0;
 
 /// Contract asserted by `image_rejection_meets_the_guaranteed_band_contract`
 /// across `[HILBERT_GUARD_HZ, fs/2 - HILBERT_GUARD_HZ]`. The Kaiser
@@ -84,6 +84,13 @@ pub struct HilbertTransformer {
     /// exact-`0.0` product changes a running f64 accumulation only via
     /// `(-0.0) + 0.0`, which IEEE 754 always resolves to `+0.0` regardless
     /// of term order, and the surviving terms' relative order is unchanged.
+    /// MAN-4 remediate: not exactly half when `(taps.len()-1)/2` (the
+    /// center index) is itself odd, as it is for the `HILBERT_TAPS = 511`
+    /// default -- center 255 is odd, so the outermost taps at offset ±255
+    /// are odd-offset and therefore nonzero, giving 256 nonzero of 511
+    /// rather than a clean half. Only every *even* offset from center is
+    /// structurally zero; how many indices that leaves nonzero depends on
+    /// center's own parity.
     nz: Vec<usize>,
     /// Ring of the last `taps.len()` real input samples, oldest first.
     hist: std::collections::VecDeque<f32>,
@@ -245,7 +252,10 @@ mod tests {
     fn default_design_is_511_taps_with_half_of_them_structurally_zero() {
         assert_eq!(HILBERT_TAPS, 511);
         let h = design_hilbert_fir();
-        assert_eq!(h.iter().filter(|t| **t != 0.0).count(), 255);
+        // 255 zero (even offsets from the odd center index 255) + 256
+        // nonzero (odd offsets, including the two outermost taps) = 511.
+        assert_eq!(h.iter().filter(|t| **t == 0.0).count(), 255);
+        assert_eq!(h.iter().filter(|t| **t != 0.0).count(), 256);
     }
 
     #[test]

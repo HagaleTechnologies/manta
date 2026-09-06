@@ -70,6 +70,14 @@ pub struct SoakMetricsReport {
     /// close -- satisfying `track_closed_events > 0` while
     /// `RepetitionGate::record` was never called (round 3 review).
     pub gate_records_total: u64,
+    /// MAN-4: `TrackManager::total_spawns()` at the end of the run --
+    /// companion to `final_close_counts` on the same "visible in metrics"
+    /// rationale (MAN-19), and evidence the guard applied above actually
+    /// keeps the DC/Nyquist spawn rate sane over a long synthetic soak
+    /// rather than only in the short MAN-4 regression tests.
+    pub total_spawns: u32,
+    /// MAN-4: `TrackManager::spawns_by_channel()` at the end of the run.
+    pub final_spawns_by_channel: Vec<u32>,
 }
 
 // Windows has no libc::rusage/getrusage (POSIX-only) -- see this crate's
@@ -151,6 +159,8 @@ pub fn soak_with_metrics(
     let mut peak_active_tracks = 0usize;
     let mut final_close_counts = CloseCounts::default();
     let mut gate_records_total = 0u64;
+    let mut total_spawns = 0u32;
+    let mut final_spawns_by_channel: Vec<u32> = Vec::new();
     let mut last_sample = Instant::now();
 
     let watchdog = std::thread::spawn(move || {
@@ -195,11 +205,19 @@ pub fn soak_with_metrics(
         let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
             .map_err(|e| anyhow::anyhow!(e))?;
         let hop = ch.hop() as u64;
+        // MAN-4 remediate: this is the *other* production IqSource pipeline
+        // (manta-soak-harness drives it with LoopingAudioIqSource) -- must
+        // raise the detector's guard to the source's declared floor exactly
+        // like listen.rs does, or AudioIqSource-family sources run the 24h
+        // soak with their Hilbert front end's DC/Nyquist guard silently off.
+        let mut detector = cfg.detector;
+        detector.guard_hz =
+            crate::listen::effective_guard_hz(detector.guard_hz, src.analytic_guard_hz());
         let mut tm = TrackManager::new(
             ch.n_channels(),
             fs,
             center_freq_hz,
-            cfg.detector,
+            detector,
             cfg.decode.clone(),
         );
         let mut validator = Validator::bundled(fs)
@@ -289,6 +307,8 @@ pub fn soak_with_metrics(
         }
         final_close_counts = tm.close_counts();
         gate_records_total = validator.gate_records_total();
+        total_spawns = tm.total_spawns();
+        final_spawns_by_channel = tm.spawns_by_channel().to_vec();
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
         // growth after the last tick (or the whole run, if
@@ -328,6 +348,8 @@ pub fn soak_with_metrics(
         final_close_counts,
         track_closed_events: track_closed_count,
         gate_records_total,
+        total_spawns,
+        final_spawns_by_channel,
     })
 }
 

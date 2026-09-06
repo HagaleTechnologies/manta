@@ -36,6 +36,16 @@ fn listen_decodes_a_clean_real_audio_signal() {
         *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
         phi += dphi;
     }
+    // MAN-4 remediate: a strictly noiseless fixture gives the 25th-
+    // percentile floor estimator nothing to find, so it reports the f32
+    // numerical floor -- against which ordinary filter sidelobes ~100 dB
+    // down still clear the +12 dB spawn gate, flooding the census with
+    // spurious tracks unrelated to the Hilbert-image mechanism this
+    // ticket is actually about. No real receiver produces zero noise;
+    // add a realistic floor via the plan's pre-decided contingency
+    // branch 2 (docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md).
+    let sigma = manta_testkit::noise::real_awgn_sigma_for_snr_2500(20.0, fs);
+    manta_testkit::noise::add_real_awgn(&mut real, sigma, 0x1234_5678);
 
     let src: Box<dyn manta_input::IqSource> = Box::new(
         AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000))).unwrap(),
