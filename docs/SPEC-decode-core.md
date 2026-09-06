@@ -570,12 +570,14 @@ block_channels = 32    block_allowance_db = 3.0
 hang_emitting_ms = 5000
 # [DEVIATION from SPEC §2.5] MAN-9 / issue #26: merge radius in channels,
 # instead of the literal 1.0-channel threshold, used by TrackManager's
-# convergence merge. 2.0 by default (MAN-9 Round-4: promoted from SPEC's
-# 1.0 -- mitigates V8w's issue #26 track fragmentation with no regression on
-# the V8 AWGN sibling); hard ceiling 2.5 (the V8/V8w scene's 300 Hz minimum
+# convergence merge. 1.0 by default (= SPEC behavior, inert); MAN-9
+# Round-4 promoted this to 2.0 but validate-plan found and reproduced a
+# production regression (signals 140-200 Hz apart spawn-and-merge every
+# hop and never decode, outside the AWGN gate's >= 300 Hz coverage), so it
+# was reverted; hard ceiling 2.5 (the V8/V8w scene's 300 Hz minimum
 # separation = 3.2 channels). See
 # manta-engine::track::DetectorConfig::merge_radius_channels and the pin doc.
-merge_radius_channels = 2.0
+merge_radius_channels = 1.0
 
 [decode]
 timing_sigma = 0.25    beam_width = 4

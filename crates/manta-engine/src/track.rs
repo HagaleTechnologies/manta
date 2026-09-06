@@ -61,13 +61,24 @@ pub struct DetectorConfig {
     /// signal separation is 300 Hz = 3.2 channels
     /// (`manta_testkit::vectors`'s `MIN_SEPARATION_HZ`), so this must
     /// stay strictly under that or genuinely distinct neighboring signals
-    /// would start merging. **`2.0` by default (MAN-9 Round-4:
-    /// promoted from SPEC's `1.0`)** — fully resolves one and reduces the
-    /// other two of V8w's three fragmented signals (idx 25/41/44: track
-    /// count within 300 Hz drops 6/5/15 -> 1/2/6), with no regression on
-    /// the V8 AWGN sibling's `>= 45/50` validated / 0-bogus gate. See
+    /// would start merging. **`1.0` by default (= SPEC behavior).**
+    /// MAN-9 Round-4 promoted this to `2.0` (fully resolves one and
+    /// reduces the other two of V8w's three fragmented signals, idx
+    /// 25/41/44: track count within 300 Hz drops 6/5/15 -> 1/2/6, with no
+    /// regression on the V8 AWGN sibling's `>= 45/50` validated / 0-bogus
+    /// gate) but the validate-plan review found and reproduced a real
+    /// production regression the AWGN gate's >= 300 Hz signal separation
+    /// cannot see: `2.0` exceeds `Track::owned()`'s +/-1-channel ownership
+    /// radius, so a second signal 1.5-2.0 channels (140-200 Hz) away sits
+    /// on an unowned channel, legally spawns a track every hop, and is
+    /// merged away on that same hop -- forever -- losing both signals'
+    /// decodes. Reverted to `1.0` for that reason; the sweep, the two unit
+    /// tests, and this field stay as the right home for a future fix that
+    /// either widens `Track::owned()` to match or gates the merge on
+    /// evidence the two tracks are the same signal. See
     /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md's "Track
-    /// continuity" section for the full sweep and re-verification record.
+    /// continuity" section for the full sweep, re-verification, and revert
+    /// record.
     pub merge_radius_channels: f32,
 }
 
@@ -111,7 +122,7 @@ impl Default for DetectorConfig {
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
-            merge_radius_channels: 2.0, // MAN-9 Round-4: promoted, see the field's doc comment and the pin doc's "Track continuity" section
+            merge_radius_channels: 1.0, // SPEC default; MAN-9 Round-4's promotion to 2.0 was reverted after validate-plan found a regression -- see the field's doc comment and the pin doc's "Track continuity" section
         }
     }
 }
@@ -1163,7 +1174,7 @@ mod tests {
         assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted); // hop 5, ACTIVE
         lc.note_emitting();
         assert_eq!(lc.on_hop(true, false, true), LifecycleEvent::None); // char decoded: silent_count -> 0
-                                                                         // 10 silent ACTIVE hops before the fade even starts.
+                                                                        // 10 silent ACTIVE hops before the fade even starts.
         for _ in 0..10 {
             assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
         }

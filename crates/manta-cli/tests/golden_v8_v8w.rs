@@ -198,11 +198,16 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// plan's >= 0.010 absolute median-CER accept bar** (best: mark-admission
 /// (0.55, 1.9) at -0.0022, roughly a quarter of the bar) -- so all three
 /// stay at their SPEC defaults. Separately, the F2 fragmentation symptom's
-/// `merge_radius_channels` lever **was** promoted (1.0 -> 2.0: fully
-/// resolves idx 25, improves but does not fully resolve idx 41/44, no
-/// regression on the V8 AWGN sibling) -- a track-continuity fix, not a
-/// CER-ladder rung, so it does not move the numbers above. Full sweep
-/// tables, the F1/F2 diagnostic run, and the promotion's re-verification:
+/// `merge_radius_channels` lever was promoted (1.0 -> 2.0: fully resolves
+/// idx 25, improves but does not fully resolve idx 41/44, no regression on
+/// the V8 AWGN sibling) and then **reverted**, after validate-plan found
+/// and reproduced a real production regression the AWGN sibling's >= 300 Hz
+/// signal separation cannot see: at `2.0`, signals 140-200 Hz apart
+/// spawn-and-merge every hop and never decode. `merge_radius_channels`
+/// ships at its SPEC default `1.0` again -- a track-continuity fix, not a
+/// CER-ladder rung either way, so none of this moves the numbers above.
+/// Full sweep tables, the F1/F2 diagnostic run, and the promotion/revert
+/// re-verification:
 /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md. Filed as
 /// <https://github.com/HagaleTechnologies/manta/issues/28>; revisit
 /// alongside V5/V6 once manta-decode gains real fading resilience (M4:

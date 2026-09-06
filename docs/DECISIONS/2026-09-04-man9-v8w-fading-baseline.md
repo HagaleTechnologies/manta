@@ -16,13 +16,20 @@ CI; it is a manual pre-release check per
 `docs/RUNBOOKS/man9-v8w-baseline-ratchet.md`, not a CI-enforced guard.
 Issue #26's track fragmentation has its F1/F2 verdict determined
 (unanimous F2, concurrent spectral spread); its `merge_radius_channels`
-lever is **promoted** this round (`1.0 -> 2.0`, re-verified against the
-CLI-based V8 AWGN golden path with no regression) but only **partially**
-fixes the symptom — one of the three fragmented signals fully resolves,
-the other two improve but remain fragmented. See "Track continuity" below
-for the full sweep and re-verification record. The three CER-ladder rungs
-(Rungs 1-3, below) were all swept to completion this round and none
-cleared their accept test — every one stays at its inert default.
+lever was **promoted** in Round 4 (`1.0 -> 2.0`, re-verified against the
+CLI-based V8 AWGN golden path with no regression on that gate) but only
+**partially** fixed the symptom — one of the three fragmented signals
+fully resolved, the other two improved but remained fragmented.
+**Round-5 remediation reverted the promotion**: validate-plan found and
+reproduced a real production regression outside the AWGN gate's coverage
+(signals 140-200 Hz apart spawn-and-merge every hop and never decode —
+see "Round-5 remediation" below). `merge_radius_channels` ships at its
+SPEC default `1.0` again; the field, its doc comment, and its two unit
+tests stay as the right home for a future, correctly-scoped fix. See
+"Track continuity" below for the full sweep, re-verification, and revert
+record. The three CER-ladder rungs (Rungs 1-3, below) were all swept to
+completion this round and none cleared their accept test — every one
+stays at its inert default.
 
 ## Measurement conditions
 
@@ -71,6 +78,15 @@ fixes" below) touch only a hang-timer bookkeeping bug and a diagnostic
 classifier bug, neither of which is on the decode path the CER numbers
 above are measured from, so this list is unchanged from the first
 implementation round's measurement too.
+
+**Round-5 note**: this was briefly untrue between Round 4 and Round 5 —
+Round 4 promoted `merge_radius_channels` to `2.0`, which this table's
+numbers (measured at `826bdd8`, before that promotion) never reflected.
+Round 5 reverted the promotion (see "Track continuity" and "Round-5
+remediation" below) after validate-plan found it regressed production
+decode, so the table is byte-identical again, this time because the
+branch's shipped default genuinely matches what was measured, not because
+a stale doc failed to record a change.
 
 ## Why nothing was promoted — the sweeps, run this round
 
@@ -248,23 +264,56 @@ median CER are essentially unchanged (partial continuity recovery on 2/34
 signals doesn't move a 34-signal median measurably), which is expected:
 Phase 5 is a track-continuity fix, not a CER-ladder rung.
 
-**Promoted this round.** Phase 5's own accept test additionally requires
-the V8 (AWGN, no fading) sibling to stay ≥ 45/50 validated with 0 bogus
-calls via the CLI-based golden path (`golden_v8_v8w.rs`) — the same
-quantization caveat above applies, so this check needs the real WAV round
-trip, not the in-process harness. Round-4 remediation ran it:
+**Promoted in Round 4, reverted in Round 5.** Phase 5's own accept test
+additionally requires the V8 (AWGN, no fading) sibling to stay ≥ 45/50
+validated with 0 bogus calls via the CLI-based golden path
+(`golden_v8_v8w.rs`) — the same quantization caveat above applies, so this
+check needs the real WAV round trip, not the in-process harness. Round-4
+remediation ran it:
 `cargo test -p manta-cli --test golden_v8_v8w v8_pileup_validates -- --nocapture`
 at `merge_radius_channels = 2.0` passes (`v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls
-... ok`, 14.5 s) — no regression on the AWGN sibling. `DetectorConfig::default()`'s
-`merge_radius_channels` is flipped from `1.0` to `2.0` (the smallest value
-reaching the plateau — smaller behavior change than `2.5` for the same
-measured effect); the full `manta-engine` unit suite (29 tests, including
-both merge-radius tests, which set their own override and are unaffected)
-stays green under the new default. CPU-budget impact is expected to be
-unmeasurable (the changed comparison, `(ca - cb).abs() < cfg.merge_radius_channels`,
-is an O(1) per-pair threshold check already on the hot path, just against a
-different constant) and is not separately re-benched this round -- same
-"CPU budget" section below.
+... ok`, 14.5 s) — no regression on that gate. On that evidence,
+`DetectorConfig::default()`'s `merge_radius_channels` was flipped from
+`1.0` to `2.0` in Round 4 (the smallest value reaching the plateau).
+
+**That evidence was insufficient, and Round-5 remediation reverted the
+promotion.** `2.0` is not just "smaller than the 2.5 hard ceiling" — it
+exceeds `Track::owned()`'s own ±1-channel ownership radius
+(`crates/manta-engine/src/track.rs`), which is what actually inhibits
+`spawn` on a channel. A second signal sitting 1.5-2.0 channels
+(140-200 Hz) away is therefore on a channel `Track::owned()` does not
+claim: it legally spawns a new candidate track every hop, and
+`merge_converged` — now comparing against the widened `2.0` radius —
+merges that candidate away on the very same hop, forever. Neither track
+ever survives long enough to promote and emit, so **both** signals in
+that separation band are lost. Reproduced end-to-end on a throwaway
+integration test (two clean +20 dB, 20 WPM CW signals, 30 s, 96 kS/s, no
+fading): at 150 Hz separation (1.60 channels), `merge_radius_channels =
+1.0` decodes `["W1AW"]` from 7 tracks, while `2.0` returns
+`Err("no signal found")` — zero events. At 200 Hz (2.13 channels), `1.0`
+decodes both `["W1AW", ...]`-equivalent while `2.0` loses both. The V8
+AWGN sibling gate above cannot see this: `manta_testkit::vectors`'s
+pileup scene enforces `MIN_SEPARATION_HZ = 300.0` (3.2 channels) between
+every pair, which sits entirely outside the affected 1.5-2.0 channel
+band — a passing 45/50-with-0-bogus result was never capable of ruling
+this out.
+
+`DetectorConfig::default()`'s `merge_radius_channels` is back at `1.0`
+(SPEC behavior, byte-identical to the pre-Round-4 baseline). The field,
+its doc comment, the two unit tests that pin `2.0`/`2.5` behavior via an
+explicit override (unaffected — they never relied on the default), and
+`v8w_lever_sweep_merge_radius_channels` all stay: they are correct code
+and remain the right starting point for a fix that is actually scoped to
+the problem, e.g. widening `Track::owned()`'s ownership radius to match
+whatever merge radius ships, or gating the merge on independent evidence
+the two tracks are the same signal rather than on proximity alone. See
+"What closes this ticket vs. what is follow-up" below. CPU-budget impact
+of the revert is nil for the same reason the Round-4 promotion's was
+expected to be nil: the changed comparison,
+`(ca - cb).abs() < cfg.merge_radius_channels`, is an O(1) per-pair
+threshold check already on the hot path, now simply back at its original
+constant — not separately re-benched this round, same "CPU budget"
+section below.
 
 ## Round-2 review fixes (this remediation round)
 
@@ -440,6 +489,44 @@ change this round is the `merge_radius_channels` promotion recorded under
 is re-verified there against the real CLI/WAV golden path (not just the
 in-process harness these four fixes touch).
 
+## Round-5 remediation (this round)
+
+One `CONFIRMED` correctness defect from the round-4 validate-plan
+code-review — serious enough to revert Round-4's one production-behavior
+change:
+
+- **Finding 1 — the Round-4 `merge_radius_channels` promotion regresses
+  decode of signals 140-200 Hz apart.** Full mechanism, reproduction, and
+  rationale moved into "Track continuity" above (the "Promoted in Round
+  4, reverted in Round 5" subsection) rather than duplicated here, since
+  that section is the durable record for this lever.
+  `DetectorConfig::default()`'s `merge_radius_channels` is back to `1.0`;
+  the field, its doc comment, and its two unit tests (which pin `2.0`/
+  `2.5` behavior via an explicit override, not the default) are unaffected
+  and stay.
+- **Two documentation-correctness findings, fixed alongside it**: this
+  doc's "Baseline table" section claimed "no default was promoted" while
+  its own "Track continuity" section said the opposite — true again now
+  that the promotion is reverted, and the top summary / "Track
+  continuity" / "What closes this ticket" sections above are reworded to
+  describe the promote-then-revert history rather than re-asserting the
+  now-stale "promoted" framing. The pinned baseline numbers
+  (`MEASURED_MEDIAN_CER`, the golden test's ignore-comment CER list, and
+  the runbook's "Runs" entry) were measured at commit `826bdd8`, before
+  the Round-4 promotion, so they describe a config the branch briefly
+  stopped shipping (`merge_radius_channels = 2.0`) and then, this round,
+  resumed shipping (`1.0`) — re-measured and re-confirmed still current;
+  see the runbook's new "Runs" entry.
+- `cargo fmt --all` also applied this round, fixing two branch-added
+  formatting violations (`track.rs`'s
+  `hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade`
+  test and `v8w_fading_diagnostics.rs`'s `nearest_track` helper) that
+  `cargo fmt --all --check` — a required CI step — was failing on.
+
+No unit test or golden-vector assertion changed; `merge_radius_channels`'s
+two explicit-override unit tests (`track.rs`) never depended on the
+default, so they were green both before and after this revert.
+
 ## Other review findings, recorded rather than fixed this round
 
 - **CR-4 (confirmed) — beam width and confidence are coupled.**
@@ -492,24 +579,31 @@ now a durable, machine-checked artifact
 (`v8w_per_signal_cer_report`/`v8w_classical_baseline_does_not_regress`),
 all three CER-ladder rungs were swept to completion and none cleared their
 accept test (Rungs 1-3 above), issue #26's track-continuity mechanism is
-understood and its `merge_radius_channels` lever promoted (partial fix: idx
-25 fully resolved, idx 41/44 improved but not fully resolved), and
+understood (unanimous F2, concurrent spectral spread) and a
+`merge_radius_channels` promotion was measured, attempted, and then
+reverted after Round-5 remediation found it regressed production decode
+outside the AWGN gate's coverage (see "Track continuity" above), and
 `ROADMAP.md`'s M4 criterion now names a coherent SNR partition to close
 against (Decision 9).
 
 Follow-up, not this ticket's scope:
 
 1. A config/CLI surface for `hang_hops_emitting`, `width_low_q`/`q_low`,
-   and `mark_admission` (CR-5) — `merge_radius_channels` no longer needs
-   this (it is now the shipped default; no lever surface is needed to use
-   a default).
+   `mark_admission`, and (again, following the Round-5 revert)
+   `merge_radius_channels` (CR-5) — none of the five levers has a shipped
+   config-file key or CLI flag, so promoting any of them still needs one.
 2. Real fading-robustness work at M4, gated on beating this pinned
    baseline under simulated fading, per this repo's design — the primary
    remaining path, since none of MAN-9's three classical CER-ladder rungs
    moved the median CER by more than 0.0022 against the 0.010 accept bar
    (Rung 3 was the closest).
-3. `merge_radius_channels`'s residual on idx 41 (5 -> 2 tracks, not fully
-   resolved) and idx 44 (15 -> 6, plateaus at the 2.5 hard ceiling) — a
-   smaller version of the same track-continuity mechanism, possibly a
-   TrackManager merge/eviction issue distinct from the radius itself; worth
-   a dedicated look, not gating this ticket.
+3. `merge_radius_channels`'s track-continuity fix, correctly scoped this
+   time: idx 25/41/44's fragmentation (6/5/15 tracks within 300 Hz) is
+   still unfixed at the reverted `1.0` default. A future attempt must
+   either widen `Track::owned()`'s ±1-channel ownership radius to match
+   whatever merge radius it ships (closing the spawn/merge-churn gap
+   Round-5 found), or gate the merge on independent evidence the two
+   tracks are the same signal rather than on center-distance proximity
+   alone, and must add golden or unit coverage in the 1.0-2.9 channel
+   (90-270 Hz) band the existing 300 Hz-minimum-separation scenes cannot
+   see, before any default is flipped again.

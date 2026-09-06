@@ -99,14 +99,11 @@ fn nearest_track(
     tracks: &BTreeMap<u32, TrackSummary>,
     expected_freq_hz: f64,
 ) -> Option<&TrackSummary> {
-    tracks
-        .values()
-        .filter(|t| t.text.is_some())
-        .min_by(|a, b| {
-            let da = (a.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
-            let db = (b.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
-            da.partial_cmp(&db).unwrap()
-        })
+    tracks.values().filter(|t| t.text.is_some()).min_by(|a, b| {
+        let da = (a.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
+        let db = (b.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
+        da.partial_cmp(&db).unwrap()
+    })
 }
 
 /// CR-7 (MAN-9 pin doc): strictly less than, not `<=` -- `radius_hz` is

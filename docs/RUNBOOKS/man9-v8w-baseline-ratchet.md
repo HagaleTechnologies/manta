@@ -44,3 +44,8 @@ regression.
 - 2026-09-06 — commit `826bdd8` (MAN-9 remediation round): `1/34` passes,
   median CER `0.2755`, matching the pin doc's baseline. See
   `docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md`.
+- 2026-09-06 — MAN-9 Round-5 remediation: `merge_radius_channels` reverted
+  `2.0 -> 1.0` after validate-plan found the promotion regressed decode of
+  signals 140-200 Hz apart (outside this scene's coverage). Re-measured at
+  HEAD post-revert to re-confirm the ratchet's pinned numbers still hold;
+  see the pin doc's "Round-5 remediation" section for the full record.
