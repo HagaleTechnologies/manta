@@ -156,8 +156,22 @@ else
   say "Nothing to do on this host. (Record it as 'not present' in the runbook table.)"
   exit 0
 fi
-git -C "$MAIN" rev-parse --git-dir >/dev/null 2>&1 \
+# CR-1 (validation round): `rev-parse --git-dir` succeeds by walking
+# UPWARD to find an enclosing repository, so on a git-managed ancestor of
+# --org-dir (e.g. a yadm/dotfiles-managed $HOME) it silently returns that
+# enclosing repo's git dir instead of failing — every subsequent
+# `git -C "$MAIN" …` (worktree inventory, worktree repair, set_origin) then
+# operates on the wrong repository. Compare --show-toplevel against $MAIN
+# itself instead: that only ever reports $MAIN when $MAIN is truly its own
+# repository's root. Canonicalize $MAIN the same way ORG_DIR already is
+# (cd && pwd -P) so a symlinked path component does not produce a spurious
+# mismatch against git's own canonicalized --show-toplevel output.
+MAIN_TOPLEVEL="$(git -C "$MAIN" rev-parse --show-toplevel 2>/dev/null)" \
   || die "$MAIN exists but is not a git repository"
+MAIN_REAL="$MAIN"
+[[ -d $MAIN ]] && MAIN_REAL="$(cd "$MAIN" && pwd -P)"
+[[ $MAIN_TOPLEVEL == "$MAIN_REAL" ]] \
+  || die "$MAIN exists but is not a git repository (found enclosing repository at $MAIN_TOPLEVEL instead)"
 
 # ---- worktree inventory ---------------------------------------------------
 # Emits "<path>\t<prunable|ok>" per worktree, main tree first.
@@ -341,21 +355,35 @@ tooling_hits() {
   # swallow that with no trace (also C-5).
   local roots=() r
   while IFS= read -r r; do
-    if [[ -d $r ]]; then
-      roots+=("$r")
-    else
+    # CR-3 (validation round): default roots were only checked with `-d`,
+    # unlike --scan-root's `-d && -r` — an existing-but-unreadable default
+    # root used to enter roots[] and have grep's permission error swallowed
+    # by tooling_hits()'s own `2>/dev/null` and trailing `|| true`, reporting
+    # a silent clean scan indistinguishable from one that actually ran.
+    if [[ ! -e $r ]]; then
       # F7: a missing DEFAULT root used to be dropped with no trace at all,
       # indistinguishable downstream from "scanned it, found nothing" —
       # warn here the same way a missing --scan-root already does below.
       say "warning: default scan root '$r' does not exist — skipping it" >&2
+    elif [[ ! -r $r ]]; then
+      say "warning: default scan root '$r' exists but is not readable — skipping it" >&2
+    else
+      roots+=("$r")
     fi
   done < <(default_scan_roots)
   if [[ ${#SCAN_ROOTS[@]} -gt 0 ]]; then
     for r in "${SCAN_ROOTS[@]}"; do
-      if [[ -d $r && -r $r ]]; then
-        roots+=("$r")
+      # CR-3: accept a FILE, not just a directory — the runbook tells
+      # operators to point --scan-root at wherever magazzino or
+      # link-build-cache.sh live, and grep handles a file operand fine.
+      # Report "does not exist" and "not readable" as distinct messages
+      # (previously one combined message covered both).
+      if [[ ! -e $r ]]; then
+        say "warning: --scan-root '$r' does not exist — skipping it" >&2
+      elif [[ ! -r $r ]]; then
+        say "warning: --scan-root '$r' exists but is not readable — skipping it" >&2
       else
-        say "warning: --scan-root '$r' does not exist or is not readable — skipping it" >&2
+        roots+=("$r")
       fi
     done
   fi

@@ -40,15 +40,28 @@ addwt() { git -C "$1" worktree add -q -b "$3" "$2"; }   # $1=clone $2=path $3=br
 # `cd "$ORG_DIR" && pwd -P`). Without this, a symlinked $TMPDIR (macOS
 # /var -> /private/var) makes fixture paths and the SUT's derived paths
 # diverge, silently disabling assertions built from the raw path.
-ALL_ROOTS=()
+# CR-2 (validation round): newroot() is invoked as `R=$(newroot)` at every
+# call site below. Command substitution forks a subshell, so an in-process
+# array append inside newroot() only ever mutates that subshell's copy —
+# the parent shell's ALL_ROOTS never grows past whatever was appended at
+# top level. Track roots in a file instead: appends from inside the
+# subshell are visible to the EXIT trap that reads it back to clean up.
+ALL_ROOTS_FILE="$(mktemp "${TMPDIR:-/tmp}/fleet-rename-test-roots.XXXXXX")"
 newroot() {
   local d
   d="$(mktemp -d "${TMPDIR:-/tmp}/fleet-rename-test.XXXXXX")"
   d="$(cd "$d" && pwd -P)"
-  ALL_ROOTS+=("$d")
+  printf '%s\n' "$d" >> "$ALL_ROOTS_FILE"
   printf '%s\n' "$d"
 }
-trap 'rm -rf "${ALL_ROOTS[@]}"' EXIT
+cleanup_roots() {
+  local d
+  if [[ -f $ALL_ROOTS_FILE ]]; then
+    while IFS= read -r d; do rm -rf "$d"; done < "$ALL_ROOTS_FILE"
+    rm -f "$ALL_ROOTS_FILE"
+  fi
+}
+trap cleanup_roots EXIT
 
 # V-5: hermetic default $HOME. Every SUT invocation below that does not
 # explicitly override HOME (T23 and T33 do, specifically to exercise the
@@ -62,7 +75,7 @@ trap 'rm -rf "${ALL_ROOTS[@]}"' EXIT
 # throwaway directory with none of those subdirectories so the harness
 # behaves identically on a laptop, CI runner, or a real fleet host.
 TESTHOME="$(mktemp -d "${TMPDIR:-/tmp}/fleet-rename-testhome.XXXXXX")"
-ALL_ROOTS+=("$TESTHOME")
+printf '%s\n' "$TESTHOME" >> "$ALL_ROOTS_FILE"
 export HOME="$TESTHOME"
 
 # --- T1: old layout present, new absent -> exit 1, reports MIGRATION NEEDED ---
@@ -467,7 +480,7 @@ grep -q "uses-old-path.sh" <<<"$out" \
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/does-not-exist" 2>&1); rc=$?
-grep -qi "does not exist or is not readable" <<<"$out" \
+grep -qi "does not exist" <<<"$out" \
   && ok "T34 warns about missing --scan-root" || bad "T34 warns about missing --scan-root" "$out"
 
 # --- T35: --apply on an already-migrated host with an unrelated pre-existing
@@ -730,6 +743,46 @@ if command -v jq >/dev/null 2>&1; then
 else
   skip "T48 skipped (no jq)"
 fi
+
+# --- T49: --org-dir sitting inside an enclosing git repository (e.g. a
+#     yadm/dotfiles-managed $HOME) with a leftover NON-repo skimmer
+#     directory must refuse rather than silently operating on the enclosing
+#     repo's .git (validation-round finding CR-1: `rev-parse --git-dir`
+#     walks upward and succeeds against the enclosing repo, so the old
+#     guard never fired; every subsequent `git -C "$MAIN" …` — worktree
+#     inventory, worktree repair, set_origin — then targeted the wrong
+#     repository and reported "VERDICT: MIGRATED" while having repointed
+#     the enclosing repo's origin) ---
+R=$(newroot)
+git -c init.defaultBranch=main init -q "$R"
+git -C "$R" config user.email t@example.invalid
+git -C "$R" config user.name  test
+: > "$R/README"; git -C "$R" add README
+git -C "$R" -c commit.gpgsign=false commit -qm init
+git -C "$R" remote add origin https://github.com/me/dotfiles.git
+mkdir -p "$R/org/skimmer"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T49 exit" "$rc" "2"
+grep -qi "is not a git repository" <<<"$out" && ok "T49 refuses non-repo checkout" \
+  || bad "T49 refuses non-repo checkout" "$out"
+check "T49 enclosing repo origin untouched" \
+  "$(git -C "$R" remote get-url origin)" \
+  "https://github.com/me/dotfiles.git"
+
+# --- T50: --scan-root pointing directly at a FILE (not its parent
+#     directory) is scanned rather than dropped as "does not exist or is
+#     not readable" (validation-round finding CR-3) — the runbook tells
+#     operators to point --scan-root at wherever link-build-cache.sh lives,
+#     and grep handles a file operand fine ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/tools"
+printf 'CACHE_SRC="%s/org/skimmer/target"\n' "$R" > "$R/tools/link-build-cache.sh"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/tools/link-build-cache.sh" 2>&1); rc=$?
+check "T50 exit" "$rc" "2"
+grep -q "link-build-cache.sh" <<<"$out" && ok "T50 accepts a file as --scan-root" \
+  || bad "T50 accepts a file as --scan-root" "$out"
+[[ -d "$R/org/skimmer" ]] && ok "T50 nothing moved" || bad "T50 nothing moved"
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
