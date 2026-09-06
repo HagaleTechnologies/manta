@@ -1073,15 +1073,46 @@ fn run_status(
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
         })
         .transpose()?;
-    let targets = resolve_status_addr(addr, file.as_ref().map(|f| &f.server))?;
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let targets = resolve_status_addr_bounded(addr, file.as_ref().map(|f| &f.server), timeout)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(fetch_status(
-        &targets,
-        std::time::Duration::from_secs(timeout_secs),
-    ))
-    .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
+    rt.block_on(fetch_status(&targets, timeout))
+        .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
+}
+
+/// Bounds `resolve_status_addr`'s hostname resolution by `timeout` (MAN-44
+/// remediate, code-review finding CR-2): `resolve_status_addr` runs a
+/// blocking `ToSocketAddrs` lookup and is called here BEFORE the tokio
+/// runtime -- and therefore `fetch_status`'s own timeout -- exists, so
+/// `--timeout-secs` previously bounded only connect+read, never the
+/// lookup itself. An unreachable or slow resolver could then block for the
+/// full OS resolver budget (commonly 10-40s with default `resolv.conf`
+/// settings) regardless of what the operator asked for -- the same hazard
+/// `uplink.rs`'s own bounded `lookup_host` already documents and mitigates
+/// on the daemon side. Runs the (still-blocking, still-uncancellable --
+/// same caveat `uplink::connect_any_resolved_address` notes for its own
+/// `getaddrinfo` call) lookup on a plain thread rather than a tokio
+/// blocking-pool task, since no runtime exists yet at this point in
+/// `run_status`; a resolver that never returns leaks that one thread, but
+/// this is a single one-shot CLI invocation, not a long-lived retry loop
+/// that could pile them up.
+fn resolve_status_addr_bounded(
+    addr: Option<&str>,
+    server: Option<&manta_server::config::ServerConfig>,
+    timeout: std::time::Duration,
+) -> Result<Vec<std::net::SocketAddr>> {
+    let addr = addr.map(str::to_string);
+    let server = server.cloned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resolve_status_addr(addr.as_deref(), server.as_ref()));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => bail!("resolving the daemon address timed out"),
+    }
 }
 
 /// Exit code contract for scripting (cron/Nagios-style): `0` when every
@@ -1122,7 +1153,12 @@ async fn fetch_status(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
 ) -> Result<manta_server::status::StatusDoc> {
-    tokio::time::timeout(timeout, fetch_status_inner(addrs))
+    // Split evenly across every candidate (CR-1, see `connect_any`): this
+    // guarantees the LAST address still gets a real attempt inside the
+    // caller's own overall budget even if every earlier one silently
+    // black-holes rather than refusing.
+    let per_addr_timeout = timeout / (addrs.len().max(1) as u32);
+    tokio::time::timeout(timeout, fetch_status_inner(addrs, per_addr_timeout))
         .await
         .map_err(|_| anyhow!("timed out talking to {}", format_addrs(addrs)))?
 }
@@ -1133,14 +1169,35 @@ async fn fetch_status(
 /// `uplink::connect_first_reachable`: a hostname resolving to more than
 /// one address must not make the CLI give up after the first, resolver-
 /// order-dependent candidate.
+///
+/// Each candidate gets its own `per_addr_timeout`, not just the single
+/// overall timeout `fetch_status` wraps around the whole operation
+/// (MAN-44 remediate, code-review finding CR-1): a first candidate that
+/// silently drops packets rather than refusing them -- a firewalled
+/// host, or a stale AAAA record with no IPv6 route -- would otherwise
+/// consume the ENTIRE overall budget before Tokio ever tries the second,
+/// live address, so the fallback this function exists for never actually
+/// happens. `fetch_status`'s caller divides the overall timeout evenly
+/// across every candidate, mirroring `uplink::connect_first_reachable`'s
+/// own per-address `CONNECT_TIMEOUT` (that one's is a fixed constant,
+/// since the daemon side isn't user-configurable; the CLI's per-address
+/// share instead comes out of the single operator-facing
+/// `--timeout-secs` knob).
 async fn connect_any(
     addrs: &[std::net::SocketAddr],
+    per_addr_timeout: std::time::Duration,
 ) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
     let mut last_err = None;
     for &addr in addrs {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(stream) => return Ok((stream, addr)),
-            Err(e) => last_err = Some(e),
+        match tokio::time::timeout(per_addr_timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok((stream, addr)),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connect to {addr} timed out"),
+                ))
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| {
@@ -1150,11 +1207,12 @@ async fn connect_any(
 
 async fn fetch_status_inner(
     addrs: &[std::net::SocketAddr],
+    per_addr_timeout: std::time::Duration,
 ) -> Result<manta_server::status::StatusDoc> {
     use manta_server::bounded_io::read_line_bounded;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let (mut stream, addr) = connect_any(addrs)
+    let (mut stream, addr) = connect_any(addrs, per_addr_timeout)
         .await
         .with_context(|| format!("connecting to {}", format_addrs(addrs)))?;
     stream
