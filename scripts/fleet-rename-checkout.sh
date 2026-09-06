@@ -99,6 +99,15 @@ NEW_MAIN="$ORG_DIR/$NEW_NAME"
 OLD_WTP="$ORG_DIR/${OLD_NAME}-worktrees"
 NEW_WTP="$ORG_DIR/${NEW_NAME}-worktrees"
 RAW_OLD_MAIN="$RAW_ORG_DIR/$OLD_NAME"
+# V-2: raw ($HOME-spelled, pre-canonicalization) counterparts of NEW_MAIN,
+# OLD_WTP and NEW_WTP too — a scan root under a symlinked path component (the
+# case the comment above already handles for OLD_MAIN) makes grep emit
+# raw-spelled lines for ANY of the four directories, not just the old main
+# checkout, so all four need a raw exclusion below or the checkout's own
+# worktree files become false-positive "tooling hits".
+RAW_NEW_MAIN="$RAW_ORG_DIR/$NEW_NAME"
+RAW_OLD_WTP="$RAW_ORG_DIR/${OLD_NAME}-worktrees"
+RAW_NEW_WTP="$RAW_ORG_DIR/${NEW_NAME}-worktrees"
 
 # Host identity, mirroring lib/host-identity.sh:9-40 (env -> Layer-2 config -> hostname).
 host_name() {
@@ -200,9 +209,14 @@ verify() {
     # separate, already-recorded worktree — otherwise a dead entry sharing a
     # basename with an unrelated, distinct live worktree gets misreported as
     # that live worktree's "unrepaired" stale copy.
+    # V-1: also require that the candidate actually IS a worktree (has a
+    # .git of its own), not merely a same-named plain directory that happens
+    # to sit under the new worktree parent — otherwise the script hands git a
+    # directory with no .git to repair, which fails and can never converge.
     if [[ $candidate == "$path" && ! -e $path ]]; then
       bn="$(basename -- "$path")"
-      if [[ -d "$NEW_WTP/$bn" ]] && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
+      if [[ -d "$NEW_WTP/$bn" && -e "$NEW_WTP/$bn/.git" ]] \
+         && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
         candidate="$NEW_WTP/$bn"
       fi
     fi
@@ -301,15 +315,23 @@ tooling_hits() {
     | grep -v "^${NEW_MAIN}/" \
     | grep -v "^${OLD_WTP}/" \
     | grep -v "^${NEW_WTP}/" \
-    | grep -v "^${RAW_OLD_MAIN}/" || true
+    | grep -v "^${RAW_OLD_MAIN}/" \
+    | grep -v "^${RAW_NEW_MAIN}/" \
+    | grep -v "^${RAW_OLD_WTP}/" \
+    | grep -v "^${RAW_NEW_WTP}/" || true
 }
 
-# On an already-migrated host nothing is going to move, so a stray hardcoded
-# reference elsewhere on the host is not this run's concern — the preflight
-# exists to protect a MOVE, and forcing it to gate the apply-is-a-no-op path too
-# broke the documented idempotent no-op (C3). `--check` still reports hits
-# unconditionally, since it never moves anything and the report is informational.
-if [[ $MODE == apply && $STATE == migrated ]]; then
+# On an already-migrated host with no legacy worktree parent left over,
+# nothing is going to move, so a stray hardcoded reference elsewhere on the
+# host is not this run's concern — the preflight exists to protect a MOVE,
+# and forcing it to gate the apply-is-a-no-op path too broke the documented
+# idempotent no-op (C3). But a migrated host CAN still have a move pending:
+# the migrated-apply branch below moves $OLD_WTP -> $NEW_WTP when a legacy
+# worktree parent is left over from a hand-rename (F2), so the skip must be
+# conditioned on there being no such move, not on STATE==migrated alone
+# (V-3). `--check` still reports hits unconditionally, since it never moves
+# anything and the report is informational.
+if [[ $MODE == apply && $STATE == migrated && ! -d $OLD_WTP ]]; then
   HITS=""
 else
   HITS="$(tooling_hits)"
@@ -386,11 +408,20 @@ reconcile_registry() {
   # usage error without one (CR-1) — which on a fleet host would abort this
   # function with a raw shell error instead of the degrade-to-warning message
   # every other failure path here uses.
-  if ! tmp="$(mktemp "${TMPDIR:-/tmp}/fleet-rename-registry.XXXXXX")"; then
+  # V-4: the template lives in $reg's OWN directory (not $TMPDIR), so the
+  # final `mv` below is a same-filesystem rename (atomic) instead of a
+  # cross-filesystem copy. mktemp also always creates the file mode 0600 —
+  # capture the registry's real mode first and restore it on the temp file
+  # before the swap, or the `mv` silently narrows registry.json's
+  # permissions and a daemon running under a different uid loses read access.
+  if ! tmp="$(mktemp "${reg}.XXXXXX")"; then
     info "mktemp failed — skipping registry reconciliation."
     info "  Edit $reg by hand so team \"$TEAM_NEW\" has repoRoot \"$NEW_MAIN\"."
     return 0
   fi
+  local reg_mode
+  reg_mode="$(stat -c '%a' "$reg" 2>/dev/null || stat -f '%Lp' "$reg" 2>/dev/null || true)"
+  [[ -n $reg_mode ]] && chmod "$reg_mode" "$tmp" 2>/dev/null
   # Correct an existing MAN entry in place, or append one. A stale SKI entry is
   # left alone on purpose: checkout-sync.mjs drops entries whose repoRoot is
   # missing (CTL-854), so it is already inert, and removing registry rows is a
@@ -457,9 +488,12 @@ $busy
       fi
       # F3: same collision guard as verify() — don't treat an unrelated, live,
       # already-recorded worktree as this entry's repaired counterpart.
+      # V-1: also require the candidate to actually be a worktree of its own
+      # (has a .git), not just a plain directory sharing the basename.
       if [[ $cand == "$p" && ! -e $p ]]; then
         bn="$(basename -- "$p")"
-        if [[ -d "$NEW_WTP/$bn" ]] && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
+        if [[ -d "$NEW_WTP/$bn" && -e "$NEW_WTP/$bn/.git" ]] \
+           && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
           cand="$NEW_WTP/$bn"
         fi
       fi

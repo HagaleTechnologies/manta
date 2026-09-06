@@ -50,6 +50,21 @@ newroot() {
 }
 trap 'rm -rf "${ALL_ROOTS[@]}"' EXIT
 
+# V-5: hermetic default $HOME. Every SUT invocation below that does not
+# explicitly override HOME (T23 and T33 do, specifically to exercise the
+# default-scan-root behavior) must not resolve the SUT's default scan roots
+# ($HOME/code-repos/github, $HOME/bin, $HOME/.local/bin) against the real
+# invoking user's home. On a fleet host that tree literally contains this
+# checkout (and this very test file) under the legacy name, which the
+# fixture-relative exclusions elsewhere in this harness know nothing about —
+# so without this, the harness only passes in an environment shaped nothing
+# like the fleet hosts it exists to validate. Point HOME at an empty,
+# throwaway directory with none of those subdirectories so the harness
+# behaves identically on a laptop, CI runner, or a real fleet host.
+TESTHOME="$(mktemp -d "${TMPDIR:-/tmp}/fleet-rename-testhome.XXXXXX")"
+ALL_ROOTS+=("$TESTHOME")
+export HOME="$TESTHOME"
+
 # --- T1: old layout present, new absent -> exit 1, reports MIGRATION NEEDED ---
 R=$(newroot); C=$(mkfixture "$R" skimmer)
 mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
@@ -511,6 +526,64 @@ check "T38 exit" "$rc" "0"
 [[ -d "$R/org/manta" ]] && ok "T38 clone renamed" || bad "T38 clone renamed" "$out"
 [[ -d "$R/org/manta-worktrees" ]] && ok "T38 pre-existing worktree parent survives" \
   || bad "T38 pre-existing worktree parent survives"
+
+# --- T39: registry.json's file mode survives --apply un-narrowed — mktemp
+#     creates 0600 by default, so mv-ing that over registry.json would leave
+#     it unreadable to a daemon running under a different uid than the
+#     operator (validation-round finding V-4) ---
+if command -v jq >/dev/null 2>&1; then
+  R=$(newroot); mkfixture "$R" skimmer >/dev/null
+  mkdir -p "$R/catalyst/execution-core"
+  printf '{"projects":[]}\n' > "$R/catalyst/execution-core/registry.json"
+  chmod 644 "$R/catalyst/execution-core/registry.json"
+  before="$(stat -c '%a' "$R/catalyst/execution-core/registry.json" 2>/dev/null \
+            || stat -f '%Lp' "$R/catalyst/execution-core/registry.json" 2>/dev/null)"
+  "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" >/dev/null 2>&1
+  after="$(stat -c '%a' "$R/catalyst/execution-core/registry.json" 2>/dev/null \
+           || stat -f '%Lp' "$R/catalyst/execution-core/registry.json" 2>/dev/null)"
+  check "T39 registry.json mode preserved" "$after" "$before"
+else
+  skip "T39 registry mode assertion skipped (no jq)"
+fi
+
+# --- T40: the tooling preflight still fires on a migrated host that has a
+#     move actually pending — a half-hand-migrated host (clone already named
+#     manta, worktree parent still skimmer-worktrees) with a
+#     link-build-cache.sh hardcoding the legacy worktree path must be
+#     refused, not silently skipped just because STATE==migrated
+#     (validation-round finding V-3) ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+mkdir -p "$R/org/skimmer-worktrees" "$R/tools"
+addwt "$C" "$R/org/skimmer-worktrees/w1" w1
+printf 'CACHE_SRC=%s/org/skimmer-worktrees/w1/target\n' "$R" > "$R/tools/link-build-cache.sh"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/tools" 2>&1); rc=$?
+check "T40 exit" "$rc" "2"
+grep -q "link-build-cache.sh" <<<"$out" && ok "T40 blocks pending worktree-parent move" \
+  || bad "T40 blocks pending worktree-parent move" "$out"
+[[ -d "$R/org/skimmer-worktrees" ]] && ok "T40 nothing moved" || bad "T40 nothing moved"
+
+# --- T41: a symlinked --org-dir component must not turn the checkout's OWN
+#     worktree files into false-positive "tooling hits" — only OLD_MAIN had a
+#     raw-spelling exclusion; NEW_MAIN/OLD_WTP/NEW_WTP need raw exclusions
+#     too, or a healthy, already-migrated host refuses to --check because its
+#     own linked worktree's test-harness copy matches the tooling-preflight
+#     scan under the raw, unresolved path (validation-round finding V-2) ---
+R=$(newroot); C=$(mkfixture "$R/real" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+ln -s "$R/real" "$R/link"
+mkdir -p "$R/real/org/manta-worktrees"
+addwt "$C" "$R/real/org/manta-worktrees/w1" w1
+mkdir -p "$R/real/org/manta-worktrees/w1/scripts/tests"
+printf 'x=%s/real/org/skimmer-worktrees/w1\n' "$R" \
+  > "$R/real/org/manta-worktrees/w1/scripts/tests/test-fleet-rename-checkout.sh"
+out=$("$SUT" --check --org-dir "$R/link/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/link/org" 2>&1); rc=$?
+check "T41 exit" "$rc" "0"
+grep -q "tooling reference" <<<"$out" \
+  && bad "T41 no false-positive tooling hit through symlinked org-dir" "$out" \
+  || ok "T41 no false-positive tooling hit through symlinked org-dir"
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
