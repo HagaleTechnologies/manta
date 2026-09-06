@@ -19,6 +19,7 @@ manta-dsp = { workspace = true }
 tungstenite = { workspace = true }
 rubato = { workspace = true }
 soapysdr = { workspace = true, optional = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

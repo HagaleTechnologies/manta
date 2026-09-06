@@ -124,3 +124,35 @@ deployment becomes operationally necessary, not assumed here. Until
 then: the proxy's OWN access log (most reverse proxies log the real
 client IP per request/connection by default) is the only place to find
 per-client attribution in this specific deployment shape.
+
+## Outbound source connections (KiwiSDR)
+
+Everything above covers manta's *inbound*-facing surfaces. `manta listen
+--kiwi-host <host>` is the opposite direction: manta connects *outbound* to
+an operator-chosen, third-party-operated KiwiSDR receiver over WebSocket.
+See `docs/DECISIONS/2026-09-04-man60-kiwi-threat-model.md` for the full
+threat-model pass; the operationally relevant points:
+
+- **The connection is plain `ws://`, never encrypted.** The KiwiSDR
+  protocol as this client speaks it has no `wss://` variant (live-verified
+  against several public receivers and the reference `jks-prv/kiwiclient`
+  client). Anyone on-path between your manta host and the configured
+  receiver can read (and, if actively on-path, alter) the IQ stream and any
+  `--kiwi-password` you configure.
+- **Use `MANTA_KIWI_PASSWORD`, not `--kiwi-password`, for a
+  password-protected node.** The CLI flag is visible to any other local
+  process via `ps`/`/proc/<pid>/cmdline` and typically ends up in shell
+  history; the env var avoids that local exposure (it does NOT avoid the
+  on-the-wire plaintext exposure above — there is no code-level mitigation
+  for that). An explicit `--kiwi-password` still wins if both are set.
+- **Don't reuse a credential of value for a private KiwiSDR node.** Given
+  the plaintext-wire exposure above, treat any password you configure here
+  as already disclosed to anyone who can observe that path.
+- **manta reconnects automatically within a bounded budget.** If the
+  configured receiver drops the connection, sends a malformed frame, or
+  goes quiet, manta logs a warning (`tracing`) and reconnects — it no
+  longer exits within milliseconds on the first hiccup the way it did
+  before MAN-60. It only exits (with a host-named error) after repeated
+  failures exhaust the reconnect budget (worst case ~35s from the last
+  good data). If you're watching for "is this KiwiSDR source still alive",
+  watch the logs for reconnect warnings, not just process exit.

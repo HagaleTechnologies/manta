@@ -81,7 +81,12 @@ enum Command {
         /// RF center frequency in Hz. Required with --kiwi-host.
         #[arg(long, requires = "kiwi_host")]
         kiwi_freq: Option<f64>,
-        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
+        /// KiwiSDR password (empty for anonymous/no-password receivers, the
+        /// common case for public nodes). Also read from
+        /// MANTA_KIWI_PASSWORD, which keeps it out of `ps`/shell history --
+        /// prefer that over this flag for a password-protected node. Sent
+        /// in cleartext over ws:// either way -- the KiwiSDR protocol has
+        /// no encrypted variant (docs/DECISIONS/2026-09-04-man60-kiwi-threat-model.md).
         #[arg(long, requires = "kiwi_host", default_value = "")]
         kiwi_password: String,
         /// Emit DecoderEvents as JSON Lines instead of plain text.
@@ -198,7 +203,12 @@ enum Command {
         /// RF center frequency in Hz. Required with --kiwi-host.
         #[arg(long, requires = "kiwi_host")]
         kiwi_freq: Option<f64>,
-        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
+        /// KiwiSDR password (empty for anonymous/no-password receivers, the
+        /// common case for public nodes). Also read from
+        /// MANTA_KIWI_PASSWORD, which keeps it out of `ps`/shell history --
+        /// prefer that over this flag for a password-protected node. Sent
+        /// in cleartext over ws:// either way -- the KiwiSDR protocol has
+        /// no encrypted variant (docs/DECISIONS/2026-09-04-man60-kiwi-threat-model.md).
         #[arg(long, requires = "kiwi_host", default_value = "")]
         kiwi_password: String,
         /// Per-source frequency-calibration correction, in ppm (config key
@@ -273,6 +283,23 @@ struct KiwiOpts {
     port: u16,
     freq: Option<f64>,
     password: String,
+}
+
+/// Resolve the KiwiSDR password: an explicit `--kiwi-password` wins, then
+/// `MANTA_KIWI_PASSWORD`, then anonymous (`""`, the common case for public
+/// nodes). The env var exists because the CLI flag is visible to every
+/// other process on the host via `ps`/`/proc/<pid>/cmdline` and typically
+/// lands in shell history (MAN-60 finding 4b). Deliberately NOT clap's
+/// `env` feature: with that feature, merely *exporting* the variable makes
+/// clap treat `--kiwi-password` as present, which fires its existing
+/// `requires = "kiwi_host"` and would break unrelated invocations like
+/// `manta listen --source foo.wav` run with `MANTA_KIWI_PASSWORD` set in
+/// the environment. A manual read has no such coupling.
+fn resolve_kiwi_password(flag: &str, env: Option<String>) -> String {
+    if !flag.is_empty() {
+        return flag.to_string();
+    }
+    env.unwrap_or_default()
 }
 
 /// SoapySDR connection flags (feature `soapy`), grouped for the same reason.
@@ -1043,7 +1070,10 @@ fn main() -> Result<()> {
                 host: kiwi_host,
                 port: kiwi_port,
                 freq: kiwi_freq,
-                password: kiwi_password,
+                password: resolve_kiwi_password(
+                    &kiwi_password,
+                    std::env::var("MANTA_KIWI_PASSWORD").ok(),
+                ),
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             #[cfg(feature = "hpsdr")]
@@ -1273,7 +1303,10 @@ fn main() -> Result<()> {
                 host: kiwi_host,
                 port: kiwi_port,
                 freq: kiwi_freq,
-                password: kiwi_password,
+                password: resolve_kiwi_password(
+                    &kiwi_password,
+                    std::env::var("MANTA_KIWI_PASSWORD").ok(),
+                ),
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
             #[cfg(feature = "hpsdr")]
@@ -1394,6 +1427,25 @@ mod tests {
             result.is_err(),
             "a pre-1970 mtime must be rejected at startup, not deferred to a later panic"
         );
+    }
+
+    #[test]
+    fn kiwi_password_precedence_is_flag_then_env_then_anonymous() {
+        // MAN-60 finding 4b: --kiwi-password is visible to any other
+        // process on the host via `ps`/`/proc/<pid>/cmdline`, so
+        // MANTA_KIWI_PASSWORD exists as a lower-visibility alternative. An
+        // explicit non-empty flag always wins (it's what the operator just
+        // typed); otherwise the env var; otherwise anonymous.
+        assert_eq!(
+            resolve_kiwi_password("flagpw", Some("envpw".to_string())),
+            "flagpw"
+        );
+        assert_eq!(
+            resolve_kiwi_password("", Some("envpw".to_string())),
+            "envpw"
+        );
+        assert_eq!(resolve_kiwi_password("", None), "");
+        assert_eq!(resolve_kiwi_password("", Some(String::new())), "");
     }
 
     #[test]
