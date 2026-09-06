@@ -784,5 +784,63 @@ grep -q "link-build-cache.sh" <<<"$out" && ok "T50 accepts a file as --scan-root
   || bad "T50 accepts a file as --scan-root" "$out"
 [[ -d "$R/org/skimmer" ]] && ok "T50 nothing moved" || bad "T50 nothing moved"
 
+# --- T51: `--check --apply` together is refused, not last-wins (validation-
+#     round finding C1) — the entire safety story of `--check` is "mutates
+#     nothing"; sharing one case arm with --apply let the mode be silently
+#     decided by argument order instead ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+out=$("$SUT" --check --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T51 exit" "$rc" "2"
+grep -qi "mutually exclusive" <<<"$out" && ok "T51 names the conflict" || bad "T51 names the conflict" "$out"
+[[ -d "$R/org/skimmer" ]] && ok "T51 nothing moved" || bad "T51 nothing moved" "$out"
+out=$("$SUT" --apply --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T51 exit (reversed order)" "$rc" "2"
+[[ -d "$R/org/skimmer" ]] && ok "T51 nothing moved (reversed order)" || bad "T51 nothing moved (reversed order)" "$out"
+
+# --- T52: a dead worktree entry recorded OUTSIDE the org dir must not be
+#     "repaired" onto an unrelated, foreign worktree that merely happens to
+#     share its basename under the new worktree parent (validation-round
+#     finding C2) — the basename-collision guard checked only "has a .git
+#     and isn't already in this repo's worktree list", never that the
+#     candidate is actually a worktree OF THIS repo. Adopting a foreign
+#     worktree as the remap target used to make the host permanently unable
+#     to reach an all-PASS verdict, since `git worktree repair` correctly
+#     declines to rewrite a foreign .git ---
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+mkdir -p "$R/gone"
+addwt "$C" "$R/gone/w1" w1
+rm -rf "$R/gone/w1"                                  # dead entry, recorded elsewhere
+mkdir -p "$R/org/manta-worktrees"
+FOREIGN=$(mkfixture "$R" other)                       # unrelated repo
+rm -rf "$R/org/manta-worktrees/w1"
+mv "$FOREIGN" "$R/org/manta-worktrees/w1"             # foreign worktree at colliding basename
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T52 exit" "$rc" "0"
+grep -q "was not repaired" <<<"$out" && bad "T52 must not misattribute the foreign worktree" "$out" \
+  || ok "T52 must not misattribute the foreign worktree"
+grep -q "pre-existing prunable" <<<"$out" && ok "T52 dead entry reported informationally" \
+  || bad "T52 dead entry reported informationally" "$out"
+check "T52 foreign worktree untouched" \
+  "$(git -C "$R/org/manta-worktrees/w1" remote get-url origin)" \
+  "https://github.com/HagaleTechnologies/other.git"
+out2=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc2=$?
+check "T52 second apply exit" "$rc2" "0"
+grep -q "ALREADY MIGRATED" <<<"$out2" && ok "T52 converges" || bad "T52 converges" "$out2"
+
+# --- T53: a stray FILE (not a directory) named after the legacy checkout is
+#     refused up front instead of being invisible to classification (which
+#     tested `-d`) but permanently failing verify() (which tested `-e`)
+#     (validation-round finding C3) — classify and verify agreeing means the
+#     runbook's documented "re-run --apply" remedy is never a no-op forever ---
+R=$(newroot); mkfixture "$R" manta >/dev/null
+git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+touch "$R/org/skimmer"                                # plain file, not a directory
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T53 exit" "$rc" "2"
+grep -qi "is not a directory" <<<"$out" && ok "T53 refuses with an actionable message" \
+  || bad "T53 refuses with an actionable message" "$out"
+out2=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc2=$?
+check "T53 second run still refuses (not a MIGRATION INCOMPLETE loop)" "$rc2" "2"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

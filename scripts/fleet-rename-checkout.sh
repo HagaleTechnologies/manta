@@ -44,7 +44,17 @@ info() { printf 'info  %s\n' "$*"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --check|--apply) MODE="${1#--}";;
+    --check|--apply)
+      # C1 (validation round): --check and --apply used to share this one
+      # case arm with no mutual-exclusion guard, so the mode was last-wins —
+      # `--check --apply` silently performed the migration under a flag
+      # whose entire safety story, in this script's own header, the
+      # runbook, and the ADR, is "--check mutates nothing". Refuse instead
+      # of picking a winner.
+      NEW_MODE="${1#--}"
+      [[ -n $MODE && $MODE != "$NEW_MODE" ]] && die "--check and --apply are mutually exclusive; pass exactly one"
+      MODE="$NEW_MODE"
+      ;;
     --old)          [[ $# -ge 2 ]] || die "missing value for $1"; OLD_NAME="$2"; shift;;
     --new)          [[ $# -ge 2 ]] || die "missing value for $1"; NEW_NAME="$2"; shift;;
     --org-dir)      [[ $# -ge 2 ]] || die "missing value for $1"; ORG_DIR="${2/#\~/$HOME}"; shift;;
@@ -143,6 +153,17 @@ say "old -> new:  $OLD_NAME -> $NEW_NAME"
 say ""
 
 # ---- classify -------------------------------------------------------------
+# C3 (validation round): classification and the move code paths tested
+# $OLD_MAIN/$OLD_WTP with `-d`, while verify() tests the very same paths
+# with `-e`. A stray FILE (not a directory) at any of these four paths was
+# therefore invisible here — classification proceeded as if it did not
+# exist — but failed verify() on every subsequent run with no way to ever
+# converge, since nothing moves or removes a thing classification never
+# saw. Refuse loudly instead, the same "needs a human" shape already used
+# for both-present below, before STATE is ever derived.
+for stray in "$OLD_MAIN" "$NEW_MAIN" "$OLD_WTP" "$NEW_WTP"; do
+  [[ -e $stray && ! -d $stray ]] && die "$stray exists but is not a directory — a human must remove or rename it before this tool can proceed."
+done
 if [[ -d $OLD_MAIN && -d $NEW_MAIN ]]; then
   die "both '$OLD_NAME' and '$NEW_NAME' are present in $ORG_DIR — ambiguous.
      A human must decide which is authoritative (compare 'git -C <dir> log -1' and
@@ -186,6 +207,31 @@ inventory() {
     esac
   done < <(git -C "$MAIN" worktree list --porcelain 2>/dev/null)
   [[ -n $wt ]] && printf '%s\t%s\n' "$wt" "${pr:-ok}"
+}
+
+# C2 (validation round): the basename-collision remap below used to accept
+# any directory at the candidate path that merely HAD a .git and was not
+# already in this repo's own worktree list — it never checked that .git
+# belonged to $MAIN at all. A foreign worktree (of some unrelated repo)
+# parked at the colliding basename was therefore adopted as the dead
+# entry's "repaired" counterpart: `git worktree repair` correctly declines
+# to rewrite a foreign .git, so the host can never reach an all-PASS state,
+# and the FAIL line's suggested remedy is a command that does nothing.
+# Compare git-common-dir (the shared .git backing every worktree of one
+# repo) rather than a mere is-there-a-.git existence check.
+worktree_belongs_to_main() {
+  local d="$1" main_gcd cand_gcd
+  main_gcd="$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || main_gcd="$(git -C "$MAIN" rev-parse --git-common-dir 2>/dev/null)"
+  [[ -n $main_gcd ]] || return 1
+  [[ $main_gcd == /* ]] || main_gcd="$MAIN/$main_gcd"
+  main_gcd="$(cd "$main_gcd" 2>/dev/null && pwd -P)" || return 1
+  cand_gcd="$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || cand_gcd="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)"
+  [[ -n $cand_gcd ]] || return 1
+  [[ $cand_gcd == /* ]] || cand_gcd="$d/$cand_gcd"
+  cand_gcd="$(cd "$cand_gcd" 2>/dev/null && pwd -P)" || return 1
+  [[ $main_gcd == "$cand_gcd" ]]
 }
 
 FAILED=0
@@ -268,10 +314,15 @@ verify() {
     # .git of its own), not merely a same-named plain directory that happens
     # to sit under the new worktree parent — otherwise the script hands git a
     # directory with no .git to repair, which fails and can never converge.
+    # C2 (validation round): "has a .git" alone accepted a FOREIGN worktree
+    # (of some unrelated repo) parked at the colliding basename — require it
+    # to actually be a worktree of $MAIN, or `git worktree repair` correctly
+    # declines it and the host can never converge.
     if [[ $candidate == "$path" && ! -e $path ]]; then
       bn="$(basename -- "$path")"
       if [[ -d "$NEW_WTP/$bn" && -e "$NEW_WTP/$bn/.git" ]] \
-         && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
+         && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths" \
+         && worktree_belongs_to_main "$NEW_WTP/$bn"; then
         candidate="$NEW_WTP/$bn"
       fi
     fi
@@ -658,10 +709,13 @@ $busy
       # already-recorded worktree as this entry's repaired counterpart.
       # V-1: also require the candidate to actually be a worktree of its own
       # (has a .git), not just a plain directory sharing the basename.
+      # C2 (validation round): same fix as verify() — require the candidate
+      # to be a worktree of $MAIN specifically, not merely any repo's .git.
       if [[ $cand == "$p" && ! -e $p ]]; then
         bn="$(basename -- "$p")"
         if [[ -d "$NEW_WTP/$bn" && -e "$NEW_WTP/$bn/.git" ]] \
-           && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
+           && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths" \
+           && worktree_belongs_to_main "$NEW_WTP/$bn"; then
           cand="$NEW_WTP/$bn"
         fi
       fi
