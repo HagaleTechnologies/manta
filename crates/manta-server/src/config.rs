@@ -21,8 +21,14 @@ fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
 }
 
+/// MAN-159: dry-run is ON unless an operator explicitly turns it off.
+/// Enabling a `[[rbn_uplink]]` block is already a deliberate act, but it
+/// should not *also* silently mean "start transmitting to a real RBN
+/// target" -- especially before MAN-90 verifies what a real target
+/// accepts. Mirrors legacy Aggregator's "prevent sending false spots
+/// during testing" checkbox, which is only useful if it is the default.
 fn default_dry_run() -> bool {
-    false
+    true
 }
 
 /// Shared by `deserialize_station_callsign` (required) and
@@ -156,11 +162,12 @@ pub struct ServerConfig {
 /// uplink is off, so existing single-node operators see no behavior
 /// change. Scoped `deny_unknown_fields` the same way `ServerConfig` is (see
 /// `DaemonConfigFile`'s doc comment on why the wrapper itself is NOT):
-/// this only needs to reject a typo INSIDE one `[[rbn_uplink]]` block, and
-/// doing so is specifically safety-relevant here -- an operator typo like
-/// `dry-run` instead of `dry_run` would otherwise silently parse as the
-/// untouched `dry_run = false` default and start transmitting real spots
-/// to RBN.
+/// this only needs to reject a typo INSIDE one `[[rbn_uplink]]` block.
+/// Since MAN-159 made `dry_run` default to `true`, a typo like `dry-run`
+/// no longer risks silently transmitting -- it now risks the mirrored
+/// confusion of an operator who wrote `dry-run = false` intending to go
+/// live and silently staying in dry-run instead. Failing loudly on the
+/// typo is the right answer in both directions.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RbnUplinkConfig {
@@ -445,7 +452,10 @@ mod tests {
         assert!(uplink.enabled);
         assert_eq!(uplink.target_host, "example.invalid");
         assert_eq!(uplink.target_port, 7300);
-        assert!(!uplink.dry_run);
+        // MAN-159: an omitted `dry_run` key must default to ON (safe),
+        // not OFF. Enabling `[[rbn_uplink]]` must never start transmitting
+        // to a real target without the operator opting in explicitly.
+        assert!(uplink.dry_run);
         assert_eq!(uplink.login_callsign, None);
     }
 
@@ -495,8 +505,8 @@ mod tests {
         // review on MAN-12/PR#63): a typo'd key here is safety-relevant in
         // a way ServerConfig's typos aren't -- e.g. `dry-run` instead of
         // `dry_run` would otherwise silently parse as the untouched
-        // dry_run=false default and start transmitting real spots to RBN
-        // instead of failing loudly.
+        // dry_run=true default (MAN-159) and leave an operator who intended
+        // to go live stuck silently in dry-run instead of failing loudly.
         let result: Result<DaemonConfigFile, _> = toml::from_str(
             r#"
             [server]

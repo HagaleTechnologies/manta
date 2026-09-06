@@ -25,3 +25,7 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 ## Status caveat
 
 The JSON schema is **not yet frozen in dispensa** — treat the field set as design-phase until the ADR lands. Do not restate fields here; the contract, once written, is authoritative. Validated spots reaching these surfaces come from [[spot-validation]].
+
+## Third surface: outbound RBN uplink
+
+manta can also act as a telnet *client*, logging into an RBN spot-collection endpoint and forwarding its own spots there (`crates/manta-server/src/uplink.rs`, one task per `[[rbn_uplink]]` config entry) — the mirror direction of the telnet server above. It ships **dry-run by default** (MAN-159): an entry with no `dry_run` key connects and logs in but transmits nothing, and each target logs its mode at startup. See README's "Outbound RBN uplink" section for the config shape; the uplink itself is unverified against a real RBN ingest pending MAN-90.
