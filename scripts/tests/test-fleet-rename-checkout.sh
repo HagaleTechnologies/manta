@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Fixture-driven tests for scripts/fleet-rename-checkout.sh.
 # bash + git only, no CI wiring — see docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md.
+#
+# shellcheck disable=SC2015
+# `A && B || C` is used throughout as ok/bad reporting, never as if/then/else
+# control flow: ok()/bad()/skip() are printf wrappers that always return 0.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUT="$REPO_ROOT/scripts/fleet-rename-checkout.sh"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 
 ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL %s\n     %s\n' "$1" "${2:-}"; }
+skip() { SKIP=$((SKIP+1)); printf 'SKIP %s\n' "$1"; }
 check(){ [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "expected [$3], got [$2]"; }
 
 # A fixture org dir: <root>/org/<name> clone, optional <name>-worktrees siblings.
@@ -29,7 +34,21 @@ addwt() { git -C "$1" worktree add -q -b "$3" "$2"; }   # $1=clone $2=path $3=br
 # Explicit template: bare `mktemp -d` is a GNU-coreutils-only extension and
 # exits 1 with a usage error on BSD/macOS mktemp, which has no default
 # template (CR-1) — this harness must itself run on a macOS fleet host.
-newroot() { mktemp -d "${TMPDIR:-/tmp}/fleet-rename-test.XXXXXX"; }
+#
+# F5: canonicalize through `pwd -P` immediately, matching the SUT's own
+# --org-dir canonicalization (fleet-rename-checkout.sh normalizes via
+# `cd "$ORG_DIR" && pwd -P`). Without this, a symlinked $TMPDIR (macOS
+# /var -> /private/var) makes fixture paths and the SUT's derived paths
+# diverge, silently disabling assertions built from the raw path.
+ALL_ROOTS=()
+newroot() {
+  local d
+  d="$(mktemp -d "${TMPDIR:-/tmp}/fleet-rename-test.XXXXXX")"
+  d="$(cd "$d" && pwd -P)"
+  ALL_ROOTS+=("$d")
+  printf '%s\n' "$d"
+}
+trap 'rm -rf "${ALL_ROOTS[@]}"' EXIT
 
 # --- T1: old layout present, new absent -> exit 1, reports MIGRATION NEEDED ---
 R=$(newroot); C=$(mkfixture "$R" skimmer)
@@ -169,6 +188,8 @@ if command -v jq >/dev/null 2>&1; then
   check "T15 unrelated team untouched" \
     "$(jq -r '.projects[]|select(.team=="CTL")|.repoRoot' "$R/catalyst/execution-core/registry.json")" \
     "$R/org/other"
+else
+  skip "T15 registry assertions skipped (no jq)"
 fi
 
 # --- T16: an existing MAN entry with a stale repoRoot is corrected, not duplicated ---
@@ -183,6 +204,8 @@ if command -v jq >/dev/null 2>&1; then
   check "T16 MAN corrected" \
     "$(jq -r '.projects[]|select(.team=="MAN")|.repoRoot' "$R/catalyst/execution-core/registry.json")" \
     "$R/org/manta"
+else
+  skip "T16 registry assertions skipped (no jq)"
 fi
 
 # --- T17: absent registry.json is not an error (host without execution-core) ---
@@ -239,9 +262,10 @@ grep -q "tooling reference" <<<"$out" && ok "T21 reports" || bad "T21 reports" "
 RB="$REPO_ROOT/docs/RUNBOOKS/fleet-checkout-rename.md"
 PARSER="$(awk '/^while \[\[ \$# -gt 0/,/^done$/' "$SUT")"
 missing=""
-for f in $(grep -o -- '--[a-z][a-z-]*' "$RB" | sort -u); do
+while IFS= read -r f; do
+  [[ -z $f ]] && continue
   grep -qE -- "(^[[:space:]]*${f}[)|])|(\\|${f}[)|])" <<<"$PARSER" || missing="$missing $f"
-done
+done < <(grep -o -- '--[a-z][a-z-]*' "$RB" | sort -u)
 [[ -z $missing ]] && ok "T22 runbook flags all exist" || bad "T22 runbook flags all exist" "$missing"
 
 # --- T23: default scan roots (no --scan-root given) must not block on the
@@ -305,7 +329,7 @@ if command -v jq >/dev/null 2>&1; then
   check "T26 exit" "$rc" "1"
   grep -qi "registry.json" <<<"$out" && ok "T26 flags stale registry" || bad "T26 flags stale registry" "$out"
 else
-  ok "T26 skipped (no jq)"
+  skip "T26 skipped (no jq)"
 fi
 
 # --- T27: a trailing flag with no operand is a usage error (exit 2), not the
@@ -334,7 +358,7 @@ if command -v jq >/dev/null 2>&1; then
   check "T28 registry untouched" \
     "$(cat "$R/catalyst/execution-core/registry.json")" '{"projects":[]}'
 else
-  ok "T28 skipped (no jq)"
+  skip "T28 skipped (no jq)"
 fi
 
 # --- T29: --apply on a hand-renamed host (directories already renamed
@@ -357,7 +381,7 @@ git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
   && ok "T29 worktree repaired" || bad "T29 worktree repaired" "$out"
 git -C "$R/org/manta" worktree list --porcelain | grep -q '^prunable' \
   && bad "T29 no prunable" "$out" || ok "T29 no prunable"
-out2=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc2=$?
+"$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" >/dev/null 2>&1; rc2=$?
 check "T29 second apply exit" "$rc2" "0"
 
 # --- T30: a trailing slash on --org-dir (what shell tab-completion produces)
@@ -431,5 +455,62 @@ out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
 grep -qi "does not exist or is not readable" <<<"$out" \
   && ok "T34 warns about missing --scan-root" || bad "T34 warns about missing --scan-root" "$out"
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+# --- T35: --apply on an already-migrated host with an unrelated pre-existing
+#     dead worktree must still exit 0 (validation-round finding F1) — the
+#     migrated branch must pass a real baseline into verify(), not an empty
+#     one, or a host with any unrelated worktree cruft can never pass ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+mkdir -p "$R/wt"; addwt "$C" "$R/wt/dead" dead; rm -rf "$R/wt/dead"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T35 exit" "$rc" "0"
+grep -q "ALREADY MIGRATED" <<<"$out" && ok "T35 verdict" || bad "T35 verdict" "$out"
+grep -q "pre-existing prunable" <<<"$out" && ok "T35 dead wt informational" \
+  || bad "T35 dead wt informational" "$out"
+
+# --- T36: --apply converges a half-hand-migrated host — main clone renamed
+#     by hand, worktree parent left at its legacy name (validation-round
+#     finding F2) — instead of failing forever on a leftover
+#     <old>-worktrees directory the migrated branch never moved ---
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
+mv "$R/org/skimmer" "$R/org/manta"
+git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T36 exit" "$rc" "0"
+[[ -d "$R/org/manta-worktrees" ]] && ok "T36 worktree parent moved" \
+  || bad "T36 worktree parent moved" "$out"
+[[ ! -e "$R/org/skimmer-worktrees" ]] && ok "T36 legacy worktree parent gone" \
+  || bad "T36 legacy worktree parent gone"
+git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
+  && ok "T36 worktree repaired" || bad "T36 worktree repaired"
+
+# --- T37: a dead worktree entry and an unrelated, distinct, live worktree
+#     that happens to share its basename must not be conflated (validation-
+#     round finding F3) — the live one is not a "repaired copy" of the dead
+#     one, and reporting it as such produces a no-op remedy ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+mkdir -p "$R/org/manta-worktrees" "$R/wt"
+addwt "$C" "$R/org/manta-worktrees/w1" w1
+addwt "$C" "$R/wt/w1" w1-dead; rm -rf "$R/wt/w1"
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T37 exit" "$rc" "0"
+grep -q "pre-existing prunable" <<<"$out" && ok "T37 dead entry informational" \
+  || bad "T37 dead entry informational" "$out"
+grep -q "was not repaired" <<<"$out" && bad "T37 must not conflate basename collision" "$out" \
+  || ok "T37 does not conflate basename collision"
+
+# --- T38: --apply is not refused merely because <new>-worktrees already
+#     exists when there is no <old>-worktrees to merge it with (validation-
+#     round finding F4) — only TWO worktree parents is an actual conflict ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/org/manta-worktrees"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T38 exit" "$rc" "0"
+[[ -d "$R/org/manta" ]] && ok "T38 clone renamed" || bad "T38 clone renamed" "$out"
+[[ -d "$R/org/manta-worktrees" ]] && ok "T38 pre-existing worktree parent survives" \
+  || bad "T38 pre-existing worktree parent survives"
+
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

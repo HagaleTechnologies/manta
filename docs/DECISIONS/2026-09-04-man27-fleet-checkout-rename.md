@@ -62,8 +62,9 @@ literal instruction gets a green exit code and a still-broken worktree.
 its post-move location and passes that list to `git worktree repair`
 explicitly; it never calls the bare form. A deliberate regression test
 (temporarily reverting to the bare call, confirming the test suite goes red,
-then reverting) is part of this change's own verification — see the test
-file's header comment and its "Testing Strategy" note.
+then reverting) is part of this change's own verification — see T8's inline
+comment in `scripts/tests/test-fleet-rename-checkout.sh` ("The regression
+that bare `git worktree repair` would leave behind (KD 1)").
 
 `git worktree repair` also exits `1` if *any* argument path is invalid, even
 though it still repairs the valid ones — the script filters its argument

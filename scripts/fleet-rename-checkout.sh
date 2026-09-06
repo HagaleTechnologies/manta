@@ -17,6 +17,12 @@
 #
 # See docs/RUNBOOKS/fleet-checkout-rename.md and
 #     docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md
+#
+# shellcheck disable=SC2015
+# `A && B || C` is used throughout as pass/fail/info reporting, never as
+# if/then/else control flow: pass()/fail()/info()/say() are printf wrappers
+# that always return 0, so B never fails in a way that would let C run
+# unintentionally.
 set -uo pipefail
 
 OLD_NAME=skimmer
@@ -45,7 +51,28 @@ while [[ $# -gt 0 ]]; do
     --catalyst-dir) [[ $# -ge 2 ]] || die "missing value for $1"; CATALYST_DIR="${2/#\~/$HOME}"; shift;;
     --scan-root)    [[ $# -ge 2 ]] || die "missing value for $1"; SCAN_ROOTS+=("${2/#\~/$HOME}"); shift;;
     --allow-tooling-hits) ALLOW_TOOLING_HITS=1;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0;;
+    -h|--help)
+      sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+      cat <<'USAGE'
+
+Flags:
+  --check                read-only audit; mutates nothing
+  --apply                perform the migration, then run the same verification
+  --old NAME             legacy directory name (default: skimmer)
+  --new NAME             target directory name (default: manta)
+  --org-dir DIR          parent directory holding the clone
+                         (default: ~/code-repos/github/HagaleTechnologies)
+  --remote-url URL       desired origin URL
+                         (default: https://github.com/HagaleTechnologies/manta.git)
+  --catalyst-dir DIR     where execution-core/registry.json lives
+                         (default: ~/catalyst, or $CATALYST_DIR)
+  --scan-root DIR        add DIR to the tooling-preflight scan roots
+                         (repeatable; default roots: ~/code-repos/github,
+                         ~/bin, ~/.local/bin)
+  --allow-tooling-hits   proceed with --apply despite tooling-preflight hits
+  -h, --help             show this help
+USAGE
+      exit 0;;
     *) die "unknown argument: $1";;
   esac
   shift
@@ -57,6 +84,10 @@ done
 # /tmp -> /private/tmp, $TMPDIR -> /private/var/..., or any host where
 # ~/code-repos sits on a symlinked volume) otherwise breaks the string-prefix
 # matching against paths `git worktree list` reports canonically (C-2).
+# Kept alongside the canonicalized form for the tooling preflight (F6): a tool
+# that hardcodes the $HOME-spelled path (never having resolved the symlink
+# itself) won't contain the canonical spelling, so both must be scanned for.
+RAW_ORG_DIR="${ORG_DIR%/}"
 if [[ -d $ORG_DIR ]]; then
   ORG_DIR="$(cd "$ORG_DIR" && pwd -P)"
 else
@@ -67,6 +98,7 @@ OLD_MAIN="$ORG_DIR/$OLD_NAME"
 NEW_MAIN="$ORG_DIR/$NEW_NAME"
 OLD_WTP="$ORG_DIR/${OLD_NAME}-worktrees"
 NEW_WTP="$ORG_DIR/${NEW_NAME}-worktrees"
+RAW_OLD_MAIN="$RAW_ORG_DIR/$OLD_NAME"
 
 # Host identity, mirroring lib/host-identity.sh:9-40 (env -> Layer-2 config -> hostname).
 host_name() {
@@ -123,8 +155,9 @@ FAILED=0
 # $1 = newline-separated baseline of paths that were ALREADY prunable before any
 #      move (empty for --check).
 verify() {
-  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root reg bn
+  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root reg bn all_paths
   mainpath="$(git -C "$MAIN" rev-parse --show-toplevel)"
+  all_paths="$(inventory | cut -f1)"
 
   # Gherkin 1: directory named <new> present, no <old> directory remains.
   [[ -d $NEW_MAIN ]] && pass "directory '$NEW_NAME' present in $ORG_DIR" \
@@ -163,9 +196,15 @@ verify() {
     # OLD_MAIN prefix math on purpose, so it still catches the regression even
     # if ORG_DIR normalization above ever falls short of some other host's
     # path shape.
+    # F3: only take the basename fallback when the candidate isn't itself a
+    # separate, already-recorded worktree — otherwise a dead entry sharing a
+    # basename with an unrelated, distinct live worktree gets misreported as
+    # that live worktree's "unrepaired" stale copy.
     if [[ $candidate == "$path" && ! -e $path ]]; then
       bn="$(basename -- "$path")"
-      [[ -d "$NEW_WTP/$bn" ]] && candidate="$NEW_WTP/$bn"
+      if [[ -d "$NEW_WTP/$bn" ]] && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
+        candidate="$NEW_WTP/$bn"
+      fi
     fi
     if [[ $flag == prunable ]]; then
       if [[ $candidate != "$path" && -d $candidate ]]; then
@@ -248,14 +287,21 @@ tooling_hits() {
   # `-R` (not `-r`) so a symlinked file — e.g. a stow/dotfiles-style `~/bin`
   # symlink farm, the layout link-build-cache.sh normally lives in — is
   # actually followed and scanned rather than silently skipped (C-4).
+  #
+  # F6: scan for BOTH the canonicalized $OLD_MAIN and its raw, $HOME-spelled
+  # form. On a host where `--org-dir` (or its default) sits on a symlinked
+  # volume, a tool that hardcodes the un-canonicalized spelling — the form a
+  # human would actually type — never contains the canonical one, so scanning
+  # only for $OLD_MAIN reports "no hits" when it should report "cannot tell".
   grep -RIn --exclude-dir=.git --exclude=.git \
        --exclude-dir=node_modules --exclude-dir=target \
-       -e "$OLD_MAIN" -e "/${OLD_NAME}-worktrees" \
+       -e "$OLD_MAIN" -e "$RAW_OLD_MAIN" -e "/${OLD_NAME}-worktrees" \
        "${roots[@]}" 2>/dev/null \
     | grep -v "^${OLD_MAIN}/" \
     | grep -v "^${NEW_MAIN}/" \
     | grep -v "^${OLD_WTP}/" \
-    | grep -v "^${NEW_WTP}/" || true
+    | grep -v "^${NEW_WTP}/" \
+    | grep -v "^${RAW_OLD_MAIN}/" || true
 }
 
 # On an already-migrated host nothing is going to move, so a stray hardcoded
@@ -381,6 +427,25 @@ if [[ $MODE == apply ]]; then
 $busy
      Stop the Catalyst daemon and any open session on this checkout, then re-run."
 
+    # F1: capture the prunable baseline before touching anything below, so
+    # pre-existing cruft (KD 4 / ADR Decision 3) stays informational in
+    # verify() instead of permanently failing a host that carries any.
+    BASELINE="$(inventory | awk -F'\t' '$2=="prunable"{print $1}')"
+
+    # F2: a host where only the main clone was hand-renamed leaves $OLD_WTP
+    # behind forever otherwise — move it now, before repairing worktrees,
+    # guarded the same way the legacy-apply path guards against merging two
+    # worktree parents.
+    if [[ -d $OLD_WTP ]]; then
+      if [[ -e $NEW_WTP ]]; then
+        die "both '${OLD_NAME}-worktrees' and '${NEW_NAME}-worktrees' exist under $ORG_DIR.
+     Refusing to merge two worktree parents. Resolve by hand, then re-run."
+      fi
+      say "moving $OLD_WTP -> $NEW_WTP"
+      mv "$OLD_WTP" "$NEW_WTP" || die "mv of the worktree parent failed"
+    fi
+
+    all_paths="$(inventory | cut -f1)"
     REPAIR=()
     while IFS=$'\t' read -r p _; do
       [[ -z $p ]] && continue
@@ -390,9 +455,13 @@ $busy
       elif [[ ! -e $p && $p == "$OLD_MAIN"/* ]]; then
         cand="$NEW_MAIN/${p#"$OLD_MAIN"/}"
       fi
+      # F3: same collision guard as verify() — don't treat an unrelated, live,
+      # already-recorded worktree as this entry's repaired counterpart.
       if [[ $cand == "$p" && ! -e $p ]]; then
         bn="$(basename -- "$p")"
-        [[ -d "$NEW_WTP/$bn" ]] && cand="$NEW_WTP/$bn"
+        if [[ -d "$NEW_WTP/$bn" ]] && ! grep -qxF "$NEW_WTP/$bn" <<<"$all_paths"; then
+          cand="$NEW_WTP/$bn"
+        fi
       fi
       [[ $cand != "$p" && -d $cand ]] && REPAIR+=("$cand")
     done <<<"$(inventory)"
@@ -416,7 +485,7 @@ $busy
     reconcile_registry
 
     say ""
-    verify ""
+    verify "$BASELINE"
     say ""
     [[ $FAILED -eq 0 ]] && { say "VERDICT: ALREADY MIGRATED — all checks pass."; exit 0; }
     say "VERDICT: MIGRATION INCOMPLETE — see FAIL lines above."; exit 1
@@ -427,8 +496,14 @@ $busy
 $busy
      Stop the Catalyst daemon and any open session on this checkout, then re-run."
 
-  [[ -e $NEW_WTP ]] && die "destination worktree parent already exists: $NEW_WTP
+  # F4: only refuse when there's actually something to merge — a host with a
+  # destination worktree parent but no legacy one (nothing under $OLD_MAIN
+  # ever had linked worktrees) has one worktree parent, not two, and the move
+  # below is safe.
+  if [[ -d $OLD_WTP && -e $NEW_WTP ]]; then
+    die "both '${OLD_NAME}-worktrees' and '${NEW_NAME}-worktrees' exist under $ORG_DIR.
      Refusing to merge two worktree parents. Resolve by hand, then re-run."
+  fi
 
   # Baseline: which worktrees were ALREADY prunable before we touched anything (KD 4).
   BASELINE="$(inventory | awk -F'\t' '$2=="prunable"{print $1}')"
