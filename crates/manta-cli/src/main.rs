@@ -970,7 +970,7 @@ fn start_spot_server(
     ))
 }
 
-/// Resolves the address `manta status` should DIAL to reach a running
+/// Resolves the address(es) `manta status` should DIAL to reach a running
 /// daemon's metrics/status listener (MAN-44). An explicit `--addr` always
 /// wins; otherwise a `--server-config`'s `[server]` table supplies the
 /// port, with its `bind_addr` translated to a real dialable address --
@@ -978,13 +978,23 @@ fn start_spot_server(
 /// something a client can connect TO, so those collapse to loopback (the
 /// one address guaranteed to reach a same-host daemon). With neither,
 /// falls back to the documented default metrics port on loopback.
+///
+/// Returns every address a hostname resolves to, not just the first
+/// (code-review fix): `ToSocketAddrs` on a hostname can return several
+/// candidates in resolver-dependent order -- e.g. `localhost` resolving
+/// `::1` before `127.0.0.1` on a dual-stack host -- and the daemon's own
+/// default `bind_addr = "0.0.0.0"` only listens on IPv4. Keeping just
+/// `.next()` picked whichever candidate the resolver happened to list
+/// first, reporting a healthy daemon as unreachable whenever that guess
+/// was wrong. `fetch_status` tries every returned address in turn (same
+/// precedent as `uplink::connect_first_reachable`).
 fn resolve_status_addr(
     addr: Option<&str>,
     server: Option<&manta_server::config::ServerConfig>,
-) -> Result<std::net::SocketAddr> {
+) -> Result<Vec<std::net::SocketAddr>> {
     if let Some(addr) = addr {
         if let Ok(sock) = addr.parse() {
-            return Ok(sock);
+            return Ok(vec![sock]);
         }
         // CR-B applies equally here: the daemon accepts a hostname in its
         // own `bind_addr` (resolved via `ToSocketAddrs` in
@@ -992,26 +1002,29 @@ fn resolve_status_addr(
         // remote daemon with `--addr <host>:<metrics_port>` -- rejecting a
         // literal-IP-only `--addr` would contradict both.
         use std::net::ToSocketAddrs;
-        return addr
+        let addrs: Vec<_> = addr
             .to_socket_addrs()
             .with_context(|| format!("invalid --addr {addr:?}"))?
-            .next()
-            .with_context(|| format!("--addr {addr:?} resolved to no addresses"));
+            .collect();
+        if addrs.is_empty() {
+            bail!("--addr {addr:?} resolved to no addresses");
+        }
+        return Ok(addrs);
     }
     let Some(server) = server else {
-        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], 7302)));
+        return Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], 7302))]);
     };
     match server.bind_addr.as_str() {
-        "0.0.0.0" => Ok(std::net::SocketAddr::new(
+        "0.0.0.0" => Ok(vec![std::net::SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
             server.metrics_port,
-        )),
-        "::" => Ok(std::net::SocketAddr::new(
+        )]),
+        "::" => Ok(vec![std::net::SocketAddr::new(
             std::net::Ipv6Addr::LOCALHOST.into(),
             server.metrics_port,
-        )),
+        )]),
         other => match other.parse::<std::net::IpAddr>() {
-            Ok(ip) => Ok(std::net::SocketAddr::new(ip, server.metrics_port)),
+            Ok(ip) => Ok(vec![std::net::SocketAddr::new(ip, server.metrics_port)]),
             // CR-B: the daemon itself binds `bind_addr` through
             // `TcpListener::bind((host, port))`, which resolves a
             // hostname via `ToSocketAddrs` (main.rs's `start_spot_server`)
@@ -1021,14 +1034,26 @@ fn resolve_status_addr(
             // config the daemon itself accepts.
             Err(_) => {
                 use std::net::ToSocketAddrs;
-                (other, server.metrics_port)
+                let addrs: Vec<_> = (other, server.metrics_port)
                     .to_socket_addrs()
                     .with_context(|| format!("resolving server.bind_addr {other:?}"))?
-                    .next()
-                    .with_context(|| format!("server.bind_addr {other:?} resolved to no addresses"))
+                    .collect();
+                if addrs.is_empty() {
+                    bail!("server.bind_addr {other:?} resolved to no addresses");
+                }
+                Ok(addrs)
             }
         },
     }
+}
+
+/// Renders a list of candidate addresses for an error message.
+fn format_addrs(addrs: &[std::net::SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(std::net::SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The full pre-render `manta status` flow: read/parse an optional
@@ -1048,15 +1073,15 @@ fn run_status(
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
         })
         .transpose()?;
-    let target = resolve_status_addr(addr, file.as_ref().map(|f| &f.server))?;
+    let targets = resolve_status_addr(addr, file.as_ref().map(|f| &f.server))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(fetch_status(
-        target,
+        &targets,
         std::time::Duration::from_secs(timeout_secs),
     ))
-    .with_context(|| format!("could not reach daemon at {target}"))
+    .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
 }
 
 /// Exit code contract for scripting (cron/Nagios-style): `0` when every
@@ -1094,21 +1119,44 @@ const MAX_STATUS_HEADER_LINES: usize = 100;
 /// (connect, write, read) is bounded by `timeout` so a silent or
 /// half-open peer can't hang `manta status` indefinitely.
 async fn fetch_status(
-    addr: std::net::SocketAddr,
+    addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
 ) -> Result<manta_server::status::StatusDoc> {
-    tokio::time::timeout(timeout, fetch_status_inner(addr))
+    tokio::time::timeout(timeout, fetch_status_inner(addrs))
         .await
-        .map_err(|_| anyhow!("timed out talking to {addr}"))?
+        .map_err(|_| anyhow!("timed out talking to {}", format_addrs(addrs)))?
 }
 
-async fn fetch_status_inner(addr: std::net::SocketAddr) -> Result<manta_server::status::StatusDoc> {
+/// Tries every candidate in turn, returning the first that accepts a TCP
+/// connection, or the last error if all of them fail (code-review fix --
+/// see `resolve_status_addr`). Same precedent as
+/// `uplink::connect_first_reachable`: a hostname resolving to more than
+/// one address must not make the CLI give up after the first, resolver-
+/// order-dependent candidate.
+async fn connect_any(
+    addrs: &[std::net::SocketAddr],
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let mut last_err = None;
+    for &addr in addrs {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => return Ok((stream, addr)),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to try")
+    }))
+}
+
+async fn fetch_status_inner(
+    addrs: &[std::net::SocketAddr],
+) -> Result<manta_server::status::StatusDoc> {
     use manta_server::bounded_io::read_line_bounded;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
+    let (mut stream, addr) = connect_any(addrs)
         .await
-        .with_context(|| format!("connecting to {addr}"))?;
+        .with_context(|| format!("connecting to {}", format_addrs(addrs)))?;
     stream
         .write_all(
             format!("GET /status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
@@ -2052,7 +2100,7 @@ mod tests {
 
         let doc = rt
             .block_on(fetch_status(
-                server.metrics_addr,
+                &[server.metrics_addr],
                 std::time::Duration::from_secs(5),
             ))
             .unwrap();
@@ -2089,35 +2137,27 @@ mod tests {
     #[test]
     fn status_address_prefers_explicit_addr_then_config_then_default() {
         assert_eq!(
-            resolve_status_addr(Some("1.2.3.4:9999"), None)
-                .unwrap()
-                .to_string(),
-            "1.2.3.4:9999"
+            resolve_status_addr(Some("1.2.3.4:9999"), None).unwrap(),
+            vec!["1.2.3.4:9999".parse().unwrap()]
         );
         // bind_addr 0.0.0.0 in config means "listening everywhere"; the
         // CLI still has to DIAL something, and loopback is the only
         // address guaranteed to reach the local daemon.
         assert_eq!(
-            resolve_status_addr(None, Some(&cfg_with("0.0.0.0", 17302)))
-                .unwrap()
-                .to_string(),
-            "127.0.0.1:17302"
+            resolve_status_addr(None, Some(&cfg_with("0.0.0.0", 17302))).unwrap(),
+            vec!["127.0.0.1:17302".parse().unwrap()]
         );
         assert_eq!(
-            resolve_status_addr(None, Some(&cfg_with("::", 17302)))
-                .unwrap()
-                .to_string(),
-            "[::1]:17302"
+            resolve_status_addr(None, Some(&cfg_with("::", 17302))).unwrap(),
+            vec!["[::1]:17302".parse().unwrap()]
         );
         assert_eq!(
-            resolve_status_addr(None, Some(&cfg_with("10.0.0.5", 17302)))
-                .unwrap()
-                .to_string(),
-            "10.0.0.5:17302"
+            resolve_status_addr(None, Some(&cfg_with("10.0.0.5", 17302))).unwrap(),
+            vec!["10.0.0.5:17302".parse().unwrap()]
         );
         assert_eq!(
-            resolve_status_addr(None, None).unwrap().to_string(),
-            "127.0.0.1:7302"
+            resolve_status_addr(None, None).unwrap(),
+            vec!["127.0.0.1:7302".parse().unwrap()]
         );
     }
 
@@ -2129,12 +2169,15 @@ mod tests {
     /// `docs/RUNBOOKS/uplink-health.md`'s documented cross-host invocation.
     #[test]
     fn status_address_resolves_a_hostname_passed_via_addr() {
-        let addr = resolve_status_addr(Some("localhost:17302"), None).unwrap();
-        assert!(
-            addr.ip().is_loopback(),
-            "expected localhost to resolve to a loopback address, got {addr}"
-        );
-        assert_eq!(addr.port(), 17302);
+        let addrs = resolve_status_addr(Some("localhost:17302"), None).unwrap();
+        assert!(!addrs.is_empty(), "expected at least one resolved address");
+        for addr in &addrs {
+            assert!(
+                addr.ip().is_loopback(),
+                "expected localhost to resolve to a loopback address, got {addr}"
+            );
+            assert_eq!(addr.port(), 17302);
+        }
     }
 
     /// MAN-44 CR-B regression: the daemon binds `bind_addr` via
@@ -2145,12 +2188,59 @@ mod tests {
     /// a config the daemon itself accepts.
     #[test]
     fn status_address_resolves_a_hostname_bind_addr_like_the_daemon_does() {
-        let addr = resolve_status_addr(None, Some(&cfg_with("localhost", 17302))).unwrap();
-        assert!(
-            addr.ip().is_loopback(),
-            "expected localhost to resolve to a loopback address, got {addr}"
-        );
-        assert_eq!(addr.port(), 17302);
+        let addrs = resolve_status_addr(None, Some(&cfg_with("localhost", 17302))).unwrap();
+        assert!(!addrs.is_empty(), "expected at least one resolved address");
+        for addr in &addrs {
+            assert!(
+                addr.ip().is_loopback(),
+                "expected localhost to resolve to a loopback address, got {addr}"
+            );
+            assert_eq!(addr.port(), 17302);
+        }
+    }
+
+    /// Code-review regression (finding 1): a hostname that resolves to
+    /// several addresses -- e.g. `localhost` returning `::1` before
+    /// `127.0.0.1` on a dual-stack host -- must not make `manta status`
+    /// give up after dialing only the FIRST candidate. The previous
+    /// `resolve_status_addr`/`fetch_status_inner` kept only
+    /// `to_socket_addrs().next()`, so a real daemon bound IPv4-only (the
+    /// project's own default `bind_addr = "0.0.0.0"`) was reported as
+    /// unreachable whenever the resolver listed an unreachable address
+    /// first. This reproduces that shape directly -- a dead IPv6 loopback
+    /// candidate followed by a live IPv4-only listener -- so it fails on
+    /// any implementation that dials only the first address, regardless
+    /// of what a given machine's real resolver happens to return for
+    /// "localhost".
+    #[tokio::test]
+    async fn fetch_status_falls_back_past_an_unreachable_first_address() {
+        // A closed port on ::1: nothing is listening, so connecting here
+        // fails immediately (connection refused) rather than hanging.
+        let dead = std::net::SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), 1);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let body = doc_with(manta_server::metrics::OverallUplinkHealth::Disabled).to_json();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let doc = fetch_status(&[dead, live], std::time::Duration::from_secs(5))
+            .await
+            .expect("must fall back to the second address after the first refuses");
+        assert_eq!(doc.schema_version, 1);
     }
 
     fn doc_with(
@@ -2224,7 +2314,7 @@ mod tests {
             let _ = socket.shutdown().await;
         });
 
-        let doc = fetch_status(addr, std::time::Duration::from_secs(5))
+        let doc = fetch_status(&[addr], std::time::Duration::from_secs(5))
             .await
             .expect("must parse a response split across several writes");
         assert_eq!(doc.schema_version, 1);
@@ -2245,7 +2335,7 @@ mod tests {
                 .unwrap();
             let _ = socket.shutdown().await;
         });
-        let err = fetch_status(addr, std::time::Duration::from_secs(5))
+        let err = fetch_status(&[addr], std::time::Duration::from_secs(5))
             .await
             .expect_err("a 404 must be a clean error, not a panic");
         assert!(format!("{err:#}").contains("404"));
@@ -2268,7 +2358,7 @@ mod tests {
                 .unwrap();
             let _ = socket.shutdown().await;
         });
-        let err = fetch_status(addr2, std::time::Duration::from_secs(5))
+        let err = fetch_status(&[addr2], std::time::Duration::from_secs(5))
             .await
             .expect_err("a non-JSON body must be a clean error, not a panic");
         assert!(format!("{err:#}").contains("status document"));
@@ -2285,7 +2375,7 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let err = fetch_status(addr, std::time::Duration::from_millis(200))
+        let err = fetch_status(&[addr], std::time::Duration::from_millis(200))
             .await
             .expect_err("a silent server must time out, not hang forever");
         assert!(err.to_string().contains("timed out"));
