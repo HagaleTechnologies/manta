@@ -145,20 +145,25 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
-    /// Overrides the metrics listener's per-source-IP AGGREGATE completed-
-    /// request rate budget (MAN-64) -- separate from
+    /// Overrides the metrics listener's per-source-IP AGGREGATE accepted-
+    /// connection rate budget (MAN-64) -- separate from
     /// `metrics_max_connections_per_ip` above, which bounds concurrent
-    /// connections, not request rate. `None` (default, field omitted) uses
-    /// the built-in default (`metrics_http::MAX_METRICS_REQUESTS_PER_IP`
+    /// connections, not the rate connections are accepted and closed at.
+    /// Every accepted connection charges this budget once when it ends,
+    /// whether or not it ever sent a complete request line (a bare
+    /// connect-and-close, e.g. a TCP liveness probe, charges it exactly
+    /// like a well-formed `GET /metrics`). `None` (default, field omitted)
+    /// uses the built-in default (`metrics_http::MAX_METRICS_REQUESTS_PER_IP`
     /// per `metrics_http::METRICS_REQUEST_RATE_WINDOW`). `0` means no
     /// per-IP cap -- and note that UNLIKE telnet/JSON there is no
     /// per-connection budget left underneath it (this endpoint serves one
     /// request per connection, see `metrics_http::write_response`'s
-    /// `Connection: close`), so `0` disables request-rate bounding on this
+    /// `Connection: close`), so `0` disables this rate bounding on this
     /// listener entirely; only the total connection ceiling and the
     /// per-IP connection quota still apply. Raise it for a federated or
-    /// multi-scraper deployment where every scrape reaches manta from one
-    /// address; see `docs/RUNBOOKS/network-exposure.md`.
+    /// multi-scraper deployment where every scrape (or a shared liveness
+    /// probe) reaches manta from one address; see
+    /// `docs/RUNBOOKS/network-exposure.md`.
     #[serde(default)]
     pub metrics_max_requests_per_ip: Option<u32>,
 }

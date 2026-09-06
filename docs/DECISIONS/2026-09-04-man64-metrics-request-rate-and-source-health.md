@@ -185,32 +185,47 @@ listener, not a new primitive.
   IpRateLimiter` parameter, cloned into each connection's spawned task the
   same way `connection_log_limiter` already is.
 - The check runs in `handle_request` on every **completed** request —
-  including one that goes on to get a `404` — immediately after the header
-  block is confirmed non-EOF, before rendering or matching the path. The
-  finding names "task, formatting, TCP, and bandwidth work" as the cost
+  including one that goes on to get a `404` — once the header block is
+  confirmed non-EOF and fully read, before rendering or matching the path.
+  The finding names "task, formatting, TCP, and bandwidth work" as the cost
   being driven; the unit of that cost is a request, not a successful
   scrape, so metering only `GET /metrics` would hand a prober the identical
   task/socket/write cost for free. This matches `telnet.rs`'s command
   budget, which charges a line whether or not it parses into a known
-  command.
-- **Round-8 correction:** the header-read error and timeout branches are
-  ALSO charged against `ip_request_limiter`, at their own two call sites
-  in `handle_request`, not just the log budget they already shared. An
-  earlier version of this document (and the matching code comment) claimed
-  `IpQuota` + `HEADER_READ_TIMEOUT` (MAN-61) already bounded those paths.
-  That claim was wrong: `read_line_bounded` (`bounded_io.rs`) errors the
-  instant an unterminated line exceeds `MAX_LINE_BYTES`, at full network
-  speed rather than after any delay, so a peer looping
-  connect/oversized-line/close was never charged and was bounded only by
-  `IpQuota`'s 8-concurrent-holds — the identical "fast, cooperative peer"
-  shape this ticket exists to close, reached by making the request
-  malformed instead of well-formed (round-7 code-review finding, PR #76,
-  round 8 remediation). Charging these branches folds malformed and
-  well-formed requests from one source IP into the same aggregate ceiling;
-  it does not reduce the task/TCP cost of an individual malformed attempt,
-  which is unavoidably paid before the charge can run (the same shape the
-  well-formed 404 path already has), but it closes the specific
-  inconsistency the finding named and keeps the doc comment truthful.
+  command. This is one of four exit points that charge the budget — see
+  the round-9 correction below for the other three.
+- **Round-8 correction, corrected again at round 9:** the header-read error
+  and timeout branches are ALSO charged against `ip_request_limiter`, at
+  their own two call sites in `handle_request`, not just the log budget
+  they already shared. An earlier version of this document (and the
+  matching code comment) claimed `IpQuota` + `HEADER_READ_TIMEOUT`
+  (MAN-61) already bounded those paths. That claim was wrong:
+  `read_line_bounded` (`bounded_io.rs`) errors the instant an unterminated
+  line exceeds `MAX_LINE_BYTES`, at full network speed rather than after
+  any delay, so a peer looping connect/oversized-line/close was never
+  charged and was bounded only by `IpQuota`'s 8-concurrent-holds — the
+  identical "fast, cooperative peer" shape this ticket exists to close,
+  reached by making the request malformed instead of well-formed (round-7
+  code-review finding, PR #76, round 8 remediation). **Round-9 correction
+  (round-7 code-review finding, surfaced again at validate-plan):** this
+  document previously said "two call sites", but a THIRD exit point — a
+  peer that connects and closes before sending a single byte (the `eof`
+  branch) — was also missed by the round-8 remediation and is now charged
+  identically. So: every accepted connection charges `ip_request_limiter`
+  exactly once, at exactly one of these four exit points — header-read
+  error, header-read timeout, EOF-before-a-request-line, or a completed
+  request (matched or `404`) — never more than one per connection. Charging
+  the non-request exit points folds malformed and empty connections from
+  one source IP into the same aggregate ceiling as well-formed requests; it
+  does not reduce the task/TCP cost of an individual malformed or empty
+  attempt, which is unavoidably paid before the charge can run (the same
+  shape the well-formed 404 path already has), but it closes the specific
+  inconsistency the finding named and keeps this document truthful. Because
+  the budget is charged per accepted *connection* rather than per completed
+  *request*, a TCP-level liveness/readiness probe (a `tcpSocket` check, an
+  HAProxy/ELB health check) sharing a source IP with real scrape traffic
+  consumes the same budget and must be sized accordingly —
+  `docs/RUNBOOKS/network-exposure.md` documents this for operators.
 - An over-budget request gets a complete `429 Too Many Requests` response
   with a `Retry-After: 60` header, `Content-Length: 0`, and `Connection:
   close` — not a bare socket close, which an operator's scraper would read
@@ -226,7 +241,14 @@ listener, not a new primitive.
   double-logging that produces on a rejection path is exactly what
   `5b9e747` (this branch's own parent commit) removed from telnet/WS —
   returning `Err` here would reintroduce the identical bug on a third
-  listener in the same PR that fixed it on the other two.
+  listener in the same PR that fixed it on the other two. **Round-9
+  correction:** the header-read-error and timeout branches above had this
+  same bug pre-existing on `main` (they logged their own specific `warn!`
+  and then returned `Err`, which the task-boundary catch-all logged a
+  second time), and this branch had edited both of them to add the
+  `ip_request_limiter` charge without closing it. Both now return `Ok(())`
+  after their specific warn, exactly like the `429` path here — one log
+  line per rejection, not two, on every warn site in this file.
 - **Deliberately no per-connection `RateLimiter` tier**, unlike telnet/JSON
   (MAN-57): this endpoint answers exactly one request per connection
   (`Connection: close` on every response), so a per-connection budget would

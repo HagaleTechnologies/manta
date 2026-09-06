@@ -103,16 +103,21 @@ same way (`0` disables it; only each connection's own per-connection
 Ping budget still applies). Same reasoning for telnet's
 `telnet_max_commands_per_ip` if telnet is ever put behind a proxy too.
 
-**The metrics listener also has its own per-IP AGGREGATE completed-request
-rate budget (MAN-64, `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-
-and-source-health.md`), separate from every field above.** `IpQuota`
-(`metrics_max_connections_per_ip`) and `ConnectionLimiter` bound how many
-connections one source may hold *at once* — they do not bound how many
-complete `GET /metrics` requests a fast, cooperative peer can drive through
-the listener by opening, scraping, and closing a connection over and over.
-`[server].metrics_max_requests_per_ip` bounds exactly that: the default is
-60 completed requests per 60 seconds per source IP, roughly 5x the load of
-the tightest realistic single scraper (a 5s scrape interval is 12/min).
+**The metrics listener also has its own per-IP AGGREGATE accepted-
+connection rate budget (MAN-64, `docs/DECISIONS/2026-09-04-man64-metrics-
+request-rate-and-source-health.md`), separate from every field above.**
+`IpQuota` (`metrics_max_connections_per_ip`) and `ConnectionLimiter` bound
+how many connections one source may hold *at once* — they do not bound how
+many times a fast, cooperative peer can drive the listener's per-connection
+task/formatting/TCP work by opening and closing a connection over and over.
+`[server].metrics_max_requests_per_ip` bounds exactly that: every accepted
+connection charges this budget once when it ends, whether or not it ever
+sent a complete request line — a bare TCP connect-and-close (e.g. a
+`tcpSocket` liveness probe) costs a charge exactly like a well-formed
+`GET /metrics`. The default is 60 accepted connections per 60 seconds per
+source IP, roughly 5x the load of the tightest realistic single scraper (a
+5s scrape interval is 12/min); a liveness probe sharing that IP counts
+against the same budget and should be sized accordingly.
 Raise it if several independent scrapers, a federation setup, or a proxy in
 front of the metrics port cause more than one real client to collapse into
 a single `peer.ip()`. Set it to `0` to disable request-rate bounding on

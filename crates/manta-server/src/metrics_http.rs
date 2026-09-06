@@ -249,13 +249,15 @@ async fn handle_request(
             // full network speed, not after any delay -- so a peer looping
             // connect/oversized-line/close was previously never charged
             // here and was bounded only by `IpQuota`'s 8-concurrent-holds,
-            // letting it sustain the flood indefinitely. The return value
-            // is unused: this connection is already terminating via the
-            // `Err` below regardless of budget state, exactly like the
-            // well-formed 404 path already charges after paying its own
-            // full connection/read cost.
+            // letting it sustain the flood indefinitely.
             ip_request_limiter.allow(peer.ip());
-            return Err(e);
+            // MAN-64 remediation (round 9, PR #76 review): `Ok(())`, not
+            // `Err(e)` -- this rejection is already logged above, and
+            // `serve`'s task-boundary catch-all logs every `Err` too,
+            // which was double-logging this event and burning two of the
+            // 30-per-60s `connection_log_limiter` slots per rejection
+            // instead of one. Matches the 429 path's log-once shape below.
+            return Ok(());
         }
         Err(_) => {
             if connection_log_limiter.allow(peer.ip()) {
@@ -267,10 +269,9 @@ async fn handle_request(
             // for the full `HEADER_READ_TIMEOUT`, and should count against
             // the same aggregate ceiling a well-formed request does.
             ip_request_limiter.allow(peer.ip());
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "header read timed out",
-            ));
+            // MAN-64 remediation (round 9): `Ok(())`, not `Err` -- see the
+            // sibling header-read-error branch above for why.
+            return Ok(());
         }
     };
     if eof {
