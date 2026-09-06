@@ -203,14 +203,14 @@ fn pileup_signals() -> Vec<SignalSpec> {
         "W1AW", "K3LR", "N4ZZ", "VE3EJ", "W6YX", "K9CT", "W5AU", "N2IC", "K1TTT", "W3LPL", "VE7CC",
         "K5TR", "N6RO", "W4AN", "K8AZ", "W2GD", "N5DX", "K4XS", "W9RE", "VA3RJ",
     ];
-    // MAN-4 remediate: this harness drives LoopingAudioIqSource, the same
-    // real-to-analytic (Hilbert) front end AudioIqSource uses, through
-    // `soak_metrics::soak_with_metrics` -- which now (see the MAN-4 pin
-    // doc's remediate addendum) applies the front end's declared
-    // `analytic_guard_hz` (HILBERT_GUARD_HZ = 600.0) exactly like
-    // `listen()` does. Every offset below is shifted up by 250 Hz from
-    // its original value so the lowest (was 420 Hz) clears the guard
-    // with margin, without touching the pileup's relative spacing/design.
+    // MAN-4 remediate (pin doc item 21): this harness drives
+    // LoopingAudioIqSource, the same real-to-analytic (Hilbert) front end
+    // AudioIqSource uses, through `soak_metrics::soak_with_metrics` --
+    // which applies the front end's declared `analytic_guard_hz`
+    // (HILBERT_GUARD_HZ = 600.0) exactly like `listen()` does. Every
+    // offset below is shifted up by 250 Hz from its original value so the
+    // lowest (was 420 Hz) clears the guard with margin, without touching
+    // the pileup's relative spacing/design.
     const GUARD_SAFE_SHIFT_HZ: f64 = 250.0;
     let offsets_hz: [f64; 20] = [
         420.0 + GUARD_SAFE_SHIFT_HZ,

@@ -31,6 +31,26 @@ pub struct DetectorConfig {
     /// neighborhood-median clamp (`floor.rs`'s `effective_floor_db`) keeps
     /// working undisturbed.
     pub guard_hz: f64,
+    /// MAN-4 remediate round 2 (code review finding 1): enables
+    /// `is_image_of_owned`/`merge_mirror_images`, independently of
+    /// `guard_hz`. The two used to be conflated (both gated on
+    /// `guard_hz > 0.0`), but they answer different questions: `guard_hz`
+    /// is "how wide is the DC/Nyquist spawn-exclusion band", which an
+    /// operator may legitimately widen on a genuine complex-IQ source (a
+    /// real, common need: LO leakage/DC spur on a direct-conversion SDR --
+    /// see the pin doc's item 4). Mirror-image suppression instead requires
+    /// "does this front end synthesize its analytic signal from real input"
+    /// -- true only for a Hilbert-based source (`AudioIqSource`,
+    /// `LoopingAudioIqSource`) -- which is a fact the source already
+    /// reports directly via `analytic_guard_hz() > 0.0`, unrelated to
+    /// whatever guard width the operator later configures. Conflating the
+    /// two meant an operator widening `guard_hz` on a SoapySDR/KiwiSDR
+    /// source (genuine complex IQ, no Hilbert synthesis at all) would
+    /// silently turn on mirror merging, and two real stations symmetric
+    /// about the dial frequency would suppress each other. Defaults
+    /// `false`; `listen()`/`soak_with_metrics` set it from the source's own
+    /// `analytic_guard_hz() > 0.0`, never from the merged `guard_hz`.
+    pub mirror_image_guard: bool,
 }
 
 impl Default for DetectorConfig {
@@ -72,6 +92,7 @@ impl Default for DetectorConfig {
             warmup_hops: 750,
             track_cap: 500,
             guard_hz: 0.0,
+            mirror_image_guard: false,
         }
     }
 }
@@ -307,6 +328,14 @@ fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
     signed as f64
 }
 
+/// MAN-4 remediate round 2 (code review finding 2): shortest circular
+/// distance between two channel indices modulo `n_channels`, used by
+/// `TrackManager::merge_mirror_images`'s tolerant mirror match.
+fn circular_distance(a: usize, b: usize, n_channels: usize) -> usize {
+    let d = a.abs_diff(b);
+    d.min(n_channels - d)
+}
+
 /// SPEC §2.5: a live centroid EMA responsive enough to follow realistic
 /// drift (V9: 50 Hz/min == ~0.0089 channels/s at 93.75 Hz spacing) with
 /// negligible lag relative to the 375 Hz hop rate; tuned empirically
@@ -469,8 +498,13 @@ impl TrackManager {
     /// MAN-4: total tracks ever spawned (`spawns_by_channel`'s sum) -- the
     /// regression surface proving a clean single signal spawns exactly
     /// once, not just that it eventually settles to one open track.
-    pub fn total_spawns(&self) -> u32 {
-        self.spawns_by_channel.iter().sum()
+    /// MAN-4 remediate round 2 (code review finding 4): widened to `u64`
+    /// -- `spawns_by_channel` is a `Vec<u32>` summed over `n_channels`
+    /// entries, and a churn regression over a long soak (MAN-19's 24h run
+    /// is 32.4M hops, with up to `n/2` spawns possible per hop in the
+    /// pathological case) could overflow a `u32` accumulator.
+    pub fn total_spawns(&self) -> u64 {
+        self.spawns_by_channel.iter().map(|&c| c as u64).sum()
     }
 
     /// MAN-4: signed baseband offset of channel `k`, Hz -- the same
@@ -491,6 +525,25 @@ impl TrackManager {
         let off = self.channel_offset_hz(k).abs();
         let nyquist = self.channel_spacing_hz * self.n_channels() as f64 / 2.0;
         off < self.cfg.guard_hz || off > nyquist - self.cfg.guard_hz
+    }
+
+    /// MAN-4 remediate round 2 (code review finding 3): minimum raw-power
+    /// ratio the mirror-image comparison (`is_image_of_owned`/
+    /// `merge_mirror_images`) requires before treating one side of a pair
+    /// as a clear winner. Comparing raw single-hop power with no margin is
+    /// a coin flip during a key-up gap, when both the real channel and its
+    /// image sit at the noise floor and can differ by fractions of a dB --
+    /// reproduced by probe: a noise-level edge could close the real ACTIVE
+    /// track as `Merged`. 3 dB is comfortably below the ~90 dB steady-state
+    /// real/image gap this mechanism exists to resolve (pin doc item 15),
+    /// so it still decides promptly the moment either side actually
+    /// reflects the real signal; an ambiguous (within-margin) comparison
+    /// now correctly defers instead of firing on noise.
+    const MIRROR_POWER_MARGIN_DB: f32 = 3.0;
+
+    /// `a` clearly exceeds `b` by at least `MIRROR_POWER_MARGIN_DB`.
+    fn clearly_exceeds(a: f32, b: f32) -> bool {
+        a >= b * 10f32.powf(Self::MIRROR_POWER_MARGIN_DB / 10.0)
     }
 
     /// MAN-4 remediate (pin doc D7 addendum): should a rise at `k` be
@@ -526,15 +579,21 @@ impl TrackManager {
     /// out the real signal for the rest of the run; a candidate that
     /// spawns anyway because it's instantaneously the stronger side
     /// leaves its now-weaker mirror to `merge_mirror_images` to close.
-    /// Always `false` when `guard_hz <= 0.0` (every complex-IQ path), so
-    /// no golden vector is affected.
+    /// MAN-4 remediate round 2 (code review finding 1): gated on
+    /// `mirror_image_guard`, not `guard_hz` -- see that field's doc
+    /// comment for why the two must not be conflated. Always `false` when
+    /// `mirror_image_guard` is unset (every complex-IQ path, and any
+    /// operator-widened `guard_hz` on a genuine complex-IQ source), so no
+    /// golden vector is affected.
     fn is_image_of_owned(&self, k: usize, hop_power: &[f32]) -> bool {
-        if self.cfg.guard_hz <= 0.0 {
+        if !self.cfg.mirror_image_guard {
             return false;
         }
         let n = self.n_channels();
         let mirror = (n - k) % n;
-        mirror != k && self.owner_of[mirror].is_some() && hop_power[k] <= hop_power[mirror]
+        mirror != k
+            && self.owner_of[mirror].is_some()
+            && Self::clearly_exceeds(hop_power[mirror], hop_power[k])
     }
 
     /// MAN-4 remediate (pin doc D7 addendum): `is_image_of_owned` blocks
@@ -547,17 +606,27 @@ impl TrackManager {
     /// `merge_converged`'s SPEC §2.5 convergence rule (there by
     /// `current_snr_db`; here by raw power, for the same ramp-up reason
     /// `is_image_of_owned` uses it), just keyed on the circular mirror
-    /// channel instead of raw distance. Always a no-op when
-    /// `guard_hz <= 0.0` (every complex-IQ path), so no golden vector is
-    /// affected, and a no-op once a pair has already been resolved (the
-    /// loser's channel stays blocked by `is_image_of_owned` from then on,
-    /// since its own power does not exceed the survivor's).
+    /// channel instead of raw distance. MAN-4 remediate round 2 (code
+    /// review finding 1): a no-op unless `mirror_image_guard` is set --
+    /// see that field's doc comment -- so no golden vector is affected,
+    /// and a no-op once a pair has already been resolved (the loser's
+    /// channel stays blocked by `is_image_of_owned` from then on, since
+    /// its own power does not exceed the survivor's).
     fn merge_mirror_images(&mut self, hop_power: &[f32]) -> Vec<u32> {
-        if self.cfg.guard_hz <= 0.0 {
+        if !self.cfg.mirror_image_guard {
             return Vec::new();
         }
         let n = self.n_channels();
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
+        // MAN-4 remediate round 2 (code review finding 5): `select_channel`
+        // depends only on the track (`i`/`a`), not on the inner loop
+        // variable `j`/`b`, but was being recomputed for `ka` on every `j`
+        // iteration -- an O(T) redundancy inside an already-O(T^2) scan.
+        // Precompute each track's selected channel once per hop instead.
+        let channel_of: BTreeMap<u32, usize> = ids
+            .iter()
+            .map(|&id| (id, self.tracks[&id].select_channel(hop_power, n)))
+            .collect();
         let mut to_close = Vec::new();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
@@ -565,12 +634,26 @@ impl TrackManager {
                 if to_close.contains(&a) || to_close.contains(&b) {
                     continue;
                 }
-                let ka = self.tracks[&a].select_channel(hop_power, n);
-                let kb = self.tracks[&b].select_channel(hop_power, n);
+                let (ka, kb) = (channel_of[&a], channel_of[&b]);
                 let mirror_of_ka = (n - ka) % n;
-                if mirror_of_ka == kb {
-                    let loser = if hop_power[ka] <= hop_power[kb] { a } else { b };
-                    to_close.push(loser);
+                // MAN-4 remediate round 2 (code review finding 2): a
+                // genuine mirror pair's two argmaxes are not always an
+                // exact reflection under noise (`select_channel` is argmax
+                // over each track's own +/-1 owned window, which can pick
+                // different offsets within that window for the two sides
+                // of a pair) -- require only a +/-1 circular match, not
+                // bit-exact index equality, or a real mirror pair whose
+                // argmaxes drift by one channel never merges and the
+                // duplicate-decode symptom this ticket is about returns.
+                if circular_distance(mirror_of_ka, kb, n) <= 1 {
+                    let (pa, pb) = (hop_power[ka], hop_power[kb]);
+                    // MAN-4 remediate round 2 (code review finding 3): only
+                    // close a definite loser; see MIRROR_POWER_MARGIN_DB.
+                    if Self::clearly_exceeds(pb, pa) {
+                        to_close.push(a);
+                    } else if Self::clearly_exceeds(pa, pb) {
+                        to_close.push(b);
+                    }
                 }
             }
         }
@@ -1326,6 +1409,7 @@ mod tests {
         let fs = 48_000.0;
         let cfg = DetectorConfig {
             guard_hz: 300.0,
+            mirror_image_guard: true,
             ..DetectorConfig::default()
         };
         let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
@@ -1368,6 +1452,7 @@ mod tests {
         let fs = 48_000.0;
         let cfg = DetectorConfig {
             guard_hz: 300.0,
+            mirror_image_guard: true,
             ..DetectorConfig::default()
         };
         let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
@@ -1405,10 +1490,11 @@ mod tests {
     }
 
     /// MAN-4 remediate: `is_image_of_owned`/`merge_mirror_images` must be
-    /// complete no-ops when `guard_hz <= 0.0` (every complex-IQ path) --
-    /// two mirror-channel signals of very different strength must both
-    /// spawn and both survive, exactly like any other unrelated pair of
-    /// signals (`two_well_separated_strong_channels_yield_two_tracks`).
+    /// complete no-ops when `mirror_image_guard` is unset (its default,
+    /// which every complex-IQ path leaves alone) -- two mirror-channel
+    /// signals of very different strength must both spawn and both
+    /// survive, exactly like any other unrelated pair of signals
+    /// (`two_well_separated_strong_channels_yield_two_tracks`).
     #[test]
     fn mirror_image_guard_is_a_no_op_when_guard_hz_is_zero() {
         let n = 512;
@@ -1417,7 +1503,7 @@ mod tests {
             n,
             fs,
             0.0,
-            DetectorConfig::default(), // guard_hz: 0.0
+            DetectorConfig::default(), // guard_hz: 0.0, mirror_image_guard: false
             DecodeConfig::default(),
         );
         feed_warmup(&mut tm, n);
@@ -1431,6 +1517,100 @@ mod tests {
             tm.tracks.len(),
             2,
             "with guard_hz == 0.0, a mirror-channel pair is just two unrelated signals"
+        );
+    }
+
+    /// MAN-4 remediate round 2 (code review finding 1): a `guard_hz` an
+    /// operator widened by hand on a genuine complex-IQ source (SoapySDR/
+    /// KiwiSDR -- no Hilbert synthesis, `mirror_image_guard` stays at its
+    /// `false` default) must NOT enable mirror-image suppression. Before
+    /// this fix `is_image_of_owned`/`merge_mirror_images` gated on
+    /// `guard_hz > 0.0` alone, so this exact config would have suppressed
+    /// two genuine stations symmetric about the dial frequency.
+    #[test]
+    fn widened_guard_hz_alone_does_not_enable_mirror_suppression() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,           // operator-widened DC guard on a complex-IQ source
+            mirror_image_guard: false, // no Hilbert synthesis in this front end
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[8] = 1e-9 * 10f32.powf(60.0 / 10.0); // real station A
+        power[n - 8] = 1e-9 * 10f32.powf(15.0 / 10.0); // real station B, mirror-symmetric about dial
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "two genuine mirror-symmetric stations must not suppress each other just because \
+             guard_hz was widened on a complex-IQ (non-Hilbert) source"
+        );
+    }
+
+    /// MAN-4 remediate round 2 (code review finding 2): built directly
+    /// against `merge_mirror_images`, the same style
+    /// `merge_closes_the_lower_snr_track_when_centers_converge` uses, since
+    /// reliably driving this exact one-channel argmax drift through
+    /// `step_hop`'s real gate/floor timing is impractical to construct
+    /// deterministically. Track A's argmax (7) is one channel off the
+    /// exact mirror reflection (505) of track B's argmax (504) -- before
+    /// this fix, `mirror_of_ka == kb` demanded bit-exact equality and this
+    /// genuine mirror pair would never merge.
+    #[test]
+    fn merge_mirror_images_tolerates_a_one_channel_argmax_drift() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        tm.spawn(8); // owned window {7,8,9}
+        tm.spawn(n - 8); // owned window {n-9,n-8,n-7}
+        let mut power = quiet_power(n);
+        power[7] = 1e-9 * 10f32.powf(60.0 / 10.0); // real signal's argmax drifts to 7, not 8
+        power[n - 8] = 1e-9 * 10f32.powf(15.0 / 10.0); // weak mirror image, argmax stays at 504
+        tm.merge_mirror_images(&power);
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "track A's argmax (7) is 1 channel off the exact mirror reflection (505) of track \
+             B's argmax (504); merge_mirror_images must still recognize this as a mirror pair"
+        );
+    }
+
+    /// MAN-4 remediate round 2 (code review finding 3): comparing raw hop
+    /// power with no margin is a coin flip when both sides of a mirror
+    /// pair sit close together (e.g. both near the noise floor during a
+    /// key-up gap) -- reproduced by probe: a noise-level edge could close
+    /// the real ACTIVE track as `Merged`. Built directly against
+    /// `merge_mirror_images` for the same reason the drift test above is.
+    #[test]
+    fn mirror_merge_defers_on_an_ambiguous_power_tie_instead_of_closing_a_track() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        tm.spawn(8);
+        tm.spawn(n - 8);
+        let mut power = quiet_power(n);
+        power[8] = 1e-9 * 1.5; // within the 3 dB margin of the other side
+        power[n - 8] = 1e-9 * 1.0;
+        tm.merge_mirror_images(&power);
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "an ambiguous (within-margin) power comparison must defer, not close either side"
         );
     }
 

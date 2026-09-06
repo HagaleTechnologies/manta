@@ -75,7 +75,7 @@ pub struct SoakMetricsReport {
     /// rationale (MAN-19), and evidence the guard applied above actually
     /// keeps the DC/Nyquist spawn rate sane over a long synthetic soak
     /// rather than only in the short MAN-4 regression tests.
-    pub total_spawns: u32,
+    pub total_spawns: u64,
     /// MAN-4: `TrackManager::spawns_by_channel()` at the end of the run.
     pub final_spawns_by_channel: Vec<u32>,
 }
@@ -159,7 +159,7 @@ pub fn soak_with_metrics(
     let mut peak_active_tracks = 0usize;
     let mut final_close_counts = CloseCounts::default();
     let mut gate_records_total = 0u64;
-    let mut total_spawns = 0u32;
+    let mut total_spawns = 0u64;
     let mut final_spawns_by_channel: Vec<u32> = Vec::new();
     let mut last_sample = Instant::now();
 
@@ -213,6 +213,11 @@ pub fn soak_with_metrics(
         let mut detector = cfg.detector;
         detector.guard_hz =
             crate::listen::effective_guard_hz(detector.guard_hz, src.analytic_guard_hz());
+        // MAN-4 remediate round 2 (code review finding 1): derived from the
+        // source's own declaration, never from the merged `guard_hz` above
+        // -- see `listen.rs`'s matching comment and
+        // `DetectorConfig::mirror_image_guard`'s doc comment.
+        detector.mirror_image_guard = src.analytic_guard_hz() > 0.0;
         let mut tm = TrackManager::new(
             ch.n_channels(),
             fs,

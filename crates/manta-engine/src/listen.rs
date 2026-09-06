@@ -66,6 +66,12 @@ pub fn listen(
     // ever narrowing an operator-configured guard.
     let mut detector = cfg.detector;
     detector.guard_hz = effective_guard_hz(detector.guard_hz, src.analytic_guard_hz());
+    // MAN-4 remediate round 2 (code review finding 1): derived from the
+    // source's own declaration, never from the merged `guard_hz` above --
+    // see `DetectorConfig::mirror_image_guard`'s doc comment for why the
+    // two must stay independent (an operator-widened guard on a genuine
+    // complex-IQ source must not turn on mirror suppression).
+    detector.mirror_image_guard = src.analytic_guard_hz() > 0.0;
     let mut tm = crate::track::TrackManager::new(
         ch.n_channels(),
         fs,
@@ -342,12 +348,14 @@ mod tests {
             AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000)))
                 .unwrap();
         let guard_hz = effective_guard_hz(0.0, src.analytic_guard_hz());
+        let mirror_image_guard = src.analytic_guard_hz() > 0.0;
         let all_iq = manta_input::read_all(&mut src).unwrap();
 
         let mut ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0).unwrap();
         let hop_samples = ch.hop() as u64;
         let detector = crate::track::DetectorConfig {
             guard_hz,
+            mirror_image_guard,
             ..crate::track::DetectorConfig::default()
         };
         let mut tm = crate::track::TrackManager::new(

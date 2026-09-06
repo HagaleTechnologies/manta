@@ -26,8 +26,8 @@ copying speed for a first pass.
 4. Watch stdout. Expected: readable text tracking the code practice
    transmission (callsigns, "CQ", punctuation-adjacent prosigns) --- not
    necessarily perfect, but clearly *recognizable*, matching ROADMAP's M1
-   bar. **MAN-4:** the audio front end will not spawn tracks below ~300 Hz
-   or within ~300 Hz of Nyquist (`HILBERT_GUARD_HZ`) -- seeing no tracks
+   bar. **MAN-4:** the audio front end will not spawn tracks below ~600 Hz
+   or within ~600 Hz of Nyquist (`HILBERT_GUARD_HZ`) -- seeing no tracks
    there is expected, not a bug; every normal CW receive-filter passband
    sits well inside the guarded band's complement.
 5. Let it run at least several minutes to also eyeball basic stability

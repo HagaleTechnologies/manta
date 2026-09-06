@@ -319,20 +319,23 @@ mod tests {
     #[test]
     fn image_rejection_meets_the_guaranteed_band_contract() {
         let fs = 48_000.0;
-        // Sweep the declared band edges and a spread of interior frequencies,
-        // both sidebands (the response is symmetric about fs/2).
+        // Sweep the declared band edges and a spread of interior
+        // frequencies. MAN-4 remediate round 2 (code review finding 6): a
+        // prior version of this loop also probed `fs - f`, intending to
+        // cover "both sidebands" -- but for a real-valued cosine input,
+        // `fs - f` is bit-for-bit the same signal as `f` (aliasing), and
+        // with `f` ranging only over `[HILBERT_GUARD_HZ, fs/2 -
+        // HILBERT_GUARD_HZ]`, `fs - f` always landed >= fs/2 and was
+        // unconditionally skipped -- dead code claiming coverage it never
+        // had. Removed rather than fixed: probing `f` alone already
+        // exercises the full declared band.
         let mut f = HILBERT_GUARD_HZ;
         while f <= fs / 2.0 - HILBERT_GUARD_HZ {
-            for probe in [f, fs - f] {
-                if probe >= fs / 2.0 {
-                    continue;
-                }
-                let r = image_rejection_db(HILBERT_TAPS, probe, fs);
-                assert!(
-                    r >= HILBERT_MIN_IMAGE_REJECTION_DB,
-                    "{probe} Hz: {r:.1} dB image rejection, want >= {HILBERT_MIN_IMAGE_REJECTION_DB}"
-                );
-            }
+            let r = image_rejection_db(HILBERT_TAPS, f, fs);
+            assert!(
+                r >= HILBERT_MIN_IMAGE_REJECTION_DB,
+                "{f} Hz: {r:.1} dB image rejection, want >= {HILBERT_MIN_IMAGE_REJECTION_DB}"
+            );
             f += 137.0; // deliberately not a channel multiple -- probe off-grid too
         }
     }

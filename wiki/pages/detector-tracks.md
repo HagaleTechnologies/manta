@@ -13,6 +13,7 @@ verified:
 links:
   - pfb-channelizer
   - decode-chain
+  - hilbert-image-guard
 ---
 The detector estimates a per-channel noise floor by order statistics (a quantile over a sliding window — a median-like estimator, so CW keying does not inflate its own floor), gates channels active when smoothed power exceeds the floor by a threshold with hysteresis, and promotes each active channel to a **track** that leases a decoder from a bounded pool. This is what turns a spectrum into a set of things worth decoding. Exact quantile, window, on/off thresholds, hang/gc timers, and track cap are normative config keys in SPEC §2 and §9 — cite, do not restate.
 

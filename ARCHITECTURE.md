@@ -118,7 +118,7 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   Hilbert-transformed to analytic. Degenerate ~3 kHz "wideband" mode; exists
   because it makes manta useful to people with zero SDR hardware, and it is the
   M1 bring-up path. **MAN-4:** the Hilbert front end's usable band is
-  `[HILBERT_GUARD_HZ, fs/2 - HILBERT_GUARD_HZ]` (300 Hz-24 kHz at 48 kS/s) --
+  `[HILBERT_GUARD_HZ, fs/2 - HILBERT_GUARD_HZ]` (600 Hz-23.4 kHz at 48 kS/s) --
   outside it, finite-length image rejection is structurally unreliable, so
   `AudioIqSource` declares this as `IqSource::analytic_guard_hz` and the
   detector will not spawn tracks there (`DetectorConfig::guard_hz`). See

@@ -253,14 +253,22 @@ was reached by actually running the code, not by further hand-derivation.
     `|offset| < 600` or `> nyquist - 600`) eliminates that entire
     secondary flood, leaving only the single structural residual item 15
     describes. 600 Hz remains below every practical CW receive-filter
-    passband (item 8's reasoning is unaffected by the specific number),
-    and the soak scene's lowest offset (420 Hz, `docs/DECISIONS/`'s
-    soak-scene pins) is unaffected since `manta-soak-harness` doesn't use
-    the audio-guarded path directly relevant here (`soak_metrics.rs`,
-    item 4's update). At N=512 channels a 600 Hz guard excludes 26 of 512
-    channels (5.1%, up from item 6's 2.7% at 300 Hz): `k in {0..=5,
-    507..=511}` near DC and `k in {250..=262}` near +/-Nyquist -- still
-    outside every real CW operating convention.
+    passband (item 8's reasoning is unaffected by the specific number).
+    **Correction (finding 9 of the remediate-round code review): this item
+    originally claimed the soak scene's lowest offset (420 Hz) was
+    unaffected because `manta-soak-harness` "doesn't use the audio-guarded
+    path" -- that is the opposite of what item 4's own update says, and
+    `soak_metrics.rs:213-215` proves item 4 right: `LoopingAudioIqSource`
+    IS driven through the guarded path, at the same 600 Hz floor. The soak
+    scene's own offsets needed, and got, a real fix -- see item 16.** At
+    N=512 channels a 600 Hz guard excludes 26 of 512 channels (5.1%, up
+    from item 6's 2.7% at 300 Hz): `k in {0..=6, 506..=511}` near DC and
+    `k in {250..=262}` near +/-Nyquist -- still outside every real CW
+    operating convention. (Corrected from an earlier, self-contradicting
+    `{0..=5, 507..=511}` DC-side enumeration -- 11 channels, not 13 -- that
+    did not match its own stated total of 26; `is_guarded` at 93.75 Hz
+    spacing guards `|signed offset in channels| <= 6`, i.e. 7 + 6 = 13
+    channels on the DC side.)
 
 14. **Realistic AWGN added to both MAN-4 regression fixtures (plan's
     pre-decided contingency branch 2).**
@@ -347,6 +355,99 @@ was reached by actually running the code, not by further hand-derivation.
     to speak of -- so no golden vector is affected (confirmed: full
     `cargo test --workspace` green, including all V1-V10 golden vectors
     and the chunking-determinism tests, with this fix in place).
+    **Superseded by item 17's `mirror_image_guard` split below** -- the
+    no-op condition described here as `guard_hz <= 0.0` is now
+    `!mirror_image_guard`, for the reason item 17 explains.
+
+## Remediate round 2 (2026-09-06): code-review response
+
+The prior remediate round's own validation gate ran a real `/code-review`
+at high effort (this container can build -- see the first remediate
+round's "How this was validated"), which surfaced four correctness
+findings, one efficiency finding, one test-quality finding, and three
+documentation-accuracy findings, all in the mirror-image machinery items
+12-15 added (the part of the change the plan never constrained). Full
+finding text lives in the validation report; this section pins the fix for
+each so a later reader does not have to reconstruct it from the diff.
+
+16. **Finding 1 (correctness, CONFIRMED): `is_image_of_owned`/
+    `merge_mirror_images` were gated on `cfg.guard_hz <= 0.0`, conflating
+    "this front end synthesizes an analytic signal from real input" with
+    "the operator widened the DC guard" -- two different, orthogonal
+    facts. Item 4 already documents widening `guard_hz` as a legitimate
+    operator action on a genuine complex-IQ source (LO leakage/DC spur);
+    under the old gating, doing so on a SoapySDR/KiwiSDR source would have
+    silently turned on mirror merging, and two real stations symmetric
+    about the dial frequency would suppress each other. Fixed by a new
+    `DetectorConfig::mirror_image_guard: bool` (default `false`),
+    independent of `guard_hz`, set by `listen()`/`soak_with_metrics` from
+    the source's own `analytic_guard_hz() > 0.0` -- never from the merged
+    `guard_hz`. See that field's doc comment (`track.rs`) for the full
+    rationale, and
+    `TrackManager::widened_guard_hz_alone_does_not_enable_mirror_suppression`
+    for the regression test.
+
+17. **Findings 2 and 3 (correctness, CONFIRMED): the mirror match required
+    bit-exact `select_channel` reflection, and the power comparison had no
+    margin.** `select_channel` is argmax over each track's own +/-1 owned
+    window, so a genuine mirror pair's two argmaxes need not be exact
+    reflections under noise (finding 2) -- fixed by a `circular_distance`
+    tolerance of 1 channel instead of `==`. Raw single-hop power with no
+    margin is a coin flip when both sides of a pair sit close together,
+    e.g. both near the noise floor during a key-up gap (finding 3) --
+    fixed by a `MIRROR_POWER_MARGIN_DB = 3.0` requirement before either
+    side of a comparison is treated as a clear winner; an ambiguous
+    comparison now defers instead of firing on noise. 3 dB is comfortably
+    below the ~90 dB steady-state real/image gap this mechanism exists to
+    resolve (item 15), so real decisions still fire promptly. See
+    `TrackManager::merge_mirror_images_tolerates_a_one_channel_argmax_drift`
+    and `TrackManager::mirror_merge_defers_on_an_ambiguous_power_tie_instead_of_closing_a_track`
+    for the regression tests (`track.rs`).
+
+18. **Finding 4 (correctness, PLAUSIBLE): `total_spawns()` summed a
+    `Vec<u32>` census into a `u32`.** A churn regression over the 24h soak
+    (32.4M hops, up to `n/2` spawns per hop in the pathological case)
+    could overflow. Widened to `u64`, matching `CloseCounts`' existing
+    convention; `SoakMetricsReport::total_spawns` widened to match.
+
+19. **Finding 5 (efficiency): `merge_mirror_images` recomputed `ka` via
+    `select_channel` on every inner-loop iteration `j`, though it depends
+    only on `i`/`a`.** Fixed by precomputing each open track's selected
+    channel once per hop into a `channel -> usize` map before the O(T^2)
+    pairwise scan, rather than inside it. The O(T^2) skeleton itself
+    (shared with the pre-existing `merge_converged`) is unchanged --
+    out of scope for this fix.
+
+20. **Finding 6 (test quality, CONFIRMED): `hilbert.rs`'s
+    `image_rejection_meets_the_guaranteed_band_contract` probed `[f, fs -
+    f]`, but `f` only ranges over `[HILBERT_GUARD_HZ, fs/2 -
+    HILBERT_GUARD_HZ]`, so `fs - f` always landed >= `fs/2` and was
+    unconditionally skipped -- dead code claiming "both sidebands"
+    coverage it never had.** Removed rather than fixed: for a real-valued
+    cosine input, `fs - f` is bit-for-bit the same signal as `f`
+    (aliasing), so probing `f` alone already exercises the full declared
+    band.
+
+21. **Finding 9 (documentation accuracy): item 13 above asserted
+    `manta-soak-harness` "doesn't use the audio-guarded path" -- directly
+    contradicting item 4's own update, and wrong: `soak_metrics.rs:213-215`
+    (item 4) applies `effective_guard_hz` to `LoopingAudioIqSource` exactly
+    like `listen()` does.** Item 13's text is corrected in place above. The
+    real, and previously undocumented, consequence: `manta-soak-harness`'s
+    `pileup_signals()` (`main.rs`) shifts every MAN-19 soak-scene offset up
+    by a `GUARD_SAFE_SHIFT_HZ = 250.0` constant so the lowest (was 420 Hz)
+    clears the 600 Hz guard with margin, without touching the pileup's
+    relative spacing/design. This shift previously existed only as an
+    inline code comment with no pin backing it; it is now also recorded
+    here, per the same "decisions get a pin, not just a comment"
+    convention this whole document exists to enforce.
+
+22. **Finding 7 (documentation accuracy, CONFIRMED): `ARCHITECTURE.md` and
+    `docs/RUNBOOKS/m1-w1aw-live-copy.md` still said "~300 Hz" after item 13
+    doubled `HILBERT_GUARD_HZ` to 600.0.** Both updated to 600 Hz; the
+    runbook one is operator-facing and was actively misleading (an
+    operator told "no tracks below ~300 Hz is expected" would misread a
+    missing 450 Hz signal as normal).
 
 ## Constraints encountered during this implementation session
 
