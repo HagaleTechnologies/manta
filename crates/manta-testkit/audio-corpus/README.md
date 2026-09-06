@@ -41,29 +41,49 @@ and conversion tooling notes, not the bytes.
   whole file into memory (`crates/manta-input/src/lib.rs`'s own doc
   comment assumes files "<~100 MB"), so at 389 MB this is oversized for
   that path's documented design assumption regardless of bit depth.
+- `B2_20251129_000000_7080kHz.wav` (1.0 GB) — first 15 minutes of CQ WW CW
+  2025, 40 meters. Genuine stereo I/Q (2-channel PCM24 @ 192 kHz,
+  00:14:59), captured by CWSL (`HrochL/CWSL`, per the file's own `encoder`
+  RIFF chunk) — embedded metadata gives capture start `2025-11-29 00:00:00
+  UTC` and center frequency 7,080,000 Hz. Source: George K5TR, received
+  2026-09-06. Loading path is `manta decode` (`WavIqSource`, native 192
+  kHz needs no resample), but like `wpx_cw_iq_96khz.wav` the 24-bit
+  samples need a bit-depth conversion first (`WavIqSource` only reads
+  Float32/Int16), and at 1.0 GB it's ~2.6x further past the "<~100 MB"
+  eager-load design assumption than that file already was.
+  `WavIqSource` also ignores the WAV's own embedded center-frequency
+  metadata — it only reads a same-stem `<name>.json` sidecar
+  (`crates/manta-input/src/lib.rs`) and silently defaults to 0.0 Hz when
+  absent — so decoding the converted file needs a
+  `B2_20251129_000000_7080kHz.json` sidecar with
+  `{"center_freq_hz": 7080000}` alongside it, or spots/events will carry
+  baseband-relative rather than correct RF frequencies.
 
 ## Ground truth
 
 No verified ground truth (capture UTC, band/frequency, or a time-aligned
-transcript) is available for either recording beyond what's stated above —
-`vp8geo_cw.mp3`'s filename implies the pileup was calling VP8GEO, but that
-is not confirmed against a transcript or RBN spots. Until a transcript or
-enough capture metadata is supplied to recover one (per
-`ARCHITECTURE.md:318-321`'s recorded-corpus strategy), treat these as
-real-conditions robustness fixtures only — decoder output against them
-cannot yet be scored for recall/precision or turned into regression
-assertions.
+transcript) is available for any of these recordings beyond what's stated
+above — `vp8geo_cw.mp3`'s filename implies the pileup was calling VP8GEO,
+and `B2_20251129_000000_7080kHz.wav`'s embedded metadata gives a capture
+timestamp and center frequency, but neither is confirmed against a
+transcript or RBN spots. Until a transcript or enough capture metadata is
+supplied to recover one (per `ARCHITECTURE.md:318-321`'s recorded-corpus
+strategy), treat these as real-conditions robustness fixtures only —
+decoder output against them cannot yet be scored for recall/precision or
+turned into regression assertions.
 
 ## Provenance and licensing
 
-Both files were received from George on 2026-09-02 as real-radio test
-material for the manta audio corpus. **Redistribution rights are not
-established**: provenance is recorded as "George" only, with no confirmed
-ownership/authorship of the recording and no explicit license or
+`vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` were received from George on
+2026-09-02; `B2_20251129_000000_7080kHz.wav` was received from George
+K5TR on 2026-09-06 — same source. All as real-radio test material for the
+manta audio corpus. **Redistribution rights are not established** for any
+of them: provenance is recorded as George (K5TR) only, with no confirmed
+ownership/authorship of the recordings and no explicit license or
 permission for redistribution under this repo's MIT/Apache-2.0 dual
 license. Unlike the vendored data documented in
 `crates/manta-spot/data/SOURCES.md`, this does not give downstream users a
-basis for redistributing the recording — so the audio stays off git
+basis for redistributing the recordings — so the audio stays off git
 entirely (not just out of this PR) until that's confirmed. If rights get
 confirmed later, update this section with the license/permission
-statement before re-adding the file to git.
+statement before re-adding a file to git.

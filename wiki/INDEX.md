@@ -12,4 +12,8 @@
 - [What spot-output contracts does manta expose (telnet RBN + JSON)?](pages/spot-output-contract.md) — manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting s...
 - [Why is the weekly Cargo Dependabot run red with `unknown_error` / `null`?](pages/dependabot-cargo-unlock.md) — Diagnose Cargo updates that Dependabot cannot reach through its single-package unlock scope.
 - [What's the PR review convergence policy?](../docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md) — P1 findings get fixed every review round; P2-and-lower findings raised after round one are tracked in a follow-up ticket instead of chased inline, so PRs converge instead of oscillating.
+<<<<<<< HEAD
 - [Which exact Rust compiler builds manta, and how do I move it?](../docs/DECISIONS/2026-09-04-man36-exact-rust-toolchain-pin.md) — `rust-toolchain.toml` pins an exact release; rustup's own directory override carries it to CI, Docker and `cross` with no workflow edit. Distinct from `Cargo.toml`'s `rust-version` MSRV floor.
+=======
+- [What changed in the 2026-09-06 broad review?](../docs/DECISIONS/2026-09-06-broad-review-decisions.md) — RBN admission strategy, the wire SNR convention, multi-band identity, pausing the Pi4 CPU-budget story, and several other decisions that revise or supersede AGENTS.md, SPEC-decode-core.md, the legacy capability matrix, and the MAN-23 threat model on specific points.
+>>>>>>> e398d46470fba19a74b645cf203b2e3f9ff8dbdd
