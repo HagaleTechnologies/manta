@@ -179,12 +179,15 @@ Ubuntu and Debian need different apt setup here. Check which one your host
 is *before* running anything below, and run only the matching block. Running
 the **Ubuntu** block on a **Debian** host is not the hazard it might look
 like: the block's own `case` guard checks `ID` for "ubuntu" before
-touching anything, so on a Debian host -- or an `ID_LIKE`-only Ubuntu
-derivative like Linux Mint or Pop!_OS, which this block can't safely fix
-(see the notes below) -- it declines immediately (prints the
+touching anything, so on a Debian host it declines immediately (prints the
 "run the Debian block below instead" message below) and writes nothing --
 no `sources.list` edit, no `ubuntu.sources` stanza, no ports source file, no
-`dpkg --add-architecture`. There is nothing to roll back in that case. The
+`dpkg --add-architecture`. There is nothing to roll back in that case. An
+`ID_LIKE`-only Ubuntu derivative like Linux Mint or Pop!_OS, which this
+block can't safely fix (see the notes below), also declines and writes
+nothing, but gets a *different* message: one that explicitly rules out the
+Debian block too, since running that block there would enable arm64 against
+that derivative's own untouched sources files. The
 real hazard runs the other direction: running the **Debian** block on
 **Ubuntu**. It is *not* harmless in general: run it before the Ubuntu block
 (or by itself), and it is the exact `apt update` exit-100 / `binary-arm64`
@@ -235,8 +238,19 @@ If the last command still refuses, something else on the host is
 registered for arm64 -- `dpkg-query -W -f='${Package}:${Architecture}\n'
 | grep ':arm64$'` lists what, so you can judge by hand whether it's yours
 to remove; don't purge that list wholesale. Only do any of this if you
-actually want arm64 gone -- it's harmless to leave the architecture and
-its packages in place if you expect to cross-build again.
+actually want arm64 gone -- after a *successful* Option B run, it's
+harmless to leave the architecture and its packages in place if you expect
+to cross-build again, since apt still has a working ports source backing
+it.
+
+That harmlessness does **not** carry over to the file-rollback path above.
+If you restored `.man47.bak` and deleted the ports source file, the default
+sources no longer carry an arm64 index at all, so leaving the architecture
+flag registered is not harmless -- every subsequent `apt update` hits the
+same `binary-arm64/Packages 404` / exit-100 failure this block exists to
+avoid. In that case also run `sudo dpkg --remove-architecture arm64`; it
+won't refuse, since the rollback path's `apt update` never succeeded and no
+arm64 package was ever actually installed.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
 (archive.ubuntu.com / security.ubuntu.com) don't carry an arm64 index at
@@ -363,10 +377,12 @@ fi
 
 **Debian build host** -- Debian's mirrors serve every release architecture,
 including arm64, from the same tree, so this is all it needs. Skip the
-Ubuntu block above entirely -- on Debian it is not just unneeded, it is
-harmful (see the hazard described above the Ubuntu block), and the guard
-at the top of that block that declines to run it there is a backstop, not a
-substitute for reading which block applies to your host:
+Ubuntu block above entirely -- on Debian it is simply unneeded, not harmful:
+its `ID` guard declines immediately and writes nothing there (see the intro
+above the Ubuntu block). That guard is a backstop against running the wrong
+block, not a substitute for reading which one applies to your host -- the
+real hazard runs the other direction, running the **Debian** block below on
+**Ubuntu**, which is exactly what the intro above warns against:
 ```
 sudo dpkg --add-architecture arm64
 sudo apt update
@@ -495,10 +511,13 @@ mutated host):
   checks `ID_LIKE` for `ubuntu` and, when it matches, does *not* point
   at the Debian block: it tells you to add `arch-=arm64` (classic) or
   `Architectures-Remove: arm64` (deb822) to the affected line(s) in
-  *your distro's own* sources file by hand, following the same pattern
-  as the Ubuntu block above. Only a host where `ID_LIKE` doesn't contain
-  `ubuntu` -- genuine Debian, or anything else -- gets pointed at the
-  Debian block.
+  *your distro's own* sources file by hand, **and** add a ports source
+  stanza pointing at `ports.ubuntu.com/ubuntu-ports` for arm64 -- the same
+  two-part fix as the Ubuntu block above. The exclusion alone only gets you
+  a clean `apt update`; without the ports stanza too, `apt install
+  libasound2-dev:arm64` still fails with `E: Unable to locate package`.
+  Only a host where `ID_LIKE` doesn't contain `ubuntu` -- genuine Debian, or
+  anything else -- gets pointed at the Debian block.
 - `apt install`'s package list is resolved as one transaction: when
   `libasound2-dev:arm64` has no candidate, apt aborts and installs
   *nothing* -- not even `gcc-aarch64-linux-gnu`, an amd64 package from the
