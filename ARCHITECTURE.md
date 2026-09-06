@@ -316,8 +316,23 @@ validation (MAN-28). Dedupe (step 5) still applies.
   record to reconstruct an abuse incident after the fact. Still
   aspirational: `manta-input`/`manta-engine` carry no logging of their
   own yet (decode-pipeline internals, not the network-facing surface
-  MAN-59 scoped to), and `manta --status` hitting a local control socket
-  for live stats is similarly not yet implemented. Prometheus text
+  MAN-59 scoped to). **`manta status` implemented** (2026-09-04, MAN-44,
+  `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`): reads a
+  JSON `StatusDoc` (`crates/manta-server/src/status.rs`) served on
+  `GET /status` by the same metrics listener that already served
+  `GET /metrics` — deliberately NOT the local-control-socket design this
+  section previously sketched as unimplemented; the ADR records why a
+  Unix-only control socket was evaluated and not taken. Reports daemon
+  uptime, spot/client counts, and — the ticket's actual scope — **per-target
+  RBN uplink health**: each configured `[[rbn_uplink]]` target's own
+  connected/sent/suppressed/reconnect counts plus a derived
+  `connected`/`flapping`/`down`/`disabled` verdict from a windowed
+  reconnect rate (`RECONNECT_WINDOW`/`FLAPPING_RECONNECTS` in
+  `metrics.rs`), so a stuck reconnect loop reads as unhealthy even while
+  technically connected at the instant it's checked. Exit code doubles as
+  a cron/Nagios check. Inherits `/metrics`'s unauthenticated,
+  `0.0.0.0`-by-default exposure posture (`docs/RUNBOOKS/network-exposure.md`).
+  Prometheus text
   endpoint (feature `metrics`): input overruns, active tracks, evictions,
   decode rate, spots/min, per-stage queue depths, spot confidence
   histogram — also aspirational for several of these fields; the
@@ -325,7 +340,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
+  gauges, `manta_source_health`, the uplink counters, and (MAN-44)
+  per-target `manta_uplink_target_*` series
   (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
   per-stage queue depths, which MAN-56 tracks as a separate gap.
   **`manta_active_tracks` is served but not populated** (corrected
