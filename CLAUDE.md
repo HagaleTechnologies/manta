@@ -16,8 +16,9 @@ near-channel-edge WPM bug (MAN-7/103), unrelated to fading. **V5/V6/V8w's
 fading-robustness gap is classical-DSP work to fix before M4** (MAN-107
 through MAN-113), not deferred to M4 ML fusion by design — see
 docs/DECISIONS/2026-09-06-broad-review-decisions.md D8. **M2 acceptance
-is still open**: Pi4 CPU-budget leg (also paused pending the fixes above,
-D6) and 24 h live-SDR soak are unmet — both need physical hardware not
+is still open**: Pi4 CPU-budget leg (also paused pending MAN-100 through
+MAN-113 landing in full, not just MAN-107-113 above — D6) and 24 h
+live-SDR soak are unmet — both need physical hardware not
 reachable from this environment.
 `manta-dsp::single`/`freqest` deprecated in place.
 
