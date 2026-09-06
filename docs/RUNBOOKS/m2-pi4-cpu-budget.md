@@ -176,27 +176,29 @@ the build host.
 **Option B — native cross-linker package + explicit Cargo linker config:**
 
 Ubuntu and Debian need different apt setup here. Check which one your host
-is *before* running anything below, and run only the matching block. The
-real hazard is running the **Ubuntu** block on a **Debian** host: it
-rewrites `/etc/apt/sources.list` (or adds a stanza to `ubuntu.sources`) and
-adds a ports source keyed on your `/etc/os-release` codename — Debian's
-`/etc/os-release` has no `UBUNTU_CODENAME` at all, so that codename comes
-out empty, producing a malformed, empty `Suites:` line that breaks apt
-parsing at *every* subsequent invocation (not merely a 404), and leaves the
-host needing manual rollback (see below). The Ubuntu block below declines
-to run on a non-Ubuntu host, but don't rely on that as your only check.
-Running the **Debian** block on **Ubuntu** is the mirror-image hazard, and
-it is *not* harmless in general: run it before the Ubuntu block (or by
-itself), and it is the exact `apt update` exit-100 / `binary-arm64` 404
-failure this section exists to avoid, and it leaves arm64 enabled with the
-default sources unrestricted, so every subsequent `apt update` on that host
-keeps failing until you either run the Ubuntu block or roll back (see
-below). Running the Debian block on Ubuntu *after* the Ubuntu block has
-already fixed the sources is harmless — its commands just re-run against
-sources that are already correct.
+is *before* running anything below, and run only the matching block. Running
+the **Ubuntu** block on a **Debian** host is not the hazard it might look
+like: the block's own `case` guard checks `ID`/`ID_LIKE` for "ubuntu" before
+touching anything, so on a Debian host it declines immediately (prints the
+"run the Debian block below instead" message below) and writes nothing --
+no `sources.list` edit, no `ubuntu.sources` stanza, no ports source file, no
+`dpkg --add-architecture`. There is nothing to roll back in that case. The
+real hazard runs the other direction: running the **Debian** block on
+**Ubuntu**. It is *not* harmless in general: run it before the Ubuntu block
+(or by itself), and it is the exact `apt update` exit-100 / `binary-arm64`
+404 failure this section exists to avoid, and it leaves arm64 enabled with
+the default sources unrestricted, so every subsequent `apt update` on that
+host keeps failing until you either run the Ubuntu block, or undo just the
+architecture flag with `sudo dpkg --remove-architecture arm64` -- the
+Debian block's `apt update` never succeeded, so no arm64 package was ever
+actually installed and the removal isn't refused; there is no `.man47.bak`
+or ports source file to restore for this case, so the file-rollback steps
+below don't apply to it. Running the Debian block on Ubuntu *after* the
+Ubuntu block has already fixed the sources is harmless -- its commands just
+re-run against sources that are already correct.
 
-If you mis-ran a block and need to roll back: `sudo mv <file>.man47.bak
-<file>` for whichever of `/etc/apt/sources.list` or
+If you mis-ran the Ubuntu block and need to roll back: `sudo mv
+<file>.man47.bak <file>` for whichever of `/etc/apt/sources.list` or
 `/etc/apt/sources.list.d/ubuntu.sources` has a `.man47.bak` next to it --
 this block's own backup suffix, distinct from a plain `.bak` some other
 tool may have left there before you ever ran this block. Don't restore a
@@ -206,8 +208,23 @@ never touched it, or an earlier run already consumed the one-time backup
 slot -- see the notes below), and there is nothing of this block's to
 restore there. Then `sudo rm -f
 /etc/apt/sources.list.d/ubuntu-ports-arm64.sources
-/etc/apt/sources.list.d/ubuntu-ports-arm64.list`, and, if wanted,
-`sudo dpkg --remove-architecture arm64`.
+/etc/apt/sources.list.d/ubuntu-ports-arm64.list`.
+
+Removing the arm64 architecture flag itself, `sudo dpkg
+--remove-architecture arm64`, is a separate step, and after a *successful*
+Option B run it will **refuse**: dpkg won't drop an architecture while any
+package is still registered for it, and a successful run leaves
+`libasound2-dev:arm64` installed along with whatever it pulled in as
+dependencies (e.g. `libasound2t64:arm64`, `libc6:arm64`) -- not just the
+packages named on the install line above, so naming those alone isn't
+enough to purge. Purge everything still registered for arm64 first, then
+remove the architecture:
+```
+sudo apt purge $(dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$')
+sudo dpkg --remove-architecture arm64
+```
+Only do this if you actually want arm64 gone -- it's harmless to leave the
+architecture and its packages in place if you expect to cross-build again.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
 (archive.ubuntu.com / security.ubuntu.com) don't carry an arm64 index at
