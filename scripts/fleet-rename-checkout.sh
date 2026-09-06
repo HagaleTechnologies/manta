@@ -38,12 +38,12 @@ info() { printf 'info  %s\n' "$*"; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check|--apply) MODE="${1#--}";;
-    --old)          OLD_NAME="$2"; shift;;
-    --new)          NEW_NAME="$2"; shift;;
-    --org-dir)      ORG_DIR="${2/#\~/$HOME}"; shift;;
-    --remote-url)   REMOTE_URL="$2"; shift;;
-    --catalyst-dir) CATALYST_DIR="${2/#\~/$HOME}"; shift;;
-    --scan-root)    SCAN_ROOTS+=("${2/#\~/$HOME}"); shift;;
+    --old)          [[ $# -ge 2 ]] || die "missing value for $1"; OLD_NAME="$2"; shift;;
+    --new)          [[ $# -ge 2 ]] || die "missing value for $1"; NEW_NAME="$2"; shift;;
+    --org-dir)      [[ $# -ge 2 ]] || die "missing value for $1"; ORG_DIR="${2/#\~/$HOME}"; shift;;
+    --remote-url)   [[ $# -ge 2 ]] || die "missing value for $1"; REMOTE_URL="$2"; shift;;
+    --catalyst-dir) [[ $# -ge 2 ]] || die "missing value for $1"; CATALYST_DIR="${2/#\~/$HOME}"; shift;;
+    --scan-root)    [[ $# -ge 2 ]] || die "missing value for $1"; SCAN_ROOTS+=("${2/#\~/$HOME}"); shift;;
     --allow-tooling-hits) ALLOW_TOOLING_HITS=1;;
     -h|--help) sed -n '2,25p' "$0"; exit 0;;
     *) die "unknown argument: $1";;
@@ -112,7 +112,7 @@ FAILED=0
 # $1 = newline-separated baseline of paths that were ALREADY prunable before any
 #      move (empty for --check).
 verify() {
-  local baseline="${1:-}" line path flag unhealthy=0 mainpath
+  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root reg
   mainpath="$(git -C "$MAIN" rev-parse --show-toplevel)"
 
   # Gherkin 1: directory named <new> present, no <old> directory remains.
@@ -131,21 +131,60 @@ verify() {
   # Gherkin 2, part A: no NEW prunable worktrees (KD 4 — baseline-relative).
   while IFS=$'\t' read -r path flag; do
     [[ -z $path ]] && continue
+    # `git worktree list` reports the path git has recorded for this worktree,
+    # which is stale if a host was renamed by hand (`mv` on both the checkout and
+    # the worktree parent) without `git worktree repair`: the recorded path no
+    # longer exists, so it is reported prunable even though the worktree is alive
+    # and well at its corresponding new-named path. Treating that as benign
+    # "pre-existing" cruft is the false-all-PASS this check exists to catch — a
+    # candidate directory that actually exists on disk under the new worktree
+    # parent is the thing to check for health, not the stale recorded path.
+    candidate="$path"
+    if [[ ! -e $path && $path == "$OLD_WTP"/* ]]; then
+      candidate="$NEW_WTP/${path#"$OLD_WTP"/}"
+    elif [[ ! -e $path && $path == "$OLD_MAIN"/* ]]; then
+      candidate="$NEW_MAIN/${path#"$OLD_MAIN"/}"
+    fi
     if [[ $flag == prunable ]]; then
-      if grep -qxF "$path" <<<"$baseline"; then
+      if [[ $candidate != "$path" && -d $candidate ]]; then
+        fail "worktree recorded as prunable at stale path $path, but $candidate exists on disk and was not repaired (run: git -C $MAIN worktree repair $candidate)"
+        unhealthy=1
+      elif grep -qxF "$path" <<<"$baseline"; then
         info "pre-existing prunable worktree (unrelated to this rename): $path"
       else
         fail "worktree is prunable after the move: $path"
       fi
     fi
     # Gherkin 2, part B: the check `worktree list` CANNOT make (KD 2).
-    [[ $path == "$mainpath" ]] && continue
-    if [[ -d $path ]] && ! git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
-      fail "unhealthy worktree — its .git file points at a stale location: $path"
+    [[ $candidate == "$mainpath" ]] && continue
+    if [[ -d $candidate ]] && ! git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1; then
+      fail "unhealthy worktree — its .git file points at a stale location: $candidate"
       unhealthy=1
     fi
   done <<<"$(inventory)"
   [[ $unhealthy -eq 0 ]] && pass "every linked worktree resolves its git dir"
+
+  # Desired End State: registry.json's MAN entry, when present, must resolve to
+  # the new checkout. Guarded on jq (the only tool that can parse it); downgrade
+  # to informational rather than passing silently when it cannot be confirmed, so
+  # a run never ends all-PASS with a dangling registry entry (C4).
+  reg="$CATALYST_DIR/execution-core/registry.json"
+  if [[ ! -f $reg ]]; then
+    info "no registry.json at $reg — nothing to verify there"
+  elif ! command -v jq >/dev/null 2>&1; then
+    info "jq not installed — cannot verify registry.json's '$TEAM_NEW' entry"
+  elif ! jq -e . "$reg" >/dev/null 2>&1; then
+    info "registry.json at $reg does not parse as JSON — cannot verify the '$TEAM_NEW' entry"
+  else
+    root="$(jq -r --arg team "$TEAM_NEW" '[.projects[]? | select(.team==$team) | .repoRoot][0] // empty' "$reg" 2>/dev/null)"
+    if [[ -z $root ]]; then
+      fail "registry.json has no '$TEAM_NEW' entry (want repoRoot $NEW_MAIN)"
+    elif [[ $root != "$NEW_MAIN" ]]; then
+      fail "registry.json '$TEAM_NEW' repoRoot = $root (want $NEW_MAIN)"
+    else
+      pass "registry.json '$TEAM_NEW' repoRoot = $NEW_MAIN"
+    fi
+  fi
 }
 
 # ---- tooling preflight ----------------------------------------------------
@@ -157,34 +196,53 @@ default_scan_roots() {
   printf '%s\n' "$HOME/code-repos/github" "$HOME/bin" "$HOME/.local/bin"
 }
 tooling_hits() {
-  local roots=("${SCAN_ROOTS[@]}")
+  local roots=()
+  [[ ${#SCAN_ROOTS[@]} -gt 0 ]] && roots=("${SCAN_ROOTS[@]}")
   if [[ ${#roots[@]} -eq 0 ]]; then
     while IFS= read -r r; do [[ -d $r ]] && roots+=("$r"); done < <(default_scan_roots)
   fi
   [[ ${#roots[@]} -eq 0 ]] && return 0
-  # Literal old checkout path, and the directory name as a path segment. Skip .git
-  # and the checkout itself (its own history legitimately mentions the old name).
-  grep -rIn --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=target \
+  # Literal old checkout path, and the directory name as a path segment. Skip:
+  #   - .git dirs and the checkout/worktree-parent trees themselves (their own
+  #     history, and a linked worktree's *own* copy of this script/tests,
+  #     legitimately mention the old name — C3);
+  #   - files literally named `.git` (a linked worktree's gitdir pointer file
+  #     necessarily contains `gitdir: <OLD_MAIN>/.git/worktrees/<id>` by
+  #     construction, and that is not "tooling hardcoding a path" — C2).
+  grep -rIn --exclude-dir=.git --exclude=.git \
+       --exclude-dir=node_modules --exclude-dir=target \
        -e "$OLD_MAIN" -e "/${OLD_NAME}-worktrees" \
        "${roots[@]}" 2>/dev/null \
-    | grep -v "^${OLD_MAIN}/" | grep -v "^${NEW_MAIN}/" || true
+    | grep -v "^${OLD_MAIN}/" \
+    | grep -v "^${NEW_MAIN}/" \
+    | grep -v "^${OLD_WTP}/" \
+    | grep -v "^${NEW_WTP}/" || true
 }
 
-HITS="$(tooling_hits)"
-if [[ -n $HITS ]]; then
-  say "tooling reference(s) to the legacy path found:"
-  printf '  %s\n' "$HITS" | head -50
-  say ""
-fi
-if [[ $MODE == apply && -n $HITS ]]; then
-  if [[ $ALLOW_TOOLING_HITS -eq 1 ]]; then
-    say "OVERRIDE: --allow-tooling-hits given; proceeding despite the references above."
-    say "          Fix them by hand after the move."
+# On an already-migrated host nothing is going to move, so a stray hardcoded
+# reference elsewhere on the host is not this run's concern — the preflight
+# exists to protect a MOVE, and forcing it to gate the apply-is-a-no-op path too
+# broke the documented idempotent no-op (C3). `--check` still reports hits
+# unconditionally, since it never moves anything and the report is informational.
+if [[ $MODE == apply && $STATE == migrated ]]; then
+  HITS=""
+else
+  HITS="$(tooling_hits)"
+  if [[ -n $HITS ]]; then
+    say "tooling reference(s) to the legacy path found:"
+    printf '  %s\n' "$HITS" | head -50
     say ""
-  else
-    die "refusing to move while tooling still hardcodes the legacy path (listed above).
+  fi
+  if [[ $MODE == apply && -n $HITS ]]; then
+    if [[ $ALLOW_TOOLING_HITS -eq 1 ]]; then
+      say "OVERRIDE: --allow-tooling-hits given; proceeding despite the references above."
+      say "          Fix them by hand after the move."
+      say ""
+    else
+      die "refusing to move while tooling still hardcodes the legacy path (listed above).
      Fix those references (magazzino's clone/worktree tooling, link-build-cache.sh,
      shell rc files), or re-run with --allow-tooling-hits to proceed anyway."
+    fi
   fi
 fi
 

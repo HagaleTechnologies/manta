@@ -230,13 +230,85 @@ rc=$?
 check "T21 exit" "$rc" "0"
 grep -q "tooling reference" <<<"$out" && ok "T21 reports" || bad "T21 reports" "$out"
 
-# --- T22: every long flag the runbook shows is a flag the script accepts ---
+# --- T22: every long flag the runbook shows is a flag the parser's case block
+#     accepts (matched against the parser only, so a prose comment mentioning a
+#     flag name — e.g. "(empty for --check)." — cannot satisfy this vacuously) ---
 RB="$REPO_ROOT/docs/RUNBOOKS/fleet-checkout-rename.md"
+PARSER="$(awk '/^while \[\[ \$# -gt 0/,/^done$/' "$SUT")"
 missing=""
 for f in $(grep -o -- '--[a-z][a-z-]*' "$RB" | sort -u); do
-  grep -q -- "$f)" "$SUT" || missing="$missing $f"
+  grep -qE -- "(^[[:space:]]*${f}[)|])|(\\|${f}[)|])" <<<"$PARSER" || missing="$missing $f"
 done
 [[ -z $missing ]] && ok "T22 runbook flags all exist" || bad "T22 runbook flags all exist" "$missing"
+
+# --- T23: default scan roots (no --scan-root given) must not block on the
+#     checkout's own linked-worktree .git pointer file, which necessarily
+#     contains the old path by construction (C2) ---
+R=$(newroot)
+ORG="$R/code-repos/github/HagaleTechnologies"
+# mkfixture always nests under <root>/org, so build this fixture by hand: the
+# default scan root ($HOME/code-repos/github) must be the org dir itself.
+mkdir -p "$ORG"
+git -c init.defaultBranch=main init -q "$ORG/skimmer"
+git -C "$ORG/skimmer" config user.email t@example.invalid
+git -C "$ORG/skimmer" config user.name  test
+: > "$ORG/skimmer/README"; git -C "$ORG/skimmer" add README
+git -C "$ORG/skimmer" -c commit.gpgsign=false commit -qm init
+git -C "$ORG/skimmer" remote add origin https://github.com/HagaleTechnologies/skimmer.git
+mkdir -p "$ORG/skimmer-worktrees"
+addwt "$ORG/skimmer" "$ORG/skimmer-worktrees/w1" w1
+out=$(HOME="$R" "$SUT" --apply --org-dir "$ORG" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T23 exit" "$rc" "0"
+[[ -d "$ORG/manta" ]] && ok "T23 moved despite default-scan-root self-reference" \
+  || bad "T23 moved despite default-scan-root self-reference" "$out"
+
+# --- T24: --apply on an already-migrated host is a verified no-op even when a
+#     scanned worktree contains literal old-path strings (this repo's own test
+#     file, checked out under the new worktree parent) — C3 ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+mkdir -p "$R/org/manta-worktrees"
+addwt "$C" "$R/org/manta-worktrees/w1" w1
+mkdir -p "$R/org/manta-worktrees/w1/scripts/tests"
+printf 'x=%s/org/skimmer-worktrees/w1\n' "$R" \
+  > "$R/org/manta-worktrees/w1/scripts/tests/test-fleet-rename-checkout.sh"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/org" 2>&1); rc=$?
+check "T24 exit" "$rc" "0"
+grep -q "ALREADY MIGRATED\|nothing to move" <<<"$out" && ok "T24 no-op despite worktree content" \
+  || bad "T24 no-op despite worktree content" "$out"
+
+# --- T25: --check must not report ALREADY MIGRATED when a worktree was moved by
+#     hand without `git worktree repair` (C1) ---
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
+mv "$R/org/skimmer" "$R/org/manta"
+mv "$R/org/skimmer-worktrees" "$R/org/manta-worktrees"
+git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T25 exit" "$rc" "1"
+grep -qi "was not repaired" <<<"$out" && ok "T25 detects unrepaired hand-move" \
+  || bad "T25 detects unrepaired hand-move" "$out"
+
+# --- T26: a registry.json MAN entry left pointing at the old path fails --check
+#     (never a silent all-PASS over a dangling registry entry) — C4 ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+mkdir -p "$R/catalyst/execution-core"
+printf '{"projects":[{"team":"MAN","repoRoot":"%s/org/skimmer"}]}\n' "$R" \
+  > "$R/catalyst/execution-core/registry.json"
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+if command -v jq >/dev/null 2>&1; then
+  check "T26 exit" "$rc" "1"
+  grep -qi "registry.json" <<<"$out" && ok "T26 flags stale registry" || bad "T26 flags stale registry" "$out"
+else
+  ok "T26 skipped (no jq)"
+fi
+
+# --- T27: a trailing flag with no operand is a usage error (exit 2), not the
+#     unbound-variable exit 1 that reads as a real verdict (C6) ---
+out=$("$SUT" --check --org-dir 2>&1); rc=$?
+check "T27 exit" "$rc" "2"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
