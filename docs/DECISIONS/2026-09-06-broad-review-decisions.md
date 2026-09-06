@@ -52,7 +52,9 @@ default is itself worth revisiting to fail safe.
 
 Telnet and the RBN uplink report SNR in the 500 Hz reference bandwidth RBN/CW Skimmer use (so manta
 doesn't read as "deaf" next to other nodes); the JSON stream keeps the native 2500 Hz channel
-measurement plus an explicit `snr_ref_hz` field, since the credibility/benchmark work (MAN-116,
+measurement plus an explicit `snrRefHz` field (camelCase, matching every other `SpotMessage` wire
+key — `dxDxcc`, `decodeConfidence` — since the struct uses `#[serde(rename_all = "camelCase")]`), so
+the credibility/benchmark work (MAN-116,
 MAN-136-adjacent) wants the uncorrected detector value to calibrate against. This is a dispensa
 contract change for the JSON field (MAN-102).
 
@@ -61,7 +63,7 @@ contract change for the JSON field (MAN-102).
 the internal detector computation, the confidence formula (`q = clamp(SNR_2500/20, 0.3, 1.0)`), and
 the golden-vector pass criteria all stay defined in 2500 Hz exactly as SPEC documents today — nothing
 about the internal pipeline changes. This decision adds a +7 dB conversion applied only when
-formatting the telnet/uplink wire line, and a new `snr_ref_hz` field on the JSON output. MAN-102
+formatting the telnet/uplink wire line, and a new `snrRefHz` field on the JSON output. MAN-102
 (the implementing ticket) and this doc's own §2.3/§7 update should both make that scope explicit so
 a future reader of SPEC doesn't conclude the internal 2500 Hz convention was abandoned.
 
@@ -124,14 +126,19 @@ meantime.
 
 ### D9 — Contester persona: in scope
 
-N1MM+/DXLog local band-map support (specifically N1MM's Spectrum Display UDP protocol, MAN-141) is in
-scope, not excluded by manta's headless-RBN-node framing. It's CW Skimmer's second real market, the
-PFB channelizer already computes the spectrum data this needs, and it doesn't require a GUI.
+N1MM's Spectrum Display UDP protocol (MAN-141) is in scope, not excluded by manta's headless-RBN-node
+framing. It's CW Skimmer's second real market, the PFB channelizer already computes the raw power
+spectrum this feed needs, and it doesn't require a GUI. **This is a panadapter/spectrum feed, not
+band-map support** — the capability matrix already correctly treats Band Map UI (decoded-call display,
+still a Non-goal — manta isn't an interactive receiver) and Spectrum-via-UDP (raw power spectrum for a
+third-party panadapter) as two separate rows, and MAN-141 is only the second one. Don't scope MAN-141
+as if it delivered decoded-call band-map data; N1MM's own band map comes from its DX cluster telnet
+connection instead, which manta's existing telnet server already serves.
 
 **Explicitly supersedes** the accepted `docs/DECISIONS/2026-09-01-legacy-capability-matrix.md`'s row
 disposing "Spectrum via UDP (feeds a power spectrum to third-party panadapters like N1MM+)" as a
-Non-goal. That row should be updated to point at MAN-141 as a real, in-scope gap rather than a
-deliberate exclusion, the next time that matrix doc is touched.
+Non-goal — that row alone, not the separate Band Map UI row. It should be updated to point at MAN-141
+as a real, in-scope gap rather than a deliberate exclusion, the next time that matrix doc is touched.
 
 ### D10 — cqdx contract gap: vendor the fix
 
@@ -152,12 +159,14 @@ design documentation) moves to a clearly-labeled, still-public archive directory
 `docs/archive/plans/`) with a provenance note — not to `thoughts/`, which is reserved for a different
 purpose and shouldn't be mixed with this (MAN-150). `.catalyst/config.json` stops being tracked. The
 Claude co-author commit trailer gets fixed at the squash-merge/Mergify template level so it stops
-recurring. Verified precisely at this doc's parent commit (80 total commits): 33 commits carry
-*some* `Co-authored-by` trailer, but only **21 name Claude** specifically — the other 12 are
-legitimate `dependabot[bot]` and Tony Hagale attribution, unrelated to the standing no-trailer
-policy this decision is about. (An earlier draft of this line conflated the two counts as "32 of 79
-commits carry it," which overstated the affected history — corrected here after a reviewer caught
-the discrepancy.) Git history
+recurring. **A specific commit count is deliberately not pinned here**: roughly two-thirds of the
+commits carrying any `Co-authored-by` trailer name Claude specifically (the rest are legitimate
+`dependabot[bot]` and Tony Hagale attribution, unrelated to the standing no-trailer policy this
+decision is about), but the exact counts drift with ordinary repo activity — including every commit
+this PR itself adds while fixing review feedback, each of which adds one more Claude-trailer commit
+to the very history being measured. Re-run `git log --format='%H %(trailers:key=Co-authored-by,valueonly)'`
+against current `HEAD` if an exact count is needed at the time this ticket is actually worked, rather
+than trusting a number frozen here. Git history
 already contains all of this regardless of where it moves going forward — a history rewrite to make
 it retroactively invisible was considered and rejected as disproportionate (breaks PR/issue
 references for no real benefit, since the content itself isn't sensitive, just mis-presented).
@@ -199,10 +208,24 @@ unfilled gap: Linux, ARM, Raspberry Pi, headless operation.
 
 ## Notes on ticket filing
 
-- 86 new tickets were filed (MAN-73 through MAN-158) with priorities and blocking/relates links set
-  at creation. See each new ticket's own body for its source lens/item number.
-- 12 review findings were folded into existing open tickets as comments rather than filed as
-  duplicates — MAN-4, MAN-13, MAN-14, MAN-17, MAN-20, MAN-25, MAN-40, MAN-45, MAN-49, MAN-52, MAN-60,
-  and MAN-64 each carry a 2026-09-06 comment cross-referencing the new work.
+The 94 hit-list items break down exactly as follows (86 + 5 + 3 = 94 — auditable, not approximate):
+
+- **86 items got a new ticket** (MAN-73 through MAN-158), each with priorities and blocking/relates
+  links set at creation. See each new ticket's own body for its source lens/item number.
+- **5 items were disposed via a comment on an existing ticket instead of a new ticket** — one of
+  those five (the multi-band-identity item) touched two tickets, so this produced six ticket-comments
+  from five items: MAN-4 (one), MAN-13 and MAN-14 (one item, both), MAN-20 (one), MAN-52 (one), MAN-60
+  (one).
+- **3 items needed no ticket and no comment**: one was already fully covered by an existing ticket's
+  Gherkin (RST/QRL extraction, already MAN-33's exact scope); one is a documented decision not to
+  build something (no TUI — the operator-visibility questions it would answer are covered by other
+  filed tickets instead); one was folded into the scope of two other new tickets rather than tracked
+  standalone (the ROADMAP post-1.0 reordering and HamSCI outreach items, absorbed into MAN-145 and
+  MAN-148 respectively).
+- Separately, and not double-counted above: **MAN-17, MAN-25, MAN-40, MAN-45, MAN-49, and MAN-64**
+  each also received a 2026-09-06 comment from this review — but as cross-references (new blocking
+  sub-tickets, a decision recorded, a corrected safety-default finding) on tickets that already
+  existed and aren't themselves one of the 94 hit-list items, not as a fold of a hit-list item that
+  would otherwise have gotten its own ticket.
 - MAN-43 was discovered to be an exact-text duplicate of MAN-40 (both open, both P0, identical body)
   and has been marked Duplicate accordingly.
