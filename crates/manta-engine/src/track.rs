@@ -276,7 +276,7 @@ use manta_decode::decoder::{DecodeConfig, TrackDecoder};
 use manta_decode::events::DecoderEvent;
 use manta_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
 use manta_dsp::floor::{FloorBank, Gate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
 /// round(center)+1}` per SPEC §2.5; `center` is a live, per-hop EMA of the
@@ -457,6 +457,14 @@ pub struct TrackManager {
     /// the same "exposed for the future M3 metrics endpoint" rationale,
     /// and the assertion surface MAN-4's regression tests use.
     spawns_by_channel: Vec<u32>,
+    /// MAN-4 remediate (validate code-review finding 1): consecutive-hop
+    /// streak of "this track is the losing side of a mirror pair", keyed
+    /// by track id. A hop that does not reconfirm a given id as that
+    /// hop's loser (a different id loses instead, the pair is now
+    /// ambiguous, or the track no longer exists) drops its entry
+    /// entirely -- only an unbroken run counts. See
+    /// `MIRROR_MERGE_CONFIRM_HOPS`.
+    mirror_merge_streak: BTreeMap<u32, u32>,
 }
 
 impl TrackManager {
@@ -483,6 +491,7 @@ impl TrackManager {
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
             spawns_by_channel: vec![0; n_channels],
+            mirror_merge_streak: BTreeMap::new(),
         }
     }
 
@@ -590,6 +599,28 @@ impl TrackManager {
         power_db(power) >= self.floor.effective_floor_db(k) + self.cfg.on_snr_db as f64
     }
 
+    /// MAN-4 remediate (validate code-review finding 1): number of
+    /// consecutive hops the same track must be identified as the losing
+    /// side of a mirror pair before `merge_mirror_images` actually closes
+    /// it. A single instantaneous hop's `clearly_exceeds` +
+    /// `reads_above_own_floor` decision is not enough on its own: probed
+    /// directly against this branch (warmed `FloorBank`, `Exp(mean =
+    /// 1e-9)` per-channel noise -- the real 2-dof-exponential statistic
+    /// this pipeline's per-channel power actually has, not a flat
+    /// constant), a noise-only mirror pair resolved in 200/200 trials,
+    /// mean 27.3 hops, closing the REAL track in 116/200 -- re-creating
+    /// this ticket's own churn symptom via the mechanism meant to prevent
+    /// it. That single-hop bar clears on roughly 1% of noise-only hops
+    /// (measured); requiring `MIRROR_MERGE_CONFIRM_HOPS` *consecutive*
+    /// same-direction hops drops the false-resolve probability to
+    /// roughly 1%^N per pair (~1e-10 at N=5) -- effectively never within
+    /// any realistic runtime -- while a genuine image (~90 dB
+    /// steady-state gap, pin doc item 15) saturates the streak in N hops
+    /// (~13 ms at the channelizer's fixed 375 Hz hop rate), far shorter
+    /// than the shortest real keying element, so genuine mirror-image
+    /// suppression is not perceptibly delayed.
+    const MIRROR_MERGE_CONFIRM_HOPS: u32 = 5;
+
     /// MAN-4 remediate (pin doc D7 addendum): should a rise at `k` be
     /// blocked because its circular mirror channel (`n_channels - k`, the
     /// same reflection `wrapped_channel_offset` uses) is already owned,
@@ -655,7 +686,12 @@ impl TrackManager {
     /// see that field's doc comment -- so no golden vector is affected,
     /// and a no-op once a pair has already been resolved (the loser's
     /// channel stays blocked by `is_image_of_owned` from then on, since
-    /// its own power does not exceed the survivor's).
+    /// its own power does not exceed the survivor's). MAN-4 remediate
+    /// (validate code-review finding 1): a per-hop decision only counts
+    /// towards closing a track once the same side has lost
+    /// `MIRROR_MERGE_CONFIRM_HOPS` consecutive hops in a row -- see that
+    /// constant's doc comment for why a single hop's decision is not
+    /// trustworthy on its own.
     fn merge_mirror_images(&mut self, hop_power: &[f32]) -> Vec<u32> {
         if !self.cfg.mirror_image_guard {
             return Vec::new();
@@ -672,6 +708,7 @@ impl TrackManager {
             .map(|&id| (id, self.tracks[&id].select_channel(hop_power, n)))
             .collect();
         let mut to_close = Vec::new();
+        let mut losing_this_hop: BTreeSet<u32> = BTreeSet::new();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 let (a, b) = (ids[i], ids[j]);
@@ -680,6 +717,23 @@ impl TrackManager {
                 }
                 let (ka, kb) = (channel_of[&a], channel_of[&b]);
                 let mirror_of_ka = (n - ka) % n;
+                let mirror_of_kb = (n - kb) % n;
+                // MAN-4 remediate (validate code-review finding 3): a
+                // channel that is its own mirror (DC, k=0; or Nyquist,
+                // k=n/2) has no distinct "other side" -- it cannot form a
+                // genuine mirror pair with any different channel, so a
+                // chance +/-1 circular-distance hit near one is an
+                // ordinary-adjacency coincidence, not a real/image pair.
+                // Without this guard, at n=512, (ka, kb) = (0, 1) and
+                // (255, 256) both false-positive: `mirror_of_ka == 0` (or
+                // `mirror_of_kb == 256`) sits within 1 of the other
+                // channel purely because the self-mirror point IS that
+                // channel, not because the two channels mirror each
+                // other. Matches `is_image_of_owned`'s own `mirror != k`
+                // guard for the same reason.
+                if mirror_of_ka == ka || mirror_of_kb == kb {
+                    continue;
+                }
                 // MAN-4 remediate round 2 (code review finding 2): a
                 // genuine mirror pair's two argmaxes are not always an
                 // exact reflection under noise (`select_channel` is argmax
@@ -700,14 +754,37 @@ impl TrackManager {
                     // floor, so a noise-only hop (both sides at the noise
                     // floor during a key-up gap) defers instead of closing
                     // the real track. See `reads_above_own_floor`.
-                    if Self::clearly_exceeds(pb, pa) && self.reads_above_own_floor(kb, pb) {
-                        to_close.push(a);
+                    let loser = if Self::clearly_exceeds(pb, pa)
+                        && self.reads_above_own_floor(kb, pb)
+                    {
+                        Some(a)
                     } else if Self::clearly_exceeds(pa, pb) && self.reads_above_own_floor(ka, pa) {
-                        to_close.push(b);
+                        Some(b)
+                    } else {
+                        None
+                    };
+                    // MAN-4 remediate (validate code-review finding 1):
+                    // don't act on a single hop's decision -- require
+                    // `MIRROR_MERGE_CONFIRM_HOPS` consecutive hops naming
+                    // the same loser. See that constant's doc comment.
+                    if let Some(loser) = loser {
+                        losing_this_hop.insert(loser);
+                        let streak = self.mirror_merge_streak.entry(loser).or_insert(0);
+                        *streak += 1;
+                        if *streak >= Self::MIRROR_MERGE_CONFIRM_HOPS {
+                            to_close.push(loser);
+                        }
                     }
                 }
             }
         }
+        // Any track not reconfirmed as this hop's loser breaks its streak
+        // -- only an unbroken run of MIRROR_MERGE_CONFIRM_HOPS counts, not
+        // a cumulative total. Also drops entries for tracks this hop no
+        // longer has (closed by some other mechanism since the last call).
+        let live_ids: BTreeSet<u32> = ids.iter().copied().collect();
+        self.mirror_merge_streak
+            .retain(|id, _| losing_this_hop.contains(id) && live_ids.contains(id));
         // MAN-19: only report a merge-loser as `TrackClosed`-worthy if it
         // actually emitted a real event -- see the matching comment in
         // `step_hop`/`merge_converged`.
@@ -1179,6 +1256,8 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::{Rng, SeedableRng};
 
     fn cfg() -> DetectorConfig {
         DetectorConfig {
@@ -1287,6 +1366,28 @@ mod tests {
 
     fn quiet_power(n: usize) -> Vec<f32> {
         vec![1e-9; n] // ~ -90 dBFS
+    }
+
+    /// MAN-4 remediate (validate code-review finding 2): `quiet_power`'s
+    /// flat, zero-variance constant can never produce the >=3 dB gaps two
+    /// independent noise samples routinely produce by chance, so a test
+    /// built on it "passes" while the statistical failure mode
+    /// `MIRROR_MERGE_CONFIRM_HOPS` exists to prevent goes unexercised.
+    /// Real per-channel power out of this pipeline is the sum of two
+    /// independent squared Gaussians (I/Q), i.e. exponentially
+    /// distributed -- sampled here directly via inverse-CDF
+    /// (`-mean * ln(u)`, `u` uniform on (0, 1)) rather than a Box-Muller
+    /// pair, since only the power (not the underlying I/Q) is needed.
+    fn exp_power(n: usize, mean: f64, rng: &mut ChaCha8Rng) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                // 53 bits of mantissa mapped to strictly (0, 1) -- never 0
+                // (which would make `ln` diverge) or 1.
+                let raw = rng.next_u64() >> 11; // uniform in [0, 2^53 - 1]
+                let u = (raw as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0);
+                (-mean * u.ln()) as f32
+            })
+            .collect()
     }
 
     fn feed_warmup(tm: &mut TrackManager, n: usize) {
@@ -1627,7 +1728,14 @@ mod tests {
         let mut power = quiet_power(n);
         power[7] = 1e-9 * 10f32.powf(60.0 / 10.0); // real signal's argmax drifts to 7, not 8
         power[n - 8] = 1e-9 * 10f32.powf(15.0 / 10.0); // weak mirror image, argmax stays at 504
-        tm.merge_mirror_images(&power);
+                                                       // MAN-4 remediate (validate code-review finding 1): the same
+                                                       // decision now needs MIRROR_MERGE_CONFIRM_HOPS consecutive hops
+                                                       // before it actually closes anything; this fixture is
+                                                       // deterministic (same power every call), so it reconfirms the
+                                                       // same loser every time -- loop to reach the threshold.
+        for _ in 0..TrackManager::MIRROR_MERGE_CONFIRM_HOPS {
+            tm.merge_mirror_images(&power);
+        }
         assert_eq!(
             tm.tracks.len(),
             1,
@@ -1693,15 +1801,20 @@ mod tests {
         );
     }
 
-    /// MAN-4 remediate round 4 (validate code-review finding 1): the exact
-    /// probe the validation report used to demonstrate the bug --
-    /// power[8]=1.0e-9 (real, key-up: noise only), power[504]=3.0e-9
-    /// (mirror, key-up: noise only, ~4.8 dB higher by chance) -- clears
-    /// `clearly_exceeds`'s 3 dB margin and used to close the REAL track,
-    /// keeping the image. With a warmed-up floor (both channels' noise
-    /// settles near -90 dBFS, same as every other channel), neither side
-    /// reads 12 dB (`on_snr_db`) above its own floor, so `reads_above_own_
-    /// floor` must block the decision and both tracks must survive.
+    /// MAN-4 remediate round 4 (validate code-review findings 1 and 2):
+    /// the original version of this test drove `merge_mirror_images` with
+    /// `quiet_power`'s flat, zero-variance -90 dBFS constant -- which can
+    /// never produce the >=3 dB gaps, or the ~5.4 dB floor deflation below
+    /// the mean, that real 2-dof-exponential per-channel power produces.
+    /// The validation report's own probe substituted realistic `Exp(mean
+    /// = 1e-9)` noise (warmup and test hops both) and found the *previous*
+    /// fix (the bare `reads_above_own_floor` margin, no persistence)
+    /// still resolved a noise-only mirror pair in 200/200 trials, mean
+    /// 27.3 hops, closing the REAL track in 116/200. Reproduce that same
+    /// statistic here across far more than 27.3 hops and assert the pair
+    /// never resolves -- which now holds only because of
+    /// `MIRROR_MERGE_CONFIRM_HOPS` (see that constant's doc comment for
+    /// the math), not because of a wider single-hop margin.
     #[test]
     fn mirror_merge_defers_when_the_winning_side_is_still_just_noise() {
         let n = 512;
@@ -1712,18 +1825,85 @@ mod tests {
             ..DetectorConfig::default()
         };
         let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
-        feed_warmup(&mut tm, n);
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        for m in 0..(250u64 * 15) {
+            tm.step_hop(&hop(m, exp_power(n, 1e-9, &mut rng)), m);
+        }
         tm.spawn(8);
         tm.spawn(n - 8);
+        // 2000 hops is far beyond the 27.3-hop mean time-to-false-resolve
+        // the validation report measured against the pre-fix code.
+        for _ in 0..2000 {
+            let power = exp_power(n, 1e-9, &mut rng);
+            tm.merge_mirror_images(&power);
+            assert_eq!(
+                tm.tracks.len(),
+                2,
+                "a noise-only mirror pair must never resolve on noise alone, no matter how \
+                 many hops"
+            );
+        }
+    }
+
+    /// MAN-4 remediate (validate code-review finding 3): a channel that
+    /// is its own mirror can never form a genuine mirror pair with a
+    /// different channel -- see `merge_mirror_images`'s self-mirror
+    /// guard. Without it, at n=512, channel 0 (DC, `mirror_of_ka == ka`)
+    /// sits within circular distance 1 of channel 1 purely because 0 IS
+    /// its own mirror, not because 0 and 1 mirror each other, and the
+    /// unrelated adjacent track would be closed as `Merged`.
+    #[test]
+    fn merge_mirror_images_never_pairs_a_self_mirror_dc_channel_with_its_neighbor() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        tm.spawn(0); // owned window {511, 0, 1}
+        tm.spawn(2); // owned window {1, 2, 3}
         let mut power = quiet_power(n);
-        power[8] = 1.0e-9; // real track, key-up: noise only
-        power[n - 8] = 3.0e-9; // mirror track, key-up: noise only, ~4.8 dB higher by chance
-        tm.merge_mirror_images(&power);
+        power[0] = 1e-9 * 10f32.powf(60.0 / 10.0); // strong: track at 0 selects channel 0
+        power[1] = 1e-9 * 10f32.powf(40.0 / 10.0); // moderate: track at 2 selects channel 1
+        for _ in 0..(2 * TrackManager::MIRROR_MERGE_CONFIRM_HOPS) {
+            tm.merge_mirror_images(&power);
+        }
         assert_eq!(
             tm.tracks.len(),
             2,
-            "a noise-only hop that merely clears the 3 dB margin must not close the real track \
-             -- neither side reads meaningfully above its own noise floor"
+            "channel 0 is its own mirror; it must never be treated as channel 1's image just \
+             because circular_distance(mirror_of(0), 1, n) <= 1"
+        );
+    }
+
+    /// MAN-4 remediate (validate code-review finding 3): the Nyquist-side
+    /// counterpart of the DC test above. At n=512, channel 256 is its own
+    /// mirror; without the guard, channel 255's mirror (257) sits within
+    /// circular distance 1 of 256 purely because 256 IS its own mirror,
+    /// not because 255 and 256 mirror each other.
+    #[test]
+    fn merge_mirror_images_never_pairs_a_self_mirror_nyquist_channel_with_its_neighbor() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        tm.spawn(255); // owned window {254, 255, 256}
+        tm.spawn(257); // owned window {256, 257, 258}
+        let mut power = quiet_power(n);
+        power[255] = 1e-9 * 10f32.powf(60.0 / 10.0); // strong: track at 255 selects channel 255
+        power[256] = 1e-9 * 10f32.powf(40.0 / 10.0); // moderate: track at 257 selects channel 256
+        for _ in 0..(2 * TrackManager::MIRROR_MERGE_CONFIRM_HOPS) {
+            tm.merge_mirror_images(&power);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "channel 256 is its own mirror; it must never be treated as channel 255's image \
+             just because circular_distance(mirror_of(255), 256, n) <= 1"
         );
     }
 
