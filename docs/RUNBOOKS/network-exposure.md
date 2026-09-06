@@ -124,9 +124,9 @@ would bound nothing the connection-level tiers above don't already bound.
 Only the total `MAX_METRICS_CONNECTIONS` ceiling and the per-IP connection
 quota still apply once this is set to `0`. Observable symptom of hitting
 the default budget: scrapes returning `429 Too Many Requests` with a
-`Retry-After: 60` header, and one `WARN` line per source IP per log window
-(not one per rejection — the same log-budget rule as every other rejection
-path in this file).
+`Retry-After: 60` header, and up to 30 `WARN` lines per source IP per 60s
+log window (`CONNECTION_LOG_MAX_PER_WINDOW`), not one per rejection — the
+same shared log-budget rule as every other rejection path in this file.
 
 **Known limitation (MAN-59, review round 5): per-client audit-log
 attribution is unavailable for WS traffic behind this same reverse-proxy

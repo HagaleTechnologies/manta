@@ -274,6 +274,19 @@ async fn handle_request(
         }
     };
     if eof {
+        // MAN-64 remediation (round-7 code-review finding, PR #76): also
+        // charged against the per-IP request budget, matching the two
+        // header-read-error branches above. A peer that connects and
+        // closes immediately (or sends nothing at all) still costs an
+        // `accept`, a spawned task, an `IpQuota` acquire/release, a
+        // `ConnectionLimiter` permit, and a `BufReader` allocation per
+        // iteration -- the identical "fast peer drives unbounded
+        // per-connection work while never occupying a permit long enough
+        // to be declined" shape the two branches above were fixed for,
+        // left open on this third path. The return value is unused: this
+        // connection is already ending via `Ok(())` regardless of budget
+        // state.
+        ip_request_limiter.allow(peer.ip());
         return Ok(());
     }
 
@@ -565,6 +578,72 @@ mod tests {
         assert!(
             status_line.starts_with("HTTP/1.1 429"),
             "expected 429 (budget already spent by the malformed connection), got {status_line:?}"
+        );
+    }
+
+    /// Remediation regression (round-7 code-review finding, PR #76): a peer
+    /// that connects and closes immediately -- hitting the `eof` branch,
+    /// never sending a request line at all -- must still be charged
+    /// against `ip_request_limiter`, the one path the round-8 remediation
+    /// left uncharged when it fixed the two header-read-error branches.
+    /// Budget of 1/window: the first (empty) connection must consume the
+    /// single slot, so the SECOND connection -- a well-formed
+    /// `GET /metrics` -- must be refused too.
+    #[tokio::test]
+    async fn eof_before_a_request_line_is_charged_against_the_request_budget() {
+        use tokio::io::AsyncBufReadExt;
+
+        let metrics = Arc::new(Metrics::new());
+        let ip_request_limiter = IpRateLimiter::new(1, Duration::from_secs(60));
+        let connection_log_limiter =
+            IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, peer) = listener.accept().await.unwrap();
+                let metrics = metrics.clone();
+                let ip_request_limiter = ip_request_limiter.clone();
+                let connection_log_limiter = connection_log_limiter.clone();
+                tokio::spawn(async move {
+                    let _ = handle_request(
+                        socket,
+                        metrics,
+                        peer,
+                        connection_log_limiter,
+                        ip_request_limiter,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // First connection: opens and closes without sending a single
+        // byte, hitting the `eof` branch before any request line is read.
+        {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            drop(stream);
+        }
+        // Give the accepted connection's task a chance to run and observe
+        // EOF before the second connection races it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second connection: a well-formed request. It must be refused
+        // with 429, proving the first (empty) connection already consumed
+        // the single available slot.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(
+            status_line.starts_with("HTTP/1.1 429"),
+            "expected 429 (budget already spent by the EOF connection), got {status_line:?}"
         );
     }
 }
