@@ -176,9 +176,17 @@ the build host.
 **Option B — native cross-linker package + explicit Cargo linker config:**
 
 Ubuntu and Debian need different apt setup here. Check which one your host
-is *before* running anything below, and run only the matching block —
-pasting both is what causes the Ubuntu ports failure this section exists to
-avoid.
+is *before* running anything below, and run only the matching block. The
+real hazard is running the **Ubuntu** block on a **Debian** host: it
+rewrites `/etc/apt/sources.list` (or adds a stanza to `ubuntu.sources`) and
+adds a ports source keyed on your `/etc/os-release` codename — on Debian
+that codename (e.g. `trixie`, `bookworm`) isn't published on
+ports.ubuntu.com, so `apt update` fails at exit 100 and leaves the host
+with a restricted `sources.list` that needs manual rollback. Running the
+Debian block on Ubuntu, or pasting both on an Ubuntu host, is harmless —
+the Debian block's commands just re-run against sources the Ubuntu block
+already fixed. The Ubuntu block below refuses to run on a non-Ubuntu host,
+but don't rely on that as your only check.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
 (archive.ubuntu.com / security.ubuntu.com) carry only amd64/i386; arm64
@@ -189,8 +197,9 @@ steps below. Two things are needed: point apt at ports for arm64, AND
 restrict the existing default sources to amd64 so they stop being asked for
 an arm64 index they will never have.
 ```
+[ "$(. /etc/os-release && echo "$ID")" = ubuntu ] || { echo "This is the Ubuntu-only block -- run the Debian block below instead." >&2; exit 1; }
 sudo dpkg --add-architecture arm64
-codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
   # 24.04 (noble) and later: deb822 stanza format.
@@ -230,9 +239,11 @@ sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 ```
 
 **Debian build host** -- Debian's mirrors serve every release architecture,
-including arm64, from the same tree, so this is all it needs (skip this if
-you ran the Ubuntu block above -- it is unnecessary on Debian, and the
-`ubuntu.sources` layout it checks for doesn't apply there):
+including arm64, from the same tree, so this is all it needs. Skip the
+Ubuntu block above entirely -- on Debian it is not just unneeded, it is
+harmful (see the hazard described above the Ubuntu block), and the guard
+at the top of that block that refuses to run it there is a backstop, not a
+substitute for reading which block applies to your host:
 ```
 sudo dpkg --add-architecture arm64
 sudo apt update
@@ -276,24 +287,41 @@ mutated host):
 - The branch keys on whether `/etc/apt/sources.list.d/ubuntu.sources` exists,
   not on the release number, so a 22.04-to-24.04 in-place upgrade that kept
   the classic format is still handled correctly.
-- Both branches are now safe to run twice *and* keep a pristine `.bak`. The
-  deb822 sed was already content-idempotent (guarded by the `grep`) and only
-  ever runs once, so its `.bak` was always pristine. The classic sed's
-  substitution was already content-idempotent too (it only matches a
-  still-unprefixed `deb ` line), but `sed -i.bak` itself is not: run bare a
-  second time, it backs up whatever is on disk *at that invocation* --
-  already-edited content -- and overwrites the pristine backup. The classic
-  branch above now takes the `.bak` only on its first run (checking whether
-  `sources.list.bak` already exists) and uses a plain `-i` on any later run,
-  so the pristine copy survives regardless of how many times the block is
-  run.
-- This only restricts the *default* sources file (`/etc/apt/sources.list` or
-  `sources.list.d/ubuntu.sources`) to amd64. A host that also carries a PPA
-  or other third-party `.list`/`.sources` file under
+- Both branches are now safe to run twice, and neither will clobber a
+  `.bak` that already exists. The deb822 sed was already content-idempotent
+  (guarded by the `grep`) and only ever runs once, so its `.bak` was always
+  pristine. The classic sed's substitution was already content-idempotent
+  too (it only matches a still-unprefixed `deb ` line), but `sed -i.bak`
+  itself is not: run bare a second time, it backs up whatever is on disk
+  *at that invocation* -- already-edited content -- and overwrites a
+  pristine backup. The classic branch above now takes the `.bak` only when
+  `sources.list.bak` doesn't already exist, and uses a plain `-i` otherwise
+  -- so a backup this block already made survives regardless of how many
+  times the block is run. It does *not* guarantee a backup exists at all:
+  if `sources.list.bak` was already present from something unrelated
+  before this block ever ran, the first run takes the plain-`-i` path and
+  creates none of its own.
+- This block does not exhaustively restrict every apt source to amd64 --
+  it covers the *default* sources file (`/etc/apt/sources.list` or
+  `sources.list.d/ubuntu.sources`) in its common stock shape. Any `deb`
+  source line that isn't carrying `[arch=amd64]` after this block runs will
+  still be asked for an arm64 index and can reproduce the same
+  `binary-arm64/Packages 404` / exit-100 failure this block exists to
+  avoid. Known gaps, none of them reachable on a stock, freshly-installed
+  host: a PPA or other third-party `.list`/`.sources` file under
   `/etc/apt/sources.list.d/` (e.g. Docker's own apt repo) needs the same
-  `[arch=amd64]` restriction applied to that file too, or it will still be
-  queried for an arm64 index it doesn't have and reproduce the same
-  `binary-arm64/Packages 404` / exit-100 failure this block exists to avoid.
+  restriction applied to it separately; a host with *both* a populated
+  `ubuntu.sources` and a populated `/etc/apt/sources.list` (possible after
+  an in-place release upgrade) only gets one of the two restricted, since
+  the branch above is either/or; a `deb` line in the default file that
+  already carries inline options (`deb [signed-by=...] https://...`) isn't
+  matched by the classic branch's substitution, which expects a bare `deb`
+  followed directly by a URI scheme; and the deb822 branch's `grep -q
+  '^Architectures:'` guard only checks that the field is *present*, not
+  that it's restricted to amd64 -- a `ubuntu.sources` that already carries
+  e.g. `Architectures: amd64 arm64` skips the `sed` and still asks the
+  default mirrors for an arm64 index. If your host has any of these, add
+  `[arch=amd64]` to the affected line(s) by hand.
 - `gcc-aarch64-linux-gnu` is an amd64 package from the host's own archive
   (`main`), so it installs fine even when the arm64 half is broken -- which
   is exactly how this failure hides itself if the `apt install` output is
