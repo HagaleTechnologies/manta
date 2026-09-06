@@ -34,6 +34,7 @@ TEAM_NEW=MAN
 MODE=""
 SCAN_ROOTS=()
 ALLOW_TOOLING_HITS=0
+EXPLICIT_REMOTE_URL=0
 
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 say()  { printf '%s\n' "$*"; }
@@ -47,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     --old)          [[ $# -ge 2 ]] || die "missing value for $1"; OLD_NAME="$2"; shift;;
     --new)          [[ $# -ge 2 ]] || die "missing value for $1"; NEW_NAME="$2"; shift;;
     --org-dir)      [[ $# -ge 2 ]] || die "missing value for $1"; ORG_DIR="${2/#\~/$HOME}"; shift;;
-    --remote-url)   [[ $# -ge 2 ]] || die "missing value for $1"; REMOTE_URL="$2"; shift;;
+    --remote-url)   [[ $# -ge 2 ]] || die "missing value for $1"; REMOTE_URL="$2"; EXPLICIT_REMOTE_URL=1; shift;;
     --catalyst-dir) [[ $# -ge 2 ]] || die "missing value for $1"; CATALYST_DIR="${2/#\~/$HOME}"; shift;;
     --scan-root)    [[ $# -ge 2 ]] || die "missing value for $1"; SCAN_ROOTS+=("${2/#\~/$HOME}"); shift;;
     --allow-tooling-hits) ALLOW_TOOLING_HITS=1;;
@@ -109,6 +110,21 @@ RAW_NEW_MAIN="$RAW_ORG_DIR/$NEW_NAME"
 RAW_OLD_WTP="$RAW_ORG_DIR/${OLD_NAME}-worktrees"
 RAW_NEW_WTP="$RAW_ORG_DIR/${NEW_NAME}-worktrees"
 
+# CR-2: a shell script a human actually writes hardcodes the checkout as
+# either the literal characters `$HOME/…` (unexpanded, e.g.
+# CACHE_SRC="$HOME/code-repos/.../skimmer") or a literal `~/…` — neither
+# spelling appears as a substring of $OLD_MAIN or $RAW_OLD_MAIN, which are
+# always the shell-expanded absolute path, so the tooling preflight never
+# saw either of the two forms a human is most likely to write. Derive both
+# literal spellings when the org dir sits under $HOME so tooling_hits() can
+# scan for them too.
+HOME_OLD_MAIN=""
+TILDE_OLD_MAIN=""
+if [[ $RAW_ORG_DIR == "$HOME" || $RAW_ORG_DIR == "$HOME"/* ]]; then
+  HOME_OLD_MAIN="\$HOME${RAW_ORG_DIR#"$HOME"}/$OLD_NAME"
+  TILDE_OLD_MAIN="~${RAW_ORG_DIR#"$HOME"}/$OLD_NAME"
+fi
+
 # Host identity, mirroring lib/host-identity.sh:9-40 (env -> Layer-2 config -> hostname).
 host_name() {
   if [[ -n ${CATALYST_HOST_NAME:-} ]]; then printf '%s' "$CATALYST_HOST_NAME"; return; fi
@@ -159,6 +175,22 @@ inventory() {
 }
 
 FAILED=0
+REGISTRY_UNVERIFIED=0
+
+# CR-4: a plain "all checks pass" verdict line is what the runbook's
+# acceptance step tells an operator to look for — printing that exact line
+# when the registry.json check never actually ran (jq absent, or the file
+# didn't parse) makes a dangling registry entry indistinguishable from a
+# genuinely clean host. Route every "all clear" verdict through here so the
+# distinction always surfaces.
+report_pass_verdict() {
+  local label="$1"
+  if [[ $REGISTRY_UNVERIFIED -eq 1 ]]; then
+    say "VERDICT: $label (registry.json's '$TEAM_NEW' entry NOT verified — see the info line above; this is not the same as confirmed clean) — all other checks pass."
+  else
+    say "VERDICT: $label — all checks pass."
+  fi
+}
 
 # ---- verify (shared by --check and the tail of --apply) --------------------
 # $1 = newline-separated baseline of paths that were ALREADY prunable before any
@@ -176,10 +208,19 @@ verify() {
   [[ -e $OLD_WTP ]]  && fail "legacy worktree parent still present: $OLD_WTP" \
                      || pass "no '${OLD_NAME}-worktrees' directory remains"
 
-  # Gherkin 1: origin points at the new URL.
+  # Gherkin 1: origin points at the new URL. CR-3: accept any origin URL that
+  # resolves to the same host/org/repo as $REMOTE_URL (SSH or HTTPS) — the
+  # ticket's own Gherkin only requires "points at HagaleTechnologies/manta",
+  # not a specific protocol, and a byte-exact HTTPS-only comparison reports a
+  # healthy SSH-origin clone as MIGRATION NEEDED.
   local url; url="$(git -C "$MAIN" remote get-url origin 2>/dev/null || echo '<none>')"
-  [[ $url == "$REMOTE_URL" ]] && pass "origin = $url" \
-                              || fail "origin = $url (want $REMOTE_URL)"
+  if [[ $url == '<none>' ]]; then
+    fail "origin = <none> (want $REMOTE_URL)"
+  elif [[ "$(normalize_origin "$url")" == "$(normalize_origin "$REMOTE_URL")" ]]; then
+    pass "origin = $url"
+  else
+    fail "origin = $url (want $REMOTE_URL)"
+  fi
 
   # Gherkin 2, part A: no NEW prunable worktrees (KD 4 — baseline-relative).
   while IFS=$'\t' read -r path flag; do
@@ -244,13 +285,21 @@ verify() {
   # the new checkout. Guarded on jq (the only tool that can parse it); downgrade
   # to informational rather than passing silently when it cannot be confirmed, so
   # a run never ends all-PASS with a dangling registry entry (C4).
+  #
+  # CR-4: "informational" here still let the run's final VERDICT line print
+  # bare "all checks pass" — indistinguishable from a host where the registry
+  # was actually confirmed clean. Flag REGISTRY_UNVERIFIED so callers can
+  # print a verdict that says the registry line never actually ran.
+  REGISTRY_UNVERIFIED=0
   reg="$CATALYST_DIR/execution-core/registry.json"
   if [[ ! -f $reg ]]; then
     info "no registry.json at $reg — nothing to verify there"
   elif ! command -v jq >/dev/null 2>&1; then
     info "jq not installed — cannot verify registry.json's '$TEAM_NEW' entry"
+    REGISTRY_UNVERIFIED=1
   elif ! jq -e . "$reg" >/dev/null 2>&1; then
     info "registry.json at $reg does not parse as JSON — cannot verify the '$TEAM_NEW' entry"
+    REGISTRY_UNVERIFIED=1
   else
     root="$(jq -r --arg team "$TEAM_NEW" '[.projects[]? | select(.team==$team) | .repoRoot][0] // empty' "$reg" 2>/dev/null)"
     if [[ -z $root ]]; then
@@ -337,9 +386,17 @@ tooling_hits() {
   # volume, a tool that hardcodes the un-canonicalized spelling — the form a
   # human would actually type — never contains the canonical one, so scanning
   # only for $OLD_MAIN reports "no hits" when it should report "cannot tell".
+  #
+  # CR-2: also scan for the literal `$HOME/…` and `~/…` spellings — the two
+  # forms a human actually writes by hand in a shell script — which match
+  # neither $OLD_MAIN nor $RAW_OLD_MAIN because both of those are always
+  # already shell-expanded to a real path.
+  local patterns=(-e "$OLD_MAIN" -e "$RAW_OLD_MAIN" -e "/${OLD_NAME}-worktrees")
+  [[ -n $HOME_OLD_MAIN  ]] && patterns+=(-e "$HOME_OLD_MAIN")
+  [[ -n $TILDE_OLD_MAIN ]] && patterns+=(-e "$TILDE_OLD_MAIN")
   grep -RIn --exclude-dir=.git --exclude=.git \
        --exclude-dir=node_modules --exclude-dir=target \
-       -e "$OLD_MAIN" -e "$RAW_OLD_MAIN" -e "/${OLD_NAME}-worktrees" \
+       "${patterns[@]}" \
        "${roots[@]}" 2>/dev/null \
     | grep -v "^${OLD_MAIN}/" \
     | grep -v "^${NEW_MAIN}/" \
@@ -382,6 +439,55 @@ else
     fi
   fi
 fi
+
+# ---- origin -----------------------------------------------------------------
+# CR-3: normalize protocol/user/.git-suffix away so an SSH origin
+# (git@github.com:org/repo(.git)?) is recognized as equivalent to the HTTPS
+# default rather than being flagged as drift or silently rewritten.
+normalize_origin() {
+  local u="${1%.git}" host path
+  case "$u" in
+    git@*:*)
+      u="${u#git@}"
+      host="${u%%:*}"
+      path="${u#*:}"
+      u="$host/$path"
+      ;;
+    ssh://git@*)  u="${u#ssh://git@}";;
+    https://*)    u="${u#https://}";;
+    http://*)     u="${u#http://}";;
+  esac
+  printf '%s' "$u"
+}
+# CR-1/CR-3: `git remote set-url` cannot create a remote that does not exist —
+# on a checkout with no origin it dies with "No such remote 'origin'" after
+# the directories have already moved, leaving the host half-migrated and
+# every subsequent --apply failing identically (never converging). Add the
+# remote when absent instead. CR-3: when origin already resolves to the same
+# repo as $REMOTE_URL but via a different protocol (SSH vs HTTPS), leave it
+# alone — rewriting it silently changes push authentication — unless the
+# operator explicitly asked for this exact URL via --remote-url.
+set_origin() {
+  local cur
+  if cur="$(git -C "$MAIN" remote get-url origin 2>/dev/null)"; then
+    if [[ $cur == "$REMOTE_URL" ]]; then
+      info "origin already correct"
+    elif [[ "$(normalize_origin "$cur")" == "$(normalize_origin "$REMOTE_URL")" ]]; then
+      if [[ $EXPLICIT_REMOTE_URL -eq 1 ]]; then
+        say "repointing origin: $cur -> $REMOTE_URL (explicit --remote-url)"
+        git -C "$MAIN" remote set-url origin "$REMOTE_URL" || die "git remote set-url failed"
+      else
+        info "origin already resolves to the right repo ($cur) — leaving its protocol alone; pass --remote-url to force $REMOTE_URL"
+      fi
+    else
+      say "repointing origin: $cur -> $REMOTE_URL"
+      git -C "$MAIN" remote set-url origin "$REMOTE_URL" || die "git remote set-url failed"
+    fi
+  else
+    say "adding origin: <none> -> $REMOTE_URL"
+    git -C "$MAIN" remote add origin "$REMOTE_URL" || die "git remote add failed"
+  fi
+}
 
 # ---- busy preflight -------------------------------------------------------
 # Moving a checkout out from under a live git operation corrupts it. Check the
@@ -553,20 +659,14 @@ $busy
       info "no linked worktrees recorded at a stale legacy path"
     fi
 
-    cur="$(git -C "$MAIN" remote get-url origin 2>/dev/null || echo '')"
-    if [[ $cur != "$REMOTE_URL" ]]; then
-      say "repointing origin: ${cur:-<none>} -> $REMOTE_URL"
-      git -C "$MAIN" remote set-url origin "$REMOTE_URL" || die "git remote set-url failed"
-    else
-      info "origin already correct"
-    fi
+    set_origin
 
     reconcile_registry
 
     say ""
     verify "$BASELINE"
     say ""
-    [[ $FAILED -eq 0 ]] && { say "VERDICT: ALREADY MIGRATED — all checks pass."; exit 0; }
+    [[ $FAILED -eq 0 ]] && { report_pass_verdict "ALREADY MIGRATED"; exit 0; }
     say "VERDICT: MIGRATION INCOMPLETE — see FAIL lines above."; exit 1
   fi
 
@@ -627,22 +727,16 @@ $busy
     info "no linked worktrees to repair"
   fi
 
-  # One set-url covers every worktree — they share the main checkout's config
-  # (measured).
-  cur="$(git -C "$MAIN" remote get-url origin 2>/dev/null || echo '')"
-  if [[ $cur != "$REMOTE_URL" ]]; then
-    say "repointing origin: ${cur:-<none>} -> $REMOTE_URL"
-    git -C "$MAIN" remote set-url origin "$REMOTE_URL" || die "git remote set-url failed"
-  else
-    info "origin already correct"
-  fi
+  # One set_origin call covers every worktree — they share the main checkout's
+  # config (measured).
+  set_origin
 
   reconcile_registry
 
   say ""
   verify "$BASELINE"
   say ""
-  [[ $FAILED -eq 0 ]] && { say "VERDICT: MIGRATED — all checks pass."; exit 0; }
+  [[ $FAILED -eq 0 ]] && { report_pass_verdict "MIGRATED"; exit 0; }
   say "VERDICT: MIGRATION INCOMPLETE — see FAIL lines above."; exit 1
 fi
 
@@ -666,6 +760,6 @@ if [[ $MODE == check ]]; then
     say "VERDICT: MIGRATION NEEDED — checkout is named '$NEW_NAME' but checks failed above."
     exit 1
   fi
-  say "VERDICT: ALREADY MIGRATED — all checks pass."
+  report_pass_verdict "ALREADY MIGRATED"
   exit 0
 fi

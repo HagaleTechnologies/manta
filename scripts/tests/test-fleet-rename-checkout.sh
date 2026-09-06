@@ -638,5 +638,98 @@ grep -qi "no tooling-preflight scan roots" <<<"$out" \
   && ok "T44 warns when the scan-root set is empty" \
   || bad "T44 warns when the scan-root set is empty" "$out"
 
+# --- T45: --apply on a checkout with no origin remote at all ADDS one
+#     instead of calling `git remote set-url`, which cannot create a remote
+#     that does not exist — previously this died mid-run ("No such remote
+#     'origin'") after the directories had already moved, leaving the host
+#     half-migrated and every subsequent --apply failing identically
+#     (validation-round finding CR-1) ---
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+git -C "$C" remote remove origin
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T45 exit" "$rc" "0"
+check "T45 origin added" \
+  "$(git -C "$R/org/manta" remote get-url origin)" \
+  "https://github.com/HagaleTechnologies/manta.git"
+grep -q "adding origin" <<<"$out" && ok "T45 logs an add, not a repoint" \
+  || bad "T45 logs an add, not a repoint" "$out"
+grep -q "VERDICT: MIGRATED" <<<"$out" && ok "T45 converges" || bad "T45 converges" "$out"
+
+# --- T46: the tooling preflight catches the literal `$HOME/…` and `~/…`
+#     spellings of the old path — the two forms a human actually writes by
+#     hand in a shell script — which matched neither $OLD_MAIN nor
+#     $RAW_OLD_MAIN before, since both of those are always already
+#     shell-expanded to a real path (validation-round finding CR-2) ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/tools"
+printf 'CACHE_SRC="$HOME/org/skimmer/target"\n' > "$R/tools/link-build-cache-home.sh"
+out=$(HOME="$R" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/tools" 2>&1); rc=$?
+check "T46a exit" "$rc" "2"
+grep -q "link-build-cache-home.sh" <<<"$out" \
+  && ok "T46a catches literal \$HOME-spelled path" \
+  || bad "T46a catches literal \$HOME-spelled path" "$out"
+[[ -d "$R/org/skimmer" ]] && ok "T46a nothing moved" || bad "T46a nothing moved"
+
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/tools"
+printf 'CACHE_SRC=~/org/skimmer/target\n' > "$R/tools/link-build-cache-tilde.sh"
+out=$(HOME="$R" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/tools" 2>&1); rc=$?
+check "T46b exit" "$rc" "2"
+grep -q "link-build-cache-tilde.sh" <<<"$out" \
+  && ok "T46b catches literal ~-spelled path" \
+  || bad "T46b catches literal ~-spelled path" "$out"
+[[ -d "$R/org/skimmer" ]] && ok "T46b nothing moved" || bad "T46b nothing moved"
+
+# --- T47: an SSH origin (git@github.com:org/repo.git) resolving to the same
+#     repo as the desired HTTPS URL is accepted as already-correct by
+#     --check's comparison, and --apply must not silently rewrite it to
+#     HTTPS (changing push authentication) unless the operator explicitly
+#     asks via --remote-url (validation-round finding CR-3) ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin git@github.com:HagaleTechnologies/manta.git
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T47a exit" "$rc" "0"
+grep -q "ALREADY MIGRATED" <<<"$out" && ok "T47a SSH origin accepted by --check" \
+  || bad "T47a SSH origin accepted by --check" "$out"
+
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+git -C "$C" remote set-url origin git@github.com:HagaleTechnologies/manta.git
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T47b exit" "$rc" "0"
+check "T47b origin protocol preserved" \
+  "$(git -C "$R/org/manta" remote get-url origin)" \
+  "git@github.com:HagaleTechnologies/manta.git"
+grep -qi "leaving its protocol alone" <<<"$out" && ok "T47b explains why it did not rewrite" \
+  || bad "T47b explains why it did not rewrite" "$out"
+
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --remote-url https://github.com/HagaleTechnologies/manta.git 2>&1); rc=$?
+check "T47c exit" "$rc" "0"
+check "T47c explicit --remote-url forces the rewrite" \
+  "$(git -C "$R/org/manta" remote get-url origin)" \
+  "https://github.com/HagaleTechnologies/manta.git"
+
+# --- T48: when registry.json cannot be verified (here: present but not
+#     valid JSON — the same code path a jq-absent host takes), the run's own
+#     VERDICT line says so instead of the bare "all checks pass" the
+#     runbook's acceptance step treats as proof the registry is clean
+#     (validation-round finding CR-4) ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/catalyst/execution-core"
+echo 'not json {' > "$R/catalyst/execution-core/registry.json"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T48 exit" "$rc" "0"
+if command -v jq >/dev/null 2>&1; then
+  grep -q "VERDICT: MIGRATED — all checks pass\.$" <<<"$out" \
+    && bad "T48 verdict must not claim bare all-checks-pass when registry unverified" "$out" \
+    || ok "T48 verdict must not claim bare all-checks-pass when registry unverified"
+  grep -qi "registry.json's 'MAN' entry NOT verified" <<<"$out" \
+    && ok "T48 verdict names the unverified registry" || bad "T48 verdict names the unverified registry" "$out"
+else
+  skip "T48 skipped (no jq)"
+fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
