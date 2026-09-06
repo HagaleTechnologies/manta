@@ -578,10 +578,14 @@ tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
 mu_ratio_bounds = [2.2, 4.5]
 char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
 cluster_alpha = 0.15
-# [DEVIATION from SPEC §3.3] MAN-9: debounce as a fraction of the tracked
-# dit (`debounce_dits · mu_dit_ms`, floored by debounce_ms, capped by
-# debounce_ceiling_ms), instead of the single WPM-independent debounce_ms
-# above. 0.0 disables (= SPEC behavior). See
+# [DEVIATION from SPEC §3.3] MAN-9: debounce as a fraction of the TRUE
+# keyed dit (`debounce_dits · (mu_dit_ms - MARK_OVERSHOOT_MS)`, floored by
+# debounce_ms, capped by debounce_ceiling_ms), instead of the single
+# WPM-independent debounce_ms above -- MAN-9 CR-A found that scaling the
+# raw (overshoot-inflated) mu_dit_ms directly can swallow a real
+# inter-element gap at high WPM, since the same overshoot that inflates
+# mu_dit_ms shortens the very gap this deviation must not eat. 0.0
+# disables (= SPEC behavior). See
 # manta-decode::envelope::DemodConfig::{debounce_dits,debounce_ceiling_ms}.
 debounce_dits = 0.0    debounce_ceiling_ms = 30.0
 # [DEVIATION from SPEC §4.4/§9] MAN-9: beam width used instead of beam_width

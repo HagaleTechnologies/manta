@@ -260,6 +260,10 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
 /// `radius_hz` of `expected_freq_hz`. MAN-9 Phase 1: distinguishes a clean
 /// single-track capture from a fragmented signal (the gate's ignore-comment
 /// records "5-15 tracks within 300 Hz" for the 3/34 fragmented signals).
+/// CR-E: strictly less than, not `<=` -- `radius_hz` is called with 300.0,
+/// exactly the scene's own `MIN_SEPARATION_HZ`, so an inclusive bound could
+/// count a neighboring signal's legitimate track as one of this signal's
+/// fragments (same tightening as `v8w_fading_diagnostics.rs`'s CR-7).
 fn tracks_near(
     tracks: &BTreeMap<u64, (String, Option<f64>)>,
     expected_freq_hz: f64,
@@ -267,7 +271,7 @@ fn tracks_near(
 ) -> usize {
     tracks
         .values()
-        .filter(|(_, freq)| freq.is_some_and(|f| (f - expected_freq_hz).abs() <= radius_hz))
+        .filter(|(_, freq)| freq.is_some_and(|f| (f - expected_freq_hz).abs() < radius_hz))
         .count()
 }
 

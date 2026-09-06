@@ -89,6 +89,10 @@ fn nearest_track(
     })
 }
 
+/// CR-7 (MAN-9 pin doc): strictly less than, not `<=` -- `radius_hz` is
+/// called with `NEAR_HZ` (300.0), exactly the scene's own
+/// `MIN_SEPARATION_HZ`, so an inclusive bound could count a neighboring
+/// signal's legitimate track as one of this signal's fragments.
 fn tracks_near(
     tracks: &BTreeMap<u32, TrackSummary>,
     expected_freq_hz: f64,
@@ -98,7 +102,7 @@ fn tracks_near(
         .values()
         .filter(|t| {
             t.freq_hz
-                .is_some_and(|f| (f - expected_freq_hz).abs() <= radius_hz)
+                .is_some_and(|f| (f - expected_freq_hz).abs() < radius_hz)
         })
         .collect()
 }

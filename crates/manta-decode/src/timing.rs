@@ -54,9 +54,27 @@ const FARNS_MIN_RATIO: f32 = 1.8;
 /// outlives the fade that caused it and degrades *subsequent* characters'
 /// gap classification and beam likelihoods, not just the one coincident
 /// with the fade. Excluded marks are still counted for the §4.1
-/// drift/regime-change rule (`SpeedTracker::check_drift`), so a genuine,
-/// sustained speed change still re-anchors normally -- only isolated
-/// outliers are rejected. Default `(0.0, INFINITY)` admits every mark (=
+/// drift/regime-change rule (`SpeedTracker::check_drift`), so a
+/// **homogeneous run** of a genuine, sustained speed change (e.g. a long
+/// string of same-length dits or dahs) still re-anchors normally.
+///
+/// **This is a narrower guarantee than it sounds (MAN-9 CR-C):**
+/// `check_drift` only fires on `DRIFT_LEN` (12) *consecutive marks from the
+/// same cluster label* (`ring.iter().all(dit)` / `all(dah)`). Ordinary
+/// mixed Morse text alternates dits and dahs, so a genuine speed change
+/// embedded in normal traffic essentially never satisfies that gate, and
+/// the tracker can stay locked on the stale centroid for the rest of the
+/// track. See
+/// `a_sustained_speed_change_in_alternating_traffic_does_not_reinitialize_the_tracker`
+/// below, which pins exactly that gap -- unlike
+/// `a_sustained_speed_change_still_reinitializes_the_tracker` above it,
+/// which demonstrates only the degenerate homogeneous-run case that does
+/// satisfy `check_drift`. Only isolated outliers embedded in otherwise-
+/// stable, alternating traffic are safely rejected by `admission`; a
+/// genuine sustained change in realistic mixed text needs either a long
+/// homogeneous run (rare) or a fix to `check_drift` itself (tracked
+/// follow-up, not addressed here) before a narrow `admission` range is
+/// safe to promote. Default `(0.0, INFINITY)` admits every mark (=
 /// SPEC behavior). Scoped to `SpeedTracker`'s `ClusterPair` (marks in ms)
 /// only -- `GapClassifier`'s `ClusterPair` (dit-ratio-typed values, not
 /// milliseconds) always uses this inert default; see `unimodal_ceiling`'s
@@ -693,6 +711,13 @@ mod tests {
     /// `check_drift`'s bookkeeping (the `ring`) is fed unconditionally by
     /// `on_mark`, independent of whether `observe` admitted the mark into
     /// the EMA, which is exactly what makes this possible.
+    ///
+    /// **Scope, per MAN-9 CR-C**: all 14 new marks are the SAME length
+    /// (22.0 ms), the one shape that reliably satisfies `check_drift`'s
+    /// "12 consecutive marks from the same cluster label" gate. See
+    /// `a_sustained_speed_change_in_alternating_traffic_does_not_reinitialize_the_tracker`
+    /// below for the realistic mixed-traffic case (alternating dit/dah
+    /// marks), which this gate does NOT reach.
     #[test]
     fn a_sustained_speed_change_still_reinitializes_the_tracker() {
         let mut t = SpeedTracker::with_admission(MarkAdmission { lo: 0.45, hi: 2.20 });
@@ -706,6 +731,44 @@ mod tests {
         assert!(
             (t.mu_dit_ms() - 22.0).abs() < 2.0,
             "tracker must follow a real regime change despite per-mark admission rejection, got {}",
+            t.mu_dit_ms()
+        );
+    }
+
+    /// MAN-9 CR-C: `MarkAdmission`'s doc comment claims a "genuine,
+    /// sustained speed change still re-anchors normally" via
+    /// `check_drift`. That is only true for a homogeneous run (see the
+    /// test above); real Morse alternates dits and dahs, so a speed change
+    /// embedded in ordinary mixed traffic never produces 12 consecutive
+    /// same-cluster marks and `check_drift` never fires. Both new marks
+    /// below (20 ms, 400 ms) are engineered to land on opposite sides of
+    /// the OLD dit/dah boundary (`sqrt(50*150) ~= 86.6`) -- so the ring
+    /// alternates dit/dah labels, same as real text -- while each is, on
+    /// its own, an admission-gate outlier relative to its OLD nearest
+    /// centroid (20/50 = 0.4 < 0.45; 400/150 = 2.67 > 2.2), so neither
+    /// individual mark can drag the EMA either. `mu_dit_ms` must therefore
+    /// stay pinned at the stale 50.0 ms centroid for the life of this
+    /// loop -- the tracker never learns of the new regime, which is
+    /// exactly the promoted-`admission` risk this test pins until
+    /// `check_drift` itself is generalized (tracked follow-up, not this
+    /// ticket's scope).
+    #[test]
+    fn a_sustained_speed_change_in_alternating_traffic_does_not_reinitialize_the_tracker() {
+        let mut t = SpeedTracker::with_admission(MarkAdmission { lo: 0.45, hi: 2.20 });
+        for _ in 0..20 {
+            t.on_mark(50.0);
+            t.on_mark(150.0);
+        }
+        for _ in 0..40 {
+            t.on_mark(20.0);
+            t.on_mark(400.0);
+        }
+        assert!(
+            (t.mu_dit_ms() - 50.0).abs() < 0.1,
+            "alternating-traffic marks must never satisfy check_drift's \
+             homogeneous-run gate, so mu_dit must stay locked on the stale \
+             centroid -- got {}, which would mean the safety net fired \
+             despite the traffic alternating",
             t.mu_dit_ms()
         );
     }

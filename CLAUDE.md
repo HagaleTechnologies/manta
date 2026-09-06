@@ -16,7 +16,7 @@ known classical-decoder fading-robustness limitations (`#[ignore]`d,
 issues #25/#28), deferred to M4 ML fusion by design, not M2 blockers. MAN-9
 walked a bounded classical-mitigation ladder against V8w and pinned the
 measured baseline (still 1/34 strong signals, median CER ≈ 0.276) plus a
-non-regression ratchet — see
+manual (`#[ignore]`d, not CI-enforced) non-regression ratchet — see
 docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md and
 `v8w_classical_baseline_does_not_regress`
 (`crates/manta-cli/tests/golden_v8_v8w.rs`). **M2 acceptance is still

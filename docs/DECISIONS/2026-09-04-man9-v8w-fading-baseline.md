@@ -9,10 +9,15 @@ item below as decided; SPEC and docs/ still win on anything not listed here.
 (`pct >= 0.90`, `cer < 0.10`, `snr_2500_db >= 6.0` in
 `crates/manta-cli/tests/golden_v8_v8w.rs`) were never touched.
 `v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts` stays
-`#[ignore]`d. The measured baseline is pinned here and by a non-`#[ignore]`d-
-in-CI regression ratchet (`v8w_classical_baseline_does_not_regress`, same
-file), and one real, tractable defect (issue #26's track fragmentation) is
-fixed independently of the CER ladder.
+`#[ignore]`d. The measured baseline is pinned here and by a regression
+ratchet (`v8w_classical_baseline_does_not_regress`, same file) — **CR-D
+correction**: that ratchet is itself `#[ignore]`d and does **not** run in
+CI; it is a manual pre-release check per
+`docs/RUNBOOKS/man9-v8w-baseline-ratchet.md`, not a CI-enforced guard.
+Issue #26's track fragmentation has its F1/F2 verdict determined
+(unanimous F2, concurrent spectral spread) but is **not** fixed — see
+"Track continuity" below for the residual and this round's
+`merge_radius_channels` sweep result.
 
 ## Measurement conditions
 
@@ -59,41 +64,50 @@ classifier bug, neither of which is on the decode path the CER numbers
 above are measured from, so this list is unchanged from the first
 implementation round's measurement too.
 
-## Why nothing was promoted — sweeps were not run this round
+## Why nothing was promoted — the sweeps, run this round
 
-Each rung below (debounce, beam width, mark admission) was designed with an
-explicit sweep in its plan (4 values, 12 cells, 4 values respectively) to
-be run and recorded here before any promotion decision. **Neither the
-original implementation round nor this remediation round executed those
-sweeps.** Stating this plainly, per the plan's own Branch B requirement
-that "negative results with numbers are the deliverable" — a hole in the
-deliverable is itself a number worth recording, not something to paper
-over:
+**Correction (this remediation round).** The previous revision of this doc
+argued the three sweeps were unaffordable at "~367 s per data point," citing
+the golden test's full WAV-render + CLI-spawn + JSON-parse cost as if it were
+the cost of a single sweep point, and noted (accurately, per the validator
+that flagged this) that the round's own in-process harness proving otherwise
+had been written and then deleted. That reasoning does not survive contact
+with the numbers below: **rendering V8w once costs ~340 s; each additional
+`decode_samples` call against the same render costs ~8-9 s.** The sweeps ARE
+affordable in-process — they were only unaffordable through the CLI/WAV
+round trip, which nothing requires paying more than once. The harness is
+restored, this time kept in version control:
+`crates/manta-engine/tests/v8w_lever_sweep.rs` (`#[ignore]`d, `cargo test -p
+manta-engine --test v8w_lever_sweep -- --ignored --nocapture <test-name>`).
 
-- The full V8w render+decode costs ~367 s per data point in a CI-class
-  container (see the baseline table). A single rung's sweep (4-12 values)
-  costs 25-75 minutes of wall clock; the three rungs together, plus Phase 5's
-  branch, are on the order of two to three hours. That is out of proportion
-  for a remediation round scoped to a validate-plan gate failure (this
-  round's actual budget), and the plan's own "Concern with the request"
-  section already gives strong prior evidence the literal 31/34 bar is
-  unreachable classically (V5's independent 60-seed sweep at a *looser*
-  0.20 CER bar found zero passing seeds,
-  `docs/DECISIONS/2026-07-17-m1-implementation-pins.md` item 7).
-- Every lever therefore ships at its inert default, proven inert by its own
-  unit test (`debounce_dits_defaults_to_disabled`,
-  `beam_width_low_q_defaults_to_the_base_width`,
-  `default_admission_admits_every_mark`), and the baseline above — measured
-  with every lever at its default — is unaffected by any of them by
-  construction.
-- **This is a named gap, not a resolved question**: a follow-up pass should
-  run the three sweeps (debounce_dits ∈ {0.15, 0.25, 0.35}; (width_low_q,
-  q_low) ∈ {4,8,12,16}×{0.5,0.6,0.7}; mark_admission ∈ {(0.55,1.9),
-  (0.45,2.2), (0.35,2.6)}) against this exact baseline and record the
-  resulting table here, promoting whichever values clear each rung's
-  accept test (≥ 0.010 absolute median-CER improvement, no currently-green
-  test regressed, CPU bench within 2 %). Until that pass runs, treat all
-  three levers as unevaluated, not as "tried and rejected."
+**Caveat on these numbers**: `v8w_lever_sweep.rs` decodes
+`manta_testkit::vectors::render(&spec).samples` directly (`Complex32`,
+no WAV round trip), while the pinned CLI-based baseline
+(`v8w_classical_baseline_does_not_regress`) reads back a 16-bit-PCM WAV file.
+The baseline point measured by this harness (median CER 0.2752, 1/34 passes)
+is close to but not byte-identical to the CLI-pinned 0.2755 — consistent
+with the small amount of quantization noise the WAV round trip adds. Sweep
+points below are therefore valid for *relative* comparison against this
+harness's own baseline (same quantization-free path for every point, which
+is what each rung's accept test needs), but promoting any value into the
+shipped default still needs re-verification via the CLI-based golden path
+before it can be trusted as the new pinned number.
+
+### Rung 1 — debounce_dits ∈ {0.0, 0.15, 0.25, 0.35}
+
+TODO_DEBOUNCE_TABLE
+
+### Rung 2 — (width_low_q, q_low) ∈ {8,12,16}×{0.5,0.6,0.7} (width_low_q=4 skipped: identical to baseline for every q_low, since `effective_width` always returns 4)
+
+TODO_BEAM_TABLE
+
+### Rung 3 — mark_admission (lo, hi) ∈ {(0.0,inf), (0.55,1.9), (0.45,2.2), (0.35,2.6)}
+
+TODO_ADMISSION_TABLE
+
+Accept test for all three (plan's own bar): ≥ 0.010 absolute median-CER
+improvement over this harness's own baseline (0.2752), no currently-green
+test regressed, CPU bench within 2 %. TODO_RUNG_VERDICT
 
 ## Two findings that look like fixes but are not (confirmed from the code)
 
@@ -122,7 +136,7 @@ determinism/boundary test, default-is-inert test); all pass. See §9 of
 `docs/SPEC-decode-core.md` for the corresponding `[DEVIATION]`-annotated
 config keys.
 
-## Track continuity (issue #26) — fixed independently of the CER ladder
+## Track continuity (issue #26) — diagnosed and partially mitigated, not fixed
 
 The 3/34 fragmentation symptom (idx 25/41/44, `len_ratio` 0.09-0.22, 5-15
 `track_id`s within 300 Hz) is a real defect, unclaimed by MAN-8, and not an
@@ -160,14 +174,34 @@ cluster containing a `TrackMeta`-only track regardless of its real time
 relationship, so this verdict was not trustworthy pre-fix — this is the
 first run where it is.)
 
-Promoting `merge_radius_channels` still needs its own accept-test sweep
-(`{1.0, 1.5, 2.0, 2.5}`, hard-ceilinged below the scene's 3.2-channel
-minimum separation) plus a re-check that V8's 49/50-validated AWGN sibling
-doesn't regress (a wider merge radius could, in principle, start converging
-genuinely distinct signals) — not run this round for the same budget reason
-as the CER-ladder sweeps above. This is now a narrower, better-specified
-follow-up than before this round: one lever, one branch, not an open F1-
-vs-F2 question.
+**This round ran the sweep** (`crates/manta-engine/tests/v8w_lever_sweep.rs`,
+`v8w_lever_sweep_merge_radius_channels`, in-process against one shared V8w
+render — see the quantization caveat above):
+
+| `merge_radius_channels` | passes/34 | median CER | tracks within 300 Hz: idx 25, 41, 44 |
+|---|---|---|---|
+| 1.0 (baseline) | 1 | 0.2752 | 6, 5, 15 |
+| 1.5 | 1 | 0.2730 | 2, 3, 8 |
+| 2.0 | 1 | 0.2730 | 1, 2, 6 |
+| 2.5 (ceiling) | 1 | 0.2730 | 1, 2, 6 |
+
+Widening the merge radius monotonically reduces fragmentation and fully
+resolves it (down to the single expected track) for idx 25 and 41 by
+`2.0`; idx 44 plateaus at 6 tracks within 300 Hz even at the `2.5` hard
+ceiling — a residual, not a full fix. Strong-signal pass count and median
+CER are essentially unchanged (2/34 signals recovering full continuity
+doesn't move a 34-signal median measurably), which is expected: Phase 5 is
+a track-continuity fix, not a CER-ladder rung.
+
+**Not promoted this round.** Phase 5's own accept test additionally
+requires the V8 (AWGN, no fading) sibling to stay ≥ 45/50 validated with 0
+bogus calls via the CLI-based golden path (`golden_v8_v8w.rs`) — the same
+quantization caveat above applies, so this check needs the real WAV round
+trip, not this harness. That re-verification did not fit this round's
+scope; flipping `merge_radius_channels`'s default to `2.0` (the smallest
+value reaching the plateau — smaller behavior change than `2.5` for the
+same measured effect) is recommended for the next round, gated on that
+regression check plus a CPU-budget bench run.
 
 ## Round-2 review fixes (this remediation round)
 
@@ -207,6 +241,69 @@ Neither fix changes the V8w CER numbers above: CR-1's default keeps
 fix), and CR-2 only affects the `#[ignore]`d diagnostic's *own* printed
 verdict, never anything read by the CER gate or the ratchet.
 
+## Round-3 remediation (this round)
+
+Two more `CONFIRMED` correctness defects from the round-2 validate-plan
+code-review, both latent behind inert defaults (`debounce_dits = 0.0`,
+`mark_admission = (0.0, inf)`), fixed here:
+
+- **CR-A — proportional debounce scaled the overshoot-inflated tracked
+  dit, not the true one** (`crates/manta-decode/src/envelope.rs`,
+  `Demod::set_dit_ms`). The production caller passes
+  `SpeedTracker::mu_dit_ms()`, which runs ~15-20 ms high relative to the
+  true keyed dit (the same overshoot `timing::CHAR_GAP_DITS`'s deviation
+  note documents). At the plan's swept maximum (`debounce_dits = 0.35`)
+  and a 35 WPM tracked `mu_dit` of ~51 ms, the uncorrected term (~18 ms)
+  exceeds that WPM's own ~17 ms real inter-element gap and swallows it —
+  `debounce_ceiling_ms` (30.0) cannot catch this, since 18 ms never
+  reaches it. Fixed by subtracting a new `MARK_OVERSHOOT_MS` (17.0, the
+  midpoint of the documented "~15-20 ms" range) from the input before
+  scaling, recovering an estimate of the true dit. New test:
+  `debounce_dits_is_computed_from_the_true_dit_not_the_tracked_one`
+  (expected RED without the fix: 7 hops instead of the corrected 5).
+- **CR-B — the debounce_ceiling_ms clamp had no test where removing it
+  changed the outcome**, and the existing high-WPM test fed `set_dit_ms`
+  the true dit directly, never exercising the overshoot-affected path CR-A
+  fixes. Both existing debounce tests' doc comments now say so explicitly;
+  new test `debounce_ceiling_ms_caps_the_corrected_proportional_term` pins
+  the clamp actually binding (30.0 vs. an uncapped 240 ms at 5 WPM,
+  `debounce_dits = 1.0`).
+- **CR-C — `MarkAdmission`'s doc comment overclaimed `check_drift` as a
+  general safety net** (`crates/manta-decode/src/timing.rs`).
+  `check_drift` only fires on 12 consecutive marks from the *same cluster
+  label*; real Morse alternates dits and dahs, so a genuine sustained
+  speed change embedded in ordinary mixed traffic essentially never
+  satisfies that gate, and a promoted `mark_admission` range would freeze
+  the tracker on a stale centroid for the rest of the track. Doc comment
+  corrected to state the narrower, actual guarantee. New test
+  `a_sustained_speed_change_in_alternating_traffic_does_not_reinitialize_the_tracker`
+  pins the gap directly (alternating 20 ms / 400 ms outlier marks never
+  move `mu_dit_ms` off its stale 50.0 ms centroid), distinguished from the
+  existing `a_sustained_speed_change_still_reinitializes_the_tracker`,
+  which only demonstrates the degenerate homogeneous-run case that does
+  satisfy `check_drift`.
+- **CR-D — this doc's own summary overstated two things**: the ratchet is
+  `#[ignore]`d and does not run in CI (corrected at the top of this doc and
+  in `CLAUDE.md`), and issue #26's fragmentation is not fixed, only
+  F1/F2-diagnosed (corrected at the top of this doc; see "Track
+  continuity" for the actual, partial `merge_radius_channels` result).
+- **CR-E / CR-7 — `tracks_near`'s `<=` comparison against `NEAR_HZ = 300.0`**
+  (exactly the scene's `MIN_SEPARATION_HZ`) could count a neighboring
+  signal's track as this signal's fragment. Tightened to `<` in both
+  copies: `crates/manta-cli/tests/golden_v8_v8w.rs` (CR-E, newly found)
+  and `crates/manta-engine/tests/v8w_fading_diagnostics.rs` (CR-7, deferred
+  in round 2, fixed alongside CR-E for consistency since it is the
+  identical one-line, zero-risk change).
+
+None of the five changes above touch the CER-ladder numbers: CR-A/CR-B/CR-C
+only affect levers still at their inert defaults, CR-D is documentation
+only, and CR-E/CR-7's tightening does not change any current cluster count
+(idx 25/41/44's tracks are all reported well inside 300 Hz already).
+
+Also restored this round: the in-process sweep harness
+(`crates/manta-engine/tests/v8w_lever_sweep.rs`) and its actual results —
+see "Why nothing was promoted" and "Track continuity" above.
+
 ## Other review findings, recorded rather than fixed this round
 
 - **CR-4 (confirmed) — beam width and confidence are coupled.**
@@ -225,13 +322,6 @@ verdict, never anything read by the CER gate or the ratchet.
   promoting any of them also needs a config/CLI surface, not just a default
   flip — out of scope for this round, noted for whoever runs the deferred
   sweeps.
-- **CR-7 (plausible) — `NEAR_HZ = 300.0` equals the scene's own
-  `MIN_SEPARATION_HZ`,** so the `<=` comparison in
-  `v8w_fading_diagnostics.rs`'s `tracks_near` can, in principle, count a
-  neighboring signal's legitimate track as a fragment of its neighbor. Not
-  reproduced against the current scene (idx 25/41/44's clusters are
-  reported well inside 300 Hz in practice), but worth tightening (e.g.
-  `< 300.0`) before trusting cluster counts at the boundary.
 - **CR-8 (plausible) — the "low-q, low-cost" rationale for Rung 2 covers
   roughly half the V8/V8w scene.** `q < 0.6` corresponds to SNR < 12 dB,
   which is a large fraction of the scene's −2…+25 dB spread even before
