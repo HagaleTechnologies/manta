@@ -29,6 +29,21 @@ async fn spawn_server() -> (
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
 ) {
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+}
+
+/// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
+/// shutdown-drain deadline directly (e.g. `Duration::ZERO`, to make an
+/// expiry exact rather than timing-dependent) instead of always waiting on
+/// the production `CLIENT_DRAIN_DEADLINE`.
+async fn spawn_server_with_drain_deadline(
+    drain_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));
     let metrics = Arc::new(Metrics::new());
     let cty = Arc::new(Table::parse(CTY_FIXTURE));
@@ -52,6 +67,7 @@ async fn spawn_server() -> (
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline,
             },
             tasks,
             limiter,
@@ -132,6 +148,153 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON line");
     assert_eq!(value["dxCall"], "JA1ABC");
+}
+
+/// MAN-45 (PR #63 round-16 finding): a drain that cannot finish inside its
+/// own deadline must COUNT everything it abandons, never truncate silently
+/// (ARCHITECTURE §8). Driven with a zero deadline so the expiry is exact
+/// rather than timing-dependent -- the property under test is the
+/// accounting, not the duration.
+///
+/// The assertion is the invariant, not a fixed split: `select!` may still
+/// deliver some spots through the LIVE arm before the shutdown arm wins, so
+/// what must hold is that every published spot is either delivered or
+/// counted, never neither.
+#[tokio::test]
+async fn tcp_shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx) = spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    tokio::time::sleep(Duration::from_millis(600)).await; // past the WS-detection peek window
+
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => delivered += 1,
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
+/// MAN-45 remediate (code-review round 18, finding 3): before this fix,
+/// `looks_like_websocket_handshake`'s classifying peek never observed
+/// `shutdown` at all -- the same gap telnet's pre-login handshake had
+/// before round 17's CR-1 fix. Sending fewer than 3 bytes keeps the peek
+/// loop's "seen some bytes" branch extending its own patience to the full
+/// `HANDSHAKE_TIMEOUT` (10s) rather than classifying quickly, so without
+/// the fix this task would sit unresponsive to `shutdown` for up to that
+/// budget -- the read below would time out well before the connection
+/// closed. Also asserts the abandoned backlog lands on the distinct
+/// shutdown counter, not the write-failure one (no write was ever
+/// attempted here).
+#[tokio::test]
+async fn shutdown_during_handshake_peek_disconnects_promptly_instead_of_waiting_out_the_full_budget(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (addr, bus, metrics, shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream.write_all(b"GE").await.unwrap(); // fewer than 3 bytes: keeps the peek loop pinned
+    tokio::time::sleep(Duration::from_millis(100)).await; // let the peek see "GE" and extend its deadline
+
+    bus.publish(sample_spot());
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled mid-handshake-classification must disconnect promptly once \
+             shutdown is signalled, not wait out the full handshake budget",
+        );
+    // The peek used to classify never CONSUMES bytes from the kernel
+    // receive queue -- the "GE" sent above is still logically unread when
+    // the server closes its side, so Linux sends an abortive RST instead
+    // of an orderly FIN (EOF). Either is a valid "disconnected promptly"
+    // signal; only a hang (the `expect` above) would indicate the fix
+    // didn't work.
+    match read_result {
+        Ok(0) => {}
+        Ok(n) => panic!("expected disconnect, got {n} bytes"),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("expected EOF or a connection reset, got: {e}"),
+    }
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        1,
+        "the queued spot must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
+}
+
+/// MAN-45 remediate (code-review round 18, finding 3): the same gap one
+/// step later in a WS client's lifecycle -- `handle_ws_client`'s own
+/// `accept_async_with_config` step never observed `shutdown` either. A
+/// `GET` request whose headers never terminate (no blank CRLFCRLF) is
+/// classified as a WS candidate by the peek (starts with "GET") and then
+/// held inside the handshake accept future indefinitely, up to
+/// `HANDSHAKE_TIMEOUT` (10s) without this fix.
+#[tokio::test]
+async fn shutdown_during_ws_accept_handshake_disconnects_promptly_instead_of_waiting_out_the_full_timeout(
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (addr, bus, metrics, shutdown_tx) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    bus.publish(sample_spot());
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled mid-WS-handshake must disconnect promptly once shutdown is \
+             signalled, not wait out the full handshake timeout",
+        );
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "expected EOF after shutdown during the WS accept handshake"
+    );
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        1,
+        "the queued spot must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
 }
 
 #[tokio::test]
@@ -408,6 +571,7 @@ async fn websocket_client_receives_spot_as_json_message() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -444,6 +608,40 @@ async fn websocket_client_receives_spot_as_json_message() {
     let _ = ws.close(None).await;
 }
 
+/// MAN-45 (PR #63 round-16 finding): the WS drain loop's own deadline, same
+/// invariant as `tcp_shutdown_drain_deadline_counts_the_backlog_it_could_not_write`.
+#[tokio::test]
+async fn ws_shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx) = spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let url = format!("ws://{addr}");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect failed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(msg)) if msg.is_text() => delivered += 1,
+                _ => return, // Close/None/error: the connection ended
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
 #[tokio::test]
 async fn websocket_client_sending_an_oversized_message_is_disconnected() {
     // Regression test (round-5 review): the WS handshake used to accept
@@ -476,6 +674,7 @@ async fn websocket_client_sending_an_oversized_message_is_disconnected() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -542,6 +741,7 @@ async fn websocket_client_sending_an_unsolicited_pong_is_disconnected() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -614,6 +814,7 @@ async fn websocket_client_sending_a_structurally_malformed_frame_is_disconnected
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,
@@ -739,6 +940,7 @@ async fn websocket_client_flooding_pings_past_the_budget_is_disconnected() {
                 station_call: STATION_CALL.to_string(),
                 decoder_version: "manta-test".to_string(),
                 shutdown: shutdown_rx,
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks,
             limiter,

@@ -288,7 +288,28 @@ validation (MAN-28). Dedupe (step 5) still applies.
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
   existing ecosystem contracts.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
-  are disconnected, never back-pressure the pipeline.
+  are disconnected, never back-pressure the pipeline. At shutdown each
+  client's queued backlog is drained on a best-effort basis bounded by a
+  per-client deadline (`tasks::CLIENT_DRAIN_DEADLINE`) that starts once the
+  handler's shutdown branch actually runs; anything the deadline abandons is
+  counted in `manta_spots_dropped_write_failed_total`, never silently
+  truncated (§8). A handler already mid-write when shutdown fires still has
+  to finish that one write first — bounded by its own `WRITE_TIMEOUT` — before
+  it can even reach the drain branch; telnet's `sh/dx` history replay
+  re-checks the shutdown signal before every history entry and, the moment
+  it's observed, defers to the loop's own drain branch to deliver the live
+  backlog with that branch's full unused budget rather than abandoning it,
+  so its worst case matches the live-write arm's rather than scaling with
+  replay depth (MAN-45 remediate, round-16 P1; round 17, CR-2/CR-3). The
+  registry-wide `SHUTDOWN_DRAIN_DEADLINE` (`manta-cli`) is sized to outlive
+  that combined true worst case — `2 * telnet::WRITE_TIMEOUT +
+  CLIENT_DRAIN_DEADLINE`, not `CLIENT_DRAIN_DEADLINE` alone — see that
+  constant's own doc comment for the full accounting. Telnet's pre-login
+  handshake (prompt/read/banner, before a client ever reaches that loop) is
+  excluded from this worst case because it is itself shutdown-aware: each
+  step races `shutdown.changed()` and bails out, counting its backlog,
+  rather than running its own (up to 50s combined) timeouts to completion
+  first (round 17, CR-1).
 - **Exposure policy (normative, not just observed behavior):** both servers are
   designed to be internet-reachable with no client authentication, matching the
   DX cluster/RBN ecosystem's own long-standing convention (CW Skimmer, SkimSrv,
@@ -324,17 +345,18 @@ validation (MAN-28). Dedupe (step 5) still applies.
   currently-implemented subset is `manta_spots_total`,
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
-  **`manta_active_tracks` is served but not populated** (corrected
-  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
-  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
-  own comment says the engine exposes no hook for it yet — so every
-  production daemon run reports a constant `0`, not a real track count.
-  Listed separately from the "currently-implemented" set above so an
-  operator doesn't read a served-but-frozen placeholder as live data.
+  `manta_spots_dropped_write_failed_total`,
+  `manta_spots_unresolved_geography_total`, `manta_active_tracks`,
+  per-protocol client-connected gauges, `manta_source_health`, and the
+  uplink counters (`crates/manta-server/src/metrics.rs`) — not input-layer
+  overruns or per-stage queue depths, which MAN-56 tracks as a separate
+  gap. **`manta_active_tracks` is now populated** (MAN-45, corrected
+  2026-09-04): `manta_engine::listen_with_observers` publishes
+  `TrackManager::active_track_count()` into a shared handle as the decode
+  loop runs (`ListenObservers`); the daemon's server runtime polls it into
+  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
+  (every other caller — `soak()`, the CPU-budget bench, both integration
+  tests) is unchanged and pays nothing for this.
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`

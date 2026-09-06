@@ -23,7 +23,14 @@ use tokio::sync::{broadcast, watch};
 /// stalled and disconnected -- ARCHITECTURE §7's "slow clients are
 /// disconnected, never back-pressured" policy applies to a client that
 /// stops reading, not just one that falls behind the broadcast channel.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// `pub` (not private): `manta-cli`'s `SHUTDOWN_DRAIN_DEADLINE` must stay
+/// sized against `2 * WRITE_TIMEOUT` -- the worst case a `select!` branch
+/// body here (`write_spot_line`'s two separately-timed writes) can run
+/// before that loop even gets back around to noticing `shutdown` -- plus
+/// `tasks::CLIENT_DRAIN_DEADLINE`. A cross-crate test asserts this
+/// relationship directly rather than re-deriving the constant by hand.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the accept loop backs off after a failed `accept()` before
 /// retrying -- a persistent resource error (e.g. `EMFILE`) makes
 /// `accept()` return immediately, and retrying with no delay turns this
@@ -172,6 +179,7 @@ pub async fn serve(
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
     ip_command_limiter: IpRateLimiter,
+    drain_deadline: Duration,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -249,6 +257,7 @@ pub async fn serve(
                 ip_command_limiter,
                 log_enabled,
                 rejection_log_limiter,
+                drain_deadline,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -299,6 +308,7 @@ async fn handle_client(
     ip_command_limiter: IpRateLimiter,
     log_enabled: bool,
     rejection_log_limiter: IpRateLimiter,
+    drain_deadline: Duration,
 ) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
@@ -306,9 +316,54 @@ async fn handle_client(
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
 
-    write_with_timeout(&mut wr, b"login: \r\n").await?;
+    // MAN-45 remediate (round 17, CR-1): every step of this pre-loop
+    // handshake now races `shutdown.changed()` -- the worst-case model
+    // `SHUTDOWN_DRAIN_DEADLINE` (`manta-cli`) and its own doc comment
+    // assert (`2 * telnet::WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE`) only
+    // covers branches INSIDE the `select!` loop below; before this fix, a
+    // client that stalled before completing login held this task outside
+    // that loop for up to `WRITE_TIMEOUT + IDLE_READ_TIMEOUT +
+    // WRITE_TIMEOUT` (50s) with `shutdown` never observed at all, so
+    // `Runtime::shutdown_timeout` could abort it with its already-
+    // subscribed `rx` backlog abandoned uncounted -- precisely the
+    // silent-truncation failure round 16's P1 was raised about, just one
+    // step earlier in the connection's lifecycle. Racing each step keeps
+    // the pre-loop phase's contribution to shutdown latency close to zero
+    // instead of growing `SHUTDOWN_DRAIN_DEADLINE` a third time to cover
+    // it.
+    //
+    // MAN-45 remediate (code-review round 18, finding 2): these three
+    // branches record into `record_dropped_shutdown`, NOT
+    // `record_write_failed` -- nothing was written and nothing failed here,
+    // the daemon shut down cleanly. The prior version called
+    // `record_write_failed`, which contradicts that counter's own doc
+    // comment and Prometheus HELP text ("a write... timed out or failed")
+    // and would make an operator reading it suspect failing client sockets
+    // on every ordinary shutdown with a stalled pre-login client.
+    tokio::select! {
+        result = write_with_timeout(&mut wr, b"login: \r\n") => {
+            result?;
+        }
+        _ = shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("telnet: shutdown signalled before login prompt, disconnecting");
+            }
+            metrics.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    }
     let mut login_line = String::new();
-    match read_line_bounded_with_timeout(&mut reader, &mut login_line).await {
+    let login_result = tokio::select! {
+        result = read_line_bounded_with_timeout(&mut reader, &mut login_line) => result,
+        _ = shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("telnet: shutdown signalled during login read, disconnecting");
+            }
+            metrics.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    };
+    match login_result {
         Ok(0) => {
             if log_enabled {
                 tracing::info!("telnet: client disconnected before completing login");
@@ -332,7 +387,19 @@ async fn handle_client(
         tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
     }
 
-    write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
+    let banner = format!("de {station_call}-# >\r\n");
+    tokio::select! {
+        result = write_with_timeout(&mut wr, banner.as_bytes()) => {
+            result?;
+        }
+        _ = shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("telnet: shutdown signalled before login banner, disconnecting");
+            }
+            metrics.record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    }
 
     // `sh/dx` default when the client didn't specify a count.
     const DEFAULT_SHOW_DX_COUNT: usize = 10;
@@ -373,7 +440,10 @@ async fn handle_client(
                             if log_enabled {
                                 tracing::warn!("telnet: spot write failed, disconnecting");
                             }
-                            metrics.record_write_failed(1 + rx.len() as u64);
+                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                true,
+                                rx.len(),
+                            ));
                             return Ok(());
                         }
                     }
@@ -467,7 +537,56 @@ async fn handle_client(
                         // spot's publish-time occurrence_count precisely
                         // so this comparison is possible here.
                         let mut history = bus.recent(n).into_iter();
-                        while let Some(bus_spot) = history.next() {
+                        loop {
+                            // MAN-45 remediate (round-16 P1, finding 2):
+                            // checked BEFORE pulling the next history
+                            // entry, not left to `select!` to notice
+                            // `shutdown` between commands -- `select!` only
+                            // polls its other branches once THIS one's
+                            // future resolves, so a full un-checked replay
+                            // of up to `RECENT_HISTORY_CAP` entries (each
+                            // up to two `WRITE_TIMEOUT`s) could otherwise
+                            // run for up to ~1000s after shutdown was
+                            // already signalled, invisible to the shutdown-
+                            // drain branch below the whole time. `has_changed`
+                            // (never `changed`, which this loop doesn't own
+                            // as a `select!` branch) only PEEKS the pending
+                            // value without marking it seen, so the real
+                            // `_ = shutdown.changed() =>` branch still fires
+                            // normally afterwards for whatever's left on
+                            // the live channel.
+                            //
+                            // MAN-45 remediate (round 17, CR-2/CR-3): `break`
+                            // back to the `select!` loop instead of
+                            // `return`ing directly -- the loop's own
+                            // `_ = shutdown.changed() =>` branch still has
+                            // its full, unused `CLIENT_DRAIN_DEADLINE`
+                            // budget and can actually DELIVER the live `rx`
+                            // backlog (e.g. spots `TrackManager::finish()`
+                            // just published), rather than abandoning it
+                            // outright on a healthy, fast-reading client
+                            // (CR-2). The remaining `history` entries are
+                            // deliberately NOT charged to
+                            // `manta_spots_dropped_write_failed_total` here:
+                            // they are replays of spots already published
+                            // (and already counted once in
+                            // `manta_spots_total`, often already delivered
+                            // live to this same client), not newly-lost
+                            // live spots -- charging them on an ordinary,
+                            // no-write-failure shutdown fabricated data
+                            // loss on that counter (CR-3).
+                            if shutdown.has_changed().unwrap_or(true) {
+                                if log_enabled {
+                                    tracing::info!(
+                                        unreplayed_history = history.len(),
+                                        "telnet: shutdown signalled mid sh/dx replay, deferring to the drain loop for the live backlog"
+                                    );
+                                }
+                                break;
+                            }
+                            let Some(bus_spot) = history.next() else {
+                                break;
+                            };
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
@@ -479,21 +598,37 @@ async fn handle_client(
                                 .is_err()
                             {
                                 // A bare `?` here (the prior behavior)
-                                // abandoned not just the rest of this
-                                // history replay but every live spot
-                                // still retained in `rx` too, uncounted
-                                // (round-13 review finding) -- count this
-                                // failed write, whatever's left of the
-                                // history iterator, and whatever's still
-                                // retained on the live channel.
+                                // abandoned every live spot still retained
+                                // in `rx` too, uncounted (round-13 review
+                                // finding) -- that live backlog is real,
+                                // newly-lost data and must be counted.
+                                // MAN-45 remediate (code-review round 18,
+                                // finding 1): the failed write itself and
+                                // the rest of `history`, however, are NOT
+                                // counted here -- both are replays of spots
+                                // already published (and already counted
+                                // once in `manta_spots_total`, often
+                                // already delivered live to this same
+                                // client before `sh/dx` was even issued),
+                                // not newly-lost live spots. This is the
+                                // exact CR-3 rationale applied a few dozen
+                                // lines above for the ordinary
+                                // no-write-failure shutdown break --
+                                // charging replay loss as real loss here
+                                // too, on the write-failure path, produced
+                                // a counter that could overcount actual
+                                // loss (and in principle exceed
+                                // `manta_spots_total`) and disagreed with
+                                // CR-3's own reasoning one function up.
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
                                 if log_enabled {
                                     tracing::warn!("telnet: sh/dx history write failed, disconnecting");
                                 }
-                                metrics.record_write_failed(
-                                    1 + history.len() as u64 + rx.len() as u64,
-                                );
+                                metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                    false,
+                                    rx.len(),
+                                ));
                                 return Ok(());
                             }
                         }
@@ -520,7 +655,10 @@ async fn handle_client(
                             if log_enabled {
                                 tracing::warn!("telnet: filter-ack write failed, disconnecting");
                             }
-                            metrics.record_write_failed(rx.len() as u64);
+                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                false,
+                                rx.len(),
+                            ));
                             return Ok(());
                         }
                     }
@@ -537,38 +675,72 @@ async fn handle_client(
             // published right before the daemon exited -- rather than
             // dropping them unsent.
             _ = shutdown.changed() => {
+                // MAN-45 (round-16 finding): this loop's OWN deadline. The
+                // outer `SHUTDOWN_DRAIN_DEADLINE`/`await_all` bound is
+                // registry-wide and cannot scale with any one client's
+                // backlog depth -- and when it expired,
+                // `Runtime::shutdown_timeout` aborted this task mid-write
+                // with everything abandoned uncounted. Same monotonic
+                // remaining-budget idiom `looks_like_websocket_handshake`
+                // already uses in `json_stream`.
+                //
                 // A `Lagged(n)` mid-drain means this subscriber missed `n`
                 // spots, not that the channel is empty -- there can still
                 // be spots queued after the gap. Stopping on the first
                 // `Err` (the prior behavior) silently dropped everything
                 // from that point on without even recording the loss
                 // (round-6 review finding).
+                let drain_deadline = tokio::time::Instant::now() + drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
-                                    continue;
+                                    continue; // a filtered spot costs no budget
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
-                                .await
-                                .is_err()
-                            {
-                                // The client's socket is presumably dead --
-                                // further writes would just fail too. A
-                                // bare `?` here (the prior behavior)
-                                // propagated the error out of the whole
-                                // handler, abandoning the rest of the
+                            // Checked BEFORE the write, not around it: this
+                            // spot has already left `rx`, so a `timeout`
+                            // wrapped around the whole loop would drop it
+                            // mid-write -- neither delivered nor counted,
+                            // reintroducing the silent loss this fix exists
+                            // to end. `true` (in-flight) is exactly that
+                            // spot.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(
+                                        remaining,
+                                        write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot),
+                                    )
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
+                                // The client's socket is presumably dead
+                                // (or hopelessly slow) -- further writes
+                                // would just fail or exhaust the budget
+                                // too. A bare `?` here (the pre-round-12
+                                // behavior) propagated the error out of the
+                                // whole handler, abandoning the rest of the
                                 // drain loop uncounted (round-12 review
-                                // finding).
-                                // MAN-59 review round 2: returns Ok(()),
-                                // not Err -- log it directly.
+                                // finding); a flat outer deadline alone
+                                // (the pre-round-16 behavior) let
+                                // `Runtime::shutdown_timeout` abort this
+                                // task mid-write once a multi-spot backlog
+                                // exceeded it, also uncounted (round-16
+                                // review finding).
                                 if log_enabled {
-                                    tracing::warn!("telnet: shutdown-drain write failed, disconnecting");
+                                    tracing::warn!(
+                                        "telnet: shutdown-drain write failed or ran out of budget, disconnecting"
+                                    );
                                 }
-                                metrics.record_write_failed(1 + rx.len() as u64);
+                                metrics.record_write_failed(crate::metrics::abandoned_spot_count(
+                                    true,
+                                    rx.len(),
+                                ));
                                 return Ok(());
                             }
                         }

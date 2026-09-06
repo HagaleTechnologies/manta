@@ -7,8 +7,8 @@ maintainer: agent
 sources:
   - ARCHITECTURE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: 5b9e747
+  date: 2026-09-04
 links:
   - decode-chain
   - spot-output-contract
@@ -22,6 +22,8 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 - Repetition requirement (a call must decode more than once within a window before first spot) is the main garble filter: §6.4.
 - Dedupe key = (callsign, freq bucket) with a re-spot suppression window unless SNR improves or type changes: §6.5.
 - `Validator::tracks`/`RepetitionGate::seen` are per-track_id state that must be freed on `DecoderEvent::TrackClosed` — the normative teardown contract (a real, measured leak this bug produced) lives in `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`, not here.
+- **MAN-28's Watch List allowlist bypasses this gate deliberately**: an operator-specified callsign in `Validator::allowlist` skips `cty.is_allocated()`/the repetition gate entirely, so an allowlisted call can reach the emit path even when `cty.lookup` itself can't resolve its geography. The output-side consequence (what `SpotMessage::from_spot` emits for that case) is [[spot-output-contract]]'s concern, not this page's — see `docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md`.
+- The decoder-output prefilter (`manta_spot::grammar::is_plausible`) is scoped to THIS pipeline only — it is not, and must not be reused as, operator-identity validation (e.g. a configured station callsign). See `crates/manta-spot/src/grammar.rs`'s module doc and `manta_server::config::check_operator_callsign`.
 
 ## Why it is shaped this way
 

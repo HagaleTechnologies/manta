@@ -699,6 +699,10 @@ fn build_pipeline_config(
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+    /// MAN-45 (round-6 review finding): shared with the JSON/WS listener's
+    /// own copy so the `on_spot` callback below can count a spot whose
+    /// geography `cty.lookup` can't resolve, without re-parsing `cty.dat`.
+    cty: std::sync::Arc<manta_spot::cty::Table>,
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
@@ -744,7 +748,76 @@ struct SpotServer {
 /// one spot. The previous 2s value was shorter than even a single one of
 /// those 10s writes, so a genuinely slow-but-completing client was
 /// routinely cut off mid-drain for no reason (round-15 review finding).
-const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+///
+/// MAN-45 (round-16 finding): as of this change, the value that actually
+/// bounds ONE client's drain is `manta_server::tasks::CLIENT_DRAIN_DEADLINE`
+/// -- each of the three per-client drain loops (telnet's, json_stream's TCP
+/// and WS) now enforces its own inner deadline and counts whatever it
+/// abandons when that fires, so a healthy handler always returns from
+/// `await_all` well within its own budget. This constant is now a
+/// registry-wide *scheduling backstop* above that per-client bound (see the
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// test below) -- it no longer needs sizing against any particular spot
+/// count, only against `CLIENT_DRAIN_DEADLINE` plus scheduling margin.
+///
+/// MAN-45 remediate (round-16 P1, finding 2): "scheduling margin" above
+/// CLIENT_DRAIN_DEADLINE isn't the whole story -- `CLIENT_DRAIN_DEADLINE`
+/// only bounds a handler's OWN `_ = shutdown.changed() =>` branch body.
+/// `tokio::select!` doesn't poll that branch again until whichever OTHER
+/// branch is currently running resolves, so a handler already mid-write
+/// when shutdown fires can burn up to its own current branch's full
+/// worst-case time BEFORE it even reaches the drain branch and starts
+/// that 20s clock. The largest such branch across all three handlers is
+/// telnet's live-spot write (`manta_server::telnet::WRITE_TIMEOUT`, TWO
+/// separately-timed writes per spot) -- json_stream's TCP/WS write and
+/// Pong-reply arms are each a single `WRITE_TIMEOUT`, strictly smaller.
+/// So the true worst case this deadline must outlive is `2 *
+/// telnet::WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE`, not
+/// `CLIENT_DRAIN_DEADLINE` alone (asserted directly by
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// below). telnet's `sh/dx` replay loop is bounded to the SAME worst case
+/// as the live-write arm rather than its own unbounded backlog depth: it
+/// re-checks `shutdown.has_changed()` before every history entry and, the
+/// moment it's observed, `break`s back to the `select!` loop's own drain
+/// branch to deliver the live `rx` backlog with that branch's full unused
+/// budget, rather than abandoning it (validation round 17, CR-2/CR-3 --
+/// the remaining history replay itself is simply not re-attempted, since
+/// those entries were already published and counted once).
+///
+/// Validation round 17 (CR-1): this model above only accounts for
+/// branches INSIDE the `select!` loop -- it does NOT need to also budget
+/// for `telnet::handle_client`'s pre-loop login handshake (prompt write,
+/// login-line read, banner write; up to `WRITE_TIMEOUT +
+/// bounded_io::IDLE_READ_TIMEOUT + WRITE_TIMEOUT` = 50s) because that
+/// handshake itself now races `shutdown.changed()` at every step and
+/// bails out (counting its subscribed `rx` backlog) the moment shutdown
+/// fires, instead of running any of those three waits to completion
+/// first. A stalled pre-login client therefore contributes close to zero
+/// to shutdown latency, not up to 50s -- if a future change ever makes
+/// that handshake NOT shutdown-aware again, this deadline's true worst
+/// case would need to grow to include it.
+///
+/// MAN-45 remediate (code-review round 18, finding 3): the same was true,
+/// but NOT yet fixed, of `json_stream::serve`'s pre-loop phase --
+/// `looks_like_websocket_handshake`'s classifying peek (up to
+/// `PEEK_TIMEOUT`, or `HANDSHAKE_TIMEOUT` once any byte had arrived) and
+/// `handle_ws_client`'s own `accept_async_with_config` step (up to another
+/// `HANDSHAKE_TIMEOUT`) previously never observed `shutdown` either. Both
+/// now race `shutdown.changed()` the same way telnet's handshake does, so
+/// this deadline's safety margin no longer rests on the coincidence that
+/// json_stream's *unraced* worst case (20s) happened to be smaller than
+/// telnet's live-write branch (`2 * telnet::WRITE_TIMEOUT` = 20s) already
+/// budgeted for above -- it now holds because BOTH pre-loop phases are
+/// shutdown-aware by design, matching this deadline's own model.
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// How often the server runtime copies the engine's live track count into
+/// the `manta_active_tracks` gauge. The decode loop runs on the MAIN
+/// thread, outside the tokio runtime that owns `Metrics`, so a poller is
+/// the bridge -- the same shape MAN-55's `confirmed_live_handle` watcher
+/// already uses. 4 Hz is far finer than any Prometheus scrape interval and
+/// costs one relaxed atomic load per tick.
+const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
@@ -852,6 +925,7 @@ fn start_spot_server(
                 cfg.telnet_max_connections_per_ip,
             ),
             telnet_ip_command_limiter,
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
         ));
         let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::json_stream::MAX_INBOUND_PINGS,
@@ -864,13 +938,14 @@ fn start_spot_server(
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus.clone(),
                 metrics: metrics.clone(),
-                cty,
+                cty: cty.clone(),
                 station_call: cfg.station_callsign.clone(),
                 decoder_version,
                 // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
                 // need shutdown_rx -- can't let this be the moving consumer
                 // anymore now that there are more consumers.
                 shutdown: shutdown_rx.clone(),
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks.clone(),
             manta_server::tasks::new_connection_limiter(
@@ -926,6 +1001,7 @@ fn start_spot_server(
         SpotServer {
             bus,
             metrics,
+            cty,
             shutdown_tx,
             tasks,
         },
@@ -1095,85 +1171,116 @@ fn main() -> Result<()> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match server_config {
-                Some(path) => {
-                    // `epoch` feeds SpotBus's wall-clock conversion (every
-                    // JSON `timestamp`/RBN Zulu field a client observes) --
-                    // a live session's epoch is this process's real start
-                    // time; a replay session's defaults to the replayed
-                    // file's own mtime, a genuine timestamp that's stable
-                    // across reruns of the SAME untouched file, but changes
-                    // across a copy/download/restore that doesn't preserve
-                    // filesystem metadata even though the recording's
-                    // content is identical -- pass --replay-epoch to pin an
-                    // exact value when that matters more than "whatever
-                    // this machine's copy says" (round-7 review finding;
-                    // see the flag's own doc comment for the full
-                    // rationale, and `epoch_for_replay_path`'s for why
-                    // neither "always now()" nor a content-hash alone was
-                    // right before this flag existed). `session_nonce` is
-                    // the separate, spot-id-uniqueness-only value:
-                    // recording-content-derived for file replay (so
-                    // different recordings never collide on id even at the
-                    // same track/sample position), nanosecond-precision-now
-                    // for a live session (so two live sessions started
-                    // within the same wall-clock second don't collide
-                    // either).
-                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                    let session_nonce: u128 = match &replay_path {
-                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
-                        // Live session: `epoch` above is already SystemTime::now().
-                        None => epoch
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .expect("epoch predates the Unix epoch")
-                            .as_nanos(),
-                    };
+            let (server_runtime, spot_server, active_tracks, mut active_tracks_poller) =
+                match server_config {
+                    Some(path) => {
+                        // `epoch` feeds SpotBus's wall-clock conversion (every
+                        // JSON `timestamp`/RBN Zulu field a client observes) --
+                        // a live session's epoch is this process's real start
+                        // time; a replay session's defaults to the replayed
+                        // file's own mtime, a genuine timestamp that's stable
+                        // across reruns of the SAME untouched file, but changes
+                        // across a copy/download/restore that doesn't preserve
+                        // filesystem metadata even though the recording's
+                        // content is identical -- pass --replay-epoch to pin an
+                        // exact value when that matters more than "whatever
+                        // this machine's copy says" (round-7 review finding;
+                        // see the flag's own doc comment for the full
+                        // rationale, and `epoch_for_replay_path`'s for why
+                        // neither "always now()" nor a content-hash alone was
+                        // right before this flag existed). `session_nonce` is
+                        // the separate, spot-id-uniqueness-only value:
+                        // recording-content-derived for file replay (so
+                        // different recordings never collide on id even at the
+                        // same track/sample position), nanosecond-precision-now
+                        // for a live session (so two live sessions started
+                        // within the same wall-clock second don't collide
+                        // either).
+                        let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                        let session_nonce: u128 = match &replay_path {
+                            Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                            // Live session: `epoch` above is already SystemTime::now().
+                            None => epoch
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .expect("epoch predates the Unix epoch")
+                                .as_nanos(),
+                        };
 
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
-                    // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` has no equivalent
-                    // hook yet -- manta-engine exposes no live track-count
-                    // API for `listen()`'s callbacks to read, so it stays
-                    // at Metrics::default()'s 0 until that surface exists.
-                    //
-                    // MAN-55: for a source where `open()` succeeding
-                    // doesn't confirm a live device (HPSDR's UDP
-                    // connect/send need no peer response at all),
-                    // `confirmed_live_handle()` returns Some, and health
-                    // starts false, flipping true only once the source's
-                    // own read loop has actually processed a valid
-                    // packet. Every other source type (Kiwi/Soapy/audio/
-                    // file) returns None from the trait's default and
-                    // keeps the original immediate-true behavior, since
-                    // opening those already implies liveness.
-                    match src.confirmed_live_handle() {
-                        Some(live) => {
-                            server.metrics.set_source_health(source_name, false);
-                            let metrics = server.metrics.clone();
+                        let (rt, server) =
+                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                        // MAN-45 (round-9 finding): the daemon's own copy of the
+                        // gauge `manta_engine::listen_with_observers` updates as
+                        // it runs (on the MAIN thread, outside this tokio
+                        // runtime) -- polled into `Metrics` below, the same
+                        // bridge shape MAN-55's `confirmed_live_handle` watcher
+                        // uses for source liveness.
+                        let active_tracks =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        // MAN-45 remediate (code-review finding 1): the
+                        // `JoinHandle` is kept, not discarded, so the shutdown
+                        // sequence below can abort this poller and WAIT for it
+                        // to actually stop before writing the deterministic
+                        // zero -- otherwise a tick already in flight can read
+                        // the still-stale gauge and write it right back after
+                        // the zero, undoing it.
+                        let active_tracks_poller = {
+                            let gauge = active_tracks.clone();
+                            let track_metrics = server.metrics.clone();
                             rt.spawn(async move {
-                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                loop {
+                                    track_metrics.set_active_tracks(
+                                        gauge.load(std::sync::atomic::Ordering::Relaxed),
+                                    );
+                                    tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
                                 }
-                                metrics.set_source_health(source_name, true);
-                            });
+                            })
+                        };
+                        // MAN-55: for a source where `open()` succeeding
+                        // doesn't confirm a live device (HPSDR's UDP
+                        // connect/send need no peer response at all),
+                        // `confirmed_live_handle()` returns Some, and health
+                        // starts false, flipping true only once the source's
+                        // own read loop has actually processed a valid
+                        // packet. Every other source type (Kiwi/Soapy/audio/
+                        // file) returns None from the trait's default and
+                        // keeps the original immediate-true behavior, since
+                        // opening those already implies liveness.
+                        match src.confirmed_live_handle() {
+                            Some(live) => {
+                                server.metrics.set_source_health(source_name, false);
+                                let metrics = server.metrics.clone();
+                                rt.spawn(async move {
+                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
+                                        tokio::time::sleep(std::time::Duration::from_millis(200))
+                                            .await;
+                                    }
+                                    metrics.set_source_health(source_name, true);
+                                });
+                            }
+                            None => server.metrics.set_source_health(source_name, true),
                         }
-                        None => server.metrics.set_source_health(source_name, true),
+                        (
+                            Some(rt),
+                            Some(server),
+                            Some(active_tracks),
+                            Some(active_tracks_poller),
+                        )
                     }
-                    (Some(rt), Some(server))
-                }
-                None => (None, None),
-            };
+                    None => (None, None, None, None),
+                };
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            let listen_result = manta_engine::listen(
+            let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
                 stop,
+                manta_engine::ListenObservers {
+                    active_tracks: active_tracks.clone(),
+                },
                 |ev| {
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
@@ -1203,6 +1310,14 @@ fn main() -> Result<()> {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
                         server.metrics.record_spot();
+                        // MAN-45: counted ONCE per spot at publish time, not
+                        // inside `SpotMessage::from_spot` -- that runs once
+                        // per connected JSON/WS client, which would scale
+                        // the count with client count instead of spot
+                        // count.
+                        if server.cty.lookup(&spot.callsign).is_none() {
+                            server.metrics.record_unresolved_geography();
+                        }
                     }
                     if json {
                         println!("{}", serde_json::json!({ "spot": spot }));
@@ -1229,6 +1344,32 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
+                // MAN-45 remediate (code-review finding 1): the engine's
+                // own gauge is already 0 on the SUCCESS path
+                // (TrackManager::finish() closed every track before
+                // `listen_with_observers` returned), but NOT on the ERROR
+                // path -- `listen_result` above is deliberately captured
+                // rather than `?`-ed so an SDR disconnect or WAV read
+                // failure still runs this drain sequence (round-7 finding),
+                // and on that path `listen_with_observers` returns before
+                // reaching `tm.finish()`'s trailing zero, leaving the
+                // shared `AtomicU64` at the last processed chunk's nonzero
+                // count. The still-running poller reads that stale value
+                // every `ACTIVE_TRACKS_POLL_INTERVAL` and would overwrite
+                // the deterministic zero below within one tick if left
+                // running -- abort it and AWAIT its actual termination
+                // first (not just issue the abort and hope), so no
+                // in-flight tick can race the zero-write below. A metrics
+                // scrape landing anywhere in the `SHUTDOWN_DRAIN_DEADLINE`
+                // window that follows must never see a stale nonzero
+                // count for a daemon with no live tracks.
+                if let Some(poller) = active_tracks_poller.take() {
+                    poller.abort();
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(poller);
+                    }
+                }
+                server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -1328,6 +1469,38 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
+    /// must never fire before a handler's own drain deadline, or
+    /// `shutdown_timeout` aborts a drain that was still inside its budget
+    /// and the abandoned queue goes uncounted again -- the exact failure
+    /// rounds 15 and 16 both landed on from different directions. The
+    /// margin covers task scheduling, not another spot's write.
+    ///
+    /// MAN-45 remediate (round-16 P1, finding 2): `CLIENT_DRAIN_DEADLINE`
+    /// alone under-counts the true worst case -- a handler already mid-
+    /// write when shutdown fires doesn't even START its own drain
+    /// deadline until that in-progress `select!` branch resolves. Asserts
+    /// the FULL relationship (`2 * telnet::WRITE_TIMEOUT +
+    /// CLIENT_DRAIN_DEADLINE`, telnet's live-spot write being the largest
+    /// such in-progress branch across all three handlers), not just the
+    /// drain deadline in isolation -- see `SHUTDOWN_DRAIN_DEADLINE`'s own
+    /// doc comment for the full argument.
+    #[test]
+    fn the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline() {
+        let worst_case_before_drain_starts = 2 * manta_server::telnet::WRITE_TIMEOUT;
+        let true_worst_case =
+            worst_case_before_drain_starts + manta_server::tasks::CLIENT_DRAIN_DEADLINE;
+        assert!(
+            SHUTDOWN_DRAIN_DEADLINE > true_worst_case,
+            "SHUTDOWN_DRAIN_DEADLINE ({SHUTDOWN_DRAIN_DEADLINE:?}) must exceed the true \
+             worst case of {true_worst_case:?} (2 * telnet::WRITE_TIMEOUT = \
+             {worst_case_before_drain_starts:?}, the largest in-progress `select!` branch \
+             a handler can already be running when shutdown fires, plus \
+             CLIENT_DRAIN_DEADLINE = {:?} for its own drain loop once it gets there)",
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
     }
 
     #[test]

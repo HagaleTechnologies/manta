@@ -118,6 +118,7 @@ struct ClientCtx {
     station_call: String,
     decoder_version: String,
     shutdown: watch::Receiver<bool>,
+    drain_deadline: Duration,
 }
 
 impl ClientCtx {
@@ -147,6 +148,11 @@ pub struct JsonStreamConfig {
     pub station_call: String,
     pub decoder_version: String,
     pub shutdown: watch::Receiver<bool>,
+    /// MAN-45 (round-16 finding): the per-client shutdown-drain deadline --
+    /// see `tasks::CLIENT_DRAIN_DEADLINE`'s doc comment for why this must
+    /// live on each handler's own loop rather than only the outer
+    /// registry-wide `await_all` deadline.
+    pub drain_deadline: Duration,
 }
 
 /// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
@@ -193,6 +199,7 @@ pub async fn serve(
         station_call: config.station_call,
         decoder_version: config.decoder_version,
         shutdown: config.shutdown,
+        drain_deadline: config.drain_deadline,
     };
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -259,37 +266,68 @@ pub async fn serve(
             // OTHER disconnect path already logs its own specific reason
             // inline -- this is the one catch-all left uncovered without
             // it, and the only place that needs the raw error itself.
-            if looks_like_websocket_handshake(&socket).await {
-                ctx.metrics.inc_ws_clients();
-                let result = handle_ws_client(
-                    socket,
-                    rx,
-                    ctx.clone(),
-                    peer,
-                    peer_ip,
-                    ip_ping_limiter,
-                    log_enabled,
-                    rejection_log_limiter,
-                )
-                .await;
-                // MAN-68 (round 6): only the Unlogged variant reaches here
-                // -- Logged means the handshake reject/timeout branch
-                // already reported this exact error.
-                if log_enabled {
-                    if let Err(WsClientError::Unlogged(e)) = &result {
-                        tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
+            //
+            // A separate clone (not `ctx.shutdown` directly) purely so this
+            // classifying peek doesn't need `ctx` itself to be mutable --
+            // `handle_ws_client`/`handle_tcp_client` below still get their
+            // own independent clone via `ctx.clone()`, each tracking
+            // `shutdown` correctly for their own `select!` loop regardless
+            // of whether this peek ever observed a change.
+            let mut peek_shutdown = ctx.shutdown.clone();
+            match looks_like_websocket_handshake(&socket, &mut peek_shutdown).await {
+                None => {
+                    // MAN-45 remediate (code-review round 18, finding 3):
+                    // shutdown fired before classification completed --
+                    // this connection was never dispatched to either
+                    // handler and is not counted in either client gauge,
+                    // so nothing to decrement. Its subscribed `rx` backlog
+                    // is abandoned the same as telnet's pre-login CR-1
+                    // branches; no write was ever attempted here either.
+                    if log_enabled {
+                        tracing::info!(
+                            "json_stream: shutdown signalled during handshake classification, disconnecting"
+                        );
                     }
+                    ctx.metrics
+                        .record_dropped_shutdown(crate::metrics::abandoned_spot_count(
+                            false,
+                            rx.len(),
+                        ));
                 }
-                ctx.metrics.dec_ws_clients();
-            } else {
-                ctx.metrics.inc_json_clients();
-                let result = handle_tcp_client(socket, rx, ctx.clone(), peer, log_enabled).await;
-                if log_enabled {
-                    if let Err(e) = &result {
-                        tracing::warn!(peer = %peer, error = %e, "json_stream: raw TCP client task ended with an error");
+                Some(true) => {
+                    ctx.metrics.inc_ws_clients();
+                    let result = handle_ws_client(
+                        socket,
+                        rx,
+                        ctx.clone(),
+                        peer,
+                        peer_ip,
+                        ip_ping_limiter,
+                        log_enabled,
+                        rejection_log_limiter,
+                    )
+                    .await;
+                    // MAN-68 (round 6): only the Unlogged variant reaches here
+                    // -- Logged means the handshake reject/timeout branch
+                    // already reported this exact error.
+                    if log_enabled {
+                        if let Err(WsClientError::Unlogged(e)) = &result {
+                            tracing::warn!(peer = %peer, error = %e, "json_stream: WS client task ended with an error");
+                        }
                     }
+                    ctx.metrics.dec_ws_clients();
                 }
-                ctx.metrics.dec_json_clients();
+                Some(false) => {
+                    ctx.metrics.inc_json_clients();
+                    let result =
+                        handle_tcp_client(socket, rx, ctx.clone(), peer, log_enabled).await;
+                    if log_enabled {
+                        if let Err(e) = &result {
+                            tracing::warn!(peer = %peer, error = %e, "json_stream: raw TCP client task ended with an error");
+                        }
+                    }
+                    ctx.metrics.dec_json_clients();
+                }
             }
         });
     }
@@ -302,18 +340,43 @@ pub async fn serve(
 /// just because the first peek alone came up short.
 const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
+/// `None` means `shutdown` fired before classification completed -- the
+/// caller must disconnect without dispatching to either handler. `Some(_)`
+/// is the ordinary classification result (`true` = WebSocket, `false` =
+/// raw JSON Lines), exactly as before this became shutdown-aware.
+///
+/// MAN-45 remediate (code-review round 18, finding 3): before this fix,
+/// this peek loop (up to `PEEK_TIMEOUT`, or `HANDSHAKE_TIMEOUT` once any
+/// byte had arrived) never observed `shutdown` at all -- the exact gap
+/// `telnet::handle_client`'s pre-login handshake had before round 17's
+/// CR-1 fix, just on this file's side of the port split. A client that
+/// connected and then stalled before completing (or ever starting) a WS
+/// handshake held this task outside any `select!` loop for up to that full
+/// budget, invisible to shutdown the whole time, with its already-
+/// subscribed `rx` backlog abandoned uncounted if `Runtime::shutdown_timeout`
+/// aborted it first. Racing each peek against `shutdown.changed()` keeps
+/// this phase's contribution to shutdown latency close to zero, matching
+/// telnet's fix and `SHUTDOWN_DRAIN_DEADLINE`'s (`manta-cli`) doc comment,
+/// which now covers this file's pre-loop phase too.
+async fn looks_like_websocket_handshake(
+    socket: &TcpStream,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<bool> {
     let mut deadline = tokio::time::Instant::now() + PEEK_TIMEOUT;
     let mut peek_buf = [0u8; 3];
     let mut seen_any_bytes = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return false; // budget exhausted with < 3 bytes ever seen
+            return Some(false); // budget exhausted with < 3 bytes ever seen
         }
-        match tokio::time::timeout(remaining, socket.peek(&mut peek_buf)).await {
-            Ok(Ok(n)) if n >= 3 => return &peek_buf[..3] == b"GET",
-            Ok(Ok(0)) => return false, // peer closed without sending anything
+        let peek_result = tokio::select! {
+            result = tokio::time::timeout(remaining, socket.peek(&mut peek_buf)) => result,
+            _ = shutdown.changed() => return None,
+        };
+        match peek_result {
+            Ok(Ok(n)) if n >= 3 => return Some(&peek_buf[..3] == b"GET"),
+            Ok(Ok(0)) => return Some(false), // peer closed without sending anything
             Ok(Ok(_)) => {
                 if !seen_any_bytes {
                     // Some evidence of an in-progress handshake (e.g. "G"
@@ -334,7 +397,7 @@ async fn looks_like_websocket_handshake(socket: &TcpStream) -> bool {
                 }
                 tokio::time::sleep(PEEK_RETRY_INTERVAL).await;
             }
-            Ok(Err(_)) | Err(_) => return false,
+            Ok(Err(_)) | Err(_) => return Some(false),
         }
     }
 }
@@ -381,7 +444,9 @@ async fn handle_tcp_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: spot write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                            ctx.metrics.record_write_failed(
+                                crate::metrics::abandoned_spot_count(true, rx.len()),
+                            );
                             return Ok(());
                         }
                     }
@@ -438,22 +503,38 @@ async fn handle_tcp_client(
             // Explicit shutdown: drain whatever's already queued rather
             // than dropping it when the runtime forcibly tears down.
             _ = ctx.shutdown.changed() => {
+                // MAN-45 (round-16 finding): this loop's OWN deadline --
+                // see `telnet::handle_client`'s identical shutdown-drain
+                // branch, and `tasks::CLIENT_DRAIN_DEADLINE`'s doc comment,
+                // for the full rationale (a flat outer registry-wide
+                // deadline can't scale with any one client's backlog
+                // depth).
+                //
                 // A `Lagged(n)` mid-drain means this subscriber missed `n`
                 // spots, not that the channel is empty -- there can still
                 // be spots queued after the gap. Stopping on the first
                 // `Err` (the prior behavior) silently dropped everything
                 // from that point on without even recording the loss
                 // (round-6 review finding).
+                let drain_deadline = tokio::time::Instant::now() + ctx.drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             let line = ctx.render(&bus_spot);
-                            let write_result = tokio::time::timeout(WRITE_TIMEOUT, async {
-                                socket.write_all(line.as_bytes()).await?;
-                                socket.write_all(b"\n").await
-                            })
-                            .await;
-                            if !matches!(write_result, Ok(Ok(()))) {
+                            // Checked BEFORE the write, not around it --
+                            // see telnet's identical comment for why.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(WRITE_TIMEOUT.min(remaining), async {
+                                        socket.write_all(line.as_bytes()).await?;
+                                        socket.write_all(b"\n").await
+                                    })
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
                                 // The client's socket is presumably dead --
                                 // further writes would just fail too, so
                                 // stop draining and count what's abandoned
@@ -461,15 +542,21 @@ async fn handle_tcp_client(
                                 // retained), rather than silently
                                 // discarding the error and continuing to
                                 // burn the write timeout on every remaining
-                                // queued spot (round-12 review finding).
+                                // queued spot (round-12 review finding), or
+                                // letting the outer registry-wide deadline
+                                // abort this task mid-write once a
+                                // multi-spot backlog exceeded it, also
+                                // uncounted (round-16 review finding).
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
                                 if log_enabled {
                                     tracing::warn!(
-                                        "json_stream: shutdown-drain write failed, disconnecting"
+                                        "json_stream: shutdown-drain write failed or ran out of budget, disconnecting"
                                     );
                                 }
-                                ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                                ctx.metrics.record_write_failed(
+                                    crate::metrics::abandoned_spot_count(true, rx.len()),
+                                );
                                 return Ok(());
                             }
                         }
@@ -545,11 +632,32 @@ async fn handle_ws_client(
     let ws_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INBOUND_WS_MESSAGE_BYTES));
-    let ws_result = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
-    )
-    .await;
+    // MAN-45 remediate (code-review round 18, finding 3): races the
+    // handshake against `shutdown.changed()` too -- the same gap as
+    // `looks_like_websocket_handshake`'s, just the next step in a WS
+    // client's connection lifecycle. Uses `ctx.shutdown` itself (not a
+    // separate clone, unlike the classifying peek in `serve`): this is the
+    // SAME receiver the loop below's own `_ = ctx.shutdown.changed() =>`
+    // branch uses, and `select!` only marks a `watch::Receiver` as having
+    // seen a change on whichever branch actually wins -- a shutdown
+    // observed here consumes it and returns immediately, so there's
+    // nothing left for the loop to double-observe; one that DOESN'T fire
+    // here leaves the receiver exactly as unseen as before, so the loop's
+    // branch still fires normally afterward.
+    let ws_result = tokio::select! {
+        result = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            tokio_tungstenite::accept_async_with_config(socket, Some(ws_config)),
+        ) => result,
+        _ = ctx.shutdown.changed() => {
+            if log_enabled {
+                tracing::info!("json_stream: shutdown signalled during WS handshake, disconnecting");
+            }
+            ctx.metrics
+                .record_dropped_shutdown(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Ok(());
+        }
+    };
     let mut ws = match ws_result {
         Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
@@ -590,7 +698,9 @@ async fn handle_ws_client(
                             if log_enabled {
                                 tracing::warn!("json_stream: WS spot write failed, disconnecting");
                             }
-                            ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                            ctx.metrics.record_write_failed(
+                                crate::metrics::abandoned_spot_count(true, rx.len()),
+                            );
                             return Ok(());
                         }
                     }
@@ -640,10 +750,41 @@ async fn handle_ws_client(
                             }
                             return Ok(());
                         }
-                        tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
-                            .await
-                            .map_err(|_| anyhow::anyhow!("write timed out"))?
-                            .map_err(anyhow::Error::from)?;
+                        let write_result =
+                            tokio::time::timeout(WRITE_TIMEOUT, ws.send(Message::Pong(payload)))
+                                .await;
+                        if !matches!(write_result, Ok(Ok(()))) {
+                            // MAN-45 (round-16 review finding): a bare `?`
+                            // here (the prior behavior) returned Err
+                            // straight out of the handler, abandoning
+                            // everything still retained in `rx` without
+                            // counting any of it -- the last write site in
+                            // this file that used to do that after
+                            // rounds 11-15 converted the rest. No spot was
+                            // in flight (this is a control frame), so only
+                            // the retained backlog is charged -- same shape
+                            // as telnet's filter-ack site.
+                            //
+                            // Validation round 17 (CR-4): `telnet.rs`'s
+                            // pre-login prompt and banner writes are now
+                            // shutdown-aware and charge their own retained
+                            // `rx` backlog on that path (CR-1), but still
+                            // propagate a genuine (non-shutdown) write I/O
+                            // error via bare `?`, uncounted -- a real,
+                            // still-open gap, just no longer the ONLY one
+                            // this comment's original "last write site"
+                            // claim implied. Left as-is: narrower in scope
+                            // than CR-1/CR-2/CR-3, and it fires only on an
+                            // already-failing socket during a phase before
+                            // the client has ever received a spot.
+                            if log_enabled {
+                                tracing::warn!("json_stream: WS Pong write failed, disconnecting");
+                            }
+                            ctx.metrics.record_write_failed(
+                                crate::metrics::abandoned_spot_count(false, rx.len()),
+                            );
+                            return Ok(());
+                        }
                     }
                     // This server never sends Ping, so ANY inbound Pong is
                     // unsolicited -- treat it the same as Text/Binary
@@ -709,31 +850,50 @@ async fn handle_ws_client(
             // Explicit shutdown: drain whatever's already queued rather
             // than dropping it when the runtime forcibly tears down.
             _ = ctx.shutdown.changed() => {
-                // See the TCP handler's identical shutdown-drain branch
-                // above for why `Lagged` must not stop the drain.
+                // MAN-45 (round-16 finding): this loop's OWN deadline --
+                // see the TCP handler's identical shutdown-drain branch
+                // above, `telnet::handle_client`'s, and
+                // `tasks::CLIENT_DRAIN_DEADLINE`'s doc comment, for the
+                // full rationale. See the TCP handler's identical
+                // shutdown-drain branch above for why `Lagged` must not
+                // stop the drain.
+                let drain_deadline = tokio::time::Instant::now() + ctx.drain_deadline;
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
                             let text = ctx.render(&bus_spot);
-                            let write_result = tokio::time::timeout(
-                                WRITE_TIMEOUT,
-                                ws.send(Message::Text(text.into())),
-                            )
-                            .await;
-                            if !matches!(write_result, Ok(Ok(()))) {
+                            // Checked BEFORE the write, not around it --
+                            // see telnet's identical comment for why.
+                            let remaining = drain_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            let timed_out = remaining.is_zero()
+                                || !matches!(
+                                    tokio::time::timeout(
+                                        WRITE_TIMEOUT.min(remaining),
+                                        ws.send(Message::Text(text.into())),
+                                    )
+                                    .await,
+                                    Ok(Ok(())),
+                                );
+                            if timed_out {
                                 // See the TCP handler's identical
-                                // shutdown-drain branch for why a failed
-                                // write stops the drain instead of
-                                // silently continuing (round-12 review
+                                // shutdown-drain branch for why a failed or
+                                // budget-exhausted write stops the drain
+                                // instead of silently continuing (round-12
+                                // review finding), and does so with its own
+                                // deadline rather than only the outer
+                                // registry-wide one (round-16 review
                                 // finding).
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
                                 if log_enabled {
                                     tracing::warn!(
-                                        "json_stream: WS shutdown-drain write failed, disconnecting"
+                                        "json_stream: WS shutdown-drain write failed or ran out of budget, disconnecting"
                                     );
                                 }
-                                ctx.metrics.record_write_failed(1 + rx.len() as u64);
+                                ctx.metrics.record_write_failed(
+                                    crate::metrics::abandoned_spot_count(true, rx.len()),
+                                );
                                 return Ok(());
                             }
                         }

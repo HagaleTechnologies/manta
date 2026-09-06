@@ -22,6 +22,22 @@ async fn spawn_server() -> (
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+}
+
+/// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
+/// shutdown-drain deadline directly (e.g. `Duration::ZERO`, to make an
+/// expiry exact rather than timing-dependent) instead of always waiting on
+/// the production `CLIENT_DRAIN_DEADLINE`.
+async fn spawn_server_with_drain_deadline(
+    drain_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
@@ -54,6 +70,7 @@ async fn spawn_server() -> (
                 manta_server::telnet::MAX_TELNET_COMMANDS,
                 manta_server::telnet::COMMAND_RATE_WINDOW,
             ),
+            drain_deadline,
         )
         .await;
     });
@@ -377,6 +394,114 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
         .expect("connection never closed after the shutdown drain")
         .unwrap();
     assert_eq!(n, 0, "expected EOF after shutdown drain, got: {trailing:?}");
+}
+
+/// Validation round 17 (CR-1): before this fix, `handle_client`'s pre-loop
+/// login handshake (prompt write, login-line read, banner write) never
+/// observed `shutdown` at all -- a client that received the prompt and then
+/// simply stalled without sending a login line held its task inside
+/// `read_line_bounded_with_timeout` for up to `bounded_io::IDLE_READ_TIMEOUT`
+/// (30s), invisible to shutdown the whole time. The fix races every step of
+/// the handshake against `shutdown.changed()`. This is fully deterministic
+/// (no timing race): the "client" here never sends anything after reading
+/// the prompt, so the ONLY way the connection can close is via the new
+/// shutdown-aware branch -- without the fix this test would hang until the
+/// assertion's own timeout fires.
+///
+/// MAN-45 remediate (code-review round 18, finding 2): also asserts the
+/// abandoned backlog lands on `spots_dropped_shutdown_total`, NOT
+/// `spots_dropped_write_failed_total` -- no write ever failed on this path,
+/// the daemon shut down cleanly, and conflating the two would mislead an
+/// operator reading `spots_dropped_write_failed_total`'s own "socket write
+/// timed out or failed" HELP text.
+#[tokio::test]
+async fn shutdown_during_login_handshake_disconnects_promptly_instead_of_idling_out() {
+    let (addr, bus, metrics, shutdown_tx, _tasks) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Read (and discard) the login prompt, then go silent -- exactly a
+    // client that connects and never logs in.
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("expected the login prompt")
+        .unwrap();
+    assert!(n > 0, "expected a non-empty login prompt");
+
+    // Queued on this client's subscribed `rx` while it's stalled at the
+    // login prompt, so the abandoned-backlog count below is provably
+    // nonzero rather than a vacuous 0 == 0.
+    bus.publish(sample_spot());
+    bus.publish(sample_spot());
+
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled in the pre-login handshake must disconnect promptly once \
+             shutdown is signalled, not wait out the idle-read timeout",
+        );
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "expected EOF after shutdown during the login handshake"
+    );
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        2,
+        "the two queued spots must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
+}
+
+/// MAN-45 (PR #63 round-16 finding): a drain that cannot finish inside its
+/// own deadline must COUNT everything it abandons, never truncate silently
+/// (ARCHITECTURE §8). Driven with a zero deadline so the expiry is exact
+/// rather than timing-dependent -- the property under test is the
+/// accounting, not the duration.
+///
+/// The assertion is the invariant, not a fixed split: `select!` may still
+/// deliver some spots through the LIVE arm before the shutdown arm wins, so
+/// what must hold is that every published spot is either delivered or
+/// counted, never neither.
+#[tokio::test]
+async fn shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx, _tasks) =
+        spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    // Published and signalled without an intervening await, so the client
+    // task first wakes with all three already queued AND shutdown set.
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    // Read to EOF: the connection must close, not hang.
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => delivered += 1,
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
 }
 
 #[tokio::test]

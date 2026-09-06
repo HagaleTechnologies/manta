@@ -10,12 +10,58 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
+/// Spots abandoned when a client connection terminates on a failed write,
+/// or (via `Metrics::record_dropped_shutdown`) on a clean shutdown before
+/// any write was attempted. `in_flight_spot` is true when the write that
+/// just failed was carrying a NEWLY-LOST live spot (that spot is lost too)
+/// and false for a control-frame write -- telnet's `Filter set:`
+/// acknowledgement, the WebSocket Pong reply -- where nothing was in
+/// flight but the receiver's queue is abandoned all the same.
+/// `still_queued` is `rx.len()`.
+///
+/// MAN-45 remediate (code-review round 18, finding 1): telnet's `sh/dx`
+/// history-replay write-failure site also passes `false`, even though a
+/// write did fail there -- the entry it was writing is a REPLAY of a spot
+/// already published (and already counted once in `manta_spots_total`,
+/// often already delivered live to this same client), not newly-lost live
+/// data, so neither it nor the rest of the unreplayed history iterator is
+/// summed into `still_queued`. Only that call site's live `rx` backlog is
+/// real, newly-abandoned loss.
+///
+/// One function rather than the arithmetic open-coded at each site: rounds
+/// 11-16 each found one more write path with this accounting missing or
+/// subtly different, and the differences between `1 + rx.len()` and bare
+/// `rx.len()` are exactly what made each one easy to get wrong. Extracted
+/// for the same reason `json_stream::is_ws_protocol_violation` was: so the
+/// policy is testable without a live socket.
+pub fn abandoned_spot_count(in_flight_spot: bool, still_queued: usize) -> u64 {
+    still_queued as u64 + u64::from(in_flight_spot)
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
+    /// MAN-45 remediate (code-review round 18, finding 2): a client's
+    /// subscribed backlog abandoned because the daemon shut down while
+    /// that client was still in telnet's pre-login handshake or
+    /// json_stream's pre-loop WS-detection peek/handshake -- NO write
+    /// itself timed out or failed on this path, the daemon shut down
+    /// cleanly. Kept out of `spots_dropped_write_failed_total` for the
+    /// same reason `uplink_disconnected_total` is kept out of
+    /// `uplink_write_failed_total`: that counter's own name and
+    /// Prometheus HELP text ("a client's socket write timed out or
+    /// failed") would otherwise mislead an operator into diagnosing a
+    /// failing client socket when the real cause was a normal shutdown.
+    spots_dropped_shutdown_total: AtomicU64,
+    /// MAN-45 (round-6 review finding): a spot whose `dxContinent`/
+    /// `dxCqZone` fell back to the `spot_message::UNKNOWN_*` sentinels
+    /// because `cty.lookup` couldn't resolve the (possibly Watch-List-
+    /// allowlisted) callsign. Counted once per SPOT at publish time, not
+    /// once per connected client -- see the call site's doc comment.
+    spots_unresolved_geography_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -81,6 +127,38 @@ impl Metrics {
     pub fn record_write_failed(&self, n: u64) {
         self.spots_dropped_write_failed_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Read accessor for the write-failure counter, mirroring the
+    /// `uplink_*_total` getters -- lets an acceptance test assert the
+    /// "delivered + counted == published" invariant (ARCHITECTURE §8)
+    /// without parsing the Prometheus text body.
+    pub fn spots_dropped_write_failed_total(&self) -> u64 {
+        self.spots_dropped_write_failed_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// See `spots_dropped_shutdown_total`'s doc comment for why this is a
+    /// separate counter from `record_write_failed` rather than another
+    /// caller of it.
+    pub fn record_dropped_shutdown(&self, n: u64) {
+        self.spots_dropped_shutdown_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Read accessor mirroring `spots_dropped_write_failed_total` -- lets a
+    /// test assert the two counters independently (e.g. that a clean
+    /// shutdown mid-handshake charges this one and leaves the write-failure
+    /// counter untouched).
+    pub fn spots_dropped_shutdown_total(&self) -> u64 {
+        self.spots_dropped_shutdown_total.load(Ordering::Relaxed)
+    }
+
+    /// MAN-45 (round-6 review finding): see `spots_unresolved_geography_total`'s
+    /// doc comment.
+    pub fn record_unresolved_geography(&self) {
+        self.spots_unresolved_geography_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_telnet_clients(&self) {
@@ -257,6 +335,25 @@ impl Metrics {
                 .load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_spots_dropped_shutdown_total Spots abandoned because the daemon shut down while a client was still in its pre-login/handshake phase, before any socket write timed out or failed.\n",
+        );
+        out.push_str("# TYPE manta_spots_dropped_shutdown_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_dropped_shutdown_total {}\n",
+            self.spots_dropped_shutdown_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_unresolved_geography_total Spots emitted with unknown dxContinent/dxCqZone because cty.lookup could not resolve the (possibly Watch-List-allowlisted) callsign.\n",
+        );
+        out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_unresolved_geography_total {}\n",
+            self.spots_unresolved_geography_total
+                .load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
         out.push_str("# TYPE manta_telnet_clients_connected gauge\n");
         out.push_str(&format!(
@@ -370,6 +467,32 @@ impl Metrics {
 mod tests {
     use super::*;
 
+    /// MAN-45 (PR #63 round-16 finding, revised round-18 remediate finding
+    /// 1): the shapes every write-failure/clean-shutdown site in
+    /// `telnet`/`json_stream` needs, in one place: a failed LIVE-SPOT write
+    /// loses the in-flight spot too; a failed CONTROL-frame write (telnet's
+    /// filter ack, the WS Pong reply) or a clean-shutdown disconnect loses
+    /// only the queue; and `sh/dx`'s history-replay write failure is the
+    /// SAME shape as a control-frame write, not a spot write -- the entry
+    /// being written is a replay of an already-published, already-counted
+    /// spot, so neither it nor the rest of the unreplayed history iterator
+    /// is newly-lost data.
+    #[test]
+    fn abandoned_spot_count_covers_every_write_failure_and_shutdown_shape() {
+        // Live-spot write: the in-flight spot plus everything still retained.
+        assert_eq!(abandoned_spot_count(true, 7), 8);
+        // Control-frame write, or a clean shutdown with no write attempted:
+        // nothing was in flight, the queue is still lost.
+        assert_eq!(abandoned_spot_count(false, 7), 7);
+        // Nothing queued, control frame: nothing to charge.
+        assert_eq!(abandoned_spot_count(false, 0), 0);
+        // `sh/dx` history-replay write failure: same shape as a
+        // control-frame write -- the failed write and the rest of the
+        // history iterator are replays, not newly-lost live spots, so only
+        // the live `rx` backlog counts.
+        assert_eq!(abandoned_spot_count(false, 7), 7);
+    }
+
     #[test]
     fn renders_spot_count_as_a_prometheus_counter() {
         let m = Metrics::new();
@@ -430,6 +553,34 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_dropped_write_failed_total counter"));
         assert!(text.contains("manta_spots_dropped_write_failed_total 7"));
+    }
+
+    /// MAN-45 remediate (code-review round 18, finding 2): a clean-shutdown
+    /// disconnect must count separately from a genuine write failure, so an
+    /// operator reading `spots_dropped_write_failed_total`'s "socket write
+    /// timed out or failed" HELP text never sees a shutdown-only session
+    /// misattributed to it.
+    #[test]
+    fn renders_dropped_shutdown_count_as_a_prometheus_counter_distinct_from_write_failed() {
+        let m = Metrics::new();
+        m.record_dropped_shutdown(2);
+        m.record_dropped_shutdown(5);
+        assert_eq!(m.spots_dropped_shutdown_total(), 7);
+        assert_eq!(m.spots_dropped_write_failed_total(), 0);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_dropped_shutdown_total counter"));
+        assert!(text.contains("manta_spots_dropped_shutdown_total 7"));
+    }
+
+    /// MAN-45 (round-6 review finding).
+    #[test]
+    fn unresolved_geography_is_counted_and_exposed() {
+        let m = Metrics::new();
+        m.record_unresolved_geography();
+        m.record_unresolved_geography();
+        assert!(m
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 2"));
     }
 
     #[test]
