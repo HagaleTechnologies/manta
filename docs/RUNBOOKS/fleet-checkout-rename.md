@@ -91,8 +91,13 @@ instruction, turned into an executable gate that runs on the host where those
 tools actually exist (rather than a step this document could complete in
 advance). Point `--scan-root` at wherever `magazzino` and `link-build-cache.sh`
 live on that host if they're outside the default roots. On an
-already-migrated host `--apply` has nothing to move, so this preflight is
-skipped there — it exists to protect a move, not to gate the verified no-op.
+already-migrated host with no leftover `<old-name>-worktrees` directory,
+`--apply` has nothing left to move, so this preflight is skipped there — it
+exists to protect a move, not to gate the verified no-op. If a leftover
+`<old-name>-worktrees` directory remains (a hand-renamed main clone whose
+worktree parent is still at its legacy name), `--apply` still has that
+directory to move and the preflight still fires and can still refuse — it is
+skipped only when the whole run is a true no-op.
 `--check` always reports hits, since it never moves anything and the report
 is purely informational.
 

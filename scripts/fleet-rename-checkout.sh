@@ -164,7 +164,7 @@ FAILED=0
 # $1 = newline-separated baseline of paths that were ALREADY prunable before any
 #      move (empty for --check).
 verify() {
-  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root reg bn all_paths
+  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root root_canon reg bn all_paths
   mainpath="$(git -C "$MAIN" rev-parse --show-toplevel)"
   all_paths="$(inventory | cut -f1)"
 
@@ -255,10 +255,21 @@ verify() {
     root="$(jq -r --arg team "$TEAM_NEW" '[.projects[]? | select(.team==$team) | .repoRoot][0] // empty' "$reg" 2>/dev/null)"
     if [[ -z $root ]]; then
       fail "registry.json has no '$TEAM_NEW' entry (want repoRoot $NEW_MAIN)"
-    elif [[ $root != "$NEW_MAIN" ]]; then
-      fail "registry.json '$TEAM_NEW' repoRoot = $root (want $NEW_MAIN)"
     else
-      pass "registry.json '$TEAM_NEW' repoRoot = $NEW_MAIN"
+      # V-6: accept either spelling. A host whose org dir sits behind a
+      # symlink (F6) can have a correct, host-native entry written in
+      # either the canonicalized form ($NEW_MAIN) or the raw, $HOME-spelled
+      # form ($RAW_NEW_MAIN) — comparing canonical-only reports a false
+      # "MIGRATION NEEDED" on a healthy host. Also canonicalize $root itself
+      # when it resolves on this host, so a THIRD spelling that happens to
+      # point at the same real directory is accepted too.
+      root_canon="$root"
+      [[ -d $root ]] && root_canon="$(cd "$root" && pwd -P)"
+      if [[ $root == "$NEW_MAIN" || $root == "$RAW_NEW_MAIN" || $root_canon == "$NEW_MAIN" ]]; then
+        pass "registry.json '$TEAM_NEW' repoRoot = $root"
+      else
+        fail "registry.json '$TEAM_NEW' repoRoot = $root (want $NEW_MAIN)"
+      fi
     fi
   fi
 }
@@ -280,7 +291,16 @@ tooling_hits() {
   # grep would otherwise exit 2 for it and the caller's `|| true` below would
   # swallow that with no trace (also C-5).
   local roots=() r
-  while IFS= read -r r; do [[ -d $r ]] && roots+=("$r"); done < <(default_scan_roots)
+  while IFS= read -r r; do
+    if [[ -d $r ]]; then
+      roots+=("$r")
+    else
+      # F7: a missing DEFAULT root used to be dropped with no trace at all,
+      # indistinguishable downstream from "scanned it, found nothing" —
+      # warn here the same way a missing --scan-root already does below.
+      say "warning: default scan root '$r' does not exist — skipping it" >&2
+    fi
+  done < <(default_scan_roots)
   if [[ ${#SCAN_ROOTS[@]} -gt 0 ]]; then
     for r in "${SCAN_ROOTS[@]}"; do
       if [[ -d $r && -r $r ]]; then
@@ -290,7 +310,17 @@ tooling_hits() {
       fi
     done
   fi
-  [[ ${#roots[@]} -eq 0 ]] && return 0
+  if [[ ${#roots[@]} -eq 0 ]]; then
+    # F7: an empty effective root set used to `return 0` exactly like a
+    # clean scan of real roots — "scanned nothing" and "scanned everything,
+    # found nothing" were the same string to the caller, silently voiding
+    # the ticket's tooling-preflight instruction (ADR Decision 6) whenever
+    # every default and every --scan-root was absent. Loudly warn instead of
+    # returning silently so an operator or the runbook's evidence table
+    # cannot mistake this for a clean scan.
+    say "warning: no tooling-preflight scan roots exist or are readable — nothing was checked for hardcoded legacy-path references (this is NOT the same as 'checked and found none')" >&2
+    return 0
+  fi
   # Literal old checkout path, and the directory name as a path segment. Skip:
   #   - .git dirs and the checkout/worktree-parent trees themselves (their own
   #     history, and a linked worktree's *own* copy of this script/tests,
@@ -426,6 +456,10 @@ reconcile_registry() {
   # left alone on purpose: checkout-sync.mjs drops entries whose repoRoot is
   # missing (CTL-854), so it is already inert, and removing registry rows is a
   # wider change than MAN-27 needs.
+  # V-6: deliberately write the canonicalized spelling ($NEW_MAIN), not the
+  # raw $HOME-spelled one — it is unambiguous across a symlinked org dir,
+  # and verify()'s own read side now accepts either spelling, so a
+  # pre-existing entry in the raw form is never falsely flagged as drift.
   jq --arg team "$TEAM_NEW" --arg root "$NEW_MAIN" '
     .projects = ((.projects // []) | map(if .team == $team then .repoRoot = $root else . end))
     | if any(.projects[]; .team == $team) then .
@@ -497,7 +531,18 @@ $busy
           cand="$NEW_WTP/$bn"
         fi
       fi
-      [[ $cand != "$p" && -d $cand ]] && REPAIR+=("$cand")
+      if [[ $cand != "$p" && -d $cand ]]; then
+        REPAIR+=("$cand")
+      elif [[ -d $p ]] && ! git -C "$p" rev-parse --git-dir >/dev/null 2>&1; then
+        # V-5: a worktree living OUTSIDE org-dir entirely (its own directory
+        # never moved, e.g. the ~/catalyst/wt/<key>/<ticket> shape) keeps its
+        # RECORDED path unchanged when only the main clone is hand-renamed —
+        # cand stays == p, so the remap above never queues it — even though
+        # its .git file still targets $OLD_MAIN's now-nonexistent
+        # .git/worktrees dir. Queue it directly whenever it exists on disk
+        # but fails to resolve its own git-dir, regardless of path remapping.
+        REPAIR+=("$p")
+      fi
     done <<<"$(inventory)"
 
     if [[ ${#REPAIR[@]} -gt 0 ]]; then

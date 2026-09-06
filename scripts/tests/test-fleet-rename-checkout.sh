@@ -585,5 +585,58 @@ grep -q "tooling reference" <<<"$out" \
   && bad "T41 no false-positive tooling hit through symlinked org-dir" "$out" \
   || ok "T41 no false-positive tooling hit through symlinked org-dir"
 
+# --- T42: --apply on the ALREADY-MIGRATED branch repairs an external
+#     worktree (the ~/catalyst/wt/<key>/<ticket> shape) whose own directory
+#     never moved — its recorded path is unchanged (cand == p) so the
+#     prefix-remap that queues stale-legacy-path entries for repair never
+#     fires, yet its .git file still targets the old main clone's now-gone
+#     .git/worktrees dir once the main clone alone is hand-renamed
+#     (validation-round finding 1: infinite non-convergence) ---
+R=$(newroot); C=$(mkfixture "$R" skimmer); mkdir -p "$R/wt"
+addwt "$C" "$R/wt/MAN-9" MAN-9
+mv "$R/org/skimmer" "$R/org/manta"          # hand-rename: already STATE=migrated
+git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T42 exit" "$rc" "0"
+git -C "$R/wt/MAN-9" rev-parse --git-dir >/dev/null 2>&1 \
+  && ok "T42 external worktree repaired on already-migrated host" \
+  || bad "T42 external worktree repaired on already-migrated host" "$out"
+out2=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc2=$?
+check "T42 second apply exit" "$rc2" "0"
+grep -q "ALREADY MIGRATED" <<<"$out2" && ok "T42 converges (no re-run loop)" \
+  || bad "T42 converges (no re-run loop)" "$out2"
+
+# --- T43: registry.json repoRoot written in the raw, $HOME-spelled form
+#     through a symlinked org dir is accepted as correct, not flagged as
+#     drift against the canonicalized spelling (validation-round finding 2)
+#     ---
+R=$(newroot); C=$(mkfixture "$R/real" manta)
+git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+ln -s "$R/real" "$R/link"
+mkdir -p "$R/catalyst/execution-core"
+printf '{"projects":[{"team":"MAN","repoRoot":"%s/link/org/manta"}]}\n' "$R" \
+  > "$R/catalyst/execution-core/registry.json"
+out=$("$SUT" --check --org-dir "$R/link/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+if command -v jq >/dev/null 2>&1; then
+  check "T43 exit" "$rc" "0"
+  grep -qi "FAIL.*registry.json" <<<"$out" && bad "T43 raw-spelled repoRoot not flagged as drift" "$out" \
+    || ok "T43 raw-spelled repoRoot not flagged as drift"
+else
+  skip "T43 skipped (no jq)"
+fi
+
+# --- T44: the tooling preflight loudly warns rather than silently returning
+#     "no hits" when the effective scan-root set is empty — distinct from
+#     genuinely scanning real roots and finding nothing (validation-round
+#     finding 3) ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T44 exit" "$rc" "0"
+[[ -d "$R/org/manta" ]] && ok "T44 still moves (warns, does not refuse)" \
+  || bad "T44 still moves (warns, does not refuse)" "$out"
+grep -qi "no tooling-preflight scan roots" <<<"$out" \
+  && ok "T44 warns when the scan-root set is empty" \
+  || bad "T44 warns when the scan-root set is empty" "$out"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
