@@ -99,7 +99,9 @@ manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
 manta listen --soapy-driver driver=rtlsdr --soapy-freq 7030000 --soapy-rate 240000
 
 # Copy from the default audio input (rig audio passband, 48 kHz),
-# reporting absolute frequencies -- pass the rig's dial frequency once
+# reporting absolute frequencies -- pass the rig's suppressed-carrier/USB
+# dial frequency once (on a CW-mode dial display, subtract your sidetone
+# pitch first, or spots will read high by that amount)
 manta listen --dial-freq-hz 14030000
 
 # Same, but watching decoded text locally with no frequency reference --

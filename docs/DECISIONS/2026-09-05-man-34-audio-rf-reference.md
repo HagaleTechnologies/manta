@@ -122,6 +122,20 @@ requirement `--server-config` already enforces today for a single source.
 surface will bind to — it did not exist before this ticket; only the
 CLI-private decorator did.
 
+## Sideband convention for `--dial-freq-hz`
+
+`center_freq_hz()` is added to the decoded audio-tone offset as-is
+(`manta-engine::listen()`), so the value passed to `--dial-freq-hz` /
+`with_center_freq_hz` must be the suppressed-carrier/USB dial reading, not
+whatever a rig's front panel happens to display in every mode. On a rig in
+CW mode the displayed dial frequency is conventionally already offset by
+the operator's sidetone pitch, so that display must have the CW pitch
+(e.g. 700-800 Hz) subtracted before it is passed here; passing it
+unmodified reports every spot high by the pitch amount, and CW-R inverts
+the sign and doubles the error. This convention is stated on the
+`--dial-freq-hz` help text, the README example, and
+`AudioIqSource::with_center_freq_hz`'s doc comment.
+
 ## What's out of scope
 
 - CAT/OmniRig/live rig polling (see above).

@@ -169,6 +169,14 @@ enum Command {
         /// frequency. Outside --server-config it's still optional, but
         /// omitting it on an audio source prints a one-line stderr
         /// warning and reported frequencies stay baseband offsets.
+        ///
+        /// Sideband convention: enter the suppressed-carrier/USB dial
+        /// reading, since manta adds the decoded audio-tone offset to this
+        /// value as-is. On a rig in CW mode the displayed dial frequency
+        /// is usually already offset by your sidetone pitch -- subtract
+        /// your CW pitch (e.g. 700-800 Hz) from that display before
+        /// passing it here, or spots will read high by the pitch amount
+        /// (CW-R inverts the sign and doubles the error).
         #[arg(long, value_parser = parse_dial_freq_hz)]
         dial_freq_hz: Option<f64>,
         /// Fixed replay epoch, Unix seconds -- overrides the replayed

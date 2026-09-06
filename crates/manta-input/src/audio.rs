@@ -58,6 +58,11 @@ impl AudioIqSource {
     /// the manual equivalent of entering the dial frequency once -- manta
     /// does not poll the rig (no CAT; README non-goals).
     ///
+    /// Sideband convention: `center_freq_hz()` is added to the decoded
+    /// audio-tone offset as-is, so pass the suppressed-carrier/USB dial
+    /// reading. On a CW-mode dial display, subtract your sidetone pitch
+    /// first, or the reported frequency reads high by the pitch amount.
+    ///
     /// Rejects non-finite and non-positive values, matching the CLI's
     /// `--dial-freq-hz` parser: "no reference" is expressed by not calling
     /// this, not by passing 0.0.
