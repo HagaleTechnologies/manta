@@ -205,6 +205,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # MAN-65: the release pipeline's tag grammar and :latest recency
+      # logic are testable without pushing a tag, and this rides the
+      # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new
+      # job auto-merge wouldn't wait for.
+      - run: bash scripts/tests/release-version.test.sh
   test-soapy:
     needs: codex-clean
     if: "!cancelled() && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')"

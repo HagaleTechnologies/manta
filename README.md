@@ -67,12 +67,11 @@ graceful shutdown off mid-drain.
 
 Both are built by [`.github/workflows/release-publish.yml`](.github/workflows/release-publish.yml)
 directly from each tagged release's commit — every published binary
-traces to a specific, auditable source revision. (If the image above
-returns an authorization error, the GHCR package needs its one-time
-"make public" step in GitHub's package settings after the first real
-release — see MAN-65. Windows binaries need the [Visual C++
-Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
-installed if it isn't already.)
+traces to a specific, auditable source revision. Windows binaries link the
+MSVC runtime statically, so they need no Visual C++ Redistributable. (If
+the `docker run` above returns an authorization error, the GHCR package
+still needs its one-time "make public" step — see
+[docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).)
 
 **Building from source** (if you're developing manta itself, or need a
 platform/feature combination the release matrix doesn't cover — the

@@ -44,7 +44,13 @@ name: Release Publish
 on:
   push:
     tags:
-      - 'v*'
+      # MAN-65: 'v*' also matched non-release tags (e.g. `vendor-freeze`),
+      # each of which used to spend five platform builds just to fail. The
+      # glob language can't express SemVer, so it only filters the obvious
+      # non-releases; validate-tag below gives the explicit, readable
+      # failure for near-misses (v1.2.3+linux and friends) -- a near-miss
+      # must FAIL loudly, not be silently ignored.
+      - 'v[0-9]*'
   workflow_dispatch:
     inputs:
       publish:
@@ -57,6 +63,17 @@ env:
   BIN_NAME: manta
 
 concurrency:
+  # Deliberately per-ref, NOT repo-wide: each release genuinely is
+  # independent work that must not cancel another release's build. The
+  # `:latest` write is the one thing that DOES need repo-wide correctness,
+  # but NOT via a wider concurrency group here -- see `publish-latest`
+  # below (deliberately no concurrency group of its own at all) and MAN-65's
+  # decision doc, Finding 3, for why a repo-wide group was tried and
+  # reverted: it would let a middle release's ENTIRE build get silently
+  # cancelled, not just its `:latest` write, and cancellation order doesn't
+  # even track tag-version order. `publish-latest` gets correctness instead
+  # from answering a global "what's newest right now" question on every
+  # run, independent of which run executes or finishes first.
   group: release-publish-${{ github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: false
 
@@ -64,7 +81,42 @@ permissions:
   contents: read
 
 jobs:
+  # MAN-65 finding 1: fail an unpublishable tag in SECONDS, before five
+  # platform builds burn -- and before Buildx rejects it 30 minutes in and
+  # takes the `release` job (needs: docker-publish) down with it. This job
+  # is also now the single place the version and image name are derived;
+  # `build` and `docker-publish` consume its outputs instead of each
+  # re-deriving them.
+  validate-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image: ${{ steps.v.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Gated on the EVENT being a real push, not merely on
+          # github.ref_type == 'tag' -- ref_type is ALSO 'tag' for
+          # `gh workflow run release-publish.yml --ref <existing-tag>
+          # -f publish=true`, a workflow_dispatch run targeting an
+          # existing tag, not a push.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="$(scripts/release-version.sh validate "$GITHUB_REF_NAME")"
+          else
+            VERSION="dispatch-${{ github.run_id }}"
+            scripts/release-version.sh assert-oci-tag "$VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # OCI/Docker repository paths must be lowercase; github.repository
+          # is case-preserving ("HagaleTechnologies/manta") and buildx
+          # rejects a mixed-case tag outright.
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: validate-tag
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +131,32 @@ jobs:
             os: windows-latest
             artifact: manta-windows-x86_64
             exe_ext: .exe
+            # MAN-65 finding 2: x86_64-pc-windows-msvc links the MSVC C
+            # runtime DYNAMICALLY by default, so manta.exe cannot start on
+            # a clean Windows install that has never had the Visual C++
+            # 2015-2022 Redistributable -- and this ZIP ships only
+            # manta.exe, README.md and the licences, nothing that would fix
+            # that. Static CRT rather than bundling Microsoft's
+            # redistributable installer: bundling adds a redistribution
+            # question and an install step to the one path whose entire
+            # point is unpack-and-run. Safe for this dependency graph:
+            # `cargo build -p manta-cli` compiles no C code on Windows (the
+            # only cc-using crate in Cargo.lock, `alloca`, is reachable
+            # only through criterion, a dev-dependency), and Windows
+            # platform access goes through windows-sys import libraries
+            # against system DLLs.
+            #
+            # Set as a per-matrix-entry RUSTFLAGS rather than
+            # .cargo/config.toml: a repo-wide cargo config file changes
+            # every contributor's local Windows build by default, which is
+            # a bigger blast radius than this fix needs, and this way the
+            # flag is visibly scoped to exactly the one target it's for.
+            # The trade-off, accepted: a contributor building locally on
+            # Windows does not get the static CRT automatically and would
+            # need to set this RUSTFLAGS themselves. The "Assert the
+            # Windows binary is statically CRT-linked" step below is what
+            # keeps this true in CI regardless.
+            rustflags: '-C target-feature=+crt-static'
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: manta-linux-x86_64
@@ -108,11 +186,48 @@ jobs:
 
       - name: Build (native)
         if: "!matrix.use_cross"
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      # MAN-65 finding 2 (PR #78 review): on a clean Windows install without
+      # the VC++ 2015-2022 Redistributable, a dynamically-CRT-linked
+      # manta.exe cannot start -- and this ZIP contains only the exe, the
+      # README and the licences, contradicting README's unpack-and-run
+      # install path. The matrix's `rustflags` entry above links the CRT
+      # statically for this target; this step is what keeps that true,
+      # since nothing else in CI would notice if the flag were dropped or
+      # overridden by a RUSTFLAGS environment variable.
+      #
+      # Substring scan of the raw bytes rather than `dumpbin /dependents`:
+      # dumpbin needs the VS developer environment imported (an extra
+      # third-party action to pin and audit), while PE import-table DLL
+      # names are stored as plain ASCII, so their ABSENCE is conclusive.
+      # The KERNEL32 assertion below is what makes that argument valid --
+      # it proves the scan can see import names at all, so "no
+      # VCRUNTIME140" means "not imported" rather than "scan looked at the
+      # wrong thing".
+      - name: Assert the Windows binary is statically CRT-linked
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}"
+          $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          if ($ascii -notmatch 'KERNEL32\.dll') {
+            Write-Error "import-name scan found no KERNEL32.dll -- the scan itself is broken, not the binary"
+            exit 1
+          }
+          foreach ($dll in @('VCRUNTIME140', 'MSVCP140', 'api-ms-win-crt-')) {
+            if ($ascii -match [regex]::Escape($dll)) {
+              Write-Error "$exe imports $dll -- the dynamic MSVC runtime is back (MAN-65 finding 2). Check the release matrix's Windows rustflags entry and any RUSTFLAGS override."
+              exit 1
+            }
+          }
+          Write-Host "OK: no dynamic MSVC CRT imports."
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -147,7 +262,7 @@ jobs:
           retention-days: 14
 
   docker-publish:
-    needs: build
+    needs: [validate-tag, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -158,45 +273,6 @@ jobs:
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
-
-      - name: Determine version, image, and tag list
-        id: version
-        shell: bash
-        run: |
-          # Gated on the EVENT being a real push, not merely on
-          # github.ref_type == 'tag' -- ref_type is ALSO 'tag' for
-          # `gh workflow run release-publish.yml --ref <existing-tag>
-          # -f publish=true`, a workflow_dispatch run targeting an
-          # existing tag, not a push.
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="dispatch-${{ github.run_id }}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # OCI/Docker repository paths must be lowercase; github.repository
-          # is case-preserving ("HagaleTechnologies/manta") and buildx
-          # rejects a mixed-case tag outright.
-          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-
-          # `:latest` is reserved for real tag pushes only -- a
-          # workflow_dispatch run with publish=true can target any
-          # branch, not just a release, and README's `docker run
-          # ghcr.io/.../manta:latest` install command must always trace
-          # to a real tagged release, not a manual test build that
-          # happened to also push. The dispatch-<run_id> tag is still
-          # pushed on a dispatch publish, for testing that path
-          # specifically -- just never `:latest`.
-          {
-            echo "tags<<RELEASE_TAGS_EOF"
-            echo "$IMAGE:$VERSION"
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              echo "$IMAGE:latest"
-            fi
-            echo "RELEASE_TAGS_EOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         if: github.event_name == 'push' || inputs.publish
@@ -211,7 +287,176 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' || inputs.publish == true }}
-          tags: ${{ steps.version.outputs.tags }}
+          # `:latest` is reserved for real tag pushes only, and is no
+          # longer written HERE at all (MAN-65 finding 3) -- see
+          # `publish-latest` below. A workflow_dispatch run with
+          # publish=true can target any branch, not just a release, and
+          # README's `docker run ghcr.io/.../manta:latest` install command
+          # must always trace to a real tagged release, not a manual test
+          # build that happened to also push. The dispatch-<run_id> tag is
+          # still pushed on a dispatch publish, for testing this job
+          # specifically -- just never `:latest`.
+          tags: ${{ needs.validate-tag.outputs.image }}:${{ needs.validate-tag.outputs.version }}
+
+      # MAN-65 finding 4 (remediate round 7, finding 3.B): this used to be
+      # the last step of `publish-latest`, gated on
+      # `steps.recency.outputs.newest == 'true'` -- but `is-newest-stable`
+      # returns `false` for EVERY pre-release by design, so the very first
+      # tag a maintainer plausibly pushes (`v0.1.0-rc.1`) skipped this
+      # probe entirely, on exactly the publish that first creates the
+      # private GHCR package. Visibility is a property of THIS PUSH, not
+      # of the `:latest` decision, so it belongs here, gated on the same
+      # condition that gates the push above -- and this is also where
+      # `version` already lives, with no cross-job output needed.
+      #
+      # Never fails the job: the release itself is fine, and the fix is an
+      # out-of-band human action. A hard failure here would report a
+      # successful release as broken.
+      #
+      # Gated on success(), NOT always() (MAN-65 remediate round, CR-2):
+      # always() also runs this probe when the preceding build-push step
+      # itself failed or was cancelled, so a failed push (registry 5xx, an
+      # arm64 compile error) would 404 the anonymous pull and report it as
+      # a GHCR-visibility problem -- sending the maintainer to change a
+      # package setting that isn't the actual failure. success() only
+      # allows the probe to run when nothing earlier in the job has failed.
+      - name: Verify the image is anonymously pullable
+        if: success() && (github.event_name == 'push' || inputs.publish == true)
+        env:
+          IMAGE_PATH: ${{ github.repository }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -uo pipefail
+          REPO_LC="$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')"
+          TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO_LC}:pull&service=ghcr.io" | jq -r .token || true)"
+          CODE="$(curl -sSL -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN:-}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${REPO_LC}/manifests/${VERSION}" || true)"
+          if [ "$CODE" = "200" ]; then
+            echo "OK: ghcr.io/${REPO_LC}:${VERSION} is anonymously pullable." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### :warning: GHCR package is not anonymously pullable (HTTP ${CODE})"
+              echo
+              echo "README's \`docker run ghcr.io/${REPO_LC}:latest\` will return an"
+              echo "authorization error for everyone until this one-time step is done:"
+              echo
+              # MAN-65 remediate round 7, finding 3.D: derived rather than
+              # hardcoded -- this repo has already been renamed once
+              # (docs/DECISIONS/2026-09-01-rename-to-manta.md), and a
+              # hardcoded name would 404 after the next rename or in a fork.
+              echo "1. https://github.com/${IMAGE_PATH}/pkgs/container/${REPO_LC##*/}"
+              echo "2. **Package settings** -> **Danger Zone** -> **Change visibility** -> **Public**"
+              echo
+              echo "See docs/RUNBOOKS/release.md. This is a deliberate human step (MAN-65 finding 4)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=GHCR package not public::anonymous pull of ${REPO_LC}:${VERSION} returned ${CODE}; see the job summary"
+          fi
+
+  # MAN-65 finding 3. Two properties, both required:
+  #
+  # 1. Correctness must not depend on GitHub Actions' concurrency-group
+  #    ordering. This job previously carried a repo-wide
+  #    `concurrency: group: release-publish-latest` block, on the theory
+  #    that "the only thing a cancellation can ever drop is a `:latest`
+  #    write from a run that was about to decline it anyway" -- confirmed
+  #    FALSE in review (remediate round 7, finding 3.A). GitHub cancels the
+  #    previously PENDING run in a concurrency group whenever a new one
+  #    arrives, regardless of `cancel-in-progress` -- that setting only
+  #    protects the run already IN PROGRESS. Pending order is ARRIVAL
+  #    order (this job's `needs: docker-publish`, so arrival order is
+  #    build-completion order), not tag-version order: with three
+  #    overlapping releases, the run for the actual newest tag can be the
+  #    one sitting pending, cancelled by a release that is neither the
+  #    newest nor the one still in progress -- and then `:latest` is never
+  #    written for the newest release at all.
+  #
+  #    Fix: no concurrency group here, at all. Each run instead answers a
+  #    GLOBAL question from a fresh `git fetch --tags` -- "what is the
+  #    newest STABLE tag in the whole repo right now?" -- rather than "is
+  #    MY tag newer than the specific run it happens to race against".
+  #    Tag creation (`git push origin vX.Y.Z`) takes seconds, at the very
+  #    START of a release, while this check runs AFTER the multi-arch
+  #    build (minutes later); any tag genuinely "overlapping" this one is
+  #    therefore already visible by the time either release reaches this
+  #    step. Whichever run actually executes reaches the same, correct
+  #    answer, independent of execution or completion order -- no run
+  #    needs to "survive" anything for the outcome to be right.
+  #
+  # 2. A recency re-check performed AFTER the build, not at job start, then
+  #    a manifest-only copy. `docker buildx imagetools create` re-points a
+  #    tag at an already-pushed multi-arch manifest in seconds, so the
+  #    window between "is this still newest?" and "wrote :latest" is
+  #    seconds rather than the whole multi-arch build. Residual risk,
+  #    accepted and recorded in
+  #    docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md: two
+  #    tags pushed within that few-second window could still resolve out
+  #    of order -- this is now the ONLY residual race (point 1 above
+  #    removed the other one). Closing it completely would need an
+  #    external lock or a reconciler workflow -- disproportionate for a
+  #    project where one maintainer pushes one release tag at a time, and
+  #    recoverable in one command (the runbook documents it).
+  #
+  # `release` below deliberately does NOT depend on this job: a declined
+  # `:latest` write must never block a GitHub Release.
+  publish-latest:
+    needs: [validate-tag, docker-publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Is this still the newest stable release?
+        id: recency
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Re-fetch HERE, after the build: tags fetched at checkout time
+          # would answer a question that was current before the build ran,
+          # which is the whole bug this job fixes.
+          git fetch --tags --force --prune origin
+          NEWEST="$(scripts/release-version.sh is-newest-stable "$GITHUB_REF_NAME")"
+          echo "newest=$NEWEST" >> "$GITHUB_OUTPUT"
+          echo "publish :latest: $NEWEST"
+          if [ "$NEWEST" != "true" ]; then
+            # MAN-65 remediate round, CR-1: this predicate decides recency
+            # from git tags alone, not from confirmed GHCR publication (see
+            # docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md,
+            # "a second deliberate asymmetry") -- so a decline here CAN be
+            # wrong if the blocking tag's own release-publish run never
+            # actually published an image. That must be visible in the
+            # run's own summary, not buried in this step's log alone.
+            {
+              echo "### :warning: \`:latest\` was NOT updated for ${GITHUB_REF_NAME}"
+              echo
+              echo "A numerically newer (or equal) stable tag exists in the repo --"
+              echo "see this step's log above for which one. If that tag's own"
+              echo "release-publish run never actually published an image, :latest"
+              echo "is now stale; recovery is documented in docs/RUNBOOKS/release.md."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=:latest not updated::${GITHUB_REF_NAME} was not published as :latest -- see the job summary and this step's log"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.recency.outputs.newest == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point :latest at this release
+        if: steps.recency.outputs.newest == 'true'
+        env:
+          IMAGE: ${{ needs.validate-tag.outputs.image }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
 
   release:
     needs: [build, docker-publish]
