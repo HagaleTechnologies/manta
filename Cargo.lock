@@ -890,6 +890,7 @@ dependencies = [
  "manta-spot",
  "manta-testkit",
  "num-complex",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

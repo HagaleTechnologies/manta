@@ -3,7 +3,7 @@
 use crate::beam::{decode_char, BeamConfig};
 use crate::envelope::{Demod, DemodConfig, Run};
 use crate::events::DecoderEvent;
-use crate::timing::{GapClass, GapClassifier, SpeedTracker};
+use crate::timing::{GapClass, GapClassifier, MarkAdmission, SpeedTracker};
 use crate::HOP_MS;
 
 /// Tunables for one track's decode chain: demod + beam + flush threshold. SPEC §9.
@@ -13,6 +13,11 @@ pub struct DecodeConfig {
     pub beam: BeamConfig,
     /// SPEC §9 decode.flush_gap_dits
     pub flush_gap_dits: f32,
+    /// MAN-9: `SpeedTracker`'s outlier-rejection bounds (see
+    /// `MarkAdmission`'s doc comment, `manta_decode::timing`). A §4.1
+    /// timing concern, not a §3 demod one, so it lives here next to
+    /// `flush_gap_dits` rather than on `DemodConfig`.
+    pub mark_admission: MarkAdmission,
 }
 
 // Manual impl: a derived Default would zero flush_gap_dits.
@@ -22,6 +27,7 @@ impl Default for DecodeConfig {
             demod: DemodConfig::default(),
             beam: BeamConfig::default(),
             flush_gap_dits: 7.0,
+            mark_admission: MarkAdmission::default(),
         }
     }
 }
@@ -53,11 +59,12 @@ impl TrackDecoder {
     /// A decoder for one track, awaiting its first samples. SPEC §5.
     pub fn new(track_id: u32, cfg: DecodeConfig) -> Self {
         let demod = Demod::new(cfg.demod.clone());
+        let mark_admission = cfg.mark_admission;
         TrackDecoder {
             track_id,
             cfg,
             demod,
-            tracker: SpeedTracker::new(),
+            tracker: SpeedTracker::with_admission(mark_admission),
             gaps: GapClassifier::new(),
             pending: Vec::new(),
             cur_marks: Vec::new(),

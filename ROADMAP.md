@@ -125,9 +125,17 @@ labeled by RBN consensus; fused with the classical decoder via dit-style adaptiv
 confidence weighting. ONNX/candle inference, feature-gated.
 
 **Accept when:**
-- On the M2 50-signal Watterson-poor scene, fusion beats classical-only CER by a
-  measured, documented margin at ≤ +6 dB SNR (target: ≥ 25 % relative CER
-  reduction below +6 dB); no regression above +10 dB.
+- On the M2 50-signal Watterson-poor scene (V8w), fusion beats classical-only
+  CER by a measured, documented margin across the **whole ≥ +6 dB strong-
+  signal set the V8w gate measures** (target: ≥ 25 % relative median-CER
+  reduction vs. the pinned classical baseline in
+  `docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md`), with no
+  per-signal CER regression above +10 dB. (MAN-9 Decision 9: the SNR
+  partition here now matches the gate it closes — as originally worded, "at
+  ≤ +6 dB" / "no regression above +10 dB" left a ≤ +6…+10 dB gap that
+  covered the worked failure in `golden_v8_v8w.rs`'s ignore-comment, AC3AGO
+  at +12 dB / CER 0.521, so M4 could have been accepted while that signal
+  stayed exactly as broken as it is today.)
 - CPU budget still holds with ML enabled on desktop-class hardware (Pi exempt;
   ML is optional).
 

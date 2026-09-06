@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn decode_report(
     spec: &manta_testkit::vectors::VectorSpec,
@@ -26,6 +27,15 @@ fn decode_report(
         String::from_utf8_lossy(&out.stderr)
     );
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
+}
+
+/// One V8w render+decode shared by every test in this binary. `cargo test`
+/// runs a binary's tests as threads in one process, so a `OnceLock` is
+/// honored across them; the 120 s / 96 kS/s / 50-signal Watterson-poor
+/// scene is far too expensive (minutes) to render+decode per test. MAN-9.
+fn v8w_decode() -> &'static (serde_json::Value, manta_testkit::vectors::Manifest) {
+    static CACHE: OnceLock<(serde_json::Value, manta_testkit::vectors::Manifest)> = OnceLock::new();
+    CACHE.get_or_init(|| decode_report(&manta_testkit::vectors::v8w()))
 }
 
 /// Group `report["events"]` by `track_id`, returning each track's decoded
@@ -148,7 +158,9 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// 0.094 (the only pass), 0.108, 0.144, 0.154, 0.181, 0.187, 0.187, 0.199,
 /// 0.200, 0.205, 0.207, 0.226, 0.232, 0.235, 0.244, 0.271, 0.275, 0.276,
 /// 0.286, 0.298, 0.308, 0.327, 0.337, 0.373, 0.384, 0.393, 0.441, 0.521,
-/// 0.526, 0.654, 0.686, 0.784, 0.844, 0.918 -- median ~0.276, ~2.76x the gate.
+/// 0.526, 0.654, 0.686, 0.784, 0.844, 0.918 -- median ~0.2755, ~2.76x the
+/// gate. Pinned, machine-checked, and MAN-9-ratcheted against regression:
+/// `v8w_classical_baseline_does_not_regress` below.
 ///
 /// Ruled out as a harness/matching artifact two ways. First, the sibling
 /// AWGN-only V8 test (identical 50-signal scene: same offsets/WPM/SNR/
@@ -162,9 +174,12 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// capture, exactly one track within 300 Hz of the expected frequency) yet
 /// CER still fails, ruling out fragmentation as the primary driver. Only
 /// 3/34 signals (AC3AGO-band idx 25, W7QLO idx 41, W8SHR idx 44) show that
-/// fragmentation pattern (len_ratio 0.09-0.22, 5-15 tracks within 300 Hz of
-/// the expected frequency) -- a secondary, QSB-driven track-continuity
-/// symptom (same family as issue #26), not the majority cause.
+/// fragmentation pattern -- MAN-9's `v8w_fragmentation_is_sequential_or_
+/// concurrent` diagnostic gave a clean, unanimous **F2 (concurrent
+/// spectral spread)** verdict for all three (every cluster has a
+/// genuinely time-overlapping track pair, not merely adjacent-in-time
+/// ones) -- a secondary, QSB-driven track-continuity symptom (same family
+/// as issue #26), not the majority cause.
 ///
 /// The dominant pattern for the other 31 is scattered character-level
 /// corruption throughout an otherwise full-length decode, e.g. signal 1
@@ -174,22 +189,43 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// same classical-decoder fading-robustness gap already tracked for V5
 /// (docs/DECISIONS/2026-07-17-m1-implementation-pins.md) and V6 (issue
 /// #25), now demonstrated at scale (34 independent fading realizations in
-/// one scene, vs V5/V6's one signal each). Filed as
+/// one scene, vs V5/V6's one signal each).
+///
+/// MAN-9 walked a bounded three-rung classical-mitigation ladder against
+/// this gap (proportional debounce, quality-gated beam width, speed-
+/// tracker outlier admission) -- all three shipped behind inert-by-default
+/// config fields, all three swept to completion, **none cleared the
+/// plan's >= 0.010 absolute median-CER accept bar** (best: mark-admission
+/// (0.55, 1.9) at -0.0022, roughly a quarter of the bar) -- so all three
+/// stay at their SPEC defaults. Separately, the F2 fragmentation symptom's
+/// `merge_radius_channels` lever was promoted (1.0 -> 2.0: fully resolves
+/// idx 25, improves but does not fully resolve idx 41/44, no regression on
+/// the V8 AWGN sibling) and then **reverted**, after validate-plan found
+/// and reproduced a real production regression the AWGN sibling's >= 300 Hz
+/// signal separation cannot see: at `2.0`, signals 140-200 Hz apart
+/// spawn-and-merge every hop and never decode. `merge_radius_channels`
+/// ships at its SPEC default `1.0` again -- a track-continuity fix, not a
+/// CER-ladder rung either way, so none of this moves the numbers above.
+/// Full sweep tables, the F1/F2 diagnostic run, and the promotion/revert
+/// re-verification:
+/// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md. Filed as
 /// <https://github.com/HagaleTechnologies/manta/issues/28>; revisit
-/// alongside V5/V6 once manta-decode gains real fading resilience (M4).
+/// alongside V5/V6 once manta-decode gains real fading resilience (M4:
+/// `ROADMAP.md`'s "fusion beats classical-only CER" criterion is scoped to
+/// this exact pinned baseline).
 #[test]
 #[ignore]
 fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
     let spec = manta_testkit::vectors::v8w();
-    let (report, manifest) = decode_report(&spec);
-    let tracks = per_track(&report);
+    let (report, manifest) = v8w_decode();
+    let tracks = per_track(report);
     let known_calls: HashSet<&str> = manifest
         .keyed_texts
         .iter()
         .map(|t| call_from_keyed_text(t))
         .collect();
 
-    let matched = match_tracks_by_freq(&manifest, &tracks);
+    let matched = match_tracks_by_freq(manifest, &tracks);
     let strong: Vec<usize> = spec
         .signals
         .iter()
@@ -218,7 +254,7 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
         pct * 100.0
     );
 
-    let spots = spotted_calls(&report);
+    let spots = spotted_calls(report);
     let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
     let bogus: Vec<&str> = spotted
         .iter()
@@ -244,4 +280,185 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
             track_ids.len()
         );
     }
+}
+
+/// Every track_id's last-reported `TrackMeta` `freq_hz`, regardless of
+/// whether it ever decoded a character or word boundary. CR-delta:
+/// `per_track` above (deliberately) drops any track with no `CharDecoded`/
+/// `WordBoundary` event, since that population is what CER matching must
+/// use -- but a fragmentation *count* needs the FULL track population,
+/// `TrackMeta`-only fragments included, matching
+/// `v8w_fading_diagnostics.rs`'s "N tracks within 300 Hz" figures. Filtering
+/// `per_track`'s output could never reproduce that count, since the
+/// TrackMeta-only entries it needs were never in that map to begin with.
+fn all_track_freqs(report: &serde_json::Value) -> BTreeMap<u64, f64> {
+    let mut freqs: BTreeMap<u64, f64> = BTreeMap::new();
+    for ev in report["events"].as_array().unwrap() {
+        if ev["event"].as_str().unwrap() == "TrackMeta" {
+            freqs.insert(
+                ev["track_id"].as_u64().unwrap(),
+                ev["freq_hz"].as_f64().unwrap(),
+            );
+        }
+    }
+    freqs
+}
+
+/// Count of tracks (by `all_track_freqs`'s full population, `TrackMeta`-only
+/// fragments included) whose last-reported `freq_hz` falls within
+/// `radius_hz` of `expected_freq_hz`. MAN-9 Phase 1: distinguishes a clean
+/// single-track capture from a fragmented signal (the gate's ignore-comment
+/// records "5-15 tracks within 300 Hz" for the 3/34 fragmented signals).
+/// CR-E: strictly less than, not `<=` -- `radius_hz` is called with 300.0,
+/// exactly the scene's own `MIN_SEPARATION_HZ`, so an inclusive bound could
+/// count a neighboring signal's legitimate track as one of this signal's
+/// fragments (same tightening as `v8w_fading_diagnostics.rs`'s CR-7).
+fn tracks_near(freqs: &BTreeMap<u64, f64>, expected_freq_hz: f64, radius_hz: f64) -> usize {
+    freqs
+        .values()
+        .filter(|&&f| (f - expected_freq_hz).abs() < radius_hz)
+        .count()
+}
+
+/// MAN-9 Phase 1: one V8w signal's diagnostic row.
+#[derive(Debug, serde::Serialize)]
+struct SignalRow {
+    idx: usize,
+    call: String,
+    snr_2500_db: f32,
+    wpm: f32,
+    expected_freq_hz: f64,
+    cer: f64,
+    len_ratio: f64,
+    tracks_within_300hz: usize,
+}
+
+fn print_table(rows: &[SignalRow]) {
+    println!(
+        "{:>3} {:<12} {:>7} {:>6} {:>13} {:>7} {:>9} {:>7}",
+        "idx", "call", "snr_db", "wpm", "freq_hz", "cer", "len_rat", "tracks"
+    );
+    for r in rows {
+        println!(
+            "{:>3} {:<12} {:>7.1} {:>6.1} {:>13.1} {:>7.3} {:>9.2} {:>7}",
+            r.idx,
+            r.call,
+            r.snr_2500_db,
+            r.wpm,
+            r.expected_freq_hz,
+            r.cer,
+            r.len_ratio,
+            r.tracks_within_300hz
+        );
+    }
+}
+
+/// Diagnostic, not a gate: prints the full per-signal V8w table and writes a
+/// machine-readable summary to `$MANTA_V8W_REPORT` if set. This is the
+/// artifact ROADMAP.md's M4 acceptance criterion ("fusion beats
+/// classical-only CER by a measured, documented margin") has to diff
+/// against -- nothing in the repository recorded this before MAN-9.
+///
+/// `cargo test -p manta-cli --test golden_v8_v8w -- --ignored --nocapture
+/// v8w_per_signal_cer_report`
+#[test]
+#[ignore]
+fn v8w_per_signal_cer_report() {
+    let spec = manta_testkit::vectors::v8w();
+    let (report, manifest) = v8w_decode();
+    let tracks = per_track(report);
+    let matched = match_tracks_by_freq(manifest, &tracks);
+    let freqs = all_track_freqs(report);
+
+    let mut rows = Vec::with_capacity(spec.signals.len());
+    for (i, sig) in spec.signals.iter().enumerate() {
+        let (decoded, _freq) = matched[i];
+        let expected = &manifest.keyed_texts[i];
+        rows.push(SignalRow {
+            idx: i,
+            call: call_from_keyed_text(expected).to_string(),
+            snr_2500_db: sig.snr_2500_db,
+            wpm: sig.wpm,
+            expected_freq_hz: manifest.expected_freqs_hz[i],
+            cer: manta_testkit::cer::cer(expected, decoded),
+            len_ratio: decoded.chars().count() as f64 / expected.chars().count() as f64,
+            tracks_within_300hz: tracks_near(&freqs, manifest.expected_freqs_hz[i], 300.0),
+        });
+    }
+    print_table(&rows);
+    if let Ok(path) = std::env::var("MANTA_V8W_REPORT") {
+        std::fs::write(path, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+    }
+
+    // Deliberately weak: this test exists to report, and to fail loudly
+    // only if the decode collapses or the scene stops matching the
+    // ticket's premise -- the real bar lives in the un-ignored gate above.
+    let strong: Vec<&SignalRow> = rows.iter().filter(|r| r.snr_2500_db >= 6.0).collect();
+    assert_eq!(strong.len(), 34, "V8w strong-signal count must stay 34");
+    assert!(
+        strong.iter().filter(|r| r.cer < 0.10).count() >= 1,
+        "V8w regressed below its recorded 1/34 baseline"
+    );
+}
+
+/// MAN-9: the classical-only V8w baseline M4's own acceptance criterion has
+/// to beat ("fusion beats classical-only CER by a measured, documented
+/// margin", `ROADMAP.md` M4). This is NOT a relaxed copy of
+/// `v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts` -- that
+/// gate keeps its 90%/0.10 thresholds untouched and stays `#[ignore]`d
+/// pending real fading-robustness work. This is a regression FLOOR pinned
+/// to what the classical chain measurably achieves TODAY (commit `826bdd8`,
+/// MAN-8's rungs -- `K_ANCHOR`, `Demod::duty`, a moved `CLUSTER_ALPHA` --
+/// all absent; see docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md),
+/// so the baseline cannot rot silently between now and M4. Raise these
+/// numbers when the decoder improves; never lower them to make this pass.
+///
+/// `#[ignore]`d per the pin doc's CI-cost rule: one full V8w render+decode
+/// measures ~367 s in this environment, over the 180 s cutoff for a second
+/// full-50-signal-scene run in CI (`golden_v8_v8w.rs` already runs one, the
+/// V8 AWGN test above). Run before release:
+/// `cargo test -p manta-cli --test golden_v8_v8w -- --ignored
+/// v8w_classical_baseline_does_not_regress`.
+#[test]
+#[ignore]
+fn v8w_classical_baseline_does_not_regress() {
+    const MEASURED_PASSES: usize = 1;
+    const MEASURED_MEDIAN_CER: f64 = 0.2755;
+
+    let spec = manta_testkit::vectors::v8w();
+    let (report, manifest) = v8w_decode();
+    let tracks = per_track(report);
+    let matched = match_tracks_by_freq(manifest, &tracks);
+    let strong: Vec<usize> = spec
+        .signals
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.snr_2500_db >= 6.0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut cers: Vec<f64> = strong
+        .iter()
+        .map(|&i| {
+            let (decoded_text, _freq) = matched[i];
+            manta_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text)
+        })
+        .collect();
+    let passes = cers.iter().filter(|&&c| c < 0.10).count();
+    cers.sort_by(f64::total_cmp);
+    let n = cers.len();
+    let median = if n % 2 == 0 {
+        (cers[n / 2 - 1] + cers[n / 2]) / 2.0
+    } else {
+        cers[n / 2]
+    };
+
+    assert!(
+        passes >= MEASURED_PASSES,
+        "V8w strong-signal passes regressed: {passes} < {MEASURED_PASSES}"
+    );
+    assert!(
+        median <= MEASURED_MEDIAN_CER + 0.01,
+        "V8w median CER regressed: {median:.4} > {MEASURED_MEDIAN_CER:.4} + 0.01"
+    );
 }

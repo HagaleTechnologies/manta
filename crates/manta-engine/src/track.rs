@@ -16,12 +16,79 @@ pub struct DetectorConfig {
     pub confirm_hops: u64,
     /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED.
     pub hang_hops: u64,
+    /// **[DEVIATION from SPEC §2.4]** MAN-9 / issue #26: hang window used
+    /// instead of `hang_hops` for a track that has already decoded a real
+    /// character (`Lifecycle::note_emitting`, driven by `CharDecoded`
+    /// only -- narrower than `Track::has_emitted`'s any-event-kind
+    /// criterion; see `note_emitting`'s doc comment for why `TrackMeta`
+    /// does not qualify). SPEC §2.4 pins a single 5000 ms hang for every
+    /// track; a
+    /// Watterson-Poor fade can hold a real signal below `off_snr_db`
+    /// longer than that, closing the track and forcing a new,
+    /// sequentially-numbered `track_id` on reacquisition -- measured on
+    /// V8w idx 25/41/44 (5-15 distinct `track_id`s within 300 Hz of one
+    /// signal). A longer coast for *proven* tracks fixes that without
+    /// keeping noise CANDIDATEs alive any longer. `track_id` is never
+    /// reused regardless -- see
+    /// docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md.
+    ///
+    /// `None` (the default) means "use `hang_hops`" (= SPEC behavior);
+    /// read it through `effective_hang_hops_emitting`, never directly.
+    /// Kept optional rather than snapshotting `hang_hops` at
+    /// `Default::default()` time specifically so a struct-update override
+    /// of `hang_hops` alone -- `DetectorConfig { hang_hops: 300,
+    /// ..Default::default() }` -- still coasts emitting tracks for 300
+    /// instead of silently reverting to the literal default's 1875
+    /// (validate-plan finding F1).
+    ///
+    /// **Hard ceiling: `gc_hops`.** `Lifecycle::on_hop`'s HANG arm checks
+    /// the `silent_count` GC timer *before* this field's `hang_count`
+    /// timer, and `silent_count` is never reset on the ACTIVE -> HANG
+    /// transition -- only `note_char_decoded` (on the next real
+    /// `CharDecoded`) resets it. So a track that was already silent for
+    /// `n` hops before the fade began gets at most `gc_hops - n` hops of
+    /// HANG coast, regardless of how large this field is set; any value
+    /// at or above `gc_hops` is unreachable outright. See
+    /// `hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade`
+    /// for the pinned behavior.
+    pub hang_hops_emitting: Option<u64>,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
     pub gc_hops: u64,
     /// SPEC §2.1: track creation inhibited for this many hops (2000ms) after start.
     pub warmup_hops: u64,
     /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
     pub track_cap: usize,
+    /// **[DEVIATION from SPEC §2.5]** MAN-9 / issue #26: merge radius, in
+    /// channels, used by `merge_converged` instead of SPEC §2.5's literal
+    /// 1.0-channel threshold. CCIR-poor's ~2 ms delay spread and 1 Hz
+    /// Doppler can smear one signal's energy across several adjacent
+    /// 93.75 Hz channels, sustaining more than one simultaneously-open
+    /// track on it (a concurrent-spectral-spread cause of V8w's 3/34
+    /// fragmented signals, distinct from `hang_hops_emitting`'s
+    /// sequential-drop/reacquire cause). Widening lets those converge
+    /// into one track. Hard ceiling: the V8/V8w scene's own minimum
+    /// signal separation is 300 Hz = 3.2 channels
+    /// (`manta_testkit::vectors`'s `MIN_SEPARATION_HZ`), so this must
+    /// stay strictly under that or genuinely distinct neighboring signals
+    /// would start merging. **`1.0` by default (= SPEC behavior).**
+    /// MAN-9 Round-4 promoted this to `2.0` (fully resolves one and
+    /// reduces the other two of V8w's three fragmented signals, idx
+    /// 25/41/44: track count within 300 Hz drops 6/5/15 -> 1/2/6, with no
+    /// regression on the V8 AWGN sibling's `>= 45/50` validated / 0-bogus
+    /// gate) but the validate-plan review found and reproduced a real
+    /// production regression the AWGN gate's >= 300 Hz signal separation
+    /// cannot see: `2.0` exceeds `Track::owned()`'s +/-1-channel ownership
+    /// radius, so a second signal 1.5-2.0 channels (140-200 Hz) away sits
+    /// on an unowned channel, legally spawns a track every hop, and is
+    /// merged away on that same hop -- forever -- losing both signals'
+    /// decodes. Reverted to `1.0` for that reason; the sweep, the two unit
+    /// tests, and this field stay as the right home for a future fix that
+    /// either widens `Track::owned()` to match or gates the merge on
+    /// evidence the two tracks are the same signal. See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md's "Track
+    /// continuity" section for the full sweep, re-verification, and revert
+    /// record.
+    pub merge_radius_channels: f32,
 }
 
 impl Default for DetectorConfig {
@@ -54,15 +121,27 @@ impl Default for DetectorConfig {
     /// SNR) keeps even the weakest golden vector (V3, +6 dB-in-2500) ~14 dB
     /// clear of the threshold, so it still promotes and decodes.
     fn default() -> Self {
+        let hang_hops = 1875;
         DetectorConfig {
             on_snr_db: 12.0,
             off_snr_db: 3.0,
             confirm_hops: 19,
-            hang_hops: 1875,
+            hang_hops,
+            hang_hops_emitting: None, // inert: SPEC behavior, see the field's doc comment
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
+            merge_radius_channels: 1.0, // SPEC default; MAN-9 Round-4's promotion to 2.0 was reverted after validate-plan found a regression -- see the field's doc comment and the pin doc's "Track continuity" section
         }
+    }
+}
+
+impl DetectorConfig {
+    /// The hang window to use once a track has proven itself
+    /// (`Lifecycle::note_emitting`): `hang_hops_emitting` if explicitly
+    /// set, else `hang_hops` -- see `hang_hops_emitting`'s doc comment.
+    pub fn effective_hang_hops_emitting(&self) -> u64 {
+        self.hang_hops_emitting.unwrap_or(self.hang_hops)
     }
 }
 
@@ -99,7 +178,7 @@ pub(crate) enum CloseReason {
 /// Exposed via `TrackManager::close_counts` for the future M3 metrics
 /// endpoint to read; nothing wires it externally yet, since the Prometheus
 /// text endpoint itself is explicit M3 scope (ROADMAP.md).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CloseCounts {
     pub unconfirmed: u64,
     pub hang_expired: u64,
@@ -142,7 +221,13 @@ pub(crate) struct Lifecycle {
     silent_count: u64,
     confirm_hops: u64,
     hang_hops: u64,
+    hang_hops_emitting: u64,
     gc_hops: u64,
+    /// MAN-9 / issue #26: true once `note_emitting` has been called (this
+    /// track has produced a real `DecoderEvent`). Selects
+    /// `hang_hops_emitting` over `hang_hops` in the HANG state; see
+    /// `DetectorConfig::hang_hops_emitting`'s doc comment.
+    emitting: bool,
 }
 
 impl Lifecycle {
@@ -155,7 +240,9 @@ impl Lifecycle {
             silent_count: 0,
             confirm_hops: cfg.confirm_hops,
             hang_hops: cfg.hang_hops,
+            hang_hops_emitting: cfg.effective_hang_hops_emitting(),
             gc_hops: cfg.gc_hops,
+            emitting: false,
         }
     }
 
@@ -181,6 +268,24 @@ impl Lifecycle {
     /// track every 30 s.
     pub(crate) fn note_char_decoded(&mut self) {
         self.silent_count = 0;
+    }
+
+    /// MAN-9 / issue #26: mark this track as having emitted a real
+    /// `DecoderEvent`, switching `on_hop`'s HANG-state timer from
+    /// `hang_hops` to `hang_hops_emitting` from here on. Idempotent, and
+    /// never reversed -- once proven, a track stays proven for its whole
+    /// life. `TrackManager::process_hops` calls this only on
+    /// `CharDecoded`, the SAME criterion `note_char_decoded`'s GC timer
+    /// uses -- deliberately narrower than MAN-19's `has_emitted`, which
+    /// fires on any event kind. `TrackMeta` is an unconditional ~1 Hz
+    /// heartbeat (`TrackDecoder::push_envelope`, `META_INTERVAL_HOPS`)
+    /// gated only on having an SNR reading, not on decoded output -- every
+    /// ACTIVE track emits one within about a second, promoted or noise, so
+    /// treating it as "proven" would make the base `hang_hops` window
+    /// effectively unreachable (round-1 review finding, CR-1). Only an
+    /// actual decoded character is evidence this track is a real signal.
+    pub(crate) fn note_emitting(&mut self) {
+        self.emitting = true;
     }
 
     /// Advance one hop. `rise`/`drop` are this hop's gate booleans for the
@@ -231,7 +336,15 @@ impl Lifecycle {
                     self.hang_count = 0;
                 } else {
                     self.hang_count += 1;
-                    if self.hang_count >= self.hang_hops {
+                    // MAN-9 / issue #26: a proven track (has emitted a real
+                    // event) coasts for `hang_hops_emitting` instead of the
+                    // base `hang_hops` -- see `note_emitting`'s doc comment.
+                    let hang_limit = if self.emitting {
+                        self.hang_hops_emitting
+                    } else {
+                        self.hang_hops
+                    };
+                    if self.hang_count >= hang_limit {
                         return LifecycleEvent::Closed(CloseReason::HangExpired);
                     }
                 }
@@ -645,7 +758,7 @@ impl TrackManager {
                     continue;
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
-                if (ca - cb).abs() < 1.0 {
+                if (ca - cb).abs() < self.cfg.merge_radius_channels as f64 {
                     let loser = if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db
                     {
                         a
@@ -738,9 +851,17 @@ impl TrackManager {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
             }
+            // MAN-9 / issue #26 (CR-1 fix): `note_emitting` -- which
+            // drives `hang_hops_emitting` -- fires ONLY on `CharDecoded`,
+            // not on `has_emitted`'s broader any-event-kind criterion.
+            // `TrackMeta` is an unconditional ~1 Hz heartbeat gated only
+            // on an SNR reading (see `note_emitting`'s doc comment), so
+            // including it here would flag every ACTIVE track as "proven"
+            // within about a second, noise included.
             if let DecoderEvent::CharDecoded { track_id, .. } = e {
                 if let Some(t) = self.tracks.get_mut(track_id) {
                     t.lifecycle.note_char_decoded();
+                    t.lifecycle.note_emitting();
                 }
             }
         }
@@ -982,6 +1103,136 @@ mod tests {
         }
     }
 
+    fn cfg_with_emitting_hang(hang_hops: u64, hang_hops_emitting: u64) -> DetectorConfig {
+        DetectorConfig {
+            confirm_hops: 5,
+            hang_hops,
+            hang_hops_emitting: Some(hang_hops_emitting),
+            gc_hops: 1000, // large enough not to fire during these hang-timer tests
+            ..DetectorConfig::default()
+        }
+    }
+
+    /// Round-2 validate-plan finding F1: a struct-update override of
+    /// `hang_hops` alone must still be reflected in the effective emitting
+    /// hang window, not silently reverted to the literal default (1875).
+    #[test]
+    fn hang_hops_emitting_follows_a_struct_update_override_of_hang_hops() {
+        let cfg = DetectorConfig {
+            hang_hops: 300,
+            ..DetectorConfig::default()
+        };
+        assert_eq!(cfg.effective_hang_hops_emitting(), 300);
+    }
+
+    #[test]
+    fn hang_hops_emitting_explicit_override_still_wins_over_hang_hops() {
+        let cfg = DetectorConfig {
+            hang_hops: 300,
+            hang_hops_emitting: Some(9999),
+            ..DetectorConfig::default()
+        };
+        assert_eq!(cfg.effective_hang_hops_emitting(), 9999);
+    }
+
+    /// MAN-9 / issue #26: a track that has emitted a real event must
+    /// survive a dropout longer than the base `hang_hops`, coasting on
+    /// `hang_hops_emitting` instead.
+    #[test]
+    fn an_emitting_track_survives_a_dropout_longer_than_the_base_hang() {
+        let cfg = cfg_with_emitting_hang(10, 20);
+        let mut lc = Lifecycle::new(&cfg);
+        for _ in 0..3 {
+            lc.on_hop(true, false, false);
+        }
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted); // hop 5, ACTIVE
+        lc.note_emitting();
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // -> HANG, hang_count=1
+                                                                         // Survive well past the base hang_hops=10 (would have closed there
+                                                                         // without note_emitting -- see hang_expires_after_hang_hops above):
+        for _ in 0..14 {
+            assert_eq!(
+                lc.on_hop(false, true, false),
+                LifecycleEvent::None,
+                "an emitting track must survive past the base hang_hops"
+            );
+        }
+        // hang_count is now 15; continue to hang_hops_emitting=20:
+        for _ in 0..4 {
+            assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None);
+        }
+        assert_eq!(
+            lc.on_hop(false, true, false),
+            LifecycleEvent::Closed(CloseReason::HangExpired)
+        ); // hang_count=20 >= hang_hops_emitting=20
+    }
+
+    /// A track that never emitted keeps the SPEC §2.4 base hang window --
+    /// so silent CANDIDATE-turned-ACTIVE noise tracks are not kept alive
+    /// longer than before (`track_cap` pressure, ARCHITECTURE §4).
+    #[test]
+    fn a_non_emitting_track_keeps_the_base_hang_window() {
+        let cfg = cfg_with_emitting_hang(10, 20);
+        let mut lc = Lifecycle::new(&cfg);
+        for _ in 0..3 {
+            lc.on_hop(true, false, false);
+        }
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted);
+        // No note_emitting() call -- never emitted a real event.
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // -> HANG, hang_count=1
+        for _ in 0..8 {
+            assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // hang_count 2..9
+        }
+        assert_eq!(
+            lc.on_hop(false, true, false),
+            LifecycleEvent::Closed(CloseReason::HangExpired)
+        ); // hang_count=10 >= hang_hops=10, unaffected by hang_hops_emitting=20
+    }
+
+    /// CR-alpha: `hang_hops_emitting` is silently capped by `gc_hops`.
+    /// `on_hop`'s HANG arm checks the `silent_count` GC timer BEFORE
+    /// `hang_count`/`hang_hops_emitting`, and `silent_count` carries over
+    /// from ACTIVE (it is only reset by a real `CharDecoded`, never by
+    /// entering HANG). A track already 10 hops into its 15-hop `gc_hops`
+    /// budget when the fade begins closes `Silent` after only 4 more HANG
+    /// hops, even though `hang_hops_emitting` is configured to allow 1000 --
+    /// pins the ceiling `DetectorConfig::hang_hops_emitting`'s doc comment
+    /// describes.
+    #[test]
+    fn hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade() {
+        let cfg = DetectorConfig {
+            confirm_hops: 5,
+            hang_hops: 3,
+            hang_hops_emitting: Some(1000),
+            gc_hops: 15,
+            ..DetectorConfig::default()
+        };
+        let mut lc = Lifecycle::new(&cfg);
+        for _ in 0..3 {
+            lc.on_hop(true, false, false);
+        }
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted); // hop 5, ACTIVE
+        lc.note_emitting();
+        assert_eq!(lc.on_hop(true, false, true), LifecycleEvent::None); // char decoded: silent_count -> 0
+                                                                        // 10 silent ACTIVE hops before the fade even starts.
+        for _ in 0..10 {
+            assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
+        }
+        // The fade begins: -> HANG. silent_count carries over at 10 (does
+        // NOT reset), so only gc_hops(15) - 10 = 5 more silent hops remain
+        // before the GC timer fires -- nowhere near hang_hops_emitting=1000.
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // -> HANG, hang_count=1, silent_count=11
+        for _ in 0..3 {
+            assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // silent_count 12,13,14; hang_count 2,3,4
+        }
+        assert_eq!(
+            lc.on_hop(false, true, false),
+            LifecycleEvent::Closed(CloseReason::Silent),
+            "gc_hops caps hang_hops_emitting's coast: closes Silent at silent_count=15 \
+             (hang_count only reached 5), far short of the configured hang_hops_emitting=1000"
+        );
+    }
+
     use manta_decode::decoder::DecodeConfig;
     use manta_dsp::channelizer::HopOutput;
 
@@ -1196,6 +1447,258 @@ mod tests {
             1,
             "issue #26: merge must be counted"
         );
+    }
+
+    /// MAN-9 / issue #26 (F2 branch): two tracks 2.0 channels apart --
+    /// converged enough to be one signal smeared across several channels
+    /// by CCIR-poor's delay spread/Doppler, but outside SPEC §2.5's
+    /// literal 1.0-channel radius -- must merge once
+    /// `merge_radius_channels` is widened to 2.5, with the higher-SNR
+    /// track surviving (SPEC §2.5). Built the same direct-`merge_converged`
+    /// way as `merge_closes_the_lower_snr_track_when_centers_converge`
+    /// above, for the same reason recorded there.
+    #[test]
+    fn tracks_within_the_configured_merge_radius_converge() {
+        let cfg = DetectorConfig {
+            merge_radius_channels: 2.5,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.center = 20.0;
+            weak.current_snr_db = 8.0;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.center = 22.0; // 2.0 channels apart: outside SPEC's 1.0 radius, inside 2.5
+            strong.current_snr_db = 18.0;
+        }
+        tm.merge_converged();
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "2.0-channel-separated tracks must merge at merge_radius_channels=2.5"
+        );
+        let survivor = tm.tracks.values().next().unwrap();
+        assert_eq!(
+            survivor.current_snr_db, 18.0,
+            "the higher-SNR track must survive"
+        );
+    }
+
+    /// The safety bound on F2's merge radius: two genuinely distinct
+    /// signals separated by the V8/V8w scene's own minimum spacing (300 Hz
+    /// = 3.2 channels at the real channelizer's 93.75 Hz spacing,
+    /// `manta_testkit::vectors`'s `MIN_SEPARATION_HZ`) must NEVER merge at
+    /// `merge_radius_channels = 2.5` -- the scene guarantees that
+    /// separation by construction specifically so distinct neighbors stay
+    /// distinct; this is the number that must never move.
+    #[test]
+    fn distinct_signals_at_the_scene_minimum_separation_do_not_merge() {
+        let cfg = DetectorConfig {
+            merge_radius_channels: 2.5,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (a_id, b_id) = (ids[0], ids[1]);
+        {
+            let a = tm.tracks.get_mut(&a_id).unwrap();
+            a.center = 20.0;
+            a.current_snr_db = 15.0;
+        }
+        {
+            let b = tm.tracks.get_mut(&b_id).unwrap();
+            b.center = 23.2; // 3.2 channels: the scene's real minimum separation
+            b.current_snr_db = 15.0;
+        }
+        tm.merge_converged();
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "distinct signals at the scene's minimum separation must never merge"
+        );
+    }
+
+    /// MAN-9 / issue #26: a track that has emitted a real event must
+    /// survive a dropout longer than the base `hang_hops` under a real
+    /// `TrackManager`, keeping its `track_id` rather than being closed
+    /// `HangExpired` and reacquired as a fresh one. Drives promotion and
+    /// the dropout via raw `step_hop` (same style as
+    /// `track_cap_evicts_lowest_snr` above); `has_emitted`/`note_emitting`
+    /// are poked directly rather than run through a real decode, mirroring
+    /// exactly what `process_hops`'s post-`drain_pool` bookkeeping would
+    /// set for a track that had actually decoded something (both fields
+    /// are crate-private, reachable from this same-crate test module).
+    #[test]
+    fn an_emitting_track_survives_a_dropout_under_a_real_track_manager() {
+        let cfg = DetectorConfig {
+            confirm_hops: 5,
+            hang_hops: 10,
+            hang_hops_emitting: Some(30),
+            gc_hops: 1000,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB, promotes like the tests above
+        let mut m = 250 * 15;
+        for _ in 0..60 {
+            tm.step_hop(&hop(m, power.clone()), m);
+            m += 1;
+            if tm
+                .tracks
+                .values()
+                .any(|t| t.state() == LifecycleState::Active)
+            {
+                break;
+            }
+        }
+        let id = *tm
+            .tracks
+            .keys()
+            .next()
+            .expect("a strong channel should have spawned and promoted a track");
+        {
+            let track = tm.tracks.get_mut(&id).unwrap();
+            track.has_emitted = true;
+            track.lifecycle.note_emitting();
+        }
+        // Drop below threshold for 20 hops: longer than base hang_hops=10,
+        // shorter than hang_hops_emitting=30.
+        let quiet = quiet_power(64);
+        for _ in 0..20 {
+            tm.step_hop(&hop(m, quiet.clone()), m);
+            m += 1;
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            1,
+            "an emitting track must survive a 20-hop dropout under hang_hops_emitting=30"
+        );
+        assert!(
+            tm.tracks.contains_key(&id),
+            "the surviving track must be the SAME track_id, not a new one"
+        );
+        assert_eq!(tm.close_counts().hang_expired, 0);
+    }
+
+    /// CR-1 fix (round-2 review of MAN-9 / issue #26): a track whose ONLY
+    /// output is the `TrackMeta` heartbeat -- never a `CharDecoded` -- must
+    /// keep the BASE `hang_hops`, not `hang_hops_emitting`. Unlike the
+    /// sibling test above (which pokes `has_emitted`/`note_emitting`
+    /// directly), this one drives a real `TrackDecoder` through
+    /// `TrackManager::process_hops` so `note_emitting`'s actual call site
+    /// is exercised: before the fix, `process_hops` called
+    /// `lifecycle.note_emitting()` for every drained event kind, so the
+    /// unconditional ~1 Hz `TrackMeta` heartbeat alone (SPEC §5,
+    /// `META_INTERVAL_HOPS`) would have flagged this track "proven" and it
+    /// would have survived the dropout below.
+    ///
+    /// Envelope design: post-promotion, feed 285 hops at a "high" level
+    /// (channel power +20 dB over the floor, same as promotion) followed
+    /// by 90 hops at a "low" level (+6 dB, still comfortably above
+    /// `off_snr_db=3.0` so the track stays ACTIVE) -- 375 total, exactly
+    /// `Demod`'s `INIT_HOPS`/`META_INTERVAL_HOPS`. The high/low amplitude
+    /// ratio (~5x) clears `Demod`'s `MIN_KEYING_RATIO=2.0` so the demod
+    /// initializes and reports one `TrackMeta` on this very hop -- but the
+    /// single high-to-low transition is confirmed into `Demod`'s `held`
+    /// slot and never evicted to a returned `Run` (that needs a SECOND
+    /// flip), so `on_run`/the beam decoder never see a mark and
+    /// `CharDecoded` never fires.
+    #[test]
+    fn a_trackmeta_only_track_keeps_the_base_hang_window_under_process_hops() {
+        let cfg = DetectorConfig {
+            confirm_hops: 5,
+            hang_hops: 10,
+            hang_hops_emitting: Some(30),
+            gc_hops: 10_000, // large: keep the GC silent-timer from interfering
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, 64);
+
+        const FLOOR_POWER: f32 = 1e-9;
+        let high_power = FLOOR_POWER * 10f32.powf(20.0 / 10.0); // +20 dB: promote + demod "mark" level
+        let low_power = FLOOR_POWER * 10f32.powf(6.0 / 10.0); // +6 dB: still ACTIVE, demod "space" level
+
+        let mut m = 250u64 * 15;
+        let mut all_events: Vec<DecoderEvent> = Vec::new();
+        let feed = |tm: &mut TrackManager,
+                    m: &mut u64,
+                    power_at_10: f32,
+                    all_events: &mut Vec<DecoderEvent>| {
+            let mut power = quiet_power(64);
+            power[10] = power_at_10;
+            all_events.extend(tm.process_hops(&[hop(*m, power)], |ts| ts));
+            *m += 1;
+        };
+
+        // Promote on channel 10, feeding the decoder pool one hop at a time
+        // so the post-promotion pending-hop count is exactly trackable.
+        let mut pending_hops_fed = 0u32;
+        while !tm
+            .tracks
+            .values()
+            .any(|t| t.state() == LifecycleState::Active)
+        {
+            feed(&mut tm, &mut m, high_power, &mut all_events);
+        }
+        pending_hops_fed += 1; // the promotion hop itself is already queued
+        let id = *tm
+            .tracks
+            .keys()
+            .next()
+            .expect("a strong channel should have spawned and promoted a track");
+
+        // Complete the 285-hop "mark" segment.
+        while pending_hops_fed < 285 {
+            feed(&mut tm, &mut m, high_power, &mut all_events);
+            pending_hops_fed += 1;
+        }
+        // The 90-hop "space" segment, completing the demod's 375-hop window.
+        while pending_hops_fed < 375 {
+            feed(&mut tm, &mut m, low_power, &mut all_events);
+            pending_hops_fed += 1;
+        }
+
+        assert!(
+            all_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { track_id, .. } if *track_id == id)),
+            "expected a TrackMeta heartbeat once the demod initializes, got {all_events:?}"
+        );
+        assert!(
+            !all_events.iter().any(
+                |e| matches!(e, DecoderEvent::CharDecoded { track_id, .. } if *track_id == id)
+            ),
+            "this track must never decode a character -- TrackMeta must be the only \
+             output for the base-hang property to be under test, got {all_events:?}"
+        );
+
+        // Real dropout: hang_hops(10) < 20 < hang_hops_emitting(30). Unlike
+        // `an_emitting_track_survives_a_dropout_under_a_real_track_manager`'s
+        // CharDecoded-backed track, this TrackMeta-only track must NOT
+        // survive -- it never earned `note_emitting`.
+        for _ in 0..20 {
+            feed(&mut tm, &mut m, FLOOR_POWER, &mut all_events);
+        }
+        assert!(
+            !tm.tracks.contains_key(&id),
+            "a track that only ever emitted TrackMeta must close on the base hang_hops, \
+             not survive on hang_hops_emitting"
+        );
+        assert_eq!(tm.close_counts().hang_expired, 1);
     }
 
     /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render
