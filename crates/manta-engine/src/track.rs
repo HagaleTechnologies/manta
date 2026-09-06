@@ -28,9 +28,18 @@ pub struct DetectorConfig {
     /// sequentially-numbered `track_id` on reacquisition -- measured on
     /// V8w idx 25/41/44 (5-15 distinct `track_id`s within 300 Hz of one
     /// signal). A longer coast for *proven* tracks fixes that without
-    /// keeping noise CANDIDATEs alive any longer. Equal to `hang_hops` by
-    /// default (= SPEC behavior). `track_id` is never reused regardless --
-    /// see docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md.
+    /// keeping noise CANDIDATEs alive any longer. `track_id` is never
+    /// reused regardless -- see
+    /// docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md.
+    ///
+    /// `None` (the default) means "use `hang_hops`" (= SPEC behavior);
+    /// read it through `effective_hang_hops_emitting`, never directly.
+    /// Kept optional rather than snapshotting `hang_hops` at
+    /// `Default::default()` time specifically so a struct-update override
+    /// of `hang_hops` alone -- `DetectorConfig { hang_hops: 300,
+    /// ..Default::default() }` -- still coasts emitting tracks for 300
+    /// instead of silently reverting to the literal default's 1875
+    /// (validate-plan finding F1).
     ///
     /// **Hard ceiling: `gc_hops`.** `Lifecycle::on_hop`'s HANG arm checks
     /// the `silent_count` GC timer *before* this field's `hang_count`
@@ -42,7 +51,7 @@ pub struct DetectorConfig {
     /// at or above `gc_hops` is unreachable outright. See
     /// `hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade`
     /// for the pinned behavior.
-    pub hang_hops_emitting: u64,
+    pub hang_hops_emitting: Option<u64>,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
     pub gc_hops: u64,
     /// SPEC §2.1: track creation inhibited for this many hops (2000ms) after start.
@@ -118,12 +127,21 @@ impl Default for DetectorConfig {
             off_snr_db: 3.0,
             confirm_hops: 19,
             hang_hops,
-            hang_hops_emitting: hang_hops, // inert: SPEC behavior, see the field's doc comment
+            hang_hops_emitting: None, // inert: SPEC behavior, see the field's doc comment
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
             merge_radius_channels: 1.0, // SPEC default; MAN-9 Round-4's promotion to 2.0 was reverted after validate-plan found a regression -- see the field's doc comment and the pin doc's "Track continuity" section
         }
+    }
+}
+
+impl DetectorConfig {
+    /// The hang window to use once a track has proven itself
+    /// (`Lifecycle::note_emitting`): `hang_hops_emitting` if explicitly
+    /// set, else `hang_hops` -- see `hang_hops_emitting`'s doc comment.
+    pub fn effective_hang_hops_emitting(&self) -> u64 {
+        self.hang_hops_emitting.unwrap_or(self.hang_hops)
     }
 }
 
@@ -222,7 +240,7 @@ impl Lifecycle {
             silent_count: 0,
             confirm_hops: cfg.confirm_hops,
             hang_hops: cfg.hang_hops,
-            hang_hops_emitting: cfg.hang_hops_emitting,
+            hang_hops_emitting: cfg.effective_hang_hops_emitting(),
             gc_hops: cfg.gc_hops,
             emitting: false,
         }
@@ -1089,10 +1107,32 @@ mod tests {
         DetectorConfig {
             confirm_hops: 5,
             hang_hops,
-            hang_hops_emitting,
+            hang_hops_emitting: Some(hang_hops_emitting),
             gc_hops: 1000, // large enough not to fire during these hang-timer tests
             ..DetectorConfig::default()
         }
+    }
+
+    /// Round-2 validate-plan finding F1: a struct-update override of
+    /// `hang_hops` alone must still be reflected in the effective emitting
+    /// hang window, not silently reverted to the literal default (1875).
+    #[test]
+    fn hang_hops_emitting_follows_a_struct_update_override_of_hang_hops() {
+        let cfg = DetectorConfig {
+            hang_hops: 300,
+            ..DetectorConfig::default()
+        };
+        assert_eq!(cfg.effective_hang_hops_emitting(), 300);
+    }
+
+    #[test]
+    fn hang_hops_emitting_explicit_override_still_wins_over_hang_hops() {
+        let cfg = DetectorConfig {
+            hang_hops: 300,
+            hang_hops_emitting: Some(9999),
+            ..DetectorConfig::default()
+        };
+        assert_eq!(cfg.effective_hang_hops_emitting(), 9999);
     }
 
     /// MAN-9 / issue #26: a track that has emitted a real event must
@@ -1163,7 +1203,7 @@ mod tests {
         let cfg = DetectorConfig {
             confirm_hops: 5,
             hang_hops: 3,
-            hang_hops_emitting: 1000,
+            hang_hops_emitting: Some(1000),
             gc_hops: 15,
             ..DetectorConfig::default()
         };
@@ -1504,7 +1544,7 @@ mod tests {
         let cfg = DetectorConfig {
             confirm_hops: 5,
             hang_hops: 10,
-            hang_hops_emitting: 30,
+            hang_hops_emitting: Some(30),
             gc_hops: 1000,
             ..DetectorConfig::default()
         };
@@ -1581,7 +1621,7 @@ mod tests {
         let cfg = DetectorConfig {
             confirm_hops: 5,
             hang_hops: 10,
-            hang_hops_emitting: 30,
+            hang_hops_emitting: Some(30),
             gc_hops: 10_000, // large: keep the GC silent-timer from interfering
             ..DetectorConfig::default()
         };

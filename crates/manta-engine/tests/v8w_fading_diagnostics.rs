@@ -207,15 +207,21 @@ fn v8w_fragmentation_is_sequential_or_concurrent() {
         let spans = timestamped_spans(&cluster);
         let overlaps = count_overlapping_pairs(&spans);
         let centers: Vec<Option<f64>> = cluster.iter().map(|t| t.freq_hz).collect();
+        // CR (validate-plan finding F3): fewer than 2 timestamped spans means
+        // nothing was actually measured -- report that as "indeterminate"
+        // rather than defaulting to "F1 sequential" on zero evidence.
+        let verdict = if spans.len() < 2 {
+            "indeterminate (fewer than 2 timestamped tracks)"
+        } else if overlaps == 0 {
+            "F1 sequential"
+        } else {
+            "F2 concurrent"
+        };
         println!(
-            "idx {idx}: {} tracks within {NEAR_HZ} Hz, {overlaps} overlapping pairs, \
-             freqs {centers:?}, spans {spans:?} (verdict: {})",
+            "idx {idx}: {} tracks within {NEAR_HZ} Hz, {} timestamped, {overlaps} overlapping \
+             pairs, freqs {centers:?}, spans {spans:?} (verdict: {verdict})",
             cluster.len(),
-            if overlaps == 0 {
-                "F1 sequential"
-            } else {
-                "F2 concurrent"
-            }
+            spans.len(),
         );
     }
     // Reports only -- the verdict per signal is transcribed into the pin

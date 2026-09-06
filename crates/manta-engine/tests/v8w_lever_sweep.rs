@@ -315,7 +315,7 @@ fn v8w_lever_sweep_beam_width_low_q() {
             cfg: PipelineConfig {
                 decode: DecodeConfig {
                     beam: BeamConfig {
-                        width_low_q,
+                        width_low_q: Some(width_low_q),
                         q_low,
                         ..Default::default()
                     },

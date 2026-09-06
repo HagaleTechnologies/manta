@@ -18,9 +18,16 @@ pub struct BeamConfig {
     /// across characters, SPEC §4.3-4.5) -- widening only for low-quality
     /// characters buys that back without paying the extra `O(width·marks)`
     /// cost on every clean character (Pi 4 CPU budget, ROADMAP M2).
-    /// Defaults to `width` (inert = SPEC behavior). See
+    ///
+    /// `None` (the default) means "use `width`" (inert = SPEC behavior);
+    /// read it through `effective_width`, never directly. Kept optional
+    /// rather than snapshotting `width` at `Default::default()` time
+    /// specifically so a struct-update override of `width` alone --
+    /// `BeamConfig { width: 8, ..Default::default() }` -- still applies
+    /// to low-quality characters instead of silently narrowing them to
+    /// the literal default's 4 (validate-plan finding F2). See
     /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
-    pub width_low_q: usize,
+    pub width_low_q: Option<usize>,
     /// Threshold on `q`, exclusive-below (`q < q_low` selects
     /// `width_low_q`). SPEC §4.5 clamps `q` to `[0.3, 1.0]`.
     pub q_low: f32,
@@ -32,7 +39,7 @@ impl Default for BeamConfig {
         BeamConfig {
             width,
             sigma: 0.25,
-            width_low_q: width, // inert: SPEC behavior, see the field's doc comment
+            width_low_q: None, // inert: SPEC behavior, see the field's doc comment
             q_low: 0.6,
         }
     }
@@ -43,7 +50,7 @@ impl BeamConfig {
     /// `q`. MAN-9: `width_low_q` below `q_low`, `width` otherwise.
     pub fn effective_width(&self, q: f32) -> usize {
         if q < self.q_low {
-            self.width_low_q
+            self.width_low_q.unwrap_or(self.width)
         } else {
             self.width
         }
@@ -167,7 +174,7 @@ mod tests {
     const CFG: BeamConfig = BeamConfig {
         width: 4,
         sigma: 0.25,
-        width_low_q: 4,
+        width_low_q: Some(4),
         q_low: 0.6,
     };
 
@@ -194,12 +201,12 @@ mod tests {
         let marks = [46.55, 83.05, 114.1, 86.25, 63.75];
         let narrow_cfg = BeamConfig {
             width: 4,
-            width_low_q: 4,
+            width_low_q: Some(4),
             ..CFG
         };
         let wide_cfg = BeamConfig {
             width: 12,
-            width_low_q: 12,
+            width_low_q: Some(12),
             ..CFG
         };
         let narrow = decode_char(&marks, 50.0, 150.0, 0.4, &narrow_cfg).unwrap();
@@ -213,7 +220,7 @@ mod tests {
     fn low_q_selects_the_wide_beam_and_high_q_does_not() {
         let cfg = BeamConfig {
             width: 4,
-            width_low_q: 12,
+            width_low_q: Some(12),
             q_low: 0.6,
             sigma: 0.25,
         };
@@ -222,12 +229,35 @@ mod tests {
         assert_eq!(cfg.effective_width(0.60), 4); // boundary is exclusive-below
     }
 
-    /// Defaults reproduce today exactly: `width_low_q` starts equal to
-    /// `width`, so `effective_width` is constant regardless of `q`.
+    /// Defaults reproduce today exactly: `width_low_q` is unset, so
+    /// `effective_width` is constant (= `width`) regardless of `q`.
     #[test]
     fn beam_width_low_q_defaults_to_the_base_width() {
         let d = BeamConfig::default();
-        assert_eq!(d.width_low_q, d.width);
+        assert_eq!(d.width_low_q, None);
+        assert_eq!(d.effective_width(0.1), d.width);
+    }
+
+    /// Round-2 validate-plan finding F2: a struct-update override of
+    /// `width` alone must still apply to low-quality characters, not
+    /// silently narrow them to the literal default (4).
+    #[test]
+    fn width_low_q_follows_a_struct_update_override_of_width() {
+        let cfg = BeamConfig {
+            width: 8,
+            ..BeamConfig::default()
+        };
+        assert_eq!(cfg.effective_width(0.1), 8); // q < q_low selects width_low_q
+    }
+
+    #[test]
+    fn width_low_q_explicit_override_still_wins_over_width() {
+        let cfg = BeamConfig {
+            width: 8,
+            width_low_q: Some(20),
+            ..BeamConfig::default()
+        };
+        assert_eq!(cfg.effective_width(0.1), 20);
     }
 
     #[test]
