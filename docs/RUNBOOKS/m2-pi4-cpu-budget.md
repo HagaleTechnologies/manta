@@ -195,24 +195,33 @@ below). Running the Debian block on Ubuntu *after* the Ubuntu block has
 already fixed the sources is harmless — its commands just re-run against
 sources that are already correct.
 
-If you mis-ran a block and need to roll back: `sudo mv <file>.bak <file>`
-for whichever of `/etc/apt/sources.list` or
-`/etc/apt/sources.list.d/ubuntu.sources` has a `.bak` next to it, then
-`sudo rm -f /etc/apt/sources.list.d/ubuntu-ports-arm64.sources
+If you mis-ran a block and need to roll back: `sudo mv <file>.man47.bak
+<file>` for whichever of `/etc/apt/sources.list` or
+`/etc/apt/sources.list.d/ubuntu.sources` has a `.man47.bak` next to it --
+this block's own backup suffix, distinct from a plain `.bak` some other
+tool may have left there before you ever ran this block. Don't restore a
+plain `.bak` you can't confirm this block created; if no `.man47.bak`
+exists next to the file, this block never backed that file up (either it
+never touched it, or an earlier run already consumed the one-time backup
+slot -- see the notes below), and there is nothing of this block's to
+restore there. Then `sudo rm -f
+/etc/apt/sources.list.d/ubuntu-ports-arm64.sources
 /etc/apt/sources.list.d/ubuntu-ports-arm64.list`, and, if wanted,
 `sudo dpkg --remove-architecture arm64`.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
-(archive.ubuntu.com / security.ubuntu.com) carry only amd64/i386; arm64
-lives on a separate mirror, ports.ubuntu.com. Without this block, `sudo apt
-update` FAILS (exit 100, "E: Failed to fetch .../binary-arm64/Packages 404
-Not Found") as soon as arm64 is added, and never reaches the install/build
-steps below. Two things are needed: point apt at ports for arm64, AND
-restrict the existing default sources to the architectures they actually
-carry (amd64 and i386) so they stop being asked for an arm64 index they
-will never have -- restricting to amd64 alone would silently drop i386
-index coverage on any host that already has i386 multiarch enabled (Steam,
-Wine, 32-bit vendor libraries).
+(archive.ubuntu.com / security.ubuntu.com) don't carry an arm64 index at
+all; arm64 lives on a separate mirror, ports.ubuntu.com. Without this
+block, `sudo apt update` FAILS (exit 100, "E: Failed to fetch
+.../binary-arm64/Packages 404 Not Found") as soon as arm64 is added, and
+never reaches the install/build steps below. Two things are needed: point
+apt at ports for arm64, AND tell the existing default sources to stop
+being asked for an arm64 index they will never have. That's a subtraction
+(`Architectures-Remove: arm64` / `arch-=arm64`), not an enumeration: it
+leaves whatever other foreign architectures the host already has enabled
+(i386 for Steam, Wine, 32-bit vendor libraries) untouched, instead of
+guessing at the full list and silently dropping index coverage for
+anything not guessed.
 ```
 if case " $(. /etc/os-release && printf '%s %s' "$ID" "$ID_LIKE") " in
      *" ubuntu "*) true ;;
@@ -220,19 +229,22 @@ if case " $(. /etc/os-release && printf '%s %s' "$ID" "$ID_LIKE") " in
    esac; then
   sudo dpkg --add-architecture arm64
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-  keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
-  if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-    # 24.04 (noble) and later: deb822 stanza format.
-    if ! grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources; then
-      if [ -e /etc/apt/sources.list.d/ubuntu.sources.bak ]; then
-        sudo sed -i '/^URIs:/a Architectures: amd64 i386' \
-          /etc/apt/sources.list.d/ubuntu.sources
-      else
-        sudo sed -i.bak '/^URIs:/a Architectures: amd64 i386' \
-          /etc/apt/sources.list.d/ubuntu.sources
+  if [ -z "$codename" ]; then
+    echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on this ID=ubuntu (or ID_LIKE containing ubuntu) host -- refusing to write an arm64 ports source with an empty Suites field, which breaks apt parsing on every subsequent invocation, not just this one. Find your release codename by hand (lsb_release -cs) and investigate why /etc/os-release is missing it before proceeding; nothing below has been touched." >&2
+  else
+    keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+      # 24.04 (noble) and later: deb822 stanza format.
+      if ! grep -q '^Architectures-Remove:' /etc/apt/sources.list.d/ubuntu.sources; then
+        if [ -e /etc/apt/sources.list.d/ubuntu.sources.man47.bak ]; then
+          sudo sed -i '/^URIs:/a Architectures-Remove: arm64' \
+            /etc/apt/sources.list.d/ubuntu.sources
+        else
+          sudo sed -i.man47.bak '/^URIs:/a Architectures-Remove: arm64' \
+            /etc/apt/sources.list.d/ubuntu.sources
+        fi
       fi
-    fi
-    sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
+      sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
 Types: deb
 URIs: http://ports.ubuntu.com/ubuntu-ports
 Suites: ${codename} ${codename}-updates ${codename}-security
@@ -240,30 +252,32 @@ Components: main
 Architectures: arm64
 Signed-By: ${keyring}
 EOF
-  else
-    # 22.04 (jammy) and earlier, and in-place upgrades that kept this format:
-    # classic one-line format. The substitution itself is already safe to
-    # re-run (it only matches a still-unprefixed `deb ` line), but `sed -i.bak`
-    # is not: it backs up whatever is on disk at that invocation, so a second
-    # bare run would overwrite the pristine backup with the already-edited
-    # file. Take the backup only once, on the first run:
-    if [ -e /etc/apt/sources.list.bak ]; then
-      sudo sed -i -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch=amd64,i386] \2|' \
-        /etc/apt/sources.list
     else
-      sudo sed -i.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch=amd64,i386] \2|' \
-        /etc/apt/sources.list
-    fi
-    sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
+      # 22.04 (jammy) and earlier, and in-place upgrades that kept this
+      # format: classic one-line format. The substitution itself is
+      # already safe to re-run (it only matches a still-unprefixed `deb `
+      # line), but `sed -i.man47.bak` is not: it backs up whatever is on
+      # disk at that invocation, so a second bare run would overwrite the
+      # pristine backup with the already-edited file. Take the backup only
+      # once, on the first run:
+      if [ -e /etc/apt/sources.list.man47.bak ]; then
+        sudo sed -i -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
+          /etc/apt/sources.list
+      else
+        sudo sed -i.man47.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
+          /etc/apt/sources.list
+      fi
+      sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main
 EOF
+    fi
+    sudo apt update
+    sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
   fi
-  sudo apt update
-  sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 else
-  echo "This is the Ubuntu-only block (checks ID=ubuntu or ID_LIKE containing ubuntu, e.g. Mint/Pop!_OS/elementary/Zorin) -- run the Debian block below instead." >&2
+  echo "This is the Ubuntu-only block (checks ID=ubuntu, or ID_LIKE containing ubuntu -- note derivatives like Mint/Pop!_OS keep their Ubuntu archive entries in their own separate sources files this block does not edit, see the notes below) -- run the Debian block below instead." >&2
 fi
 ```
 
@@ -305,7 +319,7 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 #   linker = "aarch64-linux-gnu-gcc"
 ```
 
-Notes on the Ubuntu block above (verified 2026-09-04 against the live Ubuntu
+Notes on the Ubuntu block above (verified 2026-09-06 against the live Ubuntu
 mirrors from an x86_64 host, apt 3.0.3, using isolated apt roots rather than a
 mutated host):
 
@@ -316,48 +330,56 @@ mutated host):
 - The branch keys on whether `/etc/apt/sources.list.d/ubuntu.sources` exists,
   not on the release number, so a 22.04-to-24.04 in-place upgrade that kept
   the classic format is still handled correctly.
-- Both branches are safe to run twice, and neither will clobber a `.bak`
-  that already existed before this block ever touched the file. Both
+- Both branches use a block-specific `.man47.bak` suffix rather than the
+  generic `.bak`, precisely so that the rollback instructions above can
+  never restore a stale backup some other tool left behind -- a file named
+  `<original>.man47.bak` was, unambiguously, written by this block. Both
   `sed`s are content-idempotent on their own (the deb822 one is guarded by
   the `grep`; the classic one only matches a still-unprefixed `deb ` line),
-  but `sed -i.bak` itself is not idempotent: run bare a second time, it
-  backs up whatever is on disk *at that invocation* -- already-edited
-  content -- and overwrites whatever `.bak` is sitting there, including one
-  that predates this block entirely. Both branches above now take the
-  `.bak` only when the corresponding `.bak` file doesn't already exist, and
-  use a plain `-i` otherwise -- so a pre-existing backup, or one this block
-  already made, survives regardless of how many times the block is run.
-  This does *not* guarantee a backup exists at all: if a `.bak` was already
-  present from something unrelated before this block ever ran, the first
-  run takes the plain-`-i` path and creates none of its own.
-- This block does not exhaustively restrict every apt source to
-  amd64/i386 -- it covers the *default* sources file
-  (`/etc/apt/sources.list` or `sources.list.d/ubuntu.sources`) in its
-  common stock shape. Any `deb` source line that isn't carrying
-  `[arch=amd64,i386]` after this block runs will still be asked for an
-  arm64 index and can reproduce the same `binary-arm64/Packages 404` /
-  exit-100 failure this block exists to avoid. Known gaps, none of them
-  reachable on a stock, freshly-installed host: a PPA or other third-party
-  `.list`/`.sources` file under `/etc/apt/sources.list.d/` (e.g. Docker's
-  own apt repo) needs the same restriction applied to it separately; a
-  host with *both* a populated `ubuntu.sources` and a populated
-  `/etc/apt/sources.list` (possible after an in-place release upgrade)
-  only gets one of the two restricted, since the branch above is
-  either/or; a `deb` line in the default file that already carries inline
-  options (`deb [signed-by=...] https://...`) isn't matched by the
-  classic branch's substitution, which expects a bare `deb` followed
-  directly by a URI scheme; and the deb822 branch's `grep -q
-  '^Architectures:'` guard only checks that the field is *present*, not
-  that it's restricted to `amd64 i386` -- a `ubuntu.sources` that already
-  carries e.g. `Architectures: amd64 arm64` skips the `sed` and still asks
-  the default mirrors for an arm64 index. If your host has any of these,
-  add `[arch=amd64,i386]` (classic) or `Architectures: amd64 i386`
-  (deb822) to the affected line(s) by hand.
+  but `sed -i.man47.bak` itself is not idempotent: run bare a second time,
+  it backs up whatever is on disk *at that invocation* -- already-edited
+  content -- and overwrites whatever `.man47.bak` is sitting there. Both
+  branches above take the `.man47.bak` copy only when `<original>.man47.bak`
+  doesn't already exist, and use a plain `-i` otherwise -- so the *first*
+  run's backup (the one that actually reflects pre-block state) survives
+  regardless of how many times the block runs after that. A second-or-later
+  run therefore makes no additional backup of its own; that's intentional,
+  since the first run's `.man47.bak` is the only one rollback should ever
+  restore.
+- This block does not exhaustively remove arm64 from every apt source --
+  it covers the *default* sources file (`/etc/apt/sources.list` or
+  `sources.list.d/ubuntu.sources`) in its common stock shape. Any `deb`
+  source line that isn't carrying `arch-=arm64` (classic) or
+  `Architectures-Remove: arm64` (deb822) after this block runs will still
+  be asked for an arm64 index and can reproduce the same
+  `binary-arm64/Packages 404` / exit-100 failure this block exists to
+  avoid. Known gaps: a PPA or other third-party `.list`/`.sources` file
+  under `/etc/apt/sources.list.d/` (e.g. Docker's own apt repo) needs the
+  same exclusion applied to it separately; a host with *both* a populated
+  `ubuntu.sources` and a populated `/etc/apt/sources.list` (possible after
+  an in-place release upgrade) only gets one of the two restricted, since
+  the branch above is either/or; a `deb` line in the default file that
+  already carries inline options (`deb [signed-by=...] https://...`) isn't
+  matched by the classic branch's substitution, which expects a bare `deb`
+  followed directly by a URI scheme; the deb822 branch's `grep -q
+  '^Architectures-Remove:'` guard only checks that the field is *present*,
+  not that it targets `arm64` -- a `ubuntu.sources` that already carries
+  some other `Architectures-Remove:` value skips the `sed` and still asks
+  the default mirrors for an arm64 index; and this **is** reachable on a
+  guard-admitted, non-stock-Ubuntu host: the guard runs on any `ID_LIKE`
+  containing `ubuntu`, but Linux Mint keeps its Ubuntu archive entries in
+  its own `/etc/apt/sources.list.d/official-package-repositories.list` and
+  Pop!_OS keeps its own `/etc/apt/sources.list.d/system.sources` --
+  neither is the file this block edits, so the block's `apt update`/`apt
+  install` still hits the same 404 on those hosts. If your host has any of
+  these, add `arch-=arm64` (classic) or `Architectures-Remove: arm64`
+  (deb822) to the affected line(s) by hand -- on Mint/Pop!_OS, to their own
+  separate sources file instead.
 - `gcc-aarch64-linux-gnu` is an amd64 package from the host's own archive
   (`main`), so it installs fine even when the arm64 half is broken -- which
   is exactly how this failure hides itself if the `apt install` output is
   only skimmed.
-- Unverified as of 2026-09-04: a full `apt install` + `cargo test --target
+- Unverified as of 2026-09-06: a full `apt install` + `cargo test --target
   aarch64-unknown-linux-gnu` run on a stock Ubuntu desktop/server host. What
   *was* verified is that apt resolves `libasound2-dev:arm64` to a real
   ports candidate in both sources formats and that `apt update` exits 0
