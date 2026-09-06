@@ -28,3 +28,5 @@ The channelizer is a 4×-oversampled polyphase filterbank (PFB) that splits the 
 ## Why it is shaped this way
 
 The whole design is viable only because it is cheap: the full-band pipeline stays well under one core, enforced by criterion benches as an M2 acceptance gate. The CPU budget table is in ARCHITECTURE §4; the 4× (not 2×) oversample choice was made to give enough envelope samples per dit for QSB'd fast CW. Stopband was tightened to 80 dB because pileup scenes need the dynamic range (SPEC §10.4). Detection and track handoff are covered in [[detector-tracks]].
+
+Channel-edge proximity (adjacent channels cross at -6 dB, SPEC §1.2) has a *timing* consequence beyond the steady-state energy split above: a carrier near the edge has its keying envelope's rise/fall slowed by the transition band, inflating [[decode-chain]]'s measured mark durations — see `docs/DECISIONS/2026-09-04-man7-element-gap-symmetric-wpm.md` (MAN-7) for the measured dose-response curve.

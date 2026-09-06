@@ -289,6 +289,25 @@ re-anchor `μ_dah = 3·μ_dit`. Clamp `μ_dit` to `[20 ms, 150 ms]`
 (60 WPM .. 8 WPM); PARIS WPM = `1200 / μ_dit_ms`, EMA-smoothed with
 `α = 0.1` for reporting.
 
+**[DEVIATION]** The implementation divides by a boundary-bias-corrected dit
+estimate instead of `μ_dit_ms` directly (`SpeedTracker::dit_estimate_ms` in
+`crates/manta-decode/src/timing.rs`) — see
+`docs/DECISIONS/2026-09-04-man7-element-gap-symmetric-wpm.md` (MAN-7). §3.3's
+hysteresis is asymmetric (key-down at `1.25·T`, key-up at `0.80·T`), so a
+slowly-transitioning recovered envelope (worst near a §1.2 channel edge, or
+under QSB/low SNR) shifts the mark/space boundary by a delta that inflates
+every measured mark and, by the same amount, shortens the inter-element gap
+that follows it — because a threshold crossing only *moves* that boundary, it
+neither creates nor destroys time, so `μ_dit + μ_egap = 2·true_dit`
+regardless of how large delta is. The corrected estimate is
+`μ_dit − clamp((μ_dit − μ_egap)/2, 0, 0.35·μ_dit)`, where `μ_egap` is the EMA
+(same `α = 0.15` as `μ_dit`/`μ_dah`) of gaps §4.2 classifies inter-element;
+the WPM report divides by this instead of `μ_dit_ms`. `μ_dit_ms` itself is
+left uncorrected everywhere else — the §4.2 gap-classification ratio, the
+§4.3 log-normal likelihood, §3.2's `τ_hi = 5·dit_ms`, and the §4.2 `7·μ_dit`
+flush threshold all consume the biased centroid they were tuned against
+(most explicitly `CHAR_GAP_DITS = 1.6` above).
+
 **Drift/regime change** — if 12 consecutive marks assign to a single cluster
 *and* their coefficient of variation < 0.35 *and* their mean is off that
 centroid by > 40 %, the operator has changed speed (QRQ/QRS): reinitialize
@@ -314,6 +333,12 @@ real inter-character gaps can compute to under 2.0 dits and get merged into
 the preceding character. `1.6` was chosen empirically (500-case sweep, two
 independent seeds) as the value that captures the available fix with the
 smallest deviation from the nominal `2.0`.
+
+**[DEVIATION]** Gaps classified **inter-element** also feed §4.1's `μ_egap`
+(`SpeedTracker::on_element_gap`) — see MAN-7,
+`docs/DECISIONS/2026-09-04-man7-element-gap-symmetric-wpm.md`. This is the
+other half of §4.1's boundary-bias-corrected dit estimate; it does not change
+gap classification itself.
 
 **Farnsworth decoupling** (ARCHITECTURE §5.3): run the same 2-means machinery
 on gaps with `u ≥ 1.5` (the "long gaps"), yielding `μ_cgap` (character gap)
@@ -565,7 +590,7 @@ debounce_ms = 12       hyst_up = 1.25       hyst_down = 0.80
 tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
 mu_ratio_bounds = [2.2, 4.5]
 char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
-cluster_alpha = 0.15
+cluster_alpha = 0.15   dit_bias_cap_frac = 0.35
 
 [input]
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]

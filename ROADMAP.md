@@ -48,9 +48,12 @@ KiwiSDR input.
   signals ≥ +6 dB SNR at CER < 10 %) is **not** a blocking M2 gate — measured
   at 1/34 (2.9 %), tracked as issue #28, and reclassified as a known
   classical-decoder fading-robustness limitation in the same family as
-  V2/V5/V6/issue #25. Per this repo's own design ("classical decoder first;
+  V5/V6 (issue #25). Per this repo's own design ("classical decoder first;
   ML fusion only at M4, gated on beating the classical baseline under
-  simulated fading"), closing that gap is M4's job, not M2's.
+  simulated fading"), closing that gap is M4's job, not M2's. V2 no longer
+  belongs in this family: its WPM gate was a fixable estimator bug, not a
+  fading-robustness limitation — see MAN-7,
+  `docs/DECISIONS/2026-09-04-man7-element-gap-symmetric-wpm.md`.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
   of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. **Neither
   leg is currently a resolved pass** — see
