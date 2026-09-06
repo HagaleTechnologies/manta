@@ -26,7 +26,10 @@ mkfixture() { # $1=root $2=clone-name; echoes the clone path
   printf '%s\n' "$root/org/$name"
 }
 addwt() { git -C "$1" worktree add -q -b "$3" "$2"; }   # $1=clone $2=path $3=branch
-newroot() { mktemp -d; }
+# Explicit template: bare `mktemp -d` is a GNU-coreutils-only extension and
+# exits 1 with a usage error on BSD/macOS mktemp, which has no default
+# template (CR-1) — this harness must itself run on a macOS fleet host.
+newroot() { mktemp -d "${TMPDIR:-/tmp}/fleet-rename-test.XXXXXX"; }
 
 # --- T1: old layout present, new absent -> exit 1, reports MIGRATION NEEDED ---
 R=$(newroot); C=$(mkfixture "$R" skimmer)
@@ -309,6 +312,30 @@ fi
 #     unbound-variable exit 1 that reads as a real verdict (C6) ---
 out=$("$SUT" --check --org-dir 2>&1); rc=$?
 check "T27 exit" "$rc" "2"
+
+# --- T28: mktemp failure during registry reconciliation degrades to the
+#     script's own actionable message rather than a raw mktemp usage error /
+#     shell "No such file or directory", and never corrupts registry.json
+#     (CR-1/CR-6 — this is the path a bare, GNU-only `mktemp` call took on
+#     BSD/macOS before it was given an explicit template) ---
+R=$(newroot); C=$(mkfixture "$R" skimmer) >/dev/null
+mkdir -p "$R/catalyst/execution-core" "$R/fakebin"
+printf '{"projects":[]}\n' > "$R/catalyst/execution-core/registry.json"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$R/fakebin/mktemp"
+chmod +x "$R/fakebin/mktemp"
+out=$(PATH="$R/fakebin:$PATH" "$SUT" --apply --org-dir "$R/org" \
+      --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+if command -v jq >/dev/null 2>&1; then
+  check "T28 exit" "$rc" "1"
+  grep -qi "usage: mktemp\|No such file or directory" <<<"$out" \
+    && bad "T28 no raw mktemp/shell error" "$out" || ok "T28 no raw mktemp/shell error"
+  grep -q "mktemp failed" <<<"$out" && ok "T28 prints actionable message" \
+    || bad "T28 prints actionable message" "$out"
+  check "T28 registry untouched" \
+    "$(cat "$R/catalyst/execution-core/registry.json")" '{"projects":[]}'
+else
+  ok "T28 skipped (no jq)"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

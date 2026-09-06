@@ -65,8 +65,9 @@ Flags (all optional; defaults match this ticket's shape):
 | `--allow-tooling-hits` | off | proceed with `--apply` despite tooling preflight hits (records the override in the output) |
 
 **cwd caveat**: on a legacy host the script lives inside the directory being
-moved. Running it from that directory is fine — bash has already read the
-script file into memory, and every path the script touches is derived from
+moved. Running it from that directory is fine — a same-filesystem `mv` is a
+rename that keeps the running script's open file descriptor (and inode)
+valid, and every path the script touches is derived from
 `--org-dir`/`--catalyst-dir`, not from `$PWD` — but the invoking shell's own
 `cwd` will point at a now-renamed (or, briefly, nonexistent) path afterwards.
 Run `cd "$OLDPWD"`-equivalent (i.e. `cd ~/code-repos/github/HagaleTechnologies/manta`)
@@ -76,15 +77,19 @@ practice, copy the script to `/tmp` first and run it from there instead.
 
 ## Tooling preflight
 
-Before moving anything, `--apply` greps `--scan-root` directories (default:
-`~/code-repos/github`, `~/bin`, `~/.local/bin`) for literal references to the
-old checkout path or to `<old-name>-worktrees`, and refuses to proceed if it
-finds any — this is the ticket's "check magazzino's clone/worktree tooling
-and `link-build-cache.sh` for path assumptions" instruction, turned into an
-executable gate that runs on the host where those tools actually exist
-(rather than a step this document could complete in advance). Point
-`--scan-root` at wherever `magazzino` and `link-build-cache.sh` live on that
-host if they're outside the default roots.
+When there is something to move, `--apply` greps `--scan-root` directories
+(default: `~/code-repos/github`, `~/bin`, `~/.local/bin`) for literal
+references to the old checkout path or to `<old-name>-worktrees`, and refuses
+to proceed if it finds any — this is the ticket's "check magazzino's
+clone/worktree tooling and `link-build-cache.sh` for path assumptions"
+instruction, turned into an executable gate that runs on the host where those
+tools actually exist (rather than a step this document could complete in
+advance). Point `--scan-root` at wherever `magazzino` and `link-build-cache.sh`
+live on that host if they're outside the default roots. On an
+already-migrated host `--apply` has nothing to move, so this preflight is
+skipped there — it exists to protect a move, not to gate the verified no-op.
+`--check` always reports hits, since it never moves anything and the report
+is purely informational.
 
 ## Evidence table
 

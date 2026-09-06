@@ -230,7 +230,7 @@ else
   HITS="$(tooling_hits)"
   if [[ -n $HITS ]]; then
     say "tooling reference(s) to the legacy path found:"
-    printf '  %s\n' "$HITS" | head -50
+    printf '%s\n' "$HITS" | sed 's/^/  /' | head -50
     say ""
   fi
   if [[ $MODE == apply && -n $HITS ]]; then
@@ -262,9 +262,19 @@ busy_reasons() {
     [[ -e $d/BISECT_LOG    ]] && printf 'bisect in progress: %s\n'     "$d/BISECT_LOG"
   done
   # A process whose command line mentions the old path is very likely holding it.
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -af "$OLD_MAIN" 2>/dev/null | grep -v "fleet-rename-checkout" \
-      | sed 's/^/process referencing the checkout: /'
+  # `ps -Ao pid=,args=` is portable to both GNU and BSD/macOS ps; `pgrep -af`
+  # is procps-only and macOS's pgrep has no `-a` (CR-2) — with stderr silenced
+  # it would just return nothing there, quietly dropping this half of the
+  # preflight on exactly the hosts the plan flags as macOS candidates. Filter
+  # in bash (quoted case pattern, not a grep subprocess) so the filter itself
+  # never becomes a process whose own argv contains $OLD_MAIN and matches.
+  if command -v ps >/dev/null 2>&1; then
+    while IFS= read -r procline; do
+      case "$procline" in
+        *fleet-rename-checkout*) ;;
+        *"$OLD_MAIN"*) printf 'process referencing the checkout: %s\n' "$procline";;
+      esac
+    done < <(ps -Ao pid=,args= 2>/dev/null)
   fi
   return 0
 }
@@ -286,7 +296,16 @@ reconcile_registry() {
     info "could not parse $reg as JSON — leaving it untouched. Fix it by hand."
     return 0
   fi
-  tmp="$(mktemp)"
+  # Explicit template: bare `mktemp`/`mktemp -d` is a GNU-coreutils-only
+  # extension. BSD/macOS mktemp requires a template operand and exits 1 with a
+  # usage error without one (CR-1) — which on a fleet host would abort this
+  # function with a raw shell error instead of the degrade-to-warning message
+  # every other failure path here uses.
+  if ! tmp="$(mktemp "${TMPDIR:-/tmp}/fleet-rename-registry.XXXXXX")"; then
+    info "mktemp failed — skipping registry reconciliation."
+    info "  Edit $reg by hand so team \"$TEAM_NEW\" has repoRoot \"$NEW_MAIN\"."
+    return 0
+  fi
   # Correct an existing MAN entry in place, or append one. A stale SKI entry is
   # left alone on purpose: checkout-sync.mjs drops entries whose repoRoot is
   # missing (CTL-854), so it is already inert, and removing registry rows is a
