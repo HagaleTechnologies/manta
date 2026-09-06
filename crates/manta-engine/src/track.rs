@@ -707,14 +707,10 @@ impl TrackManager {
             .iter()
             .map(|&id| (id, self.tracks[&id].select_channel(hop_power, n)))
             .collect();
-        let mut to_close = Vec::new();
         let mut losing_this_hop: BTreeSet<u32> = BTreeSet::new();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 let (a, b) = (ids[i], ids[j]);
-                if to_close.contains(&a) || to_close.contains(&b) {
-                    continue;
-                }
                 let (ka, kb) = (channel_of[&a], channel_of[&b]);
                 let mirror_of_ka = (n - ka) % n;
                 let mirror_of_kb = (n - kb) % n;
@@ -769,13 +765,24 @@ impl TrackManager {
                     // the same loser. See that constant's doc comment.
                     if let Some(loser) = loser {
                         losing_this_hop.insert(loser);
-                        let streak = self.mirror_merge_streak.entry(loser).or_insert(0);
-                        *streak += 1;
-                        if *streak >= Self::MIRROR_MERGE_CONFIRM_HOPS {
-                            to_close.push(loser);
-                        }
                     }
                 }
+            }
+        }
+        // MAN-4 remediate (validate round-2 code-review finding 1): bump
+        // each hop's loser's streak exactly once, regardless of how many
+        // partners it lost to in this hop -- `MIRROR_MERGE_CONFIRM_HOPS`
+        // counts consecutive HOPS, not pairwise losses. Doing this inside
+        // the `i`/`j` loop above (the original bug) let a track that lost
+        // to two different partners in the same hop advance its streak by
+        // 2, reaching the close threshold in 3 hops instead of 5 and
+        // degrading the documented ~1e-10 false-resolve bound to ~1e-6.
+        let mut to_close = Vec::new();
+        for &loser in &losing_this_hop {
+            let streak = self.mirror_merge_streak.entry(loser).or_insert(0);
+            *streak += 1;
+            if *streak >= Self::MIRROR_MERGE_CONFIRM_HOPS {
+                to_close.push(loser);
             }
         }
         // Any track not reconfirmed as this hop's loser breaks its streak
@@ -1750,6 +1757,16 @@ mod tests {
     /// key-up gap) -- reproduced by probe: a noise-level edge could close
     /// the real ACTIVE track as `Merged`. Built directly against
     /// `merge_mirror_images` for the same reason the drift test above is.
+    /// MAN-4 remediate (validate round-2 code-review finding 2): loops
+    /// `MIRROR_MERGE_CONFIRM_HOPS` times, not once -- with a single call,
+    /// `merge_mirror_images` can never close a track regardless of what
+    /// `clearly_exceeds` returns (the streak never reaches the confirm
+    /// threshold), so this test used to pass for a reason unrelated to
+    /// the margin gate it's named for (validation report finding 2:
+    /// deleting `MIRROR_POWER_MARGIN_DB` entirely left the whole suite
+    /// green). The fixed power is identical every call, so looping
+    /// reconfirms the same (deferred) decision every hop and would still
+    /// catch a regression that starts closing the pair after enough hops.
     #[test]
     fn mirror_merge_defers_on_an_ambiguous_power_tie_instead_of_closing_a_track() {
         let n = 512;
@@ -1765,7 +1782,9 @@ mod tests {
         let mut power = quiet_power(n);
         power[8] = 1e-9 * 1.5; // within the 3 dB margin of the other side
         power[n - 8] = 1e-9 * 1.0;
-        tm.merge_mirror_images(&power);
+        for _ in 0..(2 * TrackManager::MIRROR_MERGE_CONFIRM_HOPS) {
+            tm.merge_mirror_images(&power);
+        }
         assert_eq!(
             tm.tracks.len(),
             2,
@@ -1773,6 +1792,11 @@ mod tests {
         );
     }
 
+    /// MAN-4 remediate (validate round-2 code-review finding 2): loops
+    /// `MIRROR_MERGE_CONFIRM_HOPS` times for the same reason the tie test
+    /// above does -- a single call can never close anything regardless of
+    /// `clearly_exceeds`'s exact-zero guard, so the guard's own regression
+    /// protection was previously coming from nowhere.
     #[test]
     fn mirror_merge_defers_on_exact_zero_power_instead_of_closing_a_track() {
         // MAN-4 remediate (code-review finding 1, round 3): both sides of
@@ -1793,11 +1817,61 @@ mod tests {
         let mut power = quiet_power(n);
         power[8] = 0.0;
         power[n - 8] = 0.0;
-        tm.merge_mirror_images(&power);
+        for _ in 0..(2 * TrackManager::MIRROR_MERGE_CONFIRM_HOPS) {
+            tm.merge_mirror_images(&power);
+        }
         assert_eq!(
             tm.tracks.len(),
             2,
             "exact-zero power on both sides of a mirror pair must defer, not close either side"
+        );
+    }
+
+    /// MAN-4 remediate (validate round-2 code-review finding 3): built
+    /// directly against `merge_mirror_images` to isolate `reads_above_
+    /// own_floor` from `clearly_exceeds`'s own margin gate -- the two
+    /// defer tests above only ever need `clearly_exceeds` to defer
+    /// (`reads_above_own_floor` is trivially true against the un-warmed
+    /// -140 dBFS default floor, since neither test calls `feed_warmup`),
+    /// so mutating `reads_above_own_floor`'s body to `true` broke none of
+    /// them (validation report finding 3). Here the floor is warmed to a
+    /// real ~-90 dBFS baseline first via `feed_warmup`, and the apparent
+    /// winner's absolute power is only 6 dB above that baseline -- well
+    /// clear of `clearly_exceeds`'s 3 dB margin over the other side, but
+    /// still 6 dB short of its own floor + `on_snr_db` (12 dB), i.e.
+    /// still just noise by the floor's own measure. Only `reads_above_
+    /// own_floor` can defer this pair; deleting it (mutating its body to
+    /// `true`) would let `clearly_exceeds` alone close it after
+    /// `MIRROR_MERGE_CONFIRM_HOPS` hops.
+    #[test]
+    fn mirror_merge_defers_when_the_apparent_winner_reads_below_its_own_floor() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n); // floor settles at ~-90 dBFS everywhere
+        tm.spawn(8);
+        tm.spawn(n - 8);
+        let mut power = quiet_power(n);
+        // +6 dB over the ~-90 dBFS floor: clears clearly_exceeds's 3 dB
+        // margin over the other side (12 dB apart), but stays 6 dB below
+        // its own floor + on_snr_db (12 dB) -- still noise by the floor's
+        // own measure.
+        power[8] = 1e-9 * 10f32.powf(6.0 / 10.0);
+        power[n - 8] = 1e-9 * 10f32.powf(-6.0 / 10.0);
+        for _ in 0..(2 * TrackManager::MIRROR_MERGE_CONFIRM_HOPS) {
+            tm.merge_mirror_images(&power);
+        }
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "the apparent winner is 12 dB above the loser but still reads 6 dB below its own \
+             floor + on_snr_db; reads_above_own_floor must defer this pair even though \
+             clearly_exceeds alone would call it"
         );
     }
 

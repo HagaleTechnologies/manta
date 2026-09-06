@@ -180,7 +180,7 @@ fn parse_positive_finite_scene_seconds(s: &str) -> std::result::Result<f64, Stri
 }
 
 /// A crowded 40m CW sub-band as heard in a receiver's audio passband:
-/// ~20 simultaneous stations spread 650-2950 Hz, a couple of close pairs
+/// ~20 simultaneous stations spread 670-2910 Hz, a couple of close pairs
 /// (deliberately within a channel or two of each other) to exercise
 /// adjacent-channel merge/eviction, varied speed/SNR/jitter, plus one
 /// deliberately clean, isolated, high-SNR caller (matching soak.rs's own
@@ -260,7 +260,7 @@ fn pileup_signals() -> Vec<SignalSpec> {
         })
         .collect();
     // The deliberately clean, isolated caller -- see the function doc.
-    // Offset clear of every other signal above (max is 2660 Hz); 24 dB
+    // Offset clear of every other signal above (max is 2910 Hz); 24 dB
     // SNR, no jitter/QSB, moderate 20 WPM -- same shape as soak.rs's own
     // unit test (`soak_reports_no_panic_on_a_clean_short_signal`), which
     // is proven to decode "CQ CQ DE W1AW W1AW K" end to end.
