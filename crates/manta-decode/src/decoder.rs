@@ -141,6 +141,17 @@ impl TrackDecoder {
         if run.mark {
             if live {
                 self.tracker.on_mark(dur_ms);
+                if self.tracker.take_badlock_recovered() {
+                    // MAN-6: the tracker just re-seeded mu_dit/mu_dah from a
+                    // self-consistent bad lock. `GapClassifier`'s own
+                    // cluster pair was bootstrapped from gap/mu_dit ratios
+                    // computed against the bad mu_dit and has no
+                    // self-correction path of its own, so its boundary
+                    // would otherwise stay wrong forever, permanently
+                    // misclassifying every inter-word gap as inter-char
+                    // (see SpeedTracker::badlock_recovered's doc comment).
+                    self.gaps = GapClassifier::new();
+                }
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
                 if let Some(w) = self.tracker.wpm() {
                     let report = match self.last_reported_wpm {
@@ -317,6 +328,129 @@ mod tests {
         }
         events.extend(dec.finish());
         (events_to_text(&events), events)
+    }
+
+    /// MAN-6 regression, hermetic. A track promoted mid-element makes the
+    /// demod's init window open mid-dah; the resulting un-anchored fragment
+    /// becomes sample #1 of SpeedTracker's 5-mark bootstrap, tipping
+    /// ClusterPair::initialize's largest-ratio-gap split onto a bad,
+    /// self-consistent fixed point: mu_dit collapses, every mark
+    /// reclassifies as a dah, every inter-element gap promotes to
+    /// inter-character. Pre-fix this became an endless "TT TTT TT TTT ..."
+    /// that never re-synced; `SpeedTracker`'s bimodal bad-lock recovery
+    /// bounds it to a fixed-size garbled prefix (15 non-space characters for
+    /// this tuple) that recovers after `DRIFT_LEN` (12) marks and never
+    /// grows, however long the stream runs -- see
+    /// `mid_element_start_error_does_not_grow_with_duration` below and
+    /// docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+    /// (A companion fix that discarded the fabricated leading fragment in
+    /// `Demod` outright was tried and reverted: it also discards genuine
+    /// leading elements on ordinary decodes whenever the demod's init window
+    /// happens to open on a real edge, regressing golden V1/V10 -- see that
+    /// doc.) Reproduced here with ZERO noise, which is the point: this is a
+    /// deterministic timing-bootstrap defect, not a noise-robustness limit.
+    ///
+    /// `skip_hops` starts the fresh `TrackDecoder` (simulating a
+    /// track-promotion attach) partway through a real element: at
+    /// `dit_hops = 25`, "A" = dit(25) gap(25) dah(75), so its dah spans
+    /// hops [50, 125). `skip_hops = 125 - 7` starts 7 hops before that dah
+    /// ends, leaving a 7-hop fragment: above the 5-hop debounce floor, and
+    /// (66.67/18.7 ~= 3.6 > 200/66.67 = 3.0) large enough to win
+    /// `ClusterPair::initialize`'s largest-ratio-gap split against the real
+    /// dit/dah population.
+    fn decode_from_hop(text: &str, dit_hops: u32, skip_hops: usize) -> (String, Vec<DecoderEvent>) {
+        let env = rect_envelope(text, dit_hops);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().skip(skip_hops).enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        (events_to_text(&events), events)
+    }
+
+    #[test]
+    fn mid_element_start_does_not_lock_bad_timing() {
+        // 10 repetitions of "AU"; start 7 hops before the end of A's first
+        // dah (see decode_from_hop's doc comment for the derivation). The
+        // bad lock produces a fixed-size garbled prefix, then recovers and
+        // decodes "AU" cleanly -- as its own space-bounded word, not merely
+        // as a substring -- for the remainder of the stream. MAN-6 F3: a
+        // `matches("AU")` substring count also passes on a run that has
+        // recovered its 'T'/'E' garbling but lost every word boundary
+        // (e.g. "UAUAUAUAUAUAU" contains "AU" six times too), because
+        // `GapClassifier`'s own stale cluster state kept misclassifying
+        // every inter-word gap as inter-char. Counting whitespace-delimited
+        // "AU" tokens instead only passes once spacing is genuinely intact.
+        let text = "AU AU AU AU AU AU AU AU AU AU";
+        let (decoded, events) = decode_from_hop(text, 25, 125 - 7);
+        let au_words = decoded.split_whitespace().filter(|&w| w == "AU").count();
+        assert!(
+            au_words >= 5,
+            "expected clean, word-bounded recovery after the garbled prefix -- {decoded:?}"
+        );
+        // 25 hops/dit = 66.67 ms = 18.0 WPM.
+        let wpm = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
+                _ => None,
+            })
+            .next_back()
+            .expect("no SpeedUpdate emitted");
+        assert!((wpm - 18.0).abs() < 2.0, "wpm {wpm}");
+    }
+
+    #[test]
+    fn mid_element_start_error_does_not_grow_with_duration() {
+        // The ticket's actual acceptance criterion: error must stabilize or
+        // shrink as the scene lengthens, not accumulate. The bad-lock
+        // recovery bounds the garbled run to a fixed-size prefix that does
+        // not grow as more repetitions are appended -- it does not
+        // eliminate the garbled prefix outright (that would require
+        // discarding the fabricated leading fragment in `Demod`, which was
+        // tried and reverted for regressing ordinary decodes; see
+        // docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md).
+        //
+        // Assert against a measured baseline (reps=4, the shortest case
+        // whose prefix is already complete) rather than a hard-coded count:
+        // the bound is a property of where `is_credible_bimodal` first
+        // fires on this tuple, not a number worth freezing independent of
+        // the mechanism that produces it.
+        let baseline_text = std::iter::repeat_n("AU", 4usize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (baseline_decoded, _) = decode_from_hop(&baseline_text, 25, 125 - 7);
+        let baseline_t = baseline_decoded.chars().filter(|&c| c == 'T').count();
+        assert!(baseline_t > 0, "precondition: bad lock not reproduced");
+        for reps in [10usize, 24, 60] {
+            let text = std::iter::repeat_n("AU", reps)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (decoded, _) = decode_from_hop(&text, 25, 125 - 7);
+            let t_count = decoded.chars().filter(|&c| c == 'T').count();
+            assert_eq!(
+                t_count, baseline_t,
+                "reps {reps}: garbled prefix grew past its fixed size (baseline {baseline_t}) -- {decoded:?}"
+            );
+        }
+        // MAN-6 F3: the 'T' prefix staying flat is necessary but not
+        // sufficient -- `GapClassifier`'s own stale cluster state could
+        // still silently delete every word boundary after the recovery
+        // point even while the 'T' count stayed bounded. Assert the
+        // recovered tail is genuinely word-separated, not glued together.
+        let long_text = std::iter::repeat_n("AU", 60usize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (long_decoded, _) = decode_from_hop(&long_text, 25, 125 - 7);
+        let au_words = long_decoded
+            .split_whitespace()
+            .filter(|&w| w == "AU")
+            .count();
+        assert!(
+            au_words >= 50,
+            "recovered decode must keep word boundaries -- {long_decoded:?}"
+        );
     }
 
     #[test]

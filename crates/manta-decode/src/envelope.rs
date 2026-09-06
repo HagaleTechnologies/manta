@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn init_replay_recovers_first_second() {
         // Pinned decision 4: elements inside the first 375-hop init window
-        // must be decoded after replay. First mark starts at ts 0.
+        // must be decoded after replay.
         let mut segs = Vec::new();
         for _ in 0..10 {
             segs.push((1.0f32, 30u32));

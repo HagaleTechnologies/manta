@@ -81,11 +81,9 @@ proptest! {
     // in play, the fix gives a small, constant, measurable CER floor from
     // the lost leading repetition(s) -- not the runaway failures below.
     //
-    // Still `#[ignore]`d, though, because un-ignoring surfaced THREE
-    // separate, pre-existing, out-of-scope real-detector bugs across this
-    // proptest's WPM/offset/SNR/text space (Tasks 4-8, not a Task 11
-    // tolerance issue -- same "don't force a real bug to pass" principle
-    // this plan applies to V2 in `golden_v2_v3.rs`):
+    // Still `#[ignore]`d, though, because un-ignoring surfaced separate,
+    // pre-existing, out-of-scope real-detector bugs across this proptest's
+    // WPM/offset/SNR/text space:
     //   1. offset_hz == 0 (channel 0, dead DC center): total decode failure
     //      (zero CharDecoded events) at every WPM/SNR tried. Noted on
     //      <https://github.com/HagaleTechnologies/manta/issues/12>.
@@ -93,17 +91,27 @@ proptest! {
     //      (CER > 1) clearing completely by 10.2 WPM, independent of
     //      text/offset/SNR. Filed as
     //      <https://github.com/HagaleTechnologies/manta/issues/22>.
-    //   3. Some other (text, wpm, offset, snr) combinations well outside
-    //      both of the above (e.g. wpm=18.117826, offset=-20kHz, snr=28dB,
-    //      text "AU") produce *persistent, non-converging* garbled decode
-    //      -- CER that grows with scene duration rather than stabilizing,
-    //      unlike every warmup-floor case in this task. Filed as
-    //      <https://github.com/HagaleTechnologies/manta/issues/23>.
-    // Given #3's breadth (not confined to a narrow, excludable parameter
-    // band the way #1 and #2 are), narrowing the proptest strategy further
-    // isn't a real fix, just whack-a-mole -- re-ignoring instead of forcing
-    // a pass, per this plan's escalation guidance. Un-ignore once #12/#22/#23
-    // (or their eventual root cause, possibly shared) are resolved.
+    // A third failure mode -- persistent, non-converging garbled decode on
+    // some (text, wpm, offset, snr, seed) tuples, issue #23 / MAN-6 -- is
+    // **MITIGATED**: bimodal bad-lock recovery in `SpeedTracker` bounds the
+    // garbled run to a fixed-size prefix that stops growing with scene
+    // duration (the ticket's actual Gherkin criterion). A companion fix
+    // (discarding `Demod`'s un-anchored leading run at track promotion) was
+    // tried and reverted: it also discards genuine leading elements whenever
+    // the demod's init window happens to open on a real edge, regressing
+    // golden V1/V10 and any ordinary decode whose leading character starts
+    // with a mark — see
+    // docs/DECISIONS/2026-09-04-man6-leading-partial-run-and-badlock-recovery.md.
+    // Its regression coverage lives in
+    // `crates/manta-engine/tests/regression_man6_persistent_garble.rs`, which
+    // samples this same parameter space on a fixed deterministic grid --
+    // deliberately, rather than un-ignoring this proptest, because #12 and #22
+    // still make a randomized sweep of the full 10-40 WPM / +/-40 kHz space
+    // fail. Given #12/#22's remaining breadth, narrowing the proptest
+    // strategy further isn't a real fix, just whack-a-mole -- re-ignoring
+    // instead of forcing a pass, per this plan's escalation guidance.
+    // Un-ignore once #12 and #22 (or their eventual root cause, possibly
+    // shared) are resolved.
     #[test]
     #[ignore]
     fn iq_roundtrip_with_noise(
@@ -135,10 +143,10 @@ proptest! {
         // Loosened from the original exact `CER == 0`: like every other
         // continuously-keyed scenario in this task, the leading
         // repetition(s) played during warmup+confirm are structurally lost.
-        // This tolerance is aspirational pending issues #12/#22/#23 above --
-        // it holds for the ordinary warmup-floor-only cases but this test
-        // stays `#[ignore]`d because of the three real-bug cases that
-        // violate it regardless of tolerance.
+        // This tolerance is aspirational pending issues #12/#22 above -- it
+        // holds for the ordinary warmup-floor-only cases and for #23/MAN-6
+        // (fixed) but this test stays `#[ignore]`d because of the two
+        // remaining real-bug cases that violate it regardless of tolerance.
         prop_assert!(
             cer(&texts[0], &report.text) < 0.25,
             "wpm {} snr {} offset {} kHz: keyed {:?} decoded {:?} (CER {:.4})",
