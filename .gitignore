@@ -33,6 +33,10 @@ secrets*
 # Catalyst thoughts/ symlink (points outside the repo to the shared diario store)
 thoughts/
 
+# Local-only scratch space for material that shouldn't be committed or
+# described in tracked files (never pushed, never referenced by name).
+.private/
+
 # Real-audio corpus kept local-only -- either too big for git history
 # without LFS, or pending confirmed redistribution rights from the source.
 # See crates/manta-testkit/audio-corpus/README.md.
