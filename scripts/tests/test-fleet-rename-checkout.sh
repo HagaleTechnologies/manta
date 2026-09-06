@@ -337,5 +337,99 @@ else
   ok "T28 skipped (no jq)"
 fi
 
+# --- T29: --apply on a hand-renamed host (directories already renamed
+#     outside the script, but a worktree still registered at the legacy path
+#     and origin still pointing at the old URL — the "repointed on one
+#     machine only" state the ticket itself describes) actually repairs and
+#     repoints instead of verifying-only and looping at exit 1 forever
+#     (validation-round finding C-1) ---
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
+mv "$R/org/skimmer" "$R/org/manta"
+mv "$R/org/skimmer-worktrees" "$R/org/manta-worktrees"
+# origin left stale on purpose
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T29 exit" "$rc" "0"
+check "T29 origin repointed" \
+  "$(git -C "$R/org/manta" remote get-url origin)" \
+  "https://github.com/HagaleTechnologies/manta.git"
+git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
+  && ok "T29 worktree repaired" || bad "T29 worktree repaired" "$out"
+git -C "$R/org/manta" worktree list --porcelain | grep -q '^prunable' \
+  && bad "T29 no prunable" "$out" || ok "T29 no prunable"
+out2=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc2=$?
+check "T29 second apply exit" "$rc2" "0"
+
+# --- T30: a trailing slash on --org-dir (what shell tab-completion produces)
+#     must not stop --apply from finding and repairing a worktree still
+#     registered at the legacy path (validation-round finding C-2) ---
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
+mv "$R/org/skimmer" "$R/org/manta"
+mv "$R/org/skimmer-worktrees" "$R/org/manta-worktrees"
+git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+out=$("$SUT" --apply --org-dir "$R/org/" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T30 exit" "$rc" "0"
+git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
+  && ok "T30 worktree repaired despite trailing slash" \
+  || bad "T30 worktree repaired despite trailing slash" "$out"
+
+# --- T31: a symlinked --org-dir component (macOS /tmp -> /private/tmp,
+#     $TMPDIR -> /private/var/..., or ~/code-repos on a symlinked volume)
+#     must not stop --apply from finding and repairing a stale worktree --
+#     git canonicalizes worktree paths to the real (non-symlink) location, so
+#     the script must normalize --org-dir the same way before deriving its
+#     path variables (validation-round finding C-2) ---
+R=$(newroot); C=$(mkfixture "$R/real" skimmer); ln -s "$R/real" "$R/link"
+mkdir -p "$R/real/org/skimmer-worktrees"; addwt "$C" "$R/real/org/skimmer-worktrees/w1" w1
+mv "$R/real/org/skimmer" "$R/real/org/manta"
+mv "$R/real/org/skimmer-worktrees" "$R/real/org/manta-worktrees"
+git -C "$R/real/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
+out=$("$SUT" --apply --org-dir "$R/link/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T31 exit" "$rc" "0"
+git -C "$R/real/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
+  && ok "T31 worktree repaired through symlinked org-dir" \
+  || bad "T31 worktree repaired through symlinked org-dir" "$out"
+
+# --- T32: a symlinked file inside a scanned root (a stow/dotfiles-style
+#     ~/bin symlink farm — the normal layout link-build-cache.sh lives in) is
+#     followed and scanned, not silently skipped (validation-round finding
+#     C-4: grep -r does not follow symlinks, -R does) ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/real-tools" "$R/bin"
+printf 'CACHE_SRC=%s/org/skimmer/target\n' "$R" > "$R/real-tools/link-build-cache.sh"
+ln -s "$R/real-tools/link-build-cache.sh" "$R/bin/link-build-cache.sh"
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/bin" 2>&1); rc=$?
+check "T32 exit" "$rc" "2"
+grep -q "link-build-cache.sh" <<<"$out" && ok "T32 finds symlinked file" \
+  || bad "T32 finds symlinked file" "$out"
+[[ -d "$R/org/skimmer" ]] && ok "T32 nothing moved" || bad "T32 nothing moved"
+
+# --- T33: --scan-root ADDS to the default scan roots rather than replacing
+#     them — a hit under a default root must still block --apply even when
+#     --scan-root points somewhere else entirely (validation-round finding
+#     C-5) ---
+R=$(newroot)
+mkdir -p "$R/code-repos/github/other-tool"
+printf 'x=%s/org/skimmer\n' "$R" > "$R/code-repos/github/other-tool/uses-old-path.sh"
+mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/extra-scan-root"
+out=$(HOME="$R" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/extra-scan-root" 2>&1); rc=$?
+check "T33 exit" "$rc" "2"
+grep -q "uses-old-path.sh" <<<"$out" \
+  && ok "T33 default root hit still found alongside --scan-root" \
+  || bad "T33 default root hit still found alongside --scan-root" "$out"
+
+# --- T34: a --scan-root that does not exist is reported as skipped rather
+#     than silently absorbed by grep's own exit 2 (validation-round finding
+#     C-5) ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+      --scan-root "$R/does-not-exist" 2>&1); rc=$?
+grep -qi "does not exist or is not readable" <<<"$out" \
+  && ok "T34 warns about missing --scan-root" || bad "T34 warns about missing --scan-root" "$out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -24,7 +24,12 @@ against reality — fill in the evidence table as you go, same convention as
 
 ## Preconditions
 
-- bash + git ≥ 2.30 (`git worktree repair` landed in 2.30).
+- bash + git ≥ 2.36. `git worktree repair` itself landed in 2.30, but the
+  `prunable` annotation in `git worktree list`'s machine-readable output —
+  which this script's health check parses — arrived in 2.36. On git
+  2.30–2.35 the prunable half of the health model is inert with no warning
+  (the `git rev-parse` git-dir check still fires for worktrees under the
+  remapped new-name path, so the degradation is partial rather than total).
 - `jq` is optional — the registry-reconciliation step degrades to a printed,
   actionable warning without it; the directory/worktree/origin rename still
   completes.

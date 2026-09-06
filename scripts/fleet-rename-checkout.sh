@@ -52,6 +52,17 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n $MODE ]] || die "one of --check or --apply is required"
 
+# Normalize before deriving the path variables below: a trailing slash (what
+# shell tab-completion produces) or a symlinked path component (macOS
+# /tmp -> /private/tmp, $TMPDIR -> /private/var/..., or any host where
+# ~/code-repos sits on a symlinked volume) otherwise breaks the string-prefix
+# matching against paths `git worktree list` reports canonically (C-2).
+if [[ -d $ORG_DIR ]]; then
+  ORG_DIR="$(cd "$ORG_DIR" && pwd -P)"
+else
+  ORG_DIR="${ORG_DIR%/}"
+fi
+
 OLD_MAIN="$ORG_DIR/$OLD_NAME"
 NEW_MAIN="$ORG_DIR/$NEW_NAME"
 OLD_WTP="$ORG_DIR/${OLD_NAME}-worktrees"
@@ -112,7 +123,7 @@ FAILED=0
 # $1 = newline-separated baseline of paths that were ALREADY prunable before any
 #      move (empty for --check).
 verify() {
-  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root reg
+  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root reg bn
   mainpath="$(git -C "$MAIN" rev-parse --show-toplevel)"
 
   # Gherkin 1: directory named <new> present, no <old> directory remains.
@@ -145,6 +156,17 @@ verify() {
     elif [[ ! -e $path && $path == "$OLD_MAIN"/* ]]; then
       candidate="$NEW_MAIN/${path#"$OLD_MAIN"/}"
     fi
+    # C-3: even when the prefix remap above misses — a path shape it does not
+    # know about — a prunable entry whose recorded directory is gone but whose
+    # basename reappears live under the new worktree parent is still a fresh
+    # regression, not baseline cruft. This check is independent of OLD_WTP/
+    # OLD_MAIN prefix math on purpose, so it still catches the regression even
+    # if ORG_DIR normalization above ever falls short of some other host's
+    # path shape.
+    if [[ $candidate == "$path" && ! -e $path ]]; then
+      bn="$(basename -- "$path")"
+      [[ -d "$NEW_WTP/$bn" ]] && candidate="$NEW_WTP/$bn"
+    fi
     if [[ $flag == prunable ]]; then
       if [[ $candidate != "$path" && -d $candidate ]]; then
         fail "worktree recorded as prunable at stale path $path, but $candidate exists on disk and was not repaired (run: git -C $MAIN worktree repair $candidate)"
@@ -153,6 +175,7 @@ verify() {
         info "pre-existing prunable worktree (unrelated to this rename): $path"
       else
         fail "worktree is prunable after the move: $path"
+        unhealthy=1
       fi
     fi
     # Gherkin 2, part B: the check `worktree list` CANNOT make (KD 2).
@@ -196,10 +219,23 @@ default_scan_roots() {
   printf '%s\n' "$HOME/code-repos/github" "$HOME/bin" "$HOME/.local/bin"
 }
 tooling_hits() {
-  local roots=()
-  [[ ${#SCAN_ROOTS[@]} -gt 0 ]] && roots=("${SCAN_ROOTS[@]}")
-  if [[ ${#roots[@]} -eq 0 ]]; then
-    while IFS= read -r r; do [[ -d $r ]] && roots+=("$r"); done < <(default_scan_roots)
+  # --scan-root ADDS to the default roots rather than replacing them (C-5) —
+  # the runbook tells operators to point it at wherever magazzino or
+  # link-build-cache.sh live "if they're outside the default roots", which
+  # only makes sense as a widening of the scan, not a narrowing of it. A root
+  # that does not exist or is not readable is reported, not silently dropped:
+  # grep would otherwise exit 2 for it and the caller's `|| true` below would
+  # swallow that with no trace (also C-5).
+  local roots=() r
+  while IFS= read -r r; do [[ -d $r ]] && roots+=("$r"); done < <(default_scan_roots)
+  if [[ ${#SCAN_ROOTS[@]} -gt 0 ]]; then
+    for r in "${SCAN_ROOTS[@]}"; do
+      if [[ -d $r && -r $r ]]; then
+        roots+=("$r")
+      else
+        say "warning: --scan-root '$r' does not exist or is not readable — skipping it" >&2
+      fi
+    done
   fi
   [[ ${#roots[@]} -eq 0 ]] && return 0
   # Literal old checkout path, and the directory name as a path segment. Skip:
@@ -209,7 +245,10 @@ tooling_hits() {
   #   - files literally named `.git` (a linked worktree's gitdir pointer file
   #     necessarily contains `gitdir: <OLD_MAIN>/.git/worktrees/<id>` by
   #     construction, and that is not "tooling hardcoding a path" — C2).
-  grep -rIn --exclude-dir=.git --exclude=.git \
+  # `-R` (not `-r`) so a symlinked file — e.g. a stow/dotfiles-style `~/bin`
+  # symlink farm, the layout link-build-cache.sh normally lives in — is
+  # actually followed and scanned rather than silently skipped (C-4).
+  grep -RIn --exclude-dir=.git --exclude=.git \
        --exclude-dir=node_modules --exclude-dir=target \
        -e "$OLD_MAIN" -e "/${OLD_NAME}-worktrees" \
        "${roots[@]}" 2>/dev/null \
@@ -326,11 +365,61 @@ reconcile_registry() {
 # ---- apply ----------------------------------------------------------------
 if [[ $MODE == apply ]]; then
   if [[ $STATE == migrated ]]; then
-    say "nothing to move — checkout is already named '$NEW_NAME'; verifying only."
+    # C-1: this branch used to only call verify() and exit, so the one fleet
+    # state the ticket itself describes — "the git remote was repointed at
+    # the new URL on one machine only" (i.e. directory already renamed by
+    # hand, but worktrees/origin/registry left stale) — could never be
+    # remediated by --apply; it just reported the same FAIL lines forever.
+    # Reconcile in place instead: nothing needs to *move* (both directories
+    # are already at their new names by definition of STATE=migrated), but
+    # worktrees can still be registered at a stale legacy path, origin can
+    # still point at the old URL, and the registry can still be stale.
+    say "checkout is already named '$NEW_NAME'; reconciling any stale worktrees/origin/registry."
+
+    busy="$(busy_reasons)"
+    [[ -n $busy ]] && die "checkout is in use; refusing to touch it.
+$busy
+     Stop the Catalyst daemon and any open session on this checkout, then re-run."
+
+    REPAIR=()
+    while IFS=$'\t' read -r p _; do
+      [[ -z $p ]] && continue
+      cand="$p"
+      if [[ ! -e $p && $p == "$OLD_WTP"/* ]]; then
+        cand="$NEW_WTP/${p#"$OLD_WTP"/}"
+      elif [[ ! -e $p && $p == "$OLD_MAIN"/* ]]; then
+        cand="$NEW_MAIN/${p#"$OLD_MAIN"/}"
+      fi
+      if [[ $cand == "$p" && ! -e $p ]]; then
+        bn="$(basename -- "$p")"
+        [[ -d "$NEW_WTP/$bn" ]] && cand="$NEW_WTP/$bn"
+      fi
+      [[ $cand != "$p" && -d $cand ]] && REPAIR+=("$cand")
+    done <<<"$(inventory)"
+
+    if [[ ${#REPAIR[@]} -gt 0 ]]; then
+      say "repairing ${#REPAIR[@]} linked worktree(s) recorded at a stale legacy path"
+      git -C "$MAIN" worktree repair "${REPAIR[@]}" || \
+        info "git worktree repair reported a non-zero status; the verifier below is authoritative"
+    else
+      info "no linked worktrees recorded at a stale legacy path"
+    fi
+
+    cur="$(git -C "$MAIN" remote get-url origin 2>/dev/null || echo '')"
+    if [[ $cur != "$REMOTE_URL" ]]; then
+      say "repointing origin: ${cur:-<none>} -> $REMOTE_URL"
+      git -C "$MAIN" remote set-url origin "$REMOTE_URL" || die "git remote set-url failed"
+    else
+      info "origin already correct"
+    fi
+
+    reconcile_registry
+
+    say ""
     verify ""
     say ""
     [[ $FAILED -eq 0 ]] && { say "VERDICT: ALREADY MIGRATED — all checks pass."; exit 0; }
-    say "VERDICT: MIGRATION NEEDED — see FAIL lines above."; exit 1
+    say "VERDICT: MIGRATION INCOMPLETE — see FAIL lines above."; exit 1
   fi
 
   busy="$(busy_reasons)"
