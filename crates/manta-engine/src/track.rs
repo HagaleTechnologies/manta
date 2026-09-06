@@ -535,10 +535,13 @@ impl TrackManager {
     /// image sit at the noise floor and can differ by fractions of a dB --
     /// reproduced by probe: a noise-level edge could close the real ACTIVE
     /// track as `Merged`. 3 dB is comfortably below the ~90 dB steady-state
-    /// real/image gap this mechanism exists to resolve (pin doc item 15),
-    /// so it still decides promptly the moment either side actually
-    /// reflects the real signal; an ambiguous (within-margin) comparison
-    /// now correctly defers instead of firing on noise.
+    /// real/image gap this mechanism exists to resolve (pin doc item 15).
+    /// **This margin alone is not sufficient** -- two noise samples can
+    /// still differ by 3+ dB purely by chance (measured ~1-in-3 per hop);
+    /// `reads_above_own_floor` is the second, required gate that rules out
+    /// a noise-only hop from deciding anything at all. Together: an
+    /// ambiguous (within-margin) comparison defers, and so does a
+    /// comparison where the "winner" is still just noise.
     const MIRROR_POWER_MARGIN_DB: f32 = 3.0;
 
     /// `a` clearly exceeds `b` by at least `MIRROR_POWER_MARGIN_DB`.
@@ -555,6 +558,36 @@ impl TrackManager {
     /// `a` as clearly exceeding a silent `b == 0.0`.
     fn clearly_exceeds(a: f32, b: f32) -> bool {
         a > 0.0 && a >= b * 10f32.powf(Self::MIRROR_POWER_MARGIN_DB / 10.0)
+    }
+
+    /// MAN-4 remediate round 4 (validate code-review finding 1): is raw
+    /// `power` at channel `k` meaningfully above channel `k`'s *own* noise
+    /// floor -- i.e. does this reading actually reflect a real signal,
+    /// rather than noise scatter? `clearly_exceeds` alone answers "is A
+    /// bigger than B", which two noise samples satisfy by chance on any
+    /// given hop (measured ~1-in-3 at a 3 dB margin, ~2-dof-exponential
+    /// per-channel power, 375 hops/s) -- on a key-up hop with a mirror pair
+    /// both open (both already-spawned tracks, per `merge_mirror_images`),
+    /// both sides are noise, and a bare margin comparison could close the
+    /// real track and keep the image, recreating the ticket's own
+    /// track-ID-churn symptom via the mechanism meant to prevent it. Used
+    /// only in `merge_mirror_images`, against each side's own
+    /// `select_channel` (its argmax peak, not an arbitrary window index) --
+    /// the winning peak must itself clear its own floor by `on_snr_db`, the
+    /// same SNR bar the gate uses to call a rise a rise elsewhere.
+    /// Deliberately NOT used in `is_image_of_owned`: there `mirror` is a
+    /// literal circular index that can land on a track's owned-window
+    /// neighbor (sidelobe territory, not the peak), which routinely reads
+    /// below its own floor+on_snr_db even while genuinely owned -- gating
+    /// on that would silently stop blocking spawns near a real track's own
+    /// window (measured: floods of spurious CANDIDATEs at the ±1 channels
+    /// around a signal's mirror in `a_clean_audio_tone_spawns_one_track_
+    /// and_no_churn`). Uses the same raw (non-EMA) power `clearly_exceeds`
+    /// uses, against the `FloorBank` estimate (updated every hop regardless
+    /// of `mirror_image_guard`), so it carries none of the EMA ramp-up lag
+    /// `is_image_of_owned`'s doc comment describes.
+    fn reads_above_own_floor(&self, k: usize, power: f32) -> bool {
+        power_db(power) >= self.floor.effective_floor_db(k) + self.cfg.on_snr_db as f64
     }
 
     /// MAN-4 remediate (pin doc D7 addendum): should a rise at `k` be
@@ -660,9 +693,16 @@ impl TrackManager {
                     let (pa, pb) = (hop_power[ka], hop_power[kb]);
                     // MAN-4 remediate round 2 (code review finding 3): only
                     // close a definite loser; see MIRROR_POWER_MARGIN_DB.
-                    if Self::clearly_exceeds(pb, pa) {
+                    // MAN-4 remediate round 4 (validate code-review finding
+                    // 1): the margin alone cannot tell a real signal from
+                    // two noise samples that happen to differ by 3 dB --
+                    // also require the survivor to read above its OWN
+                    // floor, so a noise-only hop (both sides at the noise
+                    // floor during a key-up gap) defers instead of closing
+                    // the real track. See `reads_above_own_floor`.
+                    if Self::clearly_exceeds(pb, pa) && self.reads_above_own_floor(kb, pb) {
                         to_close.push(a);
-                    } else if Self::clearly_exceeds(pa, pb) {
+                    } else if Self::clearly_exceeds(pa, pb) && self.reads_above_own_floor(ka, pa) {
                         to_close.push(b);
                     }
                 }
@@ -1650,6 +1690,40 @@ mod tests {
             tm.tracks.len(),
             2,
             "exact-zero power on both sides of a mirror pair must defer, not close either side"
+        );
+    }
+
+    /// MAN-4 remediate round 4 (validate code-review finding 1): the exact
+    /// probe the validation report used to demonstrate the bug --
+    /// power[8]=1.0e-9 (real, key-up: noise only), power[504]=3.0e-9
+    /// (mirror, key-up: noise only, ~4.8 dB higher by chance) -- clears
+    /// `clearly_exceeds`'s 3 dB margin and used to close the REAL track,
+    /// keeping the image. With a warmed-up floor (both channels' noise
+    /// settles near -90 dBFS, same as every other channel), neither side
+    /// reads 12 dB (`on_snr_db`) above its own floor, so `reads_above_own_
+    /// floor` must block the decision and both tracks must survive.
+    #[test]
+    fn mirror_merge_defers_when_the_winning_side_is_still_just_noise() {
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, n);
+        tm.spawn(8);
+        tm.spawn(n - 8);
+        let mut power = quiet_power(n);
+        power[8] = 1.0e-9; // real track, key-up: noise only
+        power[n - 8] = 3.0e-9; // mirror track, key-up: noise only, ~4.8 dB higher by chance
+        tm.merge_mirror_images(&power);
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "a noise-only hop that merely clears the 3 dB margin must not close the real track \
+             -- neither side reads meaningfully above its own noise floor"
         );
     }
 
