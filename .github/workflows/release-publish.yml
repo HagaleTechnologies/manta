@@ -1,0 +1,234 @@
+name: Release Publish
+
+# MAN-21: the actual publish path -- pushes the multi-arch Docker image
+# to GHCR and creates the GitHub Release, from a tagged commit.
+#
+# Deliberately a SEPARATE FILE from release.yml, not a job within it, and
+# deliberately has NO `pull_request` trigger anywhere in its `on:` block
+# (PR #78 review round 6). Splitting into a second job within the same
+# file (the previous approach) is not sufficient on its own: for a
+# `pull_request` event, GitHub evaluates the ENTIRE workflow file --
+# every job, every `if:`, every `permissions:` block -- from the PR's OWN
+# head ref, not the base branch (this is exactly why `pull_request_target`
+# exists as the alternative; see wait-for-codex.yml's own header comment
+# for this repo's established precedent on the same class of risk). A
+# same-repository PR (not subject to the read-only-token restriction that
+# only applies to FORK PRs) could therefore edit a job's `if:` condition
+# within its own diff and have that edited condition evaluate true for
+# its own run, reaching `packages: write` before the PR is ever reviewed.
+#
+# Keeping the write-capable jobs in a file whose `on:` block never
+# includes `pull_request` at all closes the straightforward/accidental
+# version of this: today, nothing about a normal PR's `pull_request`
+# event can invoke this file, because GitHub only evaluates a workflow
+# file's jobs for event types that file's OWN `on:` block declares.
+#
+# Residual risk, NOT fully closed by this split alone, requires a human
+# decision rather than another automated fix: a sufficiently motivated
+# same-repository contributor (one who already has write access to this
+# repo -- not an anonymous fork contributor, who remains fully blocked by
+# GitHub's own fork-token restriction regardless of any of this) could
+# still ADD a `pull_request:` trigger to THIS file within their own PR's
+# diff, and per the same head-ref-evaluation rule above, that addition
+# would take effect for their own PR's event. The fully robust GitHub-
+# native closure for that is a protected Environment (repo Settings ->
+# Environments -> required reviewers) gating the `packages: write` job --
+# environment protection rules are enforced by GitHub's platform itself,
+# not expressible in or overridable by the workflow YAML a PR controls.
+# Deliberately NOT configured by this PR: creating/configuring a
+# protected environment is a standing repo-security-configuration
+# decision, not a code change, and outside what should be done
+# unsupervised. Filed as MAN-66, flagged to Tony directly -- not silently
+# worked around.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push the Docker image to GHCR (never creates a GitHub Release -- that only ever happens from a real v* tag push)'
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: manta
+
+concurrency:
+  group: release-publish-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            artifact: manta-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: manta-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: manta-windows-x86_64
+            exe_ext: .exe
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: manta-linux-x86_64
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: manta-linux-arm64
+            use_cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - if: runner.os == 'Linux' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="dist/${{ matrix.artifact }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.exe_ext }}" "$dist/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dist/" 2>/dev/null || cp README.md "$dist/"
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $dist
+          Copy-Item README.md $dist
+          if (Test-Path LICENSE-MIT) { Copy-Item LICENSE-MIT $dist }
+          if (Test-Path LICENSE-APACHE) { Copy-Item LICENSE-APACHE $dist }
+          Compress-Archive -Path $dist -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+  docker-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Determine version, image, and tag list
+        id: version
+        shell: bash
+        run: |
+          # Gated on the EVENT being a real push, not merely on
+          # github.ref_type == 'tag' -- ref_type is ALSO 'tag' for
+          # `gh workflow run release-publish.yml --ref <existing-tag>
+          # -f publish=true`, a workflow_dispatch run targeting an
+          # existing tag, not a push.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dispatch-${{ github.run_id }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # OCI/Docker repository paths must be lowercase; github.repository
+          # is case-preserving ("HagaleTechnologies/manta") and buildx
+          # rejects a mixed-case tag outright.
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          # `:latest` is reserved for real tag pushes only -- a
+          # workflow_dispatch run with publish=true can target any
+          # branch, not just a release, and README's `docker run
+          # ghcr.io/.../manta:latest` install command must always trace
+          # to a real tagged release, not a manual test build that
+          # happened to also push. The dispatch-<run_id> tag is still
+          # pushed on a dispatch publish, for testing that path
+          # specifically -- just never `:latest`.
+          {
+            echo "tags<<RELEASE_TAGS_EOF"
+            echo "$IMAGE:$VERSION"
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              echo "$IMAGE:latest"
+            fi
+            echo "RELEASE_TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' || inputs.publish
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' || inputs.publish == true }}
+          tags: ${{ steps.version.outputs.tags }}
+
+  release:
+    needs: [build, docker-publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: find dist -type f
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -279,6 +279,15 @@ pub(crate) struct Track {
     /// drained once per `process_hops` call by `drain_pool` (ARCHITECTURE
     /// §10's decoder pool).
     pending: Vec<(f32, u64)>,
+    /// Set by `process_hops` once `drain_pool` has actually produced a
+    /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
+    /// a track promoted and then merged/evicted within the *same*
+    /// `process_hops` batch never gets a `drain_pool` pass before it's
+    /// removed (that only runs once, after every hop in the batch), so it
+    /// can have an allocated decoder yet have emitted nothing at all
+    /// (MAN-19 review round 1). `TrackClosed` emission checks this, not
+    /// decoder presence.
+    has_emitted: bool,
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -306,6 +315,7 @@ impl Track {
             birth_channel,
             decoder: None,
             pending: Vec::new(),
+            has_emitted: false,
         }
     }
 
@@ -439,13 +449,18 @@ impl TrackManager {
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
     /// SPEC §2.5 and ARCHITECTURE §4/§8 both describe these closes as
-    /// "counted" -- this is the count. Not yet wired to an external
-    /// exposition (the Prometheus text endpoint is explicit M3 scope).
-    // Temporary: no non-test caller yet -- M3's metrics endpoint is this
-    // count's first real consumer.
-    #[allow(dead_code)]
+    /// "counted" -- this is the count. Wired into `soak_metrics::soak_with_metrics`
+    /// (MAN-19) ahead of the real M3 Prometheus endpoint.
     pub fn close_counts(&self) -> CloseCounts {
         self.close_counts
+    }
+
+    /// Count of tracks currently open (`self.tracks`, SPEC §2.5). Alongside
+    /// `close_counts`, this is what MAN-19's 24h soak needs visible at
+    /// every sample interval -- ROADMAP.md's M2 accept criterion ("track
+    /// count and evictions visible in metrics").
+    pub fn active_track_count(&self) -> usize {
+        self.tracks.len()
     }
 
     /// Rebuild `owner_of` from scratch against the current `tracks` map.
@@ -467,7 +482,7 @@ impl TrackManager {
     /// input) is always `false` here; the decoder pool runs after this
     /// whole batch, so no per-hop decode result is available yet to feed
     /// back into the same hop's lifecycle bookkeeping.
-    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) {
+    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> Vec<u32> {
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -546,9 +561,25 @@ impl TrackManager {
                 }
             }
         }
-        for id in closed {
-            self.tracks.remove(&id);
-        }
+        // MAN-19: only report a close as `TrackClosed`-worthy if the track
+        // actually emitted a real event (`has_emitted`), not merely
+        // whether it was ever promoted (`decoder.is_some()`) -- a track
+        // promoted and then merged/evicted within this *same*
+        // `process_hops` batch never gets a `drain_pool` pass before it's
+        // removed here (that runs once, after every hop in the batch), so
+        // it can have an allocated decoder yet have produced nothing at
+        // all (round 1 review). A CANDIDATE that closes Unconfirmed
+        // without ever being promoted never appeared in the event stream
+        // either; surfacing a `TrackClosed` for either case would
+        // introduce a track_id into the stream that callers like
+        // `decode_samples` (which picks the *lowest* track_id present as
+        // its single-track report) never used to see, silently changing
+        // which track gets reported.
+        closed.retain(|id| {
+            self.tracks
+                .remove(id)
+                .is_some_and(|track| track.has_emitted)
+        });
         self.recompute_ownership();
 
         // Same-hop simultaneous-rise tie-break (SPEC §2.5): scan channels in
@@ -577,8 +608,9 @@ impl TrackManager {
             }
         }
         self.recompute_ownership();
-        self.merge_converged();
-        self.evict_over_cap();
+        closed.extend(self.merge_converged());
+        closed.extend(self.evict_over_cap());
+        closed
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -603,7 +635,7 @@ impl TrackManager {
 
     /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
     /// the lower-current-SNR one is closed.
-    fn merge_converged(&mut self) {
+    fn merge_converged(&mut self) -> Vec<u32> {
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         let mut to_close = Vec::new();
         for i in 0..ids.len() {
@@ -624,18 +656,29 @@ impl TrackManager {
                 }
             }
         }
-        for id in to_close {
-            self.tracks.remove(&id);
-            self.close_counts.record(CloseReason::Merged);
-        }
+        // MAN-19: only report a merge-loser as `TrackClosed`-worthy if it
+        // actually emitted a real event -- see the matching comment in
+        // `step_hop` (a track promoted this same batch can be merged away
+        // before ever getting a `drain_pool` pass).
+        let ever_emitted_closed = to_close
+            .into_iter()
+            .filter(|id| {
+                self.close_counts.record(CloseReason::Merged);
+                self.tracks
+                    .remove(id)
+                    .is_some_and(|track| track.has_emitted)
+            })
+            .collect();
         if !ids.is_empty() {
             self.recompute_ownership();
         }
+        ever_emitted_closed
     }
 
     /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
     /// eviction.
-    fn evict_over_cap(&mut self) {
+    fn evict_over_cap(&mut self) -> Vec<u32> {
+        let mut evicted = Vec::new();
         while self.tracks.len() > self.cfg.track_cap {
             let loser = *self
                 .tracks
@@ -643,10 +686,19 @@ impl TrackManager {
                 .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
                 .map(|(id, _)| id)
                 .unwrap();
-            self.tracks.remove(&loser);
             self.close_counts.record(CloseReason::Evicted);
+            // MAN-19: only report as `TrackClosed`-worthy if it actually
+            // emitted a real event -- see `step_hop`'s matching comment.
+            if self
+                .tracks
+                .remove(&loser)
+                .is_some_and(|track| track.has_emitted)
+            {
+                evicted.push(loser);
+            }
         }
         self.recompute_ownership();
+        evicted
     }
 
     /// Process one `Channelizer::process()` slice: sequential per-hop
@@ -662,23 +714,49 @@ impl TrackManager {
         hops: &[HopOutput],
         hop_to_sample_ts: impl Fn(u64) -> u64,
     ) -> Vec<DecoderEvent> {
+        let mut closed_ids: Vec<u32> = Vec::new();
         for h in hops {
-            self.step_hop(h, hop_to_sample_ts(h.m));
+            closed_ids.extend(self.step_hop(h, hop_to_sample_ts(h.m)));
         }
-        let events = self.drain_pool();
+        let mut events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
         // actually decoded a character this batch. `step_hop` advances it
         // every hop with `char_emitted = false` (the pool has not run yet),
         // so this post-pool reset is the only thing that keeps a
         // continuously-decoding signal from being force-closed
         // `CloseReason::Silent` after `gc_hops` and re-spawned as a new track.
+        //
+        // Also marks `has_emitted` for MAN-19's `TrackClosed` filter (see
+        // `step_hop`'s comment on `closed.retain`) -- every event kind
+        // here counts as real output, not just `CharDecoded`. A track
+        // closed by a LATER `process_hops` call reads whatever this set,
+        // which is exactly what "did this track ever actually emit
+        // anything" needs; a track promoted and closed within THIS same
+        // call never reaches this loop before being removed, so it
+        // correctly stays `false`.
         for e in &events {
+            if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
+                t.has_emitted = true;
+            }
             if let DecoderEvent::CharDecoded { track_id, .. } = e {
                 if let Some(t) = self.tracks.get_mut(track_id) {
                     t.lifecycle.note_char_decoded();
                 }
             }
         }
+        // MAN-19: emit one `TrackClosed` per track closed this batch (any
+        // CloseReason) so downstream per-track_id state (`manta-spot`'s
+        // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
+        // free it -- see events.rs's TrackClosed doc for the unbounded-
+        // growth bug this fixes. Re-sorted with the rest per SPEC §6 rule
+        // 6; `event_sample_ts` gives these no ordering claim (ties at 0,
+        // same as SpeedUpdate/TrackMeta).
+        events.extend(
+            closed_ids
+                .into_iter()
+                .map(|track_id| DecoderEvent::TrackClosed { track_id }),
+        );
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         events
     }
 
@@ -694,6 +772,44 @@ impl TrackManager {
             .flat_map_iter(|d| d.finish())
             .collect();
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        // MAN-19 round 3: honor the same teardown contract `process_hops`
+        // does -- a track still open when the stream ends (EOF/Ctrl-C/
+        // error) must still get its `TrackClosed` if it ever emitted a
+        // real event, including one this very flush just produced (mark
+        // `has_emitted` from `events` first, same as `process_hops`).
+        // Without this, a caller that keeps the `Validator`/
+        // `RepetitionGate` alive past `finish()` (this crate's own
+        // `listen()` doesn't, but the contract shouldn't depend on that)
+        // would leak exactly the state this whole mechanism exists to
+        // free.
+        for e in &events {
+            if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
+                t.has_emitted = true;
+            }
+        }
+        let closed_ids: Vec<u32> = self
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.has_emitted)
+            .map(|(&id, _)| id)
+            .collect();
+        // MAN-19 round 7: append, then apply ONE consistent global
+        // `(sample_ts, track_id)` sort (SPEC-decode-core.md §6 rule 6) --
+        // round 4's version appended without re-sorting specifically to
+        // dodge `TrackClosed`'s old ts=0 treatment (which would've put a
+        // track's own closure *before* the real content this same flush
+        // just produced for it), but that broke the spec's single-global-
+        // sort requirement. Now that `event_sample_ts` gives `TrackClosed`
+        // a synthetic `u64::MAX` (guaranteed after every real event, for
+        // every track, not just this one), a normal full re-sort is safe
+        // and correct again.
+        events.extend(
+            closed_ids
+                .into_iter()
+                .map(|track_id| DecoderEvent::TrackClosed { track_id }),
+        );
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        self.tracks.clear();
         events
     }
 
@@ -732,13 +848,27 @@ impl TrackManager {
 }
 
 /// SPEC §6 rule 6 resequencing key: the sample timestamp an event is
-/// anchored to, or `0` for events with no inherent timestamp (`SpeedUpdate`/
-/// `TrackMeta`), which sort first among ties on `event_track_id`.
+/// anchored to, `0` for events with no inherent timestamp (`SpeedUpdate`/
+/// `TrackMeta`, which sort first among ties on `event_track_id`), or
+/// `u64::MAX` for `TrackClosed` -- a synthetic "after everything" marker,
+/// not `0` (round 7 review): `TrackClosed` isn't anchored to a real
+/// timestamp either, but unlike `SpeedUpdate`/`TrackMeta` it must never
+/// sort before another real event for the SAME track_id (a track's own
+/// final `CharDecoded`/`WordBoundary`, `finish()`'s flush) -- doing so
+/// lets a consumer free that track's state and then recreate it
+/// processing the trailing events, with nothing left to ever clean that
+/// up again (the exact leak this whole mechanism exists to prevent).
+/// `MAX` guarantees that regardless of how large a real `sample_ts`
+/// grows. This is what lets `finish()` (and `process_hops`) apply ONE
+/// consistent `(sample_ts, track_id)` sort across the whole batch
+/// (SPEC-decode-core.md §6 rule 6) instead of the append-without-
+/// re-sorting workaround round 4 used.
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
         DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
+        DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
 }
 
@@ -749,7 +879,8 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         DecoderEvent::CharDecoded { track_id, .. }
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
-        | DecoderEvent::TrackMeta { track_id, .. } => *track_id,
+        | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TrackClosed { track_id } => *track_id,
     }
 }
 
@@ -1121,5 +1252,54 @@ mod tests {
             rendered.keyed_texts[0],
             text
         );
+    }
+
+    /// MAN-19 round 4: `finish()`'s own `TrackClosed` must be ordered
+    /// after every other event it emits for the same track_id -- a
+    /// `TrackClosed` sorted in *before* that track's final `CharDecoded`/
+    /// `WordBoundary` (both carry real, positive timestamps;
+    /// `TrackClosed` sorts at ts=0) would let a consumer see the closure
+    /// first, free the track's state, then recreate it processing the
+    /// trailing events, with nothing left to ever clean that up again --
+    /// reintroducing the exact leak this mechanism exists to prevent.
+    #[test]
+    fn finish_orders_track_closed_after_every_other_event_for_that_track() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            tm.process_hops(&hops, |m| m * hop_samples);
+        }
+        let finish_events = tm.finish();
+        assert!(
+            finish_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackClosed { .. })),
+            "V1's track should still be open at EOF, so finish() should close it"
+        );
+
+        let mut closed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for e in &finish_events {
+            let id = event_track_id(e);
+            if matches!(e, DecoderEvent::TrackClosed { .. }) {
+                closed.insert(id);
+            } else {
+                assert!(
+                    !closed.contains(&id),
+                    "track {id} got a real event after its own TrackClosed -- \
+                     finish() must order TrackClosed after every other event for that track"
+                );
+            }
+        }
     }
 }

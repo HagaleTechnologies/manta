@@ -1,0 +1,170 @@
+name: Release
+
+# MAN-21: builds and validates the release binaries + Docker image for
+# every committed platform, from `pull_request` (path-filtered, build-only
+# validation), `workflow_dispatch` (manual re-run), or a real `v*` tag
+# push (also validated here, redundantly with release-publish.yml, purely
+# for CI hygiene -- harmless, never publishes anything).
+#
+# This file NEVER publishes anything and NEVER requests write permissions
+# anywhere -- deliberately, so it's safe to also trigger on `pull_request`
+# without a PR being able to reach any credential by editing it (PR #78
+# review round 6). The actual publish path (Docker push to GHCR, GitHub
+# Release creation) lives in release-publish.yml, which has NO
+# `pull_request` trigger at all -- see that file's own header comment for
+# why splitting the trigger SET, not just the job, matters here.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-publish.yml'
+      - 'Dockerfile'
+      - 'Cross.toml'
+      - '.dockerignore'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: manta
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS x86_64: macos-13 was retired (no longer in GitHub's
+          # supported runner-image table as of this workflow) -- the
+          # current Intel label is macos-15-intel (PR #78 review round 1).
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            artifact: manta-macos-x86_64
+          # macOS arm64: macos-14+ runners are Apple Silicon natively.
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: manta-macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: manta-windows-x86_64
+            exe_ext: .exe
+          # Linux x86_64: built via `cross` rather than natively on
+          # ubuntu-latest (PR #78 review round 1) -- a native build on
+          # the current runner's glibc would raise the binary's minimum
+          # glibc symbol-version requirement above what's actually
+          # available on still-supported distros (RHEL 8, Debian 11,
+          # Ubuntu 20.04), despite README advertising a generic Linux
+          # x86_64 binary. cross-rs's images are deliberately built on an
+          # older base for exactly this reason.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: manta-linux-x86_64
+            use_cross: true
+          # Linux arm64: covers Raspberry Pi OS 64-bit and other ARM
+          # SBCs. Cross-compiled via `cross` (cross-rs) rather than a
+          # native runner -- GitHub has no arm64 Linux hosted runner in
+          # this repo's plan, and `cross` handles the ALSA
+          # (cpal's Linux backend, an unconditional dependency of
+          # manta-input) cross-linking via Cross.toml's pre-build hook.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: manta-linux-arm64
+            use_cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - if: runner.os == 'Linux' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      # `soapy` is deliberately excluded from every release binary in this
+      # matrix -- it links against the SoapySDR system library, which
+      # doesn't have a straightforward statically-linked or vendored
+      # cross-compilation story across 5 targets. Operators who need it
+      # build from source with --features soapy (unchanged, documented in
+      # README). `hpsdr` has no native-library dependency at all (pure
+      # UDP/std, see crates/manta-input/src/hpsdr.rs's own module docs)
+      # so it's safe and directly relevant (MAN-21's own motivating
+      # George/K5TR conversation is an HPSDR use case) to always enable.
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release -p manta-cli --features hpsdr --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="dist/${{ matrix.artifact }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.exe_ext }}" "$dist/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dist/" 2>/dev/null || cp README.md "$dist/"
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $dist
+          Copy-Item README.md $dist
+          if (Test-Path LICENSE-MIT) { Copy-Item LICENSE-MIT $dist }
+          if (Test-Path LICENSE-APACHE) { Copy-Item LICENSE-APACHE $dist }
+          Compress-Archive -Path $dist -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+  docker-build:
+    # Build-and-validate only, never pushes, never requests packages:write
+    # -- see the top-of-file comment for why that's what makes it safe to
+    # also run on `pull_request`.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false

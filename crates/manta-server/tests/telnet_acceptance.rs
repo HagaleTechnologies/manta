@@ -9,7 +9,7 @@ use manta_server::rbn;
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const SAMPLE_RATE_HZ: f64 = 96_000.0;
@@ -20,6 +20,7 @@ async fn spawn_server() -> (
     Arc<SpotBus>,
     Arc<Metrics>,
     tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
 ) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
@@ -31,6 +32,12 @@ async fn spawn_server() -> (
     let metrics2 = metrics.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
+    // Kept alongside the clone moved into `serve()` (PR #75 review, round
+    // 3) so a caller can directly inspect a client task's own join result
+    // afterward -- a panicking task also drops its socket, so observing
+    // the socket close alone can't distinguish a clean disconnect from a
+    // handler panic.
+    let tasks_handle = tasks.clone();
     let limiter =
         manta_server::tasks::new_connection_limiter(manta_server::telnet::MAX_TELNET_CONNECTIONS);
     tokio::spawn(async move {
@@ -42,11 +49,16 @@ async fn spawn_server() -> (
             shutdown_rx,
             tasks,
             limiter,
+            manta_server::tasks::IpQuota::new(manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP),
+            manta_server::rate_limit::IpRateLimiter::new(
+                manta_server::telnet::MAX_TELNET_COMMANDS,
+                manta_server::telnet::COMMAND_RATE_WINDOW,
+            ),
         )
         .await;
     });
 
-    (addr, bus, metrics, shutdown_tx)
+    (addr, bus, metrics, shutdown_tx, tasks_handle)
 }
 
 fn sample_spot() -> Spot {
@@ -96,7 +108,7 @@ async fn connect_and_login(
 
 #[tokio::test]
 async fn standard_client_receives_spot_in_rbn_format_after_login() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     let spot = sample_spot();
@@ -114,7 +126,7 @@ async fn standard_client_receives_spot_in_rbn_format_after_login() {
 
 #[tokio::test]
 async fn sh_dx_command_does_not_disconnect_the_client() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"sh/dx\r\n").await.unwrap();
@@ -134,7 +146,7 @@ async fn sh_dx_command_does_not_disconnect_the_client() {
 
 #[tokio::test]
 async fn sh_dx_replays_recent_spot_history_in_rbn_format() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
 
     // History predates the client's connection entirely -- `sh/dx` reads
     // the bus's retained history, not the live broadcast subscription.
@@ -172,7 +184,7 @@ async fn sh_dx_history_replay_honors_the_unique_filter() {
     // stream by `set dx filter unique > n` must stay suppressed when the
     // same client replays it via `sh/dx` -- the filter must apply
     // consistently to both paths, not just the live one.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
 
     // Published BEFORE the client connects, so this is pure history --
     // sh/dx's replay path, not the live broadcast path.
@@ -216,7 +228,7 @@ async fn sh_dx_history_replay_honors_the_unique_filter() {
 
 #[tokio::test]
 async fn set_dx_filter_unique_suppresses_below_threshold_occurrences() {
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
@@ -263,7 +275,7 @@ async fn filter_evaluates_each_spot_at_its_own_publication_time_not_drain_time()
     // time the client gets around to checking it -- otherwise both the
     // first (which should be suppressed) and second occurrence would pass
     // a `unique > 1` filter once the count had already reached 2.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
@@ -301,7 +313,7 @@ async fn a_command_split_across_writes_survives_a_spot_arriving_mid_command() {
     // spot branch, then resume reading the command's remainder. The full
     // command must still be recognized, not corrupted into "x" (parsed as
     // Command::Unknown, silently producing no history replay at all).
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     let mut history_spot = sample_spot();
@@ -346,7 +358,7 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
     // (e.g. from TrackManager::finish() just before exit) must still
     // reach the client, not be dropped when the runtime tears the
     // connection's task down.
-    let (addr, bus, _metrics, shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     bus.publish(sample_spot());
@@ -369,7 +381,7 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
 
 #[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
-    let (addr, _bus, metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, _bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (_reader, _wr) = connect_and_login(addr).await;
 
     // Give the accept/login task a moment to run and increment the gauge.
@@ -377,6 +389,62 @@ async fn connecting_client_is_counted_in_metrics() {
     assert!(metrics
         .render_prometheus_text()
         .contains("manta_telnet_clients_connected 1"));
+}
+
+/// MAN-61: `ConnectionLimiter` alone bounds only the total connection
+/// ceiling, not what one source can hold of it -- a source that opens
+/// `MAX_TELNET_CONNECTIONS_PER_IP` connections and stays logged in with
+/// nothing further to say (real, legitimate telnet client behavior --
+/// module docs) must have its NEXT connection attempt declined, without
+/// disturbing the ones it already holds.
+#[tokio::test]
+async fn a_source_past_its_per_ip_connection_cap_is_declined_without_disturbing_its_existing_connections(
+) {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+
+    let mut clients = Vec::new();
+    for _ in 0..manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP {
+        clients.push(connect_and_login(addr).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        metrics.render_prometheus_text().contains(&format!(
+            "manta_telnet_clients_connected {}",
+            manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP
+        )),
+        "all {} connections from this source must have been admitted",
+        manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP
+    );
+
+    // One more from the SAME source (127.0.0.1, like every connection in
+    // this test) must be declined outright: the socket closes with no
+    // login prompt at all, rather than being admitted and then later
+    // disconnected.
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf))
+        .await
+        .expect("a declined connection must close promptly, not hang");
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "a source past its per-IP cap must get EOF (no login prompt), not be admitted"
+    );
+
+    // The existing, already-admitted connections must be completely
+    // unaffected by the decline -- still logged in and still receiving
+    // spots normally.
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    bus.publish(spot);
+    for (reader, _wr) in clients.iter_mut() {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("an already-admitted client must be unaffected by a later decline")
+            .unwrap();
+        assert_eq!(line.trim_end(), expected);
+    }
 }
 
 #[tokio::test]
@@ -395,7 +463,7 @@ async fn a_logged_in_client_that_sends_no_commands_survives_past_the_login_idle_
     // paused-time auto-advance doesn't coexist safely with real socket
     // I/O on this runtime, so a real (if slow) wait is the trustworthy
     // option here.
-    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, _wr) = connect_and_login(addr).await;
 
     tokio::time::sleep(manta_server::bounded_io::IDLE_READ_TIMEOUT + Duration::from_secs(1)).await;
@@ -415,6 +483,67 @@ async fn a_logged_in_client_that_sends_no_commands_survives_past_the_login_idle_
 }
 
 #[tokio::test]
+async fn a_line_with_no_newline_past_the_max_length_is_disconnected_not_crashed() {
+    // MAN-22 acceptance: an unterminated line past `bounded_io::MAX_LINE_BYTES`
+    // is rejected as a protocol violation (bounded_io.rs is unit-tested for
+    // this directly), but that alone doesn't prove the real telnet server
+    // wires the bound through end-to-end -- an oversized line could in
+    // principle still grow an internal buffer, wedge the connection, or
+    // take the whole listener down before the accept loop's own error
+    // handling ever sees it. Send one over a real socket and confirm: the
+    // offending connection is cleanly closed, and the server (and other
+    // clients) keep working afterward.
+    let (addr, bus, _metrics, _shutdown_tx, tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+
+    let oversized = vec![b'A'; manta_server::bounded_io::MAX_LINE_BYTES + 1];
+    wr.write_all(&oversized).await.unwrap();
+    // Deliberately never send a newline -- this is the "no terminator at
+    // all" shape bounded_io.rs's unit test also covers.
+
+    let mut trailing = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut trailing))
+        .await
+        .expect("server must actively close an oversized-line connection, not hang")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "expected the offending connection to be closed, got: {trailing:?}"
+    );
+
+    // The socket closing is consistent with EITHER a clean protocol-error
+    // disconnect OR a panic in the client-handler task (dropping the task
+    // also drops the socket) -- so it alone doesn't distinguish them
+    // (PR #75 review, round 3). Directly inspect the tracked task's own
+    // join result, before spawning the second client below so there's no
+    // ambiguity about which task's result this is.
+    let join_result = tokio::time::timeout(Duration::from_secs(5), async {
+        tasks.lock().await.join_next().await
+    })
+    .await
+    .expect("oversized-line client handler task did not complete in time")
+    .expect("client handler task set was unexpectedly empty");
+    if let Err(join_err) = join_result {
+        assert!(
+            !join_err.is_panic(),
+            "client handler task panicked on an oversized line: {join_err}"
+        );
+    }
+
+    // The server itself must still be healthy: a fresh client can connect,
+    // log in, and receive a spot.
+    let (mut reader2, _wr2) = connect_and_login(addr).await;
+    let spot = sample_spot();
+    bus.publish(spot);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader2.read_line(&mut line))
+        .await
+        .expect("server must still serve other clients after an oversized line")
+        .unwrap();
+    assert!(line.contains("DX de"), "line was: {line:?}");
+}
+
+#[tokio::test]
 async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
     // Regression test (round-14 review): an established (logged-in)
     // client could previously send an unlimited sequence of complete
@@ -422,7 +551,7 @@ async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
     // (or worse, repeated `sh/dx/50`) is real CPU/bandwidth work. A
     // client must be disconnected once it exceeds a small per-window
     // command budget.
-    let (addr, _bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (mut reader, mut wr) = connect_and_login(addr).await;
 
     for i in 0..manta_server::telnet::MAX_TELNET_COMMANDS {
@@ -449,5 +578,54 @@ async fn client_flooding_commands_past_the_rate_budget_is_disconnected() {
     assert_eq!(
         n, 0,
         "expected the connection to close after exceeding the command budget, got: {extra:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_connection_from_the_same_ip_cannot_multiply_the_command_rate_budget() {
+    // MAN-57: the per-connection RateLimiter alone let a source multiply
+    // its effective command rate by opening more connections -- each one
+    // got its own full independent budget. A second connection from the
+    // SAME source IP must draw against the same shared aggregate budget
+    // as the first, not get a fresh one of its own.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader_a, mut wr_a) = connect_and_login(addr).await;
+    let (mut reader_b, mut wr_b) = connect_and_login(addr).await;
+
+    // Connection A alone consumes the ENTIRE shared per-source budget --
+    // each ack proves the command was accepted, well within what a lone
+    // connection's own per-connection budget would also allow.
+    for i in 0..manta_server::telnet::MAX_TELNET_COMMANDS {
+        wr_a.write_all(b"set dx filter unique > 1\r\n")
+            .await
+            .unwrap();
+        let mut ack = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader_a.read_line(&mut ack))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for ack #{i} on connection A"))
+            .unwrap_or_else(|_| panic!("read error waiting for ack #{i} on connection A"));
+        assert!(
+            ack.to_lowercase().contains("filter"),
+            "expected a filter ack within budget on connection A, got: {ack:?}"
+        );
+    }
+
+    // Connection B is a FRESH connection with its own untouched
+    // per-connection RateLimiter, so under the old (per-connection-only)
+    // behavior this command would succeed. It must instead be rejected,
+    // because the shared per-IP budget A already exhausted is checked
+    // too.
+    wr_b.write_all(b"set dx filter unique > 1\r\n")
+        .await
+        .unwrap();
+    let mut extra = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader_b.read_line(&mut extra))
+        .await
+        .expect("server never responded on connection B after the shared budget was exhausted")
+        .unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "expected connection B to be disconnected once the SHARED per-IP budget \
+         (already exhausted by connection A) was exceeded, got: {extra:?}"
     );
 }

@@ -24,10 +24,19 @@ pub struct Metrics {
     uplink_sent_total: AtomicU64,
     uplink_suppressed_total: AtomicU64,
     uplink_lagged_total: AtomicU64,
+    uplink_write_failed_total: AtomicU64,
+    uplink_disconnected_total: AtomicU64,
     uplink_reconnects_total: AtomicU64,
-    /// 0/1 rather than a bool -- mirrors `telnet_clients`'s style so it
-    /// renders as a normal Prometheus gauge.
-    uplink_connected: AtomicI64,
+    /// Count of currently-connected uplink targets, not a single 0/1 flag
+    /// -- MAN-42 can spawn multiple independent `uplink::serve` tasks
+    /// sharing this one `Metrics`, and each only increments/decrements its
+    /// own connect/disconnect transition (see `mark_uplink_connected`/
+    /// `mark_uplink_disconnected`). A shared last-writer-wins boolean would
+    /// let one target's failed reconnect attempt clear the gauge while
+    /// another target is genuinely, unrelatedly connected (round-1 review
+    /// finding on MAN-42/PR). For the common single-target case this is
+    /// still exactly 0 or 1, same as before MAN-42.
+    uplink_connected_count: AtomicI64,
 }
 
 impl Metrics {
@@ -140,6 +149,50 @@ impl Metrics {
         self.uplink_lagged_total.load(Ordering::Relaxed)
     }
 
+    /// A write to the uplink target's socket itself timed out or failed
+    /// (PR #80 review, round 3, tightened round 4, narrowed round 8):
+    /// distinct from `uplink_lagged_total` (broadcast-channel lag, not a
+    /// network-level write failure) AND from `uplink_disconnected_total`
+    /// (every OTHER cause that abandons the connection's queued backlog
+    /// without a write itself having failed -- a rate-limit disconnect, a
+    /// protocol violation, a stalled login prompt, a shutdown cancelling
+    /// an in-flight write). Round 8 caught this counter being used for
+    /// those non-write causes too, which contradicts its own name and
+    /// Prometheus HELP text ("write timed out or failed") and would
+    /// misdirect operational alerts/diagnosis toward the wrong failure
+    /// mode. `n` covers the spot whose write just failed plus whatever
+    /// was still retained in the receiver's own buffer and is now
+    /// abandoned along with it -- matching `record_write_failed`'s
+    /// identical `1 + rx.len()` convention on the inbound telnet/JSON
+    /// write path (round-11 review finding there).
+    pub fn record_uplink_write_failed(&self, n: u64) {
+        self.uplink_write_failed_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The uplink connection is being torn down (and its queued backlog
+    /// abandoned) for a reason OTHER than a failed/timed-out write itself
+    /// (PR #80 review, round 8): a rate-limit disconnect, a protocol
+    /// violation (oversized/invalid response line, target closed the
+    /// connection), a stalled login prompt, or a clean shutdown
+    /// cancelling an in-flight write. Kept separate from
+    /// `uplink_write_failed_total` specifically so that counter's own
+    /// name and HELP text stay accurate for alerting/diagnosis -- see its
+    /// doc comment. `n` is the same "current item (if any) + remaining
+    /// backlog" shape as `record_uplink_write_failed`.
+    pub fn record_uplink_disconnected(&self, n: u64) {
+        self.uplink_disconnected_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn uplink_disconnected_total(&self) -> u64 {
+        self.uplink_disconnected_total.load(Ordering::Relaxed)
+    }
+
+    pub fn uplink_write_failed_total(&self) -> u64 {
+        self.uplink_write_failed_total.load(Ordering::Relaxed)
+    }
+
     pub fn record_uplink_reconnect(&self) {
         self.uplink_reconnects_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -148,13 +201,22 @@ impl Metrics {
         self.uplink_reconnects_total.load(Ordering::Relaxed)
     }
 
-    pub fn set_uplink_connected(&self, connected: bool) {
-        self.uplink_connected
-            .store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    /// Call exactly once per `uplink::serve` task each time IT transitions
+    /// from disconnected to connected -- pair with exactly one
+    /// `mark_uplink_disconnected` when that same task's connection ends.
+    /// Unbalanced calls would desync the shared count across tasks.
+    pub fn mark_uplink_connected(&self) {
+        self.uplink_connected_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// See `mark_uplink_connected` -- call only to undo a prior
+    /// `mark_uplink_connected` from the same task's same connection.
+    pub fn mark_uplink_disconnected(&self) {
+        self.uplink_connected_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn uplink_connected(&self) -> bool {
-        self.uplink_connected.load(Ordering::Relaxed) != 0
+        self.uplink_connected_count.load(Ordering::Relaxed) > 0
     }
 
     pub fn render_prometheus_text(&self) -> String {
@@ -266,6 +328,24 @@ impl Metrics {
             self.uplink_lagged_total.load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_uplink_dropped_write_failed_total Spots dropped because a write to the RBN uplink target's socket timed out or failed.\n",
+        );
+        out.push_str("# TYPE manta_uplink_dropped_write_failed_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_dropped_write_failed_total {}\n",
+            self.uplink_write_failed_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_uplink_dropped_disconnected_total Spots dropped when the RBN uplink connection was torn down for a reason other than a failed write (rate limit, protocol violation, stalled login, shutdown).\n",
+        );
+        out.push_str("# TYPE manta_uplink_dropped_disconnected_total counter\n");
+        out.push_str(&format!(
+            "manta_uplink_dropped_disconnected_total {}\n",
+            self.uplink_disconnected_total.load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.\n");
         out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
         out.push_str(&format!(
@@ -274,12 +354,12 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_uplink_connected Whether the RBN uplink is currently connected (1) or not (0).\n",
+            "# HELP manta_uplink_connected Count of configured RBN uplink targets currently connected.\n",
         );
         out.push_str("# TYPE manta_uplink_connected gauge\n");
         out.push_str(&format!(
             "manta_uplink_connected {}\n",
-            self.uplink_connected.load(Ordering::Relaxed)
+            self.uplink_connected_count.load(Ordering::Relaxed)
         ));
 
         out
@@ -379,14 +459,24 @@ mod tests {
         m.record_uplink_lagged(3);
         assert_eq!(m.uplink_lagged_total(), 3);
 
+        assert_eq!(m.uplink_write_failed_total(), 0);
+        m.record_uplink_write_failed(1);
+        assert_eq!(m.uplink_write_failed_total(), 1);
+        m.record_uplink_write_failed(4); // e.g. the failed spot + 3 abandoned backlog
+        assert_eq!(m.uplink_write_failed_total(), 5);
+
+        assert_eq!(m.uplink_disconnected_total(), 0);
+        m.record_uplink_disconnected(2);
+        assert_eq!(m.uplink_disconnected_total(), 2);
+
         assert_eq!(m.uplink_reconnects_total(), 0);
         m.record_uplink_reconnect();
         assert_eq!(m.uplink_reconnects_total(), 1);
 
         assert!(!m.uplink_connected());
-        m.set_uplink_connected(true);
+        m.mark_uplink_connected();
         assert!(m.uplink_connected());
-        m.set_uplink_connected(false);
+        m.mark_uplink_disconnected();
         assert!(!m.uplink_connected());
     }
 
@@ -397,11 +487,47 @@ mod tests {
         m.record_uplink_sent();
         m.record_uplink_suppressed();
         m.record_uplink_reconnect();
-        m.set_uplink_connected(true);
+        m.record_uplink_write_failed(1);
+        m.record_uplink_disconnected(2);
+        m.mark_uplink_connected();
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_uplink_sent_total 2"));
         assert!(text.contains("manta_uplink_suppressed_total 1"));
         assert!(text.contains("manta_uplink_reconnects_total 1"));
+        assert!(text.contains("manta_uplink_dropped_write_failed_total 1"));
+        assert!(text.contains("manta_uplink_dropped_disconnected_total 2"));
         assert!(text.contains("manta_uplink_connected 1"));
+    }
+
+    // MAN-42: multiple uplink::serve tasks share one Metrics, so
+    // uplink_connected must reflect how many are currently connected, not
+    // a single last-writer-wins boolean -- otherwise one target's failed
+    // reconnect attempt can flip the gauge to "disconnected" while another
+    // target is genuinely, unrelatedly connected (round-1 review finding
+    // on MAN-42/PR).
+    #[test]
+    fn uplink_connected_reflects_multiple_independently_tracked_targets() {
+        let m = Metrics::new();
+        assert!(!m.uplink_connected());
+
+        // Target A connects.
+        m.mark_uplink_connected();
+        assert!(m.uplink_connected());
+
+        // Target B repeatedly fails to connect/reconnect. It was never
+        // itself marked connected, so its failures must not touch the
+        // shared gauge -- A's connection must still read as connected.
+        m.record_uplink_reconnect();
+        m.record_uplink_reconnect();
+        m.record_uplink_reconnect();
+        assert!(
+            m.uplink_connected(),
+            "an unrelated target's failed reconnects must not clear the gauge \
+             while another target is genuinely connected"
+        );
+
+        // A itself drops -- now nothing is connected.
+        m.mark_uplink_disconnected();
+        assert!(!m.uplink_connected());
     }
 }

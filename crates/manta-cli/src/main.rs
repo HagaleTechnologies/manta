@@ -72,7 +72,8 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -115,7 +116,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[arg(long, conflicts_with_all = ["device", "source"])]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -129,6 +131,25 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver")]
         soapy_gain: Option<f64>,
+        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
+        /// Requires --hpsdr-freq and --hpsdr-rate.
+        #[cfg(feature = "hpsdr")]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port (default 1024, the standard Metis
+        /// discovery/control port).
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        hpsdr_port: u16,
+        /// RF center frequency in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
+        hpsdr_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
+        hpsdr_rate: Option<f64>,
         /// TOML config with a `[server]`-shaped `ServerConfig` (station
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
@@ -168,7 +189,8 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -208,7 +230,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[arg(long, conflicts_with_all = ["device", "source"])]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -222,6 +245,25 @@ enum Command {
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver")]
         soapy_gain: Option<f64>,
+        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
+        /// Requires --hpsdr-freq and --hpsdr-rate.
+        #[cfg(feature = "hpsdr")]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port (default 1024, the standard Metis
+        /// discovery/control port).
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        hpsdr_port: u16,
+        /// RF center frequency in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
+        hpsdr_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
+        hpsdr_rate: Option<f64>,
     },
 }
 
@@ -240,6 +282,44 @@ struct SoapyOpts {
     freq: Option<f64>,
     rate: Option<f64>,
     gain: Option<f64>,
+}
+
+/// HPSDR/Hermes connection flags (feature `hpsdr`), grouped for the same reason.
+#[cfg(feature = "hpsdr")]
+struct HpsdrOpts {
+    host: Option<String>,
+    port: u16,
+    freq: Option<f64>,
+    rate: Option<f64>,
+}
+
+/// Open a single-DDC HPSDR/Hermes device (feature `hpsdr`) as an
+/// `IqSource`, or `None` if `--hpsdr-host` wasn't given. Checked ahead of
+/// `open_source`'s kiwi/soapy/audio chain, so `--hpsdr-host` takes priority
+/// over those the same way `kiwi.host` already takes priority over
+/// `soapy.driver` inside that chain -- in practice only one of
+/// kiwi/soapy/hpsdr is ever set, since each already `conflicts_with_all`
+/// `device`/`source`.
+#[cfg(feature = "hpsdr")]
+fn open_hpsdr_source(hpsdr: HpsdrOpts) -> Result<Option<Box<dyn IqSource>>> {
+    let Some(host) = hpsdr.host else {
+        return Ok(None);
+    };
+    let freq = hpsdr
+        .freq
+        .ok_or_else(|| anyhow!("--hpsdr-freq is required with --hpsdr-host"))?;
+    let rate = hpsdr
+        .rate
+        .ok_or_else(|| anyhow!("--hpsdr-rate is required with --hpsdr-host"))?;
+    let cfg = manta_input::hpsdr::HpsdrConfig {
+        host,
+        port: hpsdr.port,
+        ddc_count: 1,
+        sample_rate_hz: rate,
+        center_freq_hz: vec![freq],
+    };
+    let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
+    Ok(Some(Box::new(sources.remove(0))))
 }
 
 /// Open a live audio device, WAV replay, KiwiSDR network source, or
@@ -327,6 +407,10 @@ impl IqSource for FixedCenterFreqSource {
 
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
+    }
+
+    fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.inner.confirmed_live_handle()
     }
 }
 
@@ -479,6 +563,64 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
             "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
+        ));
+    }
+    Ok(hz)
+}
+
+/// Lower bound for `--hpsdr-rate`: comfortably below every real HPSDR/
+/// Hermes sample rate (48 kHz-1.536 MHz) while still guaranteeing
+/// `GapDetector::new`'s `Duration::from_secs_f64(126.0 / sample_rate_hz)`
+/// (126 = `USB_FRAMES_PER_PACKET * samples_per_usb_frame(1)`, this CLI's
+/// fixed single-DDC case) stays far inside `Duration`'s representable range
+/// -- a finite, positive but tiny rate like `1e-20` still overflows it and
+/// panics (round-2 review finding: the round-1 fix rejected NaN/inf/<=0 but
+/// not an unrealistically small positive value).
+#[cfg(feature = "hpsdr")]
+const MIN_HPSDR_RATE_HZ: f64 = 1_000.0;
+/// Upper bound for `--hpsdr-rate`: generous headroom above any real
+/// HPSDR/Hermes rate, purely to keep the range symmetric and reject
+/// obviously-wrong input (e.g. a value with stray zeros) rather than to
+/// pin an exact hardware ceiling this CLI layer has no authority over.
+#[cfg(feature = "hpsdr")]
+const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
+
+/// Clap value parser for `--hpsdr-rate`: rejects non-finite (NaN/infinity)
+/// and out-of-range values at CLI-parse time. `HpsdrConfig::validate`'s own
+/// `validate_ddc_config` bandwidth check silently passes a NaN rate
+/// (comparisons against NaN are always false), and the value then reaches
+/// `GapDetector::new`'s `Duration::from_secs_f64(samples_per_packet as f64
+/// / sample_rate_hz)`, which panics on NaN or an unrepresentable Duration
+/// -- caught here instead, before any source is opened, matching
+/// `parse_dial_freq_hz`'s pattern.
+#[cfg(feature = "hpsdr")]
+fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --hpsdr-rate {s:?}: {e}"))?;
+    if !hz.is_finite() || !(MIN_HPSDR_RATE_HZ..=MAX_HPSDR_RATE_HZ).contains(&hz) {
+        return Err(format!(
+            "--hpsdr-rate must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
+             {MAX_HPSDR_RATE_HZ}, got {hz}"
+        ));
+    }
+    Ok(hz)
+}
+
+/// Clap value parser for `--hpsdr-freq`: rejects non-finite (NaN/infinity)
+/// and non-positive values at CLI-parse time, matching
+/// `parse_dial_freq_hz`'s pattern (round-2 review finding: an unvalidated
+/// `--hpsdr-freq NaN`/`inf` reaches `HpsdrConfig.center_freq_hz`, which is
+/// only length-checked, not value-checked, and then propagates into every
+/// emitted spot's frequency field).
+#[cfg(feature = "hpsdr")]
+fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --hpsdr-freq {s:?}: {e}"))?;
+    if !hz.is_finite() || hz <= 0.0 {
+        return Err(format!(
+            "--hpsdr-freq must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)
@@ -637,9 +779,36 @@ fn start_spot_server(
     epoch: std::time::SystemTime,
     session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    // MAN-59: the daemon's only durable record of connection events/
+    // rejections was the live Prometheus counters (no history, reset on
+    // restart) -- nothing to reconstruct WHAT happened or FROM WHERE
+    // after an abuse incident. `try_init` (not `init`, which panics on a
+    // second call) since this function is the sole place the daemon's
+    // Tokio runtime is constructed, but a defensive no-op on an
+    // already-initialized global subscriber costs nothing. `RUST_LOG`
+    // overrides; unset defaults to `info` -- connection/rejection events
+    // below are logged at `info`/`warn`, so an operator gets useful
+    // output with zero configuration, and can raise verbosity for deeper
+    // debugging without a code change.
+    //
+    // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
+    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
+    // byte-identical spot logs" hard requirement means any interleaved
+    // non-JSON tracing line corrupts that machine-readable stream for
+    // real consumers and breaks deterministic-replay byte-identity.
+    // stderr is a separate stream a JSON-Lines consumer never reads.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
     let cfg_text = std::fs::read_to_string(config_path)?;
     let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
-    let rbn_uplink_cfg = file.rbn_uplink.clone();
+    let rbn_uplink_cfgs = file.rbn_uplink.clone();
     let cfg = file.server;
 
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
@@ -662,6 +831,12 @@ fn start_spot_server(
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
 
+        let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+            manta_server::telnet::MAX_TELNET_COMMANDS,
+            manta_server::telnet::COMMAND_RATE_WINDOW,
+            cfg.telnet_max_commands_per_ip,
+        );
+        manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
         tokio::spawn(manta_server::telnet::serve(
             telnet_listener,
             bus.clone(),
@@ -672,7 +847,18 @@ fn start_spot_server(
             manta_server::tasks::new_connection_limiter(
                 manta_server::telnet::MAX_TELNET_CONNECTIONS,
             ),
+            manta_server::tasks::IpQuota::new_with_override(
+                manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                cfg.telnet_max_connections_per_ip,
+            ),
+            telnet_ip_command_limiter,
         ));
+        let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
+            manta_server::json_stream::MAX_INBOUND_PINGS,
+            manta_server::json_stream::PING_RATE_WINDOW,
+            cfg.json_max_pings_per_ip,
+        );
+        manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
         tokio::spawn(manta_server::json_stream::serve(
             json_listener,
             manta_server::json_stream::JsonStreamConfig {
@@ -681,15 +867,20 @@ fn start_spot_server(
                 cty,
                 station_call: cfg.station_callsign.clone(),
                 decoder_version,
-                // .clone(): MAN-32's uplink::serve spawn below also needs
-                // shutdown_rx -- can't let this be the moving consumer
-                // anymore now that there's a third one.
+                // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
+                // need shutdown_rx -- can't let this be the moving consumer
+                // anymore now that there are more consumers.
                 shutdown: shutdown_rx.clone(),
             },
             tasks.clone(),
             manta_server::tasks::new_connection_limiter(
                 manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
             ),
+            manta_server::tasks::IpQuota::new_with_override(
+                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                cfg.json_max_connections_per_ip,
+            ),
+            json_ip_ping_limiter,
         ));
         // Reaps completed per-client tasks continuously, independent of
         // shutdown -- without this, `tasks` only ever shrinks at
@@ -703,20 +894,27 @@ fn start_spot_server(
             manta_server::tasks::new_connection_limiter(
                 manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
             ),
+            manta_server::tasks::IpQuota::new_with_override(
+                manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+                cfg.metrics_max_connections_per_ip,
+            ),
         ));
-        // MAN-32: only spawned when the table is present at all -- the
-        // common case for existing single-node operators is no
-        // [rbn_uplink] table, and uplink::serve itself also no-ops when
+        // MAN-32/MAN-42: one independent uplink::serve task per configured
+        // [[rbn_uplink]] entry -- the common case for existing single-node
+        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
+        // body never runs), and uplink::serve itself also no-ops when
         // `enabled = false` (belt-and-suspenders, not a duplicate check:
-        // this `if let` additionally avoids spawning a task at all for
-        // the common "table absent" case).
-        if let Some(uplink_cfg) = rbn_uplink_cfg {
+        // this loop additionally avoids spawning a task at all when the
+        // Vec is empty). Each task owns its own SpotBus subscription and
+        // backoff state, so one target being down never affects another's
+        // delivery or retry timing.
+        for uplink_cfg in rbn_uplink_cfgs {
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
                 bus.clone(),
                 metrics.clone(),
-                shutdown_rx,
+                shutdown_rx.clone(),
             ));
         }
 
@@ -795,6 +993,14 @@ fn main() -> Result<()> {
             soapy_rate,
             #[cfg(feature = "soapy")]
             soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate,
             server_config,
             dial_freq_hz,
             replay_epoch,
@@ -807,11 +1013,17 @@ fn main() -> Result<()> {
             let has_soapy_source = soapy_driver.is_some();
             #[cfg(not(feature = "soapy"))]
             let has_soapy_source = false;
-            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source;
+            #[cfg(feature = "hpsdr")]
+            let has_hpsdr_source = hpsdr_host.is_some();
+            #[cfg(not(feature = "hpsdr"))]
+            let has_hpsdr_source = false;
+            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
             let source_name = if kiwi_host.is_some() {
                 "kiwi"
             } else if has_soapy_source {
                 "soapy"
+            } else if has_hpsdr_source {
+                "hpsdr"
             } else if is_file_replay {
                 "file"
             } else {
@@ -834,20 +1046,38 @@ fn main() -> Result<()> {
                 password: kiwi_password,
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
-            #[cfg(feature = "soapy")]
-            let src = open_source(
-                device,
-                source,
-                kiwi,
-                SoapyOpts {
-                    driver: soapy_driver,
-                    freq: soapy_freq,
-                    rate: soapy_rate,
-                    gain: soapy_gain,
-                },
-            )?;
-            #[cfg(not(feature = "soapy"))]
-            let src = open_source(device, source, kiwi)?;
+            #[cfg(feature = "hpsdr")]
+            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                host: hpsdr_host,
+                port: hpsdr_port,
+                freq: hpsdr_freq,
+                rate: hpsdr_rate,
+            })?;
+            #[cfg(not(feature = "hpsdr"))]
+            let hpsdr_source: Option<Box<dyn IqSource>> = None;
+            let src = match hpsdr_source {
+                Some(src) => src,
+                None => {
+                    #[cfg(feature = "soapy")]
+                    {
+                        open_source(
+                            device,
+                            source,
+                            kiwi,
+                            SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            },
+                        )?
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        open_source(device, source, kiwi)?
+                    }
+                }
+            };
             let src: Box<dyn IqSource> = match dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
@@ -906,7 +1136,30 @@ fn main() -> Result<()> {
                     // hook yet -- manta-engine exposes no live track-count
                     // API for `listen()`'s callbacks to read, so it stays
                     // at Metrics::default()'s 0 until that surface exists.
-                    server.metrics.set_source_health(source_name, true);
+                    //
+                    // MAN-55: for a source where `open()` succeeding
+                    // doesn't confirm a live device (HPSDR's UDP
+                    // connect/send need no peer response at all),
+                    // `confirmed_live_handle()` returns Some, and health
+                    // starts false, flipping true only once the source's
+                    // own read loop has actually processed a valid
+                    // packet. Every other source type (Kiwi/Soapy/audio/
+                    // file) returns None from the trait's default and
+                    // keeps the original immediate-true behavior, since
+                    // opening those already implies liveness.
+                    match src.confirmed_live_handle() {
+                        Some(live) => {
+                            server.metrics.set_source_health(source_name, false);
+                            let metrics = server.metrics.clone();
+                            rt.spawn(async move {
+                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                                metrics.set_source_health(source_name, true);
+                            });
+                        }
+                        None => server.metrics.set_source_health(source_name, true),
+                    }
                     (Some(rt), Some(server))
                 }
                 None => (None, None),
@@ -1007,6 +1260,14 @@ fn main() -> Result<()> {
             soapy_rate,
             #[cfg(feature = "soapy")]
             soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate,
         } => {
             let kiwi = KiwiOpts {
                 host: kiwi_host,
@@ -1015,20 +1276,38 @@ fn main() -> Result<()> {
                 password: kiwi_password,
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
-            #[cfg(feature = "soapy")]
-            let src = open_source(
-                device,
-                source,
-                kiwi,
-                SoapyOpts {
-                    driver: soapy_driver,
-                    freq: soapy_freq,
-                    rate: soapy_rate,
-                    gain: soapy_gain,
-                },
-            )?;
-            #[cfg(not(feature = "soapy"))]
-            let src = open_source(device, source, kiwi)?;
+            #[cfg(feature = "hpsdr")]
+            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                host: hpsdr_host,
+                port: hpsdr_port,
+                freq: hpsdr_freq,
+                rate: hpsdr_rate,
+            })?;
+            #[cfg(not(feature = "hpsdr"))]
+            let hpsdr_source: Option<Box<dyn IqSource>> = None;
+            let src = match hpsdr_source {
+                Some(src) => src,
+                None => {
+                    #[cfg(feature = "soapy")]
+                    {
+                        open_source(
+                            device,
+                            source,
+                            kiwi,
+                            SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            },
+                        )?
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        open_source(device, source, kiwi)?
+                    }
+                }
+            };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {
@@ -1290,8 +1569,8 @@ mod tests {
         );
     }
 
-    // MAN-32: start_spot_server spawns the RBN uplink only when configured
-    // and enabled.
+    // MAN-32/MAN-42: start_spot_server spawns one RBN uplink task per
+    // configured [[rbn_uplink]] target, only for those that are enabled.
 
     #[test]
     fn disabled_uplink_makes_no_connection_attempt_from_the_daemon() {
@@ -1309,7 +1588,7 @@ mod tests {
                 json_port = 0
                 metrics_port = 0
 
-                [rbn_uplink]
+                [[rbn_uplink]]
                 enabled = false
                 target_host = "127.0.0.1"
                 target_port = {target_port}
@@ -1359,7 +1638,7 @@ mod tests {
                 json_port = 0
                 metrics_port = 0
 
-                [rbn_uplink]
+                [[rbn_uplink]]
                 enabled = true
                 target_host = "127.0.0.1"
                 target_port = {target_port}
@@ -1391,5 +1670,65 @@ mod tests {
             accepted.unwrap_or(false),
             "enabled=true must connect to the configured target"
         );
+    }
+
+    #[test]
+    fn two_enabled_uplink_targets_each_independently_connect() {
+        let target1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target1.set_nonblocking(true).unwrap();
+        let target1_port = target1.local_addr().unwrap().port();
+
+        let target2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target2.set_nonblocking(true).unwrap();
+        let target2_port = target2.local_addr().unwrap().port();
+
+        let cfg_file = write_temp_file(
+            format!(
+                r#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+
+                [[rbn_uplink]]
+                enabled = true
+                target_host = "127.0.0.1"
+                target_port = {target1_port}
+
+                [[rbn_uplink]]
+                enabled = true
+                target_host = "127.0.0.1"
+                target_port = {target2_port}
+                "#
+            )
+            .as_bytes(),
+        );
+
+        let (rt, _server) = start_spot_server(
+            cfg_file.path(),
+            96_000.0,
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        async fn wait_for_accept(listener: &std::net::TcpListener) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if listener.accept().is_ok() {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or(false)
+        }
+        let (accepted1, accepted2) = rt
+            .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
+        assert!(accepted1, "first configured target must be connected to");
+        assert!(accepted2, "second configured target must be connected to");
     }
 }

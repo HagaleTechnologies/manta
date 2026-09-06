@@ -1,0 +1,24 @@
+[package]
+name = "manta-soak-harness"
+description = "MAN-19: long-duration (multi-hour) unattended soak harness, looping a synthetic 40m CW pileup scene through the live pipeline. Not part of the operator-facing manta binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "man19-soak"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+num-complex = { workspace = true }
+hound = { workspace = true }
+serde_json = { workspace = true }
+manta-dsp = { workspace = true }
+manta-engine = { workspace = true }
+manta-input = { workspace = true }
+manta-testkit = { workspace = true }

@@ -23,6 +23,20 @@ const CHANNEL_CAPACITY: usize = 1024;
 /// "don't disconnect").
 const RECENT_HISTORY_CAP: usize = 50;
 
+/// Bounds how many distinct callsigns `occurrence_counts` tracks at once
+/// (MAN-62). `docs/DECISIONS/2026-09-02-man23-threat-model.md` finding 2
+/// already accepts, as inherent to OpenHPSDR/Hermes having no
+/// cryptographic framing, that a source able to spoof the HPSDR input can
+/// inject fabricated-but-decodable CW -- an unbounded sequence of distinct
+/// SYNTHETIC callsigns from that source would otherwise grow this map for
+/// the life of the process, with no bound tied to real-world callsign
+/// space at all. Real over-the-air traffic, even an unusually busy
+/// multi-band contest weekend, plausibly logs on the order of a few
+/// thousand distinct callsigns in one session -- 20,000 is generous
+/// headroom over any realistic legitimate count while still bounding
+/// memory to a small, fixed footprint against adversarial input.
+const MAX_OCCURRENCE_ENTRIES: usize = 20_000;
+
 /// One published spot plus its occurrence count *at the moment it was
 /// published* -- captured here, not recomputed by a subscriber later, so
 /// a subscriber applying an occurrence-based filter (e.g. the telnet
@@ -39,13 +53,65 @@ pub struct BusSpot {
     pub occurrence_count: u32,
 }
 
+/// Bounded, LRU-on-touch tracker for `SpotBus::occurrence_counts` (MAN-62).
+/// Each entry carries the callsign's running count plus a monotonic
+/// `last_touched` tick, bumped on every publish for that callsign
+/// (whether it's a fresh key or an existing one). Once at
+/// `MAX_OCCURRENCE_ENTRIES` capacity, inserting a genuinely NEW callsign
+/// evicts whichever tracked callsign has gone longest untouched -- a real,
+/// currently-active station keeps getting touched (and so stays
+/// protected), while adversarial synthetic callsigns that each appear
+/// once and never again are exactly what gets evicted first under
+/// sustained flood pressure. The eviction scan is O(capacity), but only
+/// runs on the rare "insert while full" path, never on an ordinary
+/// touch -- deliberately simple over a doubly-linked-list LRU, since
+/// eviction pressure here is inherently rare (real callsign cardinality
+/// sits far under capacity; sustained floods are the exception, not the
+/// steady state).
+struct OccurrenceTracker {
+    counts: HashMap<String, (u32, u64)>,
+    next_touch: u64,
+}
+
+impl OccurrenceTracker {
+    fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+            next_touch: 0,
+        }
+    }
+
+    /// Records one occurrence of `callsign` and returns its new count.
+    fn touch(&mut self, callsign: &str) -> u32 {
+        self.next_touch += 1;
+        let touch = self.next_touch;
+        if let Some(entry) = self.counts.get_mut(callsign) {
+            entry.0 += 1;
+            entry.1 = touch;
+            return entry.0;
+        }
+        if self.counts.len() >= MAX_OCCURRENCE_ENTRIES {
+            if let Some(lru_key) = self
+                .counts
+                .iter()
+                .min_by_key(|(_, (_, last_touched))| *last_touched)
+                .map(|(key, _)| key.clone())
+            {
+                self.counts.remove(&lru_key);
+            }
+        }
+        self.counts.insert(callsign.to_string(), (1, touch));
+        1
+    }
+}
+
 pub struct SpotBus {
     tx: broadcast::Sender<BusSpot>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
     recent: Mutex<VecDeque<BusSpot>>,
-    occurrence_counts: Mutex<HashMap<String, u32>>,
+    occurrence_counts: Mutex<OccurrenceTracker>,
 }
 
 impl SpotBus {
@@ -71,7 +137,7 @@ impl SpotBus {
             session_nonce,
             sample_rate_hz,
             recent: Mutex::new(VecDeque::with_capacity(RECENT_HISTORY_CAP)),
-            occurrence_counts: Mutex::new(HashMap::new()),
+            occurrence_counts: Mutex::new(OccurrenceTracker::new()),
         }
     }
 
@@ -87,9 +153,7 @@ impl SpotBus {
                 .occurrence_counts
                 .lock()
                 .expect("occurrence_counts lock poisoned");
-            let count = counts.entry(spot.callsign.clone()).or_insert(0);
-            *count += 1;
-            *count
+            counts.touch(&spot.callsign)
         };
         let bus_spot = BusSpot {
             spot,
@@ -331,6 +395,71 @@ mod tests {
 
         assert_eq!(rx.recv().await.unwrap().occurrence_count, 1);
         assert_eq!(rx.recv().await.unwrap().occurrence_count, 2);
+    }
+
+    #[test]
+    fn occurrence_tracker_stays_bounded_under_an_unbounded_sequence_of_distinct_callsigns() {
+        // MAN-62's core scenario: a source able to inject fabricated CW
+        // for an unbounded sequence of distinct synthetic callsigns must
+        // not grow this map without bound.
+        let mut tracker = OccurrenceTracker::new();
+        for i in 0..(MAX_OCCURRENCE_ENTRIES + 5_000) {
+            tracker.touch(&format!("SYNTH{i}"));
+        }
+        assert_eq!(tracker.counts.len(), MAX_OCCURRENCE_ENTRIES);
+    }
+
+    #[test]
+    fn occurrence_tracker_evicts_the_least_recently_touched_entry_first() {
+        let mut tracker = OccurrenceTracker::new();
+        for i in 0..MAX_OCCURRENCE_ENTRIES {
+            tracker.touch(&format!("FILL{i}"));
+        }
+        assert_eq!(tracker.counts.get("FILL0").unwrap().0, 1);
+
+        // One more distinct callsign past capacity must evict the
+        // longest-untouched entry (FILL0, touched first and never since),
+        // not some other arbitrary one.
+        tracker.touch("NEWCOMER");
+        assert_eq!(tracker.counts.len(), MAX_OCCURRENCE_ENTRIES);
+        assert!(
+            !tracker.counts.contains_key("FILL0"),
+            "the least-recently-touched entry must be evicted first"
+        );
+        assert!(tracker.counts.contains_key("NEWCOMER"));
+    }
+
+    #[test]
+    fn occurrence_tracker_protects_a_repeatedly_touched_callsign_during_a_flood() {
+        // A genuinely-active real callsign that keeps getting touched must
+        // survive sustained eviction pressure from a flood of one-shot
+        // synthetic callsigns -- this IS the trade-off the ticket's own
+        // technical notes called out as needing a real design decision:
+        // LRU-on-touch (not FIFO-by-insertion) is what makes it hold.
+        let mut tracker = OccurrenceTracker::new();
+        tracker.touch("REAL_STATION"); // inserted first -- FIFO would evict it first
+
+        for i in 0..MAX_OCCURRENCE_ENTRIES {
+            tracker.touch(&format!("FLOOD{i}"));
+            if i % 100 == 0 {
+                tracker.touch("REAL_STATION"); // stays fresh throughout
+            }
+        }
+
+        assert!(
+            tracker.counts.contains_key("REAL_STATION"),
+            "a repeatedly-touched real callsign must survive sustained flood eviction pressure"
+        );
+        assert!(tracker.counts.get("REAL_STATION").unwrap().0 > 1);
+    }
+
+    #[test]
+    fn occurrence_tracker_counts_correctly_alongside_bounded_eviction() {
+        let mut tracker = OccurrenceTracker::new();
+        assert_eq!(tracker.touch("K5ARH"), 1);
+        assert_eq!(tracker.touch("K5ARH"), 2);
+        assert_eq!(tracker.touch("JA1ABC"), 1);
+        assert_eq!(tracker.touch("K5ARH"), 3);
     }
 
     #[test]

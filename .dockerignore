@@ -1,0 +1,10 @@
+target
+.git
+.github
+.claude
+.worktrees
+worktrees
+thoughts
+*.md
+!README.md
+docs
