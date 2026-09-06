@@ -412,6 +412,15 @@ impl IqSource for FixedCenterFreqSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
     }
+
+    /// MAN-4: a transparent wrapper, so it must forward the inner source's
+    /// declared guard -- without this, `--dial-freq-hz` (this wrapper's
+    /// only reason to exist, and commonly wrapping `AudioIqSource`) would
+    /// silently mask the Hilbert front end's DC/Nyquist guard on exactly
+    /// the real-audio CLI path this ticket concerns.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+    }
 }
 
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time

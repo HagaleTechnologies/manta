@@ -21,6 +21,15 @@ const CHUNK_SAMPLES: usize = 2048;
 /// startup lead-in padding below it.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
+/// MAN-4/D6: the operator may widen the detector's DC/Nyquist guard but
+/// never narrow it below what the source's front end physically requires
+/// (`IqSource::analytic_guard_hz`). `max` avoids an `Option`/sentinel in
+/// `DetectorConfig`, keeping it `Copy`. `pub(crate)` so `soak_metrics.rs`'s
+/// second `IqSource` pipeline can apply the same rule (MAN-4 remediate).
+pub(crate) fn effective_guard_hz(configured_hz: f64, source_hz: f64) -> f64 {
+    configured_hz.max(source_hz)
+}
+
 /// Run the streaming decode loop against `src` until `read` returns 0 (EOF,
 /// file replay) or `stop` is set (Ctrl-C, live audio). Each decoded event is
 /// passed to `on_event` as it's produced. Design doc §4.
@@ -52,11 +61,22 @@ pub fn listen(
     let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
+    // MAN-4: raise the detector's DC/Nyquist guard to at least the source's
+    // declared floor -- e.g. AudioIqSource's Hilbert front end -- without
+    // ever narrowing an operator-configured guard.
+    let mut detector = cfg.detector;
+    detector.guard_hz = effective_guard_hz(detector.guard_hz, src.analytic_guard_hz());
+    // MAN-4 remediate round 2 (code review finding 1): derived from the
+    // source's own declaration, never from the merged `guard_hz` above --
+    // see `DetectorConfig::mirror_image_guard`'s doc comment for why the
+    // two must stay independent (an operator-widened guard on a genuine
+    // complex-IQ source must not turn on mirror suppression).
+    detector.mirror_image_guard = src.analytic_guard_hz() > 0.0;
     let mut tm = crate::track::TrackManager::new(
         ch.n_channels(),
         fs,
         center_freq_hz,
-        cfg.detector,
+        detector,
         cfg.decode.clone(),
     );
     let mut validator = Validator::bundled(fs)
@@ -282,6 +302,125 @@ mod tests {
         };
         let stop = Arc::new(AtomicBool::new(false));
         assert!(listen(src, &cfg, stop, |_ev| {}, |_spot| {}).is_err());
+    }
+
+    /// MAN-4/D6: an operator config of 0.0 with an AudioIqSource-like source
+    /// must end up at the source's declared guard; an operator config wider
+    /// than the source's floor must stay put; a config narrower than the
+    /// source's floor must be raised, never narrowed.
+    #[test]
+    fn listen_raises_the_configured_guard_to_the_sources_floor() {
+        assert_eq!(effective_guard_hz(0.0, 300.0), 300.0);
+        assert_eq!(effective_guard_hz(1000.0, 300.0), 1000.0);
+        assert_eq!(effective_guard_hz(100.0, 300.0), 300.0);
+    }
+
+    /// MAN-4's Gherkin, measured at the level `listen()`'s callback API
+    /// cannot reach: drives `Channelizer` + `TrackManager` directly over
+    /// `AudioIqSource`-produced IQ, exactly the pipeline `listen()` runs,
+    /// and asserts the per-channel spawn census rather than just the
+    /// decoded text.
+    #[test]
+    fn a_clean_audio_tone_spawns_one_track_and_no_churn() {
+        use manta_input::AudioIqSource;
+        use manta_testkit::keyer::{key_text_loop, KeyerSpec};
+
+        let fs = 48_000.0;
+        let tone_hz = 750.0; // 750 Hz = 8 * 93.75 Hz -- an exact channel center.
+        let (env, _keyed_text) =
+            key_text_loop("CQ CQ DE W1AW W1AW K", &KeyerSpec::new(20.0), fs, 15.0).unwrap();
+
+        let mut real = vec![0.0f32; env.len()];
+        let dphi = std::f64::consts::TAU * tone_hz / fs;
+        let mut phi = 0.0f64;
+        for (i, r) in real.iter_mut().enumerate() {
+            *r = env.get(i).copied().unwrap_or(0.0) * phi.cos() as f32;
+            phi += dphi;
+        }
+        // MAN-4 remediate: see listen_audio.rs's matching comment -- a
+        // strictly noiseless fixture lets ordinary filter sidelobes clear
+        // the spawn gate against a numerically-zero floor. Same
+        // contingency-branch-2 fix, same convention.
+        let sigma = manta_testkit::noise::real_awgn_sigma_for_snr_2500(20.0, fs);
+        manta_testkit::noise::add_real_awgn(&mut real, sigma, 0x1234_5678);
+
+        let mut src =
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(real, 48_000)))
+                .unwrap();
+        let guard_hz = effective_guard_hz(0.0, src.analytic_guard_hz());
+        let mirror_image_guard = src.analytic_guard_hz() > 0.0;
+        let all_iq = manta_input::read_all(&mut src).unwrap();
+
+        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, 0.0).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let detector = crate::track::DetectorConfig {
+            guard_hz,
+            mirror_image_guard,
+            ..crate::track::DetectorConfig::default()
+        };
+        let mut tm = crate::track::TrackManager::new(
+            ch.n_channels(),
+            fs,
+            0.0,
+            detector,
+            manta_decode::decoder::DecodeConfig::default(),
+        );
+        for chunk in all_iq.chunks(4096) {
+            let hops = ch.process(chunk);
+            tm.process_hops(&hops, |m| m * hop_samples);
+        }
+        tm.finish();
+
+        let census = tm.spawns_by_channel();
+        let spawned: Vec<(usize, u32)> = census
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(k, c)| (k, *c))
+            .collect();
+        // MAN-4 remediate, pin doc D7 addendum: the tone's own negative-
+        // frequency image sits at the same |750 Hz| offset from DC as the
+        // tone itself, so no guard_hz below the tone's own frequency can
+        // suppress it without also suppressing the real signal. It still
+        // spawns a track (`TrackManager::merge_mirror_images`'s
+        // `is_image_of_owned` guard can only block a *second* spawn once
+        // one side of the mirror pair already owns a channel -- one of
+        // the two sides always gets a first crack, and a keying-edge
+        // click can occasionally let the weaker image win that race), but
+        // `merge_mirror_images` then closes it -- by raw instantaneous
+        // power, not the smoothed current_snr_db `merge_converged` uses,
+        // since the smoothed statistic ramps up over several hops at
+        // every new mark and briefly crosses paths right at mark-onset --
+        // before it ever accumulates enough hops to emit a real event.
+        // `spawns_by_channel` counts the historical spawn regardless, so
+        // this channel still shows exactly one residual spawn in the
+        // census below; it just never reaches `total_spawns`-worthy
+        // decoded output. This is the one documented exception to
+        // "exactly one track spawns"; everywhere else remains exactly
+        // what this ticket fixes.
+        let image_channel = ch.n_channels() - 8;
+        // The tone is at 750 Hz = channel 8 exactly; +/-1 is the ownership window.
+        assert!(
+            spawned
+                .iter()
+                .all(|(k, _)| (7..=9).contains(k) || *k == image_channel),
+            "tracks spawned away from channel 8 or its known image residual ({image_channel}): {spawned:?}"
+        );
+        let real_signal_spawns: u32 = (7..=9).map(|k| census[k]).sum();
+        assert_eq!(
+            real_signal_spawns, 1,
+            "the real 750 Hz signal must spawn exactly once; census {spawned:?}"
+        );
+        assert!(
+            census[image_channel] <= 1,
+            "the known image residual must not flood; census {spawned:?}"
+        );
+        assert_eq!(
+            tm.close_counts().unconfirmed,
+            0,
+            "CANDIDATE churn (the 'churning track IDs' symptom): {:?}",
+            tm.close_counts()
+        );
     }
 
     /// MAN-31: `listen()` is the other production call site that must

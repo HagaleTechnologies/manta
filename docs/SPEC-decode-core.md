@@ -142,6 +142,17 @@ Startup: for the first 10 s the ring is partially filled; the quantile is
 taken over whatever is present, and track creation is inhibited for the first
 **2 s** (`detector.warmup_ms = 2000`) to avoid floor-transient garbage.
 
+**MAN-4: DC/Nyquist spawn guard.** `detector.guard_hz` (default `0.0`, no
+guard) inhibits track *creation* (not floor/gate estimation) on channels
+within `guard_hz` of baseband DC or of ±Nyquist. This exists because a
+real→analytic front end (`manta-dsp::hilbert::HilbertTransformer`, the only
+production source of complex IQ that isn't already genuine RF IQ) cannot
+deliver trustworthy image rejection arbitrarily close to DC/Nyquist at any
+finite tap count; sources built on it declare their own floor via
+`IqSource::analytic_guard_hz`, and `listen()` raises the configured guard to
+at least that floor, never below it. Complex-IQ sources (file/SoapySDR/
+KiwiSDR/HPSDR) report `0.0` and are unaffected.
+
 ### 2.3 Gate
 
 Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
@@ -558,6 +569,7 @@ confirm_ms = 50        hang_ms = 5000
 gc_ms = 30000          warmup_ms = 2000
 floor_quantile = 0.25  floor_window_ms = 10000
 block_channels = 32    block_allowance_db = 3.0
+guard_hz = 0.0         # MAN-4: DC/Nyquist spawn-exclusion band, Hz; see §2.1
 
 [decode]
 timing_sigma = 0.25    beam_width = 4

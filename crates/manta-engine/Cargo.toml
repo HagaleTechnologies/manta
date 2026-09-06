@@ -35,6 +35,8 @@ coppa-audio = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 manta-testkit = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
 
 [[bench]]
 name = "cpu_budget"

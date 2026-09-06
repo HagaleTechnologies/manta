@@ -912,6 +912,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "coppa-dsp",
+ "criterion",
  "num-complex",
 ]
 
@@ -930,6 +931,8 @@ dependencies = [
  "manta-testkit",
  "num-complex",
  "proptest",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.1",
  "rayon",
  "serde",
  "windows-sys 0.59.0",
