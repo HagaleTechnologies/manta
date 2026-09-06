@@ -178,8 +178,10 @@ the build host.
 Ubuntu and Debian need different apt setup here. Check which one your host
 is *before* running anything below, and run only the matching block. Running
 the **Ubuntu** block on a **Debian** host is not the hazard it might look
-like: the block's own `case` guard checks `ID`/`ID_LIKE` for "ubuntu" before
-touching anything, so on a Debian host it declines immediately (prints the
+like: the block's own `case` guard checks `ID` for "ubuntu" before
+touching anything, so on a Debian host -- or an `ID_LIKE`-only Ubuntu
+derivative like Linux Mint or Pop!_OS, which this block can't safely fix
+(see the notes below) -- it declines immediately (prints the
 "run the Debian block below instead" message below) and writes nothing --
 no `sources.list` edit, no `ubuntu.sources` stanza, no ports source file, no
 `dpkg --add-architecture`. There is nothing to roll back in that case. The
@@ -215,16 +217,26 @@ Removing the arm64 architecture flag itself, `sudo dpkg
 Option B run it will **refuse**: dpkg won't drop an architecture while any
 package is still registered for it, and a successful run leaves
 `libasound2-dev:arm64` installed along with whatever it pulled in as
-dependencies (e.g. `libasound2t64:arm64`, `libc6:arm64`) -- not just the
-packages named on the install line above, so naming those alone isn't
-enough to purge. Purge everything still registered for arm64 first, then
-remove the architecture:
+dependencies (e.g. `libasound2t64:arm64`, `libc6:arm64`), registered as
+*automatically* installed since apt resolved them, not you. Purge the one
+package Option B actually named, then let `apt autoremove` drop the
+auto-installed dependency closure that came along with it -- this removes
+only what this block's own `apt install` line added, not every arm64
+package the host happens to have. A blanket `dpkg-query -W
+-f='${Package}:${Architecture}\n' | grep ':arm64$'` purge would also
+remove any arm64 package some *other* project on this host installed
+before you ever ran this block, which is not this block's to take:
 ```
-sudo apt purge $(dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$')
+sudo apt purge libasound2-dev:arm64
+sudo apt autoremove
 sudo dpkg --remove-architecture arm64
 ```
-Only do this if you actually want arm64 gone -- it's harmless to leave the
-architecture and its packages in place if you expect to cross-build again.
+If the last command still refuses, something else on the host is
+registered for arm64 -- `dpkg-query -W -f='${Package}:${Architecture}\n'
+| grep ':arm64$'` lists what, so you can judge by hand whether it's yours
+to remove; don't purge that list wholesale. Only do any of this if you
+actually want arm64 gone -- it's harmless to leave the architecture and
+its packages in place if you expect to cross-build again.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
 (archive.ubuntu.com / security.ubuntu.com) don't carry an arm64 index at
@@ -240,27 +252,40 @@ leaves whatever other foreign architectures the host already has enabled
 guessing at the full list and silently dropping index coverage for
 anything not guessed.
 ```
-if case " $(. /etc/os-release && printf '%s %s' "$ID" "$ID_LIKE") " in
+if case " $(. /etc/os-release && printf '%s' "$ID") " in
      *" ubuntu "*) true ;;
      *) false ;;
    esac; then
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
   if [ -z "$codename" ]; then
-    echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on this ID=ubuntu (or ID_LIKE containing ubuntu) host -- refusing to write an arm64 ports source with an empty Suites field, which breaks apt parsing on every subsequent invocation, not just this one. Find your release codename by hand (lsb_release -cs) and investigate why /etc/os-release is missing it before proceeding; nothing below has been touched, including dpkg's architecture list -- no dpkg --remove-architecture cleanup is needed for this path." >&2
+    echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on this ID=ubuntu host -- refusing to write an arm64 ports source with an empty Suites field, which breaks apt parsing on every subsequent invocation, not just this one. Find your release codename by hand (lsb_release -cs) and investigate why /etc/os-release is missing it before proceeding; nothing below has been touched, including dpkg's architecture list -- no dpkg --remove-architecture cleanup is needed for this path." >&2
     false
   else
     sudo dpkg --add-architecture arm64
     keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-      # 24.04 (noble) and later: deb822 stanza format.
-      if ! grep -q '^Architectures-Remove:' /etc/apt/sources.list.d/ubuntu.sources; then
-        if [ -e /etc/apt/sources.list.d/ubuntu.sources.man47.bak ]; then
-          sudo sed -i '/^URIs:/a Architectures-Remove: arm64' \
-            /etc/apt/sources.list.d/ubuntu.sources
-        else
-          sudo sed -i.man47.bak '/^URIs:/a Architectures-Remove: arm64' \
-            /etc/apt/sources.list.d/ubuntu.sources
+      # 24.04 (noble) and later: deb822 stanza format. Architectures-Remove
+      # is a per-stanza field, so check and patch each stanza individually
+      # -- a file-wide check for the field's mere presence would let one
+      # stanza that already excludes some other architecture (e.g. a
+      # pre-existing "Architectures-Remove: i386") suppress the fix for
+      # every other stanza in the file.
+      src=/etc/apt/sources.list.d/ubuntu.sources
+      fixed=$(awk -v RS='' -v ORS='\n\n' '
+        /Architectures-Remove:[^\n]*arm64/ { print; next }
+        /Architectures-Remove:/ {
+          sub(/Architectures-Remove:[^\n]*/, "& arm64"); print; next
+        }
+        /URIs:/ {
+          sub(/URIs:[^\n]*/, "&\nArchitectures-Remove: arm64"); print; next
+        }
+        { print }
+      ' "$src")
+      if [ "$fixed" != "$(cat -- "$src")" ]; then
+        if [ ! -e "$src.man47.bak" ]; then
+          sudo cp -- "$src" "$src.man47.bak"
         fi
+        printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null
       fi
       sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
 Types: deb
@@ -295,7 +320,7 @@ EOF
     sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
   fi
 else
-  echo "This is the Ubuntu-only block (checks ID=ubuntu, or ID_LIKE containing ubuntu -- note derivatives like Mint/Pop!_OS keep their Ubuntu archive entries in their own separate sources files this block does not edit, see the notes below) -- run the Debian block below instead." >&2
+  echo "This is the Ubuntu-only block (checks ID=ubuntu only -- derivatives that set ID_LIKE to something containing ubuntu, like Linux Mint or Pop!_OS, are declined here on purpose because they keep their Ubuntu archive entries in their own separate sources files this block does not edit; see the notes below) -- run the Debian block below instead." >&2
 fi
 ```
 
@@ -376,23 +401,39 @@ mutated host):
   same exclusion applied to it separately; a host with *both* a populated
   `ubuntu.sources` and a populated `/etc/apt/sources.list` (possible after
   an in-place release upgrade) only gets one of the two restricted, since
-  the branch above is either/or; a `deb` line in the default file that
+  the branch above is either/or; and a `deb` line in the default file that
   already carries inline options (`deb [signed-by=...] https://...`) isn't
   matched by the classic branch's substitution, which expects a bare `deb`
-  followed directly by a URI scheme; the deb822 branch's `grep -q
-  '^Architectures-Remove:'` guard only checks that the field is *present*,
-  not that it targets `arm64` -- a `ubuntu.sources` that already carries
-  some other `Architectures-Remove:` value skips the `sed` and still asks
-  the default mirrors for an arm64 index; and this **is** reachable on a
-  guard-admitted, non-stock-Ubuntu host: the guard runs on any `ID_LIKE`
-  containing `ubuntu`, but Linux Mint keeps its Ubuntu archive entries in
-  its own `/etc/apt/sources.list.d/official-package-repositories.list` and
-  Pop!_OS keeps its own `/etc/apt/sources.list.d/system.sources` --
-  neither is the file this block edits, so the block's `apt update`/`apt
-  install` still hits the same 404 on those hosts. If your host has any of
-  these, add `arch-=arm64` (classic) or `Architectures-Remove: arm64`
-  (deb822) to the affected line(s) by hand -- on Mint/Pop!_OS, to their own
-  separate sources file instead.
+  followed directly by a URI scheme.
+- The deb822 branch checks each stanza for an existing `arm64` exclusion
+  individually (`awk`'s paragraph mode, splitting on blank lines), rather
+  than grepping the whole file for the field's mere presence. A file-wide
+  `grep -q '^Architectures-Remove:'` guard would let one stanza that
+  already excludes some *other* architecture (e.g. a pre-existing
+  `Architectures-Remove: i386` on the `archive.ubuntu.com` stanza)
+  silently suppress the fix for every other stanza in the file, leaving
+  (for example) the `security.ubuntu.com` stanza unrestricted and still
+  404ing on `binary-arm64`. Verified 2026-09-06 against a synthetic
+  two-stanza `ubuntu.sources` with `Architectures-Remove: i386`
+  pre-existing on the first stanza only: the awk pass appends `arm64` to
+  that stanza's existing field and inserts a fresh
+  `Architectures-Remove: arm64` line into the second, untouched stanza;
+  re-running it against its own output changes nothing (idempotent).
+- This block only runs at all on a host whose `/etc/os-release` sets
+  `ID=ubuntu` -- deliberately not on an `ID_LIKE`-only Ubuntu derivative.
+  Linux Mint and Pop!_OS both set `ID_LIKE` to something containing
+  `ubuntu` but keep their own Ubuntu archive entries in their own separate
+  sources files (`/etc/apt/sources.list.d/official-package-repositories.list`
+  on Mint, `/etc/apt/sources.list.d/system.sources` on Pop!_OS) -- neither
+  is a file this block edits, so admitting those hosts here would enable
+  arm64 and restrict the *wrong* file, leaving `apt update` permanently
+  exit-100 with nothing in this block's own output to say why. Declining
+  them to the "run the Debian block below instead" message is not
+  literally true (they aren't Debian), but is strictly better than that
+  silent half-fix: if your host is one of these, add `arch-=arm64`
+  (classic) or `Architectures-Remove: arm64` (deb822) to the affected
+  line(s) in *your distro's own* sources file by hand, following the same
+  pattern as the Ubuntu block above.
 - `apt install`'s package list is resolved as one transaction: when
   `libasound2-dev:arm64` has no candidate, apt aborts and installs
   *nothing* -- not even `gcc-aarch64-linux-gnu`, an amd64 package from the
