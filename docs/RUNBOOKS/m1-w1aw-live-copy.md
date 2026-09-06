@@ -28,8 +28,12 @@ copying speed for a first pass.
    necessarily perfect, but clearly *recognizable*, matching ROADMAP's M1
    bar. **MAN-4:** the audio front end will not spawn tracks below ~600 Hz
    or within ~600 Hz of Nyquist (`HILBERT_GUARD_HZ`) -- seeing no tracks
-   there is expected, not a bug; every normal CW receive-filter passband
-   sits well inside the guarded band's complement.
+   there is expected, not a bug. Note this guard is symmetric (it does not
+   distinguish real audio from the Hilbert front end's own image leakage
+   by sign), so it is not free: a CW sidetone tuned into the 400-550 Hz
+   range -- itself a normal receive-filter/RBN-practice frequency -- will
+   also go unskimmed on this path. See
+   docs/DECISIONS/2026-09-04-man-4-hilbert-guard-pins.md item 23.
 5. Let it run at least several minutes to also eyeball basic stability
    (no panic, no runaway CPU/memory in Activity Monitor / htop).
 6. Record the result (date, band, rough accuracy impression, any issues)

@@ -542,8 +542,19 @@ impl TrackManager {
     const MIRROR_POWER_MARGIN_DB: f32 = 3.0;
 
     /// `a` clearly exceeds `b` by at least `MIRROR_POWER_MARGIN_DB`.
+    /// MAN-4 remediate (code-review finding 1, round 3): requires `a >
+    /// 0.0` as well as the ratio test -- `a >= b * ratio` alone is `true`
+    /// at `a == b == 0.0` (any nonnegative `a` satisfies `>= 0.0`), which
+    /// during an exact-silence key-up gap (both channels' raw hop power
+    /// is precisely `0.0f32`, as `soak_ci.rs`'s noiseless fixture produces
+    /// for ~336 ms/25 WPM inter-word gap) let this resolve a mirror pair
+    /// arbitrarily rather than deferring, closing whichever track happened
+    /// to be checked first even though neither side actually exceeds the
+    /// other. `a > 0.0` restores the intended "a real power reading beats
+    /// a real power reading" semantics while still treating any positive
+    /// `a` as clearly exceeding a silent `b == 0.0`.
     fn clearly_exceeds(a: f32, b: f32) -> bool {
-        a >= b * 10f32.powf(Self::MIRROR_POWER_MARGIN_DB / 10.0)
+        a > 0.0 && a >= b * 10f32.powf(Self::MIRROR_POWER_MARGIN_DB / 10.0)
     }
 
     /// MAN-4 remediate (pin doc D7 addendum): should a rise at `k` be
@@ -1611,6 +1622,34 @@ mod tests {
             tm.tracks.len(),
             2,
             "an ambiguous (within-margin) power comparison must defer, not close either side"
+        );
+    }
+
+    #[test]
+    fn mirror_merge_defers_on_exact_zero_power_instead_of_closing_a_track() {
+        // MAN-4 remediate (code-review finding 1, round 3): both sides of
+        // a mirror pair at precisely 0.0 raw hop power (an exact-silence
+        // key-up gap, as soak_ci.rs's noiseless fixture produces) must
+        // defer, not arbitrarily close one side -- `clearly_exceeds(0.0,
+        // 0.0)` used to be `true`, closing the real ACTIVE track mid-gap.
+        let n = 512;
+        let fs = 48_000.0;
+        let cfg = DetectorConfig {
+            guard_hz: 300.0,
+            mirror_image_guard: true,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(n, fs, 0.0, cfg, DecodeConfig::default());
+        tm.spawn(8);
+        tm.spawn(n - 8);
+        let mut power = quiet_power(n);
+        power[8] = 0.0;
+        power[n - 8] = 0.0;
+        tm.merge_mirror_images(&power);
+        assert_eq!(
+            tm.tracks.len(),
+            2,
+            "exact-zero power on both sides of a mirror pair must defer, not close either side"
         );
     }
 

@@ -44,9 +44,16 @@ pub const HILBERT_MIN_IMAGE_REJECTION_DB: f64 = 70.0;
 /// `hist[i]` (oldest-first), which reverses the convolution index order
 /// relative to standard causal FIR. Since the ideal Hilbert kernel is
 /// antisymmetric, this index reversal is algebraically equivalent to
-/// negating the kernel. `taps` must be odd (asserted by
-/// `HilbertTransformer::with_taps`, this function's only caller).
+/// negating the kernel. `taps` must be odd -- asserted here directly (MAN-4
+/// remediate, code-review finding 4, round 3): this function is `pub` and
+/// `design_hilbert_fir()` is a second, in-crate caller, so the invariant
+/// cannot live solely in `HilbertTransformer::with_taps`. An even `taps`
+/// left unchecked would give a half-integer `center`, silently zeroing the
+/// wrong offsets in the loop below (no panic) rather than the intended
+/// error, and `taps == 0` would underflow `len - 1`; asserting oddness
+/// up front rejects both.
 pub fn design_hilbert_fir_n(taps: usize) -> Vec<f32> {
+    assert!(taps % 2 == 1, "Hilbert FIR length must be odd, got {taps}");
     let len = taps;
     let center = (len - 1) as f64 / 2.0; // integer-valued since len is odd
     let i0_beta = bessel_i0(KAISER_BETA);
@@ -108,9 +115,9 @@ impl HilbertTransformer {
     }
 
     /// A transformer with an explicit (odd) tap count. Panics on an even
-    /// length: the design relies on an integer center tap.
+    /// length (via `design_hilbert_fir_n`'s own assertion): the design
+    /// relies on an integer center tap.
     pub fn with_taps(taps: usize) -> Self {
-        assert!(taps % 2 == 1, "Hilbert FIR length must be odd, got {taps}");
         let taps_vec = design_hilbert_fir_n(taps);
         let nz = taps_vec
             .iter()
@@ -246,6 +253,17 @@ mod tests {
     #[test]
     fn with_taps_rejects_even_lengths() {
         assert!(std::panic::catch_unwind(|| HilbertTransformer::with_taps(128)).is_err());
+    }
+
+    #[test]
+    fn design_hilbert_fir_n_rejects_even_lengths_directly() {
+        // MAN-4 remediate (code-review finding 4, round 3): the assertion
+        // must live on this pub function itself, not only on its
+        // `with_taps` caller -- `design_hilbert_fir()` is a second,
+        // in-crate caller that never went through `with_taps` at all, and
+        // an external caller of this pub fn has no other guard.
+        assert!(std::panic::catch_unwind(|| design_hilbert_fir_n(128)).is_err());
+        assert!(std::panic::catch_unwind(|| design_hilbert_fir_n(0)).is_err());
     }
 
     #[test]

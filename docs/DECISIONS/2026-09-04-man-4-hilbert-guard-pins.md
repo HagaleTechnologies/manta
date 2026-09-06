@@ -449,6 +449,89 @@ each so a later reader does not have to reconstruct it from the diff.
     operator told "no tracks below ~300 Hz is expected" would misread a
     missing 450 Hz signal as normal).
 
+## Remediate round 3 (2026-09-06): validate-gate code-review response
+
+23. **Finding 2 (correctness, PLAUSIBLE): `is_guarded` is sign-blind --
+    decided: keep it symmetric, and correct the cost claim rather than
+    attempt an unverified asymmetric redesign.** The reviewer measured
+    that image rejection at 511 taps already clears the 70 dB floor by
+    250-300 Hz, i.e. the 300 -> 600 Hz raise in item 13 was driven purely
+    by the Kaiser sidelobe residue at -562.5 Hz/-23,437.5 Hz -- both on
+    the *negative* (image) side -- so a guard that suppressed only the
+    negative-offset half near DC (and the corresponding half near
+    Nyquist) would kill that residue while leaving the real positive
+    300-600 Hz audio slice spawnable.
+
+    That asymmetric design was considered and **rejected for this round**:
+    `is_guarded` runs on a circular channel index (`wrapped_channel_offset`,
+    same convention `channel_offset_hz`/`Track::freq_hz` use), so "the
+    negative-image side" near DC and "the negative-image side" near
+    Nyquist are opposite signs of the *same* signed-offset test, and
+    getting that circular sign convention wrong is exactly the class of
+    bug this ticket exists to fix (item 7's own warning about the tap
+    widening and the guard being non-redundant, non-overlapping fixes
+    applies equally to getting either one subtly wrong). Item 15 also
+    means a real signal placed inside the surviving positive 300-600 Hz
+    slice would still need its own negative-frequency coherent image
+    (at the *same* `|offset|`) suppressed by `mirror_image_guard`, not by
+    `is_guarded` -- so the asymmetric-guard win is smaller than it first
+    looks, and this round has no hardware or measurement campaign budgeted
+    to re-verify a frequency-domain sign change with the same rigor items
+    1/13/15 got. Deferred, not abandoned: a future ticket with room for a
+    proper measurement pass (repeat `image_rejection_meets_the_guaranteed_
+    band_contract`-style verification split by sign) is the right place to
+    revisit this, not a validate-gate remediate round.
+
+    **What this round actually fixes: the stale cost claim.** Pin item 6
+    (and the plan's own D8) argued "nothing decodable is lost" for a
+    **300 Hz** guard, citing 300-800 Hz-centered CW receive filters and
+    RBN/skimmer practice at 400-1000 Hz. That argument does not cover the
+    **shipped 600 Hz** value: a 400-550 Hz CW sidetone is a real point
+    inside both cited ranges and is symmetrically excluded by `is_guarded`
+    today. `docs/RUNBOOKS/m1-w1aw-live-copy.md` step 4 is corrected below
+    to say so plainly instead of repeating item 6's 300 Hz-era reassurance
+    at the 600 Hz value, so an operator who tunes a 400-550 Hz sidetone
+    and sees no tracks reads it as this known, owned limitation rather
+    than a mystery bug.
+
+### Deferred to a follow-up ticket (P2-and-lower, per PR review convergence policy)
+
+Per `docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`, this round
+is past round one, so genuinely new P2-and-lower findings are captured
+verbatim here (not fixed inline) for whoever files the follow-up ticket --
+this remediate session has no Linear credential to file it directly.
+
+- **Findings 3 (efficiency) and 5 (test-robustness) from the round-3
+  `/code-review`**, verbatim:
+
+  > Finding 3 -- `merge_mirror_images` adds an O(T²) all-pairs scan plus a
+  > per-hop `BTreeMap` allocation on the Pi 4-budgeted path -- efficiency.
+  > `crates/manta-engine/src/track.rs` (`merge_mirror_images`). At
+  > `track_cap = 500` and 375 hops/s that is ≈125 k pair iterations per
+  > hop, doubling `merge_converged`'s existing cost -- when
+  > `owner_of[(n - ka) % n]` yields the mirror partner directly in O(T).
+  > It also calls `recompute_ownership()` every hop even when nothing
+  > closed, immediately before `evict_over_cap` recomputes again. (The
+  > O(T²) *skeleton* is copied verbatim from the pre-existing
+  > `merge_converged`, so this is a new instance of an old pattern, not a
+  > new pattern; the per-hop `BTreeMap` allocation is genuinely new.)
+  > Does not fail the gate.
+
+  > Finding 5 -- the newly un-`#[ignore]`d test's `track_ids.len() == 1`
+  > may be cross-platform-fragile -- test-robustness, PLAUSIBLE.
+  > `crates/manta-engine/tests/listen_audio.rs` (the new assertion block).
+  > The branch's own `listen.rs` census test documents that the mirror
+  > image can win the spawn race (`census[image_channel] <= 1`) and that
+  > its SNR against its own local floor is comparable to the real track's
+  > -- so it can in principle promote and emit before
+  > `merge_mirror_images` closes it. The fixture is built with
+  > `phi.cos()`, whose f64 result differs between glibc and macOS libm, so
+  > spawn timing is not bit-identical across the two required CI legs
+  > (`test (ubuntu-latest)` and `test (macos-latest)`). It passes here on
+  > Linux; the macOS leg is not observable from this container. Recording
+  > as a watch item for whoever babysits the PR's CI, not as a confirmed
+  > defect.
+
 ## Constraints encountered during this implementation session
 
 This session ran in a network-isolated container: the pinned `coppa` git
