@@ -192,9 +192,25 @@ listener, not a new primitive.
   scrape, so metering only `GET /metrics` would hand a prober the identical
   task/socket/write cost for free. This matches `telnet.rs`'s command
   budget, which charges a line whether or not it parses into a known
-  command. Header-read failures are deliberately **not** charged: they
-  never reach this point at all, and `IpQuota` + `HEADER_READ_TIMEOUT`
-  (MAN-61) already bound them.
+  command.
+- **Round-8 correction:** the header-read error and timeout branches are
+  ALSO charged against `ip_request_limiter`, at their own two call sites
+  in `handle_request`, not just the log budget they already shared. An
+  earlier version of this document (and the matching code comment) claimed
+  `IpQuota` + `HEADER_READ_TIMEOUT` (MAN-61) already bounded those paths.
+  That claim was wrong: `read_line_bounded` (`bounded_io.rs`) errors the
+  instant an unterminated line exceeds `MAX_LINE_BYTES`, at full network
+  speed rather than after any delay, so a peer looping
+  connect/oversized-line/close was never charged and was bounded only by
+  `IpQuota`'s 8-concurrent-holds — the identical "fast, cooperative peer"
+  shape this ticket exists to close, reached by making the request
+  malformed instead of well-formed (round-7 code-review finding, PR #76,
+  round 8 remediation). Charging these branches folds malformed and
+  well-formed requests from one source IP into the same aggregate ceiling;
+  it does not reduce the task/TCP cost of an individual malformed attempt,
+  which is unavoidably paid before the charge can run (the same shape the
+  well-formed 404 path already has), but it closes the specific
+  inconsistency the finding named and keeps the doc comment truthful.
 - An over-budget request gets a complete `429 Too Many Requests` response
   with a `Retry-After: 60` header, `Content-Length: 0`, and `Connection:
   close` — not a bare socket close, which an operator's scraper would read

@@ -242,12 +242,31 @@ async fn handle_request(
             if connection_log_limiter.allow(peer.ip()) {
                 tracing::warn!(peer = %peer, error = %e, "metrics_http: header read rejected (oversized/malformed line), disconnecting");
             }
+            // MAN-64 remediation (round 8 review, PR #76): also charged
+            // against the per-IP request budget below, not just the log
+            // budget above. `read_line_bounded` (bounded_io.rs) errors the
+            // instant an unterminated line exceeds MAX_LINE_BYTES -- at
+            // full network speed, not after any delay -- so a peer looping
+            // connect/oversized-line/close was previously never charged
+            // here and was bounded only by `IpQuota`'s 8-concurrent-holds,
+            // letting it sustain the flood indefinitely. The return value
+            // is unused: this connection is already terminating via the
+            // `Err` below regardless of budget state, exactly like the
+            // well-formed 404 path already charges after paying its own
+            // full connection/read cost.
+            ip_request_limiter.allow(peer.ip());
             return Err(e);
         }
         Err(_) => {
             if connection_log_limiter.allow(peer.ip()) {
                 tracing::warn!(peer = %peer, "metrics_http: header read timed out, disconnecting");
             }
+            // MAN-64 remediation (round 8): same reasoning as the sibling
+            // error branch above -- a slow-trickling client that never
+            // completes a header block still consumed a task and a socket
+            // for the full `HEADER_READ_TIMEOUT`, and should count against
+            // the same aggregate ceiling a well-formed request does.
+            ip_request_limiter.allow(peer.ip());
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "header read timed out",
@@ -264,9 +283,14 @@ async fn handle_request(
     // work is a request, not a successful scrape. Metering only
     // `GET /metrics` would hand a prober the same task/socket/write cost
     // for free. Matches `telnet.rs`'s command budget, which charges a
-    // line whether or not it parses. Header-read failures above are
-    // deliberately NOT charged: they never reach this point at all, and
-    // `IpQuota` + `HEADER_READ_TIMEOUT` (MAN-61) already bound them.
+    // line whether or not it parses. Header-read failures above are ALSO
+    // charged, at their own two branches above -- round 8 correction: an
+    // earlier version of this comment claimed `IpQuota` +
+    // `HEADER_READ_TIMEOUT` (MAN-61) already bounded those paths, but
+    // `read_line_bounded` errors immediately once a line exceeds
+    // MAX_LINE_BYTES, not after any delay, so that claim was wrong and a
+    // fast connect/oversized-line/close loop was never actually charged
+    // (round-7 code-review finding, PR #76).
     if !ip_request_limiter.allow(peer.ip()) {
         // Lazily, at the warn site, on the single connection-level log
         // budget -- MAN-59 rounds 4/5: one budget for every warn site in
@@ -467,5 +491,80 @@ mod tests {
                 "expected {expected}, got {status_line:?}"
             );
         }
+    }
+
+    /// Round-8 remediation regression (round-7 code-review finding, PR #76):
+    /// a peer that sends an oversized, unterminated line -- hitting the
+    /// `Ok(Err(e))` header-read-error branch, not a successful request --
+    /// must still be charged against `ip_request_limiter`. Budget of
+    /// 1/window: the first connection (a malformed line, over
+    /// `bounded_io::MAX_LINE_BYTES`) must consume the single slot, so the
+    /// SECOND connection -- a well-formed `GET /metrics` -- must be
+    /// refused too, even though the first connection never produced a
+    /// parsed request line at all.
+    #[tokio::test]
+    async fn header_read_errors_are_charged_against_the_request_budget() {
+        use tokio::io::AsyncBufReadExt;
+
+        let metrics = Arc::new(Metrics::new());
+        let ip_request_limiter = IpRateLimiter::new(1, Duration::from_secs(60));
+        let connection_log_limiter =
+            IpRateLimiter::new(CONNECTION_LOG_MAX_PER_WINDOW, CONNECTION_LOG_WINDOW);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, peer) = listener.accept().await.unwrap();
+                let metrics = metrics.clone();
+                let ip_request_limiter = ip_request_limiter.clone();
+                let connection_log_limiter = connection_log_limiter.clone();
+                tokio::spawn(async move {
+                    let _ = handle_request(
+                        socket,
+                        metrics,
+                        peer,
+                        connection_log_limiter,
+                        ip_request_limiter,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // First connection: an unterminated line one byte past
+        // MAX_LINE_BYTES, no trailing "\r\n" -- triggers the header-read
+        // error branch immediately, at full network speed, never reaching
+        // a parsed request line.
+        {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(&vec![b'a'; crate::bounded_io::MAX_LINE_BYTES + 1])
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut buf = String::new();
+            // The malformed connection gets no HTTP response at all -- the
+            // server closes the raw socket on this path.
+            let _ = reader.read_line(&mut buf).await;
+        }
+
+        // Second connection: a well-formed request. It must be refused
+        // with 429, proving the first (malformed) connection already
+        // consumed the single available slot.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(
+            status_line.starts_with("HTTP/1.1 429"),
+            "expected 429 (budget already spent by the malformed connection), got {status_line:?}"
+        );
     }
 }

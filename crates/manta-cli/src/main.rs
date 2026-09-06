@@ -1438,10 +1438,15 @@ mod tests {
     /// MAN-64 (PR #76 review round 7): `manta_source_health` had no failure
     /// transition at all -- a fatal source read tore the daemon down with
     /// the gauge still reading 1. The metrics listener is spawned bare (it
-    /// takes neither `ClientTasks` nor the shutdown watch), so it keeps
-    /// serving through `shutdown_runtime_after_drain`'s `await_all` --
-    /// writing 0 here, BEFORE the drain signal, is observable rather than
-    /// cosmetic.
+    /// takes neither `ClientTasks` nor the shutdown watch), so writing 0
+    /// here, BEFORE the drain signal, is observable only for whatever
+    /// fraction of the `SHUTDOWN_DRAIN_DEADLINE` window
+    /// `shutdown_runtime_after_drain`'s `await_all` happens to keep the
+    /// runtime alive -- the full window when a telnet/JSON/WS client is
+    /// genuinely still draining, but effectively zero time in the ordinary
+    /// scrape-only deployment, where `await_all` returns almost immediately.
+    /// See `record_terminal_source_health`'s own doc comment for the full
+    /// corrected claim.
     #[test]
     fn fatal_listen_error_flips_source_health_to_zero() {
         let metrics = manta_server::metrics::Metrics::new();
