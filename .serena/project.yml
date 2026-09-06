@@ -1,0 +1,78 @@
+# Serena project definition for manta (MAN-72).
+#
+# Committed so the catalyst-dev codebase-analyzer / codebase-locator /
+# codebase-pattern-finder subagents get real symbol search here instead of
+# silently falling back to grep. The machine-local halves (the generated index
+# cache, an optional project.local.yml override) are gitignored -- see
+# .serena/.gitignore.
+#
+# Every one of Serena's 22 ProjectConfig fields is spelled out below, even the
+# ones left at their defaults. Serena re-serializes this file (deleting every
+# comment in it) whenever a field is missing or uses a renamed legacy key --
+# `languages:` in particular is migrated to `language_servers:`. Keep the list
+# complete and current; crates/manta-decode/tests/serena_project_config.rs
+# enforces it.
+project_name: "manta"
+language_servers:
+- rust
+encoding: "utf-8"
+activation_command:
+activation_command_timeout: 180.0
+line_ending:
+language_backend:
+ignore_all_files_in_gitignore: true
+ls_specific_settings: {}
+ls_workspace_folders:
+- "."
+ls_additional_workspace_folders: []
+ignored_paths:
+# Serena's own generated index cache.
+- ".serena/cache"
+# Build output. Restated even though .gitignore:1 covers it, so the exclusion
+# survives independently of gitignore parsing. Anchored: a slash-less pattern
+# would also match a `target` directory nested inside a crate.
+- "/target"
+# Vendored crates.io registry. Some hosts (the catalyst cloud runner among them)
+# relocate CARGO_HOME to .catalyst-cache/cargo inside the repo root, which is
+# excluded only by a machine-local .git/info/exclude. Serena's GitignoreParser
+# reads only files named `.gitignore` and never .git/info/exclude, so
+# ignore_all_files_in_gitignore does NOT cover this -- without this entry an
+# index pass walks ~10k vendored third-party .rs files instead of manta's 84,
+# and find_symbol over the project root stops returning in useful time.
+- "/.catalyst-cache"
+# Orchestrator runtime state, not project source. Only three specific files
+# under it are gitignored (.gitignore:26-28), so the directory needs its own entry.
+- "/.catalyst"
+# A SYMLINK OUT OF THE REPO to the shared thoughts pool (.gitignore:33-34), not a
+# real directory. Excluded so Serena's walker can never follow it into the pool.
+- "/thoughts"
+# Transient parallel-work checkouts (.gitignore:5).
+- "/.worktrees"
+read_only: true
+excluded_tools: []
+included_optional_tools: []
+fixed_tools: []
+default_modes:
+added_modes:
+initial_prompt: |
+  manta: open-source, cross-platform, wideband multi-signal CW skimmer in Rust --
+  decodes every CW signal across an SDR passband and emits RBN-compatible spots,
+  an open alternative to the single closed-source Windows program the Reverse
+  Beacon Network currently depends on. 9-crate Cargo workspace under crates/:
+  manta-decode and manta-dsp have no internal deps (manta-dsp wraps the sibling
+  coppa-dsp crate); manta-spot, manta-input and manta-testkit build on those;
+  manta-engine (pipeline orchestration) and manta-server (telnet + JSON/WebSocket
+  output) build on that layer; manta-cli (the `manta` binary) and
+  manta-soak-harness (long-duration soak binary, MAN-19) sit on top. Read
+  CLAUDE.md first (status, key constraints), then ARCHITECTURE.md (data flow,
+  crate graph) and docs/SPEC-decode-core.md (normative algorithm spec -- implement
+  from this); wiki/INDEX.md maps accumulated gotchas and decisions (descriptive
+  only -- code and docs/ win any conflict). manta reuses DSP building blocks (FFT,
+  channel-impairment models, audio I/O) from the sibling coppa repo via git
+  dependency -- see wiki/pages/coppa-reuse.md before assuming a DSP primitive is
+  new code here. Prefer get_symbols_overview / find_symbol /
+  find_referencing_symbols over raw grep for symbol-level questions; call
+  read_memory("codebase_map") for the directory map.
+symbol_info_budget:
+read_only_memory_patterns: []
+ignored_memory_patterns: []
