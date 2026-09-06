@@ -563,13 +563,19 @@ block_channels = 32    block_allowance_db = 3.0
 # hang_ms above. Equal to hang_ms by default (= SPEC behavior); see
 # manta-engine::track::DetectorConfig::hang_hops_emitting and
 # docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md.
+# Hard ceiling: gc_ms above. The GC silent-timer is checked before this
+# timer and is not reset on entering HANG, so a track already partway
+# through its gc_ms budget when the fade begins gets less than the full
+# hang_emitting_ms of coast -- any value at or above gc_ms is unreachable.
 hang_emitting_ms = 5000
 # [DEVIATION from SPEC §2.5] MAN-9 / issue #26: merge radius in channels,
 # instead of the literal 1.0-channel threshold, used by TrackManager's
-# convergence merge. 1.0 by default (= SPEC behavior); hard ceiling 2.5 (the
-# V8/V8w scene's 300 Hz minimum separation = 3.2 channels). See
+# convergence merge. 2.0 by default (MAN-9 Round-4: promoted from SPEC's
+# 1.0 -- mitigates V8w's issue #26 track fragmentation with no regression on
+# the V8 AWGN sibling); hard ceiling 2.5 (the V8/V8w scene's 300 Hz minimum
+# separation = 3.2 channels). See
 # manta-engine::track::DetectorConfig::merge_radius_channels and the pin doc.
-merge_radius_channels = 1.0
+merge_radius_channels = 2.0
 
 [decode]
 timing_sigma = 0.25    beam_width = 4

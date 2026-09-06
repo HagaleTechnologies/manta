@@ -25,9 +25,17 @@ use std::collections::BTreeMap;
 const NEAR_HZ: f64 = 300.0;
 const FRAGMENTED_LEN_RATIO: f64 = 0.3;
 
+/// CR-gamma: `text` is `Some` only once a `CharDecoded`/`WordBoundary` event
+/// has actually been seen for this track -- mirrors `golden_v8_v8w.rs`'s
+/// `per_track` exactly. `nearest_track` (used for the CER-shaped
+/// `len_ratio` computation below) filters to this population so it can
+/// never select a `TrackMeta`-only fragment the golden harness cannot see.
+/// `tracks_near` (cluster/overlap counting) deliberately keeps every entry,
+/// `TrackMeta`-only ones included -- that is the population this file's own
+/// "N tracks within 300 Hz" figures describe.
 #[derive(Debug, Default)]
 struct TrackSummary {
-    text: String,
+    text: Option<String>,
     freq_hz: Option<f64>,
     first_ts: Option<u64>,
     last_ts: Option<u64>,
@@ -49,7 +57,11 @@ fn per_track(events: &[DecoderEvent]) -> BTreeMap<u32, TrackSummary> {
                 ..
             } => {
                 if let Some(c) = glyph.text_char() {
-                    out.entry(*track_id).or_default().text.push(c);
+                    out.entry(*track_id)
+                        .or_default()
+                        .text
+                        .get_or_insert_with(String::new)
+                        .push(c);
                 }
                 touch(&mut out, *track_id, *sample_ts);
             }
@@ -58,8 +70,9 @@ fn per_track(events: &[DecoderEvent]) -> BTreeMap<u32, TrackSummary> {
                 sample_ts,
             } => {
                 let e = out.entry(*track_id).or_default();
-                if !e.text.is_empty() && !e.text.ends_with(' ') {
-                    e.text.push(' ');
+                let t = e.text.get_or_insert_with(String::new);
+                if !t.is_empty() && !t.ends_with(' ') {
+                    t.push(' ');
                 }
                 touch(&mut out, *track_id, *sample_ts);
             }
@@ -78,15 +91,22 @@ fn expected_freq(spec: &VectorSpec, idx: usize) -> f64 {
     spec.center_freq_hz + spec.signals[idx].offset_hz
 }
 
+/// Nearest-by-frequency track AMONG THOSE WITH A DECODED-TEXT EVENT only --
+/// same restriction as `golden_v8_v8w.rs`'s `match_tracks_by_freq` (CR-gamma),
+/// so a closer-in-frequency `TrackMeta`-only fragment can never be picked
+/// over the real, farther track that actually carries the signal's text.
 fn nearest_track(
     tracks: &BTreeMap<u32, TrackSummary>,
     expected_freq_hz: f64,
 ) -> Option<&TrackSummary> {
-    tracks.values().min_by(|a, b| {
-        let da = (a.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
-        let db = (b.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
-        da.partial_cmp(&db).unwrap()
-    })
+    tracks
+        .values()
+        .filter(|t| t.text.is_some())
+        .min_by(|a, b| {
+            let da = (a.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
+            let db = (b.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
+            da.partial_cmp(&db).unwrap()
+        })
 }
 
 /// CR-7 (MAN-9 pin doc): strictly less than, not `<=` -- `radius_hz` is
@@ -123,7 +143,8 @@ fn fragmented_signal_indices(
         .filter_map(|(i, s)| {
             let expected = spec.center_freq_hz + s.offset_hz;
             let decoded_len = nearest_track(tracks, expected)
-                .map(|t| t.text.trim().chars().count())
+                .and_then(|t| t.text.as_deref())
+                .map(|t| t.trim().chars().count())
                 .unwrap_or(0);
             let expected_len = keyed_texts[i].chars().count();
             let len_ratio = decoded_len as f64 / expected_len as f64;

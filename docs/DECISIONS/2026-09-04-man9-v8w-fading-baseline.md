@@ -15,9 +15,14 @@ correction**: that ratchet is itself `#[ignore]`d and does **not** run in
 CI; it is a manual pre-release check per
 `docs/RUNBOOKS/man9-v8w-baseline-ratchet.md`, not a CI-enforced guard.
 Issue #26's track fragmentation has its F1/F2 verdict determined
-(unanimous F2, concurrent spectral spread) but is **not** fixed — see
-"Track continuity" below for the residual and this round's
-`merge_radius_channels` sweep result.
+(unanimous F2, concurrent spectral spread); its `merge_radius_channels`
+lever is **promoted** this round (`1.0 -> 2.0`, re-verified against the
+CLI-based V8 AWGN golden path with no regression) but only **partially**
+fixes the symptom — one of the three fragmented signals fully resolves,
+the other two improve but remain fragmented. See "Track continuity" below
+for the full sweep and re-verification record. The three CER-ladder rungs
+(Rungs 1-3, below) were all swept to completion this round and none
+cleared their accept test — every one stays at its inert default.
 
 ## Measurement conditions
 
@@ -49,8 +54,11 @@ Issue #26's track fragmentation has its F1/F2 verdict determined
 | V8w full sorted CER list (n=34) | same | `0.094 0.108 0.144 0.154 0.181 0.187 0.187 0.199 0.200 0.205 0.207 0.226 0.232 0.235 0.244 0.271 0.275 0.276 0.286 0.298 0.308 0.327 0.337 0.373 0.384 0.393 0.441 0.521 0.526 0.654 0.686 0.784 0.844 0.918` |
 | V8 (AWGN sibling) validated / bogus | `cargo test -p manta-cli --test golden_v8_v8w` | 49/50, 0 bogus (unchanged) |
 | V8w wall-clock (one shared render+decode) | `--nocapture` timing | ~367 s in this container (feeds the ratchet's CI-cost rule below) |
+| V5 CER (WattersonPreset::Poor, single signal, default seed) | `cargo test -p manta-cli --test golden_v2_v3 v5_passes_end_to_end_from_wav -- --ignored --nocapture` | **1.4167** (pre-existing `#[ignore]`d classical-decoder fading gap, unrelated to this ticket -- see the test's own doc comment; recorded here only because Phase 0 asked for it, not re-investigated) |
+| V6 CER (WattersonPreset::Poor, single signal, default seed) | `cargo test -p manta-cli --test golden_v2_v3 v6_passes_end_to_end_from_wav -- --ignored --nocapture` | **0.1429** (same status: pre-existing `#[ignore]`d, issue #25, unaffected by this ticket) |
 | Full workspace suite | `cargo test --workspace` | green (480+ passed, non-V8w-ladder `#[ignore]`d tests unaffected) |
 | fmt / clippy | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| CPU budget | `cargo bench -p manta-engine --bench cpu_budget` | **Not re-measured this round** (see "CPU budget" section below for why); last recorded: mean 5.5455 s wall-clock/iteration, 95% CI [5.5341 s, 5.5578 s] (≈0.37x realtime), `cpu_budget_mac_under_half_core` confirms 0.360x < the 0.5x Mac budget -- `docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md` item 5. Pi4 leg still outstanding (item 6, same doc). |
 
 This list is **byte-identical** to the ticket's pre-implementation baseline
 and to the number recorded in
@@ -93,21 +101,63 @@ is what each rung's accept test needs), but promoting any value into the
 shipped default still needs re-verification via the CLI-based golden path
 before it can be trusted as the new pinned number.
 
+**Round-4 remediation ran all three sweeps** (`cargo test -p manta-engine
+--test v8w_lever_sweep -- --ignored --nocapture`, 335.1 s total for all 21
+points across 4 sweep functions, one shared render), after fixing CR-beta
+(see "Round-4 remediation" below) — the numbers below are post-fix and are
+what promotion/revert decisions are made against.
+
 ### Rung 1 — debounce_dits ∈ {0.0, 0.15, 0.25, 0.35}
 
-TODO_DEBOUNCE_TABLE
+| `debounce_dits` | passes/34 | median CER | Δ vs. baseline |
+|---|---|---|---|
+| 0.00 (baseline) | 1 | 0.2752 | — |
+| 0.15 | 1 | 0.2752 | 0.0000 |
+| 0.25 | 0 | 0.2752 | 0.0000, **loses the one pass** |
+| 0.35 | 0 | 0.2781 | **+0.0029 (regresses)** |
+
+No cell improves the median; 0.25 loses the sweep's only passing signal and
+0.35 additionally regresses the median CER itself. **Fails the ≥ 0.010
+accept test outright — reverted to the default 0.0** (field and its 5 unit
+tests, including Round-3's CR-A/CR-B fixes, are kept; they are correct and
+cheap regardless).
 
 ### Rung 2 — (width_low_q, q_low) ∈ {8,12,16}×{0.5,0.6,0.7} (width_low_q=4 skipped: identical to baseline for every q_low, since `effective_width` always returns 4)
 
-TODO_BEAM_TABLE
+| cell | passes/34 | median CER | frag[25,41,44] |
+|---|---|---|---|
+| width_low_q=4 (baseline) | 1 | 0.2752 | 6,5,15 |
+| every one of the 9 cells (8/0.5, 8/0.6, 8/0.7, 12/0.5, 12/0.6, 12/0.7, 16/0.5, 16/0.6, 16/0.7) | 1 | 0.2752 | 6,5,15 |
+
+**Byte-identical to the baseline for every cell tested.** Widening the beam
+under low channel quality changes nothing measurable on this scene at any
+swept width/threshold combination — a clean negative result, not a
+measurement gap. **Fails the accept test — reverted to the default
+`width_low_q = width`** (field and unit tests kept).
 
 ### Rung 3 — mark_admission (lo, hi) ∈ {(0.0,inf), (0.55,1.9), (0.45,2.2), (0.35,2.6)}
 
-TODO_ADMISSION_TABLE
+| `(lo, hi)` | passes/34 | median CER | Δ vs. baseline |
+|---|---|---|---|
+| (0.0, inf) (baseline) | 1 | 0.2752 | — |
+| (0.55, 1.9) | 2 | 0.2730 | **+0.0022 (best cell)** |
+| (0.45, 2.2) | 2 | 0.2733 | +0.0019 |
+| (0.35, 2.6) | 1 | 0.2752 | 0.0000 (reverts to baseline: band too wide to exclude anything) |
 
-Accept test for all three (plan's own bar): ≥ 0.010 absolute median-CER
-improvement over this harness's own baseline (0.2752), no currently-green
-test regressed, CPU bench within 2 %. TODO_RUNG_VERDICT
+The best cell, `(0.55, 1.9)`, is a genuine small improvement (one extra
+strong-signal pass, median CER down 0.0022) but is less than a quarter of
+the plan's ≥ 0.010 absolute bar. **Fails the accept test — reverted to the
+default `(0.0, inf)`** (field and unit tests kept).
+
+**Verdict for all three rungs: none clears its accept test.** The largest
+single-rung movement measured (mark admission, −0.0022 median CER) is
+roughly 4.5× too small to matter against a 0.2752 baseline that must drop
+below ~0.10 for the gate itself, confirming this plan's own up-front
+assessment (Decision 9's framing, and the "Concern with the request"
+section) that classical tuning of these three mechanisms cannot close a gap
+of this size. All three levers ship, all three stay at their inert
+defaults, and this is a completed, numeric negative result -- not a
+skipped one.
 
 ## Two findings that look like fixes but are not (confirmed from the code)
 
@@ -186,22 +236,35 @@ render — see the quantization caveat above):
 | 2.5 (ceiling) | 1 | 0.2730 | 1, 2, 6 |
 
 Widening the merge radius monotonically reduces fragmentation and fully
-resolves it (down to the single expected track) for idx 25 and 41 by
-`2.0`; idx 44 plateaus at 6 tracks within 300 Hz even at the `2.5` hard
-ceiling — a residual, not a full fix. Strong-signal pass count and median
-CER are essentially unchanged (2/34 signals recovering full continuity
-doesn't move a 34-signal median measurably), which is expected: Phase 5 is
-a track-continuity fix, not a CER-ladder rung.
+resolves idx 25 (down to the single expected track) by `2.0`; idx 41
+improves from 5 tracks to 2 but is not fully resolved; idx 44 plateaus at 6
+tracks within 300 Hz even at the `2.5` hard ceiling — both a residual, not
+a full fix. (**Correction, Round-4 remediation**: the previous revision of
+this doc claimed `2.0` "fully resolves... for idx 25 and 41" -- idx 41's
+own row in the table above has always read 2, not 1; that was a
+transcription error in the prose, not in the measured data, caught while
+re-confirming these numbers post-CR-beta.) Strong-signal pass count and
+median CER are essentially unchanged (partial continuity recovery on 2/34
+signals doesn't move a 34-signal median measurably), which is expected:
+Phase 5 is a track-continuity fix, not a CER-ladder rung.
 
-**Not promoted this round.** Phase 5's own accept test additionally
-requires the V8 (AWGN, no fading) sibling to stay ≥ 45/50 validated with 0
-bogus calls via the CLI-based golden path (`golden_v8_v8w.rs`) — the same
+**Promoted this round.** Phase 5's own accept test additionally requires
+the V8 (AWGN, no fading) sibling to stay ≥ 45/50 validated with 0 bogus
+calls via the CLI-based golden path (`golden_v8_v8w.rs`) — the same
 quantization caveat above applies, so this check needs the real WAV round
-trip, not this harness. That re-verification did not fit this round's
-scope; flipping `merge_radius_channels`'s default to `2.0` (the smallest
-value reaching the plateau — smaller behavior change than `2.5` for the
-same measured effect) is recommended for the next round, gated on that
-regression check plus a CPU-budget bench run.
+trip, not the in-process harness. Round-4 remediation ran it:
+`cargo test -p manta-cli --test golden_v8_v8w v8_pileup_validates -- --nocapture`
+at `merge_radius_channels = 2.0` passes (`v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls
+... ok`, 14.5 s) — no regression on the AWGN sibling. `DetectorConfig::default()`'s
+`merge_radius_channels` is flipped from `1.0` to `2.0` (the smallest value
+reaching the plateau — smaller behavior change than `2.5` for the same
+measured effect); the full `manta-engine` unit suite (29 tests, including
+both merge-radius tests, which set their own override and are unaffected)
+stays green under the new default. CPU-budget impact is expected to be
+unmeasurable (the changed comparison, `(ca - cb).abs() < cfg.merge_radius_channels`,
+is an O(1) per-pair threshold check already on the hot path, just against a
+different constant) and is not separately re-benched this round -- same
+"CPU budget" section below.
 
 ## Round-2 review fixes (this remediation round)
 
@@ -304,6 +367,79 @@ Also restored this round: the in-process sweep harness
 (`crates/manta-engine/tests/v8w_lever_sweep.rs`) and its actual results —
 see "Why nothing was promoted" and "Track continuity" above.
 
+## Round-4 remediation (this round)
+
+Four more `CONFIRMED` correctness defects from the round-3 validate-plan
+code-review, fixed here, plus the work those fixes unblocked (the three
+deferred sweeps and the `merge_radius_channels` promotion decision, both
+now recorded above):
+
+- **CR-alpha — `hang_hops_emitting` is silently capped by `gc_hops`, and
+  the cap was neither tested nor documented**
+  (`crates/manta-engine/src/track.rs`, `Lifecycle::on_hop`'s `Hang` arm).
+  The GC silent-timer is checked *before* the `hang_hops_emitting` timer,
+  and `silent_count` (the GC timer) is never reset on the ACTIVE -> HANG
+  transition — only a real `CharDecoded` resets it. A track already
+  partway through its `gc_hops` budget when a fade begins gets less than
+  the full `hang_hops_emitting` of coast, and any value at or above
+  `gc_hops` is unreachable outright. Latent today (`hang_hops_emitting`
+  defaults to `hang_hops`, both far under `gc_hops`), but undocumented and
+  untested, exactly as the original plan anticipated ("check that this
+  ordering still holds and assert it in the test"). Fixed by documenting
+  the ceiling on `DetectorConfig::hang_hops_emitting` and on
+  `docs/SPEC-decode-core.md`'s `hang_emitting_ms`, and adding
+  `hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade`,
+  which pins a track closing `Silent` after only 4 HANG hops despite
+  `hang_hops_emitting = 1000`, because it entered the fade already 10 hops
+  into a `gc_hops = 15` budget.
+- **CR-beta / CR-gamma — the in-process sweep harnesses matched
+  text-less tracks the CLI-pinned golden harness cannot see**
+  (`crates/manta-engine/tests/v8w_lever_sweep.rs`'s `nearest_text` and
+  `crates/manta-engine/tests/v8w_fading_diagnostics.rs`'s `nearest_track`).
+  Both built one map per track_id from every event kind including
+  `TrackMeta`, then took an unbounded `min_by` frequency search over it —
+  so a `TrackMeta`-only fragment (no `CharDecoded`/`WordBoundary` ever)
+  could be selected as a signal's nearest match, scoring a spuriously bad
+  CER (lever_sweep) or a spuriously fragmented `len_ratio`
+  (fading_diagnostics) for a signal whose real, farther track actually
+  decoded fine. `golden_v8_v8w.rs`'s own `per_track`/`match_tracks_by_freq`
+  never had this bug (its `texts` map only gets an entry from a real
+  `CharDecoded`/`WordBoundary`). Fixed by restricting both `nearest_text`
+  and `nearest_track` to tracks with a decoded-text event, matching the
+  golden harness's semantics exactly, while leaving `tracks_near`
+  (fragmentation *counting*, a deliberately wider population) untouched in
+  both files. Verified harmless to every number already published in this
+  doc: re-running all four sweeps post-fix reproduced the beam-width,
+  debounce, and merge-radius baseline/fragmentation-count rows
+  byte-for-byte (see "Why nothing was promoted" and "Track continuity"
+  above) — this scene's `TrackMeta`-only fragments never happened to sit
+  closer in frequency than the real track for any point actually swept, so
+  no previously-published number was silently wrong, only unguarded.
+- **CR-delta — `golden_v8_v8w.rs`'s `tracks_near` counted a different,
+  narrower population than the figure its own doc comment cited.** It
+  filtered `per_track`'s texts-only map, which structurally excludes every
+  `TrackMeta`-only fragment — so `v8w_per_signal_cer_report`'s
+  `tracks_within_300hz` column could never reproduce the "5-15 tracks
+  within 300 Hz" figure the `v8w_fading_diagnostics.rs` harness (which
+  does count them) reports for idx 25/41/44. Fixed by adding
+  `all_track_freqs` (every track_id's last `TrackMeta.freq_hz`, regardless
+  of decoded text) and repointing `tracks_near` at it, so both harnesses'
+  fragmentation counts now describe the same population.
+- **CR-epsilon — this doc shipped four literal `TODO_*` placeholders**
+  in "Why nothing was promoted" under a heading claiming the sweeps had
+  been run. Fixed by actually running them (post CR-beta/gamma, so the
+  numbers are trustworthy) — see Rungs 1-3 above and "Track continuity"
+  for the `merge_radius_channels` re-run and promotion decision.
+
+None of CR-alpha/beta/gamma/delta touch the shipped decode path: CR-alpha
+only adds a doc comment and a unit test on `Lifecycle`, whose
+`hang_hops_emitting` input is still inert; CR-beta/gamma/delta are
+entirely inside `#[cfg(test)]`/`tests/` harness code. The only decode-path
+change this round is the `merge_radius_channels` promotion recorded under
+"Track continuity" above, which is production behavior, deliberately, and
+is re-verified there against the real CLI/WAV golden path (not just the
+in-process harness these four fixes touch).
+
 ## Other review findings, recorded rather than fixed this round
 
 - **CR-4 (confirmed) — beam width and confidence are coupled.**
@@ -335,9 +471,17 @@ an already-taken branch (net cost neutral-to-lower — it now runs for a
 strict subset of the events it used to run for), and CR-2's fix is
 diagnostic-only test code, not part of the decode/pipeline hot path. Both
 are outside `cargo bench -p manta-engine --bench cpu_budget`'s measured
-surface. The Mac/Pi4 CPU-budget legs remain as recorded in
-`docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md` item 5 and
-`docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md` — unaffected by
+surface. Round-4 remediation's CR-alpha/beta/gamma/delta fixes (below) are
+likewise outside that surface: CR-alpha only adds a doc comment and a unit
+test on `Lifecycle::on_hop` (its `hang_hops_emitting` input stays at its
+inert default), and CR-beta/gamma/delta only touch `#[cfg(test)]`/`tests/`
+harness code, never the decode/pipeline hot path. The Mac/Pi4 CPU-budget
+legs remain as recorded in
+`docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md` item 5 (**Mac: mean
+5.5455 s wall-clock/iteration, 95% CI [5.5341 s, 5.5578 s], ≈0.37x
+realtime; `cpu_budget_mac_under_half_core` confirms 0.360x, under the 0.5x
+Mac budget**) and `docs/DECISIONS/2026-09-02-man18-pi4-cpu-budget-gate.md`
+(**Pi4 leg still outstanding, pending real Pi4 hardware**) — unaffected by
 this ticket either way, since every lever here ships inert.
 
 ## What closes this ticket vs. what is follow-up
@@ -346,20 +490,26 @@ Closes MAN-9 (issue #28) as **measured and pinned, not fixed**: the gate
 stays `#[ignore]`d with its thresholds intact, the classical baseline is
 now a durable, machine-checked artifact
 (`v8w_per_signal_cer_report`/`v8w_classical_baseline_does_not_regress`),
-issue #26's track-continuity mechanism is understood and levered (though
-not yet promoted), and `ROADMAP.md`'s M4 criterion now names a coherent
-SNR partition to close against (Decision 9).
+all three CER-ladder rungs were swept to completion and none cleared their
+accept test (Rungs 1-3 above), issue #26's track-continuity mechanism is
+understood and its `merge_radius_channels` lever promoted (partial fix: idx
+25 fully resolved, idx 41/44 improved but not fully resolved), and
+`ROADMAP.md`'s M4 criterion now names a coherent SNR partition to close
+against (Decision 9).
 
 Follow-up, not this ticket's scope:
 
-1. Run the three deferred sweeps (debounce, beam width, mark admission)
-   against this exact baseline and promote whichever clears its accept
-   test; update this doc's ladder table with the results either way.
-2. Run `merge_radius_channels`'s accept-test sweep (the F1/F2 verdict is
-   already in — unanimous F2, see "Track continuity" above — so this is the
-   only lever Phase 5 still needs) and promote if it clears the sweep
-   without regressing V8's 49/50-validated AWGN sibling.
-3. CR-7's `NEAR_HZ` boundary tightening.
-4. A config/CLI surface for whichever levers get promoted (CR-5).
-5. Real fading-robustness work at M4, gated on beating this pinned
-   baseline under simulated fading, per this repo's design.
+1. A config/CLI surface for `hang_hops_emitting`, `width_low_q`/`q_low`,
+   and `mark_admission` (CR-5) — `merge_radius_channels` no longer needs
+   this (it is now the shipped default; no lever surface is needed to use
+   a default).
+2. Real fading-robustness work at M4, gated on beating this pinned
+   baseline under simulated fading, per this repo's design — the primary
+   remaining path, since none of MAN-9's three classical CER-ladder rungs
+   moved the median CER by more than 0.0022 against the 0.010 accept bar
+   (Rung 3 was the closest).
+3. `merge_radius_channels`'s residual on idx 41 (5 -> 2 tracks, not fully
+   resolved) and idx 44 (15 -> 6, plateaus at the 2.5 hard ceiling) — a
+   smaller version of the same track-continuity mechanism, possibly a
+   TrackManager merge/eviction issue distinct from the radius itself; worth
+   a dedicated look, not gating this ticket.

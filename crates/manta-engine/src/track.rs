@@ -31,6 +31,17 @@ pub struct DetectorConfig {
     /// keeping noise CANDIDATEs alive any longer. Equal to `hang_hops` by
     /// default (= SPEC behavior). `track_id` is never reused regardless --
     /// see docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md.
+    ///
+    /// **Hard ceiling: `gc_hops`.** `Lifecycle::on_hop`'s HANG arm checks
+    /// the `silent_count` GC timer *before* this field's `hang_count`
+    /// timer, and `silent_count` is never reset on the ACTIVE -> HANG
+    /// transition -- only `note_char_decoded` (on the next real
+    /// `CharDecoded`) resets it. So a track that was already silent for
+    /// `n` hops before the fade began gets at most `gc_hops - n` hops of
+    /// HANG coast, regardless of how large this field is set; any value
+    /// at or above `gc_hops` is unreachable outright. See
+    /// `hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade`
+    /// for the pinned behavior.
     pub hang_hops_emitting: u64,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
     pub gc_hops: u64,
@@ -50,7 +61,13 @@ pub struct DetectorConfig {
     /// signal separation is 300 Hz = 3.2 channels
     /// (`manta_testkit::vectors`'s `MIN_SEPARATION_HZ`), so this must
     /// stay strictly under that or genuinely distinct neighboring signals
-    /// would start merging. `1.0` by default (= SPEC behavior).
+    /// would start merging. **`2.0` by default (MAN-9 Round-4:
+    /// promoted from SPEC's `1.0`)** — fully resolves one and reduces the
+    /// other two of V8w's three fragmented signals (idx 25/41/44: track
+    /// count within 300 Hz drops 6/5/15 -> 1/2/6), with no regression on
+    /// the V8 AWGN sibling's `>= 45/50` validated / 0-bogus gate. See
+    /// docs/DECISIONS/2026-09-04-man9-v8w-fading-baseline.md's "Track
+    /// continuity" section for the full sweep and re-verification record.
     pub merge_radius_channels: f32,
 }
 
@@ -94,7 +111,7 @@ impl Default for DetectorConfig {
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
-            merge_radius_channels: 1.0, // inert: SPEC behavior, see the field's doc comment
+            merge_radius_channels: 2.0, // MAN-9 Round-4: promoted, see the field's doc comment and the pin doc's "Track continuity" section
         }
     }
 }
@@ -1119,6 +1136,50 @@ mod tests {
             lc.on_hop(false, true, false),
             LifecycleEvent::Closed(CloseReason::HangExpired)
         ); // hang_count=10 >= hang_hops=10, unaffected by hang_hops_emitting=20
+    }
+
+    /// CR-alpha: `hang_hops_emitting` is silently capped by `gc_hops`.
+    /// `on_hop`'s HANG arm checks the `silent_count` GC timer BEFORE
+    /// `hang_count`/`hang_hops_emitting`, and `silent_count` carries over
+    /// from ACTIVE (it is only reset by a real `CharDecoded`, never by
+    /// entering HANG). A track already 10 hops into its 15-hop `gc_hops`
+    /// budget when the fade begins closes `Silent` after only 4 more HANG
+    /// hops, even though `hang_hops_emitting` is configured to allow 1000 --
+    /// pins the ceiling `DetectorConfig::hang_hops_emitting`'s doc comment
+    /// describes.
+    #[test]
+    fn hang_hops_emitting_is_capped_by_gc_hops_carried_over_from_before_the_fade() {
+        let cfg = DetectorConfig {
+            confirm_hops: 5,
+            hang_hops: 3,
+            hang_hops_emitting: 1000,
+            gc_hops: 15,
+            ..DetectorConfig::default()
+        };
+        let mut lc = Lifecycle::new(&cfg);
+        for _ in 0..3 {
+            lc.on_hop(true, false, false);
+        }
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted); // hop 5, ACTIVE
+        lc.note_emitting();
+        assert_eq!(lc.on_hop(true, false, true), LifecycleEvent::None); // char decoded: silent_count -> 0
+                                                                         // 10 silent ACTIVE hops before the fade even starts.
+        for _ in 0..10 {
+            assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
+        }
+        // The fade begins: -> HANG. silent_count carries over at 10 (does
+        // NOT reset), so only gc_hops(15) - 10 = 5 more silent hops remain
+        // before the GC timer fires -- nowhere near hang_hops_emitting=1000.
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // -> HANG, hang_count=1, silent_count=11
+        for _ in 0..3 {
+            assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None); // silent_count 12,13,14; hang_count 2,3,4
+        }
+        assert_eq!(
+            lc.on_hop(false, true, false),
+            LifecycleEvent::Closed(CloseReason::Silent),
+            "gc_hops caps hang_hops_emitting's coast: closes Silent at silent_count=15 \
+             (hang_count only reached 5), far short of the configured hang_hops_emitting=1000"
+        );
     }
 
     use manta_decode::decoder::DecodeConfig;

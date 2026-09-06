@@ -28,27 +28,40 @@ use std::time::Instant;
 /// counted as one of its neighbor's fragments.
 const NEAR_HZ: f64 = 300.0;
 
+/// CR-beta: `text` is `Some` only once a `CharDecoded`/`WordBoundary` event
+/// has actually been seen for this track -- mirrors
+/// `golden_v8_v8w.rs`'s `per_track` exactly, so `nearest_text` below can
+/// never select a `TrackMeta`-only fragment (a track the CLI-pinned golden
+/// harness cannot see at all) as a signal's CER match. `tracks_near`
+/// (fragmentation counting) deliberately keeps counting every entry here,
+/// `TrackMeta`-only ones included -- that population is what
+/// `v8w_fading_diagnostics.rs`'s cluster counts describe.
 #[derive(Default)]
-struct TrackText {
-    text: String,
+struct TrackInfo {
+    text: Option<String>,
     freq_hz: Option<f64>,
 }
 
-fn per_track(events: &[DecoderEvent]) -> BTreeMap<u32, TrackText> {
-    let mut out: BTreeMap<u32, TrackText> = BTreeMap::new();
+fn per_track(events: &[DecoderEvent]) -> BTreeMap<u32, TrackInfo> {
+    let mut out: BTreeMap<u32, TrackInfo> = BTreeMap::new();
     for ev in events {
         match ev {
             DecoderEvent::CharDecoded {
                 track_id, glyph, ..
             } => {
                 if let Some(c) = glyph.text_char() {
-                    out.entry(*track_id).or_default().text.push(c);
+                    out.entry(*track_id)
+                        .or_default()
+                        .text
+                        .get_or_insert_with(String::new)
+                        .push(c);
                 }
             }
             DecoderEvent::WordBoundary { track_id, .. } => {
                 let e = out.entry(*track_id).or_default();
-                if !e.text.is_empty() && !e.text.ends_with(' ') {
-                    e.text.push(' ');
+                let t = e.text.get_or_insert_with(String::new);
+                if !t.is_empty() && !t.ends_with(' ') {
+                    t.push(' ');
                 }
             }
             DecoderEvent::TrackMeta {
@@ -62,19 +75,27 @@ fn per_track(events: &[DecoderEvent]) -> BTreeMap<u32, TrackText> {
     out
 }
 
-fn nearest_text(tracks: &BTreeMap<u32, TrackText>, expected_freq_hz: f64) -> &str {
+/// Nearest-by-frequency track AMONG THOSE WITH A DECODED-TEXT EVENT only --
+/// same restriction as `golden_v8_v8w.rs`'s `match_tracks_by_freq`, so a
+/// closer-in-frequency `TrackMeta`-only fragment can never be picked over
+/// the real, farther track that actually carries the signal's text.
+fn nearest_text(tracks: &BTreeMap<u32, TrackInfo>, expected_freq_hz: f64) -> &str {
     tracks
         .values()
+        .filter(|t| t.text.is_some())
         .min_by(|a, b| {
             let da = (a.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
             let db = (b.freq_hz.unwrap_or(f64::MAX) - expected_freq_hz).abs();
             da.partial_cmp(&db).unwrap()
         })
-        .map(|t| t.text.trim())
+        .map(|t| t.text.as_deref().unwrap_or("").trim())
         .unwrap_or("")
 }
 
-fn tracks_near(tracks: &BTreeMap<u32, TrackText>, expected_freq_hz: f64, radius_hz: f64) -> usize {
+/// Count of ALL tracks (including `TrackMeta`-only fragments) within
+/// `radius_hz` -- the fragmentation-counting population, deliberately wider
+/// than `nearest_text`'s matching population above.
+fn tracks_near(tracks: &BTreeMap<u32, TrackInfo>, expected_freq_hz: f64, radius_hz: f64) -> usize {
     tracks
         .values()
         .filter(|t| {
@@ -190,10 +211,20 @@ fn run_and_print(
     }
 }
 
-fn samples_and_spec() -> (VectorSpec, RenderedVector) {
-    let spec = manta_testkit::vectors::v8w();
-    let rendered = manta_testkit::vectors::render(&spec).unwrap();
-    (spec, rendered)
+/// One V8w render shared by every sweep test in this binary. `cargo test`
+/// runs a binary's tests as threads in one process, so a `OnceLock` is
+/// honored across them; rendering costs ~340 s (this doc's own "Why nothing
+/// was promoted" cost model already assumes exactly one render is paid),
+/// while each additional `decode_samples` call against it costs ~8-9 s --
+/// paying the render four times over (once per sweep test) would be the
+/// unaffordable version of this harness the pin doc argues against.
+fn samples_and_spec() -> &'static (VectorSpec, RenderedVector) {
+    static CACHE: std::sync::OnceLock<(VectorSpec, RenderedVector)> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let spec = manta_testkit::vectors::v8w();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        (spec, rendered)
+    })
 }
 
 /// Rung 1 (Phase 2): `debounce_dits in {0.0 [baseline], 0.15, 0.25, 0.35}`,
@@ -204,7 +235,7 @@ fn samples_and_spec() -> (VectorSpec, RenderedVector) {
 #[ignore]
 fn v8w_lever_sweep_debounce_dits() {
     let (spec, rendered) = samples_and_spec();
-    let strong = strong_indices(&spec);
+    let strong = strong_indices(spec);
     let points = [
         SweepPoint {
             label: "debounce_dits=0.00 (baseline)",
@@ -250,7 +281,7 @@ fn v8w_lever_sweep_debounce_dits() {
             },
         },
     ];
-    run_and_print(&spec, &rendered, &strong, &points);
+    run_and_print(spec, rendered, &strong, &points);
 }
 
 /// Rung 2 (Phase 3): `(width_low_q, q_low) in {4,8,12,16} x {0.5,0.6,0.7}`.
@@ -262,7 +293,7 @@ fn v8w_lever_sweep_debounce_dits() {
 #[ignore]
 fn v8w_lever_sweep_beam_width_low_q() {
     let (spec, rendered) = samples_and_spec();
-    let strong = strong_indices(&spec);
+    let strong = strong_indices(spec);
     let mut points = vec![SweepPoint {
         label: "width_low_q=4 (baseline)",
         cfg: PipelineConfig::default(),
@@ -294,7 +325,7 @@ fn v8w_lever_sweep_beam_width_low_q() {
             },
         });
     }
-    run_and_print(&spec, &rendered, &strong, &points);
+    run_and_print(spec, rendered, &strong, &points);
 }
 
 /// Rung 3 (Phase 4): `mark_admission (lo, hi) in {(0.0, inf) [baseline],
@@ -303,7 +334,7 @@ fn v8w_lever_sweep_beam_width_low_q() {
 #[ignore]
 fn v8w_lever_sweep_mark_admission() {
     let (spec, rendered) = samples_and_spec();
-    let strong = strong_indices(&spec);
+    let strong = strong_indices(spec);
     let points = [
         SweepPoint {
             label: "mark_admission=default (baseline)",
@@ -340,7 +371,7 @@ fn v8w_lever_sweep_mark_admission() {
             },
         },
     ];
-    run_and_print(&spec, &rendered, &strong, &points);
+    run_and_print(spec, rendered, &strong, &points);
 }
 
 /// Phase 5: `merge_radius_channels in {1.0 [baseline], 1.5, 2.0, 2.5}`,
@@ -354,7 +385,7 @@ fn v8w_lever_sweep_mark_admission() {
 #[ignore]
 fn v8w_lever_sweep_merge_radius_channels() {
     let (spec, rendered) = samples_and_spec();
-    let strong = strong_indices(&spec);
+    let strong = strong_indices(spec);
     let points = [1.0f32, 1.5, 2.0, 2.5].map(|r| SweepPoint {
         label: match r {
             1.0 => "merge_radius_channels=1.0 (baseline)",
@@ -370,5 +401,5 @@ fn v8w_lever_sweep_merge_radius_channels() {
             ..Default::default()
         },
     });
-    run_and_print(&spec, &rendered, &strong, &points);
+    run_and_print(spec, rendered, &strong, &points);
 }
