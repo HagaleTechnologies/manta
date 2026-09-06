@@ -203,6 +203,38 @@ re-pushed as the real next release, so it's treated conservatively; a
 pre-release is intentionally non-final and blocking on it would freeze
 `:latest` for as long as an RC cycle runs.
 
+**A second deliberate asymmetry, found in code review (remediate round,
+CR-1): recency is decided from tags, not from confirmed publication.**
+`is-newest-stable` decides "newest" purely from `git tag --list`, without
+checking whether a numerically newer tag's image was ever actually pushed
+to GHCR. If a higher-version tag's `release-publish` run fails anywhere
+before `docker-publish` succeeds (an arm64 build flake, a registry 5xx),
+no image is ever published for it -- yet its tag alone is still enough to
+make every subsequent, successfully-published, lower-version tag decline
+to write `:latest`. `:latest` then keeps serving whatever it last pointed
+to (older than the just-published, fully successful release) until a
+maintainer notices and runs the recovery command in
+`docs/RUNBOOKS/release.md`.
+
+**Decision: accept this, tag-only, rather than have `is-newest-stable`
+query the registry.** Querying GHCR from inside `release-version.sh` would
+need network access and a registry token from a script that is otherwise
+pure `git`/bash and unit-tested fully offline (every case in
+`scripts/tests/release-version.test.sh` builds a throwaway local repo with
+no network reachable); it would also need a mocking seam to stay testable
+that way, which is a materially bigger change than this asymmetry's actual
+blast radius justifies. The failure mode is rare (it needs a build to fail
+*after* its tag is pushed but *before* `docker-publish` succeeds), bounded
+(a false decline, never a false publish -- the same one-command recovery
+already documented applies), and now visible: `publish-latest`'s recency
+step emits a `::warning` and a `$GITHUB_STEP_SUMMARY` block on every
+decline, rather than only a job-log line, so a maintainer watching the
+run's summary (the same habit Finding 4 already requires) sees it in the
+same place they already check. `docs/RUNBOOKS/release.md`'s "newest
+published stable release" wording is corrected to describe what the
+predicate actually checks -- the newest *tagged* stable release, not the
+newest one confirmed published.
+
 **A silent-failure bug found in the same function (remediation round 7,
 finding 3.C):** `is-newest-stable` read the tag list via
 `< <(git tag --list 'v[0-9]*')`, a process substitution whose exit status

@@ -29,7 +29,7 @@ design rationale behind the behaviour described here.
      below) and, in parallel, `release` (creates the GitHub Release from
      the five build artifacts).
 4. Watch the `release-publish.yml` run's summary for the GHCR visibility
-   warning — see below.
+   warning and the `:latest`-not-updated warning — see below.
 
 ## Accepted tag grammar
 
@@ -94,17 +94,31 @@ push to the same already-public package and the probe reports "OK".
 ## If `:latest` ends up wrong
 
 `publish-latest` re-checks, immediately before writing `:latest`, whether
-its own tag is still the newest published stable release (comparing
-against every `vX.Y.Z` tag in the repo, numerically, ignoring
+its own tag is still the newest **tagged** stable release (comparing
+against every `vX.Y.Z` *git tag* in the repo, numerically, ignoring
 pre-releases) — this closes the race where two tags pushed close together
 used to let the older build's `:latest` write win if it finished last
-(MAN-65 finding 3). The remaining window is narrow (seconds: the check
-happens right after the multi-arch image is already pushed, and the
-`:latest` write is a manifest-only copy, not a rebuild) but not zero — two
-tags pushed within that window could still resolve out of order.
+(MAN-65 finding 3).
 
-If `:latest` is ever wrong (from that narrow window, or a manual mistake),
-recovery is one command:
+This check is deliberately a Git-tag comparison, not a check of what GHCR
+has actually published: if a numerically newer tag's own
+`release-publish` run failed before reaching `docker-publish` (so no image
+was ever pushed for it), this run still declines to write `:latest` on
+that tag's account. A decline shows up as a `::warning` and a
+`$GITHUB_STEP_SUMMARY` block on the `Is this still the newest stable
+release?` step — watch for it the same way you watch for the GHCR
+visibility warning above. See
+`docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md` ("a second
+deliberate asymmetry") for why this is accepted rather than made to query
+the registry.
+
+The remaining timing window is narrow (seconds: the check happens right
+after the multi-arch image is already pushed, and the `:latest` write is a
+manifest-only copy, not a rebuild) but not zero — two tags pushed within
+that window could still resolve out of order.
+
+If `:latest` is ever wrong (from either of the above, or a manual
+mistake), recovery is one command:
 
 ```sh
 docker buildx imagetools create \

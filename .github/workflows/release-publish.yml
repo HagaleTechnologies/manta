@@ -65,11 +65,15 @@ env:
 concurrency:
   # Deliberately per-ref, NOT repo-wide: each release genuinely is
   # independent work that must not cancel another release's build. The
-  # `:latest` write is the one thing that DOES need repo-wide ordering --
-  # see `publish-latest`'s own concurrency group below, and MAN-65's
-  # decision doc for why that job's group is scoped narrowly rather than
-  # widening this one (a repo-wide group here would let a middle release's
-  # ENTIRE build get silently cancelled, not just its `:latest` write).
+  # `:latest` write is the one thing that DOES need repo-wide correctness,
+  # but NOT via a wider concurrency group here -- see `publish-latest`
+  # below (deliberately no concurrency group of its own at all) and MAN-65's
+  # decision doc, Finding 3, for why a repo-wide group was tried and
+  # reverted: it would let a middle release's ENTIRE build get silently
+  # cancelled, not just its `:latest` write, and cancellation order doesn't
+  # even track tag-version order. `publish-latest` gets correctness instead
+  # from answering a global "what's newest right now" question on every
+  # run, independent of which run executes or finishes first.
   group: release-publish-${{ github.event_name == 'push' && github.ref || github.run_id }}
   cancel-in-progress: false
 
@@ -308,8 +312,16 @@ jobs:
       # Never fails the job: the release itself is fine, and the fix is an
       # out-of-band human action. A hard failure here would report a
       # successful release as broken.
+      #
+      # Gated on success(), NOT always() (MAN-65 remediate round, CR-2):
+      # always() also runs this probe when the preceding build-push step
+      # itself failed or was cancelled, so a failed push (registry 5xx, an
+      # arm64 compile error) would 404 the anonymous pull and report it as
+      # a GHCR-visibility problem -- sending the maintainer to change a
+      # package setting that isn't the actual failure. success() only
+      # allows the probe to run when nothing earlier in the job has failed.
       - name: Verify the image is anonymously pullable
-        if: always() && (github.event_name == 'push' || inputs.publish == true)
+        if: success() && (github.event_name == 'push' || inputs.publish == true)
         env:
           IMAGE_PATH: ${{ github.repository }}
           VERSION: ${{ needs.validate-tag.outputs.version }}
@@ -412,6 +424,24 @@ jobs:
           NEWEST="$(scripts/release-version.sh is-newest-stable "$GITHUB_REF_NAME")"
           echo "newest=$NEWEST" >> "$GITHUB_OUTPUT"
           echo "publish :latest: $NEWEST"
+          if [ "$NEWEST" != "true" ]; then
+            # MAN-65 remediate round, CR-1: this predicate decides recency
+            # from git tags alone, not from confirmed GHCR publication (see
+            # docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md,
+            # "a second deliberate asymmetry") -- so a decline here CAN be
+            # wrong if the blocking tag's own release-publish run never
+            # actually published an image. That must be visible in the
+            # run's own summary, not buried in this step's log alone.
+            {
+              echo "### :warning: \`:latest\` was NOT updated for ${GITHUB_REF_NAME}"
+              echo
+              echo "A numerically newer (or equal) stable tag exists in the repo --"
+              echo "see this step's log above for which one. If that tag's own"
+              echo "release-publish run never actually published an image, :latest"
+              echo "is now stale; recovery is documented in docs/RUNBOOKS/release.md."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=:latest not updated::${GITHUB_REF_NAME} was not published as :latest -- see the job summary and this step's log"
+          fi
 
       - name: Log in to GHCR
         if: steps.recency.outputs.newest == 'true'
