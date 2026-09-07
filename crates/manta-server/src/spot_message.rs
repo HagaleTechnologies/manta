@@ -80,7 +80,12 @@ impl SpotMessage {
         // the follow-up ticket linked from this PR's round-6 review thread
         // for the cross-repo contract question this raises.
         let dx = cty.lookup(&spot.callsign);
-        let de = cty.lookup(station_call);
+        // MAN-89: `station_call` may carry an RBN `-N` per-band SSID, which is a
+        // manta node index with no geographic meaning -- and which `cty.dat`'s
+        // exact-call alias rows would refuse to match (cty.rs:143-169 strips
+        // `/`-portable suffixes only). Look up the operator's actual callsign;
+        // `de_call` and `id` below keep the full identity.
+        let de = cty.lookup(crate::config::strip_ssid(station_call));
         // `band` must be derived from the SAME rounded value reported as
         // `frequency` -- computing it from the unrounded `spot.freq_hz`
         // separately (round-5 review finding) could disagree with
@@ -146,6 +151,39 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             track_id: 7,
             sample_ts: 12_345,
         }
+    }
+
+    /// MAN-89: `station_callsign` may now carry a `-N` SSID, but `cty.dat`'s
+    /// exact-call alias rows (`prefix_entry`, cty.rs:143-154) only tolerate a
+    /// `/`-portable suffix, never `-` -- so an operator whose OWN callsign has an
+    /// exact override (`4U1UN` etc.) would silently lose it and fall through to a
+    /// generic prefix with the wrong entity, continent and coordinates. Measured
+    /// before the fix: `4U1UN` -> NA/lat 40.75, `4U1UN-1` -> EU/lat 42.82.
+    /// The `-N` is a manta band index with no geographic meaning; strip it for
+    /// the lookup, keep it in the identity.
+    #[test]
+    fn de_geography_ignores_the_ssid_on_an_exact_alias_callsign() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let bare = SpotMessage::from_spot(&sample_spot(), "4U1UN", &cty, "v", 0, 1);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "4U1UN-1", &cty, "v", 0, 1);
+
+        assert_eq!(ssid.de_continent, bare.de_continent);
+        assert_eq!(ssid.de_lat, bare.de_lat);
+        assert_eq!(ssid.de_lon, bare.de_lon);
+        // The wire identity keeps the SSID -- geography is stripped, identity is not.
+        assert_eq!(ssid.de_call, "4U1UN-1");
+        assert!(ssid.id.starts_with("4U1UN-1:"));
+    }
+
+    /// An ordinary prefix callsign was never affected either way; pin it so a
+    /// future change to `strip_ssid` can't quietly start mangling the common case.
+    #[test]
+    fn de_geography_is_unchanged_for_an_ordinary_prefix_callsign() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let bare = SpotMessage::from_spot(&sample_spot(), "W5AU", &cty, "v", 0, 1);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "W5AU-1", &cty, "v", 0, 1);
+        assert_eq!(ssid.de_continent, bare.de_continent);
+        assert_eq!(ssid.de_lat, bare.de_lat);
     }
 
     #[test]

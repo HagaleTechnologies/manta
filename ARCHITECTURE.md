@@ -305,7 +305,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 - Single TOML config (coppa convention): device, center freq, band plan
   (CW segment limits — don't decode/spot outside them), thresholds, track cap,
-  server ports, cty/scp paths, station callsign (spotter ID).
+  server ports, cty/scp paths, station callsign (spotter ID). The station
+  callsign accepts an optional trailing `-N` per-band SSID (`W5AU-1`),
+  matching RBN's own `CALL-N-#` multi-band node convention — see
+  `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`.
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
