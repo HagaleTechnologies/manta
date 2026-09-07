@@ -396,9 +396,12 @@ transmitter-shaping term untouched — left alone, it reads high by roughly
 one rise time's worth of WPM at every speed.
 
 Track a second EMA centroid, `μ_egap` (SPEC §9 `cluster_alpha`), over gaps
-classified `InterElement` (§4.2) — and over any gap the §4.2 flush safety net
-resolves directly (§4.2's Farnsworth note). The dit period used for
-reporting is:
+classified `InterElement` (§4.2), and **only** those. Gaps the §4.2 flush
+safety net resolves directly are never element gaps (the safety net fires at
+`7·μ_dit`); folding them in here would pin `dit_estimate` at its
+`+DIT_BIAS_CAP_FRAC` cap and read WPM ~26 % low. §4.2's flush note feeds
+those gaps to the *Farnsworth long-gap* statistics, which is a different
+estimator. The dit period used for reporting is:
 
 ```
 delta = clamp(0.5 * (mu_dit - mu_egap), -DIT_BIAS_CAP_FRAC * mu_dit, +DIT_BIAS_CAP_FRAC * mu_dit)
@@ -428,12 +431,22 @@ The implementation matches this nominal `2.0` boundary (`CHAR_GAP_DITS` in
 (`docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md`) to compensate for
 §3.2's old geometric-mean threshold systematically inflating measured
 `μ_dit`; MAN-103 fixed that threshold at its source (§3.2/§3.3), so the
-compensation this deviation existed for is gone —
-`docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md` re-ran the same
-500-case sweep methodology against the corrected timing and confirmed `2.0`.
+compensation this deviation existed for is gone. The 2026-07-18 sweep
+methodology was re-run against the corrected timing before restoring `2.0`
+(500 cases x 2 independent seeds, at both the envelope and the full IQ layer;
+table in `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`, harness
+in `crates/manta-engine/tests/char_gap_sweep.rs`): `1.6` no longer buys
+anything at either layer, and `2.0` is the middle of a flat region running
+from `1.6` to at least `2.5`.
 
 **Farnsworth decoupling** (ARCHITECTURE §5.3): run the same 2-means machinery
-on gaps with `u ≥ 1.5` (the "long gaps"), yielding `μ_cgap` (character gap)
+on the "long gaps" — those with `u ≥` the inter-character boundary above,
+i.e. exactly the gaps this section does *not* call inter-element. The floor
+and the character boundary are one boundary seen from two sides and must
+always carry the same value; a floor below the boundary admits ordinary
+element gaps (which measure `u ≈ 1.5`–`1.6` near 40 WPM) into the long-gap
+clusters and drags the word threshold down onto real character gaps
+(MAN-103). Yields `μ_cgap` (character gap)
 and `μ_wgap` (word gap) when bimodal. Once ≥ 8 long gaps have been observed
 and `μ_wgap / μ_cgap ≥ 1.8`, the word threshold becomes the geometric mean
 `sqrt(μ_cgap · μ_wgap)` instead of the fixed `5.0` dits; the character

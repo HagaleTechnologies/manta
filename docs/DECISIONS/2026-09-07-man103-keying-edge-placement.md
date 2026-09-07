@@ -114,12 +114,49 @@ corrected, that compensation is no longer needed or correct. Verified
 directly in this session: with the Farnsworth-flush fix (D8) applied, V10
 passes identically whether `CHAR_GAP_DITS` is `1.6` or `2.0` — the earlier
 V10 failure this fix set (see Measurements) is not a char-gap effect at all.
-The full 500-case, two-seed sweep the 2026-07-18 doc used to derive `1.6` was
-**not re-run in this session** (time-boxed out of this implementation pass);
-`2.0` is adopted on the strength of (a) it is SPEC's own nominal value,
-(b) every golden vector passes at `2.0`, and (c) the char-gap-independent
-V10 check above. Re-running the full sweep against the corrected timing is a
-reasonable follow-up if a future change touches gap classification again.
+The full 500-case, two-seed sweep the 2026-07-18 doc used to derive `1.6`
+**was re-run against the corrected timing** (validation round 1 remediation —
+it was time-boxed out of the first implementation pass, and the validation
+report was right that it is the designed instrument for exactly the failure
+class D10 below then hit). Harness:
+`crates/manta-engine/tests/char_gap_sweep.rs`, `#[ignore]`d, two tests, both
+500 cases x 2 independent SplitMix64 stream seeds over the same generated
+space the 2026-07-18 sweep drew from (1-3 words of 2-6 characters, 10-40 WPM,
+`jitter: None`; the IQ sweep adds 15-30 dB SNR and +/-40 kHz offset). Sweeping
+values means editing the private constant and re-running, exactly as in 2026-07-18.
+
+**Envelope layer** (`key_text` -> `TrackDecoder`, the layer `CHAR_GAP_DITS`
+lives in; failure = any non-zero CER, since this chain decodes exactly on a
+clean envelope):
+
+| `CHAR_GAP_DITS` | failures / 500 (seed A) | failures / 500 (seed B) |
+|---|---|---|
+| 1.4 | 62 | 69 |
+| 1.6 (the retired deviation) | 0 | 0 |
+| 1.8 | 0 | 0 |
+| **2.0 (SPEC nominal, adopted)** | **0** | **0** |
+| 2.2 | 0 | 0 |
+| 2.5 | 0 | 0 |
+
+**Full IQ pipeline** (`render_scene` -> `decode_samples`; failure = CER >=
+0.25 or "no signal found", the criterion `roundtrip_iq.rs` applies):
+
+| `CHAR_GAP_DITS` | failures / 500 (seed A) | failures / 500 (seed B) |
+|---|---|---|
+| 1.6 | 127 | 131 |
+| **2.0 (adopted)** | **116** | **126** |
+
+Read the IQ table as a *delta*, not as an absolute quality number: its floor
+is dominated by the three known, char-gap-independent front-end bugs
+`roundtrip_iq.rs` is `#[ignore]`d for (issues #12 dead-DC offset 0, #22 the
+10.0-10.15 WPM cliff, #23 persistent garble), plus SPEC §2.1's warmup floor
+on short looped scenes. Those hit every row equally. What the two tables
+agree on is the conclusion: at the corrected timing the `1.6` deviation buys
+nothing at either layer (and costs a little at the IQ layer), and `2.0` sits
+in the middle of a flat region running from `1.6` to at least `2.5` — the
+opposite of 2026-07-18's finding, which is exactly what "the compensation is
+no longer needed" predicts. The floor of that flat region is the real
+constraint, and D10 is why.
 
 **D8 — Fix the Farnsworth flush bootstrap (`observe_flushed`).** In scope by
 necessity, not by plan: V10 is a currently-enforced (non-`#[ignore]`d) gate,
@@ -135,6 +172,26 @@ needs 5 long gaps to leave its unimodal init) can never complete. Folding
 flush-resolved gaps into the same statistics via `observe_flushed` fixes it
 (V10 passes, confirmed independent of the `CHAR_GAP_DITS` value per D7).
 
+**Correction (validation round 1).** The paragraph above describes what
+`observe_flushed` is *for*; it overstates what the call site can measure, and
+the validation report was right to flag it. `check_flush` runs every hop and
+fires the instant the open space crosses the threshold, so the `gap_ms` it
+hands to `observe_flushed` is always the threshold itself (`u` traced in the
+7.0-7.8 range), never the true length of the gap — which is not yet known at
+that moment, since the space is still open. So what the flush path restores
+is the **bootstrap**: `long_seen` advances and the long-gap `ClusterPair`
+leaves its unimodal init, which is what lifts the word threshold off the
+fixed `WORD_GAP_DITS` and is what actually fixes V10. It does *not* give
+`μ_wgap` a true word-gap measurement: under Farnsworth, real character gaps
+(~8 dits) and real word gaps (~19 dits) both enter as ~7. The unit test
+`observe_flushed_advances_farnsworth_bootstrap` feeds `6*μ` and `14*μ`, which
+the production call site cannot produce, so it pins the method's arithmetic
+and not its integration. Feeding the *true* gap instead (it is available
+later, when the space finally closes and `process_run` takes its
+`word_flushed` early return) is the natural improvement and is left as
+follow-up work: it changes what the Farnsworth clusters converge to, so it
+needs its own V10/V7/V9 measurement, and V10 is a currently-enforced gate.
+
 **D9 — Record the fading movement; do not chase it.** A midpoint threshold
 sits further above the noise floor than the old geometric mean at high
 apparent depth, so a faded signal drops below it after a shallower fade.
@@ -144,20 +201,72 @@ and none an enforced gate):
 | vector | baseline (`49f05a4`, pre-MAN-103) | after MAN-103 | gate | status |
 |---|---|---|---|---|
 | V2 (CER half) | CER 0.0325 | CER 0.0244 | <= 0.01 | improved, still `#[ignore]`d (SPEC §2.1 warmup-floor dilution, unrelated) |
-| V5 (Watterson-poor) | CER 1.4167 | CER 1.1354 | <= 0.20 | `#[ignore]`d, fails either way (slightly better) |
+| V5 (Watterson-poor) | CER 1.4167 | CER 1.1250 | <= 0.20 | `#[ignore]`d, fails either way (slightly better) |
 | V6 (sine QSB) | CER 0.1429 | CER 0.5397 | <= 0.10 | `#[ignore]`d, **measurably worse** |
 | V8w (Watterson pileup) | 1/34 strong signals (per the MAN-103 plan phase's measurement) | 0/34 | >= 90% | `#[ignore]`d, already collapsed at baseline |
 
-V6 is the one real degradation. Mechanism: a midpoint threshold sits further
-above the noise floor than `sqrt(E_hi*E_lo)` at high apparent depth, so a
-fading mark drops below the key-down threshold sooner during a fade. This is
+V6 is the one real degradation. **Mechanism (corrected in validation round
+1** — the milder mechanism this paragraph originally gave, "a fading mark
+drops below the key-down threshold sooner", is not what the measurements
+show, and a wrong mechanism is what MAN-107..113 would have built on**).**
+The real one is that `E_hi` loses its *downward* adaptation path. Both rails
+now update only from samples outside the decision band, and the collapse
+floor `E_hi >= 2*E_lo` can only raise `E_hi` — so a mark level that fades to
+roughly `0.5*E_hi` (inside the band, since `mid + half` sits near `0.65*E_hi`
+once `E_lo` is small) updates neither rail *and* does not key down. The rails
+stall at their pre-fade level and the track goes silent, rather than tracking
+the fade down as they did under `T = sqrt(E_hi*E_lo)`, where that same sample
+still sat above `1.25*T`. Measured during validation: a 6.0 dB fade silences
+the track here where the baseline decoded every mark through 10.5 dB, and
+`hyst_frac = 0` does not recover it — so it is the midpoint decision itself,
+not the dead-band width. This is
 a real cost of correct edge placement and belongs to MAN-107 through
 MAN-113 (classical-DSP fading-robustness work), per
 `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D8, which already
 scopes V5/V6/V8w's disposition out of MAN-103 ("unrelated to fading"). The
 likely classical answer is a faster-falling `E_hi` or per-element fading
-normalization, both already named in that ticket range. **Nothing in this
-change widens or re-ignores a gate to accommodate this.**
+normalization, both already named in that ticket range — and "restore a
+downward adaptation path for `E_hi`" is now the concrete first thing to try
+there. **Nothing in this change widens or re-ignores a gate to accommodate
+this.**
+
+**D10 — Tie the Farnsworth long-gap floor to the character boundary
+(`FARNS_LONG_U = CHAR_GAP_DITS`).** Added in validation round 1 remediation;
+it is the finding that made the first pass not mergeable, and it is the third
+gap-side constant the ticket's "re-derive `CHAR_GAP` from the corrected
+timing" instruction implies. `FARNS_LONG_U` (the smallest gap admitted into
+the Farnsworth long-gap `ClusterPair`) sat at a hard-coded `1.5`, chosen when
+`CHAR_GAP_DITS` was `1.6`; D7 moved the character boundary back to `2.0` and
+left the floor behind. That opens a window `[1.5, 2.0)` of gaps that
+`classify` correctly calls **InterElement** while still folding them into the
+long-gap statistics — and at the top of the supported speed range that window
+is exactly where a plain element gap lands. Measured at ~40 WPM: element gaps
+at `u ~ 1.51`-`1.55` dragged `pair.lo` from ~3.71 down to ~2.0 and `word_thr`
+from ~5.53 to ~3.99, until real inter-character gaps (`u ~ 3.99`) classified
+as **InterWord**. A 40 WPM on-centre 60 s scene decoded at CER 0.3814 (vs
+0.0361 on the pre-MAN-103 baseline), and `roundtrip_envelope`'s proptest hit
+it independently: `"GQH AA"` -> `"GQH A A"` at 39.95 WPM.
+
+The floor and the character boundary are one boundary seen from two sides —
+"long" should mean exactly "not inter-element" — so the fix is to define one
+in terms of the other rather than to pick a second number that has to be kept
+in sync by hand. SPEC §4.2's Farnsworth note is updated to state the boundary
+that way instead of restating `1.5`. This is also what gives D7's flat region
+its floor at `1.6`: below that, the two now-coupled constants start admitting
+element gaps at ordinary speeds (the 62/69 failures in the `1.4` row).
+
+Gates added for it, all deterministic:
+
+- `crates/manta-testkit/tests/roundtrip_envelope.rs`'s
+  `high_wpm_element_gap_does_not_force_a_word_break` — the `"GQH AA"` case
+  pinned at 38 / 39.952156 / 40 WPM. `clean_envelope_roundtrip` is an
+  unseeded 64-case proptest that only caught this about one run in five; this
+  is the same case as a fixed test.
+- `crates/manta-engine/tests/wpm_across_channel.rs` — a **40 WPM** row (the
+  grid stopped at 35) and a **CER ceiling** at every cell (it asserted only
+  WPM). Both were needed: at 40 WPM the WPM-only gate reported 39.83 and
+  passed while the text collapsed. Measured after the fix, the worst cell
+  over the whole 16-cell grid is CER 0.0361; the gate is 0.10.
 
 ## Measurements
 
@@ -258,7 +367,7 @@ v2_wpm_is_within_spec_tolerance      ... ok   (MAN-103 acceptance test)
 v2_char_accuracy_meets_spec          ... FAILED  CER 0.0244 (gate <= 0.01, pre-existing, unrelated)
 v3_passes_end_to_end_from_wav        ... ok
 v4_passes_end_to_end_from_wav        ... ok
-v5_passes_end_to_end_from_wav        ... FAILED  CER 1.1354 (gate <= 0.20, pre-existing, D9)
+v5_passes_end_to_end_from_wav        ... FAILED  CER 1.1250 (gate <= 0.20, pre-existing, D9)
 v6_passes_end_to_end_from_wav        ... FAILED  CER 0.5397 (gate <= 0.10, pre-existing, D9 -- worse)
 v7_passes_end_to_end_from_wav        ... ok
 v9_passes_end_to_end_from_wav        ... ok
@@ -272,11 +381,17 @@ non-`#[ignore]`d gate (including the new/tightened MAN-103 gates) is green.
 The full workspace suite (`cargo test --release --workspace --no-fail-fast`)
 is green: every crate's test binary reports `0 failed`.
 
+Re-measured after D10 (validation round 1 remediation): identical, except V5,
+which moves 1.1354 -> 1.1250 (still far over its `#[ignore]`d gate, still D9's
+disposition). V2 0.0244, V6 0.5397 and V8w 0/34 reproduce to the digit, and
+every enforced gate stays green — the table above is the post-D10 state.
+
 ### What this session did not run
 
-- **The `CHAR_GAP_DITS` 500-case, two-seed sweep** (D7) — time-boxed out;
-  the char-gap-independent V10 check plus SPEC's own nominal value stand in
-  for it. A reasonable follow-up if gap classification is touched again.
+(The `CHAR_GAP_DITS` 500-case, two-seed sweep was listed here in the first
+implementation pass; it ran in validation round 1 remediation and its tables
+are under D7.)
+
 - **The Pi4 CPU-budget acceptance leg and the 24 h live-SDR soak** — both
   need physical hardware not reachable from any container (this is a
   pre-existing, standing gap noted in `CLAUDE.md`'s Status section, not
