@@ -4,6 +4,7 @@
 //! not be able to grow a read buffer without bound, and an idle client
 //! must not hold a spawned task open forever.
 
+use crate::iac::IacFilter;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
@@ -99,6 +100,97 @@ pub async fn read_line_bounded_with_timeout<R: AsyncBufRead + Unpin>(
     tokio::time::timeout(IDLE_READ_TIMEOUT, read_line_bounded(reader, buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// `read_line_bounded`, but telnet-aware: RFC 854 IAC option-negotiation
+/// sequences are stripped from the byte stream before UTF-8 validation
+/// ever sees them, and refusals to answer them are queued on `filter`
+/// for the caller to write back (MAN-87).
+///
+/// Why a separate entry point rather than teaching `read_line_bounded`
+/// itself about IAC: its other two callers -- `metrics_http`'s HTTP
+/// request line and `uplink`'s inbound RBN stream -- are ASCII-by-
+/// contract protocols where `0xFF` is genuinely malformed input that
+/// must keep being rejected (`docs/DECISIONS/2026-09-02-man23-threat-
+/// model.md` finding 19). Only the telnet listener talks to clients that
+/// legitimately prepend binary negotiation.
+///
+/// The newline is searched for in the FILTERED output, not the raw
+/// chunk: `0x0A` occurs inside telnet framing as an option code
+/// (option 10, NAOCRD) and as subnegotiation payload, so scanning raw
+/// bytes would end the line in the middle of a negotiation sequence.
+///
+/// The length cap counts RAW bytes consumed (`filter.raw_line_bytes`),
+/// not surviving text bytes, so a client streaming endless negotiation
+/// still hits `MAX_LINE_BYTES` instead of reading forever.
+///
+/// Cancellation-safety matches `read_line_bounded`: every byte pulled
+/// off the reader is folded into `buf` and `filter` -- both caller-owned
+/// -- before `consume`, with no await point in between.
+pub async fn read_line_bounded_telnet<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    filter: &mut IacFilter,
+) -> std::io::Result<usize> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF
+        }
+        let mut consumed = 0usize;
+        let mut text = Vec::with_capacity(available.len());
+        let mut found_newline = false;
+        for &b in available {
+            consumed += 1;
+            if let Some(app) = filter.push(b) {
+                text.push(app);
+                if app == b'\n' {
+                    found_newline = true;
+                    break;
+                }
+            }
+        }
+        filter.raw_line_bytes += consumed;
+        if filter.raw_line_bytes > MAX_LINE_BYTES {
+            reader.consume(consumed);
+            filter.reset_line();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds maximum length",
+            ));
+        }
+        match std::str::from_utf8(&text) {
+            Ok(s) => buf.push_str(s),
+            Err(_) => {
+                reader.consume(consumed);
+                filter.reset_line();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line contains invalid UTF-8",
+                ));
+            }
+        }
+        reader.consume(consumed);
+        if found_newline {
+            filter.reset_line();
+            return Ok(buf.len());
+        }
+    }
+}
+
+/// `read_line_bounded_telnet`, plus the same idle-read deadline
+/// `read_line_bounded_with_timeout` applies.
+pub async fn read_line_bounded_telnet_with_timeout<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    filter: &mut IacFilter,
+) -> std::io::Result<usize> {
+    tokio::time::timeout(
+        IDLE_READ_TIMEOUT,
+        read_line_bounded_telnet(reader, buf, filter),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
 }
 
 #[cfg(test)]
@@ -219,5 +311,96 @@ mod tests {
         tokio::time::advance(IDLE_READ_TIMEOUT + Duration::from_secs(1)).await;
         let err = fut.await.expect_err("must time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_strips_negotiation_and_queues_refusals() {
+        let mut reader = BufReader::new(&b"\xff\xfb\x18\xff\xfd\x03W5AU\r\n"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "W5AU\r\n");
+        assert_eq!(n, 6);
+        assert_eq!(filter.take_replies(), vec![255, 254, 24, 255, 252, 3]);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_does_not_end_the_line_on_an_option_byte_of_0x0a() {
+        // Option 10 (NAOCRD) makes `IAC DO 10` contain a raw 0x0A -- a
+        // reader scanning raw bytes for the newline would cut the line
+        // in half here.
+        let mut reader = BufReader::new(&b"\xff\xfd\x0aW5AU\n"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "W5AU\n");
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_caps_a_flood_of_negotiation_that_never_ends_a_line() {
+        // Stripped bytes still count against MAX_LINE_BYTES, so endless
+        // negotiation cannot hold a read open forever.
+        let mut flood = Vec::new();
+        while flood.len() <= MAX_LINE_BYTES {
+            flood.extend_from_slice(b"\xff\xfb\x18");
+        }
+        let mut reader = BufReader::new(&flood[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        let err = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .expect_err("negotiation flood must hit the line cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_still_rejects_genuinely_invalid_utf8() {
+        // 0xC3 0x28 is malformed UTF-8 and is NOT telnet framing -- the
+        // MAN-23 rejection must survive the IAC change.
+        let mut reader = BufReader::new(&b"ab\xc3\x28cd\n"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        let err = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .expect_err("must still reject malformed UTF-8");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_resumes_a_negotiation_split_across_a_cancellation() {
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        write_half.write_all(b"\xff\xfb").await.unwrap(); // IAC WILL, option pending
+        tokio::task::yield_now().await;
+        {
+            let fut = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Pending => {}
+                std::task::Poll::Ready(r) => panic!("must not complete yet, got {r:?}"),
+            }
+        }
+        write_half.write_all(b"\x18W5AU\n").await.unwrap();
+        read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(
+            buf, "W5AU\n",
+            "the split IAC sequence must not leak into the line"
+        );
+        assert_eq!(filter.take_replies(), vec![255, 254, 24]);
     }
 }

@@ -19,6 +19,7 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 ## Pointers
 
 - RBN telnet format and the command grammar manta supports (`sh/dx`, filters): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- Gotcha (MAN-87): IAC (telnet option negotiation) is `0xFF`, never valid UTF-8 — a strictly-UTF-8 line reader on the telnet listener rejects any real client that negotiates on connect (Windows `telnet.exe`, PuTTY telnet mode). manta strips and refuses negotiation before UTF-8 validation runs; see `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md` for the normative design.
 - JSON spot schema: **the schema is an ecosystem contract that belongs in the `dispensa` repo** (JSON Schema, ADR pending — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. When it lands, this page should point at the corresponding ADR in plain text.
 - cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
 
