@@ -1209,6 +1209,12 @@ fn main() -> Result<()> {
 
             let cli_overrides = config::CliOverrides {
                 freq_correction_ppm,
+                // Same condition as `resolved_dial_freq_hz` above (round-2
+                // finding C-2 / code-review finding 1): an RF-aware CLI
+                // source flag discards `[input]` wholesale, so its sibling
+                // `freq_correction_ppm` -- calibrated for whatever hardware
+                // the file described -- must not silently carry over either.
+                freq_correction_ppm_file_suppressed: cli_has_source_flags && has_rf_aware_source,
                 allowlist,
                 blocklist,
                 notch,
@@ -1470,6 +1476,12 @@ fn main() -> Result<()> {
                 || kiwi_host.is_some()
                 || has_soapy_source
                 || has_hpsdr_source;
+            // Same RF-aware-source test `Listen` uses for its
+            // `resolved_dial_freq_hz`/`freq_correction_ppm_file_suppressed`
+            // suppression -- `soak` shares the same CLI source flags, so a
+            // stale `[input]` calibration must be suppressed here too.
+            let has_rf_aware_source = cli_has_source_flags
+                && (kiwi_host.is_some() || has_soapy_source || has_hpsdr_source);
 
             let config_path = resolve_config_path(config_path);
             let base_dir = config_path
@@ -1486,6 +1498,7 @@ fn main() -> Result<()> {
 
             let cli_overrides = config::CliOverrides {
                 freq_correction_ppm,
+                freq_correction_ppm_file_suppressed: has_rf_aware_source,
                 allowlist,
                 blocklist,
                 notch,

@@ -327,12 +327,26 @@ fn ms_to_hops_checked(key: &str, ms: f64) -> Result<u64> {
             "{key} must be a finite number of milliseconds between 0 (exclusive) and {MAX_PLAUSIBLE_MS}, got {ms}"
         );
     }
-    Ok(u64::from(manta_decode::ms_to_hops(ms)))
+    let hops = manta_decode::ms_to_hops(ms);
+    if hops == 0 {
+        // The smallest ms that rounds (half-up, SPEC §1.1) to >=1 hop at
+        // the channelizer's fixed hop rate: floor(ms * FO_HZ/1000 + 0.5) >= 1.
+        let min_ms = 500.0 / manta_decode::FO_HZ;
+        bail!(
+            "{key} of {ms} ms rounds to 0 hops at the channelizer's {} Hz hop rate -- the \
+             minimum is {min_ms:.3} ms",
+            manta_decode::FO_HZ
+        );
+    }
+    Ok(u64::from(hops))
 }
 
 fn positive_ms(key: &str, ms: f64) -> Result<f64> {
-    if !ms.is_finite() || ms <= 0.0 {
-        bail!("{key} must be a positive, finite number of milliseconds, got {ms}");
+    if !ms.is_finite() || ms <= 0.0 || ms > MAX_PLAUSIBLE_MS {
+        bail!(
+            "{key} must be a positive, finite number of milliseconds no greater than \
+             {MAX_PLAUSIBLE_MS}, got {ms}"
+        );
     }
     Ok(ms)
 }
@@ -746,7 +760,16 @@ pub fn load(path: Option<&Path>) -> Result<ConfigFile> {
             .with_context(|| format!("reading config file {}", p.display()))?,
         None => String::new(),
     };
-    let vars = env_overlay_vars(std::env::vars());
+    // `vars_os()`, not `vars()`: the latter panics if ANY variable in the
+    // whole process environment (not just a `MANTA_*` one) has a non-UTF-8
+    // name or value, which would turn an unrelated stray variable into a
+    // crash on every `listen`/`soak` startup (code-review finding 4). A
+    // non-UTF-8 name/value can never match a `MANTA_*` overlay key anyway,
+    // so skipping it here is lossless for this loader's purposes.
+    let vars = env_overlay_vars(
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+    );
     load_str_with_env(&text, &vars).with_context(|| match path {
         Some(p) => format!("parsing config file {}", p.display()),
         None => "parsing MANTA_* environment overrides".to_string(),
@@ -770,6 +793,17 @@ fn resolve_relative(base_dir: &Path, p: &Path) -> PathBuf {
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
     pub freq_correction_ppm: Option<f64>,
+    /// Mirrors `main.rs`'s `resolved_dial_freq_hz` suppression rule for the
+    /// sibling `[input].dial_freq_hz` key (round-2 finding C-2): when a CLI
+    /// source flag selects an RF-aware source (`--kiwi-host`/`--soapy-*`/
+    /// `--hpsdr-*`), the discarded `[input]` table's `freq_correction_ppm`
+    /// -- calibrated for whatever hardware the FILE described, not the one
+    /// actually in use -- must not silently carry over either (code-review
+    /// finding 1). `false` (the default) preserves the existing fallback
+    /// for every caller that has no CLI source flags of its own, or whose
+    /// CLI source flag chose a non-RF-aware source (`--device`/`--source`),
+    /// where the file's value legitimately still applies.
+    pub freq_correction_ppm_file_suppressed: bool,
     /// Empty means "not given" -- a non-empty CLI `--allowlist` replaces
     /// `[spot].allowlist` wholesale, it does not merge with it.
     pub allowlist: Vec<String>,
@@ -798,9 +832,13 @@ pub fn resolve_pipeline(
     cfg.freq_correction_ppm = cli
         .freq_correction_ppm
         .or_else(|| {
-            file.input
-                .as_ref()
-                .and_then(InputSource::freq_correction_ppm)
+            if cli.freq_correction_ppm_file_suppressed {
+                None
+            } else {
+                file.input
+                    .as_ref()
+                    .and_then(InputSource::freq_correction_ppm)
+            }
         })
         .unwrap_or(0.0);
 
@@ -1208,11 +1246,20 @@ mod tests {
             ("detector", "[detector]\nhang_ms = 0\n"),
             ("detector", "[detector]\ngc_ms = nan\n"),
             ("detector", "[detector]\ngc_ms = 0\n"),
+            // Code-review finding 2: rounds to 0 hops at the 375 Hz hop
+            // rate -- every track would close on its first silent hop.
+            ("detector", "[detector]\ngc_ms = 1\n"),
             ("detector", "[detector]\ntrack_cap = 0\n"),
             ("decode", "[decode]\nbeam_width = 0\n"),
             ("decode", "[decode]\ntiming_sigma = 0\n"),
             ("decode", "[decode]\nhyst_down = 2.0\nhyst_up = 1.0\n"),
             ("decode", "[decode]\ntau_hi_bounds_ms = [400, 100]\n"),
+            // Code-review finding 3: `positive_ms` used to skip
+            // MAX_PLAUSIBLE_MS entirely, unlike every `*_ms` key in
+            // [detector] -- above the shared one-hour sanity ceiling.
+            ("decode", "[decode]\ndebounce_ms = 9999999\n"),
+            ("decode", "[decode]\ntau_lo_ms = 9999999\n"),
+            ("decode", "[decode]\ntau_hi_init_ms = 9999999\n"),
         ] {
             let file = load_str(bad).unwrap();
             let result = if table == "detector" {
@@ -1222,6 +1269,19 @@ mod tests {
             };
             assert!(result.is_err(), "should have been rejected: {bad}");
         }
+    }
+
+    /// Code-review finding 2, with the error message itself checked: the
+    /// key and the actual minimum must both be named, not just "rejected".
+    #[test]
+    fn a_ms_value_that_rounds_to_zero_hops_names_the_key_and_the_minimum() {
+        let err = load_str("[detector]\ngc_ms = 1\n")
+            .unwrap()
+            .resolve_detector()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("detector.gc_ms"), "{err}");
+        assert!(err.contains("0 hops"), "{err}");
     }
 
     // Phase 3: [input]/[spot] -> pipeline/source resolution.
@@ -1301,6 +1361,44 @@ mod tests {
                 .unwrap()
                 .freq_correction_ppm,
             3.0
+        );
+    }
+
+    /// Code-review finding 1: mirrors `resolved_dial_freq_hz`'s suppression
+    /// of the sibling `[input].dial_freq_hz` key (round-2 finding C-2) --
+    /// when a CLI source flag discards `[input]` for an RF-aware source,
+    /// its `freq_correction_ppm` (calibrated for whatever hardware the FILE
+    /// described) must not silently carry over either.
+    #[test]
+    fn freq_correction_ppm_file_suppressed_discards_the_file_value() {
+        let file = load_str("[input]\ntype = \"audio\"\nfreq_correction_ppm = 3.0\n").unwrap();
+        let cli = CliOverrides {
+            freq_correction_ppm_file_suppressed: true,
+            ..CliOverrides::default()
+        };
+        assert_eq!(
+            resolve_pipeline(&file, Path::new("."), &cli)
+                .unwrap()
+                .freq_correction_ppm,
+            0.0
+        );
+    }
+
+    /// A suppressed file value still loses to an explicit CLI value -- CLI
+    /// wins over both the file AND the suppression, never the reverse.
+    #[test]
+    fn freq_correction_ppm_file_suppressed_does_not_override_an_explicit_cli_value() {
+        let file = load_str("[input]\ntype = \"audio\"\nfreq_correction_ppm = 3.0\n").unwrap();
+        let cli = CliOverrides {
+            freq_correction_ppm: Some(7.0),
+            freq_correction_ppm_file_suppressed: true,
+            ..CliOverrides::default()
+        };
+        assert_eq!(
+            resolve_pipeline(&file, Path::new("."), &cli)
+                .unwrap()
+                .freq_correction_ppm,
+            7.0
         );
     }
 

@@ -204,6 +204,36 @@ fn manta_decode_ignores_every_manta_env_var() {
     );
 }
 
+/// Code-review finding 4: `config::load` used to call `std::env::vars()`,
+/// which panics if ANY variable in the whole process environment (not just
+/// a `MANTA_*` one) has a non-UTF-8 name or value -- turning an unrelated
+/// stray variable into a crash on every `listen`/`soak` startup. Uses a
+/// `MANTA_*`-prefixed name (the case most likely to actually reach the
+/// overlay logic) with a non-UTF-8 VALUE to prove the fix, not just that
+/// an unrelated variable is ignored.
+#[test]
+#[cfg(unix)]
+fn a_non_utf8_environment_variable_does_not_panic_the_config_loader() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+
+    let bad_value = std::ffi::OsStr::from_bytes(&[0xff, 0xfe, 0xfd]);
+    let out = manta()
+        .args(["listen", "--source"])
+        .arg(&wav_path)
+        .env("MANTA_DETECTOR_ON_SNR_DB", bad_value)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a non-UTF-8 environment variable must not crash config::load -- stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// MAN-29 review round 3: `manta decode` (the primary offline-IQ path) had
 /// no `--freq-correction-ppm`, unlike `listen`/`soak` -- a user decoding a
 /// recording from a source with a known oscillator correction couldn't use
@@ -436,6 +466,29 @@ fn write_real_audio_wav(path: &std::path::Path, text: &str, duration_s: f64) {
     w.finalize().unwrap();
 }
 
+/// Writes `duration_s` of pure silence in the same format
+/// `write_real_audio_wav` does -- long enough to clear `listen()`'s
+/// `CALIBRATION_SECONDS` startup read, guaranteed to never produce a
+/// `CharDecoded`/spot event. Used by the Decision 5 override test below to
+/// distinguish "the config's source ran" from "the CLI's source ran"
+/// without depending on decode text quality across the whole multi-channel
+/// passband, which a raw text-mode stream mixes across every track.
+fn write_silent_wav(path: &std::path::Path, duration_s: f64) {
+    let fs = manta_input::TARGET_RATE_HZ;
+    let n = (fs as f64 * duration_s) as usize;
+    let wav_spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: fs,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(path, wav_spec).unwrap();
+    for _ in 0..n {
+        w.write_sample(0.0f32).unwrap();
+    }
+    w.finalize().unwrap();
+}
+
 /// Runs `manta listen --json --source <wav>`, optionally with `config_toml`
 /// written to a fresh `--config` file in `dir` -- shared by the
 /// `[detector]`-wiring regression test below.
@@ -662,6 +715,261 @@ fn cli_freq_correction_ppm_beats_the_config_file_end_to_end() {
     assert!(
         (from_file_ppm - cli_zero_ppm).abs() > 10.0,
         "the two runs should differ by ~140 Hz (10 ppm at 14 MHz); got from_file={from_file_ppm} cli_zero={cli_zero_ppm}"
+    );
+}
+
+/// Plan-named test: `run` is `listen`'s clap `visible_alias`, so the
+/// ticket's literal Gherkin spelling (`manta run --config manta.toml`)
+/// must actually work, not merely compile.
+#[test]
+fn run_is_a_visible_alias_of_listen() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
+
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "manta run --config must decode exactly like manta listen --config"
+    );
+}
+
+/// Plan-named test: `--server-config` is `--config`'s deprecated alias
+/// (kept for existing systemd unit files) -- reuses scenario 2's
+/// unknown-table repro, like `manta_config_env_var_is_used_as_the_config_fallback`
+/// does for `MANTA_CONFIG`, so a pass proves the file was actually loaded
+/// via the old spelling rather than merely that the process didn't crash.
+#[test]
+fn server_config_still_works_as_a_deprecated_alias_of_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[server]\nstation_callsign = \"W3XYZ\"\n\n[completely_bogus_table]\nnonsense = 42\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav", "--server-config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--server-config must still be read as the --config alias"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("completely_bogus_table"),
+        "stderr must show the config file reached via --server-config was actually parsed: {stderr}"
+    );
+}
+
+/// Plan-named test: `soak --config` resolves `[input]` the same way the
+/// config-driven `listen` path does (Phase 5) -- `soak` never starts the
+/// telnet/JSON/metrics servers, so this exercises source resolution only.
+#[test]
+fn soak_accepts_config_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 5.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
+
+    let out = manta()
+        .args(["soak", "--duration", "5", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("SoakReport"),
+        "expected a SoakReport on stderr, got: {stderr}"
+    );
+}
+
+/// Plan-named test (MAN-74 Decision 5): ANY CLI source-selection flag
+/// discards `[input]` WHOLESALE, not merely the specific key it
+/// corresponds to -- proven by making the config's file source pure
+/// silence (guaranteed to decode to nothing) and the CLI's `--source` file
+/// a real keyed signal, so which one actually ran is directly observable
+/// as empty-vs-non-empty output, with no dependence on decode text quality
+/// across the whole multi-channel passband.
+#[test]
+fn any_source_flag_overrides_the_whole_input_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let configured_wav = dir.path().join("configured.wav");
+    write_silent_wav(&configured_wav, 20.0);
+    let cli_wav = dir.path().join("cli.wav");
+    write_real_audio_wav(&cli_wav, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[input]\ntype = \"file\"\npath = \"configured.wav\"\n",
+    )
+    .unwrap();
+
+    // Sanity check: the config's own source, used alone (no CLI source
+    // flags), really is inert -- otherwise a pass below would prove
+    // nothing.
+    let config_only = manta()
+        .args(["listen", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        config_only.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&config_only.stderr)
+    );
+    assert!(
+        config_only.stdout.is_empty(),
+        "a silent [input] source must decode to nothing, got: {}",
+        String::from_utf8_lossy(&config_only.stdout)
+    );
+
+    let out = manta()
+        .args(["listen", "--source"])
+        .arg(&cli_wav)
+        .args(["--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "a CLI --source flag must discard [input] wholesale -- decoding the silent \
+         configured.wav instead of cli.wav would produce no output at all"
+    );
+}
+
+/// Plan-named test: an `[input]` table selecting a feature-gated source
+/// type (`soapy`) built WITHOUT that feature fails with a message naming
+/// the required `--features` flag (`open_source_spec`), not a generic or
+/// opaque error.
+#[test]
+#[cfg(not(any(feature = "soapy", feature = "hpsdr")))]
+fn a_feature_gated_source_type_fails_with_a_message_naming_the_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[input]\ntype = \"soapy\"\ndriver = \"driver=rtlsdr\"\nfreq_hz = 14025000.0\nrate_hz = 192000.0\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a soapy [input] source built without --features soapy must fail cleanly"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--features soapy"),
+        "stderr must name the required feature: {stderr}"
+    );
+}
+
+/// Polls `addr` with short-lived TCP connect attempts until one succeeds
+/// or `timeout` elapses. Used by the Decision 8 server-startup tests below
+/// to observe an actually bound socket, not just an exit code.
+fn wait_for_port_open(addr: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// MAN-74 Decision 8: the telnet/JSON/metrics servers start iff the
+/// resolved config has a `[server]` table -- not merely because `--config`
+/// was given. Proven by actually connecting a TCP client to the telnet
+/// port: `start_spot_server` (`main.rs`) binds all three sockets before
+/// `listen()` ever reads a sample, so the window to observe this is the
+/// whole run, not a narrow race.
+#[test]
+fn config_with_a_server_table_starts_the_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[server]\nstation_callsign = \"W3XYZ\"\ntelnet_port = 19391\njson_port = 19392\n\
+         metrics_port = 19393\n\n[input]\ntype = \"file\"\npath = \"cw.wav\"\n\
+         dial_freq_hz = 14025000.0\n",
+    )
+    .unwrap();
+
+    let mut child = manta()
+        .args(["listen", "--config"])
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let connected = wait_for_port_open("127.0.0.1:19391", std::time::Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        connected,
+        "telnet_port must be bound when [server] is present"
+    );
+}
+
+/// MAN-74 Decision 8, the negative case: with NO `[server]` table at all,
+/// the servers must not even attempt to bind a socket -- proven by
+/// pre-occupying the exact port a `[server]` config would have used
+/// ourselves; if the [server]-absent path tried to bind it anyway, the
+/// whole `listen` command would fail with an "address in use" error and
+/// exit non-zero instead of decoding cleanly.
+#[test]
+fn config_without_a_server_table_does_not_start_the_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
+
+    let _held = std::net::TcpListener::bind("127.0.0.1:19395").unwrap();
+
+    let out = manta()
+        .args(["listen", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "servers must not be attempted with no [server] table -- stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
