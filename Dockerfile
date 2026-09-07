@@ -41,23 +41,22 @@ WORKDIR /home/manta
 # metrics (:7302) -- ARCHITECTURE.md §7/§8. Defaults; override via config.
 EXPOSE 7300 7301 7302
 
-# `docker stop` sends SIGTERM by default, but manta-cli's shutdown
-# handling (ctrlc, without its optional `termination` feature) only
-# registers for SIGINT -- an unmodified SIGTERM would kill the process
-# directly, bypassing manta_engine::listen's cleanup, track finalization,
-# and the server-drain sequence, and potentially dropping final spots on
-# every routine container shutdown (PR #78 review round 1). Retargeting
-# the stop signal to SIGINT here is the in-scope fix for this
-# release-pipeline PR; switching manta-cli's own ctrlc feature flags is a
-# separate, broader behavior change to the application itself.
-STOPSIGNAL SIGINT
+# No STOPSIGNAL override. This image carried `STOPSIGNAL SIGINT` from PR
+# #78 until MAN-85, because manta-cli's `ctrlc` handler was registered for
+# SIGINT only and `docker stop`'s default SIGTERM killed the process
+# outright -- bypassing manta_engine::listen's cleanup, track finalization
+# and the server-drain sequence. MAN-85 enabled `ctrlc`'s `termination`
+# feature, so SIGINT, SIGTERM and SIGHUP now all drive the same drain
+# path; Docker's default stop signal is the correct one again, and
+# retargeting it would only hide whether that path still works.
+# `crates/manta-cli/tests/signal_shutdown.rs` keeps both halves honest.
 
 # `docker stop`'s own default grace period (10s on Linux) before SIGKILL
 # is SHORTER than manta-cli's own supported graceful-shutdown drain
 # window (SHUTDOWN_DRAIN_DEADLINE, 25s -- crates/manta-cli/src/main.rs)
 # for a legitimately-slow client's final write (PR #78 review round 5).
-# STOPSIGNAL alone sends the right signal, but the container can still be
-# SIGKILLed mid-drain, dropping the final spots this fix exists to
+# Handling the signal is only half of it: the container can still be
+# SIGKILLed mid-drain, dropping the final spots the drain exists to
 # preserve. A Dockerfile has no way to change the CALLER's stop grace
 # period -- operators must pass it explicitly: `docker stop -t 30
 # <container>`, or `--stop-timeout 30` on `docker run`, or the
