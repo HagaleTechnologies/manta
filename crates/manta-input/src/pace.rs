@@ -1,0 +1,196 @@
+//! Wall-clock pacing for file replay (MAN-121). A pure sleep wrapper: it
+//! delivers exactly the samples its inner source delivers, in the same
+//! order, and only decides *when*. The decode path is untouched, which is
+//! what keeps `--realtime` output byte-identical to unpaced output.
+
+use crate::IqSource;
+use anyhow::Result;
+use num_complex::Complex32;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Paces `inner` to wall-clock realtime at its own sample rate.
+///
+/// Drift-free by construction: sleeps are computed from CUMULATIVE
+/// delivered samples against a single start instant, not per-chunk, so a
+/// chunk that arrives late is absorbed rather than compounded. If the
+/// consumer falls behind the recording, `due <= elapsed` and this never
+/// sleeps at all -- pacing degrades to unpaced instead of ever stalling the
+/// pipeline.
+pub struct PacedSource {
+    inner: Box<dyn IqSource>,
+    fs: f64,
+    delivered: u64,
+    start: Instant,
+}
+
+impl PacedSource {
+    pub fn new(inner: Box<dyn IqSource>) -> Self {
+        let fs = inner.sample_rate();
+        PacedSource {
+            inner,
+            fs,
+            delivered: 0,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl IqSource for PacedSource {
+    fn sample_rate(&self) -> f64 {
+        self.inner.sample_rate()
+    }
+
+    fn center_freq_hz(&self) -> f64 {
+        self.inner.center_freq_hz()
+    }
+
+    fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
+        // Do not swallow the inner source's own liveness signal (MAN-55).
+        self.inner.confirmed_live_handle()
+    }
+
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        let due = Duration::from_secs_f64(self.delivered as f64 / self.fs);
+        let elapsed = self.start.elapsed();
+        if due > elapsed {
+            std::thread::sleep(due - elapsed);
+        }
+        let n = self.inner.read(buf)?;
+        self.delivered += n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct VecSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+    }
+
+    impl IqSource for VecSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+    }
+
+    fn drain(src: &mut dyn IqSource, chunk: usize) -> Vec<Complex32> {
+        let mut all = Vec::new();
+        let mut buf = vec![Complex32::new(0.0, 0.0); chunk];
+        loop {
+            let n = src.read(&mut buf).unwrap();
+            if n == 0 {
+                return all;
+            }
+            all.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    #[test]
+    fn paced_source_delivers_the_same_samples_in_the_same_order() {
+        // A high fake fs keeps this test fast -- pacing math is the same
+        // regardless of rate.
+        let samples: Vec<Complex32> = (0..500)
+            .map(|i| Complex32::new(i as f32, -(i as f32)))
+            .collect();
+        let src = VecSource {
+            samples: samples.clone(),
+            cursor: 0,
+            fs: 1_000_000.0,
+        };
+        let mut paced = PacedSource::new(Box::new(src));
+        let drained = drain(&mut paced, 64);
+        assert_eq!(drained, samples);
+    }
+
+    #[test]
+    fn paced_source_takes_at_least_the_recording_duration() {
+        let samples = vec![Complex32::new(0.0, 0.0); 2400];
+        let src = VecSource {
+            samples,
+            cursor: 0,
+            fs: 8000.0,
+        };
+        let mut paced = PacedSource::new(Box::new(src));
+        let start = Instant::now();
+        drain(&mut paced, 256);
+        // 2400 samples at 8000 S/s = 0.3s. Generous lower bound only --
+        // never assert an upper bound, that is CI-flaky.
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "elapsed {:?} was too short for a 0.3s recording",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn paced_source_does_not_sleep_when_the_consumer_is_already_behind() {
+        struct SlowSource {
+            inner: VecSource,
+        }
+        impl IqSource for SlowSource {
+            fn sample_rate(&self) -> f64 {
+                self.inner.sample_rate()
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                std::thread::sleep(Duration::from_millis(200));
+                self.inner.read(buf)
+            }
+        }
+        // 800 samples at 8000 S/s = 0.1s of "recording" pacing, but the
+        // single read() call already takes 0.2s -- pacing must add ~nothing
+        // on top of that one call.
+        let samples = vec![Complex32::new(0.0, 0.0); 800];
+        let slow = SlowSource {
+            inner: VecSource {
+                samples,
+                cursor: 0,
+                fs: 8000.0,
+            },
+        };
+        let mut paced = PacedSource::new(Box::new(slow));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 800];
+        let start = Instant::now();
+        assert_eq!(paced.read(&mut buf).unwrap(), 800);
+        // If pacing compounded (summed) with the artificial delay, this
+        // would take ~0.3s+; degrading to unpaced keeps it close to 0.2s.
+        assert!(
+            start.elapsed() < Duration::from_millis(280),
+            "elapsed {:?} suggests pacing compounded with the consumer delay",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn paced_source_passes_eof_through() {
+        let samples = vec![Complex32::new(0.0, 0.0); 5];
+        let src = VecSource {
+            samples,
+            cursor: 0,
+            fs: 8000.0,
+        };
+        let mut paced = PacedSource::new(Box::new(src));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 5];
+        assert_eq!(paced.read(&mut buf).unwrap(), 5);
+        let start = Instant::now();
+        assert_eq!(paced.read(&mut buf).unwrap(), 0);
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+}

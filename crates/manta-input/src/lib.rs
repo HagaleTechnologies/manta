@@ -8,6 +8,12 @@ pub use audio::{AudioIqSource, TARGET_RATE_HZ};
 pub mod kiwi;
 pub use kiwi::KiwiIqSource;
 
+pub mod pace;
+pub use pace::PacedSource;
+
+pub mod replay;
+pub use replay::LoopingWavSource;
+
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]
@@ -123,6 +129,61 @@ impl IqSource for WavIqSource {
     }
 }
 
+/// Open a replay WAV as whichever `IqSource` its layout implies: 2 channels
+/// = complex IQ (what `manta gen` writes and `manta decode` reads, at its
+/// own native rate, via `WavIqSource`); anything else = a real rig-audio
+/// passband, which `AudioIqSource` converts to analytic form via Hilbert
+/// transform and still requires at exactly `TARGET_RATE_HZ`.
+///
+/// `manta_engine::listen()` is rate-agnostic -- `Channelizer::new` accepts
+/// any `fs` where `fs / 93.75` is a power of two, and 96000 / 93.75 = 1024
+/// -- so this is a reader choice, not a resample. See MAN-121.
+///
+/// Channel count alone is only unambiguous away from `TARGET_RATE_HZ`
+/// (48 kHz): `AudioIqSource` never accepted anything but 48 kHz, so a
+/// 2-channel file at any other rate could never have been a rig-audio
+/// capture before this dispatch existed, and routing it to `WavIqSource`
+/// regresses nothing. At exactly 48 kHz a 2-channel file is genuinely
+/// ambiguous -- it's both a legal `WavIqSource` rate and `AudioIqSource`'s
+/// only rate, and a stereo soundcard recording of a receiver's passband
+/// (a real, common rig-audio capture) is indistinguishable from IQ by
+/// channel count alone. A `<stem>.json` sidecar (what `gen`/`decode`'s IQ
+/// files always carry) breaks the tie in favor of IQ; with no sidecar, a
+/// 48 kHz 2-channel file keeps its pre-MAN-121 `AudioIqSource` downmix
+/// path rather than being silently misread as `Complex32::new(I, Q)`.
+pub fn open_replay_wav(path: &Path) -> Result<Box<dyn IqSource>> {
+    let spec = hound::WavReader::open(path)
+        .with_context(|| format!("open WAV {}", path.display()))?
+        .spec();
+    let is_iq = spec.channels == 2
+        && (spec.sample_rate != TARGET_RATE_HZ || replay_wav_center_freq_hz(path).is_some());
+    if is_iq {
+        Ok(Box::new(WavIqSource::open(path)?))
+    } else {
+        Ok(Box::new(AudioIqSource::from_wav_file(path)?))
+    }
+}
+
+/// The RF center frequency a replay WAV *declares* (2-channel IQ plus a
+/// parseable `<stem>.json` sidecar with a finite, positive
+/// `center_freq_hz`), or `None` for anything else.
+///
+/// Deliberately swallows every error, including a nonexistent path, so a
+/// CLI flag-validation gate can run BEFORE any real file I/O and still
+/// report a missing flag rather than a missing file -- an ordering
+/// `crates/manta-cli/tests/cli.rs`'s
+/// `server_config_without_dial_freq_for_audio_source_is_a_clean_error`
+/// asserts and documents in its own comment.
+pub fn replay_wav_center_freq_hz(path: &Path) -> Option<f64> {
+    let spec = hound::WavReader::open(path).ok()?.spec();
+    if spec.channels != 2 {
+        return None;
+    }
+    let text = std::fs::read_to_string(path.with_extension("json")).ok()?;
+    let sc: Sidecar = serde_json::from_str(&text).ok()?;
+    (sc.center_freq_hz.is_finite() && sc.center_freq_hz > 0.0).then_some(sc.center_freq_hz)
+}
+
 /// Drain an IqSource to a Vec (file-mode helper). ARCHITECTURE §3.
 pub fn read_all(src: &mut dyn IqSource) -> Result<Vec<Complex32>> {
     let mut all = Vec::new();
@@ -236,5 +297,158 @@ mod tests {
         assert_eq!(src.read(&mut buf).unwrap(), 300);
         assert_eq!(src.read(&mut buf).unwrap(), 100);
         assert_eq!(src.read(&mut buf).unwrap(), 0); // EOF
+    }
+
+    fn write_mono_f32_wav(path: &std::path::Path, samples: &[f32], fs: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: fs,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for s in samples {
+            w.write_sample(*s).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    // MAN-121: `open_replay_wav` dispatches on channel count so `listen
+    // --source` can accept the same 2-channel IQ WAV `manta gen`/`decode`
+    // already use, not just AudioIqSource's mono rig-audio format.
+    #[test]
+    fn open_replay_wav_reads_a_stereo_iq_file_at_its_native_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("v1.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        std::fs::write(
+            dir.path().join("v1.json"),
+            r#"{"center_freq_hz": 14000000.0}"#,
+        )
+        .unwrap();
+
+        let src = open_replay_wav(&wav).unwrap();
+        assert_eq!(src.sample_rate(), 96_000.0);
+        assert_eq!(src.center_freq_hz(), 14_000_000.0);
+    }
+
+    #[test]
+    fn open_replay_wav_reads_a_mono_48k_file_as_an_audio_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("rig.wav");
+        write_mono_f32_wav(&wav, &vec![0.0f32; 480], 48_000);
+
+        let src = open_replay_wav(&wav).unwrap();
+        assert_eq!(src.sample_rate(), 48_000.0);
+        assert_eq!(src.center_freq_hz(), 0.0);
+    }
+
+    // MAN-121 remediation: a 2-channel 48 kHz WAV with no sidecar is the
+    // exact collision with AudioIqSource's only supported rate -- a stereo
+    // soundcard recording of rig audio looks identical to IQ by channel
+    // count alone. Without a sidecar it must keep the pre-MAN-121
+    // AudioIqSource downmix-and-Hilbert path, not be reinterpreted as
+    // Complex32::new(I, Q). Ch0 is constant zero and ch1 carries a large,
+    // distinctive value: WavIqSource would read the pair verbatim
+    // (0.0, 0.9); AudioIqSource downmixes to ch0 alone (constant zero) and
+    // the Hilbert transform of an all-zero signal is all-zero, so the two
+    // paths are unambiguous from the output alone.
+    #[test]
+    fn open_replay_wav_treats_a_sidecarless_48k_stereo_file_as_rig_audio_not_iq() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("rig.wav");
+        let samples: Vec<Complex32> = (0..300).map(|_| Complex32::new(0.0, 0.9)).collect();
+        write_f32_wav(&wav, &samples, 48_000);
+
+        let mut src = open_replay_wav(&wav).unwrap();
+        assert_eq!(src.sample_rate(), 48_000.0);
+        assert_eq!(src.center_freq_hz(), 0.0);
+        let all = read_all(&mut *src).unwrap();
+        assert!(
+            all.iter().all(|s| s.re == 0.0 && s.im == 0.0),
+            "expected the AudioIqSource downmix+Hilbert path (all-zero output for \
+             all-zero ch0), got non-zero samples -- the file was read as raw IQ instead"
+        );
+    }
+
+    // Companion to the above: a sidecar is exactly the signal that should
+    // still win at 48 kHz, since `gen`/`decode`'s own IQ files may legally
+    // be 48 kHz (48000 / 93.75 = 512, a valid channelizer rate).
+    #[test]
+    fn open_replay_wav_still_reads_a_sidecar_backed_48k_stereo_file_as_iq() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("v1.wav");
+        write_f32_wav(&wav, &samples(), 48_000);
+        std::fs::write(
+            dir.path().join("v1.json"),
+            r#"{"center_freq_hz": 14000000.0}"#,
+        )
+        .unwrap();
+
+        let mut src = open_replay_wav(&wav).unwrap();
+        assert_eq!(src.sample_rate(), 48_000.0);
+        assert_eq!(src.center_freq_hz(), 14_000_000.0);
+        let all = read_all(&mut *src).unwrap();
+        assert_eq!(all, samples());
+    }
+
+    #[test]
+    fn open_replay_wav_still_rejects_a_mono_file_at_the_wrong_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("rig.wav");
+        write_mono_f32_wav(&wav, &vec![0.0f32; 441], 44_100);
+
+        match open_replay_wav(&wav) {
+            Ok(_) => panic!("expected an error for a 44100 Hz mono file"),
+            Err(err) => assert!(
+                format!("{err}").contains("48000"),
+                "expected the AudioIqSource rate error, got: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn replay_wav_center_freq_hz_reports_a_sidecar_backed_iq_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("v1.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        std::fs::write(
+            dir.path().join("v1.json"),
+            r#"{"center_freq_hz": 14000000.0}"#,
+        )
+        .unwrap();
+
+        assert_eq!(replay_wav_center_freq_hz(&wav), Some(14_000_000.0));
+    }
+
+    #[test]
+    fn replay_wav_center_freq_hz_is_none_for_mono_missing_and_malformed_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Mono WAV, no sidecar possible (a real audio source, not IQ).
+        let mono = dir.path().join("rig.wav");
+        write_mono_f32_wav(&mono, &vec![0.0f32; 480], 48_000);
+        assert_eq!(replay_wav_center_freq_hz(&mono), None);
+
+        // 2ch WAV with no sidecar at all.
+        let no_sidecar = dir.path().join("nosidecar.wav");
+        write_f32_wav(&no_sidecar, &samples(), 96_000);
+        assert_eq!(replay_wav_center_freq_hz(&no_sidecar), None);
+
+        // 2ch WAV with an unparseable sidecar.
+        let bad_sidecar = dir.path().join("badsidecar.wav");
+        write_f32_wav(&bad_sidecar, &samples(), 96_000);
+        std::fs::write(dir.path().join("badsidecar.json"), "not json").unwrap();
+        assert_eq!(replay_wav_center_freq_hz(&bad_sidecar), None);
+
+        // Nonexistent path -- MUST NOT panic or error, only return None,
+        // since a CLI flag-validation gate calls this before any file I/O
+        // is meant to fail (crates/manta-cli/tests/cli.rs's
+        // server_config_without_dial_freq_for_audio_source_is_a_clean_error
+        // depends on this exact ordering).
+        assert_eq!(
+            replay_wav_center_freq_hz(std::path::Path::new("/nonexistent.wav")),
+            None
+        );
     }
 }

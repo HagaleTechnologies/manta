@@ -99,7 +99,10 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
 
 **Accept when:**
 - A stock DX cluster client (e.g. `telnet`, N1MM) connects, logs in, and
-  receives well-formed RBN-format spots.
+  receives well-formed RBN-format spots. **Met and automated, no hardware
+  needed**: `crates/manta-cli/tests/telnet_e2e.rs` drives this end-to-end
+  from `manta gen` output through `listen --source --realtime
+  --server-config` to a real telnet/JSON-Lines client (MAN-121).
 - **Parity benchmark**: on ≥ 2 h of recorded contest-weekend IQ, manta achieves
   ≥ 80 % recall of RBN's spots for the same slice with ≤ 5 % false (bogus-call)
   spots. Numbers published in the repo, whatever they are.

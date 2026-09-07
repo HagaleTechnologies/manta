@@ -67,8 +67,10 @@ enum Command {
         /// Input device name substring (default input device if omitted).
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
-        /// Replay a WAV file instead of a live device (paced by its own
-        /// sample rate via AudioIqSource; used for demos and testing).
+        /// Replay a WAV file instead of a live device: either a 2-channel
+        /// IQ WAV (what `manta gen`/`decode` use, any rate) or a 48 kHz
+        /// mono rig-audio WAV. Drains as fast as it can be read unless
+        /// --realtime is given.
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
@@ -177,6 +179,22 @@ enum Command {
         /// this machine's copy of the file happens to say."
         #[arg(long, value_parser = parse_replay_epoch)]
         replay_epoch: Option<i64>,
+        /// Replay the --source file at wall-clock realtime instead of as
+        /// fast as it can be read, so a telnet/JSON client has time to
+        /// connect and observe a spot (MAN-121). Off by default: unpaced
+        /// replay is far faster and is what the test suite and `soak` rely
+        /// on. Output is byte-identical either way -- pacing only decides
+        /// when samples are delivered, never which.
+        #[arg(long, requires = "source")]
+        realtime: bool,
+        /// Restart the --source file at end-of-file instead of exiting, for
+        /// a demo left running (MAN-121). Note: the spot dedupe window
+        /// suppresses a repeat spot for the same callsign and frequency for
+        /// 10 minutes of recording time, so a short looped file yields
+        /// roughly one spot per 10 minutes, not one per pass. Combine with
+        /// --realtime for a live-paced demo.
+        #[arg(long = "loop", requires = "source")]
+        loop_replay: bool,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -381,7 +399,11 @@ fn open_source(
 
 fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
-        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+        // Dispatches on the WAV's own channel count (MAN-121): a 2-channel
+        // IQ WAV -- what `manta gen`/`decode` already use -- decodes
+        // directly, at its own native rate; anything else is still treated
+        // as a real rig-audio passband via AudioIqSource, unchanged.
+        Some(path) => manta_input::open_replay_wav(&path)?,
         None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
 }
@@ -1004,6 +1026,8 @@ fn main() -> Result<()> {
             server_config,
             dial_freq_hz,
             replay_epoch,
+            realtime,
+            loop_replay,
         } => {
             let is_file_replay = source.is_some();
             // Captured before `open_source` consumes `source` below --
@@ -1017,7 +1041,17 @@ fn main() -> Result<()> {
             let has_hpsdr_source = hpsdr_host.is_some();
             #[cfg(not(feature = "hpsdr"))]
             let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
+            // A 2-channel IQ WAV with a `<stem>.json` sidecar DOES report a
+            // real RF frequency -- probe cheaply (never fails, even for a
+            // missing path) so this stays ahead of all file I/O and a
+            // bad-flag error still beats a bad-file error. See
+            // `replay_wav_center_freq_hz`'s doc comment (MAN-121).
+            let file_declares_rf = source
+                .as_deref()
+                .and_then(manta_input::replay_wav_center_freq_hz)
+                .is_some();
+            let has_rf_aware_source =
+                kiwi_host.is_some() || has_soapy_source || has_hpsdr_source || file_declares_rf;
             let source_name = if kiwi_host.is_some() {
                 "kiwi"
             } else if has_soapy_source {
@@ -1033,9 +1067,10 @@ fn main() -> Result<()> {
             if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
                     "--dial-freq-hz is required with --server-config when using a plain \
-                     audio device or --source WAV file -- neither reports a real RF \
-                     frequency (KiwiSDR/SoapySDR already know theirs from \
-                     --kiwi-freq/--soapy-freq)"
+                     audio device or a rig-audio --source WAV file (mono, or 2-channel at \
+                     48 kHz with no <stem>.json sidecar) -- none of these report a real RF \
+                     frequency (a 2-channel IQ WAV with a <stem>.json sidecar does, as do \
+                     KiwiSDR/SoapySDR via --kiwi-freq/--soapy-freq)"
                 );
             }
 
@@ -1057,6 +1092,16 @@ fn main() -> Result<()> {
             let hpsdr_source: Option<Box<dyn IqSource>> = None;
             let src = match hpsdr_source {
                 Some(src) => src,
+                // `--loop` requires --source (clap `requires = "source"`),
+                // so `replay_path` is guaranteed Some here. Bypasses
+                // `open_source` entirely -- `LoopingWavSource` opens the
+                // file itself (and reopens it at EOF), so there's nothing
+                // for `open_source` to hand back.
+                None if loop_replay => Box::new(manta_input::LoopingWavSource::new(
+                    replay_path
+                        .clone()
+                        .expect("--loop requires --source (clap-enforced)"),
+                )?) as Box<dyn IqSource>,
                 None => {
                     #[cfg(feature = "soapy")]
                     {
@@ -1084,6 +1129,17 @@ fn main() -> Result<()> {
                     freq_hz,
                 }),
                 None => src,
+            };
+            // Pacing wraps the OUTSIDE of everything above -- loop first
+            // (so pacing measures the continuous looped stream, not a
+            // clock that restarts each pass), then the dial-freq override,
+            // then realtime pacing (MAN-121 Decision 5). A pure sleep
+            // wrapper: never touches which samples are delivered, only
+            // when, so --realtime output is byte-identical to unpaced.
+            let src: Box<dyn IqSource> = if realtime {
+                Box::new(manta_input::PacedSource::new(src))
+            } else {
+                src
             };
 
             // Kept alive for the process lifetime: dropping it would stop
