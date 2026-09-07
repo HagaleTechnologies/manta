@@ -278,15 +278,25 @@ further code-review gaps in the shipped mechanism.
   already-observed genuine call.
 - **C5 — `longer_containment` had no support floor.** The prefix-shape
   override let a rival win `better_supported_rival` on shape alone with as
-  little as 1 observation, however badly supported. Measured: a single
-  garbled "K5ARHT" (a stray trailing "T" glued onto the real call) vetoed a
-  3-rep "K5ARH" outright, with nothing spotted in its place -- the mirror
-  image of the head-merge case this same file already protects against in
-  the other direction. Fixed by requiring the rival to also clear
+  little as 1 observation, however badly supported. Measured (a hand-built
+  scenario, not the real V8w fixture): a single garbled "K5ARHT" (a stray
+  trailing "T" glued onto the real call) vetoed a 3-rep "K5ARH" outright,
+  with nothing spotted in its place -- the mirror image of the head-merge
+  case this same file already protects against in the other direction.
+  Fixed by requiring the rival to also clear
   `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE = 2` (`support.rs`) -- the same floor
-  every other spottable candidate must itself clear. All five of this
-  ticket's originally-measured truncation cases had multi-rep rivals, so
-  this floor does not move them.
+  every other spottable candidate must itself clear.
+
+  **This claim was wrong and the fix was reverted in round 3 below.** This
+  paragraph originally asserted "all five of this ticket's
+  originally-measured truncation cases had multi-rep rivals, so this floor
+  does not move them" -- contradicted by this very document's own §4
+  measurement table, which records `cand=W6JQ (reps=3) rival=W6JQA
+  (reps=1)` for track 90. The claim was never checked against that table
+  before shipping, and the round that added this floor also skipped
+  re-running the real V8w fixture end to end (see that round's own closing
+  note below) -- the combination let a floor that reopens the ticket's own
+  headline case land unnoticed. See "Third remediation round" below.
 - **C6 — `SupportLedger::seen` keys never expired.** `observe` only pruned
   the one entry it had just touched; a text observed once and never again
   kept its key (and its now-stale observations) forever, freed only by
@@ -319,6 +329,106 @@ aged past the 90 s window `better_supported_rival` itself reads, so it
 cannot change any live comparison's outcome. Confirmed instead by the unit
 and golden-vector suites in `support.rs` and `golden_v11_v15.rs`, including
 new vectors for both fixes.
+
+## Third remediation round (validate-plan attempt 5, 2026-09-07)
+
+The third validate-plan pass re-measured V8w end to end with a base-commit
+control and found C5's floor (`MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE = 2`,
+added in round 2 above) regressed the ticket's own headline case:
+`spots=22 distinct=21 validated=20/50 bogus=1 ["W6JQ"]`, against the base
+commit's control `bogus=5` and this branch's claimed `bogus=0`. 4 of 5
+bogus spots were genuinely fixed; `W6JQ` was not, because its rival
+`W6JQA` has only 1 message-distinct repetition on the track at the time
+`W6JQ` is arbitrated (`W6JQA`'s own second exact-text occurrence on track
+90 arrives 51 words later, after `W6JQ` has already reached 3 reps and
+been evaluated -- see the research document's word-position analysis).
+`MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE = 2` excludes a 1-rep rival by
+construction, so the shape override never fired for this pair and the
+plain support comparison (1 rep vs. 3) could not save it either.
+
+**The floor is reverted.** `better_supported_rival`'s `longer_containment`
+arm now fires for any rival that has been observed at all (the pre-existing
+`s.reps == 0` guard still excludes a rival with zero observations) --
+exactly the pre-round-2 rule. This is not a partial fix: the C5 scenario
+("K5ARHT", a lone glued-tail artifact overriding a well-supported "K5ARH")
+and the ticket's own "W6JQ"/"W6JQA" case are the **same shape** --
+a well-supported short candidate, a textually-longer prefix-extension
+rival with exactly 1 observed repetition, containment relation -- and nothing
+in the ledger (reps, summed confidence, or observation timing) tells them
+apart: both are "candidate reps > 1, rival reps == 1, prefix-containment."
+No numeric floor on the rival's own rep count can admit one and exclude the
+other. Between an unmeasured, hand-built scenario (`K5ARHT` appears in no
+real fixture, no golden vector, and no measured pileup scene) and the
+ticket's own real, measured, Gherkin-cited regression, the real one wins:
+per this ticket's own priority ("false spots are what gets a node
+de-listed from RBN, not low recall"), and because the round-2 fix was
+never re-verified against real data before landing (see its own closing
+note: "not re-run against the real V8w/V8 fixtures this round").
+
+Re-measured end to end against the real V8w fixture after the revert:
+
+| | spots | distinct | validated/50 | bogus |
+|---|---|---|---|---|
+| V8w baseline (`e398d46`, control) | 30 | 27 | 22 | 5 |
+| V8w, this branch after the round-3 revert | 21 | 20 | 20 | **0** |
+
+Matches the ticket's own acceptance criterion and this document's original
+headline table exactly. `crates/manta-spot/tests/golden_v11_v15.rs`'s
+`v37_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape` pins
+this literal shape as a golden vector (`docs/SPEC-decode-core.md` §7.1,
+V37) so it cannot silently regress again; `support.rs`'s
+`a_strict_prefix_loses_to_a_longer_form_even_with_more_reps` unit test is
+restored to the plan's original 1-rep-rival spec, and a new
+`a_lone_single_observation_rival_still_overrides_by_shape` unit test
+documents the accepted trade-off explicitly (a lone, single-observation
+confusable rival now *does* override by shape) rather than leaving it as
+an implicit side effect of the revert.
+
+**Accepted, documented trade-off going forward:** a genuinely spurious,
+never-repeated decode that happens to be a textual prefix-extension of a
+well-supported real call can suppress that call. This has zero measured
+occurrences across both available multi-signal fixtures (V8, V8w). If it
+is ever measured in practice, the fix is not another numeric floor on
+`s.reps` (proven insufficient by this round) -- it needs a signal the
+ledger doesn't currently carry (e.g. the rival's own per-character
+confidence, or corroboration from a second, independent detection
+mechanism), which is out of scope for this ticket.
+
+Findings 3, 4, 5, and 6 from the same validate-plan report (ledger not
+gated on the operator blocklist; the 90 s ledger window vs. the 16-word
+context window at 8 WPM; the prefix-only asymmetry's untested tail-merge
+exposure; the untested SCP exemption) are all rated PLAUSIBLE, not
+CONFIRMED, and none is reproduced against the real fixtures or a committed
+test. Per `docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`
+("from round 2 onward, P2-and-lower findings are not fixed inline -- they
+are captured verbatim into a follow-up ticket instead"), this is round 3:
+each is recorded here verbatim for a follow-up ticket rather than
+addressed inline in this PR.
+
+- Finding 3: `Validator`'s `WordBoundary` handler
+  (`crates/manta-spot/src/validator.rs:333`) observes any grammar+cty
+  plausible word into the ledger without checking `self.blocklist` --
+  `Blocklist` is consulted only in `evaluate_candidate`, not on the
+  observe path. A blocklisted text can still accumulate ledger support and
+  win `better_supported_rival` against a genuine candidate, silently
+  costing the operator their real spot on a track where the blocklisted
+  variant out-reps it.
+- Finding 4: `support_in_window` (`support.rs`) and the 16-word
+  `WORD_WINDOW` context match live on different clocks -- a word can stay
+  eligible for `context::parse` far longer than the ledger's 90 s window
+  at slow speeds (8 WPM), so a late-resolved candidate can be evaluated
+  against a ledger where its own earlier support has already aged out.
+- Finding 5: the prefix-only `longer_containment` asymmetry (by design)
+  never fires for a tail-merge shape (true call is a strict prefix of the
+  rival, e.g. a merged trailing "K" glued onto a real call). Measured data
+  shows 0 tail-merge occurrences across both fixtures against 25
+  truncations, so this is a bounded, reasoned risk, not a demonstrated
+  defect -- but it is unmonitored.
+- Finding 6: `scp_exempt` (`validator.rs:770`) is not exercised by any
+  committed test; every golden vector constructs `Validator::new(..., None)`.
+  `master.scp` contains short real calls that are also plausible
+  truncations of longer real calls, so this is a live, untested production
+  path.
 
 ## References
 

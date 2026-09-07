@@ -1395,3 +1395,65 @@ fn v36_a_short_id_at_ordinary_cadence_is_not_spotted_from_two_reps_alone() {
          an accepted, bounded recall cost, not a spot, got {spots:?}"
     );
 }
+
+/// V37 (MAN-100 remediation round 3): the literal, measured track-90 V8w
+/// shape. A well-supported truncation ("W6JQ", 3 message-distinct reps)
+/// must still lose to its own longer, genuine form ("W6JQA") even when
+/// that genuine form has only a single observation on the track at the
+/// time the truncation is arbitrated -- in the real V8w fixture, W6JQA's
+/// own second exact-text occurrence on the track arrives 51 words after
+/// W6JQ has already reached 3 reps and been evaluated, so W6JQA itself
+/// never independently clears the bare repetition gate in this scene.
+/// `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE` (MAN-100 remediation C5), which
+/// required a rival to also independently clear the same >= 2-rep floor a
+/// spottable candidate must, silently re-opened exactly this pair --
+/// motivated by a hand-built scenario present in no real fixture, and
+/// never re-measured against V8w before landing. This vector pins the
+/// reverted behavior end to end so it cannot regress unnoticed again; see
+/// the decision record's third remediation round.
+#[test]
+fn v37_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    // The genuine, longer call: a single observation only -- the ledger
+    // records it regardless of whether context::parse ever resolves it to
+    // its own DE-anchored candidate.
+    let mut spots = run(
+        &transmission_events(1, &["CQ", "DE", "W6JQA", "K"], 0),
+        &mut v,
+    );
+
+    // Age the "DE W6JQA" context match fully out of the 16-word window
+    // before W6JQ ever appears, so context::parse's single-match-per-
+    // window DE_RE surfaces "DE W6JQ" as its own fresh candidate instead
+    // of resolving (by text) to the still-in-window "DE W6JQA" match --
+    // the same aging technique V31/V33 use. The ledger's own window is
+    // time-based (90 s), not word-count-based, so W6JQA's one observation
+    // stays live there regardless.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 300_000), &mut v));
+
+    // The truncation, decoded cleanly three times -- enough to clear the
+    // bare repetition gate on its own (reps=3), matching the real scene.
+    for i in 0..3u64 {
+        spots.extend(run(
+            &transmission_events(1, &["CQ", "DE", "W6JQ", "K"], 900_000 + i * 300_000),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        !spots.iter().any(|s| s.callsign == "W6JQ"),
+        "a 3-rep truncation must still lose to its own longer form even \
+         when that form has only a single observation on the track, got {spots:?}"
+    );
+    assert!(
+        !spots.iter().any(|s| s.callsign == "W6JQA"),
+        "the genuine longer form itself never independently cleared the \
+         repetition gate in this scene (only 1 observation), so it must \
+         not spot either -- matching the real track-90 outcome of no spot \
+         at all rather than a bogus one, got {spots:?}"
+    );
+}

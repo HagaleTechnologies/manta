@@ -539,11 +539,19 @@ window. It is withheld if a confusable, better-supported rival exists —
 shared prefix of at least 3 characters with edit distance ≤ 2 — where
 "better-supported" means strictly more message-distinct repetitions (ties
 broken by summed per-occurrence confidence), or the candidate being a
-strict prefix of a rival that itself has ≥ 2 message-distinct repetitions
-(MAN-100 remediation C5 — the same floor a spottable candidate must itself
-clear; a single stray, garbled decode that happens to be a textual
-prefix-extension of a well-supported candidate is not enough on its own to
-veto it). Symmetrically, a rival that is itself a strict prefix of the
+strict prefix of a rival that has been observed at all (≥ 1 message-distinct
+repetition — shape alone decides a prefix-containment pair once the rival
+exists, however little support it has). An earlier attempt (MAN-100
+remediation C5) also required the rival to independently clear the same
+≥ 2-repetition floor a spottable candidate must, on the reasoning that a
+single stray, garbled decode that happens to be a textual prefix-extension
+of a well-supported candidate should not be enough on its own to veto it;
+reverted in remediation round 3 because it excluded the ticket's own
+measured case (a 3-rep truncation losing to a genuine, longer call that
+had only a single observation on the track) — the two shapes are
+numerically indistinguishable from the ledger alone, and the measured,
+real case takes priority over the unmeasured, synthetic one that motivated
+C5. Symmetrically, a rival that is itself a strict prefix of the
 candidate never wins this comparison on repetition count alone (MAN-100
 remediation C1) — shape decides a prefix-containment pair in both
 directions, not just when the shorter form is being arbitrated. This
@@ -717,6 +725,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V34 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
 | V35 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
 | V36 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
+| V37 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
 
 ---
 

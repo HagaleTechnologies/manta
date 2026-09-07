@@ -14,18 +14,6 @@ use crate::gate::{self, MIN_MESSAGE_TIME_GAP_SECONDS, WINDOW_SECONDS};
 use crate::variant::{self, Relation};
 use std::collections::BTreeMap;
 
-/// A shape-only override (`longer_containment` below) must still clear
-/// the same minimum standalone support any spottable candidate itself
-/// must clear (`validator.rs`'s own `reps < 2` gate) -- otherwise a
-/// single stray, garbled decode that happens to be a textual
-/// prefix-extension of a well-supported genuine call could permanently
-/// veto it (MAN-100 remediation C5: measured, a lone "K5ARHT" glued-tail
-/// artifact suppressed a 3-rep "K5ARH" outright, with nothing spotted in
-/// its place). The measured V8/V8w truncation cases this override exists
-/// for all had multi-rep rivals, so this floor costs nothing on real
-/// data while closing the single-stray-decode failure mode.
-const MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE: u32 = 2;
-
 /// One observed decode of a plausible-shaped word on a track.
 struct Obs {
     word_seq: u64,
@@ -205,15 +193,24 @@ impl SupportLedger {
             // prefix-only: it must never fire in the other direction, or
             // a genuine call would lose to a merge artifact that happened
             // to decode first (see `variant::relation`'s docs and the
-            // MAN-100 decision record for the measured 25:0 split). Still
-            // gated on `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE`, though: shape
-            // alone is trusted to override a support comparison, but not
-            // to override the same >= 2-rep floor every other spottable
-            // candidate must itself clear (MAN-100 remediation C5).
+            // MAN-100 decision record for the measured 25:0 split). Any
+            // rival that reached this point already cleared the `s.reps
+            // == 0` guard above, so shape alone decides once the rival has
+            // been observed at all -- deliberately NOT also gated on the
+            // rival independently clearing the >= 2-rep bare spot gate
+            // (MAN-100 remediation C5 tried that: measured end to end
+            // against the real V8w fixture, it re-suppressed the ticket's
+            // own headline case, "W6JQ" beating its genuine 1-observation
+            // rival "W6JQA" 3 reps to 1 -- see the decision record's third
+            // remediation round). The accepted trade-off this reopens --
+            // a single stray, garbled decode that happens to be a textual
+            // prefix-extension of a well-supported genuine call can veto
+            // it -- has no known occurrence in either measured pileup
+            // scene; the ticket's real, measured regression takes
+            // priority over an unmeasured, synthetic one.
             let longer_containment = rel == Relation::Containment
                 && text.len() > candidate.len()
-                && text.starts_with(candidate)
-                && s.reps >= MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE;
+                && text.starts_with(candidate);
             // The reverse must also be shape-decided, not support-decided
             // (MAN-100 remediation C1): when the CANDIDATE is the longer
             // form and `text` is a strict prefix of it, `text` is the
@@ -320,13 +317,16 @@ mod tests {
         assert_eq!(rival.0, "W4KCL");
     }
 
-    /// The measured track-90 shape: W6JQ 3 reps beats W6JQA 2 reps on
-    /// plain support, but W6JQ is a strict prefix of W6JQA -- the
-    /// containment asymmetry must still let the longer form win. W6JQA
-    /// carries 2 (not 1) reps here specifically to also clear
-    /// `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE` (MAN-100 remediation C5) --
-    /// see `a_lone_stray_decode_does_not_veto_a_well_supported_candidate`
-    /// for the case where it doesn't.
+    /// The measured track-90 shape: W6JQ 3 reps beats W6JQA's single
+    /// observation (1 rep) on plain support, but W6JQ is a strict prefix
+    /// of W6JQA -- the containment asymmetry must still let the longer
+    /// form win, however few reps it has, once it's been observed at
+    /// all. This is the ticket's own headline regression (MAN-100
+    /// remediation round 3): a support-floor gate on the rival
+    /// (`MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE`, remediation C5) previously
+    /// required the rival to independently reach 2 reps, which excluded
+    /// exactly this pair and let "W6JQ" spot as a bogus callsign end to
+    /// end against the real V8w fixture.
     #[test]
     fn a_strict_prefix_loses_to_a_longer_form_even_with_more_reps() {
         let mut ledger = SupportLedger::new(FS);
@@ -334,7 +334,6 @@ mod tests {
         ledger.observe(1, "W6JQ", 19, 10_000, 0.3);
         ledger.observe(1, "W6JQ", 47, 20_000, 0.3);
         ledger.observe(1, "W6JQA", 30, 15_000, 0.3);
-        ledger.observe(1, "W6JQA", 40, 18_000, 0.3);
 
         let rival = ledger
             .better_supported_rival(1, "W6JQ", 20_000)
@@ -342,25 +341,31 @@ mod tests {
         assert_eq!(rival.0, "W6JQA");
     }
 
-    /// MAN-100 remediation C5: a lone, 1-rep stray decode that happens to
-    /// be a textual prefix-extension of a well-supported genuine call
-    /// must NOT veto it -- shape alone is not enough; the rival must also
-    /// clear `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE`. Measured: a single
-    /// garbled "K5ARHT" (a trailing "T" glued onto the real call)
-    /// suppressed a 3-rep "K5ARH" outright, with nothing spotted in its
-    /// place.
+    /// MAN-100 remediation round 3: a lone, single-observation confusable
+    /// rival that is a textual prefix-extension of a well-supported
+    /// candidate DOES veto it via the shape asymmetry above -- this is
+    /// the accepted trade-off, not a bug. A support-floor gate on the
+    /// rival (MAN-100 remediation C5) once excluded exactly this case,
+    /// motivated by a synthetic, hand-built scenario ("K5ARHT", present
+    /// in no real fixture) that has no measured occurrence in either
+    /// pileup scene; that floor was reverted because it re-suppressed the
+    /// ticket's own real, measured "W6JQ"/"W6JQA" case, which has the
+    /// identical shape (see `a_strict_prefix_loses_to_a_longer_form_even_with_more_reps`).
+    /// The two cases are numerically indistinguishable from the ledger
+    /// alone; the real, measured one takes priority.
     #[test]
-    fn a_lone_stray_decode_does_not_veto_a_well_supported_candidate() {
+    fn a_lone_single_observation_rival_still_overrides_by_shape() {
         let mut ledger = SupportLedger::new(FS);
         ledger.observe(1, "K5ARH", 4, 0, 0.3);
         ledger.observe(1, "K5ARHT", 6, 5_000, 0.3);
         ledger.observe(1, "K5ARH", 8, 10_000, 0.3);
 
-        assert!(
-            ledger.better_supported_rival(1, "K5ARH", 10_000).is_none(),
-            "a lone 1-rep glued-tail artifact must not veto a well- \
-             supported (>= 2 message-distinct reps) genuine call"
+        let rival = ledger.better_supported_rival(1, "K5ARH", 10_000).expect(
+            "a single-observation prefix-extension rival must still \
+                 override by shape -- the accepted trade-off for catching \
+                 the ticket's own real 1-rep-rival case",
         );
+        assert_eq!(rival.0, "K5ARHT");
     }
 
     /// MAN-100 remediation C1: the truncation-arrives-first ordering. The

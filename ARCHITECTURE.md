@@ -302,11 +302,14 @@ transmission may never produce again).
    relationship or a shared ≥ 3-character prefix at edit distance ≤ 2;
    better-supported meaning strictly more message-distinct repetitions (ties
    broken by summed per-occurrence confidence), or the candidate being a
-   strict prefix of a rival with ≥ 1 repetition of its own that itself
-   clears the same ≥ 2-rep floor a spottable candidate must (MAN-100
-   remediation C5) — and, symmetrically, a rival that is itself a strict
-   prefix of the candidate never wins this comparison regardless of its
-   own repetition count (MAN-100 remediation C1: shape decides a
+   strict prefix of a rival that has been observed at all (≥ 1 repetition
+   of its own — shape decides once a rival exists, regardless of how
+   little support it has; MAN-100 remediation round 3 reverted an earlier
+   attempt to also require the rival to clear the same ≥ 2-rep floor a
+   spottable candidate must, since that excluded the ticket's own
+   measured "W6JQ"/"W6JQA" case) — and, symmetrically, a rival that is itself
+   a strict prefix of the candidate never wins this comparison regardless of
+   its own repetition count (MAN-100 remediation C1: shape decides a
    prefix-containment pair in both directions, not just when arbitrating
    the shorter form). This closes the gap that let a track spot both a
    real callsign and a fading-truncated fragment of it as if they were two
