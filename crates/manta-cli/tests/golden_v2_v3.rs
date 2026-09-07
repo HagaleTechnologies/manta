@@ -22,41 +22,31 @@ fn decode_report(
     (serde_json::from_slice(&out.stdout).unwrap(), manifest)
 }
 
-/// Re-measured against the real detector/track manager (M2 sub-project 2,
-/// Task 11 Step 1). Two entirely different findings for this test's two
-/// gates:
-///
-/// **CER: the originally-diagnosed bug (pin 7/8,
-/// docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md) looks fixed.**
-/// That pin blamed keying jitter interacting with the channelizer's
-/// transient response at V2's near-channel-edge offset (-8200 Hz, -0.4667
-/// channels from center), measuring 8.94-23% CER under the old placeholder
-/// detector. Under the real detector this is now CER 0.0325 (full 90 s V2
-/// scene, with jitter) / 0.0203 (same, jitter removed) -- jitter now
-/// contributes ~1.2 points, not 8-23. Both numbers match pure SPEC §2.1
-/// warmup-floor dilution (same mechanism as every other Task 11 Step 0 fix
-/// in this plan): CER shrinks with scene duration (90s: 0.0325, 200s:
-/// 0.0128, 400s: 0.0064, converging toward 0), with a clean decode
-/// throughout the middle of the scene. Left un-widened here (rather than
-/// given a Step-0-style measured tolerance) because of the WPM finding
-/// below -- no point tuning one gate on a test that fails its other gate
-/// for an unrelated reason.
-///
-/// **WPM: a new, different, NOT-warmup-related bug, still unresolved.**
-/// V2's "35 +/- 2 WPM" gate reports ~29.1, and this does NOT improve with
-/// longer scenes (90s/200s/400s all read 29.05-29.12 -- flat, not warmup
-/// dilution). Isolated: an on-channel-center offset (otherwise identical)
-/// reads 33.94 WPM (near the SPEC band), while the near-edge offset reads
-/// ~28.6-29.1 regardless of jitter. This is a real, persistent,
-/// near-channel-edge-specific WPM-estimation bug, unrelated to jitter,
-/// warmup, or duration -- filed as
-/// <https://github.com/HagaleTechnologies/manta/issues/24>. Per this
-/// plan's own guidance ("if V2 still fails, treat as a bug in Tasks 4-8 to
-/// diagnose, not a tolerance to widen"), left `#[ignore]`d pending that
-/// investigation.
+/// MAN-103 acceptance test (supersedes MAN-7, `#4` in the lens-3 broad
+/// review): V2 is the near-channel-edge case (-8200 Hz, -0.4667 channels
+/// from center). SPEC §7 gates it at 35 +/- 2 WPM. Was persistently,
+/// duration-independently ~29.1 WPM (root cause: the `sqrt(E_hi*E_lo)`
+/// keying threshold sits far enough below the signal at high SNR to fire on
+/// the channelizer's own edge transient, stretching every mark -- worse the
+/// slower that transient is, i.e. worse near a channel edge). Fixed by
+/// `Demod`'s unbiased edge placement (`envelope.rs`) plus `SpeedTracker`'s
+/// symmetric dit-period estimate (`timing.rs`) -- see
+/// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
+#[test]
+fn v2_wpm_is_within_spec_tolerance() {
+    let spec = manta_testkit::vectors::v2();
+    let (report, _manifest) = decode_report(&spec);
+    let wpm = report["wpm"].as_f64().unwrap();
+    assert!((wpm - 35.0).abs() < 2.0, "wpm {wpm}");
+}
+
+/// CER only: SPEC §2.1 warmup-floor dilution (see the historical doc
+/// comment this test inherited), unrelated to MAN-103/MAN-7's WPM bug --
+/// left `#[ignore]`d, tracked separately from the now-passing WPM gate
+/// above.
 #[test]
 #[ignore]
-fn v2_passes_end_to_end_from_wav() {
+fn v2_char_accuracy_meets_spec() {
     let spec = manta_testkit::vectors::v2();
     let (report, manifest) = decode_report(&spec);
     let decoded = report["text"].as_str().unwrap();
@@ -67,8 +57,6 @@ fn v2_passes_end_to_end_from_wav() {
         manifest.keyed_texts[0],
         decoded
     );
-    let wpm = report["wpm"].as_f64().unwrap();
-    assert!((wpm - 35.0).abs() < 2.0, "wpm {wpm}");
 }
 
 #[test]

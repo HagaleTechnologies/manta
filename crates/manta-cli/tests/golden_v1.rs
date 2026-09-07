@@ -66,16 +66,12 @@ fn v1_passes_end_to_end_from_wav() {
     }
 
     // WPM sanity (V1 is 20 WPM; SPEC only gates WPM at V2 but it's free
-    // here). Re-measured (Task 11 Step 2) against SPEC's original +/-2 WPM:
-    // still doesn't clear it -- measured error 2.353 WPM (17.647 reported),
-    // deterministic (reproduced identically across 3 runs). Left at the
-    // wider +/-3 WPM bound (pin 10,
-    // docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md), which the
-    // measured error clears with a real (~28 %) margin: the real detector's
-    // element on/off transient response narrows the gap from M2 sub-project
-    // 1's original measurement but doesn't fully close it. Not SPEC-gated
-    // (this check is a "free" bonus), so left as a measured, explained
-    // deviation rather than pursued further.
+    // here). MAN-103 fixed the keying-threshold placement (`envelope.rs`)
+    // and the dit-period estimate (`timing.rs`) that used to inflate every
+    // mark -- the widened +/-3 WPM bound this test carried while that bug
+    // was open (measured error 2.353 WPM, 17.647 reported) is no longer
+    // needed; back to SPEC's original +/-2 WPM. See
+    // docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
     let wpm = report["wpm"].as_f64().unwrap();
-    assert!((wpm - 20.0).abs() < 3.0, "wpm {wpm}");
+    assert!((wpm - 20.0).abs() < 2.0, "wpm {wpm}");
 }

@@ -164,7 +164,11 @@ impl TrackDecoder {
                 return;
             }
             match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
-                GapClass::InterElement => {}
+                GapClass::InterElement => {
+                    if live {
+                        self.tracker.on_element_gap(dur_ms);
+                    }
+                }
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
@@ -197,8 +201,15 @@ impl TrackDecoder {
             self.demod.open_space_start_ts(),
         ) {
             let gap_ms = hops as f32 * HOP_MS as f32;
+            let mu_dit_ms = self.tracker.mu_dit_ms();
             let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
-            if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
+            if gap_ms >= flush_dits * mu_dit_ms {
+                // MAN-103 D8: this gap bypasses classify() entirely, so fold
+                // it into the Farnsworth long-gap statistics here or
+                // long_seen can never reach FARNS_MIN_COUNT on a signal
+                // whose character gaps are routinely resolved by this flush
+                // (docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md).
+                self.gaps.observe_flushed(gap_ms, mu_dit_ms);
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
                 // drained space itself is not separately gap-classified —

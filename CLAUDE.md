@@ -11,8 +11,12 @@ M1 implemented (live audio decode; manual W1AW live-copy run still
 outstanding). All M2 sub-projects implemented (PFB channelizer;
 detector/track manager + decoder pool; V8/V8w pileup + CPU-budget bench;
 SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
-2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2 is a tracked
-near-channel-edge WPM bug (MAN-7/103), unrelated to fading. **V5/V6/V8w's
+2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; **MAN-7/MAN-103's
+near-channel-edge WPM bug is fixed** (`Demod` keying-edge placement +
+`SpeedTracker` symmetric dit-period estimate — see
+docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md): V2's WPM gate
+passes at 35±2; V2's CER gate stays separately tracked (SPEC §2.1
+warmup-floor dilution, unrelated). **V5/V6/V8w's
 fading-robustness gap is classical-DSP work to fix before M4** (MAN-107
 through MAN-113), not deferred to M4 ML fusion by design — see
 docs/DECISIONS/2026-09-06-broad-review-decisions.md D8. **M2 acceptance

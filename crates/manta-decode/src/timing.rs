@@ -10,20 +10,23 @@ const WPM_ALPHA: f32 = 0.1; // SPEC §4.1 reporting EMA
 const DRIFT_LEN: usize = 12; // SPEC §4.1 regime-change rule
 const DRIFT_CV_MAX: f64 = 0.35;
 const DRIFT_OFF_FRAC: f64 = 0.40;
-// SPEC §9 decode.char_gap_dits. **[DEVIATION]** SPEC §4.2 pins 2.0; lowered
-// to 1.6 here -- see docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md.
-// Demod's hysteresis+debounce (SPEC §3.3) adds a roughly constant ~15-20ms
-// overshoot to every measured mark but not to gap durations, so mu_dit_ms
-// (built from marks) runs high relative to true keyed timing. At high WPM
-// (short true dit period) that constant overshoot is a large fraction of
-// mu_dit, compressing gap_ms/mu_dit_ms ratios enough that real
-// inter-character gaps can fall under the nominal 2.0 threshold and get
-// merged into the preceding character. A 500-case sweep at 10-40 WPM found
-// this misclassifies ~2.2% of multi-character texts at 2.0; 1.6 fixed the
-// large majority of those (11 -> 4 failures, reproduced across two
-// independent random seeds) with zero cases regressing pass -> fail.
-const CHAR_GAP_DITS: f32 = 1.6;
+// SPEC §9 decode.char_gap_dits, nominal 2.0. MAN-103 retired the prior 1.6
+// **[DEVIATION]** (docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md): that
+// value compensated for `Demod`'s old geometric-mean threshold inflating
+// every measured mark; with MAN-103's threshold-placement fix (`envelope.rs`)
+// and the symmetric dit-period estimate below, mu_dit_ms is no longer
+// systematically high and the compensation's reason for existing is gone --
+// see docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
+const CHAR_GAP_DITS: f32 = 2.0;
 const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
+/// Two-sided cap on `SpeedTracker::dit_estimate_ms`'s mark/gap symmetry
+/// correction, as a fraction of `mu_dit`. SPEC §4.1 **[DEVIATION]** (MAN-103
+/// D6, docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md). Bounds a
+/// runaway if mark/gap pairing ever breaks down (e.g. element gaps swallowed
+/// by the 12 ms debounce at extreme WPM) while still admitting the negative
+/// correction the corrected SPEC §3.3 threshold requires (a mark now reads
+/// short by the transmitter's rise time, not long).
+const DIT_BIAS_CAP_FRAC: f32 = 0.35;
 const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
                                // SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
                                // which is the practical floor for this constant: `ClusterPair::observe`
@@ -220,6 +223,11 @@ pub struct SpeedTracker {
     ring: VecDeque<(f32, bool, f32, f32)>, // (dur_ms, assigned_dit, pre_lo, pre_hi)
     wpm_ema: Option<f32>,
     recent: VecDeque<f32>, // last 5 marks, reinit source
+    /// EMA centroid of inter-element gap durations, in ms. MAN-103 D6
+    /// (docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md): `None`
+    /// until the first `on_element_gap`, so `dit_estimate_ms` can fall back
+    /// to `mu_dit_ms` before any gap has been observed.
+    mu_egap_ms: Option<f32>,
 }
 
 impl SpeedTracker {
@@ -231,6 +239,7 @@ impl SpeedTracker {
             ring: VecDeque::with_capacity(DRIFT_LEN),
             wpm_ema: None,
             recent: VecDeque::with_capacity(5),
+            mu_egap_ms: None,
         }
     }
 
@@ -252,6 +261,47 @@ impl SpeedTracker {
     /// The dit/dah decision boundary: geometric mean of the two centroids. SPEC §4.1.
     pub fn boundary_ms(&self) -> f32 {
         self.pair.boundary()
+    }
+
+    /// EMA centroid of inter-element gap durations, in ms, if any have been
+    /// observed. MAN-103 D6.
+    pub fn mu_egap_ms(&self) -> Option<f32> {
+        self.mu_egap_ms
+    }
+
+    /// Feed one inter-element gap duration, updating the gap centroid used
+    /// by `dit_estimate_ms`. SPEC §4.1 **[DEVIATION]** (MAN-103 D6).
+    pub fn on_element_gap(&mut self, dur_ms: f32) {
+        if !dur_ms.is_finite() || dur_ms <= 0.0 {
+            return;
+        }
+        self.mu_egap_ms = Some(match self.mu_egap_ms {
+            None => dur_ms,
+            Some(g) => g + CLUSTER_ALPHA * (dur_ms - g),
+        });
+    }
+
+    /// The dit period used for PARIS WPM reporting. MAN-103 D6/D1
+    /// (docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md): a
+    /// mark/space threshold crossing moves the mark/space boundary, it
+    /// neither creates nor destroys time, so `mu_dit + mu_egap = 2 *
+    /// true_dit` regardless of the boundary shift -- including the
+    /// transmitter's own rise time, which shortens every mark between its
+    /// 50 % points and lengthens every following gap by the same amount.
+    /// Falls back to `mu_dit_ms()` before any element gap has been
+    /// observed. `mu_dit_ms()` itself is left uncorrected: its consumers
+    /// (SPEC §4.2's `u = gap/mu_dit`, §4.3's beam likelihoods, §3.2's
+    /// `tau_hi`, §4.2's flush) want a centroid consistent with the marks
+    /// being classified, not an absolute physical estimate -- only the
+    /// reported WPM wants that.
+    pub fn dit_estimate_ms(&self) -> f32 {
+        let mu_dit = self.pair.lo;
+        let Some(g) = self.mu_egap_ms else {
+            return mu_dit;
+        };
+        let cap = DIT_BIAS_CAP_FRAC * mu_dit;
+        let delta = (0.5 * (mu_dit - g)).clamp(-cap, cap);
+        (mu_dit - delta).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1)
     }
 
     /// EMA-smoothed PARIS WPM (SPEC §4.1: 1200/mu_dit, alpha 0.1). None until ready.
@@ -280,7 +330,7 @@ impl SpeedTracker {
             }
             self.check_drift();
         }
-        let raw = 1200.0 / self.pair.lo;
+        let raw = 1200.0 / self.dit_estimate_ms();
         self.wpm_ema = Some(match self.wpm_ema {
             None => raw,
             Some(w) => w + WPM_ALPHA * (raw - w),
@@ -330,6 +380,11 @@ impl SpeedTracker {
             self.pair.reinit_from(&vals);
             self.apply_constraints();
             self.ring.clear();
+            // A regime change invalidates the old speed's gap centroid too
+            // (MAN-103 D6) -- carrying it forward would apply a
+            // mark/gap-symmetry correction sized for the pre-change speed
+            // against the just-reinitialized dit estimate.
+            self.mu_egap_ms = None;
         }
     }
 }
@@ -441,6 +496,25 @@ impl GapClassifier {
         }
         class
     }
+
+    /// Fold a gap that the decoder resolved OUTSIDE `classify` -- SPEC
+    /// §4.2's 7-dit safety-net flush -- into the Farnsworth long-gap
+    /// statistics. MAN-103 D8
+    /// (docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md):
+    /// `classify` is the only place `long_seen` and the long-gap
+    /// `ClusterPair` advance, and `decoder.rs`'s `check_flush` bypasses it.
+    /// That was harmless while `mu_dit` ran high (the old threshold's
+    /// overshoot, MAN-7/MAN-103): the flush threshold in ms sat above real
+    /// Farnsworth character gaps. With `mu_dit` corrected, `flush_gap_dits *
+    /// mu_dit` drops below them, the safety net intercepts nearly every
+    /// character gap, and the Farnsworth bootstrap can never complete.
+    pub fn observe_flushed(&mut self, gap_ms: f32, mu_dit_ms: f32) {
+        let u = gap_ms / mu_dit_ms;
+        if u >= FARNS_LONG_U {
+            self.pair.observe(u);
+            self.long_seen += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -522,16 +596,107 @@ mod tests {
         );
     }
 
+    /// MAN-103 D6: a mark/space boundary shift moves time from the mark to
+    /// the gap or back; it neither creates nor destroys it, so
+    /// `(mu_dit + mu_egap) / 2` is invariant to the shift's sign and size.
+    /// Both signs are exercised because the corrected `Demod` threshold
+    /// biases marks SHORT by the transmitter's rise time while the old,
+    /// uncorrected one biased them LONG by the same mechanism -- see
+    /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
+    #[test]
+    fn dit_estimate_is_invariant_to_boundary_shift() {
+        for delta in [-6.0f32, -2.0, 0.0, 2.0, 6.0] {
+            let true_dit = 60.0f32;
+            let mut t = SpeedTracker::new();
+            for _ in 0..20 {
+                t.on_mark(true_dit + delta);
+                t.on_mark(3.0 * true_dit + delta);
+                t.on_element_gap(true_dit - delta);
+            }
+            assert!(
+                (t.dit_estimate_ms() - true_dit).abs() < 1.0,
+                "delta {delta}: dit_estimate {}",
+                t.dit_estimate_ms()
+            );
+            assert!(
+                (t.wpm().unwrap() - 20.0).abs() < 0.5,
+                "delta {delta}: wpm {:?}",
+                t.wpm()
+            );
+        }
+    }
+
+    #[test]
+    fn dit_estimate_falls_back_to_mu_dit_before_any_element_gap() {
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        assert!(t.ready());
+        assert_eq!(t.dit_estimate_ms(), t.mu_dit_ms());
+    }
+
+    #[test]
+    fn dit_estimate_correction_is_capped_two_sided() {
+        let true_dit = 60.0f32;
+        // An absurdly long "element gap" (pairing breakdown, e.g. a real
+        // gap swallowed by debounce at extreme WPM) must not blow the dit
+        // estimate out to the gap's own scale in either direction.
+        let mut long = SpeedTracker::new();
+        for _ in 0..20 {
+            long.on_mark(true_dit);
+            long.on_mark(3.0 * true_dit);
+            long.on_element_gap(true_dit * 10.0);
+        }
+        assert!(
+            long.dit_estimate_ms() >= true_dit * (1.0 - DIT_BIAS_CAP_FRAC) - 1.0,
+            "dit_estimate {} under-capped",
+            long.dit_estimate_ms()
+        );
+        let mut short = SpeedTracker::new();
+        for _ in 0..20 {
+            short.on_mark(true_dit);
+            short.on_mark(3.0 * true_dit);
+            short.on_element_gap(0.01);
+        }
+        assert!(
+            short.dit_estimate_ms() <= true_dit * (1.0 + DIT_BIAS_CAP_FRAC) + 1.0,
+            "dit_estimate {} over-capped",
+            short.dit_estimate_ms()
+        );
+    }
+
+    #[test]
+    fn drift_reinit_clears_the_gap_centroid() {
+        // A stale mu_egap from before a QRQ step change must not leak a
+        // now-meaningless correction into the reinitialized dit estimate.
+        let mut t = SpeedTracker::new();
+        feed(&mut t, &[60.0, 180.0, 60.0, 60.0, 180.0]);
+        for _ in 0..3 {
+            feed(&mut t, &[60.0, 180.0, 60.0]);
+        }
+        for _ in 0..8 {
+            t.on_element_gap(60.0 - 6.0);
+        }
+        for _ in 0..14 {
+            t.on_mark(34.0); // fast dits -- triggers the drift reinit
+        }
+        assert!(
+            (t.dit_estimate_ms() - 34.0).abs() < 1.0,
+            "dit_estimate {} still carrying the stale 20wpm gap centroid",
+            t.dit_estimate_ms()
+        );
+    }
+
     #[test]
     fn gap_classification_nominal() {
-        // CHAR_GAP_DITS boundary is 1.6, not SPEC §4.2's nominal 2.0 --
-        // see docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md.
+        // CHAR_GAP_DITS boundary is SPEC §4.2's nominal 2.0 (MAN-103 D7:
+        // retired the 1.6 deviation -- see
+        // docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md).
         let mut g = GapClassifier::new();
         let mu = 60.0;
         assert_eq!(g.classify(60.0, mu), GapClass::InterElement); // 1 dit
         assert_eq!(g.classify(180.0, mu), GapClass::InterChar); // 3 dits
         assert_eq!(g.classify(420.0, mu), GapClass::InterWord); // 7 dits
-        assert_eq!(g.classify(95.0, mu), GapClass::InterElement); // < 1.6
+        assert_eq!(g.classify(108.0, mu), GapClass::InterElement); // 1.8 dits: < 2.0
         assert_eq!(g.classify(299.0, mu), GapClass::InterChar); // < 5.0
         assert_eq!(g.classify(300.0, mu), GapClass::InterWord); // >= 5.0
     }
@@ -551,6 +716,28 @@ mod tests {
         assert_eq!(g.classify(14.0 * mu, mu), GapClass::InterWord);
         // Element/char boundary is speed-locked, never Farnsworth-adjusted:
         assert_eq!(g.classify(1.5 * mu, mu), GapClass::InterElement);
+    }
+
+    /// MAN-103 D8: a gap the decoder resolved via the 7-dit safety-net
+    /// flush (never passed to `classify`) must still advance the
+    /// Farnsworth long-gap statistics, or `long_seen` can never reach
+    /// `FARNS_MIN_COUNT` when the flush intercepts gaps before `classify`
+    /// ever sees them.
+    #[test]
+    fn observe_flushed_advances_farnsworth_statistics() {
+        let mut g = GapClassifier::new();
+        let mu = 48.0;
+        for _ in 0..5 {
+            g.observe_flushed(6.0 * mu, mu);
+            g.observe_flushed(14.0 * mu, mu);
+        }
+        assert_eq!(g.long_seen, 10);
+        assert!(g.pair.ready());
+        // The now-bootstrapped Farnsworth threshold is live for a
+        // subsequent classify() call, same as if these had come through
+        // classify() directly.
+        assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(14.0 * mu, mu), GapClass::InterWord);
     }
 
     #[test]

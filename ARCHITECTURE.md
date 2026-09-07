@@ -185,13 +185,22 @@ Per track, operating on the ~375 Hz complex channel stream:
    (A separate tone-finder stage is unnecessary here — the PFB already did the
    frequency selection.)
 2. **Keying detection**: dual-rail noise/signal EMA estimators → adaptive
-   threshold at their geometric mean → key-down/key-up decisions with hysteresis
-   and minimum-duration debounce (the same keying-decision approach as dit,
-   simplified).
+   decision band centered on their *linear-amplitude midpoint* → key-down/
+   key-up decisions with hysteresis and minimum-duration debounce (the same
+   keying-decision approach as dit, simplified). **[DEVIATION, MAN-103]**: a
+   geometric-mean threshold sits close to the noise rail at high keying
+   depth, systematically inflating every measured mark (worse the slower the
+   recovered transient, e.g. near a channel edge) — see SPEC §3.2/§3.3 and
+   `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`.
 3. **Speed tracking**: online 2-means clustering of mark durations into
-   {dit, dah}; WPM = 1200/dit_ms, tracked with EMA. Handles 10–40+ WPM and drift;
-   Farnsworth spacing tolerated by decoupling inter-element and inter-word gap
-   thresholds (dit's speed-detector lesson).
+   {dit, dah}; reported WPM = `1200 / dit_estimate_ms`, where
+   `dit_estimate_ms` is a mark/gap-symmetric estimate (SPEC §4.1
+   **[DEVIATION]**, MAN-103) rather than the raw dit centroid alone — a
+   correctly-placed threshold still measures elements at their 50 %-crossing
+   points, which are one rise-time shorter than the nominal keyed length;
+   tracked with EMA. Handles 10–40+ WPM and drift; Farnsworth spacing
+   tolerated by decoupling inter-element and inter-word gap thresholds
+   (dit's speed-detector lesson).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over
    the Morse code tree** — small-Viterbi rather than hard thresholding, so a

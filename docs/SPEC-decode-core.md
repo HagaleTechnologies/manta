@@ -213,8 +213,20 @@ value. **Normalization is a single fixed scale per track:** divide `a[m]` by
 
 ### 3.2 Dual-EMA adaptive keying threshold
 
-State: `E_hi` (key-down level), `E_lo` (key-up level), threshold
-`T = sqrt(E_hi · E_lo)` (geometric mean, per ARCHITECTURE §5).
+State: `E_hi` (key-down level), `E_lo` (key-up level). **[DEVIATION]**
+(MAN-103, `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`,
+supersedes ARCHITECTURE §5's "geometric mean" framing): the keying decision
+band is centered on the **linear-amplitude midpoint**
+`mid = (E_hi + E_lo) / 2`, half-width `hyst_frac · (E_hi − E_lo)` — not the
+geometric mean `sqrt(E_hi · E_lo)`. At high apparent keying depth (large
+`E_hi / E_lo`) the geometric mean sits close to `E_lo` in linear terms, so a
+rising edge crosses it almost immediately while a falling edge must decay
+nearly all the way back down — inflating every measured mark, worse the
+slower the transient (e.g. near a channel edge, where the recovered
+envelope's own transition is slower). A band symmetric about the linear
+midpoint makes a rise's threshold-crossing delay equal a fall's, for any
+transition shape or keying depth, so the measured mark equals the signal's
+true 50 %-point duration.
 
 Initialization, from the first 375 hops (1 s) after ACTIVE:
 `E_hi = Q90(a)`, `E_lo = max(Q10(a), 1e-6)`. If `E_hi / E_lo < 2` (< 6 dB
@@ -222,12 +234,16 @@ apparent keying depth) the track stays in a *pre-decode* state and
 re-attempts initialization every 1 s; no elements are emitted (prevents
 decoding carriers/noise).
 
-Per-hop update — update only the rail the sample belongs to:
+Per-hop update — update only the rail the sample belongs to; a sample inside
+the decision band belongs to neither level and updates neither rail (a
+mid-transition sample training `E_hi` would drag the midpoint low and
+reintroduce a transition-width-dependent residual):
 
 ```
-if a[m] > T:  E_hi ← E_hi + α_hi · (a[m] − E_hi)
-else:         E_lo ← E_lo + α_lo · (a[m] − E_lo)
-T = sqrt(E_hi · E_lo)
+mid = (E_hi + E_lo) / 2
+half = hyst_frac * (E_hi - E_lo)
+if a[m] > mid + half:  E_hi ← E_hi + α_hi · (a[m] − E_hi)
+elif a[m] < mid - half: E_lo ← E_lo + α_lo · (a[m] − E_lo)
 ```
 
 Time constants: `τ_lo = 500 ms` fixed
@@ -242,9 +258,15 @@ Floors: `E_hi ≥ 2·E_lo` is enforced after every update (if violated, set
 
 ### 3.3 Key decision with hysteresis and debounce
 
-- Key-down when `a[m] > 1.25·T`; key-up when `a[m] < 0.80·T`
-  (±1.9 dB hysteresis about `T`); between the two bounds the previous state
-  holds.
+- **[DEVIATION]** (MAN-103, same doc as above): key-down when
+  `a[m] > mid + half`; key-up when `a[m] < mid - half`, using the same
+  `mid`/`half` decision band as §3.2's rail update; between the two bounds
+  the previous state holds. Replaces the old `1.25·T` / `0.80·T` band, which
+  was symmetric in the log domain (about the geometric mean) rather than the
+  linear one — the asymmetry §3.2 above describes. `hyst_frac = 0.15` is a
+  pure noise-immunity knob: the timing is provably independent of the band's
+  width for a time-symmetric transition, so this constant is tuned on
+  margin, not on any timing measurement.
 - **Debounce:** a run (mark or space) shorter than **12 ms (≈ 4.5 hops)** is
   merged into its neighbors (the two adjacent runs and the short run become
   one run of the neighbors' polarity). 12 ms ≈ half a dit at 50 WPM — nothing
@@ -286,14 +308,39 @@ space (i.e. `dit` iff `d < B`), then EMA the assigned centroid:
 **Constraints** — after every update enforce `2.2 ≤ μ_dah/μ_dit ≤ 4.5`
 (weighted keying and Farnsworth stay inside this window); on violation,
 re-anchor `μ_dah = 3·μ_dit`. Clamp `μ_dit` to `[20 ms, 150 ms]`
-(60 WPM .. 8 WPM); PARIS WPM = `1200 / μ_dit_ms`, EMA-smoothed with
-`α = 0.1` for reporting.
+(60 WPM .. 8 WPM).
+
+**[DEVIATION]** PARIS WPM reporting (MAN-103 D1/D6,
+`docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`): a correctly
+§3.3-placed threshold measures elements at their 50 %-crossing points, and a
+raised-cosine-shaped (or any other non-instantaneous) element is one full
+rise-time shorter between its 50 % points than its nominal keyed length —
+this is a property of the transmitted waveform, not a receiver defect, so
+§3.2/§3.3's threshold-placement fix alone cannot remove it. `SpeedTracker`
+also tracks `μ_egap`, the EMA centroid of inter-element gap durations
+(`on_element_gap`, same `α = 0.15` as the mark clusters). A threshold
+crossing moves the mark/space boundary; it neither creates nor destroys
+time, so `μ_dit + μ_egap = 2 · true_dit` regardless of that shift's size or
+sign — including the transmitter's own rise time, which shortens every mark
+between its 50 % points and lengthens the following gap by the same amount.
+Reported WPM is `1200 / dit_estimate_ms`, where
+`dit_estimate_ms = μ_dit − clamp(0.5·(μ_dit − μ_egap), −cap, cap)`,
+`cap = DIT_BIAS_CAP_FRAC · μ_dit` (`0.35`, two-sided — bounds a runaway if
+mark/gap pairing ever breaks down, e.g. an element gap swallowed by §3.3's
+12 ms debounce at extreme WPM), clamped to the same `[20, 150]` ms bound as
+`μ_dit`; falls back to `μ_dit` before any element gap has been observed.
+EMA-smoothed with `α = 0.1` for reporting. **`μ_dit` itself is left
+uncorrected** — §4.2's `u = gap/μ_dit`, §4.3's beam likelihoods, and §3.2's
+`τ_hi` all want a centroid consistent with the marks being classified, not
+an absolute physical estimate; only the reported WPM wants that.
 
 **Drift/regime change** — if 12 consecutive marks assign to a single cluster
 *and* their coefficient of variation < 0.35 *and* their mean is off that
 centroid by > 40 %, the operator has changed speed (QRQ/QRS): reinitialize
-from the last 5 marks. (Plain EMA tracking already follows ≤ ~20 % gradual
-drift; this rule catches step changes.)
+from the last 5 marks, and clear `μ_egap` (a stale gap centroid from the old
+speed would size the mark/gap-symmetry correction above against the
+just-reinitialized `μ_dit`). (Plain EMA tracking already follows ≤ ~20 %
+gradual drift; this rule catches step changes.)
 
 ### 4.2 Gap classification (spaces)
 
@@ -303,17 +350,16 @@ Nominal thresholds in dits (`u = gap_ms / μ_dit`):
 - `2.0 ≤ u < 5.0` → **inter-character**
 - `u ≥ 5.0` → **inter-word**
 
-**[DEVIATION]** The implementation uses `1.6`, not `2.0`, for the
-element/character boundary (`CHAR_GAP_DITS` in
-`crates/manta-decode/src/timing.rs`) — see
-`docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md`. §3.3's
-hysteresis+debounce systematically inflates measured `μ_dit` relative to
-true keyed timing without inflating gap durations the same way; at high WPM
-that overshoot is large enough relative to the (short) true dit period that
-real inter-character gaps can compute to under 2.0 dits and get merged into
-the preceding character. `1.6` was chosen empirically (500-case sweep, two
-independent seeds) as the value that captures the available fix with the
-smallest deviation from the nominal `2.0`.
+The implementation uses SPEC's nominal `2.0` for the element/character
+boundary (`CHAR_GAP_DITS` in `crates/manta-decode/src/timing.rs`). A prior
+deviation lowered it to `1.6` to compensate for §3.2/§3.3's old
+geometric-mean threshold inflating measured `μ_dit` relative to true keyed
+timing (`docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md`); MAN-103's
+threshold-placement fix and §4.1's symmetric dit-period estimate removed
+that inflation, retiring the deviation's reason for existing — see
+`docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`, which re-ran
+this section's original 500-case sweep methodology against the corrected
+timing.
 
 **Farnsworth decoupling** (ARCHITECTURE §5.3): run the same 2-means machinery
 on gaps with `u ≥ 1.5` (the "long gaps"), yielding `μ_cgap` (character gap)
@@ -325,7 +371,15 @@ character/word spacing is what Farnsworth stretches).
 
 A trailing space reaching `7·μ_dit` without a new mark forces character +
 word flush immediately (don't wait for the next mark to close a word —
-spots must not lag the transmission).
+spots must not lag the transmission), via `check_flush` rather than through
+this classifier. **[DEVIATION]** (MAN-103 D8,
+`docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`): that gap is
+folded into the Farnsworth long-gap statistics via
+`GapClassifier::observe_flushed`, so `long_seen` still advances — with
+`μ_dit` corrected (§4.1 above), this flush threshold in ms can drop below
+real Farnsworth character gaps, so most of them are resolved by the flush
+rather than by `classify` itself; without folding them in here, the
+Farnsworth bootstrap above could never complete.
 
 ### 4.3 Per-element likelihoods
 
@@ -561,11 +615,11 @@ block_channels = 32    block_allowance_db = 3.0
 
 [decode]
 timing_sigma = 0.25    beam_width = 4
-debounce_ms = 12       hyst_up = 1.25       hyst_down = 0.80
+debounce_ms = 12       hyst_frac = 0.15
 tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
 mu_ratio_bounds = [2.2, 4.5]
 char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
-cluster_alpha = 0.15
+cluster_alpha = 0.15   dit_bias_cap_frac = 0.35
 
 [input]
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]
@@ -591,3 +645,9 @@ allowlist = []
 4. Stopband target tightened from the implied ~60 dB to **80 dB** (§1.2) —
    free given 8 taps/branch, and pileup scenes (V8) have ≥ 27 dB dynamic
    range between neighbors.
+5. **Keying threshold at the linear midpoint, not the geometric mean**
+   (§3.2/§3.3, MAN-103, `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`):
+   ARCHITECTURE §5 describes "an adaptive threshold at their geometric mean";
+   at high apparent keying depth that threshold sits close to `E_lo` in
+   linear terms, systematically inflating every measured mark. Replaced by a
+   band symmetric about `(E_hi + E_lo) / 2`.

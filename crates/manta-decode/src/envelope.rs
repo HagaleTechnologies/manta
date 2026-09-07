@@ -7,8 +7,14 @@ use std::collections::VecDeque;
 /// SPEC §9 [decode] table defaults.
 #[derive(Debug, Clone)]
 pub struct DemodConfig {
-    pub hyst_up: f32,
-    pub hyst_down: f32,
+    /// Half-width of the keying decision band, as a fraction of the keying
+    /// depth (`E_hi - E_lo`). SPEC §3.3 **[DEVIATION]**: replaces the old
+    /// multiplicative `1.25`/`0.80` band -- see
+    /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md. A band
+    /// symmetric about the linear-amplitude midpoint (not the geometric
+    /// mean) is what makes a rising edge's threshold-crossing delay equal a
+    /// falling edge's, for any transition shape or keying depth (MAN-103).
+    pub hyst_frac: f32,
     pub debounce_ms: f64,
     pub tau_lo_ms: f64,
     pub tau_hi_init_ms: f64,
@@ -18,8 +24,7 @@ pub struct DemodConfig {
 impl Default for DemodConfig {
     fn default() -> Self {
         DemodConfig {
-            hyst_up: 1.25,
-            hyst_down: 0.80,
+            hyst_frac: 0.15,
             debounce_ms: 12.0,
             tau_lo_ms: 500.0,
             tau_hi_init_ms: 200.0,
@@ -75,7 +80,6 @@ pub struct Demod {
     a_ref: f32,
     e_hi: f32,
     e_lo: f32,
-    t: f32,
     alpha_hi: f32,
     alpha_lo: f32,
     key_down: bool,
@@ -102,7 +106,6 @@ impl Demod {
             a_ref: 1.0,
             e_hi: 0.0,
             e_lo: 0.0,
-            t: 0.0,
             alpha_hi,
             alpha_lo,
             key_down: false,
@@ -196,7 +199,6 @@ impl Demod {
             self.a_ref = a_ref;
             self.e_hi = e_hi;
             self.e_lo = e_lo;
-            self.t = (e_hi * e_lo).sqrt();
             // Pinned decision 4: replay the init window so its elements are
             // decoded. Only the successful window replays (decision 10).
             let start = buf.len() - INIT_HOPS;
@@ -236,22 +238,39 @@ impl Demod {
         out
     }
 
+    /// The keying decision band, symmetric about the linear-amplitude
+    /// midpoint of the two rails: `mid = (E_hi + E_lo) / 2`, half-width
+    /// `hyst_frac * (E_hi - E_lo)`. SPEC §3.2/§3.3 **[DEVIATION]** -- see
+    /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md (MAN-103
+    /// D2/D3). Shared by the rail update and the key decision (D5) so both
+    /// use exactly one definition of "which level does this sample belong
+    /// to."
+    fn decision_band(&self) -> (f32, f32) {
+        let lo = self.e_lo.max(E_LO_FLOOR);
+        let mid = 0.5 * (self.e_hi + lo);
+        let half = self.cfg.hyst_frac * (self.e_hi - lo);
+        (mid, half)
+    }
+
     fn step(&mut self, a_raw: f32, sample_ts: u64, out: &mut Vec<Run>) {
         let a = a_raw / self.a_ref;
-        // Pinned decision 9 ordering:
-        // (1) rail update against previous T (SPEC §3.2: update only the rail
-        //     the sample belongs to)
-        if a > self.t {
+        // Pinned decision 9 ordering, amended by MAN-103 D5:
+        // (1) rail update against the band computed from the PREVIOUS
+        //     rails -- only a sample confidently outside the decision band
+        //     trains a rail. A sample inside the band belongs to neither
+        //     level (SPEC §3.2); training E_hi from mid-transition samples
+        //     drags the midpoint low and reintroduces a transition-width-
+        //     dependent residual.
+        let (mid, half) = self.decision_band();
+        if a > mid + half {
             self.e_hi += self.alpha_hi * (a - self.e_hi);
-        } else {
+        } else if a < mid - half {
             self.e_lo += self.alpha_lo * (a - self.e_lo);
         }
         // (2) rail-collapse floor (SPEC §3.2)
         if self.e_hi < 2.0 * self.e_lo {
             self.e_hi = 2.0 * self.e_lo;
         }
-        // (3) recompute T
-        self.t = (self.e_hi * self.e_lo.max(E_LO_FLOOR)).sqrt();
         // SPEC §3.1: one-shot A_ref re-estimation if E_hi drifts 3x.
         if !self.reest_done
             && (self.e_hi > 3.0 || self.e_hi < 1.0 / 3.0)
@@ -263,16 +282,24 @@ impl Demod {
             let factor = self.a_ref / new_ref;
             self.e_hi *= factor;
             self.e_lo *= factor;
-            self.t *= factor;
             self.a_ref = new_ref;
             self.reest_done = true;
         }
-        // (4) key decision with hysteresis (SPEC §3.3)
+        // (3) key decision: symmetric about the midpoint (SPEC §3.3, D3).
+        // For a time-symmetric transition (manta's channelizer is provably
+        // linear-phase and the keyer's raised cosine is symmetric), a band
+        // placed symmetrically about the linear-amplitude midpoint makes
+        // the rise-crossing delay equal the fall-crossing delay for any
+        // transition width or keying depth -- the measured mark then equals
+        // the true 50%-crossing mark. The old multiplicative 1.25/0.80 band
+        // was symmetric in the log domain, not the linear one, and
+        // reintroduced the asymmetry this fix removes.
+        let (mid, half) = self.decision_band();
         if self.key_down {
-            if a < self.cfg.hyst_down * self.t {
+            if a < mid - half {
                 self.key_down = false;
             }
-        } else if a > self.cfg.hyst_up * self.t {
+        } else if a > mid + half {
             self.key_down = true;
         }
         // Run bookkeeping with debounce (SPEC §3.3, pinned decision 5).
@@ -439,6 +466,82 @@ mod tests {
         let h = d.open_space_hops().expect("open space");
         assert!(h >= 90, "open space {h} hops");
         assert!(d.open_space_start_ts().is_some());
+    }
+
+    /// Synthetic symmetric raised-cosine cycle: an "on" segment of `n_on`
+    /// hops (rise/fall of `ramp` hops each, contained inside the segment,
+    /// mirroring `manta-testkit::keyer`'s convention) riding between `e_lo`
+    /// and `e_hi`, followed by `n_off` flat hops at `e_lo`. The true
+    /// 50 %-crossing width of the "on" segment is `n_on - ramp` (rise and
+    /// fall each cross 50 % at `ramp/2` into the transition).
+    fn cycle_levels(n_on: usize, n_off: usize, ramp: usize, e_lo: f32, e_hi: f32) -> Vec<f32> {
+        let mut v = Vec::with_capacity(n_on + n_off);
+        for i in 0..n_on {
+            let up = if i < ramp {
+                0.5 * (1.0 - (std::f32::consts::PI * i as f32 / ramp as f32).cos())
+            } else {
+                1.0
+            };
+            let rem = n_on - 1 - i;
+            let down = if rem < ramp {
+                0.5 * (1.0 - (std::f32::consts::PI * rem as f32 / ramp as f32).cos())
+            } else {
+                1.0
+            };
+            v.push(e_lo + (e_hi - e_lo) * up.min(down));
+        }
+        for _ in 0..n_off {
+            v.push(e_lo);
+        }
+        v
+    }
+
+    /// MAN-103 mechanism gate: a correctly-placed keying edge measures a
+    /// mark at its true 50 %-crossing duration regardless of keying depth
+    /// or transition width. This is the test that pins the *mechanism*
+    /// (threshold placement) rather than any one end-to-end WPM number --
+    /// see docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
+    /// Pre-fix (`T = sqrt(E_hi*E_lo)`, multiplicative hysteresis) this fails
+    /// by up to 8 hops at the high-depth/wide-ramp corner.
+    #[test]
+    fn keying_edge_bias_is_within_one_hop_of_true_50pct_crossing() {
+        const N_ON: usize = 24;
+        const N_OFF: usize = 24;
+        for &depth_db in &[12.0f32, 20.0, 30.0, 40.0] {
+            for &ramp in &[2usize, 6, 12] {
+                let e_hi = 1.0f32;
+                let e_lo = 10f32.powf(-depth_db / 20.0);
+                let cycle = cycle_levels(N_ON, N_OFF, ramp, e_lo, e_hi);
+                let true_mark = (N_ON - ramp) as i64;
+
+                let mut d = Demod::new(DemodConfig::default());
+                let mut ts = 0u64;
+                let mut marks = Vec::new();
+                // Enough cycles to clear the 375-hop init window and settle
+                // the rails several time constants past it.
+                for _ in 0..60 {
+                    for &level in &cycle {
+                        for r in d.push(level, ts) {
+                            if r.mark {
+                                marks.push(r.hops as i64);
+                            }
+                        }
+                        ts += 256;
+                    }
+                }
+                let settled = &marks[marks.len() / 2..];
+                assert!(
+                    !settled.is_empty(),
+                    "no steady-state marks at depth {depth_db} dB ramp {ramp} hops"
+                );
+                for &m in settled {
+                    assert!(
+                        (m - true_mark).abs() <= 1,
+                        "depth {depth_db} dB ramp {ramp} hops: measured mark {m} hops, true {true_mark} hops"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
