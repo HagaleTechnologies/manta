@@ -145,6 +145,11 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
+    /// MAN-122 periodic status line cadence, seconds. `None` (field omitted)
+    /// uses `status::DEFAULT_STATUS_INTERVAL` (60 s); `0` disables the status
+    /// line entirely, for operators who ship logs by the byte.
+    #[serde(default)]
+    pub status_interval_secs: Option<u64>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.

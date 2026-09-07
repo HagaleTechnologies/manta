@@ -773,9 +773,43 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
+/// What the MAN-122 startup banner names about the live source; carried as
+/// one struct so `start_spot_server`'s argument list stays at four.
+struct SourceInfo<'a> {
+    name: &'a str,
+    sample_rate_hz: f64,
+    dial_freq_hz: f64,
+}
+
+/// MAN-122: the daemon's live track count, derived from the event stream
+/// `on_event` already sees. Mirrors manta-spot's `Validator`, which keys
+/// per-track state on *any* track-scoped event (`CharDecoded`,
+/// `WordBoundary`, `SpeedUpdate`, `TrackMeta` -- MAN-19's `Validator::
+/// ingest`), not `TrackMeta` alone: a track that decodes characters or
+/// crosses a word boundary inside its first second, or whose envelope
+/// demod never reaches `running()` at a 375-hop `TrackMeta` boundary,
+/// still gets counted. Frees on `TrackClosed`, and relies on the same
+/// invariant `Validator` does: every track that emits anything gets
+/// exactly one `TrackClosed`, including at end-of-stream via
+/// `TrackManager::finish()`.
+/// Returns true when the count changed and should be republished.
+fn note_track_event(
+    open: &mut std::collections::HashSet<u32>,
+    ev: &manta_decode::events::DecoderEvent,
+) -> bool {
+    use manta_decode::events::DecoderEvent;
+    match ev {
+        DecoderEvent::CharDecoded { track_id, .. }
+        | DecoderEvent::WordBoundary { track_id, .. }
+        | DecoderEvent::SpeedUpdate { track_id, .. }
+        | DecoderEvent::TrackMeta { track_id, .. } => open.insert(*track_id),
+        DecoderEvent::TrackClosed { track_id } => open.remove(track_id),
+    }
+}
+
 fn start_spot_server(
     config_path: &std::path::Path,
-    sample_rate_hz: f64,
+    source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
@@ -812,7 +846,7 @@ fn start_spot_server(
     let cfg = file.server;
 
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
-        sample_rate_hz,
+        source.sample_rate_hz,
         epoch,
         session_nonce,
     ));
@@ -830,6 +864,26 @@ fn start_spot_server(
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
+
+        // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
+        // failure never produces a "ready" line) but BEFORE any listener task is
+        // spawned -- on a multi-thread runtime a spawned accept loop can admit a
+        // client immediately, and its per-connection line would otherwise be able
+        // to land ahead of the banner. `local_addr()`, not the configured port,
+        // so a `*_port = 0` (ephemeral) config still names the real address.
+        tracing::info!(
+            "{}",
+            manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                source: source.name,
+                sample_rate_hz: source.sample_rate_hz,
+                dial_freq_hz: source.dial_freq_hz,
+                station_callsign: &cfg.station_callsign,
+                telnet_addr: telnet_listener.local_addr()?,
+                json_addr: json_listener.local_addr()?,
+                metrics_addr: metrics_listener.local_addr()?,
+            })
+        );
 
         let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::telnet::MAX_TELNET_COMMANDS,
@@ -908,6 +962,7 @@ fn start_spot_server(
         // Vec is empty). Each task owns its own SpotBus subscription and
         // backoff state, so one target being down never affects another's
         // delivery or retry timing.
+        let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
         for uplink_cfg in rbn_uplink_cfgs {
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
@@ -917,6 +972,17 @@ fn start_spot_server(
                 shutdown_rx.clone(),
             ));
         }
+
+        // MAN-122 scenario 2.
+        manta_server::status::spawn_status_line(
+            metrics.clone(),
+            cfg.status_interval_secs
+                .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
+                    std::time::Duration::from_secs(secs)
+                }),
+            enabled_uplinks,
+            shutdown_rx.clone(),
+        );
 
         anyhow::Ok(())
     })?;
@@ -1129,13 +1195,22 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                    let (rt, server) = start_spot_server(
+                        &path,
+                        SourceInfo {
+                            name: source_name,
+                            sample_rate_hz: src.sample_rate(),
+                            dial_freq_hz: src.center_freq_hz(),
+                        },
+                        epoch,
+                        session_nonce,
+                    )?;
                     // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` has no equivalent
-                    // hook yet -- manta-engine exposes no live track-count
-                    // API for `listen()`'s callbacks to read, so it stays
-                    // at Metrics::default()'s 0 until that surface exists.
+                    // and is running. `active_tracks` is populated below,
+                    // via `note_track_event` deriving a live count from the
+                    // `DecoderEvent` stream `on_event` already observes
+                    // (MAN-122) -- not through a `manta-engine` API, which
+                    // still exposes no live track-count surface of its own.
                     //
                     // MAN-55: for a source where `open()` succeeding
                     // doesn't confirm a live device (HPSDR's UDP
@@ -1165,6 +1240,7 @@ fn main() -> Result<()> {
                 None => (None, None),
             };
 
+            let mut open_tracks: std::collections::HashSet<u32> = std::collections::HashSet::new();
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
@@ -1175,11 +1251,16 @@ fn main() -> Result<()> {
                 &cfg,
                 stop,
                 |ev| {
+                    use manta_decode::events::DecoderEvent;
+                    if let Some(server) = &spot_server {
+                        if note_track_event(&mut open_tracks, ev) {
+                            server.metrics.set_active_tracks(open_tracks.len() as u64);
+                        }
+                    }
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
                     }
-                    use manta_decode::events::DecoderEvent;
                     use std::io::Write as _;
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
@@ -1328,6 +1409,39 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn open_tracks_follows_any_track_scoped_event_and_track_closed() {
+        use manta_decode::events::DecoderEvent;
+        let mut open = std::collections::HashSet::new();
+        let meta = |id| DecoderEvent::TrackMeta {
+            track_id: id,
+            snr_2500_db: 10.0,
+            freq_hz: 14_000_000.0,
+        };
+        note_track_event(&mut open, &meta(1));
+        note_track_event(&mut open, &meta(2));
+        note_track_event(&mut open, &meta(1)); // repeated TrackMeta must not double-count
+        assert_eq!(open.len(), 2);
+        // CR-1: a track that never reaches TrackMeta's 375-hop/~1s cadence
+        // (or whose demod never latches) must still be counted the moment
+        // it emits any other track-scoped event.
+        note_track_event(
+            &mut open,
+            &DecoderEvent::WordBoundary {
+                track_id: 3,
+                sample_ts: 0,
+            },
+        );
+        assert_eq!(open.len(), 3);
+        note_track_event(&mut open, &DecoderEvent::TrackClosed { track_id: 1 });
+        assert_eq!(open.len(), 2);
+        // A close for a track we never saw is a no-op, not a panic or an underflow.
+        note_track_event(&mut open, &DecoderEvent::TrackClosed { track_id: 99 });
+        assert_eq!(open.len(), 2);
+        note_track_event(&mut open, &DecoderEvent::TrackClosed { track_id: 3 });
+        assert_eq!(open.len(), 1);
     }
 
     #[test]
@@ -1599,7 +1713,11 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -1649,7 +1767,11 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -1708,7 +1830,11 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )

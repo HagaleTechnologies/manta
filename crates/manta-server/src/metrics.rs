@@ -113,6 +113,31 @@ impl Metrics {
         self.active_tracks.store(count, Ordering::Relaxed);
     }
 
+    /// Live-state getters for MAN-122's periodic status line. `Metrics` is
+    /// already the daemon's one shared, synchronously-readable handle on live
+    /// state (every subsystem holds an `Arc` clone of it), so the status task
+    /// reads it directly instead of parsing `render_prometheus_text()` back
+    /// out of a String.
+    pub fn spots_total(&self) -> u64 {
+        self.spots_total.load(Ordering::Relaxed)
+    }
+
+    pub fn active_tracks(&self) -> u64 {
+        self.active_tracks.load(Ordering::Relaxed)
+    }
+
+    pub fn telnet_clients(&self) -> i64 {
+        self.telnet_clients.load(Ordering::Relaxed)
+    }
+
+    pub fn json_clients(&self) -> i64 {
+        self.json_clients.load(Ordering::Relaxed)
+    }
+
+    pub fn ws_clients(&self) -> i64 {
+        self.ws_clients.load(Ordering::Relaxed)
+    }
+
     pub fn set_source_health(&self, source: &str, healthy: bool) {
         self.source_health
             .write()
@@ -529,5 +554,25 @@ mod tests {
         // A itself drops -- now nothing is connected.
         m.mark_uplink_disconnected();
         assert!(!m.uplink_connected());
+    }
+
+    // MAN-122: the periodic status line reads these getters directly
+    // instead of parsing render_prometheus_text() back out of a String.
+    #[test]
+    fn live_state_getters_read_back_what_the_recorders_wrote() {
+        let m = Metrics::new();
+        m.record_spot();
+        m.record_spot();
+        m.set_active_tracks(4);
+        m.inc_telnet_clients();
+        m.inc_json_clients();
+        m.inc_ws_clients();
+        m.dec_ws_clients();
+        assert_eq!(m.spots_total(), 2);
+        assert_eq!(m.active_tracks(), 4);
+        assert_eq!(
+            (m.telnet_clients(), m.json_clients(), m.ws_clients()),
+            (1, 1, 0)
+        );
     }
 }

@@ -313,11 +313,21 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `bounded_io` read rejections, malformed-WS-frame disconnects, and
   rejected metrics-endpoint requests are all logged (plain `fmt` output,
   `RUST_LOG`-controlled, default `info`) to give an operator a durable
-  record to reconstruct an abuse incident after the fact. Still
-  aspirational: `manta-input`/`manta-engine` carry no logging of their
-  own yet (decode-pipeline internals, not the network-facing surface
-  MAN-59 scoped to), and `manta --status` hitting a local control socket
-  for live stats is similarly not yet implemented. Prometheus text
+  record to reconstruct an abuse incident after the fact. **The daemon
+  also logs its own liveness** — landed 2026-09-07 (MAN-122,
+  `docs/DECISIONS/2026-09-07-man122-operator-liveness-logging.md`): one
+  startup banner (version, source, sample rate, dial frequency, station
+  callsign, real bound telnet/JSON/metrics addresses) logged once every
+  bind succeeds and before any listener task is spawned, plus a
+  rate-limited periodic status line (`manta_server::status`,
+  `status_interval_secs` in `[server]`, default 60 s, `0` disables) naming
+  active track count, spots/min, connected client count, and uplink
+  connection state. Still aspirational: `manta-input`'s and
+  `manta-engine`'s own internals carry no logging of their own yet
+  (decode-pipeline internals, not the network-facing surface MAN-59
+  scoped to, nor the daemon-lifecycle surface MAN-122 scoped to), and
+  `manta --status` hitting a local control socket for live stats is
+  similarly not yet implemented (MAN-44). Prometheus text
   endpoint (feature `metrics`): input overruns, active tracks, evictions,
   decode rate, spots/min, per-stage queue depths, spot confidence
   histogram — also aspirational for several of these fields; the
@@ -328,13 +338,15 @@ validation (MAN-28). Dedupe (step 5) still applies.
   gauges, `manta_source_health`, and the uplink counters
   (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
   per-stage queue depths, which MAN-56 tracks as a separate gap.
-  **`manta_active_tracks` is served but not populated** (corrected
-  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
-  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
-  own comment says the engine exposes no hook for it yet — so every
-  production daemon run reports a constant `0`, not a real track count.
-  Listed separately from the "currently-implemented" set above so an
-  operator doesn't read a served-but-frozen placeholder as live data.
+  **`manta_active_tracks` is now populated** (corrected 2026-09-07,
+  MAN-122): `main.rs`'s `on_event` closure derives a live count from the
+  `DecoderEvent` stream it already observes — inserting a `track_id` on
+  any track-scoped event (`CharDecoded`/`WordBoundary`/`SpeedUpdate`/
+  `TrackMeta`), removing it on `TrackClosed` (mirroring `manta-spot`'s
+  `Validator`, MAN-19, which keys the same way rather than on `TrackMeta`
+  alone) — and publishes it via `set_active_tracks` on every change, so
+  `manta_active_tracks` and the status line's `tracks=` field both report
+  a real, moving count instead of the previous permanent `0`.
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
