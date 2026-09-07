@@ -12,6 +12,7 @@ pub mod noise;
 pub mod timing;
 pub mod tree;
 
+pub use decoder::META_INTERVAL_HOPS;
 pub use envelope::SNR_BW_CORR_DB;
 
 /// Channel output (envelope) rate, invariant across input rates. SPEC §1.1.

@@ -78,7 +78,11 @@ impl Default for DecodeConfig {
     }
 }
 
-const META_INTERVAL_HOPS: u64 = 375; // SPEC §5: TrackMeta at 1 Hz cadence
+/// SPEC §5: `TrackMeta` at 1 Hz cadence. `pub` (MAN-102 review round 2,
+/// finding 2) so `manta-engine`'s peak-hold reset can align to this
+/// boundary directly, rather than only via `TrackMeta` actually firing --
+/// see `TrackDecoder::hop_count`.
+pub const META_INTERVAL_HOPS: u64 = 375;
 const WPM_REPORT_DELTA: f32 = 1.0; // SPEC §5: SpeedUpdate on >= 1 WPM change
 
 // SPEC §2.3: 10*log10(2500/93.75) -- same bandwidth correction as
@@ -189,6 +193,17 @@ impl TrackDecoder {
     /// setter exists to fix.
     pub fn set_snr_2500_db(&mut self, snr_2500_db: f32) {
         self.snr_2500_db = Some(snr_2500_db);
+    }
+
+    /// Hops fed to this decoder so far. `manta-engine`'s peak-hold reset
+    /// checks `hop_count() % META_INTERVAL_HOPS == 0` to detect the SPEC §5
+    /// reporting boundary independent of whether it actually produced a
+    /// `TrackMeta` -- it does not while `!self.demod.running()` (pre-init/
+    /// retrying, SPEC §3.2), and without this the peak window was
+    /// unbounded for however long init takes instead of one interval
+    /// (MAN-102 review round 2, finding 2).
+    pub fn hop_count(&self) -> u64 {
+        self.hop_count
     }
 
     /// One hop: linear amplitude, linear power, optional spectral noise
@@ -364,6 +379,7 @@ impl TrackDecoder {
             if let Some(snr) = snr {
                 events.push(DecoderEvent::TrackMeta {
                     track_id: self.track_id,
+                    sample_ts: self.last_ts,
                     snr_2500_db: snr,
                     freq_hz: self.freq_hz,
                 });

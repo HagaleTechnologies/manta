@@ -41,8 +41,14 @@ fn try_reported_snr_for(true_snr_2500_db: f32) -> Option<f32> {
 }
 
 fn reported_snr_for(true_snr_2500_db: f32) -> f32 {
-    try_reported_snr_for(true_snr_2500_db)
-        .unwrap_or_else(|| panic!("no spots produced for true SNR {true_snr_2500_db} dB"))
+    try_reported_snr_for(true_snr_2500_db).unwrap_or_else(|| {
+        // The sweep's own characterization run shows this vector's
+        // no-validated-spot cliff at 30 dB, one step above this CI test's
+        // highest point -- if this panics, check whether the cliff moved
+        // down before assuming a MAN-102 regression (review round 2,
+        // finding 3).
+        panic!("no spots produced for true SNR {true_snr_2500_db} dB")
+    })
 }
 
 #[test]

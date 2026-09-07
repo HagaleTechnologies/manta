@@ -395,15 +395,19 @@ pub(crate) struct Track {
     /// branch never activated). The *raw* per-hop SNR (MAN-102) is queued,
     /// not a pre-computed peak: `drain_pool` walks a track's items in
     /// order, maintaining `snr_peak_db` and resetting it the instant that
-    /// item's decoder push actually emits a `TrackMeta`, so the window
-    /// boundary lines up with the real report regardless of where a
-    /// `process_hops` batch happens to end, and two reports inside one
+    /// item's decoder push crosses a SPEC §5 reporting boundary
+    /// (`hop_count() % META_INTERVAL_HOPS == 0`), so the window boundary
+    /// lines up with the real report regardless of where a `process_hops`
+    /// batch happens to end, and two boundaries inside one
     /// batch each get their own reset. (MAN-102 review round 1, findings
     /// 2/3: an earlier version paired a pre-accumulated peak here and
     /// reset it once per `drain_pool` call at batch end, which made the
     /// reported value depend on the caller's chunk size -- `decode_samples`
     /// uses 4096-sample chunks, `listen`/`soak_metrics` use their own --
-    /// contradicting SPEC §6's determinism rule.)
+    /// contradicting SPEC §6's determinism rule. Review round 2, finding 2:
+    /// resetting only when `TrackMeta` actually emits left the window
+    /// unbounded while `!Demod::running()`, so the reset now keys off the
+    /// boundary itself, which fires every interval regardless.)
     pending: Vec<(f32, f32, Option<f32>, u64, f32)>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
@@ -600,17 +604,16 @@ impl Track {
             return Vec::new();
         };
         let pending = std::mem::take(&mut self.pending);
-        // MAN-102: same peak-hold/reset-on-TrackMeta pattern as
-        // `TrackManager::drain_pool` -- see that function's doc comment.
+        // MAN-102: same peak-hold/reset-at-reporting-boundary pattern as
+        // `TrackManager::drain_pool` -- see that function's doc comment
+        // (review round 2, finding 2: keyed to `hop_count() %
+        // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
         for (amp, raw_power, spectral_ref_power, ts, snr_db) in pending {
             self.snr_peak_db = self.snr_peak_db.max(snr_db);
             decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
             let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-            if hop_events
-                .iter()
-                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. }))
-            {
+            if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                 self.snr_peak_db = f32::NEG_INFINITY;
             }
             events.extend(hop_events);
@@ -635,17 +638,16 @@ impl Track {
             return Vec::new();
         };
         let pending = std::mem::take(&mut self.pending);
-        // MAN-102: same peak-hold/reset-on-TrackMeta pattern as
-        // `TrackManager::drain_pool` -- see that function's doc comment.
+        // MAN-102: same peak-hold/reset-at-reporting-boundary pattern as
+        // `TrackManager::drain_pool` -- see that function's doc comment
+        // (review round 2, finding 2: keyed to `hop_count() %
+        // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
         for (amp, raw_power, spectral_ref_power, ts, snr_db) in pending {
             self.snr_peak_db = self.snr_peak_db.max(snr_db);
             decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
             let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-            if hop_events
-                .iter()
-                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. }))
-            {
+            if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                 self.snr_peak_db = f32::NEG_INFINITY;
             }
             events.extend(hop_events);
@@ -1359,8 +1361,10 @@ impl TrackManager {
         // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
         // free it -- see events.rs's TrackClosed doc for the unbounded-
         // growth bug this fixes. Re-sorted with the rest per SPEC §6 rule
-        // 6; `event_sample_ts` gives these no ordering claim (ties at 0,
-        // same as SpeedUpdate/TrackMeta).
+        // 6; `event_sample_ts` gives these no ordering claim of their own
+        // (synthetic `u64::MAX`, same treatment as `SpeedUpdate`'s
+        // synthetic `0` -- see that function's doc; `TrackMeta` now
+        // carries a real timestamp, MAN-102 review round 2).
         events.extend(
             closed_ids
                 .into_iter()
@@ -1460,23 +1464,27 @@ impl TrackManager {
                 for (amp, raw_power, spectral_ref_power, ts, snr_db) in pending {
                     // MAN-102: SPEC §2.3's floor-based estimate, in the
                     // 2500 Hz reference bandwidth, held at its peak since
-                    // this track's last `TrackMeta` (see `snr_peak_db`'s and
-                    // `pending`'s doc comments on `Track`). The reset below,
-                    // right after a push that actually emits `TrackMeta`,
-                    // is what makes the window boundary land on the real
-                    // report instead of on this call's batch boundary
-                    // (review round 1 findings 2/3). Consumed only by the
-                    // `Legacy` engine (`TrackDecoder::tick_meta`);
+                    // this track's last SPEC §5 reporting boundary (see
+                    // `snr_peak_db`'s and `pending`'s doc comments on
+                    // `Track`). The reset below is keyed to the boundary
+                    // itself (`hop_count() % META_INTERVAL_HOPS == 0`), not
+                    // to `TrackMeta` actually being emitted: before
+                    // `Demod::running()` (init/retrying, SPEC §3.2) no
+                    // `TrackMeta` fires at all, and resetting only on
+                    // emission left the peak window unbounded for however
+                    // long init took instead of one interval (review round
+                    // 2, finding 2). This still lands on the exact hop a
+                    // report fires when one does (review round 1 findings
+                    // 2/3): the boundary check is the same hop the decoder
+                    // itself gates `TrackMeta` emission on. Consumed only by
+                    // the `Legacy` engine (`TrackDecoder::tick_meta`);
                     // `EdgeLegacy`/`Hsmm` source their own SPEC v2 §2.3
                     // evidence-derived estimate instead, so this call is
                     // harmless but inert for those two engines.
                     *peak = peak.max(snr_db);
                     decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
                     let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-                    if hop_events
-                        .iter()
-                        .any(|e| matches!(e, DecoderEvent::TrackMeta { .. }))
-                    {
+                    if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
                         *peak = f32::NEG_INFINITY;
                     }
                     out.extend(hop_events);
@@ -1490,27 +1498,35 @@ impl TrackManager {
 }
 
 /// SPEC §6 rule 6 resequencing key: the sample timestamp an event is
-/// anchored to, `0` for events with no inherent timestamp (`SpeedUpdate`/
-/// `TrackMeta`, which sort first among ties on `event_track_id`), or
-/// `u64::MAX` for `TrackClosed` -- a synthetic "after everything" marker,
-/// not `0` (round 7 review): `TrackClosed` isn't anchored to a real
-/// timestamp either, but unlike `SpeedUpdate`/`TrackMeta` it must never
-/// sort before another real event for the SAME track_id (a track's own
-/// final `CharDecoded`/`WordBoundary`, `finish()`'s flush) -- doing so
-/// lets a consumer free that track's state and then recreate it
-/// processing the trailing events, with nothing left to ever clean that
-/// up again (the exact leak this whole mechanism exists to prevent).
-/// `MAX` guarantees that regardless of how large a real `sample_ts`
-/// grows. This is what lets `finish()` (and `process_hops`) apply ONE
-/// consistent `(sample_ts, track_id)` sort across the whole batch
-/// (SPEC-decode-core.md §6 rule 6) instead of the append-without-
+/// anchored to, `0` for `SpeedUpdate` (no inherent timestamp -- sorts
+/// first among ties on `event_track_id`), or `u64::MAX` for `TrackClosed`
+/// -- a synthetic "after everything" marker, not `0` (round 7 review):
+/// `TrackClosed` isn't anchored to a real timestamp either, but unlike
+/// `SpeedUpdate` it must never sort before another real event for the
+/// SAME track_id (a track's own final `CharDecoded`/`WordBoundary`,
+/// `finish()`'s flush) -- doing so lets a consumer free that track's state
+/// and then recreate it processing the trailing events, with nothing left
+/// to ever clean that up again (the exact leak this whole mechanism exists
+/// to prevent). `MAX` guarantees that regardless of how large a real
+/// `sample_ts` grows. This is what lets `finish()` (and `process_hops`)
+/// apply ONE consistent `(sample_ts, track_id)` sort across the whole
+/// batch (SPEC-decode-core.md §6 rule 6) instead of the append-without-
 /// re-sorting workaround round 4 used.
+///
+/// `TrackMeta` carries a real `sample_ts` rather than tying at `0` like
+/// `SpeedUpdate` (MAN-102 review round 2 finding: pinning it to `0` sorted
+/// every `TrackMeta` ahead of its *entire* emitting batch, including
+/// earlier-hop `CharDecoded`/`WordBoundary` events from the same batch, so
+/// a just-reset/just-reported SNR value could retroactively attach to
+/// characters decoded before it -- with the magnitude depending on the
+/// caller's chunk size (`decode_samples` vs. `listen`/`soak_metrics`)).
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }
-        | DecoderEvent::TrackPromoted { sample_ts, .. } => *sample_ts,
-        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
+        | DecoderEvent::TrackPromoted { sample_ts, .. }
+        | DecoderEvent::TrackMeta { sample_ts, .. } => *sample_ts,
+        DecoderEvent::SpeedUpdate { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
 }

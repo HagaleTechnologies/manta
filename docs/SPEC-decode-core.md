@@ -517,7 +517,7 @@ Per track, an ordered event stream:
 CharDecoded    { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
 WordBoundary   { track_id, sample_ts: u64 }
 SpeedUpdate    { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
-TrackMeta      { track_id, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
+TrackMeta      { track_id, sample_ts: u64, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
 TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;
                  added post-freeze, 2026-09-09 — the exact hop a track is
                  promoted from CANDIDATE to ACTIVE, independent of whether the
@@ -533,6 +533,14 @@ TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
 over the reporting interval, per §2.3), supplied by the detector layer that
 owns the gate/floor state -- not the §3.2 keying-rail ratio §4.5's `q` uses
 (MAN-102 / decision D3).
+
+`TrackMeta.sample_ts` is the hop that produced it, so §6 rule 6's
+`(sample_ts, track_id)` resequencing places it in its true chronological
+position -- not a synthetic tie value -- among the same batch's
+`CharDecoded`/`WordBoundary` events (MAN-102 review round 2, finding 1:
+tying it to a synthetic `0` let a just-reported SNR retroactively attach to
+characters decoded earlier in the same batch, with the effect's magnitude
+depending on the caller's chunk size).
 
 `sample_ts` is the input-stream sample counter (u64, monotonic from stream
 start). Wall-clock time exists only at the spot-emission boundary

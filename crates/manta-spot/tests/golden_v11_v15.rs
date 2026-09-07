@@ -50,6 +50,7 @@ fn run(events: &[DecoderEvent], v: &mut Validator) -> Vec<Spot> {
 fn seed_meta(v: &mut Validator, track_id: u32) {
     v.ingest(&DecoderEvent::TrackMeta {
         track_id,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
     });
@@ -166,6 +167,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
     // increase for the dedupe override below.
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 0.0,
         freq_hz: 14_000_000.0,
     });
@@ -187,6 +189,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
 
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 6.0,
         freq_hz: 14_000_000.0,
     });
@@ -313,6 +316,7 @@ fn v22_exempt_spot_waits_for_track_metadata_before_emitting() {
     // so the spot comes out of this same ingest call.
     let more_spots = v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
     });
@@ -394,6 +398,7 @@ fn v25_pending_candidate_retried_when_metadata_arrives_with_no_further_words() {
 
     let spots = v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
     });
@@ -659,6 +664,7 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
 
     let spots = v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
     });

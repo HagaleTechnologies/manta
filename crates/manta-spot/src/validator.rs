@@ -501,6 +501,7 @@ impl Validator {
                 track_id,
                 snr_2500_db,
                 freq_hz,
+                ..
             } => {
                 let track = self.tracks.entry(*track_id).or_default();
                 let had_meta = track.has_meta;
@@ -1291,6 +1292,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn seed_meta(v: &mut Validator, track_id: u32) {
         v.ingest(&DecoderEvent::TrackMeta {
             track_id,
+            sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_000_000.0,
         });
@@ -1826,6 +1828,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             &mut v,
         );
         v.ingest(&DecoderEvent::TrackMeta {
+            sample_ts: 0,
             track_id: 2,
             snr_2500_db: 20.0,
             freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket
@@ -1849,6 +1852,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1); // freq_hz 14_000_000.0
         v.ingest(&DecoderEvent::TrackMeta {
+            sample_ts: 0,
             track_id: 2,
             snr_2500_db: 20.0,
             freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket
@@ -1877,6 +1881,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             .unwrap();
         v.ingest(&DecoderEvent::TrackMeta {
             track_id: 1,
+            sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: RAW_FREQ_HZ,
         });
@@ -1898,6 +1903,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         v.ingest(&DecoderEvent::TrackMeta {
             track_id: 1,
+            sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_027_000.0,
         });
@@ -2068,6 +2074,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // small/stale relative to the far-future check below.
         for track_id in 0..2_000u32 {
             v.ingest(&DecoderEvent::TrackMeta {
+                sample_ts: 0,
                 track_id,
                 snr_2500_db: 20.0,
                 freq_hz: 14_000_000.0 + (track_id as f64) * 1000.0,
