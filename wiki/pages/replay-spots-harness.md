@@ -19,7 +19,7 @@ links:
 
 ```
 cargo build --release -p manta-cli --example replay_spots
-manta --release decode --json v8w.wav > v8w-report.json   # the slow part, once
+cargo run --release -p manta-cli -- decode --json v8w.wav > v8w-report.json   # the slow part, once
 ./target/release/examples/replay_spots v8w-report.json calls.txt | tail -2
 === ingest 13.6 ms over 21028 events
 === spots=30 distinct=27 validated=22/50 bogus=5 ["AB2TTLK","K6F","W4KTNL","W6DW","W6JQ"]

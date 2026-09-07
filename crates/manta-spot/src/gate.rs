@@ -13,7 +13,10 @@
 
 use std::collections::BTreeMap;
 
-const WINDOW_SECONDS: f64 = 90.0;
+/// Shared with `support::SupportLedger` (MAN-100 remediation C6) so the
+/// gate and the ledger can never drift into arbitrating against a
+/// different window than the one the repetition gate itself uses.
+pub(crate) const WINDOW_SECONDS: f64 = 90.0;
 
 /// MAN-100 Scenario 2. SPEC's payload template "CQ CQ DE <CALL> <CALL> K"
 /// puts one message's two utterances a single word apart; the closest two

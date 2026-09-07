@@ -302,26 +302,28 @@ transmission may never produce again).
    relationship or a shared ≥ 3-character prefix at edit distance ≤ 2;
    better-supported meaning strictly more message-distinct repetitions (ties
    broken by summed per-occurrence confidence), or the candidate being a
-   strict prefix of a rival with ≥ 1 repetition of its own — and, symmetrically,
-   a rival that is itself a strict prefix of the candidate never wins this
-   comparison regardless of its own repetition count (MAN-100 remediation
-   C1: shape decides a prefix-containment pair in both directions, not just
-   when arbitrating the shorter form). This closes the gap that let a track
-   spot both a real callsign and a fading-truncated fragment of it as if
-   they were two different stations — measured on a 50-signal CCIR-poor
-   pileup at an 18% busted-spot rate among distinct spotted calls, none of
-   which `c_call` alone could distinguish (bogus and genuine confidence
-   ranges overlapped completely). Purely subtractive: this step can only
-   withhold a spot the rest of the pipeline would have emitted, never
-   produce one, so it can never itself cause a false spot. Never fires
-   against an operator-allowlisted callsign, one present in the bundled
-   `master.scp`, or a `SpotType::Beacon` candidate (MAN-100 remediation C3)
-   — the beacon exemption mirrors step 4's own repetition-gate exemption
-   immediately above: a once-per-cycle beacon's rep count is structurally
-   low, so a confusable rival's fading-corrupted repeat could otherwise
-   outrank and permanently suppress the genuine beacon on rep count alone.
-   All three exemptions trade toward recall on exactly the population RBN
-   cares about, at the cost (measured as zero on the available multi-signal
+   strict prefix of a rival with ≥ 1 repetition of its own that itself
+   clears the same ≥ 2-rep floor a spottable candidate must (MAN-100
+   remediation C5) — and, symmetrically, a rival that is itself a strict
+   prefix of the candidate never wins this comparison regardless of its
+   own repetition count (MAN-100 remediation C1: shape decides a
+   prefix-containment pair in both directions, not just when arbitrating
+   the shorter form). This closes the gap that let a track spot both a
+   real callsign and a fading-truncated fragment of it as if they were two
+   different stations — measured on a 50-signal CCIR-poor pileup at an 18%
+   busted-spot rate among distinct spotted calls, none of which `c_call`
+   alone could distinguish (bogus and genuine confidence ranges overlapped
+   completely). Purely subtractive: this step can only withhold a spot the
+   rest of the pipeline would have emitted, never produce one, so it can
+   never itself cause a false spot. Never fires against an
+   operator-allowlisted callsign, one present in the bundled `master.scp`,
+   or a `SpotType::Beacon` candidate (MAN-100 remediation C3) — the beacon
+   exemption mirrors step 4's own repetition-gate exemption immediately
+   above: a once-per-cycle beacon's rep count is structurally low, so a
+   confusable rival's fading-corrupted repeat could otherwise outrank and
+   permanently suppress the genuine beacon on rep count alone. All three
+   exemptions trade toward recall on exactly the population RBN cares
+   about, at the cost (measured as zero on the available multi-signal
    test scenes, for the allowlist/SCP pair) of occasionally letting a
    truncation or confusable variant of an exempt call through unarbitrated.
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress

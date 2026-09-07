@@ -524,7 +524,12 @@ s comfortably covers a full "CQ CQ DE `<CALL>` `<CALL>` K" transmission even
 at 8 WPM (this section's slowest supported speed, ~40 s for that template)
 with margin, while staying well under the 90 s ledger/gate window itself.
 The beacon/allowlist exemptions above are unaffected — they never consult
-`r`'s distinctness rule at all.
+`r`'s distinctness rule at all. A short "DE `<CALL>`" ID repeated only
+twice at ordinary (sub-60 s) cadence remains unspotted under this rule — an
+accepted, bounded recall cost (MAN-100 remediation C2, quantified; V36),
+not tightened further: any time-gap threshold low enough to rescue it would
+also treat a single corrupted message's own doubled utterance as two
+distinct messages, reopening the hole this rule exists to close.
 
 **Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
 Before a candidate spots, it is checked against every other decoded,
@@ -534,18 +539,25 @@ window. It is withheld if a confusable, better-supported rival exists —
 shared prefix of at least 3 characters with edit distance ≤ 2 — where
 "better-supported" means strictly more message-distinct repetitions (ties
 broken by summed per-occurrence confidence), or the candidate being a
-strict prefix of a rival that itself has ≥ 1 repetition. Symmetrically, a
-rival that is itself a strict prefix of the candidate never wins this
-comparison on repetition count alone (MAN-100 remediation C1) — shape
-decides a prefix-containment pair in both directions, not just when the
-shorter form is being arbitrated. This mechanism is purely subtractive: it
-can only withhold a spot the rest of this section would otherwise emit,
-never produce one, and it never fires against an operator-allowlisted
-callsign, one present in the bundled SCP list, or a candidate already
-type-tagged `BEACON` (MAN-100 remediation C3 — the same once-per-cycle
-reasoning as this section's own beacon repetition-gate exemption above: a
-beacon's structurally low rep count would otherwise let a confusable,
-fading-corrupted rival permanently outrank it). See
+strict prefix of a rival that itself has ≥ 2 message-distinct repetitions
+(MAN-100 remediation C5 — the same floor a spottable candidate must itself
+clear; a single stray, garbled decode that happens to be a textual
+prefix-extension of a well-supported candidate is not enough on its own to
+veto it). Symmetrically, a rival that is itself a strict prefix of the
+candidate never wins this comparison on repetition count alone (MAN-100
+remediation C1) — shape decides a prefix-containment pair in both
+directions, not just when the shorter form is being arbitrated. This
+mechanism is purely subtractive: it can only withhold a spot the rest of
+this section would otherwise emit, never produce one, and it never fires
+against an operator-allowlisted callsign, one present in the bundled SCP
+list, or a candidate already type-tagged `BEACON` (MAN-100 remediation C3 —
+the same once-per-cycle reasoning as this section's own beacon
+repetition-gate exemption above: a beacon's structurally low rep count
+would otherwise let a confusable, fading-corrupted rival permanently
+outrank it). The per-track ledger this arbitration reads evicts an entry
+once its newest observation ages out of the 90 s window (MAN-100
+remediation C6), so a long-lived track's key space stays bounded by what's
+currently live rather than growing with track history. See
 `manta-spot::variant`/`manta-spot::support` for the exact relation and
 comparison, and the MAN-100 decision record for the measured rationale
 behind the prefix-only asymmetry.
@@ -704,6 +716,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V33 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
 | V34 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
 | V35 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
+| V36 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
 
 ---
 

@@ -180,7 +180,9 @@ calls without having been tuned to make any measured test pass.
   `cq_call_with_trailing_t_spots_once_as_cq_not_beacon`) were updated to
   source their second repetition from a genuinely separate message —
   their original subject (provenance binding; the CQ/DE power-step guard)
-  is unchanged.
+  is unchanged. V33-V35 (arrival-order, short-ID time gap, beacon exemption)
+  added in the first remediation round; V36 (short-ID ordinary-cadence
+  acceptance) added in the second.
 
 ## Risks and how each is bounded
 
@@ -259,6 +261,65 @@ pinned with golden vectors V33–V35 (`docs/SPEC-decode-core.md` §7.1).
   (tuned for calls that must clear ≥ 2 reps to spot at all) systematically
   displace a true beacon spot with a false one.
 
+## Second remediation round (validate-plan attempt 3, 2026-09-07)
+
+The second validate-plan pass found the first remediation round's own golden
+vector for Scenario 1 (V31) was non-discriminating (it passed unchanged on
+`e398d46`, because `context::parse`'s single-match-per-window `DE_RE` never
+let "K5AR" surface as its own candidate in that event sequence), plus three
+further code-review gaps in the shipped mechanism.
+
+- **F1/F2 — V31 was vacuous.** Fixed by applying the same 16-word
+  filler-aging technique V33/V35 already use: age the well-supported
+  genuine call's earlier context match fully out of the window before the
+  truncation is ever decoded, so the truncation reaches its own 2 reps
+  (clearing the bare repetition gate on its own -- confirmed red on
+  `e398d46`, green on this branch) and is only then arbitrated against the
+  already-observed genuine call.
+- **C5 — `longer_containment` had no support floor.** The prefix-shape
+  override let a rival win `better_supported_rival` on shape alone with as
+  little as 1 observation, however badly supported. Measured: a single
+  garbled "K5ARHT" (a stray trailing "T" glued onto the real call) vetoed a
+  3-rep "K5ARH" outright, with nothing spotted in its place -- the mirror
+  image of the head-merge case this same file already protects against in
+  the other direction. Fixed by requiring the rival to also clear
+  `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE = 2` (`support.rs`) -- the same floor
+  every other spottable candidate must itself clear. All five of this
+  ticket's originally-measured truncation cases had multi-rep rivals, so
+  this floor does not move them.
+- **C6 — `SupportLedger::seen` keys never expired.** `observe` only pruned
+  the one entry it had just touched; a text observed once and never again
+  kept its key (and its now-stale observations) forever, freed only by
+  `forget_track` on `TrackClosed` -- which a long-lived track, exactly the
+  24 h-soak shape MAN-19 exists for, never triggers mid-run. Fixed by
+  sweeping every `(track_id, *)` entry whose newest observation has aged
+  out of the window on every `observe` call, bounding both the per-track
+  key count and the O(keys) cost `better_supported_rival` pays per
+  candidate evaluation to what's currently live, not to track history.
+- **C2, quantified — accepted, not tightened.** A short "DE `<CALL>`" ID
+  repeated at ordinary (sub-60 s) cadence regresses under the message-gap
+  rule: a station that IDs exactly twice, 20 s apart, is not spotted at
+  all (a station that keeps IDing is merely delayed one transmission, since
+  the greedy chain eventually clears the 3-word gap across occurrences 1
+  and 3). Not tightened: any `MIN_MESSAGE_TIME_GAP_SECONDS` low enough to
+  rescue a 20 s cadence would also treat a single corrupted "CQ CQ DE
+  `<CALL>` `<CALL>` K" message's own doubled utterance -- typically only a
+  few seconds apart -- as two distinct messages, reopening the exact hole
+  this rule exists to close. Pinned as accepted, current behaviour by V36
+  rather than left unquantified.
+
+Not re-run against the real V8w/V8 fixtures this round (same constraint the
+first validate-plan pass recorded: the fixture-dump step is uncommitted
+scratch code and the container lacks the disk/time for a fresh release
+decode) -- the "does not move the measured cases" claims above are
+analytical, not re-measured: C5's floor (>= 2 rival reps) is already
+cleared by all five originally-measured truncation cases per the first
+round's own analysis, and C6 only removes ledger entries that have already
+aged past the 90 s window `better_supported_rival` itself reads, so it
+cannot change any live comparison's outcome. Confirmed instead by the unit
+and golden-vector suites in `support.rs` and `golden_v11_v15.rs`, including
+new vectors for both fixes.
+
 ## References
 
 - Ticket: MAN-100.
@@ -267,7 +328,7 @@ pinned with golden vectors V33–V35 (`docs/SPEC-decode-core.md` §7.1).
   pending MAN-100 through MAN-113), D8 (classical-DSP fixes before M4).
 - Code: `crates/manta-spot/src/variant.rs`, `crates/manta-spot/src/support.rs`,
   `crates/manta-spot/src/gate.rs`, `crates/manta-spot/src/validator.rs`.
-- Vectors: `docs/SPEC-decode-core.md` §4.6, §7.1 (V29, V31, V32, V33–V35);
+- Vectors: `docs/SPEC-decode-core.md` §4.6, §7.1 (V29, V31, V32, V33–V36);
   `crates/manta-spot/tests/golden_v11_v15.rs`.
 - Replay harness: `crates/manta-cli/examples/replay_spots.rs`,
   `wiki/pages/replay-spots-harness.md`.

@@ -13,8 +13,9 @@ pub fn common_prefix_len(a: &str, b: &str) -> usize {
 }
 
 /// Levenshtein (edit) distance between `a` and `b`. Callsigns are capped
-/// at 8 characters by `grammar::is_plausible` (a 7-character base plus an
-/// optional 1-character portable designator), so the plain two-row DP is
+/// at 11 characters by `grammar::is_plausible` (a 7-character base plus
+/// an optional `/` and up to a 3-character portable designator -- `/P`,
+/// `/QRP`, `/MM`, `/AM`, `/M`, or `/<digit>`), so the plain two-row DP is
 /// already trivially cheap -- no bounded/early-exit variant is warranted.
 /// (`manta-testkit::cer` has a sibling implementation, but it's a
 /// test-only crate that `manta-spot` must not depend on.)

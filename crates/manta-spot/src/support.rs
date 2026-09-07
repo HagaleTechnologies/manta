@@ -10,14 +10,21 @@
 //! `BTreeMap`, never `HashMap` (rule 3) -- this state feeds directly into
 //! whether a `Spot` is emitted, so its iteration order is output-affecting.
 
-use crate::gate::{self, MIN_MESSAGE_TIME_GAP_SECONDS};
+use crate::gate::{self, MIN_MESSAGE_TIME_GAP_SECONDS, WINDOW_SECONDS};
 use crate::variant::{self, Relation};
 use std::collections::BTreeMap;
 
-/// Same window as the repetition gate (`gate::WINDOW_SECONDS`) -- this
-/// ledger arbitrates against evidence the gate would itself still
-/// consider live.
-const WINDOW_SECONDS: f64 = 90.0;
+/// A shape-only override (`longer_containment` below) must still clear
+/// the same minimum standalone support any spottable candidate itself
+/// must clear (`validator.rs`'s own `reps < 2` gate) -- otherwise a
+/// single stray, garbled decode that happens to be a textual
+/// prefix-extension of a well-supported genuine call could permanently
+/// veto it (MAN-100 remediation C5: measured, a lone "K5ARHT" glued-tail
+/// artifact suppressed a 3-rep "K5ARH" outright, with nothing spotted in
+/// its place). The measured V8/V8w truncation cases this override exists
+/// for all had multi-rep rivals, so this floor costs nothing on real
+/// data while closing the single-stray-decode failure mode.
+const MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE: u32 = 2;
 
 /// One observed decode of a plausible-shaped word on a track.
 struct Obs {
@@ -86,6 +93,32 @@ impl SupportLedger {
         });
         let cutoff = sample_ts.saturating_sub(self.window_samples);
         entry.retain(|o| o.sample_ts >= cutoff);
+        self.evict_aged_out(track_id, cutoff);
+    }
+
+    /// Drops every `(track_id, *)` entry whose newest observation has
+    /// aged out of the window (MAN-100 remediation C6). Without this,
+    /// `seen` grows one entry per distinct plausible-shaped garble ever
+    /// decoded on a long-lived track: `observe`'s own `retain` only
+    /// prunes the ONE entry it just touched, so a text never observed
+    /// again keeps its last (now-stale) observations, and its key,
+    /// forever -- `forget_track` only helps once the whole track closes,
+    /// which the 24h-soak shape MAN-19 exists for never does mid-run.
+    /// Swept on every `observe` call rather than lazily, so both the
+    /// per-track key count and the O(keys) cost `better_supported_rival`
+    /// pays per candidate evaluation stay bounded by what's live in the
+    /// window, not by track history.
+    fn evict_aged_out(&mut self, track_id: u32, cutoff: u64) {
+        let stale: Vec<(u32, String)> = self
+            .seen
+            .range((track_id, String::new())..)
+            .take_while(|(k, _)| k.0 == track_id)
+            .filter(|(_, obs)| obs.iter().all(|o| o.sample_ts < cutoff))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            self.seen.remove(&k);
+        }
     }
 
     /// Folds `obs` into `Support` by calling the SAME shared greedy
@@ -172,10 +205,15 @@ impl SupportLedger {
             // prefix-only: it must never fire in the other direction, or
             // a genuine call would lose to a merge artifact that happened
             // to decode first (see `variant::relation`'s docs and the
-            // MAN-100 decision record for the measured 25:0 split).
+            // MAN-100 decision record for the measured 25:0 split). Still
+            // gated on `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE`, though: shape
+            // alone is trusted to override a support comparison, but not
+            // to override the same >= 2-rep floor every other spottable
+            // candidate must itself clear (MAN-100 remediation C5).
             let longer_containment = rel == Relation::Containment
                 && text.len() > candidate.len()
-                && text.starts_with(candidate);
+                && text.starts_with(candidate)
+                && s.reps >= MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE;
             // The reverse must also be shape-decided, not support-decided
             // (MAN-100 remediation C1): when the CANDIDATE is the longer
             // form and `text` is a strict prefix of it, `text` is the
@@ -282,9 +320,13 @@ mod tests {
         assert_eq!(rival.0, "W4KCL");
     }
 
-    /// The measured track-90 shape: W6JQ 3 reps beats W6JQA 1 rep on plain
-    /// support, but W6JQ is a strict prefix of W6JQA -- the containment
-    /// asymmetry must still let the longer form win.
+    /// The measured track-90 shape: W6JQ 3 reps beats W6JQA 2 reps on
+    /// plain support, but W6JQ is a strict prefix of W6JQA -- the
+    /// containment asymmetry must still let the longer form win. W6JQA
+    /// carries 2 (not 1) reps here specifically to also clear
+    /// `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE` (MAN-100 remediation C5) --
+    /// see `a_lone_stray_decode_does_not_veto_a_well_supported_candidate`
+    /// for the case where it doesn't.
     #[test]
     fn a_strict_prefix_loses_to_a_longer_form_even_with_more_reps() {
         let mut ledger = SupportLedger::new(FS);
@@ -292,11 +334,33 @@ mod tests {
         ledger.observe(1, "W6JQ", 19, 10_000, 0.3);
         ledger.observe(1, "W6JQ", 47, 20_000, 0.3);
         ledger.observe(1, "W6JQA", 30, 15_000, 0.3);
+        ledger.observe(1, "W6JQA", 40, 18_000, 0.3);
 
         let rival = ledger
             .better_supported_rival(1, "W6JQ", 20_000)
             .expect("W6JQA must beat W6JQ via the prefix-containment asymmetry");
         assert_eq!(rival.0, "W6JQA");
+    }
+
+    /// MAN-100 remediation C5: a lone, 1-rep stray decode that happens to
+    /// be a textual prefix-extension of a well-supported genuine call
+    /// must NOT veto it -- shape alone is not enough; the rival must also
+    /// clear `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE`. Measured: a single
+    /// garbled "K5ARHT" (a trailing "T" glued onto the real call)
+    /// suppressed a 3-rep "K5ARH" outright, with nothing spotted in its
+    /// place.
+    #[test]
+    fn a_lone_stray_decode_does_not_veto_a_well_supported_candidate() {
+        let mut ledger = SupportLedger::new(FS);
+        ledger.observe(1, "K5ARH", 4, 0, 0.3);
+        ledger.observe(1, "K5ARHT", 6, 5_000, 0.3);
+        ledger.observe(1, "K5ARH", 8, 10_000, 0.3);
+
+        assert!(
+            ledger.better_supported_rival(1, "K5ARH", 10_000).is_none(),
+            "a lone 1-rep glued-tail artifact must not veto a well- \
+             supported (>= 2 message-distinct reps) genuine call"
+        );
     }
 
     /// MAN-100 remediation C1: the truncation-arrives-first ordering. The
@@ -389,6 +453,28 @@ mod tests {
             ledger.seen.len(),
             0,
             "seen must not accumulate one entry per historical track_id"
+        );
+    }
+
+    /// MAN-100 remediation C6: reproduces the 24h-soak shape MAN-19 exists
+    /// for, but WITHOUT track churn -- a single, long-lived track that
+    /// keeps decoding new, never-repeated garbled words well outside each
+    /// other's 90s window. `forget_track` (MAN-19's fix) never fires here
+    /// since the track never closes; only `observe`'s own aging-out
+    /// eviction can bound growth.
+    #[test]
+    fn a_single_long_lived_track_stays_bounded_as_its_garbles_age_out() {
+        let mut ledger = SupportLedger::new(FS);
+        let window_samples = (WINDOW_SECONDS * FS) as u64;
+        for i in 0..10_000u64 {
+            let text = format!("K{i}AB");
+            ledger.observe(1, &text, i, i * (window_samples + 1), 0.5);
+        }
+        assert_eq!(
+            ledger.seen.len(),
+            1,
+            "seen must not accumulate one entry per historical garble on a \
+             single long-lived track once each ages out of the window"
         );
     }
 }
