@@ -43,18 +43,25 @@ Debug profile (what CI's `cargo test --workspace` uses), 2 vCPU container:
 | Ignored CER test alone | 196.85 s | 196.85 s (unchanged) |
 
 `cargo test --workspace` runs one test binary at a time, so the
-workspace-level delta equals the per-binary delta: **+182.8 s per required
-CI leg**. That leg is not paid twice — it is paid **six** times per push.
-`golden_v8_v8w.rs` lives in `manta-cli`, and three required jobs build and
-run `manta-cli`'s test binaries, each across `strategy.matrix.os:
+workspace-level delta equals the per-binary delta: **+182.8 s per CI leg**.
+That leg is not paid twice — it is paid **six** times per push.
+`golden_v8_v8w.rs` lives in `manta-cli`, and three jobs build and run
+`manta-cli`'s test binaries, each across `strategy.matrix.os:
 [ubuntu-latest, macos-latest]`: `test` (`cargo test --workspace`,
 `ci.yml:207`), `test-soapy` (`cargo test -p manta-input -p manta-cli
 --features soapy`, `ci.yml:227`), and `test-hpsdr` (`cargo test -p
-manta-input -p manta-cli --features hpsdr`, `ci.yml:245`). None of the
-three feature-gates `golden_v8_v8w` away, so `cargo test -p manta-cli`
-builds and runs every integration test in the package on all six legs.
-Total added CI wall-clock is therefore **~6 x 183 s ≈ 18-19 minutes of
-serial cost per push**, not ~6 minutes. The single-sample 193.40 s/196.76 s
+manta-input -p manta-cli --features hpsdr`, `ci.yml:245`). Only `test`
+(`ubuntu-latest`/`macos-latest`) is a **required** context under
+`docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md:26-27,64-66`;
+`test-soapy` and `test-hpsdr` are not — a red run on either does not block
+auto-merge. None of the three feature-gates `golden_v8_v8w` away, though,
+so `cargo test -p manta-cli` builds and runs every integration test in the
+package on all six legs regardless of which are required. Those six legs
+run **concurrently** as independent GitHub Actions jobs, so added CI
+**wall-clock** is therefore approximately **one leg, ~3-4 minutes**, not
+six times that. Added **billed runner-time**, summed across all six legs,
+is **~6 x 183 s ≈ 18-19 minutes** (before any macOS runner-minute
+multiplier) — a real cost, but not a serial wall-clock one. The single-sample 193.40 s/196.76 s
 figures above are not perfectly stable run to run: three independent
 measurements on this container class (same code, same machine) produced
 193 s, 229 s, and 237 s, so treat "~183-240 s per leg" as the honest range
