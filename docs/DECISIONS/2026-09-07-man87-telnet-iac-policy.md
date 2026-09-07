@@ -211,8 +211,46 @@ character-identical by construction.
   `command::parse` — same predicate, same reason: `read_line_bounded_telnet`
   recognizes `CR NUL` as a line terminator (above) on both reads, and
   `command::parse`'s `str::trim` does not strip the trailing NUL, so an
-  unrimmed `"sh/dx\r\0"` tokenized to `["SH", "DX", "\0"]` and matched no
+  untrimmed `"sh/dx\r\0"` tokenized to `["SH", "DX", "\0"]` and matched no
   command arm — an interactive client could log in but every command it
   sent was silently ignored (round-3 validation, code-review finding 1).
   `command.rs` is outside this ticket's change scope, so the trim happens
   at the `telnet.rs` call site rather than inside `command::parse`.
+
+## Round 4 (remediation, validate-plan code-review findings F1/F2)
+
+**F1 — negotiation-reply write failure went unlogged and uncounted.**
+`telnet.rs`'s mid-session negotiation-reply flush (inside the command
+`select!` loop) was the one write-failure site in `handle_client` that
+returned a bare `Ok(())` instead of closing the accounting gap every other
+write site in the same function already closes (round-11/13/15 review
+findings): a `tracing::warn!` plus `metrics.record_write_failed(rx.len()
+as u64)`, matching the filter-ack site immediately below it. Fixed inline
+— one-line application of an established pattern in the same function.
+
+**F2 — a keepalive-only client could be disconnected with "line exceeds
+maximum length".** Round 3 (above) predicted this exact failure and
+deferred it as "real but rare," naming the fix shape in advance: "a budget
+that is bounded (never fully releasable to an attacker) but distinct from
+the ordinary line-content cap." That is what round 4 implements.
+`IacFilter` now tracks two separate counters instead of one:
+`raw_line_bytes` (application-content bytes only, reset on line
+completion — same release semantics as before, just narrower scope) and
+`framing_bytes` (protocol-framing bytes, accumulated over the whole
+connection lifetime, never reset by `reset_line`). `bounded_io::
+MAX_FRAMING_BYTES` (1 MiB) bounds the latter. This is not round 2's
+reverted fix: round 2 fully released the (then-shared) budget on any
+framing-only read, which made a pure-framing flood unbounded. Here framing
+bytes are never released, only diverted to a separate, larger counter —
+a flood still trips a fixed, finite cap (proven by the updated
+`telnet_variant_caps_a_flood_of_negotiation_that_never_ends_a_line`
+test, now driven past `MAX_FRAMING_BYTES` instead of `MAX_LINE_BYTES`),
+while realistic keepalive traffic (PuTTY's `IAC NOP`, even every few
+seconds for weeks) stays well under it (proven by the new
+`telnet_variant_keepalive_only_traffic_does_not_trip_the_line_cap` test,
+reproducing round 3's exact 600-keepalive-pair repro and asserting the
+line still reads).
+
+F3 (no timeout backstop for a client blocked waiting on a mid-session
+negotiation reply) remains unfixed, per round 3's own "revisit only if a
+real client is observed doing that" stance — no code change in round 4.

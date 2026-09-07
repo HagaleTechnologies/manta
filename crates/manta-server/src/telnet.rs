@@ -441,6 +441,22 @@ async fn handle_client(
                 if iac.has_replies() {
                     let replies = iac.take_replies();
                     if write_with_timeout(&mut wr, &replies).await.is_err() {
+                        // A bare `Ok(())` here (the prior behavior) was the
+                        // only write-failure site in this function that
+                        // left the accounting gap open -- the same one
+                        // every other write site already closes (round-15
+                        // review finding). The failed write itself isn't a
+                        // queued spot, so only the retained live-channel
+                        // backlog counts here (no `1 +`), matching the
+                        // filter-ack site below.
+                        // MAN-87 remediation (round-4 validation, code-
+                        // review finding F1).
+                        if log_enabled {
+                            tracing::warn!(
+                                "telnet: negotiation reply write failed, disconnecting"
+                            );
+                        }
+                        metrics.record_write_failed(rx.len() as u64);
                         return Ok(());
                     }
                 }

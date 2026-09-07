@@ -47,13 +47,30 @@ enum State {
 pub struct IacFilter {
     state: State,
     replies: Vec<u8>,
-    /// Raw bytes consumed for the line currently being assembled,
-    /// negotiation included. The line-length cap counts RAW bytes, not
-    /// surviving text bytes, so stripping IAC can never turn
-    /// `MAX_LINE_BYTES` into an unbounded read. Lives here rather than
-    /// in the read function because it, too, must survive a
-    /// `tokio::select!` cancellation mid-line.
+    /// Raw APPLICATION-content bytes consumed for the line currently
+    /// being assembled -- i.e. bytes `push` returned `Some` for.
+    /// Protocol framing no longer counts here (see `framing_bytes`), so
+    /// this is released the same way it always was: on line completion
+    /// or a read error. Lives here rather than in the read function
+    /// because it must survive a `tokio::select!` cancellation mid-line.
     pub raw_line_bytes: usize,
+    /// Raw protocol-framing bytes consumed -- i.e. bytes `push` returned
+    /// `None` for -- accumulated over the CONNECTION's whole lifetime,
+    /// never reset by `reset_line`. Split out from `raw_line_bytes`
+    /// (MAN-87 remediation, round-4 validation code-review finding F2):
+    /// counting framing bytes against the per-line budget meant a
+    /// keepalive-only client (PuTTY's telnet keepalive is `IAC NOP`)
+    /// accumulated that budget across its entire session and was
+    /// eventually disconnected with "line exceeds maximum length" having
+    /// never sent anything resembling a long line. A separate,
+    /// connection-lifetime budget (`bounded_io::MAX_FRAMING_BYTES`, checked
+    /// by the caller) is large enough that realistic keepalive traffic
+    /// never approaches it, while still bounding a pure-framing flood (an
+    /// `IAC SB` stream with no closing `IAC SE`, or a fast `IAC NOP`
+    /// trickle) to a fixed amount of work -- unlike review round 2's
+    /// now-reverted fix, which fully released the shared budget on any
+    /// framing-only read and made that exact flood unbounded.
+    pub framing_bytes: usize,
 }
 
 impl IacFilter {
@@ -143,7 +160,9 @@ impl IacFilter {
         !self.replies.is_empty()
     }
 
-    /// Called when a line completes: the raw-byte budget is per line.
+    /// Called when a line completes: the content-byte budget is per
+    /// line. `framing_bytes` is deliberately untouched -- it is a
+    /// connection-lifetime budget, never released (see its doc comment).
     pub fn reset_line(&mut self) {
         self.raw_line_bytes = 0;
     }
