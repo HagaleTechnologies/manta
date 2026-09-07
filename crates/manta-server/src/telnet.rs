@@ -482,7 +482,18 @@ async fn handle_client(
                 // or bare `Unknown`), never the raw client-supplied line,
                 // which is unescaped and could otherwise inject the same
                 // way the login field could (see the fix just above).
-                let parsed_command = command::parse(&cmd_line);
+                //
+                // MAN-87 remediation (code-review finding 1): trimmed with
+                // the same predicate as the login line before parsing.
+                // `read_line_bounded_telnet` now recognizes CR NUL as a
+                // line terminator (interactive BSD/macOS `telnet(1)`), and
+                // both terminator bytes stay in `cmd_line`; `command::parse`
+                // only calls `str::trim`, which does not strip NUL, so
+                // `"sh/dx\r\0"` tokenized to `["SH", "DX", "\0"]` and every
+                // command from that client class was silently `Unknown`.
+                // `command.rs` is outside this ticket's change scope, so
+                // the trim happens at this call site instead of inside it.
+                let parsed_command = command::parse(trim_login(&cmd_line));
                 if log_enabled {
                     tracing::info!(command = ?parsed_command, "telnet: command received");
                 }

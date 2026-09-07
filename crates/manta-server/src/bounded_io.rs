@@ -129,14 +129,18 @@ pub async fn read_line_bounded_with_timeout<R: AsyncBufRead + Unpin>(
 ///
 /// The length cap counts RAW bytes consumed (`filter.raw_line_bytes`),
 /// not surviving text bytes, so a client streaming endless negotiation
-/// still hits `MAX_LINE_BYTES` instead of reading forever. That budget is
-/// released not only when a line completes or a read errors, but also
-/// whenever a read consumes nothing but protocol framing with no
-/// application text pending yet -- otherwise a legitimate client sending
-/// only occasional keepalive negotiation (e.g. `IAC NOP`) would have
-/// `raw_line_bytes` accumulate across its entire session and eventually
-/// trip the cap despite never sending anything resembling a long line
-/// (MAN-87 review round 2, C2).
+/// still hits `MAX_LINE_BYTES` instead of reading forever, and that
+/// budget is released ONLY when a line completes or a read errors (never
+/// on a read that consumed nothing but protocol framing). MAN-87 review
+/// round 2 (C2) tried releasing it on pure-framing reads too, to keep a
+/// client sending only occasional keepalive negotiation from accumulating
+/// `raw_line_bytes` across a long session -- but that made the cap
+/// unreachable for a client that never lets a read return anything but
+/// framing (a flood of `IAC SB`/`IAC NOP`), and chunk-size dependent for
+/// everyone else (round-3 validation, code-review findings 2/3). Reverted:
+/// the few dozen bytes real negotiation costs against the 1024-byte budget
+/// (this decision's own original tradeoff) is cheaper than reopening the
+/// cap.
 ///
 /// Cancellation-safety matches `read_line_bounded`: every byte pulled
 /// off the reader is folded into `buf` and `filter` -- both caller-owned
@@ -192,14 +196,6 @@ pub async fn read_line_bounded_telnet<R: AsyncBufRead + Unpin>(
         if found_newline {
             filter.reset_line();
             return Ok(buf.len());
-        }
-        if text.is_empty() && buf.is_empty() {
-            // Nothing is pending for this line yet -- what was just
-            // consumed was pure protocol framing (e.g. a keepalive
-            // `IAC NOP`), not the start of a real line. Releasing the
-            // budget here is what keeps a slow, legitimate keepalive
-            // client from tripping the length cap across its session.
-            filter.reset_line();
         }
     }
 }
@@ -369,17 +365,40 @@ mod tests {
     #[tokio::test]
     async fn telnet_variant_caps_a_flood_of_negotiation_that_never_ends_a_line() {
         // Stripped bytes still count against MAX_LINE_BYTES, so endless
-        // negotiation cannot hold a read open forever.
-        let mut flood = Vec::new();
-        while flood.len() <= MAX_LINE_BYTES {
-            flood.extend_from_slice(b"\xff\xfb\x18");
-        }
-        let mut reader = BufReader::new(&flood[..]);
+        // negotiation cannot hold a read open forever -- regardless of how
+        // the flood happens to be chunked on the wire. Driven through a
+        // small-buffer `tokio::io::duplex` (not a single `BufReader`-over-
+        // slice, where one `fill_buf` call hands over the whole flood at
+        // once) so the cap is proven across several genuinely separate
+        // reads, matching what a real socket delivers (round-3 validation,
+        // code-review finding 3: the prior version of this test passed
+        // only by accident of that single-chunk shortcut). This also
+        // covers finding 2: MAN-87 review round 2 (C2) added a budget
+        // release for pure-framing reads to keep a legitimate slow
+        // keepalive-only client from tripping the cap, but that made the
+        // cap unreachable for exactly this flood -- reverted, so trickled
+        // negotiation that never completes a line is capped the same as a
+        // single burst.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
         let mut buf = String::new();
         let mut filter = IacFilter::new();
+
+        let _writer = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent <= MAX_LINE_BYTES {
+                if write_half.write_all(b"\xff\xfb\x18").await.is_err() {
+                    return; // reader stopped reading once the cap tripped
+                }
+                sent += 3;
+            }
+        });
+
         let err = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
             .await
-            .expect_err("negotiation flood must hit the line cap");
+            .expect_err("negotiation flood must hit the line cap regardless of chunking");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(buf.is_empty());
     }
@@ -428,43 +447,6 @@ mod tests {
         };
         assert_eq!(buf, "W5AU\r\0");
         assert_eq!(n, 6);
-    }
-
-    #[tokio::test]
-    async fn telnet_variant_releases_the_budget_between_keepalives_with_no_line() {
-        // MAN-87 review round 2 (C2): reset_line() previously fired only
-        // on a completed line or an error, so a legitimate client sending
-        // nothing but `IAC NOP` keepalives -- a normal "still listening"
-        // heartbeat -- would accumulate raw_line_bytes across its entire
-        // session and eventually be disconnected with "line exceeds
-        // maximum length", despite never sending anything resembling an
-        // oversized line.
-        use tokio::io::AsyncWriteExt;
-
-        let (mut write_half, read_half) = tokio::io::duplex(64);
-        let mut reader = BufReader::new(read_half);
-        let mut buf = String::new();
-        let mut filter = IacFilter::new();
-
-        // More raw framing bytes than MAX_LINE_BYTES in total, delivered
-        // as a slow trickle -- the tiny duplex buffer forces genuinely
-        // separate reads via backpressure. If the budget were never
-        // released between them, this alone would trip the cap before the
-        // real command line is ever reached.
-        let keepalives = MAX_LINE_BYTES / 2 + 50;
-        let writer = tokio::spawn(async move {
-            for _ in 0..keepalives {
-                write_half.write_all(b"\xff\xf1").await.unwrap(); // IAC NOP
-            }
-            write_half.write_all(b"W5AU\n").await.unwrap();
-        });
-
-        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
-            .await
-            .expect("a slow keepalive client must not trip the length cap");
-        assert_eq!(buf, "W5AU\n");
-        assert_eq!(n, 5);
-        writer.await.unwrap();
     }
 
     #[tokio::test]

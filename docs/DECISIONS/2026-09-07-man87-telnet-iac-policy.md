@@ -87,13 +87,33 @@ against its 1024-byte line budget, irrelevant at the few dozen bytes real
 negotiation occupies. The raw-byte counter lives on `IacFilter` itself
 (`raw_line_bytes`), not in the read function, because it must survive
 `tokio::select!` cancellation mid-line exactly like `cmd_line` does — it's
-the one per-connection value that does. The budget is released not only
-when a line completes or a read errors, but also whenever a read consumes
-nothing but framing with no application text pending yet — otherwise a
-client sending only occasional keepalive negotiation (e.g. `IAC NOP`)
-would have `raw_line_bytes` accumulate across its entire session and
-eventually trip the cap despite never sending anything resembling a long
-line (review round 2, finding C2).
+the one per-connection value that does. The budget is released ONLY when
+a line completes or a read errors — this is D4, held as originally
+decided.
+
+**Round 2 (finding C2) tried releasing the budget on pure-framing reads
+too** — a read that consumed nothing but protocol framing with no
+application text pending yet — to keep a client sending only occasional
+keepalive negotiation (e.g. `IAC NOP`) from having `raw_line_bytes`
+accumulate across its entire session and eventually trip the cap despite
+never sending anything resembling a long line. **Reverted in round 3**
+(validation, code-review findings 2 and 3): that release made the cap
+unreachable for a client that never lets a single read return anything but
+framing (an `IAC SB` stream with no closing `IAC SE`, or a trickle of
+`IAC NOP` pairs — the branch's own test proved a flood of either sailed
+through uncapped), and made the cap's behavior depend on how the OS
+happened to chunk the incoming bytes across `fill_buf` calls rather than
+on what was sent. The C2 concern (a long-lived, keepalive-only client
+eventually crossing 1024 raw bytes without ever completing a command line)
+is real but rare — D4's own rationale already accepts the cost of counting
+negotiation against the line budget, on the grounds that real negotiation
+is a few dozen bytes; it did not anticipate a client sending nothing else
+for an entire multi-hour session. If that is ever observed from a real
+client, the fix needs a budget that is bounded (never fully releasable to
+an attacker) but distinct from the ordinary line-content cap — not the
+full release round 2 shipped. Not attempted in round 3: no real client has
+been observed doing this, and D4's original tradeoff already covers the
+common case (option negotiation at connect).
 
 **Negotiation replies are batched and flushed by the caller after the read
 returns, not written from inside `bounded_io`.** Two reasons: the
@@ -104,6 +124,19 @@ before sending its callsign. Stated plainly: a hypothetical client that
 *did* block after sending only negotiation would hit the existing 30 s
 idle timeout, which is still strictly better than today's immediate
 disconnect. Revisit only if a real client is observed doing that.
+
+**Correction (round 3 validation, code-review finding 4, plausible/lower
+severity):** the 30 s idle-timeout backstop above applies to the LOGIN
+read only (`read_line_bounded_telnet_with_timeout`). The command read
+(`telnet.rs`'s `select!` loop) deliberately uses the untimed variant
+(round-5 review finding: an established, quietly-listening client must
+never be disconnected just for staying quiet) — so a logged-in client that
+sends only a mid-session negotiation probe (e.g. `IAC DO TIMING-MARK`) and
+then waits for the reply has nothing bounding that wait at all on the
+command path. No real client has been observed doing this; not fixed in
+round 3 on that basis, per this decision's own "revisit only if observed"
+stance — but the decision record above overstated the backstop's reach and
+is corrected here rather than left standing as written.
 
 **Reply buffering is bounded** (`MAX_NEGOTIATION_REPLY_BYTES = 192`, 64
 refusals). An unauthenticated client must not be able to grow a
@@ -174,4 +207,12 @@ character-identical by construction.
 - `crates/manta-server/src/telnet.rs`: one `IacFilter` per connection,
   used by both the login read and the command read inside `select!`;
   refusals flushed after each; `trim_login` applied to the stored/logged
-  login value.
+  login value, and (round 3) to the command line too, immediately before
+  `command::parse` — same predicate, same reason: `read_line_bounded_telnet`
+  recognizes `CR NUL` as a line terminator (above) on both reads, and
+  `command::parse`'s `str::trim` does not strip the trailing NUL, so an
+  unrimmed `"sh/dx\r\0"` tokenized to `["SH", "DX", "\0"]` and matched no
+  command arm — an interactive client could log in but every command it
+  sent was silently ignored (round-3 validation, code-review finding 1).
+  `command.rs` is outside this ticket's change scope, so the trim happens
+  at the `telnet.rs` call site rather than inside `command::parse`.
