@@ -44,10 +44,24 @@ Debug profile (what CI's `cargo test --workspace` uses), 2 vCPU container:
 
 `cargo test --workspace` runs one test binary at a time, so the
 workspace-level delta equals the per-binary delta: **+182.8 s per required
-CI leg, paid on both `test (ubuntu-latest)` and `test (macos-latest)`**.
-The V8w (fading) decode is roughly 14x slower than the sibling AWGN-only
-V8 decode of the identical 50-signal scene (13.99 s) — Watterson fading is
-the entire cost, not test-harness overhead.
+CI leg**. That leg is not paid twice — it is paid **six** times per push.
+`golden_v8_v8w.rs` lives in `manta-cli`, and three required jobs build and
+run `manta-cli`'s test binaries, each across `strategy.matrix.os:
+[ubuntu-latest, macos-latest]`: `test` (`cargo test --workspace`,
+`ci.yml:207`), `test-soapy` (`cargo test -p manta-input -p manta-cli
+--features soapy`, `ci.yml:227`), and `test-hpsdr` (`cargo test -p
+manta-input -p manta-cli --features hpsdr`, `ci.yml:245`). None of the
+three feature-gates `golden_v8_v8w` away, so `cargo test -p manta-cli`
+builds and runs every integration test in the package on all six legs.
+Total added CI wall-clock is therefore **~6 x 183 s ≈ 18-19 minutes of
+serial cost per push**, not ~6 minutes. The single-sample 193.40 s/196.76 s
+figures above are not perfectly stable run to run: three independent
+measurements on this container class (same code, same machine) produced
+193 s, 229 s, and 237 s, so treat "~183-240 s per leg" as the honest range
+rather than a fixed constant. The V8w (fading) decode is roughly 14x
+slower than the sibling AWGN-only V8 decode of the identical 50-signal
+scene (13.99 s) — Watterson fading is the entire cost, not test-harness
+overhead.
 
 ## Why this test is deliberately exempt from MAN-9's 180 s ignore rule
 
@@ -114,6 +128,24 @@ level down.
   `manta-spot`.
 - The CER gate and its `#[ignore]` are untouched — that remains MAN-9 /
   MAN-107–MAN-113 / issue #28's scope.
+
+## No shared decode cache, and the PR #106 rebase rule
+
+MAN-9's PR #106 is open against this same file (`golden_v8_v8w.rs`) and,
+as of this change, is not yet on `main`. Its diff adds a `OnceLock` decode
+cache to the file. This change deliberately introduces no such cache of
+its own: with the CER test still `#[ignore]`d, a plain CI run decodes V8w
+exactly once either way, so a second cache would save nothing on the CI
+path today and would only guarantee a merge conflict with #106.
+
+**Rebase rule, either ordering:** whichever of MAN-101 or PR #106 lands
+second on `main` rebases and, in the newly-added
+`v8w_pileup_fading_spots_no_bogus_callsigns`, changes only the line `let
+(report, manifest) = decode_report(&spec);` to call #106's cached
+accessor instead of `decode_report` directly. Nothing else in this test
+needs to change for that rebase. This is recorded here — rather than left
+only in the PR body — so it survives independently of PR #132's own
+lifecycle.
 
 ## Expected sequencing
 
