@@ -339,7 +339,25 @@ impl TrackDecoder {
         self.hop_count += 1;
         if self.hop_count % META_INTERVAL_HOPS == 0 {
             let snr = if self.cfg.engine == Engine::Legacy {
-                self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
+                // MAN-102 review round 1, finding 1: `self.demod.running()`
+                // is the real presence gate here -- it is what used to keep
+                // a never-keyed track (steady carrier, birdie, tuning note)
+                // from emitting `TrackMeta` at all, since the old code read
+                // presence straight off `self.demod.snr_2500_db()`, which
+                // returns `None` exactly when `!running()`. Falling back to
+                // `self.demod.snr_2500_db()` for the *value* without first
+                // checking `running()` let an engine-supplied
+                // `self.snr_2500_db` (always `Some` in production --
+                // `manta-engine` calls `set_snr_2500_db` on every queued
+                // hop) bypass that gate entirely. `running()` being true
+                // guarantees `self.demod.snr_2500_db()` is `Some`, so the
+                // `or_else` fallback always yields a value once we're past
+                // this check.
+                if self.demod.running() {
+                    self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
+                } else {
+                    None
+                }
             } else {
                 self.last_snr
             };
@@ -1209,11 +1227,43 @@ mod tests {
         for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
             events.extend(dec.push_envelope(a, i as u64 * 256));
         }
+        let rail_snr = dec.demod.snr_2500_db().expect(
+            "keyed_envelope_for_tests should bring the demod to Running within one interval",
+        );
+        let meta = events.iter().find_map(|e| match e {
+            DecoderEvent::TrackMeta { snr_2500_db, .. } => Some(*snr_2500_db),
+            _ => None,
+        });
+        assert_eq!(
+            meta,
+            Some(rail_snr),
+            "TrackMeta must carry the rail estimate exactly when no engine-supplied SNR is set"
+        );
+    }
+
+    #[test]
+    fn track_meta_is_not_emitted_for_a_track_whose_demod_never_initialized() {
+        // MAN-102 review round 1, finding 1 (regression). A steady carrier,
+        // birdie, or tuning note never lets `Demod` leave `Phase::Init`
+        // (E_hi/E_lo never crosses MIN_KEYING_RATIO -- see envelope.rs's
+        // `carrier_never_inits`), so `self.demod.running()` stays false
+        // forever. `manta-engine` calls `set_snr_2500_db` on every queued
+        // hop for every track it drives, including never-keyed ones, so a
+        // TrackDecoder here sees an engine-supplied SNR on every hop just
+        // like it would in production -- that must not be enough by itself
+        // to emit TrackMeta.
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        dec.set_freq_hz(14_012_340.0);
+        let mut events = Vec::new();
+        for i in 0..3000u64 {
+            dec.set_snr_2500_db(20.0);
+            events.extend(dec.push_envelope(0.5, i * 256));
+        }
         assert!(
-            events
+            !events
                 .iter()
                 .any(|e| matches!(e, DecoderEvent::TrackMeta { .. })),
-            "no TrackMeta emitted without an engine-supplied SNR"
+            "a never-initialized demod (steady carrier) must not emit TrackMeta, got {events:?}"
         );
     }
 

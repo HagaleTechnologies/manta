@@ -100,7 +100,11 @@ in wiring correctness, not pinned numeric expectations.
 `TrackMeta` is actually emitted for that track (driven by the decoder's real
 emission, not a duplicated hop counter, so the two mechanisms cannot drift
 apart). SPEC §2.3 specifies the *quantity* (`S − F`); this ticket adds the
-aggregation SPEC did not previously pin.
+aggregation SPEC did not previously pin. **Round-1 review correction:** the
+first landing reset the window once per `drain_pool` call (batch end), not
+at the hop the report actually fired on, which made the reported value
+depend on the caller's chunk size (`decode_samples` batches raw samples at
+4096, `listen`/`soak_metrics` at 2048) — see Remediation below.
 
 **D-102.2 — Plumb via a `set_snr_2500_db` setter on `TrackDecoder`, mirroring
 the existing `set_freq_hz` precedent.** `manta-decode` has no dependency on
@@ -163,6 +167,49 @@ the old compressed rail estimate never surfaced. `manta-spot::dedupe`'s
 `SNR_IMPROVEMENT_DB = 6.0` re-spot override threshold now fires somewhat
 more often on a fading station as a result. The threshold itself is outside
 D3's scope and is not retuned here — see Follow-ups FU-2.
+
+## Remediation (2026-09-07, validate round 1)
+
+`/catalyst-dev:validate-plan` at code-review step FAILed on two CONFIRMED
+correctness findings in the first landing, both fixed in this round:
+
+- **Finding 1 — a never-keyed track (steady carrier/birdie) emitted
+  `TrackMeta`.** `TrackDecoder::push_envelope`
+  (`crates/manta-decode/src/decoder.rs`) read `self.demod.snr_2500_db()` as
+  both the SNR *value* and, implicitly, the emit *gate* (it returns `None`
+  exactly when `!self.demod.running()`). Falling back to an
+  engine-supplied `self.snr_2500_db` — always `Some` in production, since
+  `manta-engine` calls `set_snr_2500_db` on every queued hop for every
+  track it drives — bypassed that gate. Fixed by gating explicitly on
+  `self.demod.running()` before reading either source. Regression test:
+  `decoder::tests::track_meta_is_not_emitted_for_a_track_whose_demod_never_initialized`.
+- **Finding 2/3 — reported SNR depended on the caller's `process_hops`
+  chunk size.** The peak window reset once per `drain_pool` call, at batch
+  end, seeded from `current_snr_db` as of the batch's *last* hop — not from
+  the hop the report actually fired on. Moved the reset into `drain_pool`
+  itself: `Track::pending` now queues the *raw* per-hop SNR, and
+  `drain_pool` walks each track's queued items in order, maintaining
+  `snr_peak_db` and resetting it the instant a given push's
+  `TrackDecoder::push_envelope` call actually returns a `TrackMeta`. This
+  makes the window boundary track the real report regardless of batch
+  boundaries. Regression test:
+  `track::tests::track_meta_snr_is_invariant_to_process_hops_chunk_size`
+  (V1 driven through two `TrackManager`s at 4096- and 2048-sample chunks;
+  every `TrackMeta.snr_2500_db` compares bit-identical).
+- The fallback test's weak assertion (test-coverage finding) was
+  tightened: `decoder::tests::track_meta_falls_back_to_the_rail_estimate_when_unset`
+  now asserts the emitted value equals `demod.snr_2500_db()` exactly, not
+  merely that some `TrackMeta` exists.
+- Re-ran `crates/manta-engine/tests/snr_calibration.rs`'s ignored sweep
+  after the fix: identical to the table in Measurements above (this V1/V-
+  style single-continuous-signal scene's reports happen to land on batch
+  boundaries either way, so the chunk-dependence bug never perturbed this
+  particular characterization).
+- **FU-6** (closing the dangling pointer left by the first landing): the
+  30 dB "no spots" point in the sweep above pre-dates this ticket (present
+  in the plan's own baseline sweep too) and is out of MAN-102's scope; if
+  it needs its own investigation, file it as a new ticket rather than
+  tracking it here.
 
 ## Cross-repo proposal — ready to lift into dispensa
 
