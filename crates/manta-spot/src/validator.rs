@@ -1062,16 +1062,31 @@ impl Validator {
 
         // MAN-100 step 4b: cross-candidate arbitration. Allowlisted calls
         // are exempt (the Watch List already bypasses grammar/cty and the
-        // repetition gate, MAN-28), and so is any call in master.scp -- a
+        // repetition gate, MAN-28), so is any call in master.scp -- a
         // curated list of real, active callsigns, where a false
         // suppression would cost recall on exactly the population RBN
-        // cares most about. Both exemptions only ever *add* spots
+        // cares most about -- and so is any `SpotType::Beacon` candidate
+        // (MAN-100 remediation C3), for the same reason step 4's own
+        // repetition gate exempts beacons two checks above: an NCDXF-style
+        // beacon legitimately IDs once per cycle, so its "support" is
+        // structurally capped at a low rep count that a confusable
+        // rival's fading-corrupted repeat can easily outrun on rep count
+        // alone -- measured: "V V V W6DPH K" x2 then "V V V W6DPG K" x1
+        // spotted only the corrupted W6DPH and permanently suppressed the
+        // genuine, once-per-cycle W6DPG. Not exempting would let this
+        // rep-count-based heuristic (tuned for calls that must clear >= 2
+        // reps to spot at all) systematically displace a true beacon spot
+        // with a false one -- worse than the small, bounded risk of a
+        // corrupted beacon variant occasionally spotting unarbitrated,
+        // the same tradeoff already accepted for the allowlist/SCP
+        // exemptions above. All three exemptions only ever *add* spots
         // relative to the bare rule. Purely subtractive otherwise: this
         // check can only withhold a spot the rest of the pipeline would
         // have emitted, never create one.
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
         if !is_allowlisted
             && !scp_exempt
+            && spot_type != SpotType::Beacon
             && self
                 .ledger
                 .better_supported_rival(track_id, &candidate, sample_ts)

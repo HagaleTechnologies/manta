@@ -10,7 +10,7 @@
 //! `BTreeMap`, never `HashMap` (rule 3) -- this state feeds directly into
 //! whether a `Spot` is emitted, so its iteration order is output-affecting.
 
-use crate::gate::MIN_MESSAGE_WORD_GAP;
+use crate::gate::{self, MIN_MESSAGE_TIME_GAP_SECONDS};
 use crate::variant::{self, Relation};
 use std::collections::BTreeMap;
 
@@ -54,6 +54,7 @@ impl Support {
 
 pub struct SupportLedger {
     window_samples: u64,
+    time_gap_samples: u64,
     seen: BTreeMap<(u32, String), Vec<Obs>>,
 }
 
@@ -61,6 +62,7 @@ impl SupportLedger {
     pub fn new(fs: f64) -> Self {
         Self {
             window_samples: (WINDOW_SECONDS * fs) as u64,
+            time_gap_samples: (MIN_MESSAGE_TIME_GAP_SECONDS * fs) as u64,
             seen: BTreeMap::new(),
         }
     }
@@ -86,35 +88,36 @@ impl SupportLedger {
         entry.retain(|o| o.sample_ts >= cutoff);
     }
 
-    /// Folds `obs` into `Support`, applying the SAME greedy message-gap
-    /// rule as `RepetitionGate` (`gate::MIN_MESSAGE_WORD_GAP`) -- and,
-    /// critically, summing `geo_conf` only for the occurrences that rule
-    /// actually counts (the first of each message), not every raw
-    /// observation. Confidence must be scoped to the same message-
-    /// distinct occurrences `reps` reflects: summing every raw repeat
-    /// would let a candidate whose fading corruption happens to repeat
-    /// verbatim several times WITHIN one message accumulate a higher
-    /// `conf_sum` than a genuinely better-supported rival at equal reps,
-    /// exactly inverting the tie-break this exists for (caught by an
-    /// end-to-end run against the real V8w fixture during development --
-    /// summing every raw observation left one bogus call, W4KTNL,
-    /// winning its tie against W4KCL on raw occurrence count alone).
-    fn support_in_window(obs: &[Obs], now: u64, window_samples: u64) -> Support {
+    /// Folds `obs` into `Support` by calling the SAME shared greedy
+    /// message-gap helper as `RepetitionGate` (`gate::message_distinct_indices`,
+    /// word_seq gap OR sample_ts gap -- MAN-100 remediation C2) and, critically,
+    /// summing `geo_conf` only for the occurrences that helper actually
+    /// returns (the first of each message), not every raw observation.
+    /// Confidence must be scoped to the same message-distinct occurrences
+    /// `reps` reflects: summing every raw repeat would let a candidate
+    /// whose fading corruption happens to repeat verbatim several times
+    /// WITHIN one message accumulate a higher `conf_sum` than a genuinely
+    /// better-supported rival at equal reps, exactly inverting the
+    /// tie-break this exists for (caught by an end-to-end run against the
+    /// real V8w fixture during development -- summing every raw
+    /// observation left one bogus call, W4KTNL, winning its tie against
+    /// W4KCL on raw occurrence count alone). Calling the shared helper
+    /// (rather than re-implementing the greedy loop, as this used to)
+    /// also guarantees this can never drift from `RepetitionGate`'s own
+    /// counting rule (MAN-100 remediation C4).
+    fn support_in_window(
+        obs: &[Obs],
+        now: u64,
+        window_samples: u64,
+        time_gap_samples: u64,
+    ) -> Support {
         let cutoff = now.saturating_sub(window_samples);
-        let mut reps = 0u32;
-        let mut conf_sum = 0f32;
-        let mut last_counted_seq: Option<u64> = None;
-        for o in obs.iter().filter(|o| o.sample_ts >= cutoff) {
-            let counts = match last_counted_seq {
-                None => true,
-                Some(prev) => o.word_seq >= prev + MIN_MESSAGE_WORD_GAP,
-            };
-            if counts {
-                reps += 1;
-                conf_sum += o.geo_conf;
-                last_counted_seq = Some(o.word_seq);
-            }
-        }
+        let windowed: Vec<&Obs> = obs.iter().filter(|o| o.sample_ts >= cutoff).collect();
+        let occurrences: Vec<(u64, u64)> =
+            windowed.iter().map(|o| (o.word_seq, o.sample_ts)).collect();
+        let counted = gate::message_distinct_indices(&occurrences, time_gap_samples);
+        let reps = counted.len() as u32;
+        let conf_sum = counted.iter().map(|&i| windowed[i].geo_conf).sum();
         Support { reps, conf_sum }
     }
 
@@ -123,7 +126,9 @@ impl SupportLedger {
     /// never observed.
     pub fn support(&self, track_id: u32, text: &str, now: u64) -> Support {
         match self.seen.get(&(track_id, text.to_string())) {
-            Some(obs) => Self::support_in_window(obs, now, self.window_samples),
+            Some(obs) => {
+                Self::support_in_window(obs, now, self.window_samples, self.time_gap_samples)
+            }
             None => Support::default(),
         }
     }
@@ -152,7 +157,7 @@ impl SupportLedger {
             let Some(rel) = variant::relation(candidate, text) else {
                 continue;
             };
-            let s = Self::support_in_window(obs, now, self.window_samples);
+            let s = Self::support_in_window(obs, now, self.window_samples, self.time_gap_samples);
             if s.reps == 0 {
                 continue;
             }
@@ -171,6 +176,25 @@ impl SupportLedger {
             let longer_containment = rel == Relation::Containment
                 && text.len() > candidate.len()
                 && text.starts_with(candidate);
+            // The reverse must also be shape-decided, not support-decided
+            // (MAN-100 remediation C1): when the CANDIDATE is the longer
+            // form and `text` is a strict prefix of it, `text` is the
+            // truncation artifact and must never be allowed to win this
+            // comparison, however many reps it has racked up. Without
+            // this, a truncation that simply arrives first and reaches 2
+            // reps before the real call has any could suppress the real
+            // call forever after (measured: "CQ DE W6JQ K" x3 then "CQ DE
+            // W6JQA K" x2 on one track spotted only the truncation).
+            // Prefix-only for the same reason `longer_containment` is: a
+            // head-merge rival (`DEN3NXI` vs `N3NXI`) is a SUFFIX
+            // relationship, not a prefix one, so it's untouched by this
+            // arm and the ordinary support comparison still decides it.
+            let shorter_prefix_of_candidate = rel == Relation::Containment
+                && candidate.len() > text.len()
+                && candidate.starts_with(text.as_str());
+            if shorter_prefix_of_candidate {
+                continue;
+            }
             if !longer_containment && !s.strictly_better_than(&mine) {
                 continue;
             }
@@ -273,6 +297,28 @@ mod tests {
             .better_supported_rival(1, "W6JQ", 20_000)
             .expect("W6JQA must beat W6JQ via the prefix-containment asymmetry");
         assert_eq!(rival.0, "W6JQA");
+    }
+
+    /// MAN-100 remediation C1: the truncation-arrives-first ordering. The
+    /// truncation reaches 2 reps (enough to itself beat `Support::default`)
+    /// before the longer, genuine form has any support at all -- a pure
+    /// support comparison for the LONGER form's own arbitration call would
+    /// let the truncation win. The prefix-containment asymmetry must fire
+    /// in this direction too, not just when arbitrating the shorter form.
+    #[test]
+    fn a_truncation_that_arrives_first_still_loses_to_the_longer_form() {
+        let mut ledger = SupportLedger::new(FS);
+        ledger.observe(1, "W6JQ", 4, 0, 0.3);
+        ledger.observe(1, "W6JQ", 10, 10_000, 0.3);
+        ledger.observe(1, "W6JQA", 20, 20_000, 0.3);
+
+        assert!(
+            ledger.better_supported_rival(1, "W6JQA", 20_000).is_none(),
+            "a 2-rep truncation that arrived first must not suppress the \
+             longer, genuine form once it appears, even though the \
+             truncation's rep count is still ahead (2 vs the genuine \
+             form's 1)"
+        );
     }
 
     /// The measured V8 shape: N3NXI 6 reps must beat the DEN3NXI 1-rep

@@ -1195,3 +1195,140 @@ fn v32_same_message_repetition_does_not_satisfy_the_gate() {
         "a second, genuinely later message must complete the gate, got {second:?}"
     );
 }
+
+/// V33 (MAN-100 remediation C1): the prefix-containment asymmetry must
+/// fire regardless of which form is observed first. A strict prefix
+/// (truncation) that arrives on the track FIRST and clears the
+/// repetition gate before the genuine, longer call has any support at
+/// all must still let the genuine call spot once it's observed -- before
+/// this fix, `better_supported_rival` only guarded the case where the
+/// truncation was arbitrated against an already-supported longer form,
+/// so this ordering suppressed the genuine call permanently (measured:
+/// "CQ DE W6JQ K" x3 then "CQ DE W6JQA K" x2 spotted only "W6JQ"). Note
+/// this fix cannot (and does not try to) retroactively revoke the
+/// truncation's own earlier spot -- the base, pre-MAN-100 commit already
+/// spotted it in this ordering too; the regression this closes is the
+/// genuine call being suppressed afterward, not the truncation spotting
+/// at all.
+#[test]
+fn v33_a_truncation_that_arrives_first_still_lets_the_genuine_call_spot() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let mut spots = Vec::new();
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQ", "K"], 0),
+        &mut v,
+    ));
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQ", "K"], 300_000),
+        &mut v,
+    ));
+
+    // Push the two W6JQ transmissions (8 words) entirely out of the
+    // 16-word context window (`WORD_WINDOW`) before W6JQA ever appears,
+    // so `context::parse`'s single-match-per-pattern `DE_RE` surfaces "DE
+    // W6JQA" as a candidate instead of resolving (by text) to the
+    // still-in-window, earlier "DE W6JQ" match -- the same aging
+    // technique V29 uses. The ledger's own window is time-based (90 s),
+    // not word-count-based, so W6JQ's observations stay live there
+    // regardless, which is what actually exercises this fix.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 600_000), &mut v));
+
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQA", "K"], 900_000),
+        &mut v,
+    ));
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQA", "K"], 1_200_000),
+        &mut v,
+    ));
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "W6JQA"),
+        "the genuine, longer call must still spot once observed, even \
+         though its own strict-prefix truncation arrived first and \
+         already cleared the repetition gate, got {spots:?}"
+    );
+}
+
+/// V34 (MAN-100 remediation C2): a short "DE <CALL>" ID puts its callsign
+/// only 2 decoded words apart even across genuinely separate
+/// transmissions -- below `MIN_MESSAGE_WORD_GAP` (3). Before this fix,
+/// `count_message_distinct` consulted only `word_seq`, so this shape
+/// never cleared the repetition gate no matter how far apart in time the
+/// transmissions actually were (measured: 10 repeats at 80 s spacing over
+/// 13 minutes never spotted). The time-based OR clears it here: 80 s of
+/// `sample_ts` is well past `MIN_MESSAGE_TIME_GAP_SECONDS` (60 s).
+#[test]
+fn v34_a_short_id_repeated_far_apart_in_time_still_clears_the_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let eighty_seconds_samples = (80.0 * FS) as u64;
+    let mut spots = Vec::new();
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["DE", "K5ARH"], i * eighty_seconds_samples),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "K5ARH"),
+        "a 2-word ID repeated 80 s apart is two genuinely separate \
+         messages and must clear the repetition gate despite its short \
+         word_seq gap, got {spots:?}"
+    );
+}
+
+/// V35 (MAN-100 remediation C3): a `SpotType::Beacon` candidate is exempt
+/// from step 4b's cross-candidate arbitration, the same way it's already
+/// exempt from the repetition gate two checks earlier (ARCHITECTURE
+/// §6.4) -- an NCDXF-style beacon legitimately IDs once per cycle, so its
+/// rep count is structurally low and a confusable rival that happens to
+/// repeat (a fading-corrupted decode of the same beacon) must not be
+/// allowed to outrank it on rep count alone. Before this fix, a 2-rep
+/// corrupted decode permanently suppressed a genuine, once-per-cycle
+/// beacon's single correct decode (measured: "V V V W6DPH K" x2 then
+/// "V V V W6DPG K" x1 spotted only the corrupted "W6DPH").
+#[test]
+fn v35_beacon_candidates_are_exempt_from_variant_arbitration() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let mut spots = Vec::new();
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["V", "V", "V", "W6DPH", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+
+    // Push both W6DPH transmissions (10 words) entirely out of the
+    // 16-word context window before W6DPG appears, so `BEACON_RE`'s
+    // single-match-per-window scan surfaces "V V V W6DPG" as a candidate
+    // instead of resolving (by text) to the still-in-window, earlier "V V
+    // V W6DPH" match -- same technique V33 uses. The ledger's own window
+    // is time-based (90 s), not word-count-based, so W6DPH's observations
+    // stay live there regardless, which is what actually exercises this
+    // fix.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 600_000), &mut v));
+
+    spots.extend(run(
+        &transmission_events(1, &["V", "V", "V", "W6DPG", "K"], 900_000),
+        &mut v,
+    ));
+
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W6DPG" && s.spot_type == SpotType::Beacon),
+        "the genuine once-per-cycle beacon must still spot despite a \
+         better-repeated confusable rival, got {spots:?}"
+    );
+}

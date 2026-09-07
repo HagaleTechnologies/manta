@@ -509,15 +509,22 @@ immediately.
 
 **"Distinct" (MAN-100).** Two decodes of the same callsign text on a track
 count as separate repetitions toward `r` only when at least
-`MIN_MESSAGE_WORD_GAP = 3` decoded words on that track separate them.
-SPEC's own default payload template repeats the callsign back-to-back
-within one transmission (`CQ CQ DE <CALL> <CALL> K`, §7's payload note) —
-without this rule, that single, possibly fading-corrupted message alone
-could satisfy the ≥ 2-repetition gate. 3 words sits strictly between the
-one-word gap inside a single message and the minimum five-word gap between
-two separate ones (`<CALL> K CQ CQ DE <CALL>`). The beacon/allowlist
-exemptions above are unaffected — they never consult `r`'s distinctness
-rule at all.
+`MIN_MESSAGE_WORD_GAP = 3` decoded words on that track separate them, **or**
+at least `MIN_MESSAGE_TIME_GAP_SECONDS = 60` seconds of `sample_ts` separate
+them (MAN-100 remediation C2). SPEC's own default payload template repeats
+the callsign back-to-back within one transmission (`CQ CQ DE <CALL> <CALL>
+K`, §7's payload note) — without the word-gap half of this rule, that
+single, possibly fading-corrupted message alone could satisfy the ≥
+2-repetition gate. 3 words sits strictly between the one-word gap inside a
+single message and the minimum five-word gap between two separate ones
+(`<CALL> K CQ CQ DE <CALL>`). That word-gap reasoning assumes SPEC's own
+payload template, though, and does not hold for a real, shorter ID (e.g.
+"DE `<CALL>`", 2 words) — the time-gap half exists for exactly that case: 60
+s comfortably covers a full "CQ CQ DE `<CALL>` `<CALL>` K" transmission even
+at 8 WPM (this section's slowest supported speed, ~40 s for that template)
+with margin, while staying well under the 90 s ledger/gate window itself.
+The beacon/allowlist exemptions above are unaffected — they never consult
+`r`'s distinctness rule at all.
 
 **Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
 Before a candidate spots, it is checked against every other decoded,
@@ -527,10 +534,18 @@ window. It is withheld if a confusable, better-supported rival exists —
 shared prefix of at least 3 characters with edit distance ≤ 2 — where
 "better-supported" means strictly more message-distinct repetitions (ties
 broken by summed per-occurrence confidence), or the candidate being a
-strict prefix of a rival that itself has ≥ 1 repetition. This mechanism is
-purely subtractive: it can only withhold a spot the rest of this section
-would otherwise emit, never produce one, and it never fires against an
-operator-allowlisted callsign or one present in the bundled SCP list. See
+strict prefix of a rival that itself has ≥ 1 repetition. Symmetrically, a
+rival that is itself a strict prefix of the candidate never wins this
+comparison on repetition count alone (MAN-100 remediation C1) — shape
+decides a prefix-containment pair in both directions, not just when the
+shorter form is being arbitrated. This mechanism is purely subtractive: it
+can only withhold a spot the rest of this section would otherwise emit,
+never produce one, and it never fires against an operator-allowlisted
+callsign, one present in the bundled SCP list, or a candidate already
+type-tagged `BEACON` (MAN-100 remediation C3 — the same once-per-cycle
+reasoning as this section's own beacon repetition-gate exemption above: a
+beacon's structurally low rep count would otherwise let a confusable,
+fading-corrupted rival permanently outrank it). See
 `manta-spot::variant`/`manta-spot::support` for the exact relation and
 comparison, and the MAN-100 decision record for the measured rationale
 behind the prefix-only asymmetry.
@@ -686,6 +701,9 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
 | V31 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V31b (per-track scoping) and V31c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
 | V32 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the ≥ 2-rep gate; the second message completes it |
+| V33 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
+| V34 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
+| V35 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
 
 ---
 

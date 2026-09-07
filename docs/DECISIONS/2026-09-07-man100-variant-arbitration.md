@@ -201,6 +201,64 @@ calls without having been tuned to make any measured test pass.
 - **Ledger memory.** Same shape and same `TrackClosed` teardown as
   `RepetitionGate::seen` (MAN-19); bounded per track, freed on close.
 
+## Remediation round (validate-plan code-review, 2026-09-07)
+
+The first validate-plan pass reproduced the headline V8w/V8 numbers above
+end to end, but code review found three confirmed correctness gaps the
+shipped rule and its golden vectors didn't cover. All three are fixed in
+this same PR, re-verified against V8/V8w with the replay harness (both
+scenes byte-for-byte unchanged: V8w 21 spots/20 distinct/0 bogus, V8 51
+spots/49 distinct/0 bogus — identical to the numbers measured above), and
+pinned with golden vectors V33–V35 (`docs/SPEC-decode-core.md` §7.1).
+
+- **C1 — the prefix asymmetry was one-directional.** `longer_containment`
+  only fired when the *rival* was the longer form; nothing stopped a
+  shorter truncation from winning `better_supported_rival` on raw support
+  when arbitrating the *longer, genuine* candidate (a truncation that
+  simply arrives first and reaches 2 reps before the real call has any
+  support could suppress the real call forever after — measured: `CQ DE
+  W6JQ K` ×3 then `CQ DE W6JQA K` ×2 on one track spotted only the
+  truncation). Fixed by also skipping a rival that is a strict prefix of
+  the candidate (`support.rs`'s `shorter_prefix_of_candidate` arm),
+  symmetric with the existing `longer_containment` arm and still
+  prefix-only for the same reason: a head-merge rival (`DEN3NXI` vs
+  `N3NXI`) is a suffix relationship, so this arm never touches it (V31c
+  stays green). This does not (and architecturally cannot) retroactively
+  revoke a spot the truncation already emitted before the genuine call
+  was ever observed — V33 documents that scope boundary explicitly.
+- **C2 — `count_message_distinct` never consulted `sample_ts`.** A
+  two-word ID (e.g. `DE <CALL>`) puts the callsign only 2 word_seqs apart
+  across genuinely *separate* transmissions, below
+  `MIN_MESSAGE_WORD_GAP = 3`, with no time-based escape hatch (measured:
+  `DE K5ARH` ×10 at 80s spacing over 13 minutes never spotted at all).
+  Fixed by adding `MIN_MESSAGE_TIME_GAP_SECONDS = 60` as an OR condition —
+  two occurrences now count as separate messages when either the
+  word_seq gap clears `MIN_MESSAGE_WORD_GAP` or the `sample_ts` gap
+  clears 60s (60s comfortably covers a full "CQ CQ DE `<CALL>` `<CALL>`
+  K" transmission even at 8 WPM, SPEC's slowest supported speed, ~40s for
+  that template, while staying under the 90s ledger/gate window). The
+  greedy chain logic is now a single shared helper
+  (`gate::message_distinct_indices`) that both `RepetitionGate::record`
+  and `support::SupportLedger::support_in_window` call, closing a related
+  low-severity finding (C4) that the two had drifted into independent
+  reimplementations of the same rule.
+- **C3 — step 4b had no beacon exemption.** `SpotType::Beacon` is exempt
+  from the repetition gate (ARCHITECTURE §6.4, MAN-28) because an
+  NCDXF-style beacon legitimately IDs once per cycle — but arbitration
+  didn't carry the same exemption, so a beacon's structurally low rep
+  count let any confusable, fading-corrupted rival with more reps
+  permanently outrank it (measured: `V V V W6DPH K` ×2 then `V V V
+  W6DPG K` ×1 spotted only the corrupted `W6DPH`, silently displacing the
+  genuine once-per-cycle beacon). Decided explicitly (this was previously
+  an oversight, not a decision — neither the plan, this decision record,
+  nor any test considered beacons under arbitration): `SpotType::Beacon`
+  is now exempt from step 4b, alongside the allowlist/SCP exemptions,
+  accepting the same bounded tradeoff already accepted for those two — a
+  confusable variant of an exempt call may occasionally spot
+  unarbitrated, in exchange for never letting this rep-count heuristic
+  (tuned for calls that must clear ≥ 2 reps to spot at all) systematically
+  displace a true beacon spot with a false one.
+
 ## References
 
 - Ticket: MAN-100.
@@ -209,5 +267,7 @@ calls without having been tuned to make any measured test pass.
   pending MAN-100 through MAN-113), D8 (classical-DSP fixes before M4).
 - Code: `crates/manta-spot/src/variant.rs`, `crates/manta-spot/src/support.rs`,
   `crates/manta-spot/src/gate.rs`, `crates/manta-spot/src/validator.rs`.
-- Vectors: `docs/SPEC-decode-core.md` §4.6, §7.1 (V29, V31, V32);
+- Vectors: `docs/SPEC-decode-core.md` §4.6, §7.1 (V29, V31, V32, V33–V35);
   `crates/manta-spot/tests/golden_v11_v15.rs`.
+- Replay harness: `crates/manta-cli/examples/replay_spots.rs`,
+  `wiki/pages/replay-spots-harness.md`.

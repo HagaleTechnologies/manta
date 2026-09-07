@@ -24,28 +24,59 @@ const WINDOW_SECONDS: f64 = 90.0;
 /// must independently support the candidate", so 3 is what ships.
 pub const MIN_MESSAGE_WORD_GAP: u64 = 3;
 
-/// Counts a greedy chain of `word_seq`s (assumed ascending, as they are
-/// whenever pushed by `record`'s in-order calls) where each counted
-/// occurrence is at least `MIN_MESSAGE_WORD_GAP` seqs beyond the previous
-/// *counted* one. Shared by `RepetitionGate` and
-/// `support::SupportLedger` (MAN-100 Scenario 1), which must count
-/// repetitions by the same rule so a candidate's gate-facing rep count and
-/// its ledger-facing support figure never disagree about what counts as a
-/// separate message.
-pub(crate) fn count_message_distinct(seqs: &[u64]) -> usize {
-    let mut count = 0usize;
-    let mut last_counted: Option<u64> = None;
-    for &seq in seqs {
+/// Width, in seconds of `sample_ts` (never real wall clock), beyond which
+/// two occurrences of the same text cannot plausibly belong to one
+/// transmission, regardless of their word_seq gap (MAN-100 remediation
+/// C2). A short ID -- e.g. "DE <CALL>", 2 words -- puts genuinely
+/// separate messages below `MIN_MESSAGE_WORD_GAP`, and a pure word_seq
+/// rule then has no way to tell them apart from one corrupted message's
+/// double utterance (measured: "DE K5ARH" repeated 10x at 80s spacing,
+/// 13 minutes total, never spotted at all under a word_seq-only rule).
+/// 60s comfortably covers a full "CQ CQ DE <CALL> <CALL> K" transmission
+/// even at 8 WPM (SPEC-decode-core.md's slowest supported speed, ~40s for
+/// that template) with margin, while staying well under the 80s spacing
+/// that must count as separate and under the 90s ledger/gate window
+/// itself.
+pub const MIN_MESSAGE_TIME_GAP_SECONDS: f64 = 60.0;
+
+/// The indices into `occurrences` (word_seq, sample_ts) pairs -- assumed
+/// ascending in both fields, as they are whenever pushed by `record`'s/
+/// `SupportLedger::observe`'s in-order calls -- that count toward
+/// message-distinctness: an occurrence counts if it's the first, or if it
+/// clears `MIN_MESSAGE_WORD_GAP` word_seqs *or* `time_gap_samples`
+/// sample_ts beyond the previously *counted* occurrence. Shared by
+/// `RepetitionGate` and `support::SupportLedger` (MAN-100 Scenario 1),
+/// which must count repetitions by the same rule so a candidate's
+/// gate-facing rep count and its ledger-facing support figure never
+/// disagree about what counts as a separate message --
+/// `support::SupportLedger::support_in_window` folds `conf_sum` over
+/// exactly the occurrences this returns.
+pub(crate) fn message_distinct_indices(
+    occurrences: &[(u64, u64)],
+    time_gap_samples: u64,
+) -> Vec<usize> {
+    let mut counted = Vec::new();
+    let mut last_counted: Option<(u64, u64)> = None;
+    for (i, &(seq, ts)) in occurrences.iter().enumerate() {
         let counts = match last_counted {
             None => true,
-            Some(prev) => seq >= prev + MIN_MESSAGE_WORD_GAP,
+            Some((prev_seq, prev_ts)) => {
+                seq >= prev_seq + MIN_MESSAGE_WORD_GAP
+                    || ts.saturating_sub(prev_ts) >= time_gap_samples
+            }
         };
         if counts {
-            count += 1;
-            last_counted = Some(seq);
+            counted.push(i);
+            last_counted = Some((seq, ts));
         }
     }
-    count
+    counted
+}
+
+/// See `message_distinct_indices`; `RepetitionGate::record` only needs the
+/// count.
+pub(crate) fn count_message_distinct(occurrences: &[(u64, u64)], time_gap_samples: u64) -> usize {
+    message_distinct_indices(occurrences, time_gap_samples).len()
 }
 
 /// Width of a frequency bucket, in Hz (MAN-166). See `RepetitionGate`'s
@@ -150,6 +181,8 @@ impl GateEntry {
 pub struct RepetitionGate {
     window_samples: u64,
     min_occurrence_gap_samples: u64,
+    /// MAN-100 remediation C2: `MIN_MESSAGE_TIME_GAP_SECONDS` in samples.
+    time_gap_samples: u64,
     /// Keyed by a frequency bucket (not `track_id`, MAN-166): a real
     /// signal's `track_id` changes every time its track closes and
     /// reopens (e.g. `CloseReason::HangExpired`'s 5s silence timer), so
@@ -173,6 +206,7 @@ impl RepetitionGate {
         Self {
             window_samples: (WINDOW_SECONDS * fs) as u64,
             min_occurrence_gap_samples: (MIN_OCCURRENCE_GAP_SECONDS * fs) as u64,
+            time_gap_samples: (MIN_MESSAGE_TIME_GAP_SECONDS * fs) as u64,
             seen: BTreeMap::new(),
             records_total: 0,
         }
@@ -183,9 +217,10 @@ impl RepetitionGate {
     /// `Word` (MAN-100 Scenario 2). Returns the number of
     /// *message*-distinct decodes within the trailing window (including
     /// this one) -- two accepted occurrences fewer than
-    /// `MIN_MESSAGE_WORD_GAP` words apart count as one, since SPEC's own
-    /// default payload template repeats a callsign back-to-back within a
-    /// single transmission.
+    /// `MIN_MESSAGE_WORD_GAP` words apart *and* less than
+    /// `MIN_MESSAGE_TIME_GAP_SECONDS` apart in sample_ts count as one,
+    /// since SPEC's own default payload template repeats a callsign
+    /// back-to-back within a single transmission.
     ///
     /// A single `bucket(freq_hz)` lookup isn't sufficient identity on its
     /// own: two decodes of the same real signal can round to *different*
@@ -355,19 +390,20 @@ impl RepetitionGate {
         }
         entry.accepted.retain(|&(ts, _)| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
-        // MAN-100 Scenario 2: the raw accepted count (frequency-bucket,
-        // near-duplicate-track-filtered) is not the same thing as the
-        // message-distinct count SPEC's own gate wants -- two accepted
-        // occurrences from one message's back-to-back utterance are
-        // minutes apart in track-drift terms but zero words apart in
-        // message terms. Sorted defensively, not just collected in push
-        // order: `resolve_pending_beacons` can replay an older, deferred
-        // (sample_ts, word_seq) pair after newer ones already landed on
-        // this same entry (see `most_recent`'s doc), and
-        // `count_message_distinct` assumes its input is ascending.
-        let mut seqs: Vec<u64> = entry.accepted.iter().map(|&(_, seq)| seq).collect();
-        seqs.sort_unstable();
-        count_message_distinct(&seqs)
+        // MAN-100 Scenario 2 (remediation C2): message-distinctness is now
+        // word_seq gap OR sample_ts gap (`count_message_distinct`'s
+        // `time_gap_samples`), not word_seq alone -- see that function's
+        // doc. It expects `(word_seq, sample_ts)` pairs, the opposite
+        // order `accepted` stores them in; built and sorted defensively,
+        // not just collected in push order: `resolve_pending_beacons` can
+        // replay an older, deferred pair after newer ones already landed
+        // on this same entry (see `most_recent`'s doc), and
+        // `count_message_distinct` assumes its input is ascending in both
+        // fields.
+        let mut occurrences: Vec<(u64, u64)> =
+            entry.accepted.iter().map(|&(ts, seq)| (seq, ts)).collect();
+        occurrences.sort_unstable();
+        count_message_distinct(&occurrences, self.time_gap_samples)
     }
 
     /// See `records_total`'s doc.
@@ -472,6 +508,40 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         gate.record(1, 7_080_000.0, "K5ARH", 0, 4);
         assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 100_000, 7), 2);
+    }
+
+    /// MAN-100 remediation C2: a short "DE <CALL>" ID puts the callsign
+    /// only 2 words apart even across genuinely separate transmissions --
+    /// below `MIN_MESSAGE_WORD_GAP`. The time-based OR clears it instead:
+    /// 80s of sample_ts is well past `MIN_MESSAGE_TIME_GAP_SECONDS`, so
+    /// this must still count as two messages despite the short word gap.
+    #[test]
+    fn a_short_id_repeated_with_a_wide_time_gap_counts_as_two_messages() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 4);
+        let eighty_seconds_samples = (80.0 * FS) as u64;
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", eighty_seconds_samples, 6),
+            2,
+            "word gap is only 2, but 80s of sample_ts must still separate \
+             two genuinely distinct transmissions of a short ID"
+        );
+    }
+
+    /// The flip side of the above: a short word gap AND a short time gap
+    /// together still mean one message -- the time-based OR must not fire
+    /// spuriously on ordinary adjacent-word repeats.
+    #[test]
+    fn a_short_word_gap_and_a_short_time_gap_together_still_count_as_one_message() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 4);
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", 10_000, 5),
+            1,
+            "10 000 samples (~0.1s) is nowhere near \
+             MIN_MESSAGE_TIME_GAP_SECONDS, so the word-gap rule alone \
+             should decide, same as before this change"
+        );
     }
 
     /// A real signal's track closing and reopening under a new `track_id`
