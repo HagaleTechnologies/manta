@@ -7,6 +7,8 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::PathBuf;
 
+mod fmt;
+
 #[derive(Parser)]
 #[command(
     name = "manta",
@@ -184,6 +186,9 @@ enum Command {
         /// Duration in seconds.
         #[arg(long)]
         duration: u64,
+        /// Emit the soak report as one JSON object on stdout.
+        #[arg(long)]
+        json: bool,
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
         #[arg(long, conflicts_with = "device")]
@@ -381,7 +386,27 @@ fn open_source(
 
 fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
-        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+        Some(path) => {
+            let src = manta_input::AudioIqSource::from_wav_file(&path).map_err(|e| {
+                // Name the file first -- an error that says only "No such
+                // file or directory" leaves the operator guessing which of
+                // several paths on the command line was wrong.
+                let e = e.context(format!("open audio source {}", path.display()));
+                // The hint is about the file's *contents* (rate/layout), so
+                // it only helps when there is a file to have contents: on a
+                // mistyped path it sends the operator off to check a sample
+                // rate that was never the problem.
+                if path.is_file() {
+                    e.context(fmt::Hint(
+                        "--source takes a 48 kHz mono audio WAV; use `manta decode <file>` for \
+                         an IQ WAV",
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            Box::new(src)
+        }
         None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
 }
@@ -421,7 +446,7 @@ impl IqSource for FixedCenterFreqSource {
 fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     let ppm: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| e.to_string())?;
     Ok(ppm)
 }
@@ -559,11 +584,12 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !hz.is_finite() || hz <= 0.0 {
-        return Err(format!(
-            "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
-        ));
+        // Clap's own frame already prints `invalid value '<v>' for
+        // '--dial-freq-hz <..>': `, so the flag name and the value belong
+        // to it, not to this message (MAN-130).
+        return Err("must be a finite, positive number of Hz".to_string());
     }
     Ok(hz)
 }
@@ -597,11 +623,10 @@ const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --hpsdr-rate {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !hz.is_finite() || !(MIN_HPSDR_RATE_HZ..=MAX_HPSDR_RATE_HZ).contains(&hz) {
         return Err(format!(
-            "--hpsdr-rate must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
-             {MAX_HPSDR_RATE_HZ}, got {hz}"
+            "must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and {MAX_HPSDR_RATE_HZ}"
         ));
     }
     Ok(hz)
@@ -617,11 +642,9 @@ fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --hpsdr-freq {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !hz.is_finite() || hz <= 0.0 {
-        return Err(format!(
-            "--hpsdr-freq must be a finite, positive number of Hz, got {hz}"
-        ));
+        return Err("must be a finite, positive number of Hz".to_string());
     }
     Ok(hz)
 }
@@ -648,11 +671,10 @@ const MAX_REPLAY_EPOCH_SECS: i64 = 4_102_444_800;
 fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
     let secs: i64 = s
         .parse()
-        .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
     if !(0..=MAX_REPLAY_EPOCH_SECS).contains(&secs) {
         return Err(format!(
-            "--replay-epoch must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
-             (2100-01-01), got {secs}"
+            "must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} (2100-01-01)"
         ));
     }
     Ok(secs)
@@ -932,7 +954,20 @@ fn start_spot_server(
     ))
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{}", fmt::render_error(&err));
+            if let Some(hint) = fmt::render_hint(&err) {
+                eprintln!("{hint}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<std::process::ExitCode> {
     match Cli::parse().command {
         Command::Decode {
             path,
@@ -948,8 +983,12 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-                eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
-                eprintln!("spots: {}", report.spots.len());
+                eprintln!(
+                    "frequency: {} kHz  speed: {} wpm  spots: {}",
+                    fmt::khz(report.freq_hz),
+                    fmt::wpm_opt(report.wpm),
+                    report.spots.len()
+                );
             }
         }
         Command::Gen { vector, out } => {
@@ -960,7 +999,7 @@ fn main() -> Result<()> {
                 "v4" => manta_testkit::vectors::v4(),
                 "v5" => manta_testkit::vectors::v5(),
                 "v6" => manta_testkit::vectors::v6(),
-                other => bail!("unknown vector {other:?} (available: v1-v6)"),
+                other => bail!("unknown vector '{other}' (available: v1-v6)"),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
@@ -1181,16 +1220,19 @@ fn main() -> Result<()> {
                     }
                     use manta_decode::events::DecoderEvent;
                     use std::io::Write as _;
+                    // The live per-character monitor is a diagnostic (is it
+                    // hearing anything?), not the command's product -- it
+                    // goes to stderr so the spot lines on stdout stay clean.
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
                             if let Some(c) = glyph.text_char() {
-                                print!("{c}");
-                                let _ = std::io::stdout().flush();
+                                eprint!("{c}");
+                                let _ = std::io::stderr().flush();
                             }
                         }
                         DecoderEvent::WordBoundary { .. } => {
-                            print!(" ");
-                            let _ = std::io::stdout().flush();
+                            eprint!(" ");
+                            let _ = std::io::stderr().flush();
                         }
                         _ => {}
                     }
@@ -1199,6 +1241,7 @@ fn main() -> Result<()> {
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
                 // ARCHITECTURE §7), fed here when --server-config is set.
+                // The spot is the product: it goes to stdout in both modes.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
@@ -1208,15 +1251,7 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
-                    eprintln!(
-                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
-                        spot.callsign,
-                        spot.spot_type,
-                        spot.freq_hz,
-                        spot.snr_db,
-                        spot.wpm,
-                        spot.confidence
-                    );
+                    println!("{}", fmt::spot_line(spot));
                 },
             );
 
@@ -1242,6 +1277,7 @@ fn main() -> Result<()> {
         }
         Command::Soak {
             duration,
+            json,
             device,
             source,
             kiwi_host,
@@ -1309,13 +1345,37 @@ fn main() -> Result<()> {
                 }
             };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
-            eprintln!("{report:?}");
-            if !manta_engine::soak_passed(&report) {
-                std::process::exit(1);
+            let passed = manta_engine::soak_passed(&report);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "passed": passed,
+                        "duration_s": duration,
+                        "events_emitted": report.events_emitted,
+                        "rss_growth_bytes": report.rss_growth_bytes,
+                        "panicked": report.panicked,
+                    }))?
+                );
+            } else {
+                println!("soak: {}", if passed { "passed" } else { "FAILED" });
+                println!("  duration:    {duration} s");
+                println!("  events:      {}", report.events_emitted);
+                println!(
+                    "  rss growth:  {:.1} MiB",
+                    report.rss_growth_bytes as f64 / (1024.0 * 1024.0)
+                );
+                println!(
+                    "  panicked:    {}",
+                    if report.panicked { "yes" } else { "no" }
+                );
+            }
+            if !passed {
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

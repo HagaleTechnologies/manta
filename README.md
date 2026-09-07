@@ -122,7 +122,10 @@ enforced by criterion benches.
 
 ## Outputs
 
-- Decoded text or JSON Lines on stdout today.
+- `decode` puts decoded text on stdout, a one-line summary on stderr.
+- `listen` puts spot lines (text mode) or JSON Lines (`--json`) on stdout;
+  the live decoded character stream is a stderr diagnostic in text mode.
+- `soak` puts a human report or (`--json`) one JSON object on stdout.
 - RBN-format `DX de` spots over the DX cluster telnet protocol (port 7300)
   and a JSON Lines / WebSocket stream (port 7301): in progress, see
   [ROADMAP.md](ROADMAP.md) milestone M3.

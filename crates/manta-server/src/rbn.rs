@@ -1,16 +1,7 @@
 //! RBN-format ("DX de ...") line rendering for the telnet cluster server.
 //! ARCHITECTURE §7.
 
-use manta_spot::{Spot, SpotType};
-
-fn spot_type_label(spot_type: SpotType) -> &'static str {
-    match spot_type {
-        SpotType::Cq => "CQ",
-        SpotType::De => "DE",
-        SpotType::Beacon => "BEACON",
-        SpotType::Unknown => "",
-    }
-}
+use manta_spot::Spot;
 
 /// Renders one spot as a standard RBN `DX de` cluster line, e.g.
 /// `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
@@ -32,13 +23,14 @@ pub fn format_line(spot: &Spot, spotter_call: &str, unix_ts_secs: i64) -> String
         call = spot.callsign,
         snr = spot.snr_db.round() as i32,
         wpm = spot.wpm.round() as i32,
-        ctx = spot_type_label(spot.spot_type),
+        ctx = spot.spot_type.rbn_flag(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manta_spot::SpotType;
 
     fn sample_spot() -> Spot {
         Spot {

@@ -32,7 +32,10 @@ fn default_dry_run() -> bool {
 /// drift between the two call sites.
 fn check_plausible(call: &str) -> Result<(), String> {
     if !manta_spot::grammar::is_plausible(call) {
-        return Err(format!("{call:?} is not a plausible callsign"));
+        return Err(format!(
+            "'{}' is not a plausible callsign",
+            call.escape_debug()
+        ));
     }
     Ok(())
 }

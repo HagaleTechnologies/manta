@@ -116,7 +116,11 @@ impl SpotMessage {
             de_continent: de.map(|e| e.continent.clone()).unwrap_or_default(),
             snr: Some(spot.snr_db.round() as i32),
             wpm: Some(spot.wpm.round() as i32),
-            decode_confidence: Some(spot.confidence),
+            // Rounded to 2 dp for the same reason `snr`/`wpm` above are
+            // rounded to integers: the wire value should carry the
+            // precision manta can justify, not f32 promotion noise
+            // (observed: 0.2694305).
+            decode_confidence: Some((spot.confidence * 100.0).round() / 100.0),
             decoder_version: Some(decoder_version.to_string()),
             channelizer_resolution_hz: None,
         }
@@ -221,6 +225,17 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
 
         assert_eq!(msg.dx_dxcc, None);
         assert_eq!(msg.de_dxcc, None);
+    }
+
+    #[test]
+    fn decode_confidence_carries_two_decimals_not_float_noise() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.confidence = 0.269_430_5; // the value captured on the live :7301 wire
+        let msg = SpotMessage::from_spot(&spot, "W5AU", &cty, "manta-0.1.0", 0, 1);
+        assert_eq!(msg.decode_confidence, Some(0.27));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"decodeConfidence\":0.27"), "{json}");
     }
 
     #[test]
