@@ -322,9 +322,9 @@ pub struct DetectorTable {
 const MAX_PLAUSIBLE_MS: f64 = 3_600_000.0;
 
 fn ms_to_hops_checked(key: &str, ms: f64) -> Result<u64> {
-    if !ms.is_finite() || !(0.0..=MAX_PLAUSIBLE_MS).contains(&ms) {
+    if !ms.is_finite() || ms <= 0.0 || ms > MAX_PLAUSIBLE_MS {
         bail!(
-            "{key} must be a finite number of milliseconds between 0 and {MAX_PLAUSIBLE_MS}, got {ms}"
+            "{key} must be a finite number of milliseconds between 0 (exclusive) and {MAX_PLAUSIBLE_MS}, got {ms}"
         );
     }
     Ok(u64::from(manta_decode::ms_to_hops(ms)))
@@ -615,11 +615,35 @@ const ENV_PREFIX: &str = "MANTA_";
 /// table-overlay treatment every other `MANTA_*` variable gets.
 pub const ENV_CONFIG_PATH: &str = "MANTA_CONFIG";
 
+/// `(table, key)` pairs whose target field is always `String`/`PathBuf` --
+/// forced to a bare TOML string unconditionally in `apply_env_overlay`,
+/// bypassing `env_value_to_toml`'s TOML-typed probe entirely. Without this,
+/// a numeric-looking value -- a KiwiSDR password (MAN-73's secret-injection
+/// use case), a `MANTA_INPUT_DEVICE` that happens to be all digits, a
+/// numeric-looking blocklist/notch path -- parses as an integer instead of
+/// a string, with no documented way to force the string type (round-2
+/// finding C-5). `[spot].allowlist` is deliberately absent: it is a
+/// `Vec<String>`, which genuinely needs the TOML-array parse
+/// (`a_typed_env_value_is_parsed_as_toml`).
+const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
+    ("server", "station_callsign"),
+    ("server", "bind_addr"),
+    ("input", "device"),
+    ("input", "path"),
+    ("input", "host"),
+    ("input", "password"),
+    ("input", "driver"),
+    ("spot", "blocklist_path"),
+    ("spot", "notch_path"),
+];
+
 /// Best-effort TOML-typed parse of one environment variable's raw text:
 /// tried first as a TOML value (so `9300`, `true`, `1.5`, `["W1AW"]` come
 /// through typed), falling back to a bare string so
 /// `MANTA_SERVER_BIND_ADDR=0.0.0.0` or `MANTA_SERVER_STATION_CALLSIGN=K1ABC`
-/// need no shell quoting.
+/// need no shell quoting. Callers that know the target field is always a
+/// string (`STRING_TYPED_ENV_KEYS`) skip this probe entirely rather than
+/// relying on it -- see that constant's doc comment.
 fn env_value_to_toml(raw: &str) -> toml::Value {
     let probe = format!("x = {raw}");
     match toml::from_str::<toml::Table>(&probe) {
@@ -661,7 +685,12 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(String, String)]) -> Result
         let Some(table_mut) = entry.as_table_mut() else {
             bail!("{name}: [{table}] is not a table in the config file");
         };
-        table_mut.insert(key, env_value_to_toml(value));
+        let toml_value = if STRING_TYPED_ENV_KEYS.contains(&(table.as_str(), key.as_str())) {
+            toml::Value::String(value.clone())
+        } else {
+            env_value_to_toml(value)
+        };
+        table_mut.insert(key, toml_value);
     }
     Ok(())
 }
@@ -691,6 +720,19 @@ pub fn load_str_with_env(text: &str, vars: &[(String, String)]) -> Result<Config
     load_from_text_and_env(text, vars)
 }
 
+/// The table-overlay-eligible subset of a raw variable list: every
+/// `MANTA_*`-prefixed name except [`ENV_CONFIG_PATH`] itself, which
+/// `main.rs` reads directly as the `--config` fallback, not as a table key.
+/// Split out from `load` so the exclusion can be asserted directly against
+/// a plain `Vec`, with no `std::env::set_var` needed (`load`'s own
+/// `std::env::vars()` read is the one real call site that touches the
+/// process environment).
+fn env_overlay_vars(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter(|(k, _)| k.starts_with(ENV_PREFIX) && k != ENV_CONFIG_PATH)
+        .collect()
+}
+
 /// The real entry point: reads `path` (if given), overlays the process's
 /// actual `MANTA_*` environment variables (excluding [`ENV_CONFIG_PATH`],
 /// which `main.rs` reads directly as the `--config` fallback, not as a
@@ -704,9 +746,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigFile> {
             .with_context(|| format!("reading config file {}", p.display()))?,
         None => String::new(),
     };
-    let vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with(ENV_PREFIX) && k != ENV_CONFIG_PATH)
-        .collect();
+    let vars = env_overlay_vars(std::env::vars());
     load_str_with_env(&text, &vars).with_context(|| match path {
         Some(p) => format!("parsing config file {}", p.display()),
         None => "parsing MANTA_* environment overrides".to_string(),
@@ -1165,7 +1205,9 @@ mod tests {
                 "[detector]\non_snr_db = 3.0\noff_snr_db = 9.0\n",
             ),
             ("detector", "[detector]\nhang_ms = -1\n"),
+            ("detector", "[detector]\nhang_ms = 0\n"),
             ("detector", "[detector]\ngc_ms = nan\n"),
+            ("detector", "[detector]\ngc_ms = 0\n"),
             ("detector", "[detector]\ntrack_cap = 0\n"),
             ("decode", "[decode]\nbeam_width = 0\n"),
             ("decode", "[decode]\ntiming_sigma = 0\n"),
@@ -1372,19 +1414,57 @@ mod tests {
     }
 
     #[test]
-    fn an_env_value_is_validated_by_the_same_typed_layer() {
+    fn an_env_only_input_table_with_no_type_anywhere_is_a_missing_field_error() {
+        // `[input]` is a tagged union: MANTA_INPUT_* with no `type` key,
+        // in the file or via MANTA_INPUT_TYPE, cannot select a variant --
+        // this must be an error, never a silent accept of the (also
+        // out-of-range) ppm value (round-2 finding C-4, SPEC §9).
         let err = load_str_with_env(
             "",
             &[(
                 "MANTA_INPUT_FREQ_CORRECTION_PPM".to_string(),
                 "999999".to_string(),
             )],
-        );
-        // MANTA_INPUT_* with no `type` key set is itself a distinct
-        // error (a bare freq_correction_ppm with no [input].type is
-        // missing the required tag) -- either way this must be an error,
-        // not a silent accept of the out-of-range value.
-        assert!(err.is_err());
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing field `type`"), "{err}");
+    }
+
+    #[test]
+    fn an_env_value_is_validated_by_the_same_typed_layer_once_type_is_known() {
+        // With MANTA_INPUT_TYPE supplying the tag the earlier test lacked,
+        // the out-of-range ppm value now reaches the real typed validator.
+        let err = load_str_with_env(
+            "",
+            &[
+                ("MANTA_INPUT_TYPE".to_string(), "audio".to_string()),
+                (
+                    "MANTA_INPUT_FREQ_CORRECTION_PPM".to_string(),
+                    "999999".to_string(),
+                ),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("[-1000, 1000]"), "{err}");
+    }
+
+    #[test]
+    fn a_numeric_looking_env_string_value_is_not_mistyped_as_a_number() {
+        // MAN-73's secret-injection use case: a KiwiSDR password that
+        // happens to be all digits must stay a string, not become a TOML
+        // integer with no documented way to force the type back (round-2
+        // finding C-5).
+        let cfg = load_str_with_env(
+            "[input]\ntype = \"kiwi\"\nhost = \"kiwi.example.com\"\nfreq_hz = 14025000.0\n",
+            &[("MANTA_INPUT_PASSWORD".to_string(), "12345678".to_string())],
+        )
+        .unwrap();
+        match cfg.input.unwrap() {
+            InputSource::Kiwi { password, .. } => assert_eq!(password, "12345678"),
+            other => panic!("expected a Kiwi input source, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1399,13 +1479,29 @@ mod tests {
     }
 
     #[test]
-    fn manta_config_env_var_name_is_excluded_from_table_overlay_when_using_load() {
-        // `load` (the real, non-hermetic entry point) must not treat
-        // MANTA_CONFIG as a table-key overlay attempt -- main.rs reads it
-        // directly as the --config fallback.
-        std::env::set_var(ENV_CONFIG_PATH, "/should/not/be/read/as/a/table.toml");
-        let result = load(None);
-        std::env::remove_var(ENV_CONFIG_PATH);
-        assert!(result.is_ok(), "{result:?}");
+    fn manta_config_env_var_name_is_excluded_from_table_overlay() {
+        // `load`'s env-collection filter must not treat MANTA_CONFIG as a
+        // table-key overlay attempt -- main.rs reads it directly as the
+        // --config fallback. Asserted against `env_overlay_vars` directly
+        // rather than via `std::env::set_var`, which raced `load`'s own
+        // `std::env::vars()` read against sibling tests sharing this bin
+        // target's single test process (round-2 finding C-6).
+        let vars = env_overlay_vars([
+            (
+                ENV_CONFIG_PATH.to_string(),
+                "/should/not/be/read/as/a/table.toml".to_string(),
+            ),
+            (
+                "MANTA_SERVER_STATION_CALLSIGN".to_string(),
+                "W3XYZ".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            vars,
+            vec![(
+                "MANTA_SERVER_STATION_CALLSIGN".to_string(),
+                "W3XYZ".to_string()
+            )]
+        );
     }
 }

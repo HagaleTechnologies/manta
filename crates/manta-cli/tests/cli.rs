@@ -153,6 +153,57 @@ fn json_output_is_valid_and_deterministic_across_three_runs() {
     assert!(v["events"].is_array());
 }
 
+/// MAN-74 "What We're NOT Doing" #2: `decode` is the entry point SPEC §6's
+/// "file input -> byte-identical spot logs" determinism contract runs
+/// through, so it must stay hermetic against both `MANTA_*` env vars and
+/// `--config` -- an ambient, machine-specific override would make the
+/// contract depend on the environment instead of the input file alone.
+#[test]
+fn manta_decode_ignores_every_manta_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectorspec_short();
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join(format!("{}.wav", spec.name));
+
+    let without_env = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        without_env.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&without_env.stderr)
+    );
+
+    let with_env = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .env("MANTA_DECODE_TIMING_SIGMA", "0.9")
+        .env("MANTA_DETECTOR_ON_SNR_DB", "99.0")
+        .output()
+        .unwrap();
+    assert!(
+        with_env.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_env.stderr)
+    );
+    assert_eq!(
+        without_env.stdout, with_env.stdout,
+        "manta decode must be hermetic against MANTA_* environment variables"
+    );
+
+    let with_config_flag = manta()
+        .args(["decode", "--config", "/x.toml"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        !with_config_flag.status.success(),
+        "`decode` must have no --config flag"
+    );
+}
+
 /// MAN-29 review round 3: `manta decode` (the primary offline-IQ path) had
 /// no `--freq-correction-ppm`, unlike `listen`/`soak` -- a user decoding a
 /// recording from a source with a known oscillator correction couldn't use
@@ -385,6 +436,60 @@ fn write_real_audio_wav(path: &std::path::Path, text: &str, duration_s: f64) {
     w.finalize().unwrap();
 }
 
+/// Runs `manta listen --json --source <wav>`, optionally with `config_toml`
+/// written to a fresh `--config` file in `dir` -- shared by the
+/// `[detector]`-wiring regression test below.
+fn run_listen(wav: &std::path::Path, dir: &std::path::Path, config_toml: Option<&str>) -> Vec<u8> {
+    let mut cmd = manta();
+    cmd.args(["listen", "--json", "--source"]).arg(wav);
+    if let Some(toml) = config_toml {
+        let cfg_path = dir.join("detector.toml");
+        std::fs::write(&cfg_path, toml).unwrap();
+        cmd.args(["--config"]).arg(&cfg_path);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// MAN-74 Phase 2 regression: on the pre-fix commit, `[detector]` parsed
+/// (Phase 1) but `resolve_pipeline` never reached the running detector, so
+/// a config with a high `on_snr_db` decoded byte-identically to no config
+/// at all. This proves the wiring, not just the parse.
+///
+/// `on_snr_db = 1000.0`, not something closer to the 12.0 default:
+/// `write_real_audio_wav` synthesizes a pure keyed tone with no added
+/// noise, so its real per-channel SNR (set only by float32 rounding/FFT
+/// leakage, not a calibrated noise floor like the golden vectors'
+/// `manta_testkit::vectors` AWGN) is far higher than any realistic HF
+/// signal's -- a threshold has to clear that to suppress every track
+/// reliably rather than flake on the exact leakage floor this build
+/// happens to produce.
+#[test]
+fn detector_on_snr_db_from_the_config_file_actually_silences_the_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+
+    let baseline = run_listen(&wav_path, dir.path(), None);
+    let muted = run_listen(
+        &wav_path,
+        dir.path(),
+        Some("[detector]\non_snr_db = 1000.0\n"),
+    );
+
+    assert!(!baseline.is_empty(), "baseline must decode something");
+    assert!(
+        muted.is_empty(),
+        "detector.on_snr_db = 1000.0 must suppress every track, got: {}",
+        String::from_utf8_lossy(&muted)
+    );
+}
+
 /// MAN-74 scenario 1, end to end: `manta listen --config manta.toml` with
 /// an `[input] type = "file"` table and NO CLI source flags at all must
 /// decode using exactly that source configuration.
@@ -434,6 +539,66 @@ fn unknown_top_level_config_table_is_rejected_end_to_end() {
     assert!(
         stderr.contains("completely_bogus_table"),
         "stderr must name the table: {stderr}"
+    );
+}
+
+/// MAN-74 round-2 finding C-1: `MANTA_CONFIG` is documented (SPEC §9,
+/// `docs/DECISIONS/2026-09-06-man74-config-surface.md`) as the `--config`
+/// fallback an operator's systemd unit can set instead of a CLI flag, but
+/// `main.rs` never read it. Reuses scenario 2's unknown-table repro so a
+/// pass here proves the file was actually loaded via the env var, not just
+/// that the process didn't crash.
+#[test]
+fn manta_config_env_var_is_used_as_the_config_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[server]\nstation_callsign = \"W3XYZ\"\n\n[completely_bogus_table]\nnonsense = 42\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav"])
+        .env("MANTA_CONFIG", &cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "MANTA_CONFIG must be read as the --config fallback and reject the unknown table"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("completely_bogus_table"),
+        "stderr must show the config file reached via MANTA_CONFIG was actually parsed: {stderr}"
+    );
+}
+
+/// MAN-74 round-2 finding C-1 (continued): an explicit `--config` flag
+/// still wins over `MANTA_CONFIG`, matching the documented CLI > env
+/// precedence -- `MANTA_CONFIG` pointing at the bogus-table file above must
+/// not override a valid `--config` file.
+#[test]
+fn explicit_config_flag_beats_the_manta_config_env_var() {
+    let dir = tempfile::tempdir().unwrap();
+    let bogus_cfg_path = dir.path().join("bogus.toml");
+    std::fs::write(&bogus_cfg_path, "[completely_bogus_table]\nnonsense = 42\n").unwrap();
+    let good_cfg_path = dir.path().join("good.toml");
+    std::fs::write(&good_cfg_path, "").unwrap();
+
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav", "--config"])
+        .arg(&good_cfg_path)
+        .env("MANTA_CONFIG", &bogus_cfg_path)
+        .output()
+        .unwrap();
+    // Both configs are otherwise valid enough to reach the WAV-open step,
+    // so success/failure alone can't tell them apart -- but the bogus file
+    // would have failed at config-load with a distinct, checkable error.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("completely_bogus_table"),
+        "an explicit --config must win over MANTA_CONFIG, got: {stderr}"
     );
 }
 

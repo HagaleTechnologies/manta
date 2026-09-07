@@ -144,7 +144,21 @@ as the `--config` path fallback, not as a table-key overlay.
 Value parsing tries the raw text as a TOML scalar first (`9300`, `true`,
 `1.5`, `["W1AW","K1ABC"]` all come through typed), falling back to a bare
 string otherwise — so `MANTA_SERVER_BIND_ADDR=0.0.0.0` and
-`MANTA_SERVER_STATION_CALLSIGN=K1ABC` need no shell quoting.
+`MANTA_SERVER_STATION_CALLSIGN=K1ABC` need no shell quoting. A fixed list
+of known-`String`/`PathBuf` keys (`station_callsign`, `bind_addr`, and
+`[input]`'s `device`/`path`/`host`/`password`/`driver`, `[spot]`'s
+`blocklist_path`/`notch_path`) skips that scalar probe entirely and is
+always taken as a bare string — otherwise a numeric-looking secret like a
+KiwiSDR password (`MANTA_INPUT_PASSWORD=12345678`) would type as an
+integer, not a string, with no way to force the string type back (round-2
+review finding C-5).
+
+`[input]` is a tagged union keyed on `type`, so `MANTA_INPUT_*` variables
+can only extend an `[input]` table whose variant is already known — from
+the file's own `type` key, or from a `MANTA_INPUT_TYPE` variable set
+alongside the others. Setting e.g. only `MANTA_INPUT_FREQ_CORRECTION_PPM`
+with no `type` anywhere is a `missing field \`type\`` error, not a silent
+no-op (round-2 review finding C-4).
 
 ## Decision 7 — `manta decode`/`manta gen` stay hermetic
 

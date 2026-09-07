@@ -563,6 +563,13 @@ config file or `MANTA_*` variable at all -- SPEC §6's "file input ->
 byte-identical spot logs" determinism contract runs through `decode`, and an
 ambient, machine-specific override would break it.
 
+`[input]` is a tagged union (`type` selects the variant), so the env tier
+can only add/override a *sibling* key once `type` is already known --
+either from the file's own `[input].type`, or from `MANTA_INPUT_TYPE` set
+alongside the other `MANTA_INPUT_*` variables. A `MANTA_INPUT_*` variable
+with no `type` anywhere (file or env) is a `missing field \`type\`` error,
+not a silent no-op or a guessed variant.
+
 Unknown top-level tables, and unknown keys within a modeled table, are a
 parse error naming the offending table/key -- there is no silent-ignore
 tier below "built-in default".

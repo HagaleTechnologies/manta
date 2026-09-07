@@ -411,6 +411,19 @@ fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<
     })
 }
 
+/// `--config`'s fallback: `MANTA_CONFIG`, read directly here rather than
+/// through `apply_env_overlay`'s per-key table splice, since it names which
+/// file to read rather than a value inside one (`config::ENV_CONFIG_PATH`'s
+/// own doc comment). An explicit `--config` always wins, matching the
+/// documented CLI-flag > env var precedence.
+fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
+    cli_config.or_else(|| {
+        std::env::var(config::ENV_CONFIG_PATH)
+            .ok()
+            .map(PathBuf::from)
+    })
+}
+
 /// Opens a `[input]`-table-derived `config::SourceSpec` (MAN-74) -- the
 /// config-file counterpart to `open_source`/`open_hpsdr_source`'s
 /// CLI-flag-driven chain. `InputSource`/`SourceSpec` are never
@@ -1109,6 +1122,7 @@ fn main() -> Result<()> {
                 || has_soapy_source
                 || has_hpsdr_source;
 
+            let config_path = resolve_config_path(config_path);
             let base_dir = config_path
                 .as_deref()
                 .and_then(std::path::Path::parent)
@@ -1162,11 +1176,26 @@ fn main() -> Result<()> {
             };
 
             // The resolved dial frequency: an explicit CLI flag wins over
-            // `[input].dial_freq_hz` (MAN-74).
+            // `[input].dial_freq_hz` (MAN-74). The file's `dial_freq_hz`
+            // only carries over when the source actually in effect is
+            // non-RF-aware -- a plain audio device or WAV replay (whether
+            // chosen via `[input]` or `--device`/`--source`) reports no
+            // real RF frequency of its own, so the file's value legitimately
+            // still applies per Decision 5. But an RF-aware CLI source flag
+            // (`--kiwi-host`/`--soapy-*`/`--hpsdr-*`) discards `[input]`
+            // wholesale (`file_source`/`has_rf_aware_source` above) and
+            // reports its own center frequency, so a config's stale
+            // `dial_freq_hz` left over for a DIFFERENT source must not
+            // silently wrap it in the wrong center frequency (round-2
+            // finding C-2).
             let resolved_dial_freq_hz = dial_freq_hz.or_else(|| {
-                file.input
-                    .as_ref()
-                    .and_then(config::InputSource::dial_freq_hz)
+                if cli_has_source_flags && has_rf_aware_source {
+                    None
+                } else {
+                    file.input
+                        .as_ref()
+                        .and_then(config::InputSource::dial_freq_hz)
+                }
             });
 
             if file.server.is_some() && !has_rf_aware_source && resolved_dial_freq_hz.is_none() {
@@ -1442,6 +1471,7 @@ fn main() -> Result<()> {
                 || has_soapy_source
                 || has_hpsdr_source;
 
+            let config_path = resolve_config_path(config_path);
             let base_dir = config_path
                 .as_deref()
                 .and_then(std::path::Path::parent)
