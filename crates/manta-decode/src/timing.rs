@@ -28,26 +28,42 @@ const DIT_BIAS_CAP_FRAC: f32 = 0.35;
 // the `EdgeLegacy`/`Hsmm`-only `CHAR_GAP_DITS_NOMINAL` split (SPEC v2 §0
 // Task 5) along with it, since every engine now uses the same nominal 2.0.
 const CHAR_GAP_DITS: f32 = 2.0;
-const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
-const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
-                               // SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
-                               // which is the practical floor for this constant: `ClusterPair::observe`
-                               // (below) always needs exactly 5 samples to leave its unimodal `init` phase
-                               // and become `ready()` (a fixed threshold shared with `SpeedTracker`'s
-                               // mu_dit/mu_dah bootstrap, not specific to Farnsworth), and
-                               // `farnsworth_active()` requires both `pair.ready()` and `long_seen >=
-                               // FARNS_MIN_COUNT` -- so any value <= 5 is equivalent (confirmed empirically:
-                               // 2/3/4/5 all produce identical V10 classification). Values > 5 only add
-                               // extra confirmation delay past that floor. This does not fully eliminate
-                               // Farnsworth's activation lag -- seeing this shared 5-sample bootstrap
-                               // itself takes several inter-character/inter-word gaps on any real
-                               // Farnsworth signal, which is why V10's golden test tolerates a small,
-                               // documented "warmup" word-boundary count instead of an exact match (see
-                               // golden_v7_v9_v10.rs's v10 test and the M2 sub-project 2 close-out pins
-                               // doc). Reducing the shared 5-sample bootstrap itself was considered and
-                               // rejected for this task: it also drives mark-speed (mu_dit/mu_dah)
-                               // estimation for every decode, not just Farnsworth ones, and changing it
-                               // needs its own full-suite/multi-WPM validation, out of this task's scope.
+// SPEC §9 decode.word_gap_dits
+const WORD_GAP_DITS: f32 = 5.0;
+// SPEC §4.2 long-gap floor: the smallest gap, in dit units, that is
+// admitted into the Farnsworth long-gap `ClusterPair`. Re-derived by
+// MAN-103 together with `CHAR_GAP_DITS` (see
+// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md): the floor and
+// the char/element boundary are the *same* boundary seen from two sides, so
+// they must move together. It was 1.5 only because `CHAR_GAP_DITS` was
+// temporarily 1.6; with the char boundary back at SPEC's nominal 2.0 a stale
+// 1.5 opens a window [1.5, 2.0) of gaps that `classify` correctly calls
+// InterElement while still folding them into the long-gap statistics. That
+// window is not hypothetical at the top of the supported speed range: a
+// plain element gap measures u ~ 1.5-1.6 near 40 WPM, which dragged
+// `pair.lo` down to ~2 and `word_thr` with it until real inter-character
+// gaps classified as InterWord (measured: "GQH AA" -> "GQH A A" at 39.95
+// WPM, and CER 0.38 on a 40 WPM 60 s scene). Tying it to CHAR_GAP_DITS
+// makes the two definitions of "long" identical by construction.
+const FARNS_LONG_U: f32 = CHAR_GAP_DITS;
+// SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
+// which is the practical floor for this constant: `ClusterPair::observe`
+// (below) always needs exactly 5 samples to leave its unimodal `init` phase
+// and become `ready()` (a fixed threshold shared with `SpeedTracker`'s
+// mu_dit/mu_dah bootstrap, not specific to Farnsworth), and
+// `farnsworth_active()` requires both `pair.ready()` and `long_seen >=
+// FARNS_MIN_COUNT` -- so any value <= 5 is equivalent (confirmed empirically:
+// 2/3/4/5 all produce identical V10 classification). Values > 5 only add
+// extra confirmation delay past that floor. This does not fully eliminate
+// Farnsworth's activation lag -- seeing this shared 5-sample bootstrap
+// itself takes several inter-character/inter-word gaps on any real
+// Farnsworth signal, which is why V10's golden test tolerates a small,
+// documented "warmup" word-boundary count instead of an exact match (see
+// golden_v7_v9_v10.rs's v10 test and the M2 sub-project 2 close-out pins
+// doc). Reducing the shared 5-sample bootstrap itself was considered and
+// rejected for this task: it also drives mark-speed (mu_dit/mu_dah)
+// estimation for every decode, not just Farnsworth ones, and changing it
+// needs its own full-suite/multi-WPM validation, out of this task's scope.
 const FARNS_MIN_COUNT: u32 = 5;
 const FARNS_MIN_RATIO: f32 = 1.8;
 
