@@ -552,7 +552,8 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 MAN-74: `manta-cli::config::ConfigFile` (`crates/manta-cli/src/config.rs`) is
 the loader for the single `manta.toml` these tables live in, reachable via
 `manta listen`/`manta run`/`manta soak --config <path>` (`--server-config` is
-a deprecated alias). Precedence, per key: **CLI flag > `MANTA_<TABLE>_<KEY>`
+a deprecated alias of `--config`, scoped to `listen`/`run` only -- `soak`
+never accepted it). Precedence, per key: **CLI flag > `MANTA_<TABLE>_<KEY>`
 environment variable > this file > the built-in default below.** The env
 tier addresses `[server]`, `[input]`, `[spot]`, `[detector]`, and `[decode]`
 (e.g. `MANTA_DETECTOR_ON_SNR_DB=10.0`); `[[rbn_uplink]]` is an

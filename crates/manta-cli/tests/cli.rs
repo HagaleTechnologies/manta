@@ -914,17 +914,29 @@ fn wait_for_port_open(addr: &str, timeout: std::time::Duration) -> bool {
 /// port: `start_spot_server` (`main.rs`) binds all three sockets before
 /// `listen()` ever reads a sample, so the window to observe this is the
 /// whole run, not a narrow race.
+/// Binds an OS-assigned ephemeral port and immediately releases it --
+/// CLAUDE.md's multi-agent hygiene rule ("don't bind fixed ports") means a
+/// literal port number here can false-pass or false-fail against another
+/// concurrent test/agent on the same host.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 #[test]
 fn config_with_a_server_table_starts_the_servers() {
     let dir = tempfile::tempdir().unwrap();
     let wav_path = dir.path().join("cw.wav");
     write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
     let cfg_path = dir.path().join("manta.toml");
+    let (telnet_port, json_port, metrics_port) = (free_port(), free_port(), free_port());
     std::fs::write(
         &cfg_path,
-        "[server]\nstation_callsign = \"W3XYZ\"\ntelnet_port = 19391\njson_port = 19392\n\
-         metrics_port = 19393\n\n[input]\ntype = \"file\"\npath = \"cw.wav\"\n\
-         dial_freq_hz = 14025000.0\n",
+        format!(
+            "[server]\nstation_callsign = \"W3XYZ\"\ntelnet_port = {telnet_port}\n\
+             json_port = {json_port}\nmetrics_port = {metrics_port}\n\n\
+             [input]\ntype = \"file\"\npath = \"cw.wav\"\ndial_freq_hz = 14025000.0\n"
+        ),
     )
     .unwrap();
 
@@ -936,7 +948,10 @@ fn config_with_a_server_table_starts_the_servers() {
         .spawn()
         .unwrap();
 
-    let connected = wait_for_port_open("127.0.0.1:19391", std::time::Duration::from_secs(10));
+    let connected = wait_for_port_open(
+        &format!("127.0.0.1:{telnet_port}"),
+        std::time::Duration::from_secs(10),
+    );
     let _ = child.kill();
     let _ = child.wait();
     assert!(
@@ -947,10 +962,15 @@ fn config_with_a_server_table_starts_the_servers() {
 
 /// MAN-74 Decision 8, the negative case: with NO `[server]` table at all,
 /// the servers must not even attempt to bind a socket -- proven by
-/// pre-occupying the exact port a `[server]` config would have used
-/// ourselves; if the [server]-absent path tried to bind it anyway, the
-/// whole `listen` command would fail with an "address in use" error and
-/// exit non-zero instead of decoding cleanly.
+/// pre-occupying the REAL default ports (`manta-server/src/config.rs`'s
+/// `default_telnet_port`/`default_json_port`/`default_metrics_port`:
+/// 7300/7301/7302) a `[server]`-less config would fall back to if the
+/// Decision 8 guard ever regressed to constructing a `ServerConfig`
+/// unconditionally; if the [server]-absent path tried to bind any of them
+/// anyway, the whole `listen` command would fail with an "address in use"
+/// error and exit non-zero instead of decoding cleanly. Deliberately NOT
+/// `free_port()` here (unlike the positive test above) -- an OS-assigned
+/// port the regression doesn't know to try would prove nothing.
 #[test]
 fn config_without_a_server_table_does_not_start_the_servers() {
     let dir = tempfile::tempdir().unwrap();
@@ -959,7 +979,9 @@ fn config_without_a_server_table_does_not_start_the_servers() {
     let cfg_path = dir.path().join("manta.toml");
     std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
 
-    let _held = std::net::TcpListener::bind("127.0.0.1:19395").unwrap();
+    let _held_telnet = std::net::TcpListener::bind("127.0.0.1:7300").unwrap();
+    let _held_json = std::net::TcpListener::bind("127.0.0.1:7301").unwrap();
+    let _held_metrics = std::net::TcpListener::bind("127.0.0.1:7302").unwrap();
 
     let out = manta()
         .args(["listen", "--config"])
