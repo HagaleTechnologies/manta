@@ -498,9 +498,11 @@ fn v28_reclassification_still_accepted_when_driven_by_a_new_word() {
 
 /// V29: provenance must bind to the exact `Word` occurrence being
 /// evaluated, not whichever occurrence `context::parse`'s regex happened
-/// to match first. "CQ DE K5ARH DE K5ARH" repeats "DE K5ARH" -- the
-/// second, newest K5ARH is the one `evaluate_candidate` selects (its
-/// word-lookup always picks the newest matching word), but
+/// to match first. "CQ DE K5ARH K CQ DE K5ARH" repeats "DE K5ARH" across
+/// two genuinely separate messages (MAN-100 Scenario 2 -- the two
+/// occurrences must be `>= MIN_MESSAGE_WORD_GAP` words apart to both
+/// count) -- the second, newest K5ARH is the one `evaluate_candidate`
+/// selects (its word-lookup always picks the newest matching word), but
 /// `context::parse`'s first-match regex describes the FIRST "DE K5ARH"
 /// occurrence's span. If that mismatch stores the wrong (lower)
 /// `classified_max_seq` on the newest word, then once "CQ" (and the first
@@ -512,7 +514,7 @@ fn v29_provenance_bound_to_exact_word_occurrence_across_repetitions() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
-    let words = ["CQ", "DE", "K5ARH", "DE", "K5ARH"];
+    let words = ["CQ", "DE", "K5ARH", "K", "CQ", "DE", "K5ARH"];
     let first = run(&transmission_events(1, &words, 0), &mut v);
     assert!(
         first
@@ -601,12 +603,17 @@ fn a_resolved_named_match_still_suppresses_an_unrelated_power_step_candidate() {
 /// K5ARH") that also decodes a trailing "T", the coarse CQ/DE guard
 /// suppresses the power-step candidate outright (the bare "CQ" is
 /// present) -- K5ARH spots once, as `Cq`, with no Beacon reclassification.
+/// Run twice, 300 000 samples apart (MAN-100 Scenario 2): the two "K5ARH"
+/// utterances inside one "CQ K5ARH K5ARH T" transmission are adjacent
+/// (one message's worth of evidence), so a second, genuinely later
+/// transmission is needed to clear the repetition gate.
 #[test]
 fn cq_call_with_trailing_t_spots_once_as_cq_not_beacon() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let words = ["CQ", "K5ARH", "K5ARH", "T"];
-    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    spots.extend(run(&transmission_events(1, &words, 300_000), &mut v));
     assert!(
         spots
             .iter()
@@ -1044,5 +1051,147 @@ fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
             .iter()
             .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
         "the captured beacon must still resolve at true close, got {spots:?}"
+    );
+}
+
+/// V31 (MAN-100 Scenario 1): a track decodes both a call and a confusable,
+/// less-supported truncation of it on separate transmissions. K5ARH
+/// reaches 3 message-distinct repetitions; the truncated K5AR reaches 2 --
+/// enough to itself clear the repetition gate -- but must still lose to
+/// the better-supported, containing form on the same track.
+#[test]
+fn v31_truncated_variant_loses_to_the_better_supported_call() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let mut spots = Vec::new();
+    let transmissions: [[&str; 4]; 5] = [
+        ["CQ", "DE", "K5ARH", "K"],
+        ["CQ", "DE", "K5ARH", "K"],
+        ["CQ", "DE", "K5AR", "K"], // truncation, 1st
+        ["CQ", "DE", "K5ARH", "K"],
+        ["CQ", "DE", "K5AR", "K"], // truncation, 2nd -- reaches 2 reps
+    ];
+    for (i, words) in transmissions.iter().enumerate() {
+        spots.extend(run(
+            &transmission_events(1, words, i as u64 * 300_000),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "K5ARH"),
+        "the better-supported call must still spot, got {spots:?}"
+    );
+    assert!(
+        !spots.iter().any(|s| s.callsign == "K5AR"),
+        "a strict prefix of a better-supported call on the same track must \
+         not spot, got {spots:?}"
+    );
+}
+
+/// V31b: arbitration is per track. The same truncation shape on two
+/// different tracks describes two different stations, and both must
+/// still spot -- arbitration must never compare candidates across tracks.
+#[test]
+fn v31b_variant_arbitration_does_not_cross_tracks() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    seed_meta(&mut v, 2);
+
+    let mut spots = Vec::new();
+    for i in 0..3u64 {
+        spots.extend(run(
+            &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(2, &["CQ", "DE", "K5AR", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.track_id == 1),
+        "K5ARH on track 1 must spot, got {spots:?}"
+    );
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5AR" && s.track_id == 2),
+        "K5AR on its own, unrelated track must still spot -- arbitration is \
+         per track, not global, got {spots:?}"
+    );
+}
+
+/// V31c: a genuine call is not suppressed by a merge artifact that glued a
+/// framing word onto it (the "DE" + call shape measured in the MAN-100
+/// plan's V8 scene). The real call is a strict SUFFIX of the merge
+/// artifact, so the prefix-only containment asymmetry must not fire in
+/// this direction, and the ordinary support comparison must let the
+/// far-better-supported real call win. Uses a local fixture that also
+/// allocates the "DE" alias, purely so the merge artifact itself clears
+/// cty and actually reaches arbitration instead of being rejected earlier
+/// for an unrelated reason.
+#[test]
+fn v31c_head_merge_artifact_never_suppresses_the_real_call() {
+    const CTY: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N,AA,AB,AC,DE;
+";
+    let mut v = Validator::new(FS, CTY, None);
+    seed_meta(&mut v, 1);
+
+    // A single 1-rep merge artifact first, decoded as one word ("DE" +
+    // call glued together with no word boundary between them).
+    let mut spots = run(&transmission_events(1, &["CQ", "DEN3NXI", "K"], 0), &mut v);
+
+    // The real call, decoded cleanly across two separate transmissions --
+    // must still spot despite the merge artifact already sitting in the
+    // ledger.
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "N3NXI", "K"], 300_000),
+        &mut v,
+    ));
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "N3NXI", "K"], 600_000),
+        &mut v,
+    ));
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "N3NXI"),
+        "the real call must spot despite a 1-rep head-merge artifact \
+         sharing its text as a suffix, got {spots:?}"
+    );
+    assert!(
+        !spots.iter().any(|s| s.callsign == "DEN3NXI"),
+        "the 1-rep merge artifact must never itself spot, got {spots:?}"
+    );
+}
+
+/// V32 (MAN-100 Scenario 2): the two adjacent utterances in one "CQ CQ DE
+/// <CALL> <CALL> K" transmission are one message's worth of evidence, not
+/// two -- a second, genuinely later transmission is required to clear the
+/// repetition gate.
+#[test]
+fn v32_same_message_repetition_does_not_satisfy_the_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let one_message = ["CQ", "CQ", "DE", "K5ARH", "K5ARH", "K"];
+    let first = run(&transmission_events(1, &one_message, 0), &mut v);
+    assert!(
+        first.is_empty(),
+        "one message's doubled call must not satisfy the >= 2 rep gate, got {first:?}"
+    );
+
+    let second = run(&transmission_events(1, &one_message, 300_000), &mut v);
+    assert!(
+        second.iter().any(|s| s.callsign == "K5ARH"),
+        "a second, genuinely later message must complete the gate, got {second:?}"
     );
 }

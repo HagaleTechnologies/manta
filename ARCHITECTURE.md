@@ -282,7 +282,37 @@ transmission may never produce again).
    repetitions, SNR, SCP/cty hits). **Exemption**: messages already
    type-tagged `BEACON` by step 1's context parse skip this gate entirely
    — NCDXF-style beacons ID once per power-step cycle and legitimately
-   won't repeat within the window (MAN-28).
+   won't repeat within the window (MAN-28). **"Distinct" requires separate messages** (MAN-100): two decodes
+   of the same text fewer than `MIN_MESSAGE_WORD_GAP` (3) decoded words apart
+   count as one repetition, not two — SPEC's own default payload template
+   repeats the callsign back-to-back within a single transmission (`CQ CQ DE
+   <CALL> <CALL> K`), and without this rule that one message's fading-
+   corrupted double utterance alone could satisfy the gate.
+4b. **Cross-candidate variant arbitration** (MAN-100): before a candidate
+   spots, it's checked against every other decoded, spottable-shaped word
+   (one that itself passes steps 1's grammar/cty check) observed on the same
+   track within the same 90 s window. It's withheld if a confusable,
+   better-supported rival exists — confusable meaning a substring/superstring
+   relationship or a shared ≥ 3-character prefix at edit distance ≤ 2;
+   better-supported meaning strictly more message-distinct repetitions (ties
+   broken by summed per-occurrence confidence), or the candidate being a
+   strict prefix of a rival with ≥ 1 repetition of its own. This closes the
+   gap that let a track spot both a real callsign and a fading-truncated
+   fragment of it as if they were two different stations — measured on a
+   50-signal CCIR-poor pileup at an 18% busted-spot rate among distinct
+   spotted calls, none of which `c_call` alone could distinguish (bogus and
+   genuine confidence ranges overlapped completely). Purely subtractive: this
+   step can only withhold a spot the rest of the pipeline would have emitted,
+   never produce one, so it can never itself cause a false spot. Never fires
+   against an operator-allowlisted callsign or one present in the bundled
+   `master.scp` — both exemptions trade toward recall on exactly the
+   population RBN cares about, at the cost (measured as zero on the
+   available multi-signal test scenes) of occasionally letting a truncation
+   of an SCP-listed call through unarbitrated. Also never fires against a
+   `SpotType::Beacon` candidate (MAN-28's once-per-cycle exemption extends
+   to arbitration too, per remediation C3): a beacon's structurally low
+   repetition count must not let a confusable, more-repeated rival
+   permanently outrank it.
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,

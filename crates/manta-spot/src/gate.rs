@@ -3,10 +3,50 @@
 //! §6.4. `sample_ts`-based, never wall clock (SPEC-decode-core.md §6 rule
 //! 2). `BTreeMap`, never `HashMap` (rule 3) -- this state feeds directly
 //! into whether/when a `Spot` is emitted.
+//!
+//! MAN-100 Scenario 2: "distinct decodes" means distinct *messages*, not
+//! distinct decoded `Word`s. SPEC's own default payload template repeats
+//! a callsign back-to-back within one transmission ("CQ CQ DE <CALL>
+//! <CALL> K"), which the old word-count-only accounting let satisfy this
+//! gate on the strength of a single, possibly-corrupted message alone --
+//! see `MIN_MESSAGE_WORD_GAP`.
 
 use std::collections::BTreeMap;
 
 const WINDOW_SECONDS: f64 = 90.0;
+
+/// MAN-100 Scenario 2. SPEC's payload template "CQ CQ DE <CALL> <CALL> K"
+/// puts one message's two utterances a single word apart; the closest two
+/// *separate* messages can put them is five ("<CALL> K CQ CQ DE
+/// <CALL>"). 3 sits between the two with margin. Measured (this ticket's
+/// plan): gap = 2 and gap = 3 give identical outcomes on the reference
+/// pileup fixtures; 3 is the stricter reading of "a second, later message
+/// must independently support the candidate", so 3 is what ships.
+pub const MIN_MESSAGE_WORD_GAP: u64 = 3;
+
+/// Counts a greedy chain of `word_seq`s (assumed ascending, as they are
+/// whenever pushed by `record`'s in-order calls) where each counted
+/// occurrence is at least `MIN_MESSAGE_WORD_GAP` seqs beyond the previous
+/// *counted* one. Shared by `RepetitionGate` and
+/// `support::SupportLedger` (MAN-100 Scenario 1), which must count
+/// repetitions by the same rule so a candidate's gate-facing rep count and
+/// its ledger-facing support figure never disagree about what counts as a
+/// separate message.
+pub(crate) fn count_message_distinct(seqs: &[u64]) -> usize {
+    let mut count = 0usize;
+    let mut last_counted: Option<u64> = None;
+    for &seq in seqs {
+        let counts = match last_counted {
+            None => true,
+            Some(prev) => seq >= prev + MIN_MESSAGE_WORD_GAP,
+        };
+        if counts {
+            count += 1;
+            last_counted = Some(seq);
+        }
+    }
+    count
+}
 
 /// Width of a frequency bucket, in Hz (MAN-166). See `RepetitionGate`'s
 /// doc for why bucketing exists at all, and `record`'s doc for why a
@@ -55,9 +95,16 @@ fn bucket(freq_hz: f64) -> i64 {
 
 #[derive(Default)]
 struct GateEntry {
-    /// Timestamps of *accepted* (distinct) occurrences -- what actually
-    /// drives the returned repetition count.
-    accepted: Vec<u64>,
+    /// `(sample_ts, word_seq)` of every *accepted* (distinct, non-near-
+    /// duplicate) occurrence. The returned repetition count is not simply
+    /// this vec's length: MAN-100 Scenario 2 requires accepted occurrences
+    /// to also be message-distinct (`count_message_distinct` on the
+    /// `word_seq`s, `MIN_MESSAGE_WORD_GAP` apart), since SPEC's own default
+    /// payload template repeats a callsign back-to-back within one
+    /// transmission and both utterances land here as separate *accepted*
+    /// occurrences (they're minutes, not `MIN_OCCURRENCE_GAP_SECONDS`,
+    /// apart) despite being one message's worth of evidence.
+    accepted: Vec<(u64, u64)>,
     /// Every track_id that has touched this entry -- accepted *or*
     /// rejected as a near-duplicate -- and when it was last seen (Codex
     /// review, PR #152, round 6): without this, a track whose first
@@ -92,8 +139,8 @@ impl GateEntry {
     fn most_recent(&self) -> Option<u64> {
         self.accepted
             .iter()
+            .map(|&(ts, _)| ts)
             .max()
-            .copied()
             .into_iter()
             .chain(self.last_seen_by_track.values().copied())
             .max()
@@ -132,8 +179,13 @@ impl RepetitionGate {
     }
 
     /// Records one decode of `callsign` by `track_id` at `freq_hz` at
-    /// `sample_ts`. Returns the number of distinct decodes within the
-    /// trailing window (including this one).
+    /// `sample_ts`, originating from the track's `word_seq`-numbered
+    /// `Word` (MAN-100 Scenario 2). Returns the number of
+    /// *message*-distinct decodes within the trailing window (including
+    /// this one) -- two accepted occurrences fewer than
+    /// `MIN_MESSAGE_WORD_GAP` words apart count as one, since SPEC's own
+    /// default payload template repeats a callsign back-to-back within a
+    /// single transmission.
     ///
     /// A single `bucket(freq_hz)` lookup isn't sufficient identity on its
     /// own: two decodes of the same real signal can round to *different*
@@ -189,7 +241,14 @@ impl RepetitionGate {
     /// signal happens to already occupy there -- bucket 0 in particular
     /// is already a live sentinel elsewhere in this codebase for "unknown
     /// center frequency" (`WavIqSource`'s missing-sidecar default).
-    pub fn record(&mut self, track_id: u32, freq_hz: f64, callsign: &str, sample_ts: u64) -> usize {
+    pub fn record(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        sample_ts: u64,
+        word_seq: u64,
+    ) -> usize {
         self.records_total += 1;
         if !freq_hz.is_finite() {
             return 0;
@@ -292,11 +351,23 @@ impl RepetitionGate {
             .and_modify(|existing| *existing = (*existing).max(sample_ts))
             .or_insert(sample_ts);
         if is_distinct_occurrence {
-            entry.accepted.push(sample_ts);
+            entry.accepted.push((sample_ts, word_seq));
         }
-        entry.accepted.retain(|&ts| ts >= cutoff);
+        entry.accepted.retain(|&(ts, _)| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
-        entry.accepted.len()
+        // MAN-100 Scenario 2: the raw accepted count (frequency-bucket,
+        // near-duplicate-track-filtered) is not the same thing as the
+        // message-distinct count SPEC's own gate wants -- two accepted
+        // occurrences from one message's back-to-back utterance are
+        // minutes apart in track-drift terms but zero words apart in
+        // message terms. Sorted defensively, not just collected in push
+        // order: `resolve_pending_beacons` can replay an older, deferred
+        // (sample_ts, word_seq) pair after newer ones already landed on
+        // this same entry (see `most_recent`'s doc), and
+        // `count_message_distinct` assumes its input is ascending.
+        let mut seqs: Vec<u64> = entry.accepted.iter().map(|&(_, seq)| seq).collect();
+        seqs.sort_unstable();
+        count_message_distinct(&seqs)
     }
 
     /// See `records_total`'s doc.
@@ -335,7 +406,7 @@ impl RepetitionGate {
     pub fn sweep(&mut self, now_ts: u64) {
         let cutoff = now_ts.saturating_sub(self.window_samples);
         self.seen.retain(|_, entry| {
-            entry.accepted.retain(|&ts| ts >= cutoff);
+            entry.accepted.retain(|&(ts, _)| ts >= cutoff);
             entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
@@ -351,31 +422,56 @@ mod tests {
     #[test]
     fn first_decode_counts_as_one() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 0), 1);
     }
 
     #[test]
     fn second_decode_within_window_counts_as_two() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, 7_080_000.0, "K5ARH", 0);
-        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 300_000), 2);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 0);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 300_000, 10), 2);
     }
 
     #[test]
     fn decode_outside_window_resets_the_count() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, 7_080_000.0, "K5ARH", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 0);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
-        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", window_samples + 1), 1);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", window_samples + 1, 10), 1);
     }
 
     #[test]
     fn different_frequencies_and_callsigns_are_independent() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, 7_080_000.0, "K5ARH", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 0);
         // Far enough apart (>1 bucket width) to land outside neighbor matching.
-        assert_eq!(gate.record(1, 7_081_000.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(1, 7_080_000.0, "W1AW", 0), 1);
+        assert_eq!(gate.record(1, 7_081_000.0, "K5ARH", 0, 0), 1);
+        assert_eq!(gate.record(1, 7_080_000.0, "W1AW", 0, 0), 1);
+    }
+
+    /// MAN-100 Scenario 2: two occurrences fewer than `MIN_MESSAGE_WORD_GAP`
+    /// words apart -- e.g. the two adjacent utterances in one "CQ CQ DE
+    /// <CALL> <CALL> K" transmission -- are one message's worth of
+    /// evidence, not two.
+    #[test]
+    fn adjacent_words_are_one_message_not_two() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 4);
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", 10_000, 5),
+            1,
+            "seq 4 and 5 are one message"
+        );
+    }
+
+    /// MAN-100 Scenario 2: the flip side -- occurrences at least
+    /// `MIN_MESSAGE_WORD_GAP` words apart are genuinely separate messages
+    /// and both count.
+    #[test]
+    fn words_three_apart_are_two_messages() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 4);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 100_000, 7), 2);
     }
 
     /// A real signal's track closing and reopening under a new `track_id`
@@ -388,9 +484,9 @@ mod tests {
     #[test]
     fn sweep_between_two_records_does_not_reset_the_count() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, 7_080_000.0, "K5ARH", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 0);
         gate.sweep(0);
-        assert_eq!(gate.record(2, 7_080_000.0, "K5ARH", 300_000), 2);
+        assert_eq!(gate.record(2, 7_080_000.0, "K5ARH", 300_000, 10), 2);
     }
 
     /// `sweep` prunes only entries whose timestamps have fully aged out of
@@ -401,12 +497,12 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
 
-        gate.record(1, 7_080_000.0, "K5ARH", 0); // will age out, never refreshed
-        gate.record(2, 7_090_000.0, "W1AW", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0, 0); // will age out, never refreshed
+        gate.record(2, 7_090_000.0, "W1AW", 0, 0);
         // A genuine later occurrence (comfortably past both the
         // minimum-occurrence gap and, eventually, `now`'s cutoff) keeps
         // W1AW's entry alive.
-        gate.record(2, 7_090_000.0, "W1AW", window_samples + 1);
+        gate.record(2, 7_090_000.0, "W1AW", window_samples + 1, 10);
 
         gate.sweep(window_samples * 2);
 
@@ -427,8 +523,8 @@ mod tests {
     #[test]
     fn a_decode_just_across_a_bucket_boundary_still_counts_toward_the_same_signal() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(1, 14_000_049.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(2, 14_000_051.0, "K5ARH", 300_000), 2);
+        assert_eq!(gate.record(1, 14_000_049.0, "K5ARH", 0, 0), 1);
+        assert_eq!(gate.record(2, 14_000_051.0, "K5ARH", 300_000, 10), 2);
     }
 
     /// Codex review, PR #152 (both rounds): two genuinely *different*,
@@ -443,13 +539,13 @@ mod tests {
     fn near_simultaneous_decodes_from_a_different_track_do_not_double_count() {
         let mut gate = RepetitionGate::new(FS);
         // Same exact bucket, different (duplicate-spawn) track, same instant.
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 1_000), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0, 0), 1);
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 1_000, 1), 1);
         // Neighbor bucket, yet another track, still the same instant.
-        assert_eq!(gate.record(3, 14_000_060.0, "K5ARH", 1_500), 1);
+        assert_eq!(gate.record(3, 14_000_060.0, "K5ARH", 1_500, 2), 1);
         // A real, later re-transmission (comfortably past the minimum
         // gap; track_id doesn't matter here) still counts.
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 300_000), 2);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 300_000, 10), 2);
     }
 
     /// The minimum-gap check above must never apply *within* a single
@@ -458,12 +554,16 @@ mod tests {
     /// deliberate real practice so the transmission carries its own two
     /// confirmations) decodes both instances on the same track, often
     /// well under a second apart, and must still count as two -- one
-    /// continuous decode stream can't decode the same instant twice.
+    /// continuous decode stream can't decode the same instant twice. Uses
+    /// `word_seq`s >= `MIN_MESSAGE_WORD_GAP` apart (MAN-100) so this test
+    /// isolates the near-duplicate-time mechanism it names, rather than
+    /// colliding with the separate message-gap rule that would otherwise
+    /// also collapse two genuinely adjacent words to one message.
     #[test]
     fn rapid_same_track_repeats_are_never_rejected_as_near_simultaneous() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 500), 2);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0, 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 500, 10), 2);
     }
 
     /// Codex review, PR #152: a non-finite `freq_hz` (NaN/±infinity) must
@@ -477,14 +577,14 @@ mod tests {
     fn non_finite_and_extreme_frequencies_do_not_panic() {
         let mut gate = RepetitionGate::new(FS);
         for freq in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(gate.record(1, freq, "K5ARH", 0), 0);
+            assert_eq!(gate.record(1, freq, "K5ARH", 0, 0), 0);
         }
         assert!(
             gate.is_empty(),
             "non-finite frequencies must never create an entry"
         );
         for freq in [f64::MAX, f64::MIN] {
-            gate.record(1, freq, "K5ARH", 0);
+            gate.record(1, freq, "K5ARH", 0, 0);
         }
     }
 
@@ -500,16 +600,18 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
 
         // Bucket b-1 (14_999_900 Hz): an old decode.
-        gate.record(1, 14_999_900.0, "K5ARH", 0);
+        gate.record(1, 14_999_900.0, "K5ARH", 0, 0);
         // Bucket b+1 (15_000_100 Hz): a more recent decode, different track.
-        gate.record(2, 15_000_100.0, "K5ARH", 500_000);
+        gate.record(2, 15_000_100.0, "K5ARH", 500_000, 0);
 
         // A new decode at the home bucket (15_000_000 Hz), comfortably past
         // the minimum-occurrence gap from bucket b+1's timestamp, must join
         // the freshest neighbor (b+1) -- becoming its second occurrence --
-        // not the older, lowest-numbered one (b-1).
+        // not the older, lowest-numbered one (b-1). word_seq 10 (>=
+        // MIN_MESSAGE_WORD_GAP past b+1's seq 0) so the message-gap rule
+        // doesn't collapse this genuinely distinct occurrence into one.
         assert_eq!(
-            gate.record(3, 15_000_000.0, "K5ARH", 700_000),
+            gate.record(3, 15_000_000.0, "K5ARH", 700_000, 10),
             2,
             "must join the freshest neighbor entry, not the stale lowest-numbered one"
         );
@@ -526,16 +628,16 @@ mod tests {
     fn a_tracks_own_repeat_counts_even_after_its_first_attempt_was_rejected() {
         let mut gate = RepetitionGate::new(FS);
         // Track 1 establishes the entry.
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0, 0), 1);
         // Track 2's near-simultaneous decode is correctly rejected as a
         // likely duplicate of track 1's.
-        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 500), 1);
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 500, 1), 1);
         // Track 2 decodes AGAIN, shortly after its own (rejected) first
         // attempt -- this is track 2's own second word, not a duplicate
         // of anyone else, and must count as a second distinct occurrence
         // even though it's still well under the minimum gap from track
         // 1's original timestamp.
-        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 600), 2);
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 600, 10), 2);
     }
 
     /// MAN-19's original concern (unbounded growth under sustained track
@@ -549,7 +651,7 @@ mod tests {
         // 1 kHz apart: far outside neighbor-bucket matching range, so each
         // gets its own entry.
         for i in 0..10_000i64 {
-            gate.record(i as u32, i as f64 * 1000.0, "K5ARH", 0);
+            gate.record(i as u32, i as f64 * 1000.0, "K5ARH", 0, 0);
         }
         gate.sweep(window_samples + 1);
         assert_eq!(
@@ -576,15 +678,15 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         let one_second = FS as u64;
 
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0, 0), 1);
         // Track B's near-simultaneous duplicate of A's first decode is
         // correctly rejected -- but B's identity is now on record.
-        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", one_second / 2), 1);
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", one_second / 2, 1), 1);
 
         // Much later, but still inside the trailing 90s window: track A's
         // genuine second occurrence.
         let later = 89 * one_second;
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", later), 2);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", later, 10), 2);
 
         // Immediately after: track B decodes again. This is near-
         // simultaneous with A's fresh occurrence above, not with B's own
@@ -592,7 +694,7 @@ mod tests {
         // as a likely duplicate of A's just-accepted occurrence, not
         // waved through as "B's own repeat."
         assert_eq!(
-            gate.record(2, 14_000_000.0, "K5ARH", later + one_second / 20),
+            gate.record(2, 14_000_000.0, "K5ARH", later + one_second / 20, 20),
             2,
             "an old rejected identity must not exempt a fresh near-duplicate of a DIFFERENT track's brand-new occurrence"
         );
@@ -614,17 +716,17 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
 
         // Occurrence 1: bucket 140000 (14_000_000 Hz).
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0, 0), 1);
         // Occurrence 2: bucket 140001 (14_000_050 Hz) -- a near-
         // simultaneous duplicate from a different track, rejected, but it
         // joins (and should move the anchor to) bucket 140001.
-        assert_eq!(gate.record(2, 14_000_050.0, "K5ARH", 100), 1);
+        assert_eq!(gate.record(2, 14_000_050.0, "K5ARH", 100, 1), 1);
         // Occurrence 3: bucket 140002 (14_000_200 Hz) -- adjacent to
         // bucket 140001, two away from the original bucket 140000. A
         // genuine later occurrence, comfortably past the
         // minimum-occurrence gap.
         assert_eq!(
-            gate.record(3, 14_000_200.0, "K5ARH", 300_000),
+            gate.record(3, 14_000_200.0, "K5ARH", 300_000, 10),
             2,
             "must follow the anchor across successive adjacent bucket hops, not stay pinned to the original bucket"
         );
@@ -645,17 +747,17 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
 
         // b-1 (13_999_900 Hz): a one-off decode, its own entry.
-        assert_eq!(gate.record(1, 13_999_900.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 13_999_900.0, "K5ARH", 0, 0), 1);
         // b+1 (14_000_050 Hz): a separate one-off decode, its own entry.
-        assert_eq!(gate.record(2, 14_000_050.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(2, 14_000_050.0, "K5ARH", 0, 0), 1);
         // A near-simultaneous rejected decode at home bucket b (empty) --
         // legitimately moves the fresher neighbor (b+1) into b.
-        assert_eq!(gate.record(3, 14_000_000.0, "K5ARH", 100), 1);
+        assert_eq!(gate.record(3, 14_000_000.0, "K5ARH", 100, 5), 1);
         // Another near-simultaneous rejected decode, this time at b-1 --
         // which already has its OWN entry. Must use that entry directly,
         // never importing b's (now more recently touched) entry.
         assert_eq!(
-            gate.record(4, 13_999_900.0, "K5ARH", 150),
+            gate.record(4, 13_999_900.0, "K5ARH", 150, 5),
             1,
             "must never combine two independently-established entries just because one neighbor is fresher"
         );
@@ -678,7 +780,7 @@ mod tests {
 
         // Home bucket (140000): a stale entry, its only touch at t=0.
         let mut stale = GateEntry::default();
-        stale.accepted.push(0);
+        stale.accepted.push((0, 0));
         stale.last_seen_by_track.insert(1, 0);
         gate.seen.insert((140000, "K5ARH".to_string()), stale);
 
@@ -686,16 +788,18 @@ mod tests {
         // the window as of the decisive call below.
         let fresh_ts = window_samples - 200_000;
         let mut fresh = GateEntry::default();
-        fresh.accepted.push(fresh_ts);
+        fresh.accepted.push((fresh_ts, 0));
         fresh.last_seen_by_track.insert(2, fresh_ts);
         gate.seen.insert((140001, "K5ARH".to_string()), fresh);
 
         // A decode arrives at home (b) just past the window boundary
         // relative to the stale entry (t=0), but still well within the
-        // window relative to the fresh neighbor.
+        // window relative to the fresh neighbor. word_seq 10 (>=
+        // MIN_MESSAGE_WORD_GAP past the fresh neighbor's seq 0) so the
+        // message-gap rule doesn't collapse this into one message.
         let now = window_samples + 1;
         assert_eq!(
-            gate.record(3, 14_000_000.0, "K5ARH", now),
+            gate.record(3, 14_000_000.0, "K5ARH", now, 10),
             2,
             "an expired home must be discarded, not block a fresh neighbor's history"
         );
@@ -716,14 +820,14 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         let one_second = FS as u64;
 
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0, 0), 1);
         assert_eq!(
-            gate.record(2, 14_000_000.0, "K5ARH", 9 * one_second / 10),
+            gate.record(2, 14_000_000.0, "K5ARH", 9 * one_second / 10, 1),
             1,
             "B is a near-duplicate of A, correctly rejected"
         );
         assert_eq!(
-            gate.record(3, 14_000_000.0, "K5ARH", 11 * one_second / 10),
+            gate.record(3, 14_000_000.0, "K5ARH", 11 * one_second / 10, 2),
             1,
             "C is only 0.2s after B's rejected touch -- still a likely duplicate of the same occurrence, must not clear the gap just because it's 1.1s past A's accepted timestamp"
         );
@@ -745,13 +849,16 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
 
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 8_000_000), 1);
-        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 8_100_000), 2);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 8_000_000, 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 8_100_000, 10), 2);
 
         // The deferred replay: the SAME track's own much older pending
         // sample_ts, arriving last in call order (simulating
-        // resolve_pending_beacons firing at track close).
-        gate.record(1, 14_000_000.0, "K5ARH", 500);
+        // resolve_pending_beacons firing at track close). Its own
+        // word_seq doesn't matter -- its sample_ts (500) is pruned by the
+        // very next call's retain, before message-distinctness is ever
+        // computed over it.
+        gate.record(1, 14_000_000.0, "K5ARH", 500, 5);
 
         // A later, genuinely live touch. Relative to the old replayed
         // timestamp (500) this looks expired (comfortably past the
@@ -768,7 +875,7 @@ mod tests {
             "sanity check: must still be genuinely live relative to the true latest activity"
         );
         assert_eq!(
-            gate.record(4, 14_000_000.0, "K5ARH", now),
+            gate.record(4, 14_000_000.0, "K5ARH", now, 20),
             3,
             "an out-of-order deferred replay must not make a genuinely live entry look expired and discard its real history"
         );

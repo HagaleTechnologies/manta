@@ -10,6 +10,7 @@ use crate::gate::RepetitionGate;
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
+use crate::support::SupportLedger;
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
@@ -139,6 +140,11 @@ struct PendingBeacon {
     /// letting one real over-the-air occurrence, captured by two
     /// overlapping tracks, reach `reps >= 2` on its own.
     origin_track_id: u32,
+    /// The captured word's own `seq` (MAN-100 Scenario 2), threaded to
+    /// `RepetitionGate::record` on eventual resolution so a deferred
+    /// Beacon replay is subject to the same message-distinctness rule as
+    /// every other candidate.
+    word_seq: u64,
 }
 
 #[derive(Default)]
@@ -286,6 +292,10 @@ pub struct SuppressionCounts {
     /// guard destroyed no beacon candidacy there (Codex review on PR #90,
     /// round 10). See `burn_suppressed_power_step_candidate`.
     pub power_step_guard: u64,
+    /// Spots withheld by MAN-100's cross-candidate variant arbitration: a
+    /// confusable, better-supported rival existed on the same track in the
+    /// same window. See `support::SupportLedger`.
+    pub variant: u64,
 }
 
 pub struct Validator {
@@ -294,6 +304,10 @@ pub struct Validator {
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
+    /// MAN-100 Scenario 1: per-track ledger of every observed,
+    /// spottable-shaped decoded word, used to arbitrate between confusable
+    /// candidates on the same track (see `support::SupportLedger`).
+    ledger: SupportLedger,
     freq_calibration: f64,
     allowlist: std::collections::BTreeSet<String>,
     blocklist: Blocklist,
@@ -340,6 +354,7 @@ impl Validator {
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
+            ledger: SupportLedger::new(fs),
             freq_calibration: 1.0,
             allowlist: std::collections::BTreeSet::new(),
             blocklist: Blocklist::default(),
@@ -471,16 +486,34 @@ impl Validator {
             } => {
                 self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
+                let mut newly_completed: Option<(String, u64, f32)> = None;
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
                     word.seq = track.next_word_seq;
                     track.next_word_seq += 1;
+                    newly_completed = Some((
+                        word.text.clone(),
+                        word.seq,
+                        confidence::geo_mean(&word.confidences),
+                    ));
                     track.words.push_back(word);
                     if track.words.len() > WORD_WINDOW {
                         track.words.pop_front();
                     }
                 }
                 track.last_sample_ts = *sample_ts;
+                // MAN-100 Scenario 1: the ledger records every observed
+                // word that is ITSELF spottable-shaped (grammar + cty) --
+                // a form that could never be spotted must not be able to
+                // veto one that could. Gated on the same two checks
+                // `evaluate_candidate` runs for a non-allowlisted
+                // candidate below, so the ledger's population is never
+                // wider than what could plausibly spot.
+                if let Some((text, seq, geo)) = newly_completed {
+                    if grammar::is_plausible(&text) && self.cty.is_allocated(&text) {
+                        self.ledger.observe(*track_id, &text, seq, *sample_ts, geo);
+                    }
+                }
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
@@ -583,6 +616,17 @@ impl Validator {
                 // `last_sample_ts` was never a safe sweep reference on its
                 // own.
                 self.tracks.remove(track_id);
+                // MAN-100 Scenario 1: unlike `self.gate` above, the
+                // variant-arbitration ledger is still keyed by `track_id`
+                // (mirrors the pre-MAN-166 `RepetitionGate::forget_track`
+                // pattern), so it's still forgotten on close rather than
+                // swept. Known, unmeasured risk (not one of this ticket's
+                // measured V8/V8w cases): a real signal's track closing
+                // and reopening under a new `track_id` (MAN-166) resets
+                // its observed-word history here, the same class of bug
+                // MAN-166 fixed for the gate -- out of this ticket's scope
+                // to fix pre-emptively; revisit if measured in practice.
+                self.ledger.forget_track(*track_id);
                 self.maybe_sweep();
                 spots
             }
@@ -894,7 +938,7 @@ impl Validator {
             )
         };
 
-        let (char_confidences, reclassifying) = {
+        let (char_confidences, reclassifying, resolved_word_seq) = {
             let track = self.tracks.get_mut(&track_id)?;
             // Named patterns resolve by text, always to the NEWEST word
             // sharing it (MAN-28 round 13, V29 -- a repeated "DE K5ARH ...
@@ -944,7 +988,7 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
             word.classified_max_seq = involved_max_seq;
-            (word.confidences.clone(), reclassifying)
+            (word.confidences.clone(), reclassifying, word.seq)
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
@@ -992,7 +1036,9 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate.record(track_id, freq_hz, &candidate, sample_ts) as u32
+            self.gate
+                .record(track_id, freq_hz, &candidate, sample_ts, resolved_word_seq)
+                as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -1013,6 +1059,28 @@ impl Validator {
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
             return None;
         }
+
+        // MAN-100 step 4b: cross-candidate arbitration. Allowlisted calls
+        // are exempt (the Watch List already bypasses grammar/cty and the
+        // repetition gate, MAN-28), and so is any call in master.scp -- a
+        // curated list of real, active callsigns, where a false
+        // suppression would cost recall on exactly the population RBN
+        // cares most about. Both exemptions only ever *add* spots
+        // relative to the bare rule. Purely subtractive otherwise: this
+        // check can only withhold a spot the rest of the pipeline would
+        // have emitted, never create one.
+        let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
+        if !is_allowlisted
+            && !scp_exempt
+            && self
+                .ledger
+                .better_supported_rival(track_id, &candidate, sample_ts)
+                .is_some()
+        {
+            self.suppression_counts.variant += 1;
+            return None;
+        }
+
         if !self
             .dedupe
             .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
@@ -1055,7 +1123,7 @@ impl Validator {
         // PR #154, round 3): checking blocklist/notch before this guard
         // would re-count a permanently-suppressed candidate every time an
         // unrelated later word re-triggers a scan that finds it again.
-        let char_confidences = {
+        let (char_confidences, word_seq) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = if let Some(seq) = exact_seq {
                 track.words.iter_mut().find(|w| w.seq == seq)?
@@ -1076,7 +1144,7 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(SpotType::Beacon);
             word.classified_max_seq = involved_max_seq;
-            word.confidences.clone()
+            (word.confidences.clone(), word.seq)
         };
 
         // Operator suppression overrides (MAN-31), same boundary as the
@@ -1113,6 +1181,7 @@ impl Validator {
             snr_db,
             char_confidences,
             origin_track_id: track_id,
+            word_seq,
         });
         None
     }
@@ -1192,10 +1261,13 @@ impl Validator {
                 // rapid-same-track exemption -- letting one real
                 // over-the-air occurrence, captured by two overlapping
                 // duplicate-spawn tracks, reach reps >= 2 on its own.
-                let reps =
-                    self.gate
-                        .record(pb.origin_track_id, pb.freq_hz, &pb.candidate, pb.sample_ts)
-                        as u32;
+                let reps = self.gate.record(
+                    pb.origin_track_id,
+                    pb.freq_hz,
+                    &pb.candidate,
+                    pb.sample_ts,
+                    pb.word_seq,
+                ) as u32;
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {
                     confidence =

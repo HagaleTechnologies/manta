@@ -507,6 +507,34 @@ decode -- only the MOMENT of emission moved from "first decode" to "track
 close." An allowlisted callsign is unaffected by this and still spots
 immediately.
 
+**"Distinct" (MAN-100).** Two decodes of the same callsign text on a track
+count as separate repetitions toward `r` only when at least
+`MIN_MESSAGE_WORD_GAP = 3` decoded words on that track separate them.
+SPEC's own default payload template repeats the callsign back-to-back
+within one transmission (`CQ CQ DE <CALL> <CALL> K`, §7's payload note) —
+without this rule, that single, possibly fading-corrupted message alone
+could satisfy the ≥ 2-repetition gate. 3 words sits strictly between the
+one-word gap inside a single message and the minimum five-word gap between
+two separate ones (`<CALL> K CQ CQ DE <CALL>`). The beacon/allowlist
+exemptions above are unaffected — they never consult `r`'s distinctness
+rule at all.
+
+**Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
+Before a candidate spots, it is checked against every other decoded,
+spottable-shaped word observed on the same track within the same 90 s
+window. It is withheld if a confusable, better-supported rival exists —
+"confusable" meaning a shared contiguous substring relationship, or a
+shared prefix of at least 3 characters with edit distance ≤ 2 — where
+"better-supported" means strictly more message-distinct repetitions (ties
+broken by summed per-occurrence confidence), or the candidate being a
+strict prefix of a rival that itself has ≥ 1 repetition. This mechanism is
+purely subtractive: it can only withhold a spot the rest of this section
+would otherwise emit, never produce one, and it never fires against an
+operator-allowlisted callsign or one present in the bundled SCP list. See
+`manta-spot::variant`/`manta-spot::support` for the exact relation and
+comparison, and the MAN-100 decision record for the measured rationale
+behind the prefix-only asymmetry.
+
 ---
 
 ## 5. Decoder output
@@ -654,8 +682,10 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
-| V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
+| V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+| V31 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V31b (per-track scoping) and V31c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
+| V32 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the ≥ 2-rep gate; the second message completes it |
 
 ---
 
