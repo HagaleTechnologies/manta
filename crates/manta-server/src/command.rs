@@ -16,6 +16,15 @@ pub enum Command {
     /// `set dx filter unique > <n>` -- suppress spots for a callsign
     /// until it's been seen more than `min` times on this bus.
     SetFilterUnique { min: u32 },
+    /// `SKIMMER/SETT` (or bare `SETT`) -- Aggregator's handshake probe.
+    /// Per Aggregator manual v6.0 §9.2, a source that never answers this
+    /// has its spots dropped entirely, so this is the gate on manta being
+    /// usable behind a stock Aggregator at all (MAN-86).
+    Sett,
+    /// `BYE` -- the client is done; reply `CU AGN!` and close the
+    /// connection (CW Skimmer manual, Telnet Commands; Aggregator manual
+    /// v6.0 §10.5 lists it on Aggregator's own local user port too).
+    Bye,
     /// Anything else: accepted (never disconnects the client) but not
     /// acted on.
     Unknown,
@@ -40,6 +49,8 @@ pub fn parse(line: &str) -> Command {
             Ok(min) => Command::SetFilterUnique { min },
             Err(_) => Command::Unknown,
         },
+        ["SKIMMER", "SETT"] | ["SETT"] => Command::Sett,
+        ["BYE"] => Command::Bye,
         _ => Command::Unknown,
     }
 }
@@ -86,9 +97,39 @@ mod tests {
 
     #[test]
     fn unrecognized_command_is_unknown_not_an_error() {
-        assert_eq!(parse("bye"), Command::Unknown);
+        // MAN-86 deliberately promoted `bye` out of `Unknown` (see
+        // `parses_bye_case_insensitively` below) -- don't "restore" it here.
         assert_eq!(parse(""), Command::Unknown);
         assert_eq!(parse("set dx filter unique > banana"), Command::Unknown);
+    }
+
+    #[test]
+    fn parses_skimmer_sett_in_both_slash_and_space_form() {
+        // Aggregator sends `SKIMMER/SETT` (Aggregator manual v6.0 §3.1); the
+        // manuals also refer to it in prose as bare "the SETT command"
+        // (§6.1, §9.2), so accept both rather than gambling on one spelling.
+        assert_eq!(parse("SKIMMER/SETT"), Command::Sett);
+        assert_eq!(parse("skimmer/sett"), Command::Sett);
+        assert_eq!(parse("SKIMMER SETT"), Command::Sett);
+        assert_eq!(parse("sett"), Command::Sett);
+    }
+
+    #[test]
+    fn parses_bye_case_insensitively() {
+        // Aggregator manual v6.0 §10.5 lists "BYE or bye" on its own local
+        // user port -- both spellings are real.
+        assert_eq!(parse("BYE"), Command::Bye);
+        assert_eq!(parse("bye"), Command::Bye);
+        assert_eq!(parse("bye\r\n"), Command::Bye);
+    }
+
+    #[test]
+    fn sett_with_trailing_junk_is_unknown_not_sett() {
+        // Matches the existing malformed-argument rule (`sh/dx/banana` is
+        // Unknown, not a bare `sh/dx`) -- a command shape we don't
+        // understand must not be silently treated as one we do.
+        assert_eq!(parse("skimmer/sett/14000"), Command::Unknown);
+        assert_eq!(parse("bye now"), Command::Unknown);
     }
 
     #[test]

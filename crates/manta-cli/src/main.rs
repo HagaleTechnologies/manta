@@ -776,6 +776,7 @@ fn shutdown_runtime_after_drain(
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
+    center_freq_hz: f64,
     epoch: std::time::SystemTime,
     session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
@@ -837,11 +838,33 @@ fn start_spot_server(
             cfg.telnet_max_commands_per_ip,
         );
         manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
+        // MAN-86: Aggregator will not forward spots from a source that
+        // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
+        // `profile` carries the operator identity for the greeting banner
+        // and the live-passband segments for the SETT reply.
+        if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
+            tracing::warn!(
+                "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
+                 operator_grid so RBN Aggregator can record this node's location \
+                 (Aggregator manual v6.0 §9.2)"
+            );
+        }
+        let profile = std::sync::Arc::new(manta_server::telnet::StationProfile {
+            call: cfg.station_callsign.clone(),
+            operator_name: cfg.operator_name.clone(),
+            operator_qth: cfg.operator_qth.clone(),
+            operator_grid: cfg.operator_grid.clone(),
+            sett: manta_server::sett::SettSettings {
+                validation_level: manta_server::sett::ValidationLevel::Normal,
+                cq_only: false,
+                segments: manta_server::sett::segments_for_passband(center_freq_hz, sample_rate_hz),
+            },
+        });
         tokio::spawn(manta_server::telnet::serve(
             telnet_listener,
             bus.clone(),
             metrics.clone(),
-            cfg.station_callsign.clone(),
+            profile,
             shutdown_rx.clone(),
             tasks.clone(),
             manta_server::tasks::new_connection_limiter(
@@ -1129,8 +1152,13 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                    let (rt, server) = start_spot_server(
+                        &path,
+                        src.sample_rate(),
+                        src.center_freq_hz(),
+                        epoch,
+                        session_nonce,
+                    )?;
                     // Real, if coarse, health signal: this source opened
                     // and is running. `active_tracks` has no equivalent
                     // hook yet -- manta-engine exposes no live track-count
@@ -1600,6 +1628,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
             96_000.0,
+            14_040_000.0,
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -1650,6 +1679,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
             96_000.0,
+            14_040_000.0,
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -1669,6 +1699,42 @@ mod tests {
         assert!(
             accepted.unwrap_or(false),
             "enabled=true must connect to the configured target"
+        );
+    }
+
+    // MAN-86: the three new [server] operator-identity keys must load
+    // through the real --server-config path (`start_spot_server`), not
+    // just through manta-server's own unit tests. Additive on a
+    // deny_unknown_fields struct, so a config WITHOUT them (every other
+    // test in this module) must keep loading too.
+    #[test]
+    fn server_config_accepts_the_operator_identity_keys() {
+        let cfg_file = write_temp_file(
+            r#"
+            [server]
+            station_callsign = "HB9H"
+            bind_addr = "127.0.0.1"
+            telnet_port = 0
+            json_port = 0
+            metrics_port = 0
+            operator_name = "Art"
+            operator_qth = "Switzerland"
+            operator_grid = "JN46la"
+            "#
+            .as_bytes(),
+        );
+
+        let result = start_spot_server(
+            cfg_file.path(),
+            96_000.0,
+            14_040_000.0,
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        );
+        assert!(
+            result.is_ok(),
+            "a config with the operator-identity keys present must still start: {:?}",
+            result.err()
         );
     }
 
@@ -1709,6 +1775,7 @@ mod tests {
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
             96_000.0,
+            14_040_000.0,
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )

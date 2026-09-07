@@ -278,11 +278,20 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 7. Output layer (`manta-server`)
 
-- **Telnet DX cluster server** (default :7300): standard login prompt, emits
-  RBN-format spots —
+- **Telnet DX cluster server** (default :7300): on connect, sends a CW-Skimmer-
+  shaped greeting banner (software name/version, operator name/callsign/QTH/
+  grid, then `Please enter your callsign: `), validates the login as a
+  plausible callsign shape (not authentication — see Exposure policy below),
+  then emits RBN-format spots —
   `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
-  Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
-  clients not to choke. This is the RBN/aggregator compatibility surface.
+  Read-mostly protocol; enough command grammar (`sh/dx`, filters, `SKIMMER/
+  SETT`, `BYE`) for common clients — and RBN's own Aggregator — not to choke.
+  `SKIMMER/SETT` replies with validation level and the live decodable
+  passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
+  spots from a source that never answers it (Aggregator manual v6.0 §9.2).
+  This is the RBN/aggregator compatibility surface — see
+  `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md` for the
+  exact wire format and its primary sources.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the

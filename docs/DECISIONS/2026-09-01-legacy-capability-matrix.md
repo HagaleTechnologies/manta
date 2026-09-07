@@ -61,6 +61,9 @@ separate jobs**, not two:
 | RF center-frequency reference for the rig-audio input mode | **Gap** — see MAN-34 below. Caught by Codex review on PR #57: the CAT non-goal above only holds for wideband sources — manta's already-shipped `listen`/`listen --device` audio-passband mode has no CAT need either, but also has no *other* way to know the tuned RF frequency. Verified: `AudioIqSource::center_freq_hz()` always returns `0.0` (`crates/manta-input/src/audio.rs:77`), a deliberate M1-scope decision, not a non-goal |
 | Remote SKIMMER/QSY, SKIMMER/AUDIOIF, SKIMMER/LO_FREQ (narrowband retune-by-telnet commands) | **Non-goal** — these retune a single narrowband receiver; manta's channelizer decodes the whole configured passband at once and has nothing to retune |
 | Remote SKIMMER/START, SKIMMER/STOP (process start/stop via telnet) | **Non-goal** — process lifecycle is an ops/systemd concern (MAN-21), not a wire-protocol feature |
+| Remote SKIMMER/SETT (handshake Aggregator uses to learn operator/location/passband before it will forward spots) | **Covered** — MAN-86. The one `SKIMMER/*` subcommand that IS implemented; the three `Non-goal` rows above don't cover the whole `SKIMMER/*` namespace, just the retune/lifecycle subset |
+| Telnet greeting banner (software name/version, operator name/callsign/QTH/grid, `Please enter your callsign:`) | **Covered** — MAN-86, see `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md` |
+| `BYE` (client-initiated clean telnet disconnect, `CU AGN!` reply) | **Covered** — MAN-86 |
 | Multiple instances via per-instance `.ini` files | **Covered (superseded)** — MAN-13's single-daemon multi-source model replaces this |
 | Auto-start (command-line switch / VBScript) | **Covered** — falls under MAN-21's non-developer install/operate scope |
 | Frequency calibration (manual correction-factor procedure) | **Gap** — see MAN-29 below |
