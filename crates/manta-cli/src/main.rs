@@ -1370,8 +1370,15 @@ fn deprecations<I: IntoIterator<Item = String>>(args: I) -> Vec<Deprecation> {
 /// runs before clap, so it cannot know which tokens are values. The failure
 /// mode is one extra stderr line, never a wrong exit code or a changed
 /// behavior.
+///
+/// Reads `args_os()`, not `args()`: this runs before `Cli::parse()` for
+/// every subcommand, and `args()` panics on non-UTF-8 argv where clap's own
+/// `args_os()`-based parsing (e.g. a non-UTF-8 `PathBuf`) does not. A lossy
+/// conversion can only misdetect a flag value that both contains invalid
+/// UTF-8 and happens to collide with `--config`/`--server-config`.
 fn warn_deprecations() {
-    for d in deprecations(std::env::args()) {
+    let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+    for d in deprecations(argv) {
         match d {
             Deprecation::ListenVerb => eprintln!(
                 "warning: starting the daemon with `manta listen` is deprecated and will be \

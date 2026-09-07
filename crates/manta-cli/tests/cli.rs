@@ -198,9 +198,42 @@ fn the_ad_hoc_listen_path_is_not_nagged() {
 fn deprecation_notices_never_touch_stdout() {
     // AGENTS.md: file input -> byte-identical spot logs. stdout carries the
     // JSON Lines stream; a warning there would corrupt it.
-    let out = manta().args(["listen", "--help"]).output().unwrap();
+    //
+    // Regression for code-review F-2: `listen --help` emits no notice on
+    // either stream (no --config/--server-config present), so it could not
+    // have caught an eprintln! -> println! regression. Use argv that
+    // actually fires both notices, and assert the split, not just stdout.
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.contains("deprecated"), "stdout: {stdout}");
+    assert!(stderr.contains("deprecated"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_argv_does_not_panic_the_deprecation_scan() {
+    // Regression for code-review F-1: warn_deprecations() used to call
+    // std::env::args(), which panics on non-UTF-8 argv, as main()'s first
+    // statement -- so every subcommand panicked on a non-UTF-8 path, not
+    // just the deprecated spellings the scan exists to detect.
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let bad_path = OsStr::from_bytes(b"/tmp/\xffnonexistent.wav");
+    let out = manta().arg("decode").arg(bad_path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert_ne!(out.status.code(), Some(101), "stderr: {stderr}");
 }
 
 #[test]
