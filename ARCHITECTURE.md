@@ -319,9 +319,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 - **Telnet DX cluster server** (default :7300): standard login prompt, emits
   RBN-format spots —
-  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
+  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  30 dB  28 WPM  CQ  0312Z`.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
-  clients not to choke. This is the RBN/aggregator compatibility surface.
+  clients not to choke. This is the RBN/aggregator compatibility surface. The
+  SNR field is quoted in the 500 Hz reference bandwidth RBN/CW Skimmer use
+  (MAN-102 / decision D3), converted from the decoder's native 2500 Hz
+  measurement at render time — see `docs/SPEC-decode-core.md` §2.3.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
@@ -331,6 +334,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+  Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
+  alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
+  of either surface never has to guess which convention it's reading
+  (MAN-102 / decision D3).
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a

@@ -15,6 +15,11 @@
 //! definition outside every DXCC entity, so it gets ADIF's own
 //! `NO_DXCC_ENTITY` (0) plus unknown continent/zone/lat/lon instead of its
 //! home entity's geography.
+//!
+//! `snrRefHz` (MAN-102 / decision D3) is a manta-originated addition not
+//! yet reflected in dispensa's frozen schema -- see
+//! `docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for
+//! the proposed schema fragment, ready to lift into that repo's ADR-0011.
 
 use manta_spot::cty;
 use manta_spot::Spot;
@@ -121,6 +126,14 @@ impl Geography {
     }
 }
 
+/// MAN-102 / decision D3: the reference bandwidth every `snr` on this
+/// stream is quoted in. Constant today -- SPEC §2.3 bakes the
+/// channel-to-2500 Hz conversion into where the value is computed, so no
+/// code path can produce another reference. Present so a consumer never
+/// has to infer it, and so the telnet surface's 500 Hz convention
+/// (`rbn::format_line`) cannot be confused with this one.
+pub const SNR_REF_HZ: u32 = 2500;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotMessage {
@@ -145,6 +158,8 @@ pub struct SpotMessage {
     pub de_dxcc: i64,
     pub de_continent: String,
     pub snr: Option<i32>,
+    /// The reference bandwidth `snr` is quoted in. MAN-102 / D3.
+    pub snr_ref_hz: u32,
     pub wpm: Option<i32>,
     pub decode_confidence: Option<f32>,
     pub decoder_version: Option<String>,
@@ -231,6 +246,7 @@ impl SpotMessage {
             de_dxcc: de.dxcc,
             de_continent: de.continent,
             snr: Some(spot.snr_db.round() as i32),
+            snr_ref_hz: SNR_REF_HZ,
             wpm: Some(spot.wpm.round() as i32),
             decode_confidence: Some(spot.confidence),
             decoder_version: Some(decoder_version.to_string()),
@@ -510,6 +526,29 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     }
 
     #[test]
+    fn json_snr_is_the_native_2500hz_value_with_an_explicit_reference() {
+        // MAN-102/D3: JSON must NOT carry the telnet/uplink +7 dB
+        // conversion -- that's a wire-boundary rendering step
+        // (`rbn::format_line`), not a pipeline value change.
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            &cty,
+            "manta-0.1.0",
+            0,
+            1_699_999_000,
+        );
+        assert_eq!(msg.snr, Some(23), "JSON must NOT carry the telnet +7 dB");
+        assert_eq!(msg.snr_ref_hz, 2500);
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v["snrRefHz"], 2500,
+            "camelCase wire key, per the struct's rename_all"
+        );
+    }
+
+    #[test]
     fn optional_decoder_metadata_fields_are_populated() {
         let cty = cty::Table::parse(CTY_FIXTURE);
         let msg = SpotMessage::from_spot(
@@ -600,6 +639,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             "deDxcc",
             "deContinent",
             "snr",
+            "snrRefHz",
             "wpm",
             "decodeConfidence",
             "decoderVersion",

@@ -361,27 +361,39 @@ pub(crate) struct Track {
     /// This hop's SNR estimate for the track's selected channel (SPEC
     /// §2.5), used by `merge_converged`/`evict_over_cap` tie-breaks.
     pub(crate) current_snr_db: f32,
+    /// MAN-102: running maximum of `current_snr_db` since this track's
+    /// last `TrackMeta`. `TrackMeta` fires once per 375 hops at an
+    /// arbitrary phase of the keying, and `current_snr_db` is a 40 ms EMA
+    /// that decays to the floor on every key-up -- sampling it
+    /// instantaneously swings ~35 dB between key-down and key-up (measured;
+    /// see the MAN-102 decision record). The peak over the interval is the
+    /// settled key-down level, which is what RBN/CW Skimmer report.
+    pub(crate) snr_peak_db: f32,
     /// The channel index this track first spawned on (SPEC §2.1); the
     /// anchor for `Track::freq_hz`'s absolute-Hz conversion.
     pub(crate) birth_channel: usize,
     /// The track's leased decoder, allocated on CANDIDATE -> ACTIVE
     /// promotion (SPEC §2.4/§5); `None` before promotion.
     decoder: Option<TrackDecoder>,
-    /// `(amplitude, raw_power, spectral_ref_power, sample_ts)` queued this
-    /// hop-batch by `step_hop`, drained once per `process_hops` call by
-    /// `drain_pool` (ARCHITECTURE §10's decoder pool). `raw_power` is kept
-    /// separate from `amplitude` (rather than derived as `amplitude *
-    /// amplitude`) so the noise tracker always sees the tracked channel's
-    /// real, full-bandwidth power even when `amplitude` is a narrowband-
-    /// refined value (Codex review, PR #178) -- see `decoder_input`'s doc
-    /// comment. `spectral_ref_power` (SPEC v2 §2.2's min-of-six-neighbors
-    /// reference, linear) is computed by `step_hop` from `FloorBank`, not
-    /// `decoder_input` (a `Track` method with no access to the floor bank,
-    /// a `TrackManager` field) -- always `Some` since `FloorBank` has a
-    /// real value for every channel from construction onward (Codex
-    /// review, PR #178: this was hard-coded `None` before, so
-    /// `NoiseTracker`'s spectral-discounting branch never activated).
-    pending: Vec<(f32, f32, Option<f32>, u64)>,
+    /// `(amplitude, raw_power, spectral_ref_power, sample_ts,
+    /// snr_peak_db_at_that_hop)` queued this hop-batch by `step_hop`,
+    /// drained once per `process_hops` call by `drain_pool` (ARCHITECTURE
+    /// §10's decoder pool). `raw_power` is kept separate from `amplitude`
+    /// (rather than derived as `amplitude * amplitude`) so the noise
+    /// tracker always sees the tracked channel's real, full-bandwidth power
+    /// even when `amplitude` is a narrowband-refined value (Codex review,
+    /// PR #178) -- see `decoder_input`'s doc comment. `spectral_ref_power`
+    /// (SPEC v2 §2.2's min-of-six-neighbors reference, linear) is computed
+    /// by `step_hop` from `FloorBank`, not `decoder_input` (a `Track`
+    /// method with no access to the floor bank, a `TrackManager` field) --
+    /// always `Some` since `FloorBank` has a real value for every channel
+    /// from construction onward (Codex review, PR #178: this was
+    /// hard-coded `None` before, so `NoiseTracker`'s spectral-discounting
+    /// branch never activated). `snr_peak_db` (MAN-102) is paired per hop
+    /// rather than read once at drain time so the reported value does not
+    /// depend on the caller's chunk size (`decode_samples` uses 4096
+    /// samples, `listen` uses its own) -- SPEC §6's determinism rule.
+    pending: Vec<(f32, f32, Option<f32>, u64, f32)>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -438,6 +450,7 @@ impl Track {
             lifecycle: Lifecycle::new(cfg),
             center: birth_channel as f64,
             current_snr_db: 0.0,
+            snr_peak_db: 0.0,
             birth_channel,
             decoder: None,
             pending: Vec::new(),
@@ -887,6 +900,7 @@ impl TrackManager {
             track.update_centroid(k, &hop.power, n);
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
+            track.snr_peak_db = track.snr_peak_db.max(track.current_snr_db);
             let char_emitted = false; // GC timer input; refined below once a decoder exists.
             let event = track.lifecycle.on_hop(rise[k], drop[k], char_emitted);
             match event {
@@ -913,7 +927,12 @@ impl TrackManager {
                     let spectral_ref_power = compute_spectral_ref_power
                         .then(|| Self::spectral_ref_power(&self.floor, track.center))
                         .flatten();
-                    track.pending.push((amp, raw_power, spectral_ref_power, ts));
+                    // MAN-102: the peak-held SNR is paired per hop, same as
+                    // the other fields, so the reported value does not
+                    // depend on the caller's chunk size.
+                    track
+                        .pending
+                        .push((amp, raw_power, spectral_ref_power, ts, track.snr_peak_db));
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
@@ -958,7 +977,13 @@ impl TrackManager {
                         let spectral_ref_power = compute_spectral_ref_power
                             .then(|| Self::spectral_ref_power(&self.floor, track.center))
                             .flatten();
-                        track.pending.push((amp, raw_power, spectral_ref_power, ts));
+                        track.pending.push((
+                            amp,
+                            raw_power,
+                            spectral_ref_power,
+                            ts,
+                            track.snr_peak_db,
+                        ));
                     }
                 }
             }
@@ -1115,6 +1140,7 @@ impl TrackManager {
         let mut track = Track::new(id, birth_channel, &self.cfg);
         let f = self.floor.effective_floor_db(birth_channel);
         track.current_snr_db = (self.gate.smoothed_db(birth_channel) - f) as f32;
+        track.snr_peak_db = track.current_snr_db;
         for ch in track.owned(self.n_channels()) {
             self.owner_of[ch] = Some(id);
         }
@@ -1395,13 +1421,37 @@ impl TrackManager {
             .flat_map_iter(|(decoder, pending)| {
                 pending
                     .into_iter()
-                    .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                    .flat_map(|(amp, raw_power, spectral_ref_power, ts, snr_peak)| {
+                        // MAN-102: SPEC §2.3's floor-based estimate, in the
+                        // 2500 Hz reference bandwidth, held at its peak
+                        // over the reporting interval (see `snr_peak_db`'s
+                        // doc comment on `Track`). Consumed only by the
+                        // `Legacy` engine (`TrackDecoder::tick_meta`);
+                        // `EdgeLegacy`/`Hsmm` source their own SPEC v2 §2.3
+                        // evidence-derived estimate instead, so this call is
+                        // harmless but inert for those two engines.
+                        decoder.set_snr_2500_db(snr_peak - manta_decode::SNR_BW_CORR_DB);
                         decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
                     })
                     .collect::<Vec<_>>()
             })
             .collect();
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        // MAN-102: a track that just reported starts a fresh peak window,
+        // driven by the decoder's actual emission rather than a duplicated
+        // 375-hop counter here, so the two can never drift apart.
+        let reported: std::collections::BTreeSet<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TrackMeta { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .collect();
+        for (id, t) in self.tracks.iter_mut() {
+            if reported.contains(id) {
+                t.snr_peak_db = t.current_snr_db;
+            }
+        }
         events
     }
 }

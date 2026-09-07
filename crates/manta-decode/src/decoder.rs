@@ -122,6 +122,13 @@ pub struct TrackDecoder {
     snr_history: VecDeque<(u64, u64, f32)>,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
+    /// SPEC §2.3's floor-based SNR for this track, supplied by the layer
+    /// that owns the gate/floor state (`manta-engine`), exactly as
+    /// `freq_hz` is. `None` when a `TrackDecoder` is driven standalone
+    /// (manta-decode's own tests, manta-testkit's roundtrip vectors), in
+    /// which case `TrackMeta` falls back to the M0 keying-rail estimate.
+    /// MAN-102.
+    snr_2500_db: Option<f32>,
 }
 
 impl TrackDecoder {
@@ -162,12 +169,26 @@ impl TrackDecoder {
             last_snr: None,
             snr_history: VecDeque::new(),
             garble_count: 0,
+            snr_2500_db: None,
         }
     }
 
     /// Set the track's absolute RF frequency, reported in TrackMeta events. SPEC §5.
     pub fn set_freq_hz(&mut self, hz: f64) {
         self.freq_hz = hz;
+    }
+
+    /// Set the track's floor-based SNR in the 2500 Hz reference bandwidth,
+    /// reported in TrackMeta events. SPEC §2.3/§5. See `set_freq_hz` for why
+    /// this is pushed down from `manta-engine` rather than computed here:
+    /// the noise floor and gate live one crate above this one. MAN-102.
+    /// Consumed only by the `Legacy` engine (see `tick_meta`) -- `EdgeLegacy`
+    /// and `Hsmm` already source `TrackMeta.snr_2500_db` from their own SPEC
+    /// v2 §2.3 evidence-derived estimate (`last_snr`, via `snr_from_evidence`),
+    /// which does not share `Legacy`'s keying-rail-ratio inaccuracy this
+    /// setter exists to fix.
+    pub fn set_snr_2500_db(&mut self, snr_2500_db: f32) {
+        self.snr_2500_db = Some(snr_2500_db);
     }
 
     /// One hop: linear amplitude, linear power, optional spectral noise
@@ -306,14 +327,19 @@ impl TrackDecoder {
         }
     }
 
-    /// SPEC §5: TrackMeta at the 1 Hz cadence. `Legacy` reads its SNR
-    /// straight from the keying rails; `EdgeLegacy`/`Hsmm` use the SPEC v2
-    /// §2.3 evidence-derived estimate stashed by `snr_from_evidence`.
+    /// SPEC §5: TrackMeta at the 1 Hz cadence. `Legacy` prefers the engine's
+    /// floor-based SPEC §2.3 peak-hold estimate (`snr_2500_db`, pushed down
+    /// by `manta-engine`, MAN-102), falling back to the keying-rail M0
+    /// stand-in only when no engine-supplied value has ever been set (e.g. a
+    /// `TrackDecoder` driven standalone, outside `manta-engine`).
+    /// `EdgeLegacy`/`Hsmm` use their own SPEC v2 §2.3 evidence-derived
+    /// estimate stashed by `snr_from_evidence`, which does not share
+    /// `Legacy`'s rail-ratio inaccuracy MAN-102 exists to fix.
     fn tick_meta(&mut self, events: &mut Vec<DecoderEvent>) {
         self.hop_count += 1;
         if self.hop_count % META_INTERVAL_HOPS == 0 {
             let snr = if self.cfg.engine == Engine::Legacy {
-                self.demod.snr_2500_db()
+                self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
             } else {
                 self.last_snr
             };
@@ -1140,6 +1166,55 @@ mod tests {
             DecoderEvent::char_decoded(1, 4, Glyph::Char('B'), 1.0),
         ];
         assert_eq!(events_to_text(&ev), "A B");
+    }
+
+    /// 375 hops (one META_INTERVAL_HOPS/SPEC §5 reporting interval) of a
+    /// keyed envelope, alternating enough to let `Demod`'s init succeed
+    /// (SPEC §3.1-§3.2's E_hi/E_lo ratio check) within this same window.
+    fn keyed_envelope_for_tests() -> Vec<f32> {
+        let mut env = Vec::new();
+        for _ in 0..12 {
+            env.extend(std::iter::repeat_n(1.0f32, 15));
+            env.extend(std::iter::repeat_n(0.01f32, 15));
+        }
+        env.extend(std::iter::repeat_n(1.0f32, 15));
+        env
+    }
+
+    #[test]
+    fn track_meta_uses_the_engine_supplied_snr_when_set() {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        dec.set_freq_hz(14_012_340.0);
+        let mut events = Vec::new();
+        // 375 hops of a keyed envelope is one META_INTERVAL_HOPS.
+        for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+            dec.set_snr_2500_db(19.5);
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let meta = events.iter().find_map(|e| match e {
+            DecoderEvent::TrackMeta { snr_2500_db, .. } => Some(*snr_2500_db),
+            _ => None,
+        });
+        assert_eq!(meta, Some(19.5), "the engine-supplied value must win");
+    }
+
+    #[test]
+    fn track_meta_falls_back_to_the_rail_estimate_when_unset() {
+        // A TrackDecoder driven standalone (manta-decode's own tests,
+        // manta-testkit's roundtrip_envelope) never calls set_snr_2500_db
+        // and must keep emitting the M0 rail estimate rather than nothing
+        // at all.
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. })),
+            "no TrackMeta emitted without an engine-supplied SNR"
+        );
     }
 
     #[test]
