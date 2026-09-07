@@ -1031,7 +1031,22 @@ fn start_spot_server(
     ))
 }
 
+/// `--server-config` is a deprecated alias for `--config`
+/// (`Listen::config`'s `alias = "server-config"`), kept only so existing
+/// systemd unit files/scripts keep working. Clap's derive `alias` gives no
+/// way to ask which spelling the user actually typed (`ArgMatches::
+/// value_source` tracks provenance TIER -- cli/env/default -- not the
+/// literal flag text), so this checks the raw argv directly instead,
+/// before `Cli::parse()` ever runs.
+fn server_config_alias_was_used(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--server-config" || a.starts_with("--server-config="))
+}
+
 fn main() -> Result<()> {
+    if server_config_alias_was_used(&std::env::args().collect::<Vec<_>>()) {
+        eprintln!("warning: --server-config is deprecated, use --config instead");
+    }
     match Cli::parse().command {
         Command::Decode {
             path,
@@ -1212,6 +1227,7 @@ fn main() -> Result<()> {
                 allowlist,
                 blocklist,
                 notch,
+                suppress_file_input_shared_keys: cli_has_source_flags && has_rf_aware_source,
             };
             let cfg = config::resolve_pipeline(&file, &base_dir, &cli_overrides)?;
 
@@ -1470,6 +1486,12 @@ fn main() -> Result<()> {
                 || kiwi_host.is_some()
                 || has_soapy_source
                 || has_hpsdr_source;
+            // Mirrors Listen's identically-named check: an RF-aware CLI
+            // source flag discards `[input]` wholesale, so its shared
+            // per-source `freq_correction_ppm` must not silently carry
+            // over from a now-unused, different source (code-review
+            // finding 1 / round-2 finding C-2).
+            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
 
             let config_path = resolve_config_path(config_path);
             let base_dir = config_path
@@ -1489,6 +1511,7 @@ fn main() -> Result<()> {
                 allowlist,
                 blocklist,
                 notch,
+                suppress_file_input_shared_keys: cli_has_source_flags && has_rf_aware_source,
             };
             let cfg = config::resolve_pipeline(&file, &base_dir, &cli_overrides)?;
 
@@ -1963,5 +1986,32 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    #[test]
+    fn server_config_alias_was_used_detects_both_spellings_and_nothing_else() {
+        let args = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(server_config_alias_was_used(&args(&[
+            "manta",
+            "listen",
+            "--server-config",
+            "manta.toml"
+        ])));
+        assert!(server_config_alias_was_used(&args(&[
+            "manta",
+            "listen",
+            "--server-config=manta.toml"
+        ])));
+        assert!(!server_config_alias_was_used(&args(&[
+            "manta",
+            "listen",
+            "--config",
+            "manta.toml"
+        ])));
+        assert!(!server_config_alias_was_used(&args(&[
+            "manta",
+            "decode",
+            "fixture.wav"
+        ])));
     }
 }

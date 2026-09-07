@@ -321,18 +321,38 @@ pub struct DetectorTable {
 /// enough to reject a stray extra zero instead of silently accepting it.
 const MAX_PLAUSIBLE_MS: f64 = 3_600_000.0;
 
+/// The smallest `*_ms` value that rounds up to a nonzero hop count at the
+/// channelizer's fixed 375 Hz rate, per `manta_decode::ms_to_hops`'s
+/// round-half-up rule (`floor(ms * 0.375 + 0.5)`): solving
+/// `floor(ms * 0.375 + 0.5) >= 1` for `ms` gives `ms >= 4.0 / 3.0`. Below
+/// this, `ms_to_hops` silently rounds to 0 -- and `TrackManager::on_hop`
+/// (`manta-engine::track`) compares `silent_count >= gc_hops`/
+/// `confirm_count >= confirm_hops` etc., both of which are trivially true
+/// at 0, so every track would close (or promote) on its very first hop.
+/// The daemon would run and silently spot nothing (code-review finding 2).
+const MIN_MS_FOR_ONE_HOP: f64 = 4.0 / 3.0;
+
 fn ms_to_hops_checked(key: &str, ms: f64) -> Result<u64> {
     if !ms.is_finite() || ms <= 0.0 || ms > MAX_PLAUSIBLE_MS {
         bail!(
             "{key} must be a finite number of milliseconds between 0 (exclusive) and {MAX_PLAUSIBLE_MS}, got {ms}"
         );
     }
-    Ok(u64::from(manta_decode::ms_to_hops(ms)))
+    let hops = manta_decode::ms_to_hops(ms);
+    if hops == 0 {
+        bail!(
+            "{key} = {ms} rounds to 0 hops at the channelizer's fixed 375 Hz rate -- the smallest \
+             value that rounds up to 1 hop is {MIN_MS_FOR_ONE_HOP} ms"
+        );
+    }
+    Ok(u64::from(hops))
 }
 
 fn positive_ms(key: &str, ms: f64) -> Result<f64> {
-    if !ms.is_finite() || ms <= 0.0 {
-        bail!("{key} must be a positive, finite number of milliseconds, got {ms}");
+    if !ms.is_finite() || ms <= 0.0 || ms > MAX_PLAUSIBLE_MS {
+        bail!(
+            "{key} must be a finite number of milliseconds between 0 (exclusive) and {MAX_PLAUSIBLE_MS}, got {ms}"
+        );
     }
     Ok(ms)
 }
@@ -733,6 +753,27 @@ fn env_overlay_vars(vars: impl IntoIterator<Item = (String, String)>) -> Vec<(St
         .collect()
 }
 
+/// `std::env::vars()` PANICS if any variable in the process environment --
+/// including one entirely unrelated to manta -- has a non-Unicode name or
+/// value. `load` is on the unconditional `listen`/`soak` startup path (it
+/// runs even with no `--config`), so that panic would turn a clean startup
+/// into a crash over a stray environment entry manta never reads
+/// (code-review finding 4). A name that isn't valid Unicode can never
+/// match `MANTA_<TABLE>_<KEY>` anyway, so it's dropped outright; a value
+/// that isn't is converted lossily (`\u{FFFD}` in place of invalid bytes)
+/// so a genuinely-relevant `MANTA_*` variable still reaches the ordinary
+/// per-field validation instead of crashing the process.
+fn os_vars_to_string_lossy(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let k = k.into_string().ok()?;
+            Some((k, v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
 /// The real entry point: reads `path` (if given), overlays the process's
 /// actual `MANTA_*` environment variables (excluding [`ENV_CONFIG_PATH`],
 /// which `main.rs` reads directly as the `--config` fallback, not as a
@@ -746,7 +787,7 @@ pub fn load(path: Option<&Path>) -> Result<ConfigFile> {
             .with_context(|| format!("reading config file {}", p.display()))?,
         None => String::new(),
     };
-    let vars = env_overlay_vars(std::env::vars());
+    let vars = env_overlay_vars(os_vars_to_string_lossy(std::env::vars_os()));
     load_str_with_env(&text, &vars).with_context(|| match path {
         Some(p) => format!("parsing config file {}", p.display()),
         None => "parsing MANTA_* environment overrides".to_string(),
@@ -775,6 +816,17 @@ pub struct CliOverrides {
     pub allowlist: Vec<String>,
     pub blocklist: Option<PathBuf>,
     pub notch: Option<PathBuf>,
+    /// True when a CLI source-selection flag (`--kiwi-host`/`--soapy-*`/
+    /// `--hpsdr-*`) chose an RF-aware live source that discards `[input]`
+    /// wholesale (MAN-74 Decision 3/5) -- in that case `[input]`'s shared
+    /// per-source keys describe a DIFFERENT, now-unused source and must
+    /// not silently carry over. `main.rs` already applies exactly this
+    /// condition to suppress a stale `[input].dial_freq_hz` (round-2
+    /// finding C-2); `freq_correction_ppm` used to skip that same check
+    /// (code-review finding 1: a WAV's 25 ppm calibration silently
+    /// applying to a live Kiwi source the operator switched to via
+    /// `--kiwi-host`) -- both shared keys now use this one flag.
+    pub suppress_file_input_shared_keys: bool,
 }
 
 /// Merges a parsed `ConfigFile` with CLI overrides into one
@@ -798,9 +850,13 @@ pub fn resolve_pipeline(
     cfg.freq_correction_ppm = cli
         .freq_correction_ppm
         .or_else(|| {
-            file.input
-                .as_ref()
-                .and_then(InputSource::freq_correction_ppm)
+            if cli.suppress_file_input_shared_keys {
+                None
+            } else {
+                file.input
+                    .as_ref()
+                    .and_then(InputSource::freq_correction_ppm)
+            }
         })
         .unwrap_or(0.0);
 
@@ -1224,6 +1280,83 @@ mod tests {
         }
     }
 
+    /// Code-review finding 2: below `MIN_MS_FOR_ONE_HOP`, `ms_to_hops`
+    /// silently rounds to 0 -- and a 0 `gc_hops`/`confirm_hops` closes (or
+    /// promotes) every track on its very first hop, since
+    /// `manta-engine::track`'s `>= 0` comparisons are trivially true. A
+    /// config with a stray-small `*_ms` value must be rejected, not
+    /// silently produce a daemon that decodes nothing.
+    #[test]
+    fn a_ms_value_that_rounds_to_zero_hops_is_rejected() {
+        for bad in ["[detector]\ngc_ms = 1\n", "[detector]\nconfirm_ms = 1\n"] {
+            let err = load_str(bad)
+                .unwrap()
+                .resolve_detector()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("0 hops"), "{bad} -> {err}");
+        }
+        // Comfortably above the ~1.333 ms floor: must still be accepted.
+        assert!(load_str("[detector]\ngc_ms = 50\n")
+            .unwrap()
+            .resolve_detector()
+            .is_ok());
+    }
+
+    /// Code-review finding 3: `MAX_PLAUSIBLE_MS`'s own doc comment claims it
+    /// bounds "any `*_ms` key in `[detector]`/`[decode]`", but `positive_ms`
+    /// (used by `decode.debounce_ms`/`tau_lo_ms`/`tau_hi_init_ms`) never
+    /// applied it -- the same stray-extra-zero typo was accepted in
+    /// `[decode]` while the mirrored `[detector]` key was rejected.
+    #[test]
+    fn an_implausibly_large_decode_ms_value_is_rejected() {
+        let err = load_str("[decode]\ndebounce_ms = 4000000\n")
+            .unwrap()
+            .resolve_decode()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3600000"), "{err}");
+    }
+
+    /// Code-review finding 4: `std::env::vars()` panics on any non-Unicode
+    /// entry in the WHOLE process environment, including one unrelated to
+    /// manta -- `load` is on the unconditional startup path, so that used
+    /// to turn a clean `listen`/`soak` invocation into a crash. Exercised
+    /// against the pure `os_vars_to_string_lossy` helper (not real process
+    /// env, matching this module's existing hermetic-test convention) so
+    /// the fix is proven without mutating `std::env` and racing sibling
+    /// tests in this shared bin target.
+    #[test]
+    #[cfg(unix)]
+    fn os_vars_to_string_lossy_never_panics_on_non_utf8_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let non_utf8_name = OsString::from_vec(vec![0xff, 0xfe]);
+        let non_utf8_value = OsString::from_vec(vec![b'x', 0xff, b'y']);
+        let result = os_vars_to_string_lossy([
+            (non_utf8_name, OsString::from("ignored")),
+            (OsString::from("MANTA_INPUT_DEVICE"), non_utf8_value),
+            (
+                OsString::from("MANTA_SERVER_STATION_CALLSIGN"),
+                OsString::from("K1ABC"),
+            ),
+        ]);
+
+        // The non-UTF-8-named entry is dropped outright (never matches
+        // MANTA_<TABLE>_<KEY> anyway); the non-UTF-8 value is kept, lossily
+        // converted rather than panicking; an ordinary entry passes through
+        // untouched.
+        assert_eq!(result.len(), 2);
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "MANTA_INPUT_DEVICE" && v.contains('\u{FFFD}')));
+        assert!(result.contains(&(
+            "MANTA_SERVER_STATION_CALLSIGN".to_string(),
+            "K1ABC".to_string()
+        )));
+    }
+
     // Phase 3: [input]/[spot] -> pipeline/source resolution.
 
     #[test]
@@ -1283,6 +1416,29 @@ mod tests {
         let file = load_str("[input]\ntype = \"audio\"\nfreq_correction_ppm = 3.0\n").unwrap();
         let cli = CliOverrides {
             freq_correction_ppm: Some(0.0),
+            ..CliOverrides::default()
+        };
+        assert_eq!(
+            resolve_pipeline(&file, Path::new("."), &cli)
+                .unwrap()
+                .freq_correction_ppm,
+            0.0
+        );
+    }
+
+    /// Code-review finding 1: a CLI source flag that discards `[input]`
+    /// wholesale (`suppress_file_input_shared_keys`) must also discard the
+    /// stale `[input].freq_correction_ppm` it carries -- otherwise a WAV
+    /// recording's calibration silently applies to a completely different,
+    /// CLI-selected source (e.g. a live KiwiSDR), matching the existing
+    /// `dial_freq_hz` suppression rule (round-2 finding C-2).
+    #[test]
+    fn a_suppressed_file_input_does_not_leak_its_freq_correction_ppm() {
+        let file =
+            load_str("[input]\ntype = \"file\"\npath = \"x.wav\"\nfreq_correction_ppm = 25.0\n")
+                .unwrap();
+        let cli = CliOverrides {
+            suppress_file_input_shared_keys: true,
             ..CliOverrides::default()
         };
         assert_eq!(

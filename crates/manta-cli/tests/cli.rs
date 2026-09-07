@@ -665,6 +665,232 @@ fn cli_freq_correction_ppm_beats_the_config_file_end_to_end() {
     );
 }
 
+/// MAN-74's own literal Gherkin spelling (`manta run --config manta.toml`):
+/// `run` ships as a `visible_alias` of `listen` (main.rs), so the exact
+/// same config-only invocation that `listen_runs_from_a_config_file_with_no_source_flags`
+/// exercises must also work through the `run` spelling.
+#[test]
+fn run_is_a_visible_alias_of_listen() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 20.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
+
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "manta run --config <file> must behave exactly like manta listen --config <file>"
+    );
+}
+
+/// Backward-compat promise for existing systemd unit files/scripts that
+/// still spell the flag `--server-config` (`Listen::config`'s `alias =
+/// "server-config"`): the entire test suite used to have zero coverage of
+/// this spelling actually working end to end (the one test that exercised
+/// it was rewritten to use `--config` during this ticket's own work).
+#[test]
+fn server_config_still_works_as_a_deprecated_alias_of_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[server]\nstation_callsign = \"W3XYZ\"\n").unwrap();
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav", "--server-config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure without --dial-freq-hz, via the deprecated --server-config spelling"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("--config"),
+        "--server-config must also print a deprecation warning naming --config: {stderr}"
+    );
+}
+
+fn port_is_listening(port: u16, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// MAN-74 Decision 8, positive case: a resolved config WITH a `[server]`
+/// table actually starts the telnet/JSON/metrics servers -- checked by
+/// binding a real socket, not just by reading the code.
+#[test]
+fn config_with_a_server_table_starts_the_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 3.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[server]\nstation_callsign = \"W3XYZ\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 18420\njson_port = 18421\nmetrics_port = 18422\n",
+    )
+    .unwrap();
+
+    let mut child = manta()
+        .args(["listen", "--source"])
+        .arg(&wav_path)
+        .args(["--dial-freq-hz", "14025000", "--config"])
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    assert!(
+        port_is_listening(18420, std::time::Duration::from_secs(10)),
+        "telnet server should be listening on the configured port"
+    );
+
+    let status = child.wait().unwrap();
+    assert!(status.success());
+}
+
+/// MAN-74 Decision 8, negative case: a resolved config with NO `[server]`
+/// table is a valid decode-only tuning file and must not bind any of the
+/// default server ports (ARCHITECTURE §7-8: telnet 7300 by default).
+#[test]
+fn config_without_a_server_table_does_not_start_the_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 3.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[detector]\non_snr_db = 12.0\n").unwrap();
+
+    let mut child = manta()
+        .args(["listen", "--source"])
+        .arg(&wav_path)
+        .args(["--config"])
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // A 3 s fixture decodes in well under a second (not real-time paced --
+    // confirmed empirically against `config_with_a_server_table_starts_the_servers`
+    // above, whose own server binds within milliseconds of process start),
+    // so this can't assume the process is still running by the time it
+    // checks -- if a `[server]`-table bug started the servers anyway, the
+    // bind happens near process start, well inside this poll window,
+    // regardless of whether decode itself has already finished.
+    let saw_listener = port_is_listening(7300, std::time::Duration::from_millis(300));
+
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "listen with no [server] table should still decode and exit cleanly"
+    );
+    assert!(
+        !saw_listener,
+        "no [server] table means the telnet/JSON/metrics servers must not start (MAN-74 Decision 8)"
+    );
+}
+
+/// `soak` gained the same `--config` support as `listen` -- a duplicated
+/// resolution block with no test exercising it before this.
+#[test]
+fn soak_accepts_config_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 3.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(&cfg_path, "[input]\ntype = \"file\"\npath = \"cw.wav\"\n").unwrap();
+
+    let out = manta()
+        .args(["soak", "--duration", "2", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// MAN-74 Decision 3/5: any CLI source-selection flag wins over `[input]`
+/// as a whole -- proven here by pointing `[input]` at a source that would
+/// fail or hang if it were ever touched (a KiwiSDR host that resolves to
+/// nothing) while `--source` supplies a real, working WAV file. If
+/// CLI/file source fields were ever merged per-key instead of whole-table,
+/// this would try to open the bogus Kiwi host instead of decoding the WAV.
+#[test]
+fn any_source_flag_overrides_the_whole_input_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav_path = dir.path().join("cw.wav");
+    write_real_audio_wav(&wav_path, "CQ CQ DE W1AW W1AW K", 3.0);
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[input]\ntype = \"kiwi\"\nhost = \"bogus-nonexistent-host.invalid\"\nfreq_hz = 14025000.0\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--source"])
+        .arg(&wav_path)
+        .args(["--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--source must override [input] wholesale, not attempt the bogus kiwi host; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// MAN-74 Decision 4: `[input]` parses `type = "soapy"`/`"hpsdr"` on every
+/// build regardless of Cargo features -- a build missing the matching
+/// feature must fail at source-OPEN time with a message naming the
+/// required `--features` flag (`open_source_spec`, main.rs), not with an
+/// opaque parse error.
+#[test]
+#[cfg(not(feature = "soapy"))]
+fn a_soapy_input_table_fails_with_a_message_naming_the_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("manta.toml");
+    std::fs::write(
+        &cfg_path,
+        "[input]\ntype = \"soapy\"\ndriver = \"driver=rtlsdr\"\nfreq_hz = 14025000.0\nrate_hz = 192000.0\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--features soapy"),
+        "expected an explanatory error naming the required feature, got: {stderr}"
+    );
+}
+
 #[test]
 #[cfg(feature = "soapy")]
 fn soapy_driver_without_freq_and_rate_is_a_clean_error() {

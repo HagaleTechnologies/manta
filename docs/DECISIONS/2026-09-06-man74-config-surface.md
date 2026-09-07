@@ -212,3 +212,52 @@ scope (promoting `run` to canonical and retiring `listen`).
   follow-up, not silently ignored.
 - ARCHITECTURE §8's band-plan and runtime `cty`/`scp`-path promises (broad
   review R-09) — neither is named by this ticket's own Gherkin scenarios.
+
+## Decision 9 — the `open_source` collapse and `SourceFlags` extraction are deferred, not dropped
+
+The implementation plan's Phase 3/5 refactors — collapsing `open_source`/
+`open_hpsdr_source`/`open_audio_source` (plus the `KiwiOpts`/`SoapyOpts`/
+`HpsdrOpts` flag-bag structs) into one `fn open_source(spec: SourceSpec)`,
+and extracting `Listen`/`Soak`'s near-identical source-flag blocks into one
+`SourceFlags` struct — were reviewed and deliberately **not** performed in
+this remediation round, and are tracked as a follow-up rather than
+silently abandoned (round-2 validation finding: the earlier state left
+both unresolved with no record of the decision either way).
+
+Reasoning: both refactors touch the `#[cfg(feature = "soapy")]`/
+`#[cfg(feature = "hpsdr")]`-gated arms of `main.rs`'s source-opening code —
+exactly the code this repo's own CI/validation environment cannot fully
+exercise (the `soapy` feature leg cannot build here at all: the
+`SoapySDR` system library is absent, per this ticket's own validation
+report). Restructuring that code without being able to compile and test
+the `soapy` feature leg in this environment is a correctness risk with no
+corresponding local verification — the existing two-parallel-paths shape
+(`open_source` for CLI flags, `open_source_spec` for `[input]`) is
+duplicated but independently correct and tested (`cargo test --features
+hpsdr` is green; `open_source_spec`'s own feature-gate error paths are
+covered by `a_soapy_input_table_fails_with_a_message_naming_the_feature`).
+Collapsing them is pure code organization, not a behavior change this
+ticket's Gherkin requires, so it is deferred to a follow-up ticket (to be
+filed against MAN-74's own backlog) rather than risked in an environment
+that cannot build and test one of the two feature legs it would touch.
+
+What *was* fixed in this round instead: the code-review finding that
+motivated re-examining this area — `[input]`'s shared `freq_correction_ppm`
+key used to leak past a CLI source override while its sibling
+`dial_freq_hz` was already correctly suppressed (Decision 5/round-2 C-2).
+Both now use the same `CliOverrides::suppress_file_input_shared_keys`
+condition (`crates/manta-cli/src/config.rs`), so the two shared per-source
+keys behave identically regardless of which parallel source-opening path
+is in effect — the actual reported defect is closed independently of
+whether the two paths are ever unified.
+
+The `--server-config` deprecation warning (Phase 5, `tracing::warn!` in
+the original plan text) **is** implemented, as a raw-argv check
+(`server_config_alias_was_used`, `main.rs`) rather than `tracing::warn!`:
+clap's derive `alias` mechanism has no API to report which spelling of a
+flag the user actually typed, and `tracing`'s subscriber is only
+initialized inside `start_spot_server` (i.e. only when a `[server]` table
+is present) — a plain `eprintln!` on the raw command-line arguments fires
+unconditionally and needs no subscriber, so it covers the deprecated
+spelling on every invocation, not only ones that start the daemon
+servers.
