@@ -697,3 +697,35 @@ async fn a_login_terminated_with_cr_nul_and_no_newline_is_accepted() {
         String::from_utf8_lossy(&rest)
     );
 }
+
+/// MAN-87 review round 2 (C1): the interactive case, not just piped
+/// stdin -- BSD/macOS `telnet(1)`'s `crlf` toggle defaults to FALSE, so
+/// Enter is sent as CR NUL while the client stays interactive (its write
+/// half is never closed). The test above only proves the EOF-after-CR-NUL
+/// case; without this fix the server never finds a line to trim and the
+/// client is dropped by the idle timeout instead of logging in.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_is_accepted_with_the_connection_kept_open() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` here -- an interactive client keeps
+    // its write half open, waiting on the post-login greeting.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+}

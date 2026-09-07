@@ -120,9 +120,23 @@ pub async fn read_line_bounded_with_timeout<R: AsyncBufRead + Unpin>(
 /// (option 10, NAOCRD) and as subnegotiation payload, so scanning raw
 /// bytes would end the line in the middle of a negotiation sequence.
 ///
+/// A bare `\n` is not the only line terminator recognized: RFC 854's NVT
+/// encodes Enter as `CR NUL` too, and that is what BSD/macOS `telnet(1)`
+/// sends by default (`crlf` toggle default FALSE) while keeping the
+/// connection open -- unlike the piped-stdin case, there is no EOF to
+/// fall back on, so without this a line never completes and the client
+/// is eventually dropped by the idle timeout (MAN-87 review round 2, C1).
+///
 /// The length cap counts RAW bytes consumed (`filter.raw_line_bytes`),
 /// not surviving text bytes, so a client streaming endless negotiation
-/// still hits `MAX_LINE_BYTES` instead of reading forever.
+/// still hits `MAX_LINE_BYTES` instead of reading forever. That budget is
+/// released not only when a line completes or a read errors, but also
+/// whenever a read consumes nothing but protocol framing with no
+/// application text pending yet -- otherwise a legitimate client sending
+/// only occasional keepalive negotiation (e.g. `IAC NOP`) would have
+/// `raw_line_bytes` accumulate across its entire session and eventually
+/// trip the cap despite never sending anything resembling a long line
+/// (MAN-87 review round 2, C2).
 ///
 /// Cancellation-safety matches `read_line_bounded`: every byte pulled
 /// off the reader is folded into `buf` and `filter` -- both caller-owned
@@ -143,8 +157,12 @@ pub async fn read_line_bounded_telnet<R: AsyncBufRead + Unpin>(
         for &b in available {
             consumed += 1;
             if let Some(app) = filter.push(b) {
+                let prev = text
+                    .last()
+                    .copied()
+                    .or_else(|| buf.as_bytes().last().copied());
                 text.push(app);
-                if app == b'\n' {
+                if app == b'\n' || (app == 0 && prev == Some(b'\r')) {
                     found_newline = true;
                     break;
                 }
@@ -174,6 +192,14 @@ pub async fn read_line_bounded_telnet<R: AsyncBufRead + Unpin>(
         if found_newline {
             filter.reset_line();
             return Ok(buf.len());
+        }
+        if text.is_empty() && buf.is_empty() {
+            // Nothing is pending for this line yet -- what was just
+            // consumed was pure protocol framing (e.g. a keepalive
+            // `IAC NOP`), not the start of a real line. Releasing the
+            // budget here is what keeps a slow, legitimate keepalive
+            // client from tripping the length cap across its session.
+            filter.reset_line();
         }
     }
 }
@@ -369,6 +395,76 @@ mod tests {
             .await
             .expect_err("must still reject malformed UTF-8");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_accepts_a_cr_nul_terminated_line_with_the_connection_kept_open() {
+        // MAN-87 review round 2 (C1): CR NUL must end a line even when the
+        // client keeps the connection open afterwards (interactive BSD/
+        // macOS telnet(1), `crlf` toggle default FALSE) -- not only when
+        // it is followed by EOF, which is all the piped-stdin case proves.
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        write_half.write_all(b"W5AU\r\0").await.unwrap();
+        tokio::task::yield_now().await;
+
+        let n = {
+            let fut = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(r) => r.expect("must accept the CR NUL terminated line"),
+                std::task::Poll::Pending => {
+                    panic!("must not stall waiting for EOF that never comes")
+                }
+            }
+        };
+        assert_eq!(buf, "W5AU\r\0");
+        assert_eq!(n, 6);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_releases_the_budget_between_keepalives_with_no_line() {
+        // MAN-87 review round 2 (C2): reset_line() previously fired only
+        // on a completed line or an error, so a legitimate client sending
+        // nothing but `IAC NOP` keepalives -- a normal "still listening"
+        // heartbeat -- would accumulate raw_line_bytes across its entire
+        // session and eventually be disconnected with "line exceeds
+        // maximum length", despite never sending anything resembling an
+        // oversized line.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        // More raw framing bytes than MAX_LINE_BYTES in total, delivered
+        // as a slow trickle -- the tiny duplex buffer forces genuinely
+        // separate reads via backpressure. If the budget were never
+        // released between them, this alone would trip the cap before the
+        // real command line is ever reached.
+        let keepalives = MAX_LINE_BYTES / 2 + 50;
+        let writer = tokio::spawn(async move {
+            for _ in 0..keepalives {
+                write_half.write_all(b"\xff\xf1").await.unwrap(); // IAC NOP
+            }
+            write_half.write_all(b"W5AU\n").await.unwrap();
+        });
+
+        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .expect("a slow keepalive client must not trip the length cap");
+        assert_eq!(buf, "W5AU\n");
+        assert_eq!(n, 5);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

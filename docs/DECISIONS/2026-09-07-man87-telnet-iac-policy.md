@@ -87,7 +87,13 @@ against its 1024-byte line budget, irrelevant at the few dozen bytes real
 negotiation occupies. The raw-byte counter lives on `IacFilter` itself
 (`raw_line_bytes`), not in the read function, because it must survive
 `tokio::select!` cancellation mid-line exactly like `cmd_line` does — it's
-the one per-connection value that does.
+the one per-connection value that does. The budget is released not only
+when a line completes or a read errors, but also whenever a read consumes
+nothing but framing with no application text pending yet — otherwise a
+client sending only occasional keepalive negotiation (e.g. `IAC NOP`)
+would have `raw_line_bytes` accumulate across its entire session and
+eventually trip the cap despite never sending anything resembling a long
+line (review round 2, finding C2).
 
 **Negotiation replies are batched and flushed by the caller after the read
 returns, not written from inside `bounded_io`.** Two reasons: the
@@ -114,6 +120,16 @@ reads); reusing it costs one argument and one post-read flush, not a
 redesign.
 
 ## Scenario 2: trim, don't validate
+
+The reader recognizes `CR NUL` as a line terminator alongside `\n`
+(`bounded_io::read_line_bounded_telnet`), not just `\n` followed by EOF.
+RFC 854's NVT encodes Enter as `CR NUL` too, and that is exactly what
+BSD/macOS `telnet(1)` sends by default (`crlf` toggle default FALSE)
+*without* closing the connection afterwards — the piped-stdin case (EOF
+right after `CR NUL`) is a different, easier shape of the same client
+behavior. Recognizing only `\n` handled the piped-stdin shape but left the
+interactive shape stalling forever on a line that never completes, dropped
+only by the 30 s idle timeout (review round 2, finding C1).
 
 `trim_login()` (`crates/manta-server/src/telnet.rs`) strips trailing (and
 leading) CR/NUL/whitespace via
