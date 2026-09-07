@@ -96,15 +96,24 @@ in wiring correctness, not pinned numeric expectations.
 
 **D-102.1 — Peak-hold aggregation, not instantaneous or key-down-mean.**
 `Track::snr_peak_db` (`crates/manta-engine/src/track.rs`) tracks
-`max(current_snr_db)` since the track's last `TrackMeta`, reset once a
-`TrackMeta` is actually emitted for that track (driven by the decoder's real
-emission, not a duplicated hop counter, so the two mechanisms cannot drift
-apart). SPEC §2.3 specifies the *quantity* (`S − F`); this ticket adds the
-aggregation SPEC did not previously pin. **Round-1 review correction:** the
-first landing reset the window once per `drain_pool` call (batch end), not
-at the hop the report actually fired on, which made the reported value
-depend on the caller's chunk size (`decode_samples` batches raw samples at
-4096, `listen`/`soak_metrics` at 2048) — see Remediation below.
+`max(current_snr_db)` since the track's last SPEC §5 reporting boundary,
+reset the instant `drain_pool` processes the hop that boundary falls on —
+keyed to `decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0`, the
+same post-increment expression `TrackDecoder::push_envelope` itself gates
+`TrackMeta` emission on, not to `TrackMeta` actually being emitted. SPEC
+§2.3 specifies the *quantity* (`S − F`); this ticket adds the aggregation
+SPEC did not previously pin. **Round-1 review correction:** the first
+landing reset the window once per `drain_pool` call (batch end), not at the
+hop the report actually fired on, which made the reported value depend on
+the caller's chunk size (`decode_samples` batches raw samples at 4096,
+`listen`/`soak_metrics` at 2048) — see Remediation below. **Round-2 review
+correction:** the round-1 fix keyed the reset to `TrackMeta` actually being
+emitted, which is wrong for a different reason — before `Demod::running()`
+(init/retrying, SPEC §3.2) no `TrackMeta` fires at all, so an emission-keyed
+reset left the peak window unbounded for however long init took instead of
+bounded to one interval. Keying to the boundary expression itself (a hop
+counter, not the emission) fixes that while still landing on the exact hop
+a report fires when one does — see Remediation (round 2) below.
 
 **D-102.2 — Plumb via a `set_snr_2500_db` setter on `TrackDecoder`, mirroring
 the existing `set_freq_hz` precedent.** `manta-decode` has no dependency on
@@ -195,7 +204,10 @@ correctness findings in the first landing, both fixed in this round:
   boundaries. Regression test:
   `track::tests::track_meta_snr_is_invariant_to_process_hops_chunk_size`
   (V1 driven through two `TrackManager`s at 4096- and 2048-sample chunks;
-  every `TrackMeta.snr_2500_db` compares bit-identical).
+  every `TrackMeta.snr_2500_db` compares bit-identical). **Superseded by
+  round 2:** this emission-keyed reset is itself replaced below — it left
+  the window unbounded whenever `push_envelope` never returns a `TrackMeta`
+  at all, i.e. during `!Demod::running()` — see Remediation (round 2).
 - The fallback test's weak assertion (test-coverage finding) was
   tightened: `decoder::tests::track_meta_falls_back_to_the_rail_estimate_when_unset`
   now asserts the emitted value equals `demod.snr_2500_db()` exactly, not
@@ -210,6 +222,59 @@ correctness findings in the first landing, both fixed in this round:
   in the plan's own baseline sweep too) and is out of MAN-102's scope; if
   it needs its own investigation, file it as a new ticket rather than
   tracking it here.
+
+## Remediation (2026-09-07, validate round 2)
+
+`/catalyst-dev:validate-plan` at code-review step FAILed on one CONFIRMED
+correctness finding in the round-1 landing, fixed in this round:
+
+- **Finding 2 — the round-1 fix's emission-keyed reset left the peak window
+  unbounded during `Demod` init.** Round 1 reset `snr_peak_db` "the instant
+  a given push's `TrackDecoder::push_envelope` call actually returns a
+  `TrackMeta`" — correct once the decoder is running, but before
+  `Demod::running()` (init/retrying, SPEC §3.2) `push_envelope` never
+  returns a `TrackMeta` at all, so the peak accumulated across every hop of
+  init with no reset, instead of being bounded to one `META_INTERVAL_HOPS`
+  window. Fixed by keying the reset directly to the boundary expression
+  `TrackDecoder::push_envelope` itself gates emission on —
+  `decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0` — evaluated
+  unconditionally in `drain_pool` after every `push_envelope` call, whether
+  or not that call actually produced a `TrackMeta`. This still lands on the
+  exact hop a report fires when one does, and now also bounds the window
+  during init. `META_INTERVAL_HOPS` (`crates/manta-decode/src/decoder.rs`)
+  and `TrackDecoder::hop_count()` were widened from crate-private to `pub`
+  (the latter re-exported at the `manta_decode` crate root) so
+  `manta-engine` reads the identical boundary expression rather than
+  duplicating the constant or the modulus check, ruling out the two crates'
+  copies drifting apart. Regression test: no new test was needed beyond the
+  existing `track_meta_snr_is_invariant_to_process_hops_chunk_size` (the
+  boundary-keyed and emission-keyed resets coincide once the decoder is
+  running, so that test does not distinguish them) — the init-unbounded
+  case does not currently have scene coverage; see FU-7 below.
+- **Unplanned scope addition surfaced by the same review round:
+  `DecoderEvent::TrackMeta` gained a real `sample_ts` field.** Before this
+  change, `manta_engine::track::event_sample_ts` gave `TrackMeta` no
+  timestamp of its own (implicitly `0`, the same synthetic value
+  `SpeedUpdate` still uses), which sorted every `TrackMeta` ahead of the
+  *entire batch* it was emitted in — including `CharDecoded`/`WordBoundary`
+  events from earlier, real hops in that same batch — letting a
+  just-reset/just-reported SNR value retroactively attach to characters
+  decoded before it, with the magnitude depending on the caller's chunk
+  size (`decode_samples` vs. `listen`, the same class of bug Finding 2/3
+  above fixed for the peak-hold window itself, but in the output ordering
+  rather than the aggregation). `TrackMeta` now carries the hop's real
+  input-stream sample counter (`crates/manta-decode/src/events.rs`), and
+  `event_sample_ts` sorts it like `CharDecoded`/`WordBoundary` instead of at
+  the synthetic `0` — the same treatment `TrackClosed` already gets (via
+  `u64::MAX`) for the analogous problem at the other end of a track's life.
+  This is beyond D3's "nothing about the internal pipeline changes" and
+  beyond the plan as originally written, but it is a genuine ordering
+  correctness fix directly caused by shipping a real `TrackMeta` more often
+  under this ticket's peak-hold change, is now documented normatively in
+  SPEC §5, and does not drop or reorder any other event (global
+  `sort_by_key` stays stable; the only events that can tie on
+  `(sample_ts, track_id)` come from one `push_envelope` call and are
+  already contiguous).
 
 ## Cross-repo proposal — ready to lift into dispensa
 
@@ -246,6 +311,13 @@ from a strict-mode consumer until the schema itself is updated.
   the low end of the measured sweep, shrinking with SNR) against real RBN
   archive spots, and decide then — not now, and not from synthetic AWGN
   vectors alone — whether a correction offset is warranted.
+- **FU-7** — add scene coverage for the round-2 fix specifically: a track
+  that spends more than one `META_INTERVAL_HOPS` window in `!Demod::running()`
+  before its decoder starts, asserting `snr_peak_db` does not carry an
+  unbounded pre-init accumulation into the first real `TrackMeta`. No
+  existing golden vector or characterization scene exercises a long enough
+  pre-running period to distinguish the round-1 (emission-keyed) and
+  round-2 (boundary-keyed) resets from each other.
 
 ## References
 
@@ -253,8 +325,9 @@ from a strict-mode consumer until the schema itself is updated.
 - Governing decision: `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D3
 - Origin of the M0 stand-in: `docs/DECISIONS/2026-07-11-m0-implementation-pins.md` pin 8
 - `crates/manta-decode/src/envelope.rs` — `SNR_BW_CORR_DB` (now `pub`), `Demod::snr_2500_db()` (unchanged)
-- `crates/manta-decode/src/decoder.rs` — `TrackDecoder::set_snr_2500_db`, `push_envelope`'s fallback, `emit_char`'s unchanged `q`
-- `crates/manta-engine/src/track.rs` — `Track::snr_peak_db`, `step_hop`, `spawn`, `drain_pool`
+- `crates/manta-decode/src/decoder.rs` — `TrackDecoder::set_snr_2500_db`, `push_envelope`'s fallback, `emit_char`'s unchanged `q`, `META_INTERVAL_HOPS` and `hop_count()` (now `pub`)
+- `crates/manta-decode/src/events.rs` — `DecoderEvent::TrackMeta.sample_ts` (MAN-102 review round 2)
+- `crates/manta-engine/src/track.rs` — `Track::snr_peak_db`, `step_hop`, `spawn`, `drain_pool`, `event_sample_ts`
 - `crates/manta-engine/tests/snr_calibration.rs` — the calibration bound test and characterization sweep
 - `crates/manta-server/src/rbn.rs` — `RBN_REF_BW_CORRECTION_DB`, `format_line`
 - `crates/manta-server/src/spot_message.rs` — `SNR_REF_HZ`, `SpotMessage::snr_ref_hz`
