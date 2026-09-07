@@ -1482,8 +1482,10 @@ mod tests {
         use clap::CommandFactory as _;
         let literal = ["SPEC", "ARCHITECTURE", "ROADMAP", "Appendix", "\u{a7}"];
         let patterns = [r"\bM[0-4]\b", r"\bMAN-\d+"];
-        let res: Vec<regex::Regex> =
-            patterns.iter().map(|p| regex::Regex::new(p).unwrap()).collect();
+        let res: Vec<regex::Regex> = patterns
+            .iter()
+            .map(|p| regex::Regex::new(p).unwrap())
+            .collect();
 
         let mut out = Vec::new();
         help_strings(&Cli::command(), "manta", &mut out);
@@ -1501,7 +1503,11 @@ mod tests {
                 }
             }
         }
-        assert!(bad.is_empty(), "internal jargon in --help:\n{}", bad.join("\n"));
+        assert!(
+            bad.is_empty(),
+            "internal jargon in --help:\n{}",
+            bad.join("\n")
+        );
     }
 
     /// MAN-135: a flag with no `///` comment renders as a blank line under
@@ -1534,11 +1540,18 @@ mod tests {
     #[test]
     fn every_hz_valued_flag_is_named_hz() {
         use clap::CommandFactory as _;
+        // A frequency-ish name that already carries a DIFFERENT explicit unit
+        // is self-describing and must not be forced to `-hz`:
+        // `--freq-correction-ppm` is parts-per-million, not hertz. Only
+        // unitless frequency/rate names are ambiguous to an operator.
+        const OTHER_UNIT_SUFFIXES: [&str; 1] = ["-ppm"];
         fn walk(cmd: &clap::Command, path: &str, bad: &mut Vec<String>) {
             for a in cmd.get_arguments() {
                 if let Some(long) = a.get_long() {
                     let is_freq_or_rate = long.contains("freq") || long.contains("rate");
-                    if is_freq_or_rate && !long.ends_with("-hz") {
+                    let has_explicit_unit = long.ends_with("-hz")
+                        || OTHER_UNIT_SUFFIXES.iter().any(|s| long.ends_with(s));
+                    if is_freq_or_rate && !has_explicit_unit {
                         bad.push(format!("{path} --{long}"));
                     }
                 }
