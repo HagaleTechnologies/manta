@@ -37,6 +37,9 @@ thoughts/
 # described in tracked files (never pushed, never referenced by name).
 .private/
 
+# Operator config copied from manta.example.toml (see packaging/README.md).
+/manta.toml
+
 # Real-audio corpus kept local-only -- either too big for git history
 # without LFS, or pending confirmed redistribution rights from the source.
 # See crates/manta-testkit/audio-corpus/README.md.

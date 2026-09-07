@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  manta as an unattended macOS LaunchAgent (MAN-75).
+  Install steps, the choice of LaunchAgent over LaunchDaemon, and a known
+  SIGTERM limitation with no plist-level workaround: see packaging/README.md.
+
+  launchd does NOT expand a tilde or $HOME here. Replace YOUR_USERNAME
+  (three places) and YOUR_KIWI_HOST before loading this file.
+
+  (XML forbids a double hyphen inside a comment, so flag names are spelled
+  out in packaging/README.md rather than here.)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hagaletechnologies.manta</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/manta</string>
+        <string>listen</string>
+        <string>--server-config</string>
+        <string>/Users/YOUR_USERNAME/Library/Application Support/manta/manta.toml</string>
+        <string>--kiwi-host</string>
+        <string>YOUR_KIWI_HOST</string>
+        <string>--kiwi-freq</string>
+        <string>14050000</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/manta.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/manta.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

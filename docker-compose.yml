@@ -1,0 +1,69 @@
+# manta as an unattended container (MAN-75). See packaging/README.md.
+#
+#   cp manta.example.toml manta.toml
+#   $EDITOR manta.toml          # set station_callsign
+#   $EDITOR docker-compose.yml  # set the source flags in `command:` below
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down         # honours stop_grace_period below
+#
+# `image:` below only resolves once a real tagged release exists and the
+# GHCR package has had its one-time "make public" step (tracked as MAN-65);
+# until then, comment `image:` out and uncomment `build: .` to build the
+# same image locally from this checkout.
+
+services:
+  manta:
+    image: ghcr.io/hagaletechnologies/manta:latest
+    # build: .
+    container_name: manta
+    restart: unless-stopped
+
+    # manta's drain budget is 25 s for in-flight client writes plus a 2 s
+    # hard runtime cutoff = 27 s worst case. Compose's own default grace
+    # period is 10 s, which truncates a slow client's final spot; 30 s
+    # matches the systemd unit's TimeoutStopSec and the launchd plist's
+    # ExitTimeOut.
+    stop_grace_period: 30s
+
+    # No `stop_signal:` here on purpose. The image already sets
+    # `STOPSIGNAL SIGINT` (Dockerfile), which is the signal manta actually
+    # handles, and Compose uses the image's stop signal when the service
+    # does not override it. Setting `stop_signal: SIGTERM` here would
+    # reintroduce the abrupt kill the Dockerfile fixed.
+
+    # EDIT THIS. Source selection has no TOML equivalent yet (MAN-74), so
+    # the input stays on the command line. KiwiSDR is shown because it is a
+    # plain TCP client that needs no device passthrough and no special
+    # network mode. For HPSDR add --hpsdr-host/--hpsdr-freq/--hpsdr-rate
+    # (the image is built --features hpsdr) and consider network_mode: host
+    # on Linux, since HPSDR is a high-rate UDP flow through the bridge NAT;
+    # note network_mode: host is incompatible with the `ports:` block below.
+    # Rig audio (--device) needs /dev/snd passthrough and is not what a
+    # container is good at.
+    command:
+      - listen
+      - --server-config
+      - /etc/manta/manta.toml
+      - --kiwi-host
+      - kiwi.example.org
+      - --kiwi-freq
+      - "14050000"
+
+    volumes:
+      - ./manta.toml:/etc/manta/manta.toml:ro
+
+    ports:
+      - "7300:7300"
+      - "7301:7301"
+      # 7302 is the unauthenticated Prometheus metrics port -- unlike
+      # 7300/7301 it is NOT meant to be public. Bound to loopback only by
+      # default. Docker's published ports are DNAT'd through the
+      # FORWARD/DOCKER chains, not INPUT, so a host firewall rule on 7302
+      # (docs/RUNBOOKS/network-exposure.md's only prescribed mitigation)
+      # does NOT block it once it's published this way -- widen this past
+      # 127.0.0.1 only if you've separately secured access to it.
+      - "127.0.0.1:7302:7302"
+
+    environment:
+      RUST_LOG: info

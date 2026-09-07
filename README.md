@@ -80,6 +80,20 @@ platform/feature combination the release matrix doesn't cover — the
 binaries since it needs the SoapySDR system library) still works exactly
 as before, and is what the rest of this Quickstart assumes:
 
+## Running unattended
+
+`manta` is a daemon, and the repo ships the files that make it behave like
+one so you do not have to write them:
+
+- [`manta.example.toml`](manta.example.toml) — every config key, at its real
+  built-in default. Copy it, set `station_callsign`, and it starts as-is.
+- [`packaging/systemd/manta.service`](packaging/systemd/manta.service) — Linux
+- [`packaging/launchd/com.hagaletechnologies.manta.plist`](packaging/launchd/com.hagaletechnologies.manta.plist) — macOS
+- [`docker-compose.yml`](docker-compose.yml) — anywhere Docker runs
+
+Install steps, how to swap the source, and how to stop manta cleanly on each
+platform: [`packaging/README.md`](packaging/README.md).
+
 ## Quickstart
 
 Requires Rust 1.85 or newer.
