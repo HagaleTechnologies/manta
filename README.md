@@ -133,7 +133,10 @@ test vectors.
 
 ## Status
 
-Pre-1.0. What exists and what does not:
+**Pre-stability alpha, expect breakage.** `v0.1.0` is the first tagged
+release; manta has not cleared its own M2/M3 acceptance gates (below).
+CLI flags, config keys, and the JSON spot schema can still change without
+a deprecation path before 1.0. What exists and what does not:
 
 - **Done:** single-signal decode from files and live audio (M1); the full
   wideband pipeline of polyphase channelizer, detector, track manager, and
