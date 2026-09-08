@@ -195,6 +195,14 @@ enum Command {
         /// 10 minutes of recording time, so a short looped file yields
         /// roughly one spot per 10 minutes, not one per pass. Combine with
         /// --realtime for a live-paced demo.
+        ///
+        /// REQUIRES --realtime when --server-config is also given: an
+        /// unpaced loop never ends and advances its sample clock ~30-40x
+        /// faster than wall time, so `SpotBus` would keep publishing spots
+        /// stamped ever further into the future to real telnet/JSON
+        /// clients (round-14 review). Enforced below, in the Listen arm,
+        /// rather than by clap, so a plain (non-networked) unpaced loop --
+        /// which publishes to nobody -- keeps working.
         #[arg(long = "loop", requires = "source")]
         loop_replay: bool,
     },
@@ -556,9 +564,7 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening {} to derive its replay identity", path.display()))?;
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
+    let mut hash = FNV_OFFSET_BASIS;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file
@@ -569,8 +575,43 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
         }
         for &byte in &buf[..n] {
             hash ^= byte as u64;
-            hash = hash.wrapping_mul(PRIME);
+            hash = hash.wrapping_mul(FNV_PRIME);
         }
+    }
+    Ok(hash as u128)
+}
+
+/// FNV-1a-64's published constants, shared by the content hash above and
+/// the RF mix-in below so the whole replay identity is one continuous
+/// FNV-1a stream over (recording bytes || effective RF frequency).
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The FULL replay session identity: the recording's content hash mixed
+/// with the RF center frequency the session will actually publish spots
+/// at.
+///
+/// The WAV bytes alone are not the identity of a replay observation
+/// (round-14 review). The RF frequency comes from OUTSIDE the WAV -- the
+/// `<stem>.json` sidecar, or a `--dial-freq-hz` override -- so two copies
+/// of one baseband recording tagged with different `center_freq_hz`
+/// values, or one file replayed twice at two different dial frequencies,
+/// hashed identically. Every other spot-`id` input (station, track id,
+/// sample timestamp, callsign) is identical across those runs too, so the
+/// ids collided outright while describing genuinely different RF
+/// observations -- and `SpotMessage`'s own docs note that cqdx keys on
+/// that id and may overwrite or drop a collision.
+///
+/// Takes the EFFECTIVE frequency -- read off the fully-wrapped source, so
+/// a `--dial-freq-hz` override is what gets mixed in, exactly as it is
+/// what gets published -- and mixes its IEEE-754 bits, which keeps the
+/// value deterministic across builds and machines just like the byte
+/// stream it continues.
+fn session_nonce_for_replay(path: &std::path::Path, center_freq_hz: f64) -> Result<u128> {
+    let mut hash = session_nonce_for_replay_path(path)? as u64;
+    for &byte in &center_freq_hz.to_bits().to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     Ok(hash as u128)
 }
@@ -1082,6 +1123,28 @@ fn main() -> Result<()> {
                 );
             }
 
+            // An unpaced loop is unbounded in BOTH directions: it never
+            // reaches EOF, and its sample clock runs ~30-40x faster than
+            // wall time. `Dedupe` releases a repeat spot every 600 s of
+            // that simulated time, and `SpotBus::unix_ts_for` adds
+            // `sample_ts` to the fixed replay epoch -- so a networked
+            // unpaced loop publishes spots timestamped progressively
+            // further into the future, forever, to real clients that have
+            // no way to tell them from current observations. Paced
+            // (`--realtime`) looping keeps simulated and wall time
+            // together, so it stays truthful. Checked here, alongside the
+            // --dial-freq-hz gate and ahead of all file I/O, so this stays
+            // a flag error rather than a file error (round-14 review).
+            if loop_replay && server_config.is_some() && !realtime {
+                bail!(
+                    "--loop with --server-config also requires --realtime -- an unpaced loop \
+                     advances its sample clock ~30-40x faster than wall time and never ends, so \
+                     telnet/JSON clients would receive spots timestamped progressively further \
+                     into the future. Add --realtime for a live-paced looping demo, or drop \
+                     --server-config to loop without publishing to clients"
+                );
+            }
+
             let kiwi = KiwiOpts {
                 host: kiwi_host,
                 port: kiwi_port,
@@ -1185,7 +1248,17 @@ fn main() -> Result<()> {
                     // either).
                     let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
                     let session_nonce: u128 = match &replay_path {
-                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                        // The EFFECTIVE center frequency, read off the
+                        // fully-wrapped `src` (so a --dial-freq-hz
+                        // override counts), is part of the replay
+                        // identity -- it comes from the sidecar or the
+                        // flag, never from the WAV bytes, so hashing the
+                        // bytes alone collided two different RF
+                        // observations onto one spot id (round-14
+                        // review).
+                        Some(replay_path) => {
+                            session_nonce_for_replay(replay_path, src.center_freq_hz())?
+                        }
                         // Live session: `epoch` above is already SystemTime::now().
                         None => epoch
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1631,6 +1704,39 @@ mod tests {
             a, b,
             "two different recordings must not collide on the same replay session nonce"
         );
+    }
+
+    // Round-14 review: the RF frequency a replay session publishes at comes
+    // from the sidecar or --dial-freq-hz, never from the WAV bytes, so the
+    // content hash alone let two genuinely different RF observations of the
+    // same recording collide on every JSON spot id.
+    #[test]
+    fn session_nonce_for_replay_separates_the_same_recording_at_different_frequencies() {
+        let f = write_temp_file(b"one recording, two dial frequencies");
+        let a = session_nonce_for_replay(f.path(), 14_027_000.0).unwrap();
+        let b = session_nonce_for_replay(f.path(), 7_027_000.0).unwrap();
+        assert_ne!(
+            a, b,
+            "the same recording replayed at two RF frequencies must not share a session nonce"
+        );
+    }
+
+    #[test]
+    fn session_nonce_for_replay_is_deterministic_for_the_same_recording_and_frequency() {
+        let f = write_temp_file(b"one recording, one dial frequency");
+        assert_eq!(
+            session_nonce_for_replay(f.path(), 14_027_000.0).unwrap(),
+            session_nonce_for_replay(f.path(), 14_027_000.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn session_nonce_for_replay_still_separates_different_recordings_at_one_frequency() {
+        let a = session_nonce_for_replay(write_temp_file(b"contest weekend").path(), 14_027_000.0)
+            .unwrap();
+        let b = session_nonce_for_replay(write_temp_file(b"quiet weeknight").path(), 14_027_000.0)
+            .unwrap();
+        assert_ne!(a, b);
     }
 
     // MAN-32/MAN-42: start_spot_server spawns one RBN uplink task per

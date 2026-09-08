@@ -10,9 +10,13 @@ sources:
   - crates/manta-input/src/pace.rs
   - crates/manta-input/src/replay.rs
   - docs/DECISIONS/2026-09-07-man121-hardware-free-replay.md
-verified:
-  commit: 49f05a4
-  date: 2026-09-07
+# `verified:` is deliberately UNSET. The only revision this page could
+# have cited when it was written (49f05a4) predates the page itself and
+# every module it describes -- `pace.rs`, `replay.rs`, `open_replay_wav` --
+# so recording it would have made the provenance marker actively
+# misleading to a maintainer reading this field (MAN-121 review). Set it
+# in a later pass, against a revision that actually contains the behaviour
+# described below.
 links:
   - spot-output-contract
 ---
@@ -32,8 +36,14 @@ quickstart told you to point it at.
 
 Note also that "rate-agnostic" means *any channelizer rate*, not any rate
 at all: `fs / 93.75` must be a power of two (12/24/48/96/192/384 kHz and
-so on). A 44.1 kHz or 100 kHz IQ WAV is still rejected, by
-`Channelizer::new`, not by the reader.
+so on). A 44.1 kHz or 100 kHz IQ WAV is still rejected —
+now by `open_replay_wav` itself, up front. It used to be rejected only
+later, by `Channelizer::new`, and `manta_engine::listen` sizes a
+two-second complex calibration buffer from `sample_rate()` *before* that
+check runs, so a malformed header claiming a rate near `u32::MAX` asked
+the allocator for tens of GiB and aborted the process instead of printing
+the unsupported-rate error (MAN-121 review). `Channelizer::supports_rate`
+is the shared predicate.
 
 ## The fix: dispatch on channel count, with a rate-and-sidecar tie-break at 48 kHz
 
@@ -102,7 +112,12 @@ wants full-speed drain. `--loop` (`LoopingWavSource`,
 `crates/manta-input/src/replay.rs`) reopens the file at EOF for a
 demo left running; combined with the 600 s spot-dedupe window, a short
 looped file yields roughly one spot per 10 minutes, not one per pass — by
-design, not a bug to chase.
+design, not a bug to chase. `--loop` **requires** `--realtime` when
+`--server-config` is given: an unpaced loop never ends and runs its sample
+clock ~30–40× faster than wall time, and `SpotBus::unix_ts_for` adds that
+runaway `sample_ts` to the fixed replay epoch, so clients would receive
+spots timestamped ever further into the future. Looping without
+`--server-config` (nobody to publish to) stays unrestricted.
 
 ## Gotcha: `SpotBus`'s live channel has no history for late subscribers
 

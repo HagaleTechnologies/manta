@@ -12,19 +12,48 @@ fn manta() -> Command {
     Command::new(env!("CARGO_BIN_EXE_manta"))
 }
 
-/// Ask the OS for a free port, then release it. There is no way to learn a
-/// port the CLI assigned itself -- `start_spot_server` binds from the TOML,
-/// not from an OS-assigned `:0` the caller could read back -- so the port
-/// must be chosen before the child starts. The bind-then-release race is
-/// negligible on a CI runner: the connect-with-retry loop below tolerates
-/// the child taking a moment to bind, and a stolen port would fail loudly
-/// (a connect timeout) rather than silently.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Ephemeral ports HELD by their own listeners until the child is about to
+/// start. There is no way to learn a port the CLI assigned itself --
+/// `start_spot_server` binds from the TOML, not from an OS-assigned `:0`
+/// the caller could read back -- so the ports must be chosen before the
+/// child starts.
+///
+/// Reserving all of them at once and releasing them together is what makes
+/// the three DISTINCT (round-14 review): binding and immediately releasing
+/// one port at a time let the OS hand the very same port back for the next
+/// call, and `cargo test --workspace` runs these two tests in parallel with
+/// each other and with the rest of the suite. A duplicate port makes one of
+/// `start_spot_server`'s three required binds fail, which the connect
+/// retry loop below cannot repair -- it just spends the whole 40 s deadline
+/// and reports a timeout, i.e. a flake in a required acceptance test.
+///
+/// The residual bind-then-release window (release -> child bind) is
+/// unavoidable without a `:0`-and-report-back mode in the CLI, but it is
+/// now a few milliseconds wide and, when it does lose, fails loudly via
+/// `connect_with_retry`'s child-exit check rather than silently.
+struct ReservedPorts(Vec<TcpListener>);
+
+impl ReservedPorts {
+    fn reserve(n: usize) -> Self {
+        ReservedPorts(
+            (0..n)
+                .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+                .collect(),
+        )
+    }
+
+    fn ports(&self) -> Vec<u16> {
+        self.0
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect()
+    }
+
+    /// Hand the ports back to the OS, immediately before spawning the child
+    /// that binds them.
+    fn release(self) {
+        drop(self.0);
+    }
 }
 
 struct KillOnDrop(Child);
@@ -52,11 +81,23 @@ fn spawn_listen(wav: &std::path::Path, server_toml: &std::path::Path) -> KillOnD
     KillOnDrop(child)
 }
 
-fn connect_with_retry(port: u16, deadline: Instant) -> TcpStream {
+fn connect_with_retry(child: &mut Child, port: u16, deadline: Instant) -> TcpStream {
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => return s,
             Err(e) => {
+                // A bind failure in the child (a port lost between release
+                // and spawn, a bad config) is terminal: retrying cannot
+                // repair it, and without this check the test burns its
+                // whole deadline before reporting a bare connect timeout
+                // that says nothing about the real cause (round-14
+                // review).
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!(
+                        "manta exited with {status} before 127.0.0.1:{port} accepted a \
+                         connection (last connect error: {e}) -- it most likely failed to bind"
+                    );
+                }
                 if Instant::now() >= deadline {
                     panic!("could not connect to 127.0.0.1:{port} within deadline: {e}");
                 }
@@ -139,15 +180,16 @@ fn a_stock_telnet_client_receives_a_well_formed_rbn_spot_from_gen_output() {
     let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
     let wav = dir.path().join("v1.wav");
 
-    let telnet_port = free_port();
-    let json_port = free_port();
-    let metrics_port = free_port();
+    let reserved = ReservedPorts::reserve(3);
+    let ports = reserved.ports();
+    let (telnet_port, json_port, metrics_port) = (ports[0], ports[1], ports[2]);
     let server_toml = write_server_toml(dir.path(), telnet_port, json_port, metrics_port);
+    reserved.release();
 
     let mut child = spawn_listen(&wav, &server_toml);
 
     let deadline = Instant::now() + Duration::from_secs(SPOT_WAIT_DEADLINE_S);
-    let stream = connect_with_retry(telnet_port, deadline);
+    let stream = connect_with_retry(&mut child.0, telnet_port, deadline);
     let mut reader = BufReader::new(stream);
 
     wait_for_line_containing(&mut reader, "login", deadline);
@@ -181,15 +223,16 @@ fn a_json_lines_client_receives_the_same_spot() {
     let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
     let wav = dir.path().join("v1.wav");
 
-    let telnet_port = free_port();
-    let json_port = free_port();
-    let metrics_port = free_port();
+    let reserved = ReservedPorts::reserve(3);
+    let ports = reserved.ports();
+    let (telnet_port, json_port, metrics_port) = (ports[0], ports[1], ports[2]);
     let server_toml = write_server_toml(dir.path(), telnet_port, json_port, metrics_port);
+    reserved.release();
 
-    let _child = spawn_listen(&wav, &server_toml);
+    let mut child = spawn_listen(&wav, &server_toml);
 
     let deadline = Instant::now() + Duration::from_secs(SPOT_WAIT_DEADLINE_S);
-    let stream = connect_with_retry(json_port, deadline);
+    let stream = connect_with_retry(&mut child.0, json_port, deadline);
     stream
         .set_read_timeout(Some(Duration::from_secs(SPOT_WAIT_DEADLINE_S)))
         .unwrap();

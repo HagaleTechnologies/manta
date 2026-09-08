@@ -133,7 +133,7 @@ manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
 
 | Source | How | Status |
 | --- | --- | --- |
-| IQ / audio WAV file | `decode`, `listen --source` | Working -- `listen --source` takes a 2-channel IQ WAV (what `decode`/`gen` use, sidecar-aware; any channelizer rate other than 48 kHz, or 48 kHz with a `<stem>.json` sidecar) or a 48 kHz mono/stereo rig-audio WAV (48 kHz stereo with no sidecar downmixes like mono); add `--realtime`/`--loop` to pace or repeat file replay. A "channelizer rate" is any `fs` where `fs / 93.75` is a power of two -- 12/24/48/96/192/384 kHz and so on, not 44.1 or 100 kHz |
+| IQ / audio WAV file | `decode`, `listen --source` | Working -- `listen --source` takes a 2-channel IQ WAV (what `decode`/`gen` use, sidecar-aware; any channelizer rate other than 48 kHz, or 48 kHz with a `<stem>.json` sidecar) or a 48 kHz mono/stereo rig-audio WAV (48 kHz stereo with no sidecar downmixes like mono); add `--realtime`/`--loop` to pace or repeat file replay (`--loop` requires `--realtime` when `--server-config` is given, so looped spots aren't published with runaway future timestamps). A "channelizer rate" is any `fs` where `fs / 93.75` is a power of two -- 12/24/48/96/192/384 kHz and so on, not 44.1 or 100 kHz |
 | Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` | Working |
 | RTL-SDR, Airspy, SDRplay, HackRF, and anything else SoapySDR drives | `listen --soapy-driver`, feature `soapy` | Working, needs hardware soak |

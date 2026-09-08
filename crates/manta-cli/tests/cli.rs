@@ -313,6 +313,64 @@ fn loop_requires_source() {
     assert!(stderr.contains("--source <SOURCE>"), "stderr: {stderr}");
 }
 
+/// Round-14 review: an unpaced `--loop` never ends and advances its sample
+/// clock ~30-40x faster than wall time, so a networked one would publish
+/// spots timestamped ever further into the future to real clients. Like the
+/// --dial-freq-hz gate, it is a flag error checked ahead of all file I/O,
+/// so nonexistent paths still provoke exactly this message.
+#[test]
+fn loop_with_server_config_but_no_realtime_is_a_clean_error() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+            "--dial-freq-hz",
+            "14027000",
+            "--loop",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure for a networked unpaced loop"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--realtime"), "stderr: {stderr}");
+}
+
+/// The same combination WITH --realtime passes the flag gate -- it must
+/// fail on the missing file instead, proving the gate above is about
+/// pacing and not about `--loop` plus `--server-config` as such.
+#[test]
+fn loop_with_server_config_and_realtime_passes_the_flag_gate() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+            "--dial-freq-hz",
+            "14027000",
+            "--loop",
+            "--realtime",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("also requires --realtime"),
+        "the pacing gate must not fire when --realtime is given: {stderr}"
+    );
+    assert!(
+        stderr.contains("/nonexistent.wav"),
+        "expected the missing-file error instead: {stderr}"
+    );
+}
+
 #[test]
 fn dial_freq_hz_rejects_non_finite_and_non_positive_values() {
     for bad in ["nan", "inf", "-inf", "0", "-14027000"] {

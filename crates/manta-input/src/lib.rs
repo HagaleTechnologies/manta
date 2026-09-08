@@ -152,6 +152,11 @@ impl IqSource for WavIqSource {
 /// 48 kHz 2-channel file keeps its pre-MAN-121 `AudioIqSource` downmix
 /// path rather than being silently misread as `Complex32::new(I, Q)`.
 ///
+/// The IQ branch additionally rejects any rate the channelizer can't
+/// accept (`fs/93.75` not a power of two), because it is the branch that
+/// adopts the FILE's own rate -- see the guard's own comment for why that
+/// has to happen here rather than in `manta_engine::listen`.
+///
 /// The tie-break asks `replay_wav_has_iq_sidecar` -- "is there a parseable
 /// IQ sidecar?" -- and deliberately NOT `replay_wav_center_freq_hz`, which
 /// answers the separate question "does that sidecar declare an RF
@@ -168,6 +173,24 @@ pub fn open_replay_wav(path: &Path) -> Result<Box<dyn IqSource>> {
     let is_iq = spec.channels == 2
         && (spec.sample_rate != TARGET_RATE_HZ || replay_wav_has_iq_sidecar(path));
     if is_iq {
+        // The IQ path is the one that adopts the FILE's own rate, so it is
+        // also the one that must bound it. `manta_engine::listen` sizes a
+        // `CALIBRATION_SECONDS * fs` complex buffer from `sample_rate()`
+        // and only THEN calls `Channelizer::new` to validate the rate, so
+        // a malformed 2-channel header claiming a rate near `u32::MAX`
+        // would ask for tens of GiB and abort the process instead of
+        // reporting the documented unsupported-rate error. Reject it here,
+        // before the source is ever handed to the engine (MAN-121 review).
+        // `AudioIqSource` needs no equivalent guard -- it already accepts
+        // exactly `TARGET_RATE_HZ` and nothing else.
+        let fs = spec.sample_rate as f64;
+        if !manta_dsp::channelizer::Channelizer::supports_rate(fs) {
+            bail!(
+                "unsupported sample rate {fs} in {}: an IQ replay WAV must use a channelizer \
+                 rate (fs/93.75 a power of two -- 12/24/48/96/192/384 kHz and so on)",
+                path.display()
+            );
+        }
         Ok(Box::new(WavIqSource::open(path)?))
     } else {
         Ok(Box::new(AudioIqSource::from_wav_file(path)?))
@@ -424,6 +447,44 @@ mod tests {
         assert_eq!(src.center_freq_hz(), 14_000_000.0);
         let all = read_all(&mut *src).unwrap();
         assert_eq!(all, samples());
+    }
+
+    // MAN-121 review: an unsupported IQ rate must be rejected HERE, not
+    // deep inside `manta_engine::listen`, which sizes a two-second complex
+    // calibration buffer from `sample_rate()` before `Channelizer::new`
+    // ever validates it -- a header claiming a rate near `u32::MAX` would
+    // request tens of GiB and abort the process instead of reporting this
+    // error. 100 kHz is the smallest realistic case of the same class:
+    // 100000 / 93.75 = 1066.67, not a power of two.
+    #[test]
+    fn open_replay_wav_rejects_an_iq_file_at_an_unsupported_channelizer_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("odd.wav");
+        write_f32_wav(&wav, &samples(), 100_000);
+
+        // `Box<dyn IqSource>` isn't `Debug`, so `unwrap_err` is unavailable.
+        let err = match open_replay_wav(&wav) {
+            Ok(_) => panic!("expected an unsupported-rate error, got a source"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("unsupported sample rate"),
+            "expected an unsupported-rate error, got: {err}"
+        );
+    }
+
+    // The pathological case the guard above exists for, stated exactly: a
+    // 2-channel header claiming 200 MS/s. `listen` would have asked for
+    // 2 * 2e8 complex samples (~3.2 GiB) before validating the rate. (Not
+    // literally `u32::MAX`, which `hound`'s own writer can't even encode
+    // -- its byte-rate field overflows -- but the same class of header.)
+    #[test]
+    fn open_replay_wav_rejects_an_absurd_iq_sample_rate_before_any_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("huge.wav");
+        write_f32_wav(&wav, &samples(), 200_000_000);
+
+        assert!(open_replay_wav(&wav).is_err());
     }
 
     // Round-2 review: format detection and RF-frequency validation are

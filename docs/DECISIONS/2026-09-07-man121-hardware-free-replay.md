@@ -148,6 +148,19 @@ station every time it repeats CQ) and is not special-cased away. It's
 stated in the flag's own `--help` text instead of "fixed," since fixing it
 would mean weakening dedupe, an unrelated and unwanted change.
 
+**Amendment (round-14 review): `--loop` requires `--realtime` when
+`--server-config` is given.** An unpaced loop is unbounded in both
+directions -- it never reaches EOF, and its sample clock advances ~30-40x
+faster than wall time. `Dedupe` therefore releases another spot every 600 s
+of *simulated* time while `SpotBus::unix_ts_for` adds that runaway
+`sample_ts` to the fixed replay epoch, so a networked unpaced loop
+publishes an endless series of spots stamped progressively further into the
+future -- to real telnet/JSON clients that have no way to distinguish them
+from current observations. Rejected at startup, next to the `--dial-freq-hz`
+gate and ahead of all file I/O, so it stays a flag error rather than a file
+error. Looping *without* `--server-config` is unrestricted: it publishes to
+nobody, and the local event stream is sample-relative.
+
 ## Decision 5 — the M3 README demo needs `sh/dx`, not just perfect timing
 
 Measured empirically while writing the README's Quickstart update: with

@@ -73,7 +73,12 @@ mod tests {
         let samples: Vec<Complex32> = (0..10)
             .map(|i| Complex32::new(i as f32, -(i as f32)))
             .collect();
-        write_f32_wav(&wav, &samples, 8000);
+        // 96 kHz, not an arbitrary rate: `open_replay_wav` now rejects an
+        // IQ WAV whose rate the channelizer can't accept (MAN-121 review),
+        // and 48 kHz would take the sidecarless-stereo tie-break down the
+        // AudioIqSource path instead. This test is about loop-past-EOF
+        // semantics, not rate.
+        write_f32_wav(&wav, &samples, 96_000);
 
         let mut src = LoopingWavSource::new(wav).unwrap();
         let mut buf = vec![Complex32::new(0.0, 0.0); 10];

@@ -39,6 +39,15 @@ pub fn listen(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
+    // Built BEFORE the calibration buffer is sized, not after: `calib_n`
+    // is derived from `fs`, so a source reporting an unsupported rate --
+    // in the extreme, a malformed WAV header claiming a rate near
+    // `u32::MAX` -- used to allocate tens of GiB and abort the process
+    // before this rate check could return its error (MAN-121 review).
+    // Same fail-fast rationale as the config validation above.
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
@@ -49,8 +58,6 @@ pub fn listen(
         }
         filled += n;
     }
-    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
     let mut tm = crate::track::TrackManager::new(
         ch.n_channels(),
