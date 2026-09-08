@@ -1,15 +1,37 @@
 //! `SpotMessage` -- the JSON Lines wire shape for manta's `:7301` stream.
 //! Field names/types mirror dispensa's `contracts/spots/spots.v1.schema.json`
-//! (ADR-0011): required fields manta cannot resolve from data it actually
-//! has (`dxDxcc`/`deDxcc` -- an ADIF DXCC entity-number table isn't
-//! vendored here) are serialized as JSON `null` rather than a fabricated
-//! placeholder value. `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` (and the
-//! `de*` counterparts) ARE resolved, from the same vendored `cty.dat` the
+//! (ADR-0011). `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are
+//! ALL required and non-nullable on that contract -- see
+//! docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md.
+//! `dxDxcc`/`deDxcc` are resolved from the vendored `dxcc.tsv` ADIF entity-
+//! number table (MAN-136); `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` (and the
+//! `de*` counterparts) are resolved from the same vendored `cty.dat` the
 //! validator already trusts for the plausibility gate (`manta_spot::cty`).
+//! When a callsign isn't cty-resolvable, each required field gets a named
+//! out-of-domain `UNKNOWN_*` sentinel below rather than a fabricated-looking
+//! real value or (where the contract forbids it) `null`.
 
 use manta_spot::cty;
 use manta_spot::Spot;
 use serde::Serialize;
+
+/// Emitted for `dxDxcc`/`deDxcc` when `cty.lookup` cannot resolve the
+/// callsign. Deliberately NEGATIVE: ADIF entity codes run 1-522, and ADIF
+/// code 0 already has a specific different meaning -- "None: the contacted
+/// station is known to NOT be within a DXCC entity" -- which would be a false
+/// positive claim about a call manta merely failed to resolve. dispensa's
+/// spots.v1 declares this field required and non-nullable, so `null` is not
+/// available. See docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md.
+pub const UNKNOWN_DXCC: i64 = -1;
+
+/// Emitted for `dxContinent`/`deContinent` when `cty.lookup` cannot resolve
+/// the callsign. Outside the field's real domain -- the seven two-letter
+/// continent codes -- so it reads as "unknown", never as geography.
+pub const UNKNOWN_CONTINENT: &str = "";
+
+/// Emitted for `dxCqZone` when `cty.lookup` cannot resolve the callsign.
+/// Real CQ zones are 1-40, so 0 is unambiguously "unknown".
+pub const UNKNOWN_CQ_ZONE: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,14 +47,14 @@ pub struct SpotMessage {
     pub dx_grid: Option<String>,
     pub dx_lat: Option<f64>,
     pub dx_lon: Option<f64>,
-    pub dx_dxcc: Option<i64>,
+    pub dx_dxcc: i64,
     pub dx_continent: String,
     pub dx_cq_zone: u16,
     pub de_call: String,
     pub de_grid: Option<String>,
     pub de_lat: Option<f64>,
     pub de_lon: Option<f64>,
-    pub de_dxcc: Option<i64>,
+    pub de_dxcc: i64,
     pub de_continent: String,
     pub snr: Option<i32>,
     pub wpm: Option<i32>,
@@ -65,20 +87,22 @@ impl SpotMessage {
         unix_ts_secs: i64,
         session_nonce: u128,
     ) -> Self {
-        // Falls back to empty-string/zero when `dx_call` isn't
-        // cty-allocated. Reachable in practice, not just a defensive
-        // fallback: MAN-28's Watch List lets an operator allowlist a call
-        // that bypasses `cty.is_allocated()` entirely (e.g. a deliberately
-        // unallocated or malformed test callsign), so `Validator` can emit
-        // a spot for a callsign `cty.lookup` genuinely can't resolve.
-        // dxContinent/dxCqZone (and their de* counterparts) are REQUIRED,
-        // non-nullable fields on dispensa's spots.v1 wire contract, unlike
-        // dxDxcc/deDxcc (declared nullable there) -- there is currently no
-        // contract-defined "unknown" representation for these two fields,
-        // so this fallback stays a real (if honestly imperfect) value
-        // rather than null, which the contract would reject outright. See
-        // the follow-up ticket linked from this PR's round-6 review thread
-        // for the cross-repo contract question this raises.
+        // Falls back to the UNKNOWN_* sentinels above when the callsign
+        // isn't cty-allocated. Reachable in practice, not defensive: MAN-28's
+        // Watch List lets an operator allowlist a call that bypasses
+        // `cty.is_allocated()` entirely (validator.rs:669-680), so
+        // `Validator` can emit a spot for a callsign `cty.lookup` genuinely
+        // can't resolve.
+        //
+        // MAN-136 / broad-review D10: dxDxcc, deDxcc, dxContinent, deContinent
+        // and dxCqZone are ALL required and non-nullable on dispensa's
+        // spots.v1 contract -- emitting JSON `null` for any of them fails
+        // cqdx's ingest rather than satisfying it. So each has a named,
+        // out-of-domain sentinel instead. `dxLat`/`dxLon` ARE nullable on the
+        // contract and DO serialize as `null` here, which is the one
+        // contract-defined "geography unknown" signal a consumer can key on
+        // today. Occurrences are counted as
+        // `manta_spots_unresolved_geography_total` (main.rs, at publish).
         let dx = cty.lookup(&spot.callsign);
         let de = cty.lookup(station_call);
         // `band` must be derived from the SAME rounded value reported as
@@ -105,15 +129,25 @@ impl SpotMessage {
             dx_grid: None,
             dx_lat: dx.map(|e| e.lat),
             dx_lon: dx.map(|e| e.lon),
-            dx_dxcc: None,
-            dx_continent: dx.map(|e| e.continent.clone()).unwrap_or_default(),
-            dx_cq_zone: dx.map(|e| e.cq_zone).unwrap_or(0),
+            dx_dxcc: dx
+                .and_then(|e| e.dxcc)
+                .map(i64::from)
+                .unwrap_or(UNKNOWN_DXCC),
+            dx_continent: dx
+                .map(|e| e.continent.clone())
+                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
+            dx_cq_zone: dx.map(|e| e.cq_zone).unwrap_or(UNKNOWN_CQ_ZONE),
             de_call: station_call.to_string(),
             de_grid: None,
             de_lat: de.map(|e| e.lat),
             de_lon: de.map(|e| e.lon),
-            de_dxcc: None,
-            de_continent: de.map(|e| e.continent.clone()).unwrap_or_default(),
+            de_dxcc: de
+                .and_then(|e| e.dxcc)
+                .map(i64::from)
+                .unwrap_or(UNKNOWN_DXCC),
+            de_continent: de
+                .map(|e| e.continent.clone())
+                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
             snr: Some(spot.snr_db.round() as i32),
             wpm: Some(spot.wpm.round() as i32),
             decode_confidence: Some(spot.confidence),
@@ -207,20 +241,72 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(msg.de_continent, "NA");
     }
 
+    /// MAN-136 scenario 1: dispensa's spots.v1 declares dxDxcc REQUIRED and
+    /// non-nullable; manta used to emit `null` for EVERY spot, including ones
+    /// whose callsign cty.dat resolves fine -- cqdx's ingest would reject the
+    /// batch on this field alone. CTY_FIXTURE's entities carry the real primary
+    /// prefixes `JA` and `K`, so the real vendored dxcc.tsv resolves them.
     #[test]
-    fn dxcc_entity_numbers_are_null_not_fabricated() {
+    fn a_resolvable_callsign_carries_its_real_adif_dxcc_entity_number() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let msg = SpotMessage::from_spot(
-            &sample_spot(),
-            "W3XYZ",
-            &cty,
-            "manta-0.1.0",
-            0,
-            1_699_999_000,
-        );
+        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ", &cty, "manta-0.1.0", 0, 0);
 
-        assert_eq!(msg.dx_dxcc, None);
-        assert_eq!(msg.de_dxcc, None);
+        assert_eq!(msg.dx_dxcc, 339, "JA1ABC -> Japan");
+        assert_eq!(msg.de_dxcc, 291, "W3XYZ -> United States");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["dxDxcc"], 339);
+        assert_eq!(json["deDxcc"], 291);
+        assert!(!json["dxDxcc"].is_null(), "the whole point of MAN-136");
+    }
+
+    /// MAN-136 scenario 2 (also MAN-45 finding 1): MAN-28's Watch List allowlist
+    /// (validator.rs:669-680) lets an operator emit a spot for a call cty.lookup
+    /// genuinely cannot resolve. All three required geography fields must then
+    /// carry a named, out-of-domain sentinel -- never a fabricated-looking value,
+    /// and never null.
+    ///
+    /// Uses the REAL vendored cty.dat, not CTY_FIXTURE: a call that is
+    /// unallocated in a 2-entity fixture is usually allocated in the real file
+    /// (ZZ9ZZZ -> Brazil/108 via ZZ; NOCALL -> US/291 via N). ITU allocates no Q
+    /// prefixes, so QQ1AAA is genuinely unresolvable.
+    #[test]
+    fn an_unresolvable_callsign_emits_named_out_of_domain_sentinels() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let mut spot = sample_spot();
+        spot.callsign = "QQ1AAA".to_string();
+        assert!(cty.lookup(&spot.callsign).is_none(), "test premise");
+
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+
+        assert_eq!(msg.dx_dxcc, UNKNOWN_DXCC);
+        assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT);
+        assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE);
+        // Each sentinel must be outside its field's real domain. UNKNOWN_DXCC's
+        // own doc comment covers why it's negative and not 0 (ADIF 0 means
+        // "confirmed not in any entity") -- both are constant properties, not
+        // something to assert at runtime here.
+        assert!(!(1..=40).contains(&msg.dx_cq_zone));
+        assert!(msg.dx_continent.len() != 2);
+        // The contract-legal unknown signal consumers can key on today.
+        assert!(msg.dx_lat.is_none());
+        assert!(msg.dx_lon.is_none());
+        // The station's own call still resolves -- de geography is unaffected.
+        assert_eq!(msg.de_dxcc, 291);
+        assert_eq!(msg.de_continent, "NA");
+    }
+
+    /// The de side gets the same treatment: `station_callsign` is operator config
+    /// and is not required to be cty-resolvable.
+    #[test]
+    fn an_unresolvable_station_callsign_also_gets_the_sentinels() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let msg = SpotMessage::from_spot(&sample_spot(), "QQ1AAA", &cty, "manta-0.1.0", 0, 0);
+
+        assert_eq!(msg.de_dxcc, UNKNOWN_DXCC);
+        assert_eq!(msg.de_continent, UNKNOWN_CONTINENT);
+        assert!(msg.de_lat.is_none());
+        // dx geography is unaffected.
+        assert_eq!(msg.dx_dxcc, 339);
     }
 
     #[test]
@@ -321,6 +407,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         ] {
             assert!(json.get(key).is_some(), "missing key: {key}");
         }
-        assert_eq!(json["dxDxcc"], serde_json::Value::Null);
+        assert_eq!(json["dxDxcc"], 339);
+        assert!(!json["dxDxcc"].is_null());
     }
 }

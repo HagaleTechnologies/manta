@@ -7,8 +7,8 @@ maintainer: agent
 sources:
   - ARCHITECTURE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: 01d1ea1
+  date: 2026-09-07
 links:
   - decode-chain
   - spot-output-contract
@@ -22,6 +22,7 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 - Repetition requirement (a call must decode more than once within a window before first spot) is the main garble filter: §6.4.
 - Dedupe key = (callsign, freq bucket) with a re-spot suppression window unless SNR improves or type changes: §6.5.
 - `Validator::tracks`/`RepetitionGate::seen` are per-track_id state that must be freed on `DecoderEvent::TrackClosed` — the normative teardown contract (a real, measured leak this bug produced) lives in `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`, not here.
+- An operator-allowlisted callsign (MAN-28's Watch List) can bypass the cty.dat prefix gate entirely, so a spot can reach [[spot-output-contract]] for a call cty.dat genuinely can't resolve — see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md` for what manta emits in that case.
 
 ## Why it is shaped this way
 
