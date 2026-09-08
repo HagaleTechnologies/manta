@@ -45,6 +45,16 @@ the allocator for tens of GiB and aborted the process instead of printing
 the unsupported-rate error (MAN-121 review). `Channelizer::supports_rate`
 is the shared predicate.
 
+`supports_rate` is only half the guard, though, because it bounds the
+rate's *shape* and not its *size*: 393216000 (= 93.75 × 2²²) is a
+perfectly well-shaped channelizer rate, so it passes — and still asks for
+a ~5.9 GiB calibration buffer and a 2²²-point FFT from a file that may be
+a few hundred bytes long. `open_replay_wav` therefore also bounds the
+magnitude, at `manta_input::MAX_REPLAY_RATE_HZ` (10 MS/s — the same
+ceiling `--hpsdr-rate` already applies to a live source, so replay is
+bounded no more tightly than real hardware). Both halves are needed;
+neither implies the other (MAN-121 round-15 review).
+
 ## The fix: dispatch on channel count, with a rate-and-sidecar tie-break at 48 kHz
 
 `manta_input::open_replay_wav(path)` picks the reader from the WAV header,

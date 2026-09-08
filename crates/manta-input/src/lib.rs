@@ -129,6 +129,22 @@ impl IqSource for WavIqSource {
     }
 }
 
+/// Upper bound on the sample rate `open_replay_wav` will adopt from an IQ
+/// replay WAV's own header, in S/s.
+///
+/// `Channelizer::supports_rate` constrains the rate's SHAPE but not its
+/// SIZE, and everything sized from a replay rate -- `manta_engine::listen`'s
+/// `CALIBRATION_SECONDS * fs` complex buffer, the channelizer's `fs/93.75`
+/// -point FFT and prototype filter -- is allocated from a number a
+/// few-hundred-byte file can claim freely. 10 MS/s is deliberately the same
+/// ceiling `manta-cli`'s `--hpsdr-rate` already applies to a LIVE source, so
+/// replay is bounded no more tightly than real hardware: it admits every
+/// rate any supported receiver produces (the largest well-shaped rate under
+/// it is 6.144 MS/s, a ~98 MiB calibration buffer) while turning the
+/// 5.9 GiB-and-up headers into the documented startup error instead of an
+/// OOM abort.
+pub const MAX_REPLAY_RATE_HZ: f64 = 10_000_000.0;
+
 /// Open a replay WAV as whichever `IqSource` its layout implies: 2 channels
 /// = complex IQ (what `manta gen` writes and `manta decode` reads, at its
 /// own native rate, via `WavIqSource`); anything else = a real rig-audio
@@ -153,9 +169,10 @@ impl IqSource for WavIqSource {
 /// path rather than being silently misread as `Complex32::new(I, Q)`.
 ///
 /// The IQ branch additionally rejects any rate the channelizer can't
-/// accept (`fs/93.75` not a power of two), because it is the branch that
-/// adopts the FILE's own rate -- see the guard's own comment for why that
-/// has to happen here rather than in `manta_engine::listen`.
+/// accept (`fs/93.75` not a power of two) *and* any rate above
+/// `MAX_REPLAY_RATE_HZ`, because it is the branch that adopts the FILE's
+/// own rate -- see the guard's own comment for why that has to happen
+/// here rather than in `manta_engine::listen`.
 ///
 /// The tie-break asks `replay_wav_has_iq_sidecar` -- "is there a parseable
 /// IQ sidecar?" -- and deliberately NOT `replay_wav_center_freq_hz`, which
@@ -183,11 +200,30 @@ pub fn open_replay_wav(path: &Path) -> Result<Box<dyn IqSource>> {
         // before the source is ever handed to the engine (MAN-121 review).
         // `AudioIqSource` needs no equivalent guard -- it already accepts
         // exactly `TARGET_RATE_HZ` and nothing else.
+        //
+        // Two independent things have to be true, and `supports_rate`
+        // only answers the first: the rate's SHAPE (`fs/93.75` a power of
+        // two) and its MAGNITUDE. `supports_rate` has no upper bound, so
+        // a malformed header claiming e.g. 393_216_000 (= 93.75 * 2^22,
+        // a perfectly well-shaped rate) passes it and still asks
+        // `manta_engine::listen` for a ~5.9 GiB calibration buffer -- and
+        // `Channelizer::new` for a 2^22-point FFT and prototype filter --
+        // from a file that may be a few hundred bytes long. Bound the
+        // magnitude too (MAN-121 round-15 review).
         let fs = spec.sample_rate as f64;
         if !manta_dsp::channelizer::Channelizer::supports_rate(fs) {
             bail!(
                 "unsupported sample rate {fs} in {}: an IQ replay WAV must use a channelizer \
                  rate (fs/93.75 a power of two -- 12/24/48/96/192/384 kHz and so on)",
+                path.display()
+            );
+        }
+        if fs > MAX_REPLAY_RATE_HZ {
+            bail!(
+                "unsupported sample rate {fs} in {}: an IQ replay WAV must be at most \
+                 {MAX_REPLAY_RATE_HZ} S/s -- a higher rate is a malformed or unsupported \
+                 header, and sizing the decoder's startup buffers from it would exhaust \
+                 memory before the rate could be reported",
                 path.display()
             );
         }
@@ -485,6 +521,49 @@ mod tests {
         write_f32_wav(&wav, &samples(), 200_000_000);
 
         assert!(open_replay_wav(&wav).is_err());
+    }
+
+    // The half of that class the shape check alone does NOT catch
+    // (MAN-121 round-15 review): 393_216_000 = 93.75 * 2^22 is a
+    // perfectly WELL-SHAPED channelizer rate, so `supports_rate` says
+    // yes, yet `manta_engine::listen` would size a ~5.9 GiB calibration
+    // buffer (and a 2^22-point FFT) from this ~8 KiB file. Only the
+    // magnitude bound rejects it.
+    #[test]
+    fn open_replay_wav_rejects_a_well_shaped_but_absurdly_large_iq_rate() {
+        let fs = 393_216_000;
+        assert!(
+            manta_dsp::channelizer::Channelizer::supports_rate(fs as f64),
+            "this test is only meaningful for a rate the SHAPE check accepts"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("wellshaped-huge.wav");
+        write_f32_wav(&wav, &samples(), fs);
+
+        let err = match open_replay_wav(&wav) {
+            Ok(_) => panic!("expected an unsupported-rate error, got a source"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("unsupported sample rate") && err.contains("at most"),
+            "expected the magnitude-bound error, got: {err}"
+        );
+    }
+
+    // The bound admits every rate a real receiver produces -- the
+    // ceiling's own largest well-shaped rate must still open.
+    #[test]
+    fn open_replay_wav_accepts_the_largest_realistic_iq_rate() {
+        let fs = 6_144_000;
+        assert!(fs as f64 <= MAX_REPLAY_RATE_HZ);
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fast.wav");
+        write_f32_wav(&wav, &samples(), fs);
+
+        let src = open_replay_wav(&wav).unwrap();
+        assert_eq!(src.sample_rate(), fs as f64);
     }
 
     // Round-2 review: format detection and RF-frequency validation are
