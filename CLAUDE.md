@@ -25,7 +25,7 @@ reachable from this environment.
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals
-- `ARCHITECTURE.md` — 8-crate workspace, data flow, channelizer/decoder/
+- `ARCHITECTURE.md` — 9-crate workspace, data flow, channelizer/decoder/
   validation/output design
 - `docs/SPEC-decode-core.md` — implementation-level algorithm spec: exact
   channelizer constants, noise-floor estimator, track state machine, decoder
