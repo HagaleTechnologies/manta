@@ -49,8 +49,14 @@ with documented, testable algorithms.
 ## Installation
 
 ```sh
-cargo build --release -p manta-cli   # Rust 1.85+
+cargo install --path crates/manta-cli --features hpsdr   # Rust 1.85+
 ```
+
+That puts a `manta` binary in Cargo's bin directory (`~/.cargo/bin`
+unless you moved `CARGO_HOME`), which a standard Rust install already has
+on `PATH` — every command below assumes a bare `manta` resolves. To build
+without installing, `cargo build --release -p manta-cli` leaves the
+binary at `target/release/manta`; run that path instead.
 
 No tagged release yet, so there is no prebuilt binary or Docker image to
 pull — build from source for now. Both publish automatically, for every
@@ -70,21 +76,23 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   Docker's default 10-second grace period is shorter than manta's drain
   window for a slow client's final write (up to 25 s), so the default
   can cut a graceful shutdown off mid-drain.
-- The `soapy` feature (RTL-SDR, Airspy, SDRplay, HackRF via SoapySDR)
-  needs the native SoapySDR system library and is not in the container
-  image; build from source with `--features soapy` to use it. `hpsdr`
-  (OpenHPSDR/Hermes) has no native dependency and is on by default in
-  the container image and every release binary.
+- Input backends are cargo features, and a build that did not ask for
+  one has no flags for it — `--hpsdr-host` / `--soapy-driver` fail with
+  `error: unexpected argument` on a build without them. `hpsdr`
+  (OpenHPSDR/Hermes) has no native dependency, which is why the install
+  line above turns it on. `soapy` (RTL-SDR, Airspy, SDRplay, HackRF via
+  SoapySDR) needs the native SoapySDR system library installed first;
+  once you have it, add it: `--features hpsdr,soapy`.
 - Windows binaries need the [Visual C++
   Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
   installed if it isn't already.
 
 ## 60-second demo
 
-No SDR, no radio. Build, generate a synthetic golden vector, decode it:
+No SDR, no radio. Install, generate a synthetic golden vector, decode it:
 
 ```sh
-cargo build --release -p manta-cli      # Rust 1.85+
+cargo install --path crates/manta-cli --features hpsdr   # puts `manta` on PATH
 manta gen v1 --out /tmp/v1              # 120 s of synthetic CW, 20 WPM, +20 dB
 manta decode /tmp/v1/v1.wav
 # CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ …
@@ -140,8 +148,8 @@ Before exposing any port beyond loopback, read
 | IQ / audio WAV file | `decode`, `listen --source` | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio) |
 | Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` | Working |
-| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — in every official binary | Working; protocol verified against reference sources, not yet against hardware |
-| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in official binaries, needs the SoapySDR system library | Working, needs hardware soak |
+| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
+| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
 
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
@@ -186,7 +194,9 @@ Pre-1.0, and pre-first-release. What is true today:
 - **Not yet measured:** the RBN parity benchmark (recall vs. RBN on
   recorded contest IQ), the Raspberry Pi 4 CPU budget, and a 24-hour
   live-SDR soak. The first needs reference data; the other two need
-  physical hardware.
+  physical hardware. The CPU budget's desktop leg *has* been measured and
+  currently reads as a **fail** — ≈0.53x–0.58x realtime against a <0.5x
+  budget, pending a clean rerun on a quiet machine ([ROADMAP.md](ROADMAP.md) M2).
 - **Known limits:** the classical decoder loses copy under heavy HF
   fading on several golden vectors, and at low SNR the validator still
   admits occasional bogus callsigns from noise. Closing the fading gap is

@@ -20,6 +20,12 @@ fn doc(rel: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
 }
 
+/// Every run of whitespace collapsed to a single space, so a phrase that a
+/// Markdown reflow split across two lines still matches.
+fn squash_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Text between a `## <heading>` and the next `## ` heading.
 fn section<'a>(md: &'a str, heading: &str) -> &'a str {
     let start = md
@@ -62,9 +68,12 @@ fn architecture_lists_every_workspace_crate() {
     }
 }
 
-/// README, ARCHITECTURE, CLAUDE.md and the wiki overview must all state the
-/// same crate count, and it must be the real one. Guard-listing the stale
-/// spellings keeps the failure message actionable when a crate is added.
+/// README, CLAUDE.md and the wiki overview must all state the same crate
+/// count, and it must be the real one. ARCHITECTURE.md is deliberately not
+/// in the list: it states no count in words, and is covered for crate
+/// *names* by `architecture_lists_every_workspace_crate` above. Guard-
+/// listing the stale spellings keeps the failure message actionable when a
+/// crate is added.
 #[test]
 fn every_doc_states_the_real_crate_count() {
     let n = workspace_members().len();
@@ -100,8 +109,8 @@ fn every_doc_states_the_real_crate_count() {
 // ---- Scenario 2: the Inputs table lists every shipped input ----
 
 /// Every input the CLI can be built with needs a row. HPSDR/Hermes shipped
-/// (crates/manta-input/src/hpsdr.rs, feature `hpsdr`, in every release
-/// binary) and had no row at all.
+/// (crates/manta-input/src/hpsdr.rs, feature `hpsdr`, which the README's
+/// install line turns on) and had no row at all.
 #[test]
 fn readme_inputs_table_covers_every_shipped_input() {
     let readme = doc("README.md");
@@ -187,7 +196,10 @@ fn roadmap_does_not_defer_rbn_admission() {
 #[test]
 fn roadmap_m3_does_not_list_shipped_server_as_remaining() {
     let roadmap = doc("ROADMAP.md");
-    let m3 = section(&roadmap, "M3");
+    // Collapse runs of whitespace so the search survives a paragraph reflow:
+    // the phrase is line-wrapped in the source Markdown, and matching the raw
+    // text would panic on `.expect()` instead of reporting a real drift.
+    let m3 = squash_whitespace(section(&roadmap, "M3"));
     let idx = m3
         .find("Remaining M3 sub-projects")
         .expect("M3 remaining-work sentence");
