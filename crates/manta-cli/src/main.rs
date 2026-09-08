@@ -193,8 +193,11 @@ enum Command {
         /// a demo left running (MAN-121). Note: the spot dedupe window
         /// suppresses a repeat spot for the same callsign and frequency for
         /// 10 minutes of recording time, so a short looped file yields
-        /// roughly one spot per 10 minutes, not one per pass. Combine with
-        /// --realtime for a live-paced demo.
+        /// roughly one spot per 10 minutes, not one per pass. Requires
+        /// --realtime when combined with --server-config: an unpaced
+        /// endless loop advances its sample clock far faster than wall
+        /// clock, so its spots would reach clients timestamped ever
+        /// further into the future.
         #[arg(long = "loop", requires = "source")]
         loop_replay: bool,
     },
@@ -545,13 +548,28 @@ fn resolve_epoch(
 /// `start_spot_server` -- covers separately and deliberately does NOT
 /// reproduce across reruns).
 ///
+/// The nonce covers the recording's bytes AND the RF frequency this
+/// session will actually publish (`effective_center_freq_hz`: the
+/// `--dial-freq-hz` override if given, else the source's own sidecar-
+/// declared `center_freq_hz`). Content alone is not the observation's
+/// identity: the SAME baseband IQ bytes tagged with two different
+/// sidecars -- or replayed once with `--dial-freq-hz 14027000` and once
+/// with `7027000` -- describe two DIFFERENT RF observations, yet would
+/// otherwise share a nonce and therefore collide on JSON spot `id` at the
+/// same track/sample position. `SpotMessage` documents that cqdx keys on
+/// that id, so a collision can overwrite or drop a real spot (round-3
+/// review).
+///
 /// This value is ONLY a session nonce (`SpotBus::session_nonce`), never
 /// fed into `SpotBus::epoch`/`unix_ts_for` -- an earlier version derived
 /// both from this same hash, which meant a replayed file's JSON
 /// `timestamp`/RBN Zulu time was a fabricated date with no relation to
 /// real time (nanoseconds-since-Unix-epoch reinterpreted as a wall clock).
 /// A network client's `timestamp` must always be truthful.
-fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
+fn session_nonce_for_replay_path(
+    path: &std::path::Path,
+    effective_center_freq_hz: f64,
+) -> Result<u128> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)
@@ -571,6 +589,14 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(PRIME);
         }
+    }
+    // The RF frequency the session will actually PUBLISH, folded in after
+    // the recording's bytes as its IEEE-754 bits, big-endian (a fixed
+    // 8-byte, endianness-independent encoding, so the nonce stays stable
+    // across platforms like the byte hash above it).
+    for &byte in effective_center_freq_hz.to_bits().to_be_bytes().iter() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(PRIME);
     }
     Ok(hash as u128)
 }
@@ -1082,6 +1108,27 @@ fn main() -> Result<()> {
                 );
             }
 
+            // Round-3 review: unpaced looping replay never ends AND runs
+            // its sample clock ~30-40x faster than wall time. `Dedupe`
+            // releases a repeat spot every 600 s of RECORDING time, and
+            // `SpotBus::unix_ts_for` adds that fast-advancing `sample_ts`
+            // to the fixed replay epoch -- so telnet/JSON clients would be
+            // served an endless stream of repeats stamped progressively
+            // further into the future, presented as current observations.
+            // A one-pass replay self-limits to the recording's own length;
+            // an endless one does not, so a networked loop must be paced.
+            // Checked here, alongside the --dial-freq-hz gate and ahead of
+            // all file I/O, so a flag error still beats a file error.
+            if loop_replay && server_config.is_some() && !realtime {
+                bail!(
+                    "--loop with --server-config also requires --realtime: unpaced looping \
+                     replay never ends and advances its sample clock far faster than wall \
+                     clock, so clients would receive endless repeat spots timestamped \
+                     progressively further into the future -- add --realtime for a \
+                     live-paced demo, or drop --loop to replay the file once"
+                );
+            }
+
             let kiwi = KiwiOpts {
                 host: kiwi_host,
                 port: kiwi_port,
@@ -1185,7 +1232,15 @@ fn main() -> Result<()> {
                     // either).
                     let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
                     let session_nonce: u128 = match &replay_path {
-                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                        // `src.center_freq_hz()` is the EFFECTIVE RF
+                        // frequency this session publishes -- the
+                        // `--dial-freq-hz` override where one was given
+                        // (`FixedCenterFreqSource` reports it, and both
+                        // `PacedSource` and `LoopingWavSource` forward it
+                        // unchanged), else the file's own sidecar value.
+                        Some(replay_path) => {
+                            session_nonce_for_replay_path(replay_path, src.center_freq_hz())?
+                        }
                         // Live session: `epoch` above is already SystemTime::now().
                         None => epoch
                             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1579,22 +1634,53 @@ mod tests {
         // XOR/multiply order or wrong constant.
         const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
-        let expected_empty = OFFSET_BASIS as u128;
-        let expected_a = (OFFSET_BASIS ^ 0x61u64).wrapping_mul(PRIME) as u128;
-        let expected_ab =
-            (((OFFSET_BASIS ^ 0x61u64).wrapping_mul(PRIME) ^ 0x62u64).wrapping_mul(PRIME)) as u128;
+        // A frequency of 0.0 has all-zero IEEE-754 bits, and FNV-1a's
+        // XOR-with-zero is the identity -- so folding those 8 trailing
+        // bytes in (round-3 review) multiplies by PRIME exactly 8 more
+        // times and nothing else. That closed form keeps this pin
+        // INDEPENDENT of the implementation rather than a restatement of
+        // it, which is the whole point of the test.
+        let freq_tail = PRIME.wrapping_pow(8);
+        let expected_empty = OFFSET_BASIS.wrapping_mul(freq_tail) as u128;
+        let expected_a = (OFFSET_BASIS ^ 0x61u64)
+            .wrapping_mul(PRIME)
+            .wrapping_mul(freq_tail) as u128;
+        let expected_ab = ((OFFSET_BASIS ^ 0x61u64).wrapping_mul(PRIME) ^ 0x62u64)
+            .wrapping_mul(PRIME)
+            .wrapping_mul(freq_tail) as u128;
 
         assert_eq!(
-            session_nonce_for_replay_path(write_temp_file(b"").path()).unwrap(),
+            session_nonce_for_replay_path(write_temp_file(b"").path(), 0.0).unwrap(),
             expected_empty
         );
         assert_eq!(
-            session_nonce_for_replay_path(write_temp_file(b"a").path()).unwrap(),
+            session_nonce_for_replay_path(write_temp_file(b"a").path(), 0.0).unwrap(),
             expected_a
         );
         assert_eq!(
-            session_nonce_for_replay_path(write_temp_file(b"ab").path()).unwrap(),
+            session_nonce_for_replay_path(write_temp_file(b"ab").path(), 0.0).unwrap(),
             expected_ab
+        );
+    }
+
+    /// Round-3 review: the same IQ bytes tagged with a different sidecar
+    /// (or replayed under a different `--dial-freq-hz`) are a DIFFERENT RF
+    /// observation, and must not share a session nonce -- spots at the
+    /// same track/sample position would otherwise collide on the JSON
+    /// `id` cqdx keys on.
+    #[test]
+    fn session_nonce_for_replay_path_differs_across_dial_frequencies() {
+        let f = write_temp_file(b"identical baseband recording bytes");
+        let on_20m = session_nonce_for_replay_path(f.path(), 14_027_000.0).unwrap();
+        let on_40m = session_nonce_for_replay_path(f.path(), 7_027_000.0).unwrap();
+        assert_ne!(
+            on_20m, on_40m,
+            "the same bytes at two different RF frequencies must not collide on one nonce"
+        );
+        // ...and it is still deterministic for a given (bytes, frequency).
+        assert_eq!(
+            on_20m,
+            session_nonce_for_replay_path(f.path(), 14_027_000.0).unwrap()
         );
     }
 
@@ -1602,8 +1688,8 @@ mod tests {
     fn session_nonce_for_replay_path_is_deterministic_for_the_same_content() {
         let f = write_temp_file(b"same recording bytes");
         assert_eq!(
-            session_nonce_for_replay_path(f.path()).unwrap(),
-            session_nonce_for_replay_path(f.path()).unwrap()
+            session_nonce_for_replay_path(f.path(), 14_027_000.0).unwrap(),
+            session_nonce_for_replay_path(f.path(), 14_027_000.0).unwrap()
         );
     }
 
@@ -1615,18 +1701,20 @@ mod tests {
         let a = write_temp_file(b"identical recording bytes");
         let b = write_temp_file(b"identical recording bytes");
         assert_eq!(
-            session_nonce_for_replay_path(a.path()).unwrap(),
-            session_nonce_for_replay_path(b.path()).unwrap(),
+            session_nonce_for_replay_path(a.path(), 14_027_000.0).unwrap(),
+            session_nonce_for_replay_path(b.path(), 14_027_000.0).unwrap(),
             "the same content at two different paths must derive the same nonce"
         );
     }
 
     #[test]
     fn session_nonce_for_replay_path_differs_across_different_recordings() {
-        let a = session_nonce_for_replay_path(write_temp_file(b"contest-weekend bytes").path())
-            .unwrap();
-        let b = session_nonce_for_replay_path(write_temp_file(b"quiet-weeknight bytes").path())
-            .unwrap();
+        let a =
+            session_nonce_for_replay_path(write_temp_file(b"contest-weekend bytes").path(), 0.0)
+                .unwrap();
+        let b =
+            session_nonce_for_replay_path(write_temp_file(b"quiet-weeknight bytes").path(), 0.0)
+                .unwrap();
         assert_ne!(
             a, b,
             "two different recordings must not collide on the same replay session nonce"

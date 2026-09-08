@@ -129,6 +129,25 @@ impl IqSource for WavIqSource {
     }
 }
 
+/// Upper bound on the sample rate a replay WAV may DECLARE, Hz.
+///
+/// A WAV header's rate is a raw `u32` that an arbitrary (or corrupt) file
+/// can set to anything, and a streaming consumer sizes its startup buffer
+/// from `IqSource::sample_rate()` before anything validates that rate is
+/// even channelizable -- `manta_engine::listen`/`soak` allocate
+/// `fs * 2` complex calibration samples up front. Unbounded, a 40-byte
+/// file declaring a rate near `u32::MAX` asks the allocator for ~64 GiB
+/// and aborts the process, instead of failing with the channelizer's own
+/// documented unsupported-rate error (round-3 review).
+///
+/// 10 MHz is the same deliberately generous "reject obviously-wrong input"
+/// ceiling `--hpsdr-rate` uses: far above any passband manta actually
+/// channelizes (192 kS/s is the CPU-budget target, and the highest
+/// channelizable rate below this bound is 6.144 MS/s) and far below
+/// anything that can exhaust memory -- 2 s of 10 MS/s complex is 160 MB.
+/// It is a sanity bound, not a claim about which rates decode well.
+pub const MAX_REPLAY_RATE_HZ: u32 = 10_000_000;
+
 /// Open a replay WAV as whichever `IqSource` its layout implies: 2 channels
 /// = complex IQ (what `manta gen` writes and `manta decode` reads, at its
 /// own native rate, via `WavIqSource`); anything else = a real rig-audio
@@ -168,6 +187,17 @@ pub fn open_replay_wav(path: &Path) -> Result<Box<dyn IqSource>> {
     let is_iq = spec.channels == 2
         && (spec.sample_rate != TARGET_RATE_HZ || replay_wav_has_iq_sidecar(path));
     if is_iq {
+        // Bound the declared rate HERE, before the source is handed to an
+        // engine that sizes a startup buffer from it (round-3 review).
+        if spec.sample_rate > MAX_REPLAY_RATE_HZ {
+            bail!(
+                "unsupported sample rate {} Hz in {}: an IQ replay WAV may declare at most \
+                 {} Hz (and fs/93.75 must be a power of two)",
+                spec.sample_rate,
+                path.display(),
+                MAX_REPLAY_RATE_HZ
+            );
+        }
         Ok(Box::new(WavIqSource::open(path)?))
     } else {
         Ok(Box::new(AudioIqSource::from_wav_file(path)?))
@@ -514,6 +544,42 @@ mod tests {
                 format!("{err}").contains("48000"),
                 "expected the AudioIqSource rate error, got: {err}"
             ),
+        }
+    }
+
+    // Round-3 review: a tiny file may still declare an enormous rate, and
+    // `manta_engine::listen` sizes its 2 s calibration buffer from that
+    // number BEFORE `Channelizer::new` gets to reject it -- near
+    // `u32::MAX` that is a ~64 GiB allocation and a process abort rather
+    // than an error. Reject the header at the reader instead.
+    #[test]
+    fn open_replay_wav_rejects_an_absurd_declared_sample_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("huge.wav");
+        // Four samples, a rate near u32::MAX: 2 s of calibration at this
+        // rate would be ~68 GiB of Complex32.
+        write_f32_wav(&wav, &samples()[..4], u32::MAX - 1);
+
+        match open_replay_wav(&wav) {
+            Ok(_) => panic!("expected an error for a {} Hz IQ file", u32::MAX - 1),
+            Err(err) => assert!(
+                format!("{err}").contains("unsupported sample rate"),
+                "expected the bounded-rate error, got: {err}"
+            ),
+        }
+    }
+
+    // The bound must not narrow what already worked: every rate manta
+    // actually channelizes is far below it.
+    #[test]
+    fn open_replay_wav_still_accepts_every_ordinary_channelizer_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        for fs in [48_000u32, 96_000, 192_000, 384_000] {
+            let wav = dir.path().join(format!("iq{fs}.wav"));
+            write_f32_wav(&wav, &samples(), fs);
+            let src = open_replay_wav(&wav)
+                .unwrap_or_else(|e| panic!("{fs} Hz IQ WAV should open, got: {e}"));
+            assert_eq!(src.sample_rate(), fs as f64);
         }
     }
 

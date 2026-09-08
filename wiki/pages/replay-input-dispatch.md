@@ -10,9 +10,12 @@ sources:
   - crates/manta-input/src/pace.rs
   - crates/manta-input/src/replay.rs
   - docs/DECISIONS/2026-09-07-man121-hardware-free-replay.md
-verified:
-  commit: 49f05a4
-  date: 2026-09-07
+# `verified` is deliberately UNSET: this page is new in the same change it
+# describes, so no already-merged revision contains both the page and the
+# `open_replay_wav` dispatch / `pace` / `replay` modules it documents. A
+# marker naming a revision that predates the code would misstate this
+# page's provenance to anyone trusting the field (round-3 review). Set it
+# in a later pass, against a revision that actually carries the behavior.
 links:
   - spot-output-contract
 ---

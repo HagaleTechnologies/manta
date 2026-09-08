@@ -182,6 +182,16 @@ pub fn soak_with_metrics(
         let fs = src.sample_rate();
         let center_freq_hz = src.center_freq_hz();
 
+        // Built BEFORE the calibration buffer is sized, so an
+        // unsupported `fs` fails with the channelizer's own error
+        // instead of first asking the allocator for `fs * 2` complex
+        // samples -- a source declaring an absurd rate (a corrupt WAV
+        // header can name any `u32`) would otherwise abort the process
+        // on a multi-GiB allocation before anything validated the rate
+        // at all (round-3 review). `Channelizer::new` reads no samples,
+        // so nothing else about the ordering changes.
+        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
         let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
         let mut filled = 0;
@@ -192,8 +202,6 @@ pub fn soak_with_metrics(
             }
             filled += n;
         }
-        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-            .map_err(|e| anyhow::anyhow!(e))?;
         let hop = ch.hop() as u64;
         let mut tm = TrackManager::new(
             ch.n_channels(),

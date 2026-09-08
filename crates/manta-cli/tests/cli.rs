@@ -300,6 +300,59 @@ fn loop_replay_keeps_producing_events_past_the_end_of_the_file() {
     );
 }
 
+/// Round-3 review: unpaced `--loop` never ends and advances its sample
+/// clock far faster than wall clock, so a networked loop would serve
+/// clients endless repeat spots timestamped progressively into the future.
+/// Rejected before any file I/O, so nonexistent paths provoke it cleanly.
+#[test]
+fn loop_with_server_config_but_no_realtime_is_a_clean_error() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+            "--dial-freq-hz",
+            "14027000",
+            "--loop",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure for --loop --server-config without --realtime"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--realtime"), "stderr: {stderr}");
+}
+
+/// The same combination WITH --realtime passes the flag gate and goes on
+/// to real work (it fails later, on the nonexistent file) -- the gate must
+/// not reject a legitimately paced networked loop.
+#[test]
+fn loop_with_server_config_and_realtime_passes_the_flag_gate() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+            "--dial-freq-hz",
+            "14027000",
+            "--loop",
+            "--realtime",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("also requires --realtime"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn loop_requires_source() {
     let out = manta().args(["listen", "--loop"]).output().unwrap();

@@ -148,6 +148,21 @@ station every time it repeats CQ) and is not special-cased away. It's
 stated in the flag's own `--help` text instead of "fixed," since fixing it
 would mean weakening dedupe, an unrelated and unwanted change.
 
+**`--loop` with `--server-config` additionally requires `--realtime`**
+(round-3 review). Unpaced replay drains ~30-40x faster than wall clock and
+*never ends* when looped, so `Dedupe`'s 600 s of simulated time elapses
+every ~15-20 s of real time while `SpotBus::unix_ts_for` adds that
+fast-advancing `sample_ts` to the fixed replay epoch: a connected telnet or
+JSON client would be served an endless stream of repeat spots stamped
+progressively further into the future, presented as *current* observations.
+A one-pass unpaced replay self-limits to the recording's own length (and is
+what the test suite and `soak` depend on, so it stays allowed); an endless
+one does not. Rejected as a flag error at startup, alongside the
+`--dial-freq-hz` gate and ahead of any file I/O, rather than by suppressing
+or rewriting the timestamps -- publishing a *truthful* timestamp is
+`SpotBus`'s contract, and `--realtime` already makes simulated time and
+wall clock agree.
+
 ## Decision 5 — the M3 README demo needs `sh/dx`, not just perfect timing
 
 Measured empirically while writing the README's Quickstart update: with
