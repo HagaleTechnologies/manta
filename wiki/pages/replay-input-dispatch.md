@@ -86,7 +86,10 @@ realtime), so the process (and its telnet/JSON servers) could exit before
 any client had a realistic chance to connect. `PacedSource`
 (`crates/manta-input/src/pace.rs`) is a pure sleep wrapper around any
 `IqSource`: it computes sleeps from *cumulative* delivered samples against
-one `Instant`, so a slow consumer degrades to unpaced instead of ever
+one `Instant` (started on the first `read()`, so CLI setup between
+construction and the first sample — epoch resolution, whole-file hashing,
+server bind — is not charged to the recording's clock), so a slow consumer
+degrades to unpaced instead of ever
 stalling or drifting — and because it never touches which samples are
 delivered, `--realtime` output is byte-identical to unpaced output. The
 sleep happens **after** the inner `read()`, against the count that

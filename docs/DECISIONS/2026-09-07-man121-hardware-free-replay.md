@@ -108,8 +108,12 @@ Taking the flag branch:
    not move.
 
 `PacedSource` (`crates/manta-input/src/pace.rs`) tracks cumulative
-delivered samples against a single `Instant` captured at construction and
-sleeps only for `due - elapsed` when positive. **Round-2 review
+delivered samples against a single `Instant` -- captured lazily on the
+FIRST `read()`, not at construction, because `manta-cli` resolves the
+replay epoch, hashes the whole recording for the session nonce, and binds
+the telnet/JSON listeners in between, and charging that setup time to the
+recording's own clock shortened the very window `--realtime` exists to
+open -- and sleeps only for `due - elapsed` when positive. **Round-2 review
 correction:** that sleep happens *after* the inner `read()`, against the
 count that includes the buffer about to be returned. Sleeping first, against
 the previous count, handed every chunk to the consumer a chunk before its own

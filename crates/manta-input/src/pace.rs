@@ -14,15 +14,25 @@ use std::time::{Duration, Instant};
 ///
 /// Drift-free by construction: sleeps are computed from CUMULATIVE
 /// delivered samples (including the chunk being returned) against a single
-/// start instant, not per-chunk, so a chunk that arrives late is absorbed
-/// rather than compounded. If the consumer falls behind the recording,
-/// `due <= elapsed` and this never sleeps at all -- pacing degrades to
-/// unpaced instead of ever stalling the pipeline.
+/// start instant (taken on the first read), not per-chunk, so a chunk
+/// that arrives late is absorbed rather than compounded. If the consumer
+/// falls behind the recording, `due <= elapsed` and this never sleeps at
+/// all -- pacing degrades to unpaced instead of ever stalling the
+/// pipeline.
 pub struct PacedSource {
     inner: Box<dyn IqSource>,
     fs: f64,
     delivered: u64,
-    start: Instant,
+    /// The recording clock's origin, started LAZILY on the first `read()`
+    /// rather than at construction. `manta-cli` builds the paced source
+    /// before it resolves the replay epoch, hashes the whole recording for
+    /// the session nonce, and binds the telnet/JSON listeners -- all of
+    /// which happen between `new()` and the first read. Anchoring the
+    /// clock at construction credited that setup time against the
+    /// recording's own timeline, so the first buffer's pacing debt was
+    /// already partly spent before the servers were even listening and a
+    /// client had that much less of the window to connect in.
+    start: Option<Instant>,
 }
 
 impl PacedSource {
@@ -32,8 +42,14 @@ impl PacedSource {
             inner,
             fs,
             delivered: 0,
-            start: Instant::now(),
+            start: None,
         }
+    }
+
+    /// Wall-clock since the recording clock started, or zero before the
+    /// first `read()` has started it.
+    fn elapsed(&self) -> Duration {
+        self.start.map_or(Duration::ZERO, |start| start.elapsed())
     }
 }
 
@@ -82,6 +98,11 @@ impl IqSource for PacedSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        // Start the recording clock here, on the first read, and BEFORE
+        // the inner read runs -- the time the inner source itself spends
+        // producing this buffer is part of the recording's own interval,
+        // not something to sleep on top of.
+        self.start.get_or_insert_with(Instant::now);
         let n = self.inner.read(buf)?;
         self.delivered += n as u64;
         // Sleep AFTER the read, against the count that INCLUDES this
@@ -91,7 +112,7 @@ impl IqSource for PacedSource {
         // `listen`'s first read -- the whole two-second calibration
         // buffer -- returned at once and anything decoded from it could
         // reach the servers before a client could connect.
-        if let Some(delay) = pacing_delay(self.delivered, self.fs, self.start.elapsed()) {
+        if let Some(delay) = pacing_delay(self.delivered, self.fs, self.elapsed()) {
             std::thread::sleep(delay);
         }
         Ok(n)
@@ -212,7 +233,7 @@ mod tests {
         // broken by an oversubscribed CI runner overshooting the 200ms
         // sleep rather than by pacing compounding.
         assert_eq!(
-            pacing_delay(paced.delivered, paced.fs, paced.start.elapsed()),
+            pacing_delay(paced.delivered, paced.fs, paced.elapsed()),
             None,
             "pacing must ask for no delay once the consumer has fallen behind"
         );
@@ -255,6 +276,45 @@ mod tests {
         );
     }
 
+    // The recording clock must start at the FIRST READ, not at
+    // construction. `manta-cli` builds the paced source, then resolves the
+    // replay epoch, hashes the whole recording for the session nonce, and
+    // binds the telnet/JSON listeners before `listen()` ever reads a
+    // sample. Charging that setup time to the recording meant the first
+    // buffer -- `listen`'s whole two-second calibration read -- came due
+    // that much sooner, eating into the window a client has to connect
+    // after the servers are actually up.
+    #[test]
+    fn paced_source_clock_starts_at_the_first_read_not_at_construction() {
+        let samples = vec![Complex32::new(0.0, 0.0); 800];
+        let src = VecSource {
+            samples,
+            cursor: 0,
+            fs: 8000.0,
+        };
+        let mut paced = PacedSource::new(Box::new(src));
+        // Stand in for the CLI's own between-construction-and-first-read
+        // setup: epoch resolution, whole-file hashing, server bind.
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            paced.elapsed(),
+            Duration::ZERO,
+            "the recording clock must not run before the first read"
+        );
+        let mut buf = vec![Complex32::new(0.0, 0.0); 800];
+        let start = Instant::now();
+        assert_eq!(paced.read(&mut buf).unwrap(), 800);
+        // 800 samples at 8000 S/s = 0.1s of recording, owed in FULL from
+        // this point -- not reduced by the 150ms of setup above. Generous
+        // lower bound only; never an upper bound, that is CI-flaky.
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "the first read returned after {:?}, so the 150ms of setup \
+             before it was credited against the recording's own clock",
+            start.elapsed()
+        );
+    }
+
     #[test]
     fn paced_source_passes_eof_through() {
         let samples = vec![Complex32::new(0.0, 0.0); 5];
@@ -281,7 +341,7 @@ mod tests {
             Some(Duration::from_secs_f64(5.0 / 8000.0))
         );
         assert_eq!(
-            pacing_delay(paced.delivered, paced.fs, paced.start.elapsed()),
+            pacing_delay(paced.delivered, paced.fs, paced.elapsed()),
             None,
             "the 625us debt is long spent -- EOF reads must not sleep"
         );
