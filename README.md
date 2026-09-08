@@ -41,11 +41,11 @@ and the reason the network works as well as it does.
 
 Those are Windows programs, and Skimmer Server wants an x86 CPU with SSE3, so
 they can't reach the platforms a lot of amateur radio now runs on: Linux, ARM,
-a Raspberry Pi at a remote antenna, a container, anything headless. `manta` is
-a second, independent implementation for exactly those platforms — open
-source, with documented algorithms and golden-vector regression tests anyone
-can read, run, and check. Shared infrastructure is healthier with more than
-one implementation of it, on more than one operating system.
+a Raspberry Pi at a remote antenna. `manta` is a second, independent
+implementation for exactly those platforms — a headless daemon, open source,
+with documented algorithms and golden-vector regression tests anyone can read,
+run, and check. Shared infrastructure is healthier with more than one
+implementation of it, on more than one operating system.
 
 ## Installation
 
@@ -170,8 +170,7 @@ criteria.
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary — there
-  is no separate aggregator or companion program to install and start
-  alongside it.
+  is no companion program to sequence-launch.
 - No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
   CAT/rig control to align a narrowband receiver with the channelizer.
   `manta` does ingest a local audio device (`listen`/`listen --device`,
