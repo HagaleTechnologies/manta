@@ -68,6 +68,18 @@ positive `center_freq_hz`), and returns `None` on **any** error, including
 a nonexistent path. The gate folds this into `has_rf_aware_source` and
 stays exactly where it was in the CLI handler, ahead of all real file I/O.
 
+**Round-2 review correction:** Decision 1's format tie-break must *not*
+reuse this RF probe. The first cut did, so a 48 kHz 2-channel IQ file whose
+sidecar declares `center_freq_hz: 0.0` (baseband, or an unknown dial the
+operator supplies with `--dial-freq-hz`) failed the positive-frequency test
+and was classified as rig audio -- its Q channel discarded and re-synthesized
+through the Hilbert path, contradicting Decision 1's own "parseable sidecar"
+wording. The two questions are now separate functions over one private
+helper: `replay_wav_has_iq_sidecar` (FORMAT -- finite `center_freq_hz`,
+`0.0` included) drives `open_replay_wav`, and `replay_wav_center_freq_hz`
+(RF -- finite and positive) drives this gate alone. Both still swallow every
+error, so the ordering invariant below is untouched.
+
 This preserves an existing, test-enforced invariant:
 `crates/manta-cli/tests/cli.rs::server_config_without_dial_freq_for_audio_source_is_a_clean_error`
 provokes the gate with `/nonexistent.wav` and asserts the error names the
@@ -97,7 +109,14 @@ Taking the flag branch:
 
 `PacedSource` (`crates/manta-input/src/pace.rs`) tracks cumulative
 delivered samples against a single `Instant` captured at construction and
-sleeps only for `due - elapsed` when positive. A consumer that falls behind
+sleeps only for `due - elapsed` when positive. **Round-2 review
+correction:** that sleep happens *after* the inner `read()`, against the
+count that includes the buffer about to be returned. Sleeping first, against
+the previous count, handed every chunk to the consumer a chunk before its own
+recording interval had elapsed -- and `manta_engine::listen`'s first read is
+the entire two-second calibration buffer, so a spot decoded from it could be
+published before a client had any chance to connect, which is the exact
+failure `--realtime` exists to prevent. A consumer that falls behind
 the recording simply stops sleeping and degrades to unpaced -- it can never
 stall the pipeline or accumulate drift from repeated small delays.
 

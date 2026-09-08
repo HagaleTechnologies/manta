@@ -23,23 +23,57 @@ implementation, `AudioIqSource` (`crates/manta-input/src/audio.rs`), not to
 the streaming pipeline. Misreading that constraint as belonging to
 `listen()` itself is what made MAN-121 look like a resampling problem for
 longer than it was: it wasn't. `manta gen`/`decode` always use
-`WavIqSource` (2-channel complex IQ, any rate, sidecar-carried center
-freq); `listen --source`/`--device` used to hard-code `AudioIqSource` (a
-real, single-channel rig-audio passband converted to analytic form via
-Hilbert transform) regardless of what the file actually contained — so
+`WavIqSource` (2-channel complex IQ, any channelizer rate,
+sidecar-carried center freq); `listen --source`/`--device` used to
+hard-code `AudioIqSource` (a real, single-channel rig-audio passband
+converted to analytic form via Hilbert transform) regardless of what the file actually contained — so
 `gen`'s own 96 kHz stereo IQ output couldn't feed the server the README's
 quickstart told you to point it at.
 
-## The fix: dispatch on channel count, not a flag
+Note also that "rate-agnostic" means *any channelizer rate*, not any rate
+at all: `fs / 93.75` must be a power of two (12/24/48/96/192/384 kHz and
+so on). A 44.1 kHz or 100 kHz IQ WAV is still rejected, by
+`Channelizer::new`, not by the reader.
 
-`manta_input::open_replay_wav(path)` picks the reader from the WAV
-header's channel count: 2 → `WavIqSource`; anything else → `AudioIqSource`
-(unchanged, still 48 kHz-only — that's still correct for its scenario).
-`manta_input::replay_wav_center_freq_hz(path)` similarly lets a
-sidecar-backed IQ file satisfy the CLI's `--dial-freq-hz` gate on its own,
-but is written to **never fail**, even for a nonexistent path — the gate
-must report a missing flag before a missing file, and a probe that could
-itself error would invert that ordering. See
+## The fix: dispatch on channel count, with a rate-and-sidecar tie-break at 48 kHz
+
+`manta_input::open_replay_wav(path)` picks the reader from the WAV header,
+and **not** from channel count alone — the shipped rule is:
+
+| WAV header | Reader |
+| --- | --- |
+| 2 channels, rate ≠ 48 kHz | `WavIqSource` (complex IQ) |
+| 2 channels, 48 kHz, parseable `<stem>.json` sidecar | `WavIqSource` (complex IQ) |
+| 2 channels, 48 kHz, no/unparseable sidecar | `AudioIqSource` (downmix + Hilbert) |
+| anything else (e.g. mono) | `AudioIqSource` (unchanged, still 48 kHz-only) |
+
+The 48 kHz row is the whole subtlety, and it is deliberate: 48 kHz is
+`AudioIqSource`'s *only* rate, so a stereo soundcard recording of a
+receiver's passband is indistinguishable from IQ by channel count alone,
+and reading it as `Complex32::new(I, Q)` would silently corrupt it. Away
+from 48 kHz there is no such collision — `AudioIqSource` never accepted
+those rates — so channel count decides on its own. Do not "simplify" this
+back to `channels == 2`.
+
+Two separate sidecar probes back that table, and conflating them was a
+real round-2 review bug:
+
+- `manta_input::replay_wav_has_iq_sidecar(path)` — the **format**
+  question, and the one the 48 kHz tie-break asks. True for 2 channels
+  plus a parseable sidecar with a *finite* `center_freq_hz`, **including
+  `0.0`** (baseband, or a dial frequency the operator will pass with
+  `--dial-freq-hz`).
+- `manta_input::replay_wav_center_freq_hz(path)` — the **RF** question,
+  and the one the CLI's `--dial-freq-hz` gate asks. `Some` only for a
+  finite *positive* `center_freq_hz`.
+
+Using the RF probe for the format tie-break (as the first cut did) sends a
+48 kHz IQ file declaring `center_freq_hz: 0.0` down the Hilbert path,
+discarding Q, even when `--dial-freq-hz` was supplied.
+
+Both probes are written to **never fail**, even for a nonexistent path —
+the gate must report a missing flag before a missing file, and a probe
+that could itself error would invert that ordering. See
 `docs/DECISIONS/2026-09-07-man121-hardware-free-replay.md` for the full
 rationale and rejected alternatives (resampling, a new 48 kHz vector
 family).
@@ -54,7 +88,12 @@ any client had a realistic chance to connect. `PacedSource`
 `IqSource`: it computes sleeps from *cumulative* delivered samples against
 one `Instant`, so a slow consumer degrades to unpaced instead of ever
 stalling or drifting — and because it never touches which samples are
-delivered, `--realtime` output is byte-identical to unpaced output. Opt-in
+delivered, `--realtime` output is byte-identical to unpaced output. The
+sleep happens **after** the inner `read()`, against the count that
+*includes* the buffer about to be returned: pacing against the previous
+count (the first cut) returned every chunk a chunk early, and `listen()`'s
+first read is the whole two-second calibration buffer, so a spot decoded
+from it could reach the servers before any client could connect. Opt-in
 only (`--realtime`), since the default path (tests, `soak --source`) still
 wants full-speed drain. `--loop` (`LoopingWavSource`,
 `crates/manta-input/src/replay.rs`) reopens the file at EOF for a

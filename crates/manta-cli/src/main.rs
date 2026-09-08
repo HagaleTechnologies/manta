@@ -68,9 +68,11 @@ enum Command {
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
         /// Replay a WAV file instead of a live device: either a 2-channel
-        /// IQ WAV (what `manta gen`/`decode` use, any rate) or a 48 kHz
-        /// mono rig-audio WAV. Drains as fast as it can be read unless
-        /// --realtime is given.
+        /// IQ WAV (what `manta gen`/`decode` use) at a channelizer rate --
+        /// fs/93.75 must be a power of two, i.e. 12/24/48/96/192/384 kHz
+        /// and so on, NOT arbitrary rates like 44.1 or 100 kHz -- or a
+        /// 48 kHz mono rig-audio WAV. Drains as fast as it can be read
+        /// unless --realtime is given.
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
@@ -1041,11 +1043,15 @@ fn main() -> Result<()> {
             let has_hpsdr_source = hpsdr_host.is_some();
             #[cfg(not(feature = "hpsdr"))]
             let has_hpsdr_source = false;
-            // A 2-channel IQ WAV with a `<stem>.json` sidecar DOES report a
-            // real RF frequency -- probe cheaply (never fails, even for a
-            // missing path) so this stays ahead of all file I/O and a
-            // bad-flag error still beats a bad-file error. See
-            // `replay_wav_center_freq_hz`'s doc comment (MAN-121).
+            // A 2-channel IQ WAV whose `<stem>.json` sidecar declares a
+            // POSITIVE center frequency DOES report a real RF frequency --
+            // probe cheaply (never fails, even for a missing path) so this
+            // stays ahead of all file I/O and a bad-flag error still beats
+            // a bad-file error. Deliberately the RF probe, not
+            // `replay_wav_has_iq_sidecar`'s format probe: a sidecar
+            // declaring `0.0` makes the file IQ but supplies no dial
+            // frequency, so the gate must still fire for it (MAN-121,
+            // round-2 review).
             let file_declares_rf = source
                 .as_deref()
                 .and_then(manta_input::replay_wav_center_freq_hz)
@@ -1067,10 +1073,12 @@ fn main() -> Result<()> {
             if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
                     "--dial-freq-hz is required with --server-config when using a plain \
-                     audio device or a rig-audio --source WAV file (mono, or 2-channel at \
-                     48 kHz with no <stem>.json sidecar) -- none of these report a real RF \
-                     frequency (a 2-channel IQ WAV with a <stem>.json sidecar does, as do \
-                     KiwiSDR/SoapySDR via --kiwi-freq/--soapy-freq)"
+                     audio device, a rig-audio --source WAV file (mono, or 2-channel at \
+                     48 kHz with no <stem>.json sidecar), or an IQ WAV whose sidecar \
+                     declares center_freq_hz = 0 (baseband/unknown) -- none of these report \
+                     a real RF frequency (a 2-channel IQ WAV whose sidecar declares a \
+                     positive center_freq_hz does, as do KiwiSDR/SoapySDR via \
+                     --kiwi-freq/--soapy-freq)"
                 );
             }
 

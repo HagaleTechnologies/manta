@@ -151,12 +151,22 @@ impl IqSource for WavIqSource {
 /// files always carry) breaks the tie in favor of IQ; with no sidecar, a
 /// 48 kHz 2-channel file keeps its pre-MAN-121 `AudioIqSource` downmix
 /// path rather than being silently misread as `Complex32::new(I, Q)`.
+///
+/// The tie-break asks `replay_wav_has_iq_sidecar` -- "is there a parseable
+/// IQ sidecar?" -- and deliberately NOT `replay_wav_center_freq_hz`, which
+/// answers the separate question "does that sidecar declare an RF
+/// frequency good enough to satisfy the CLI's `--dial-freq-hz` gate?"
+/// (round-2 review). Those are different questions: a baseband or
+/// unknown-dial capture whose sidecar says `center_freq_hz: 0.0` is still
+/// unambiguously IQ in FORMAT, and conflating the two silently downmixed
+/// such a 48 kHz file through `AudioIqSource`'s Hilbert path, discarding
+/// Q, even when the caller supplied `--dial-freq-hz`.
 pub fn open_replay_wav(path: &Path) -> Result<Box<dyn IqSource>> {
     let spec = hound::WavReader::open(path)
         .with_context(|| format!("open WAV {}", path.display()))?
         .spec();
     let is_iq = spec.channels == 2
-        && (spec.sample_rate != TARGET_RATE_HZ || replay_wav_center_freq_hz(path).is_some());
+        && (spec.sample_rate != TARGET_RATE_HZ || replay_wav_has_iq_sidecar(path));
     if is_iq {
         Ok(Box::new(WavIqSource::open(path)?))
     } else {
@@ -164,24 +174,48 @@ pub fn open_replay_wav(path: &Path) -> Result<Box<dyn IqSource>> {
     }
 }
 
-/// The RF center frequency a replay WAV *declares* (2-channel IQ plus a
-/// parseable `<stem>.json` sidecar with a finite, positive
-/// `center_freq_hz`), or `None` for anything else.
+/// Whatever `center_freq_hz` a replay WAV's sidecar declares: `Some` for 2
+/// channels plus a parseable `<stem>.json` carrying a finite
+/// `center_freq_hz` -- including `0.0`, which means "baseband/unknown", not
+/// "not IQ" -- and `None` for anything else.
 ///
 /// Deliberately swallows every error, including a nonexistent path, so a
 /// CLI flag-validation gate can run BEFORE any real file I/O and still
 /// report a missing flag rather than a missing file -- an ordering
 /// `crates/manta-cli/tests/cli.rs`'s
 /// `server_config_without_dial_freq_for_audio_source_is_a_clean_error`
-/// asserts and documents in its own comment.
-pub fn replay_wav_center_freq_hz(path: &Path) -> Option<f64> {
+/// asserts and documents in its own comment. Both public wrappers below
+/// inherit that property.
+fn replay_wav_sidecar_center_freq_hz(path: &Path) -> Option<f64> {
     let spec = hound::WavReader::open(path).ok()?.spec();
     if spec.channels != 2 {
         return None;
     }
     let text = std::fs::read_to_string(path.with_extension("json")).ok()?;
     let sc: Sidecar = serde_json::from_str(&text).ok()?;
-    (sc.center_freq_hz.is_finite() && sc.center_freq_hz > 0.0).then_some(sc.center_freq_hz)
+    sc.center_freq_hz.is_finite().then_some(sc.center_freq_hz)
+}
+
+/// FORMAT question: does this replay WAV carry a valid IQ sidecar (2
+/// channels plus a parseable `<stem>.json` with a finite `center_freq_hz`)?
+///
+/// This is the 48 kHz tie-break `open_replay_wav` uses, and it is
+/// deliberately independent of what that frequency actually *is*: a
+/// sidecar declaring `center_freq_hz: 0.0` (baseband, or a dial frequency
+/// the operator will supply with `--dial-freq-hz` instead) still marks the
+/// file as IQ, so its Q channel is read rather than thrown away.
+pub fn replay_wav_has_iq_sidecar(path: &Path) -> bool {
+    replay_wav_sidecar_center_freq_hz(path).is_some()
+}
+
+/// RF question: the real RF center frequency a replay WAV *declares* -- a
+/// valid IQ sidecar whose `center_freq_hz` is finite and positive -- or
+/// `None` for anything else, including an IQ file that declares `0.0`.
+///
+/// Only this answers "may `--server-config` go without `--dial-freq-hz`?";
+/// use `replay_wav_has_iq_sidecar` to decide how to READ the file.
+pub fn replay_wav_center_freq_hz(path: &Path) -> Option<f64> {
+    replay_wav_sidecar_center_freq_hz(path).filter(|hz| *hz > 0.0)
 }
 
 /// Drain an IqSource to a Vec (file-mode helper). ARCHITECTURE §3.
@@ -390,6 +424,82 @@ mod tests {
         assert_eq!(src.center_freq_hz(), 14_000_000.0);
         let all = read_all(&mut *src).unwrap();
         assert_eq!(all, samples());
+    }
+
+    // Round-2 review: format detection and RF-frequency validation are
+    // separate questions. A 48 kHz 2-channel IQ file whose sidecar declares
+    // `center_freq_hz: 0.0` (baseband, or a dial frequency the operator
+    // passes with --dial-freq-hz) is still IQ in FORMAT -- routing it to
+    // AudioIqSource would discard Q and synthesize it back via Hilbert.
+    // Same ch0=0 / ch1=0.9 discriminator as the sidecarless test above:
+    // WavIqSource returns the pair verbatim, AudioIqSource returns zeros.
+    #[test]
+    fn open_replay_wav_reads_a_zero_freq_sidecar_48k_stereo_file_as_iq() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("baseband.wav");
+        let samples: Vec<Complex32> = (0..300).map(|_| Complex32::new(0.0, 0.9)).collect();
+        write_f32_wav(&wav, &samples, 48_000);
+        std::fs::write(
+            dir.path().join("baseband.json"),
+            r#"{"center_freq_hz": 0.0}"#,
+        )
+        .unwrap();
+
+        let mut src = open_replay_wav(&wav).unwrap();
+        assert_eq!(src.sample_rate(), 48_000.0);
+        let all = read_all(&mut *src).unwrap();
+        assert_eq!(
+            all, samples,
+            "a zero-frequency sidecar still declares IQ -- Q must not be \
+             discarded and re-synthesized by the AudioIqSource path"
+        );
+    }
+
+    // The other half of the same split: declaring `0.0` marks the file as
+    // IQ but does NOT report a real RF frequency, so the CLI's
+    // --dial-freq-hz gate must still fire for it.
+    #[test]
+    fn a_zero_freq_sidecar_declares_iq_format_but_no_rf_frequency() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("baseband.wav");
+        write_f32_wav(&wav, &samples(), 48_000);
+        std::fs::write(
+            dir.path().join("baseband.json"),
+            r#"{"center_freq_hz": 0.0}"#,
+        )
+        .unwrap();
+
+        assert!(replay_wav_has_iq_sidecar(&wav));
+        assert_eq!(replay_wav_center_freq_hz(&wav), None);
+    }
+
+    #[test]
+    fn replay_wav_has_iq_sidecar_is_false_without_a_parseable_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let no_sidecar = dir.path().join("nosidecar.wav");
+        write_f32_wav(&no_sidecar, &samples(), 48_000);
+        assert!(!replay_wav_has_iq_sidecar(&no_sidecar));
+
+        let bad_sidecar = dir.path().join("badsidecar.wav");
+        write_f32_wav(&bad_sidecar, &samples(), 48_000);
+        std::fs::write(dir.path().join("badsidecar.json"), "not json").unwrap();
+        assert!(!replay_wav_has_iq_sidecar(&bad_sidecar));
+
+        let mono = dir.path().join("rig.wav");
+        write_mono_f32_wav(&mono, &vec![0.0f32; 480], 48_000);
+        std::fs::write(
+            dir.path().join("rig.json"),
+            r#"{"center_freq_hz": 7030000.0}"#,
+        )
+        .unwrap();
+        assert!(!replay_wav_has_iq_sidecar(&mono));
+
+        // Never fails, for the same reason replay_wav_center_freq_hz never
+        // does: the CLI gate probes before any file I/O is meant to fail.
+        assert!(!replay_wav_has_iq_sidecar(std::path::Path::new(
+            "/nonexistent.wav"
+        )));
     }
 
     #[test]

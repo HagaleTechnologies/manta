@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 /// Paces `inner` to wall-clock realtime at its own sample rate.
 ///
 /// Drift-free by construction: sleeps are computed from CUMULATIVE
-/// delivered samples against a single start instant, not per-chunk, so a
-/// chunk that arrives late is absorbed rather than compounded. If the
-/// consumer falls behind the recording, `due <= elapsed` and this never
-/// sleeps at all -- pacing degrades to unpaced instead of ever stalling the
-/// pipeline.
+/// delivered samples (including the chunk being returned) against a single
+/// start instant, not per-chunk, so a chunk that arrives late is absorbed
+/// rather than compounded. If the consumer falls behind the recording,
+/// `due <= elapsed` and this never sleeps at all -- pacing degrades to
+/// unpaced instead of ever stalling the pipeline.
 pub struct PacedSource {
     inner: Box<dyn IqSource>,
     fs: f64,
@@ -37,10 +37,19 @@ impl PacedSource {
     }
 }
 
-/// How long `read()` must wait before delivering the sample that follows
-/// `delivered`, given `elapsed` wall-clock since the paced source started.
+/// How long `read()` must still wait before it may RETURN a buffer that
+/// brings the cumulative delivered count to `delivered`, given `elapsed`
+/// wall-clock since the paced source started.
 ///
-/// `None` means "deliver now": the consumer is already at or past the
+/// The count is the one INCLUDING the buffer about to be returned, not the
+/// one before it (round-2 review): pacing on the previous count would hand
+/// every buffer to the consumer a full chunk before its own recording
+/// interval had elapsed, and the very first chunk -- which for
+/// `manta_engine::listen` is the entire two-second calibration buffer --
+/// would be delivered instantly, so a spot inside it could be published
+/// before any client had time to connect.
+///
+/// `None` means "return now": the consumer is already at or past the
 /// recording's own clock, so pacing degrades to unpaced rather than ever
 /// stalling the pipeline. Extracted as a pure function so the pacing
 /// decision can be asserted exactly, instead of inferred from a wall-clock
@@ -73,11 +82,18 @@ impl IqSource for PacedSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.delivered += n as u64;
+        // Sleep AFTER the read, against the count that INCLUDES this
+        // buffer: the samples this call is about to hand back must have
+        // had their own recording interval elapse first. Sleeping before
+        // the read instead paced against the PREVIOUS call's samples, so
+        // `listen`'s first read -- the whole two-second calibration
+        // buffer -- returned at once and anything decoded from it could
+        // reach the servers before a client could connect.
         if let Some(delay) = pacing_delay(self.delivered, self.fs, self.start.elapsed()) {
             std::thread::sleep(delay);
         }
-        let n = self.inner.read(buf)?;
-        self.delivered += n as u64;
         Ok(n)
     }
 }
@@ -208,6 +224,34 @@ mod tests {
             pacing_delay(800, 8000.0, Duration::from_millis(40)),
             Some(Duration::from_millis(60)),
             "when the consumer is AHEAD, the delay is the remaining debt only"
+        );
+    }
+
+    // Round-2 review: the FIRST read must be paced too. `listen`'s first
+    // read asks for the whole two-second calibration buffer, and pacing
+    // against the count BEFORE that buffer made it return instantly --
+    // every sample of the first chunk was handed to the decoder at
+    // startup, so a spot inside it could reach the servers before a client
+    // could connect. Asserted on the single first call, not on a drain.
+    #[test]
+    fn paced_source_paces_the_very_first_read() {
+        let samples = vec![Complex32::new(0.0, 0.0); 800];
+        let src = VecSource {
+            samples,
+            cursor: 0,
+            fs: 8000.0,
+        };
+        let mut paced = PacedSource::new(Box::new(src));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 800];
+        let start = Instant::now();
+        assert_eq!(paced.read(&mut buf).unwrap(), 800);
+        // 800 samples at 8000 S/s = 0.1s of recording. Generous lower
+        // bound only -- never an upper bound, that is CI-flaky.
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "the first read returned after {:?}, before its own 0.1s of \
+             recording had elapsed",
+            start.elapsed()
         );
     }
 
