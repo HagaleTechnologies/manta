@@ -33,10 +33,19 @@ No GUI. CLI, a config file, and metrics.
 
 The Reverse Beacon Network is infrastructure the whole amateur radio hobby
 leans on for CW spotting, contest scoring, propagation awareness, and antenna
-testing. It runs almost entirely on **CW Skimmer**, a closed-source,
-Windows-only program maintained by a single author. That is a single point of
-failure for a shared resource. `manta` is an open, cross-platform replacement
-with documented, testable algorithms.
+testing. Nearly all of it is skimmed by
+**[CW Skimmer](https://www.dxatlas.com/CwSkimmer/)** and
+**[CW Skimmer Server](https://www.dxatlas.com/SkimServer/)**, written by Alex
+Shovkoplyas, VE3NEA — the reference implementation of wideband CW skimming,
+and the reason the network works as well as it does.
+
+Those are Windows programs, and Skimmer Server wants an x86 CPU with SSE3, so
+they can't reach the platforms a lot of amateur radio now runs on: Linux, ARM,
+a Raspberry Pi at a remote antenna, a container, anything headless. `manta` is
+a second, independent implementation for exactly those platforms — open
+source, with documented algorithms and golden-vector regression tests anyone
+can read, run, and check. Shared infrastructure is healthier with more than
+one implementation of it, on more than one operating system.
 
 ## Installation
 
@@ -160,8 +169,9 @@ criteria.
   though the channelizer architecture does not preclude them later.
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
-- Not a multi-process Windows orchestrator. `manta` is a single Rust binary;
-  there is no companion-program sprawl to sequence-launch.
+- Not a multi-process orchestrator. `manta` is a single Rust binary — there
+  is no separate aggregator or companion program to install and start
+  alongside it.
 - No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
   CAT/rig control to align a narrowband receiver with the channelizer.
   `manta` does ingest a local audio device (`listen`/`listen --device`,
