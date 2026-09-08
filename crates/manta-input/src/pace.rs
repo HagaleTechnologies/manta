@@ -37,6 +37,27 @@ impl PacedSource {
     }
 }
 
+/// How long `read()` must wait before delivering the sample that follows
+/// `delivered`, given `elapsed` wall-clock since the paced source started.
+///
+/// `None` means "deliver now": the consumer is already at or past the
+/// recording's own clock, so pacing degrades to unpaced rather than ever
+/// stalling the pipeline. Extracted as a pure function so the pacing
+/// decision can be asserted exactly, instead of inferred from a wall-clock
+/// upper bound on a whole `read()`. Such bounds measure the machine as
+/// much as the code and are flake-prone on a loaded CI runner -- the
+/// `--features hpsdr` job in particular runs this module's tests inside a
+/// far heavier `manta-input` test binary (every UDP-loopback HPSDR test
+/// too) than the default job does.
+fn pacing_delay(delivered: u64, fs: f64, elapsed: Duration) -> Option<Duration> {
+    let due = Duration::from_secs_f64(delivered as f64 / fs);
+    if due > elapsed {
+        Some(due - elapsed)
+    } else {
+        None
+    }
+}
+
 impl IqSource for PacedSource {
     fn sample_rate(&self) -> f64 {
         self.inner.sample_rate()
@@ -52,10 +73,8 @@ impl IqSource for PacedSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        let due = Duration::from_secs_f64(self.delivered as f64 / self.fs);
-        let elapsed = self.start.elapsed();
-        if due > elapsed {
-            std::thread::sleep(due - elapsed);
+        if let Some(delay) = pacing_delay(self.delivered, self.fs, self.start.elapsed()) {
+            std::thread::sleep(delay);
         }
         let n = self.inner.read(buf)?;
         self.delivered += n as u64;
@@ -167,14 +186,28 @@ mod tests {
         };
         let mut paced = PacedSource::new(Box::new(slow));
         let mut buf = vec![Complex32::new(0.0, 0.0); 800];
-        let start = Instant::now();
         assert_eq!(paced.read(&mut buf).unwrap(), 800);
-        // If pacing compounded (summed) with the artificial delay, this
-        // would take ~0.3s+; degrading to unpaced keeps it close to 0.2s.
-        assert!(
-            start.elapsed() < Duration::from_millis(280),
-            "elapsed {:?} suggests pacing compounded with the consumer delay",
-            start.elapsed()
+        // Asserted on the pacing DECISION, not on a wall-clock upper bound
+        // for the whole call: `elapsed` is already >= the inner source's
+        // own 200ms by the time `read()` returns, while the recording is
+        // only worth 800/8000 = 100ms, so the next read's delay is
+        // guaranteed to be None on any machine at any load. A `<280ms`
+        // bound on the whole call asserted the same thing but could be
+        // broken by an oversubscribed CI runner overshooting the 200ms
+        // sleep rather than by pacing compounding.
+        assert_eq!(
+            pacing_delay(paced.delivered, paced.fs, paced.start.elapsed()),
+            None,
+            "pacing must ask for no delay once the consumer has fallen behind"
+        );
+        // The pure decision itself, pinned exactly: 100ms of recording
+        // delivered, 200ms of wall-clock spent -- no delay, and no
+        // compounding of the two.
+        assert_eq!(pacing_delay(800, 8000.0, Duration::from_millis(200)), None);
+        assert_eq!(
+            pacing_delay(800, 8000.0, Duration::from_millis(40)),
+            Some(Duration::from_millis(60)),
+            "when the consumer is AHEAD, the delay is the remaining debt only"
         );
     }
 
@@ -189,8 +222,24 @@ mod tests {
         let mut paced = PacedSource::new(Box::new(src));
         let mut buf = vec![Complex32::new(0.0, 0.0); 5];
         assert_eq!(paced.read(&mut buf).unwrap(), 5);
-        let start = Instant::now();
         assert_eq!(paced.read(&mut buf).unwrap(), 0);
-        assert!(start.elapsed() < Duration::from_millis(50));
+        // EOF must not advance the delivered counter, or every further
+        // read at EOF would accrue a larger and larger sleep debt against
+        // a source that has nothing left to give. Asserted on the counter
+        // and on the pacing decision rather than on a wall-clock upper
+        // bound for the EOF read, which a loaded CI runner can break for
+        // reasons that have nothing to do with pacing.
+        assert_eq!(paced.delivered, 5, "EOF must not advance `delivered`");
+        // The whole debt a 5-sample read at 8 kS/s can ever ask for is
+        // 5/8000 s, and it is already spent by the time EOF is reached.
+        assert_eq!(
+            pacing_delay(5, 8000.0, Duration::ZERO),
+            Some(Duration::from_secs_f64(5.0 / 8000.0))
+        );
+        assert_eq!(
+            pacing_delay(paced.delivered, paced.fs, paced.start.elapsed()),
+            None,
+            "the 625us debt is long spent -- EOF reads must not sleep"
+        );
     }
 }
