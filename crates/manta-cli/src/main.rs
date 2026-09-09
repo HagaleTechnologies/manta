@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -55,9 +55,8 @@ enum Command {
         #[arg(long)]
         notch: Option<PathBuf>,
         /// Decode engine (SPEC v2 §0): `legacy` (default) or `edge-legacy`.
-        /// (`hsmm` is a recognized `Engine` variant but not implemented yet
-        /// -- Task 8 -- and is rejected here with a clean error rather than
-        /// accepted and left to panic mid-decode.)
+        /// (`hsmm` is a fully implemented `Engine` variant since Task 8 but
+        /// not yet enabled on this command -- see `parse_engine`.)
         #[arg(long, default_value = "legacy", value_parser = parse_engine)]
         engine: Engine,
     },
@@ -202,6 +201,16 @@ enum Command {
         /// this machine's copy of the file happens to say."
         #[arg(long, value_parser = parse_replay_epoch)]
         replay_epoch: Option<i64>,
+        /// Decode engine (SPEC v2 §0): `legacy` (default) or `edge-legacy`.
+        /// (`hsmm` is a recognized `Engine` variant, implemented since Task
+        /// 8, but not yet enabled on a production-facing command -- see
+        /// `parse_engine`.) Unset (rather than defaulting to `legacy`) so
+        /// an explicit flag can be told apart from an absent one: when
+        /// `--server-config`'s `[decode]` table also sets `engine`, this
+        /// flag takes precedence over it when given, and the file's value
+        /// is the baseline otherwise (SPEC v2 §7).
+        #[arg(long, value_parser = parse_engine)]
+        engine: Option<Engine>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -453,14 +462,15 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
 
 fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
     let engine: Engine = s.parse()?;
-    // `Engine::Hsmm` is a real enum variant (needed by manta-decode's
-    // internal engine dispatch) but `TrackDecoder::push_hop_hsmm` is still
-    // `unimplemented!("Task 8")` -- accepting it here would let a user pass
-    // `--engine hsmm` and get a panic on the first hop instead of a clean
-    // error, since the brief's "not reachable from any test" assumption
-    // stops holding once a real CLI flag exists.
+    // `Engine::Hsmm` is a real, fully implemented engine (Task 8:
+    // `TrackDecoder::push_hop_hsmm`) -- this is no longer a
+    // not-implemented-yet guard. It stays rejected here because enabling
+    // `--engine hsmm` on a production-facing command is a bigger decision
+    // (rollout/support posture, not code-readiness) than any single task's
+    // scope; nothing in the plan has made that call yet. Lift this once
+    // that decision is made, not before.
     if engine == Engine::Hsmm {
-        return Err("the hsmm engine is not implemented yet (Task 8)".to_string());
+        return Err("the hsmm engine is not enabled on this command yet".to_string());
     }
     Ok(engine)
 }
@@ -734,6 +744,44 @@ fn build_pipeline_config(
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
     }
     Ok(cfg)
+}
+
+/// Loads the `[decode]` TOML table (SPEC v2 §7) from `--server-config`, if
+/// given, into a full `manta_decode::decoder::DecodeConfig`. Parses the
+/// same file's raw text a SECOND time, independent of
+/// `manta_server::config::DaemonConfigFile` -- that struct deliberately
+/// does not model `[decode]` (see its own doc comment), and re-parsing the
+/// same text into a separately-modeled top-level table is the existing
+/// pattern for this unified daemon config (`ServerConfig`/`RbnUplinkConfig`
+/// already work this way). `Ok(DecodeConfig::default())` when no
+/// `--server-config` path is given, matching `PipelineConfig::default()`'s
+/// own decode baseline.
+fn load_decode_config_file(
+    server_config: Option<&Path>,
+) -> Result<manta_decode::decoder::DecodeConfig> {
+    let Some(path) = server_config else {
+        return Ok(manta_decode::decoder::DecodeConfig::default());
+    };
+    let cfg_text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading --server-config {}", path.display()))?;
+    let file: manta_decode::config_file::DecodeConfigFile = toml::from_str(&cfg_text)
+        .with_context(|| format!("parsing [decode] table in {}", path.display()))?;
+    Ok(file.decode.into_decode_config())
+}
+
+/// SPEC v2 §7: an explicit `--engine` flag overrides the `[decode]` table's
+/// `engine` key; the file's value (or `Engine::Legacy` if there's no
+/// `--server-config`/no `[decode]` table) is the baseline otherwise. Every
+/// other `DecodeConfig` field always comes from `file_decode` (i.e. from
+/// the file, or its defaults) -- there is no CLI flag for them.
+fn merge_cli_engine(
+    cli_engine: Option<Engine>,
+    mut file_decode: manta_decode::decoder::DecodeConfig,
+) -> manta_decode::decoder::DecodeConfig {
+    if let Some(engine) = cli_engine {
+        file_decode.engine = engine;
+    }
+    file_decode
 }
 
 /// Handles the `Listen` on-spot closure needs to feed a running spot server.
@@ -1074,6 +1122,7 @@ fn main() -> Result<()> {
             server_config,
             dial_freq_hz,
             replay_epoch,
+            engine,
         } => {
             let is_file_replay = source.is_some();
             // Captured before `open_source` consumes `source` below --
@@ -1115,13 +1164,19 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(
+            // SPEC v2 §7: `[decode]` (from --server-config, if given) is
+            // the baseline; an explicit --engine overrides just its
+            // `engine` key (merge_cli_engine).
+            let decode_from_file = load_decode_config_file(server_config.as_deref())?;
+            let decode_cfg = merge_cli_engine(engine, decode_from_file);
+            let mut cfg = build_pipeline_config(
                 freq_correction_ppm,
                 allowlist,
                 blocklist,
                 notch,
-                Engine::Legacy,
+                decode_cfg.engine,
             )?;
+            cfg.decode = decode_cfg;
             #[cfg(feature = "hpsdr")]
             let hpsdr_source = open_hpsdr_source(HpsdrOpts {
                 host: hpsdr_host,
@@ -1410,6 +1465,70 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn merge_cli_engine_prefers_the_explicit_cli_flag_over_the_file() {
+        // SPEC v2 §7: --engine overrides [decode]'s engine key when both
+        // are given -- this is the exact precedence rule Command::Listen's
+        // handler relies on `merge_cli_engine` for.
+        let file_decode = manta_decode::decoder::DecodeConfig {
+            engine: Engine::Legacy,
+            ..manta_decode::decoder::DecodeConfig::default()
+        };
+        let resolved = merge_cli_engine(Some(Engine::EdgeLegacy), file_decode);
+        assert_eq!(resolved.engine, Engine::EdgeLegacy);
+    }
+
+    #[test]
+    fn merge_cli_engine_falls_back_to_the_file_engine_when_the_flag_is_absent() {
+        let file_decode = manta_decode::decoder::DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..manta_decode::decoder::DecodeConfig::default()
+        };
+        let resolved = merge_cli_engine(None, file_decode);
+        assert_eq!(resolved.engine, Engine::EdgeLegacy);
+    }
+
+    #[test]
+    fn merge_cli_engine_leaves_every_other_decode_field_from_the_file_untouched() {
+        // The CLI has no flag for sigma_u/beam/etc. -- only `engine` may be
+        // overridden; everything else must come through verbatim from the
+        // file-derived DecodeConfig.
+        let mut file_decode = manta_decode::decoder::DecodeConfig::default();
+        file_decode.evidence.sigma_u = 0.31;
+        file_decode.hsmm.beam = 10;
+        let resolved = merge_cli_engine(Some(Engine::EdgeLegacy), file_decode);
+        assert_eq!(resolved.evidence.sigma_u, 0.31);
+        assert_eq!(resolved.hsmm.beam, 10);
+    }
+
+    #[test]
+    fn load_decode_config_file_defaults_when_no_server_config_given() {
+        let cfg = load_decode_config_file(None).unwrap();
+        assert_eq!(cfg.engine, Engine::Legacy);
+        assert_eq!(
+            cfg.evidence.sigma_u,
+            manta_decode::evidence::EvidenceConfig::default().sigma_u
+        );
+    }
+
+    #[test]
+    fn load_decode_config_file_reads_the_decode_table_from_server_config() {
+        let f = write_temp_file(
+            br#"
+            [server]
+            station_callsign = "W3XYZ"
+            [decode]
+            engine = "edge-legacy"
+            sigma_u = 0.31
+            beam = 10
+            "#,
+        );
+        let cfg = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(cfg.engine, Engine::EdgeLegacy);
+        assert_eq!(cfg.evidence.sigma_u, 0.31);
+        assert_eq!(cfg.hsmm.beam, 10);
     }
 
     #[test]

@@ -905,6 +905,7 @@ dependencies = [
  "approx",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

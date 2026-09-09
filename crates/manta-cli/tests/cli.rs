@@ -73,11 +73,10 @@ fn unknown_vector_errors() {
     assert!(!out.status.success());
 }
 
-/// `Engine::Hsmm` is a real enum variant (`manta-decode`'s internal engine
-/// dispatch needs it) but `TrackDecoder::push_hop_hsmm` is still
-/// `unimplemented!("Task 8")`. `--engine hsmm` must be rejected as a clean
-/// clap argument error before any pipeline/decode work starts -- never
-/// accepted and left to panic on the first hop.
+/// `Engine::Hsmm` is a fully implemented engine since Task 8
+/// (`TrackDecoder::push_hop_hsmm`), but not yet enabled on this command --
+/// see `parse_engine`. `--engine hsmm` must be rejected as a clean clap
+/// argument error before any pipeline/decode work starts.
 #[test]
 fn engine_hsmm_is_a_clean_error_not_a_panic() {
     // clap's own value_parser rejects "hsmm" before any file I/O or decode
@@ -138,6 +137,66 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+}
+
+/// SPEC v2 §0/§7: `manta listen` gets the same `--engine` flag `manta
+/// decode` already has (Task 6), threaded through to the same
+/// `PipelineConfig`/`DecodeConfig` `manta_engine::listen` reads (Task 9).
+/// A full decode-success run (as `decode_accepts_engine_flag`, Task 9
+/// brief, does for `decode`) isn't used here: `--source` requires a real
+/// 48 kHz mono audio WAV (`AudioIqSource`, not `decode`'s 96 kHz complex-IQ
+/// vector format), and a synthetic clean one hits a pre-existing,
+/// `#[ignore]`'d `AudioIqSource`/Hilbert near-DC leakage bug
+/// (`manta-engine`'s `listen_decodes_a_clean_real_audio_signal`,
+/// <https://github.com/HagaleTechnologies/manta/issues/21>) that spuriously
+/// promotes extra tracks -- not something Task 9 should newly depend on
+/// being fixed. Instead: for each valid engine value, confirm clap accepts
+/// the flag (exit code is NOT clap's arg-error 2) and the run fails for the
+/// EXPECTED downstream reason (the nonexistent source file), proving
+/// `--engine` parsed successfully and `merge_cli_engine`/
+/// `load_decode_config_file` ran without erroring before ever reaching
+/// `open_source`.
+#[test]
+fn listen_accepts_engine_flag_for_every_valid_value() {
+    for engine in ["legacy", "edge-legacy"] {
+        let out = manta()
+            .args(["listen", "--engine", engine, "--source", "/nonexistent.wav"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{engine}: expected a failure");
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "{engine}: --engine must not be rejected as a bad argument"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+            "{engine}: expected the nonexistent-source-file error, got: {stderr}"
+        );
+    }
+}
+
+/// Same restriction as `decode`'s `engine_hsmm_is_a_clean_error_not_a_panic`
+/// (`parse_engine` is shared by both commands' `--engine` value parser) --
+/// `listen --engine hsmm` must fail the same clean, pre-pipeline way.
+#[test]
+fn listen_engine_hsmm_is_a_clean_error_not_a_panic() {
+    let out = manta()
+        .args(["listen", "--engine", "hsmm", "--source", "/nonexistent.wav"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected --engine hsmm to be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "must not panic; stderr: {stderr}"
+    );
+    assert!(stderr.contains("hsmm"), "stderr: {stderr}");
+    assert_eq!(out.status.code(), Some(2), "clap arg-error exit code");
 }
 
 #[test]

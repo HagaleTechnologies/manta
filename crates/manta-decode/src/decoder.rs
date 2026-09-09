@@ -50,6 +50,13 @@ pub struct DecodeConfig {
     pub noise: NoiseConfig,
     /// SPEC v2 §4: `Hsmm` token-passing decoder tunables.
     pub hsmm: HsmmConfig,
+    /// SPEC v2 §3/§7 `decode.refine_bw_hz`: narrowband refiner bandwidth in
+    /// Hz (0 = off, the default). Reserved -- not yet wired to any effect.
+    /// The refiner itself (`manta-dsp::refine::Refiner`) and its
+    /// `manta-engine` call site are a later task (MAN-168); this field
+    /// exists now so config plumbing (SPEC v2 §7) covers the full key list
+    /// ahead of that wiring landing.
+    pub refine_bw_hz: f32,
 }
 
 // Manual impl: a derived Default would zero flush_gap_dits.
@@ -63,6 +70,7 @@ impl Default for DecodeConfig {
             evidence: EvidenceConfig::default(),
             noise: NoiseConfig::default(),
             hsmm: HsmmConfig::default(),
+            refine_bw_hz: 0.0,
         }
     }
 }
