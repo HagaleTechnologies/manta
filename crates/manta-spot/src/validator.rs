@@ -196,7 +196,27 @@ pub struct Validator {
     /// whole `Validator`, matching SPEC-decode-core.md §6 rule 2
     /// (sample_ts-based, never wall clock).
     now_ts: u64,
+    /// `now_ts` as of the last `gate.sweep()` call (Codex review, PR
+    /// #152). `TrackClosed` alone isn't a sufficient sweep trigger: a
+    /// persistently-active track that never closes (e.g. real noise/QRM
+    /// continually feeding it new plausible-but-wrong callsigns, each
+    /// resetting its own silent-GC timer) would otherwise let the gate
+    /// grow unbounded for as long as it stays open, even though
+    /// `now_ts` itself keeps advancing correctly. `maybe_sweep` also
+    /// runs off every `now_ts`-bearing event, throttled by
+    /// `sweep_interval_samples` so a busy pipeline doesn't pay for an
+    /// O(gate size) scan on every single character.
+    last_swept_ts: u64,
+    sweep_interval_samples: u64,
 }
+
+/// How often (in seconds of `sample_ts`) the repetition gate is swept
+/// independent of any `TrackClosed` event (MAN-166, Codex review PR
+/// #152). Small relative to the gate's own 90s window (`gate::
+/// WINDOW_SECONDS`) so a persistently-open, never-closing track can't
+/// let it grow far past its steady-state size before the next sweep --
+/// a reasoned choice, not yet measured against real long-run data.
+const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
 
 impl Validator {
     pub fn new(fs: f64, cty_dat: &str, master_scp: Option<&str>) -> Self {
@@ -212,6 +232,31 @@ impl Validator {
             notch: NotchList::default(),
             suppression_counts: SuppressionCounts::default(),
             now_ts: 0,
+            last_swept_ts: 0,
+            sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
+        }
+    }
+
+    /// Advances `now_ts` to `sample_ts` (if later), then `maybe_sweep`s.
+    /// Called from every event carrying a real `sample_ts` -- see
+    /// `now_ts`'s doc for why `TrackClosed` alone isn't a sufficient
+    /// sweep trigger on its own.
+    fn advance_clock(&mut self, sample_ts: u64) {
+        self.now_ts = self.now_ts.max(sample_ts);
+        self.maybe_sweep();
+    }
+
+    /// Sweeps the repetition gate if `sweep_interval_samples` has elapsed
+    /// since the last sweep -- throttled the same way regardless of
+    /// caller, `TrackClosed` included: under real sustained track churn
+    /// (tens of thousands of closes in a 15-minute recording, MAN-166) an
+    /// *unthrottled* per-close sweep would mean an O(gate size) scan on
+    /// every single close, reintroducing the cost problem periodic
+    /// sweeping exists to bound.
+    fn maybe_sweep(&mut self) {
+        if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
+            self.gate.sweep(self.now_ts);
+            self.last_swept_ts = self.now_ts;
         }
     }
 
@@ -287,7 +332,7 @@ impl Validator {
                 confidence,
                 sample_ts,
             } => {
-                self.now_ts = self.now_ts.max(*sample_ts);
+                self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
                 match glyph {
                     Glyph::Char(c) => {
@@ -308,7 +353,7 @@ impl Validator {
                 track_id,
                 sample_ts,
             } => {
-                self.now_ts = self.now_ts.max(*sample_ts);
+                self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
@@ -356,7 +401,7 @@ impl Validator {
             // exists to surface) creates no per-track_id state here to
             // leak.
             DecoderEvent::TrackPromoted { sample_ts, .. } => {
-                self.now_ts = self.now_ts.max(*sample_ts);
+                self.advance_clock(*sample_ts);
                 Vec::new()
             }
             DecoderEvent::TrackClosed { track_id } => {
@@ -374,23 +419,18 @@ impl Validator {
                 // across the churn this event represents -- forgetting it
                 // here, the way `self.tracks` correctly is, would defeat
                 // the gate's whole 90s window the instant a track closed.
-                // `sweep` still bounds `gate`'s memory the way MAN-19
-                // needed, just on elapsed time instead of track lifetime.
-                // Uses `self.now_ts` (Codex review, PR #152), not this
-                // closing track's own `last_sample_ts`: a track that
-                // emitted metadata but no `WordBoundary` still has
-                // `last_sample_ts == 0`, and sweeping with that stale
-                // value is a no-op (`sweep`'s cutoff saturates to 0),
-                // leaving every *other* genuinely-expired gate entry to
-                // grow unbounded forever -- reintroducing the exact
-                // MAN-19 leak this mechanism exists to prevent.
-                // `now_ts` is the latest `sample_ts` seen across every
-                // event this `Validator` has ever ingested, so it's
-                // monotonic regardless of which specific track is
-                // closing (SPEC-decode-core.md §6 rule 2: sample_ts-based,
-                // never wall clock).
+                // `maybe_sweep` still bounds `gate`'s memory the way
+                // MAN-19 needed, just on elapsed time instead of track
+                // lifetime -- and unlike this event alone (Codex review,
+                // PR #152), it also runs off every other `sample_ts`-
+                // bearing event via `advance_clock`, so a persistently-
+                // active track that never closes at all still gets swept.
+                // See `now_ts`'s and `maybe_sweep`'s own docs for why a
+                // closing track's own (possibly stale/zero)
+                // `last_sample_ts` was never a safe sweep reference on its
+                // own.
                 self.tracks.remove(track_id);
-                self.gate.sweep(self.now_ts);
+                self.maybe_sweep();
                 Vec::new()
             }
         }
@@ -1196,6 +1236,34 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             v.gate.len(),
             0,
             "gate must not accumulate one entry per historical frequency once genuinely swept past the window"
+        );
+    }
+
+    /// Codex review, PR #152: a persistently-active track that never
+    /// closes (e.g. real noise/QRM continually feeding it new plausible-
+    /// but-wrong callsigns, each resetting its own silent-GC timer so it
+    /// never emits `TrackClosed`) must not let the gate grow unbounded
+    /// just because sweep was only ever wired to that one event -- it
+    /// must also run periodically off the same monotonic clock.
+    #[test]
+    fn gate_sweeps_periodically_even_when_no_track_ever_closes() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // one persistent track_id, never closed below
+
+        // 500 distinct plausible callsigns on the same never-closing
+        // track, spaced ~1.04s apart -- comfortably past both the
+        // repetition gate's own window and any reasonable sweep interval
+        // by the end of the loop, all without a single TrackClosed.
+        for i in 0..500u32 {
+            let call = format!("K{i}Y");
+            let words = ["DE", &call, "K"];
+            run(&transmission_events(1, &words, i as u64 * 100_000), &mut v);
+        }
+
+        assert!(
+            v.gate.len() < 100,
+            "gate must be swept periodically even with no TrackClosed at all, not just accumulate one entry per historical callsign (got {})",
+            v.gate.len()
         );
     }
 }

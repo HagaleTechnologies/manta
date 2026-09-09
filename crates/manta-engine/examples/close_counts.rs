@@ -13,6 +13,14 @@ use manta_input::WavIqSource;
 use std::path::Path;
 use std::time::Duration;
 
+/// Generous enough that no real recording plausible for this corpus
+/// (ARCHITECTURE.md's audio-corpus scope) should ever hit it, but a hard
+/// cap on a WAV file that hangs is still real: without one, this tool
+/// would just block forever instead of failing loudly (Codex review, PR
+/// #152, on the previous 1h cap silently truncating a slower-than-1h
+/// run's report with no indication it had happened at all).
+const MAX_DURATION: Duration = Duration::from_secs(24 * 3600);
+
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("usage: close_counts <wav>");
     let src = WavIqSource::open(Path::new(&path))?;
@@ -20,10 +28,21 @@ fn main() -> anyhow::Result<()> {
     let report = soak_with_metrics(
         Box::new(src),
         &cfg,
-        Duration::from_secs(3600),
-        Duration::from_secs(3600),
+        MAX_DURATION,
+        MAX_DURATION,
         |_sample| {},
     )?;
+    // soak_with_metrics's watchdog stops processing once `duration`
+    // elapses regardless of whether the source reached EOF -- if that's
+    // what happened here, every count below is a partial report of an
+    // arbitrarily-truncated prefix of the file, not the whole thing, and
+    // must not be read as if it were.
+    if report.duration_actual >= MAX_DURATION {
+        anyhow::bail!(
+            "hit the {MAX_DURATION:?} processing cap before the file finished -- \
+             every count above is a PARTIAL report of a truncated prefix, not the whole file"
+        );
+    }
     println!("{:#?}", report);
     Ok(())
 }
