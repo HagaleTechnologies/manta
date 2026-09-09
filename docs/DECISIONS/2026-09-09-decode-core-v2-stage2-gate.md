@@ -62,15 +62,15 @@ enough to clear the raised stage-2 bar (60 %/40 %, vs stage-1's 45 %/no
 ## 2. RBN spot recall/precision, B2 recording, full 15-minute decode
 
 `cargo run --release -p manta-cli -- decode --json --engine <engine> <B2
-wav>` (legacy: 743.8 s real / 634.8 s user / 88.5 s sys; hsmm: 889.9 s
-real / 2501.6 s user / 87.5 s sys -- hsmm uses ~1.2x the wall time
+wav>` -- legacy: 743.8 s real / 634.8 s user / 88.5 s sys; hsmm: 889.9 s
+real / 2501.6 s user / 87.5 s sys. Hsmm uses ~1.2x the wall time
 (889.9/743.8) and ~3.9x the CPU time (2501.6/634.8) of legacy on this
-~15-minute recording. hsmm's own user-time/real-time ratio here (2501.6/889.9
-= ~2.8x) shows it parallelizing across multiple cores, not a
-comparison to legacy. Both the elevated CPU time and the parallelism
-are consistent with the CPU-budget overage measured in §6 below), scored with
-`scripts/score-against-rbn.py --capture-start 2025-11-29T00:00:00Z
---sample-rate-hz 192000`.
+~15-minute recording. Hsmm's own user-time/real-time ratio here
+(2501.6/889.9 = ~2.8x) shows it parallelizing across multiple cores; this
+is not a comparison to legacy. Both the elevated CPU time and the
+parallelism are consistent with the CPU-budget overage measured in §6
+below. Scored with `scripts/score-against-rbn.py --capture-start
+2025-11-29T00:00:00Z --sample-rate-hz 192000`.
 
 **This branch's own `scripts/score-against-rbn.py` is currently a stub**
 (commit `2357a80`, "score RBN benchmark against a single spotter") that
@@ -106,7 +106,9 @@ divides K5TR-attributed true positives by the *total* spot count (197 /
 spot that K5TR simply never heard (e.g. a station too weak for K5TR's
 own antenna/receiver, or on a band K5TR wasn't skimming that moment)
 counts as a false positive here even though it isn't one against the
-full RBN set. All-RBN precision above is the real precision figure.
+full RBN set. All-RBN precision above is the better-founded figure, though
+still bounded below by RBN's own truth incompleteness -- a correct decode
+no spotter happened to hear also counts as a false positive there.
 
 Legacy's all-RBN 29.9 % precision / 4.1 % recall matches this project's
 prior historical measurement (`docs/DECISIONS/2026-09-09-decoder-recall-research.md`
@@ -280,9 +282,9 @@ SPEC v2 §8.4 stage 2 requires ALL of: oracle `as_word >= 60 %`, `framed
 | determinism | pass |
 | CPU budget | FAIL (4.25x over, MAN-171) |
 
-**Overall: FAIL.** Five of six sub-gates fail (only determinism passes),
-three of them (oracle x2, V/VR correctness) by a wide margin, not a
-near-miss. Hsmm is a
+**Overall: FAIL.** Five of six sub-gates fail (only determinism passes).
+Oracle `as_word`/`framed`, V1-V10, and VR1-VR8 all fail by a wide margin,
+not a near-miss; CPU budget also fails, at 4.25x over. Hsmm is a
 substantial, real improvement over `legacy` on every headline metric
 measured (oracle as_word/framed roughly doubled, RBN recall roughly
 doubled), but is not yet ready to be the default engine, and does not
