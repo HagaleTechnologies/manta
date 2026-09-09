@@ -35,6 +35,13 @@ pub struct SignalSpec {
     /// Raised-cosine rise/fall for this signal's keying, threaded into
     /// `KeyerSpec::rise_ms`. SPEC v2 §8.2 VR4 (0.5 ms "hard edges"). 5.0 ms
     /// (standard) for every vector before VR4.
+    ///
+    /// This is a true per-signal knob only for callers that build
+    /// `SignalSpec`s and call `render_scene` directly. A signal reached via
+    /// `VectorSpec::render()`/`render_v9_drift()` has this value silently
+    /// overridden by `VectorSpec::rise_ms` (see that field's doc comment) --
+    /// there is currently no way to give two signals in the same
+    /// `VectorSpec`-based vector different edge shapes.
     pub rise_ms: f64,
 }
 

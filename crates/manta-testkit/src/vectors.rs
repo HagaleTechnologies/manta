@@ -20,10 +20,17 @@ pub struct VectorSpec {
     pub center_freq_hz: f64,
     pub noise_seed: u64,
     pub signals: Vec<SignalSpec>,
-    /// Scene-wide raised-cosine rise/fall, overriding every signal's own
-    /// `SignalSpec::rise_ms` at render time (`render`/`render_v9_drift`).
-    /// SPEC v2 §8.2 VR4 ("hard-edges", 0.5 ms). 5.0 ms (standard) for every
-    /// vector before VR4.
+    /// Scene-wide raised-cosine rise/fall, silently overriding every
+    /// signal's own `SignalSpec::rise_ms` at render time
+    /// (`render`/`render_v9_drift`) -- there is currently no way to give
+    /// two signals in the same vector different edge shapes; a future
+    /// vector needing that must call `render_scene` directly instead of
+    /// going through `VectorSpec`. SPEC v2 §8.2 VR4 ("hard-edges", 0.5 ms).
+    /// 5.0 ms (standard) for every vector before VR4. `render`/
+    /// `render_v9_drift` each carry a `debug_assert!` that every signal's
+    /// `rise_ms` already matches this field, as a safety net against this
+    /// override silently discarding a per-signal value someone set by
+    /// mistake.
     pub rise_ms: f64,
 }
 
@@ -631,6 +638,17 @@ pub struct RenderedVector {
 /// Render a VectorSpec to samples + ground truth. SPEC §7. `spec.rise_ms`
 /// overrides every signal's own `SignalSpec::rise_ms` (SPEC v2 §8.2 VR4).
 pub fn render(spec: &VectorSpec) -> Result<RenderedVector> {
+    for s in &spec.signals {
+        debug_assert!(
+            s.rise_ms == spec.rise_ms,
+            "SignalSpec.rise_ms ({}) differs from VectorSpec.rise_ms ({}) -- \
+             the vector-level value silently wins; if you need true \
+             per-signal edge shapes, use render_scene directly instead of \
+             VectorSpec::render()",
+            s.rise_ms,
+            spec.rise_ms
+        );
+    }
     let signals: Vec<SignalSpec> = spec
         .signals
         .iter()
@@ -656,6 +674,15 @@ pub fn render_v9_drift(spec: &VectorSpec) -> Result<RenderedVector> {
     const DRIFT_HZ_PER_MIN: f64 = 50.0;
     const STEP_S: f64 = 2.0;
     let sig = &spec.signals[0];
+    debug_assert!(
+        sig.rise_ms == spec.rise_ms,
+        "SignalSpec.rise_ms ({}) differs from VectorSpec.rise_ms ({}) -- \
+         the vector-level value silently wins; if you need true per-signal \
+         edge shapes, use render_scene directly instead of \
+         VectorSpec::render_v9_drift()",
+        sig.rise_ms,
+        spec.rise_ms
+    );
     let n_steps = (spec.duration_s / STEP_S).round() as usize;
     let mut samples = Vec::new();
     let mut keyed_text = String::new();
