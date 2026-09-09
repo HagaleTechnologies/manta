@@ -113,6 +113,26 @@ impl TrackDecoder {
                 });
             }
         }
+        // Unconditional final report, bypassing WPM_REPORT_DELTA -- a
+        // consumer that gates a decision on the track's true final speed
+        // (manta-spot's Beacon-WPM plausibility check, added PR #154) has
+        // no other event to observe it on. The live >= 1 WPM throttle
+        // above exists to reduce mid-stream chatter and stays as-is; this
+        // is an addition for track finalization only, not a change to
+        // live reporting (Codex review on PR #154, round 4: the tracker's
+        // speed can settle across a threshold-relevant boundary the live
+        // throttle was never designed to catch, e.g. 45.6 -> 44.9 WPM,
+        // and a short single-transmission track like a beacon ID may
+        // never produce another WordBoundary to retry on naturally).
+        if let Some(w) = self.tracker.wpm() {
+            if self.last_reported_wpm != Some(w) {
+                self.last_reported_wpm = Some(w);
+                events.push(DecoderEvent::SpeedUpdate {
+                    track_id: self.track_id,
+                    wpm: w,
+                });
+            }
+        }
         events
     }
 
@@ -348,6 +368,38 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, DecoderEvent::TrackMeta { freq_hz, .. } if *freq_hz == 14_012_340.0)
         ));
+    }
+
+    /// Codex review on PR #154, round 4: the live path (`process_run`)
+    /// only reports a `SpeedUpdate` on a >= `WPM_REPORT_DELTA` change from
+    /// the last REPORTED value, so a track whose true estimate settles by
+    /// less than that delta never gets a correcting report -- a consumer
+    /// gating a decision on the track's true final speed (manta-spot's
+    /// Beacon-WPM check) has no other event to observe it on for a short,
+    /// single-transmission track. `finish()` must flush the true value
+    /// unconditionally.
+    #[test]
+    fn finish_flushes_a_final_speed_update_even_below_the_report_delta() {
+        let env = rect_envelope("CQ CQ DE W1AW W1AW K", 18);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let wpm_now = dec.tracker.wpm().expect("tracker must be ready by now");
+        // Pretend the last LIVE report already claimed a value stale by
+        // less than WPM_REPORT_DELTA -- the live path would never correct
+        // this on its own.
+        dec.last_reported_wpm = Some(wpm_now + (WPM_REPORT_DELTA - 0.1));
+
+        let finish_events = dec.finish();
+        assert!(
+            finish_events.iter().any(
+                |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - wpm_now).abs() < 0.01)
+            ),
+            "finish() must flush the true final wpm even when it's within \
+             WPM_REPORT_DELTA of the last reported value, got {finish_events:?}"
+        );
     }
 
     #[test]
