@@ -151,19 +151,29 @@ def parse_iso(s):
     return dt
 
 
-def _finite_non_negative(name):
-    """argparse type for a tolerance option: rejects non-finite (nan/inf)
-    and negative values (Codex review, PR #144) -- `x > nan` is always
-    False in Python, so an un-validated `--time-tol-s nan` would silently
-    disable the time bound entirely (any spot, arbitrarily far from a
-    truth observation, would pass), and a negative tolerance would
-    silently reject even an exact (0-second/0-Hz) match."""
+def _finite(name, *, min_exclusive=None, min_inclusive=None):
+    """argparse type for a numeric option: rejects non-finite (nan/inf)
+    values, plus an optional lower bound (Codex review, PR #144). Without
+    this, `x > nan` is always False in Python, so e.g. an un-validated
+    `--time-tol-s nan` would silently disable the time bound entirely
+    (any spot, arbitrarily far from a truth observation, would pass); a
+    negative tolerance would silently reject even an exact match; and a
+    zero or negative `--sample-rate-hz` would crash or corrupt every
+    spot's derived time (dividing `sample_ts` by it)."""
     def parse(s):
         v = float(s)
-        if not (v == v) or v in (float("inf"), float("-inf")) or v < 0:
-            raise argparse.ArgumentTypeError(
-                f"{name} must be a finite, non-negative number, got {s!r}"
+        finite = (v == v) and v not in (float("inf"), float("-inf"))
+        in_bounds = finite and (
+            (min_exclusive is None or v > min_exclusive)
+            and (min_inclusive is None or v >= min_inclusive)
+        )
+        if not in_bounds:
+            bound = (
+                f"> {min_exclusive}" if min_exclusive is not None
+                else f">= {min_inclusive}" if min_inclusive is not None
+                else "finite"
             )
+            raise argparse.ArgumentTypeError(f"{name} must be finite and {bound}, got {s!r}")
         return v
     return parse
 
@@ -174,9 +184,9 @@ def main():
     ap.add_argument("rbn_truth_csv")
     ap.add_argument("--capture-start", required=True, type=parse_iso,
                      help="Recording's capture start, ISO-8601 UTC (e.g. 2025-11-29T00:00:00Z)")
-    ap.add_argument("--sample-rate-hz", required=True, type=float)
-    ap.add_argument("--freq-tol-hz", type=_finite_non_negative("--freq-tol-hz"), default=500.0)
-    ap.add_argument("--time-tol-s", type=_finite_non_negative("--time-tol-s"), default=90.0,
+    ap.add_argument("--sample-rate-hz", required=True, type=_finite("--sample-rate-hz", min_exclusive=0))
+    ap.add_argument("--freq-tol-hz", type=_finite("--freq-tol-hz", min_inclusive=0), default=500.0)
+    ap.add_argument("--time-tol-s", type=_finite("--time-tol-s", min_inclusive=0), default=90.0,
                      help="Max seconds between a manta spot and some real RBN observation of that call+freq (default: 90s, matching RepetitionGate's own window)")
     ap.add_argument("--show-samples", type=int, default=10)
     args = ap.parse_args()

@@ -63,7 +63,10 @@ and conversion tooling notes, not the bytes.
   identify the benchmark input; bit-depth/normalization choices in the
   conversion can shift weak-signal samples and so the reported spot
   count):
-  `ffmpeg -i B2_20251129_000000_7080kHz.wav -c:a pcm_s16le B2_20251129_000000_7080kHz.wav`
+  `ffmpeg -i B2_20251129_000000_7080kHz.source.wav -c:a pcm_s16le B2_20251129_000000_7080kHz.wav`
+  (distinct input/output paths -- ffmpeg refuses to edit a file in place;
+  rename the as-received source to the `.source.wav` stem above, or point
+  `-i` at wherever it actually lives, before running this)
   (source, as received from George K5TR, unmodified: SHA-256
   `74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2`;
   converted, this repo's benchmark input: SHA-256
