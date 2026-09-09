@@ -283,6 +283,69 @@ fn launchd_plist_carries_the_required_keys() {
     );
 }
 
+/// launchd stops a job with `SIGTERM`, which manta does not handle, so the
+/// only clean stop is to signal `SIGINT` and let it drain. Under an
+/// unconditional `KeepAlive` launchd relaunches manta the instant that
+/// drained process exits and the following `launchctl bootout` kills the
+/// *replacement* abruptly, so the conditional `SuccessfulExit=false` form
+/// is load-bearing for the documented stop sequence, not a style choice.
+#[test]
+fn launchd_keepalive_does_not_respawn_after_a_clean_drain() {
+    let text = read(PLIST);
+    let body: String = text
+        .split("<key>KeepAlive</key>")
+        .nth(1)
+        .expect("plist must set KeepAlive")
+        .split("</dict>")
+        .next()
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        body.starts_with("<dict><key>SuccessfulExit</key><false/>"),
+        "KeepAlive must be the conditional dict with SuccessfulExit=false, \
+         so a SIGINT drain (exit 0) is not immediately relaunched; found: \
+         {body}"
+    );
+}
+
+/// The path in `ProgramArguments[0]` is absolute and launchd searches no
+/// `PATH`, so the documented macOS install has to actually create it. A
+/// plist pointing at a binary the instructions never install bootstraps
+/// without error and then fails on every spawn.
+#[test]
+fn documented_macos_install_creates_the_plist_program_path() {
+    let plist = read(PLIST);
+    let program = plist
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .expect("plist must set ProgramArguments")
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("<string>")?
+                .strip_suffix("</string>")
+                .map(str::to_string)
+        })
+        .expect("ProgramArguments must open with the executable path");
+
+    let readme = read("packaging/README.md");
+    let section = readme
+        .split("## Installing on macOS")
+        .nth(1)
+        .expect("packaging/README.md must have a macOS install section");
+    let section = section.split("\n## ").next().unwrap();
+    assert!(
+        section.lines().map(str::trim).any(|l| {
+            l.starts_with("sudo install ")
+                && l.split_whitespace().next_back() == Some(program.as_str())
+        }),
+        "the macOS instructions never install the binary at `{program}`, \
+         the path the plist's ProgramArguments executes"
+    );
+}
+
 // ---------------------------------------------------------------- compose
 
 #[test]

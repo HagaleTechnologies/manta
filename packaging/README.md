@@ -58,12 +58,13 @@ the process manager escalates to `SIGKILL`.
 | --- | --- | --- |
 | systemd | `SIGTERM` by default | `KillSignal=SIGINT` in the shipped unit retargets it, mirroring the Dockerfile's own `STOPSIGNAL SIGINT`. |
 | Docker / Compose | the image's `STOPSIGNAL` | Already `SIGINT` (set in `Dockerfile` under MAN-21) — no compose-level override needed or wanted. |
-| launchd | `SIGTERM`, always | **No fix exists.** launchd has no `KillSignal=`-equivalent key; stop, logout, and reboot all send `SIGTERM` unconditionally. `launchctl bootout`/stop will kill manta abruptly until manta itself handles `SIGTERM`. `kill -INT <pid>` (found via `launchctl print gui/$(id -u)/com.hagaletechnologies.manta`) drains cleanly, but the shipped plist's `KeepAlive` is unconditional, so launchd relaunches manta the moment that drained process exits — see *Installing on macOS* below for the two-step sequence that actually stops it. |
+| launchd | `SIGTERM`, always | **No signal-level fix exists.** launchd has no `KillSignal=`-equivalent key; stop, logout, and reboot all send `SIGTERM` unconditionally, so `launchctl bootout`/`stop` on a *running* manta is abrupt until manta itself handles `SIGTERM`. The shipped plist works around it from the other side: `KeepAlive` is the conditional `SuccessfulExit=false` form, so signalling `SIGINT` yourself drains manta *and leaves it down* instead of triggering an instant relaunch — see *Installing on macOS* below for the sequence. |
 
 Once manta handles `SIGTERM` itself, `KillSignal=SIGINT` can be dropped
-from the systemd unit and this whole section shrinks to "manta drains
-within 27 s of any stop signal, so a 30 s grace period is enough" — both
-the unit and this file mark that removal point explicitly.
+from the systemd unit, the plist's `KeepAlive` can go back to a plain
+`<true/>`, and this whole section shrinks to "manta drains within 27 s of
+any stop signal, so a 30 s grace period is enough" — the unit, the plist
+and this file each mark that removal point explicitly.
 
 ## Validate your config before you install the unit
 
@@ -115,7 +116,14 @@ visible to `systemctl cat`/`ps`; use a password-free receiver, or an
 ## Installing on macOS (launchd)
 
 ```
-mkdir -p ~/Library/Application\ Support/manta ~/Library/LaunchAgents
+# The plist runs an absolute path and launchd searches no PATH, so the
+# binary has to be installed where ProgramArguments points, exactly as on
+# Linux. Release binaries are not code-signed or notarized, so clear the
+# download quarantine flag first or Gatekeeper blocks every spawn.
+xattr -d com.apple.quarantine ./manta 2>/dev/null || true
+sudo install -d -m 0755 /usr/local/bin
+sudo install -m 0755 ./manta /usr/local/bin/manta
+mkdir -p ~/Library/Application\ Support/manta ~/Library/LaunchAgents ~/Library/Logs
 cp manta.example.toml ~/Library/Application\ Support/manta/manta.toml
 $EDITOR ~/Library/Application\ Support/manta/manta.toml   # set station_callsign
 cp packaging/launchd/com.hagaletechnologies.manta.plist ~/Library/LaunchAgents/
@@ -131,19 +139,38 @@ LaunchDaemon can never be granted, so a LaunchAgent is the right default
 even for the shown KiwiSDR example, in case you later switch it to rig
 audio.
 
-Stopping it cleanly is two steps, in that order — the shipped plist's
-`KeepAlive` is unconditional, so a bare `kill -INT` drains manta and then
-launchd immediately relaunches it:
+Stopping it cleanly is two steps, in that order:
 
 ```
-$ kill -INT $(launchctl print gui/$(id -u)/com.hagaletechnologies.manta | awk '/pid = /{print $3}')
-# wait for it to exit (up to ExitTimeOut, 30s) -- this is the clean drain
+$ launchctl kill SIGINT gui/$(id -u)/com.hagaletechnologies.manta
+# manta drains and exits 0 (up to ExitTimeOut, 30s). KeepAlive is the
+# conditional SuccessfulExit=false form, so launchd treats that clean exit
+# as intentional and does NOT relaunch -- the job stays loaded but idle.
 $ launchctl bootout gui/$(id -u)/com.hagaletechnologies.manta
-# unloads the job so KeepAlive can't respawn it
+# unloads the job for good. Nothing is running by now, so this sends no
+# signal to anything.
 ```
 
-Running `launchctl bootout` by itself (skipping the `kill -INT` step) is
-abrupt — see the `SIGTERM` caveat above.
+That ordering is what makes the stop clean, and it only works because the
+plist's `KeepAlive` is conditional. Under the unconditional `<true/>` this
+file previously shipped, the drained process was relaunched the instant it
+exited and the `bootout` then killed the *replacement* with launchd's
+unhandled `SIGTERM` — the same abrupt kill the sequence was there to
+avoid.
+
+Running `launchctl bootout` (or `launchctl stop`) by itself, while manta
+is still running, skips the drain and is abrupt — see the `SIGTERM` caveat
+above. To bring manta back up after stopping it: `launchctl kickstart
+gui/$(id -u)/com.hagaletechnologies.manta` if you only signalled it and
+the job is still loaded, or the `launchctl bootstrap` line above if you
+went on to boot it out.
+
+The cost of that `KeepAlive` choice, versus the systemd unit's
+`Restart=always`: launchd relaunches manta after a crash, a non-zero exit
+or a kill by signal, but *not* after any exit 0 — including one manta
+takes for its own reasons, such as a `--source` file ending. A 24/7
+KiwiSDR or rig-audio source does not exit 0 on its own, so this only
+changes behaviour for a deliberate stop or a finite input.
 
 ## Installing with Docker Compose
 
