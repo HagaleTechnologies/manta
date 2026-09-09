@@ -110,14 +110,14 @@ pub fn listen_with_track_count(
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
     for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
     on_tracks(tm.decoding_track_count());
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
@@ -136,7 +136,7 @@ pub fn listen_with_track_count(
         for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
             m.saturating_sub(pad_hops) * hop
         }) {
-            on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
+            on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
             for spot in validator.ingest(&ev) {
                 on_spot(&spot);
             }
@@ -144,7 +144,7 @@ pub fn listen_with_track_count(
         on_tracks(tm.decoding_track_count());
     }
     for ev in tm.finish() {
-        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
