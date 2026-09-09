@@ -6,6 +6,7 @@ pub mod edge_demod;
 pub mod envelope;
 pub mod events;
 pub mod evidence;
+pub mod hsmm;
 pub mod noise;
 pub mod timing;
 pub mod tree;
