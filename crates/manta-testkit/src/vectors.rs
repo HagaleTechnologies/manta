@@ -510,6 +510,7 @@ pub fn vr4() -> VectorSpec {
         None,
     );
     v.rise_ms = 0.5;
+    v.signals[0].rise_ms = 0.5;
     v
 }
 
