@@ -93,6 +93,15 @@ path above needs no clone:
 - [`packaging/launchd/com.hagaletechnologies.manta.plist`](packaging/launchd/com.hagaletechnologies.manta.plist) — macOS
 - [`docker-compose.yml`](docker-compose.yml) — anywhere Docker runs
 
+Running it *inside* the unpacked archive, as above, is fine by hand — but
+the systemd unit and the launchd plist both execute the absolute path
+`/usr/local/bin/manta`, and neither service manager searches `PATH`, so on
+Linux and macOS alike the first install step is copying the unpacked binary
+there (`sudo install -m 0755 ./manta /usr/local/bin/manta`). The
+per-platform install blocks linked below open with exactly that command; a
+unit bootstrapped without it loads without error and then fails on every
+spawn.
+
 Install steps, how to swap the source, and how to stop manta cleanly on each
 platform: [`packaging/README.md`](packaging/README.md).
 
