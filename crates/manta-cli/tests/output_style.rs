@@ -398,14 +398,21 @@ fn no_debug_formatting_in_any_cli_print_macro() {
 /// --device <missing>` rendered the device name with `{n:?}`
 /// (`manta-input/src/audio.rs`) and an unsupported WAV exposed
 /// `hound::SampleFormat`'s Debug variant (`manta-input/src/lib.rs`).
-/// Scans every workspace crate an operator-facing error can come from, for
-/// a Debug spec inside an error-constructing call.
+/// Scans every workspace crate an operator-facing error can come from --
+/// `manta-cli` included -- for a Debug spec inside an error-constructing
+/// call.
 #[test]
-fn no_debug_formatting_in_an_operator_facing_dependency_error() {
-    // `manta-cli` is covered by the print-macro scan above;
+fn no_debug_formatting_in_an_operator_facing_error() {
     // `manta-soak-harness` is a non-operator-facing CI binary, an explicit
-    // exception in docs/DECISIONS/2026-09-07-cli-output-style.md.
-    const SKIPPED_CRATES: [&str; 2] = ["manta-cli", "manta-soak-harness"];
+    // exception in docs/DECISIONS/2026-09-07-cli-output-style.md. Nothing
+    // else is skipped. `manta-cli` used to be, on the premise that the
+    // print-macro scan above already covered it -- it does not: that scan
+    // only inspects print macros, so a Debug spec in one of the CLI's OWN
+    // error constructors (`bail!("unknown vector '{other:?}'")` and the
+    // like) was checked by neither guard, even though `fmt::render_error`
+    // prints that text to the operator verbatim exactly as it does a
+    // dependency crate's.
+    const SKIPPED_CRATES: [&str; 1] = ["manta-soak-harness"];
     // Each of these constructs an error whose text the operator reads.
     const ERROR_CTORS: [&str; 4] = ["anyhow!(", "bail!(", ".context(", "with_context("];
 
