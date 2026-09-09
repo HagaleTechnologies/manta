@@ -423,7 +423,14 @@ async fn handle_tcp_client(
     let mut scratch = [0u8; 64];
     loop {
         tokio::select! {
-            spot = rx.recv() => {
+            // MAN-45 remediate (round-19 P1 review finding): disabled once
+            // `shutdown` is pending, so a backlogged client can't keep
+            // winning this arm and performing further live writes before
+            // the shutdown-drain arm below ever gets selected -- see
+            // `telnet::handle_client`'s identical precondition for the full
+            // rationale (`has_changed` only peeks; the drain arm still
+            // fires normally).
+            spot = rx.recv(), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
                         let line = ctx.render(&bus_spot);
@@ -470,7 +477,10 @@ async fn handle_tcp_client(
             // period -- without this, only `rx.recv()` is ever polled, so
             // a closed-but-idle client's task/socket/gauge would linger
             // until the next spot's write happened to fail.
-            read_result = socket.read(&mut scratch) => {
+            // Guarded for the same reason as the live-spot arm above --
+            // once shutdown is pending, the drain arm is the only thing
+            // this loop should still be able to select.
+            read_result = socket.read(&mut scratch), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match read_result {
                     Ok(0) => {
                         if log_enabled {
@@ -679,7 +689,10 @@ async fn handle_ws_client(
     let mut ping_limiter = crate::rate_limit::RateLimiter::new(MAX_INBOUND_PINGS, PING_RATE_WINDOW);
     loop {
         tokio::select! {
-            spot = rx.recv() => {
+            // MAN-45 remediate (round-19 P1 review finding): disabled once
+            // `shutdown` is pending -- see `telnet::handle_client`'s
+            // identical precondition for the full rationale.
+            spot = rx.recv(), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
                         let text = ctx.render(&bus_spot);
@@ -717,7 +730,11 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            frame = ws.next() => {
+            // Guarded like the live-spot arm above: this arm's Ping branch
+            // writes a Pong (its own `WRITE_TIMEOUT`), so a client pinging
+            // in a tight loop could otherwise keep deferring the drain arm
+            // indefinitely after shutdown was signalled.
+            frame = ws.next(), if !ctx.shutdown.has_changed().unwrap_or(true) => {
                 match frame {
                     Some(Ok(Message::Close(_))) | None => {
                         if log_enabled {

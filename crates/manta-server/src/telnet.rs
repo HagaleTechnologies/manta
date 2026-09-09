@@ -416,7 +416,29 @@ async fn handle_client(
         crate::rate_limit::RateLimiter::new(MAX_TELNET_COMMANDS, COMMAND_RATE_WINDOW);
     loop {
         tokio::select! {
-            spot = rx.recv() => {
+            // MAN-45 remediate (round-19 P1 review finding): every arm that
+            // can perform a client write is DISABLED once `shutdown` is
+            // pending, so the shutdown-drain arm below is the only one this
+            // `select!` can still take. `tokio::select!` picks a random
+            // ready arm, so without this precondition a client with a
+            // backlog could win the live-spot arm again and again --
+            // performing an unbounded number of two-`WRITE_TIMEOUT` writes
+            // AFTER shutdown was signalled and before its own
+            // `CLIENT_DRAIN_DEADLINE` clock ever started, which is exactly
+            // what `SHUTDOWN_DRAIN_DEADLINE`'s `2 * WRITE_TIMEOUT +
+            // CLIENT_DRAIN_DEADLINE` model assumes cannot happen. With the
+            // precondition, at most ONE such write can still be in flight
+            // (the one already selected when shutdown fired), which is what
+            // that model budgets for.
+            //
+            // `has_changed` (never `changed`) only PEEKS the pending value
+            // without marking it seen, so the `_ = shutdown.changed() =>`
+            // arm below still fires normally on the next trip -- the same
+            // idiom the `sh/dx` replay loop already uses. `unwrap_or(true)`
+            // treats a dropped sender as "shutting down": the drain arm
+            // resolves immediately in that case too, so the loop still
+            // makes progress rather than disabling every arm forever.
+            spot = rx.recv(), if !shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
                         if let Some(min) = min_unique {
@@ -474,7 +496,12 @@ async fn handle_client(
             // must never be disconnected just for staying quiet. (Round-5
             // review finding: this branch used to reuse the timed variant
             // here too, which cut off exactly that client after 30s.)
-            n = read_line_bounded(&mut reader, &mut cmd_line) => {
+            // Guarded for the same reason as the live-spot arm above: a
+            // command this arm accepts can itself write (a `sh/dx` replay,
+            // a filter ack), so leaving it enabled after shutdown was
+            // signalled would let a chatty client keep pushing the drain
+            // arm out of the way with writes of its own.
+            n = read_line_bounded(&mut reader, &mut cmd_line), if !shutdown.has_changed().unwrap_or(true) => {
                 let n = match n {
                     Ok(n) => n,
                     Err(e) => {

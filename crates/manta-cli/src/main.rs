@@ -903,6 +903,21 @@ struct SpotServer {
 /// telnet's live-write branch (`2 * telnet::WRITE_TIMEOUT` = 20s) already
 /// budgeted for above -- it now holds because BOTH pre-loop phases are
 /// shutdown-aware by design, matching this deadline's own model.
+///
+/// MAN-45 remediate (code-review round 19, P1): the "at most ONE in-flight
+/// branch body precedes the drain" step of that model is now ENFORCED, not
+/// assumed. `tokio::select!` picks a random ready arm, so a client with a
+/// backlog could previously win the live-spot arm repeatedly after shutdown
+/// was signalled -- an unbounded number of `2 * WRITE_TIMEOUT` writes
+/// before its own `CLIENT_DRAIN_DEADLINE` clock ever started, which this
+/// deadline cannot cover at any constant value. Every client-write-capable
+/// arm in all three handler loops (`telnet::handle_client`'s live-spot and
+/// command-read arms, `json_stream`'s TCP live-spot and socket-read arms,
+/// and its WS live-spot and frame arms) now carries an
+/// `if !shutdown.has_changed()` precondition, so once shutdown is pending
+/// the drain arm is the only arm those loops can still select. The worst
+/// case therefore really is one already-selected branch body plus
+/// `CLIENT_DRAIN_DEADLINE`, which is what the value below is sized for.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// How often the server runtime copies the engine's live track count into

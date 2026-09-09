@@ -2,13 +2,9 @@
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
 pub mod listen;
-<<<<<<< HEAD
 pub use listen::{listen, listen_with_observers, ListenObservers};
-=======
-pub use listen::listen;
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
->>>>>>> ea0b305d98310f0d3c611c2516e18c7388ce3a60
 pub mod soak;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
