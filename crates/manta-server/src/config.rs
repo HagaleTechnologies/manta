@@ -55,10 +55,11 @@ fn is_valid_ssid(ssid: &str) -> bool {
 const MIN_CALLSIGN_LEN: usize = 3;
 
 /// True when this ONE `/`-delimited segment has the structure of a complete
-/// ITU callsign: a prefix, a separating digit, and a letter suffix -- i.e.
-/// some digit with at least one letter BEFORE it and at least one letter
-/// AFTER it. `W1A`, `W5AU`, `4U1UN`, `3DA0RS`, `GB3LER` and multi-digit
-/// special-event forms like `LZ130LO` all satisfy it.
+/// ITU callsign: a prefix, a separating digit, and a letter suffix that runs
+/// to the END of the segment -- i.e. some digit with at least one letter
+/// BEFORE it, and the segment's LAST character a letter. `W1A`, `W5AU`,
+/// `4U1UN`, `3DA0RS`, `GB3LER` and multi-digit special-event forms like
+/// `LZ130LO` all satisfy it.
 ///
 /// Structure, not just character classes (PR #131 review, round 4): a
 /// predicate that only asks for `MIN_CALLSIGN_LEN` characters plus "some
@@ -66,6 +67,13 @@ const MIN_CALLSIGN_LEN: usize = 3;
 /// `W12/P`, whose only other segment is a portable designator). None of
 /// those has a suffix, so none is a callsign -- and the typo would become
 /// this node's identity on every telnet line and JSON `deCall`.
+///
+/// The suffix must run to the end of the segment, not merely exist somewhere
+/// after a digit (PR #131 review, round 5): "a letter somewhere to the right
+/// of the digit" still accepted `W1A2` (and `W1A2-1`, `W1A2/P`), where the
+/// trailing digit sits OUTSIDE the suffix. ITU RR 19.68A puts a letter last
+/// in every amateur callsign, so a segment ending in a digit is a typo at any
+/// length.
 ///
 /// The length bound is implied rather than restated: a letter, then a digit,
 /// then a letter is already `MIN_CALLSIGN_LEN` characters. Prefix (`JW/`) and
@@ -77,9 +85,15 @@ fn is_complete_callsign(segment: &str) -> bool {
     let Some(first_letter) = bytes.iter().position(u8::is_ascii_alphabetic) else {
         return false;
     };
-    let Some(last_letter) = bytes.iter().rposition(u8::is_ascii_alphabetic) else {
+    // The suffix ENDS the segment: `rposition` alone only proves a letter
+    // exists somewhere after the digit, which `W1A2` also satisfies.
+    let Some(&last) = bytes.last() else {
         return false;
     };
+    if !last.is_ascii_alphabetic() {
+        return false;
+    }
+    let last_letter = bytes.len() - 1;
     bytes
         .iter()
         .enumerate()
@@ -153,7 +167,8 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     // legitimately carry letters or digits alone -- accepted.
     // That segment must also have the ITU call STRUCTURE, not merely a
     // qualifying length and one of each character class (PR #131 review,
-    // rounds 3 and 4) -- see `is_complete_callsign`.
+    // rounds 3, 4 and 5) -- prefix, separating digit, and a letter suffix
+    // running to the END of the segment; see `is_complete_callsign`.
     if !segments.iter().any(|s| is_complete_callsign(s)) {
         return Err(format!(
             "{call:?} is not a plausible callsign (one segment must be a complete \
@@ -556,6 +571,15 @@ mod tests {
             "AB12",
             "3DA0",
             "1W2",
+            // PR #131 review round 5: the letter suffix must run to the END of
+            // the segment (ITU RR 19.68A -- every amateur callsign ends in a
+            // letter). A letter merely somewhere right of the separating digit
+            // leaves the trailing digit outside the suffix: still a typo.
+            "W1A2",
+            "W1A2-1",
+            "W1A2/P",
+            "LZ130LO5",
+            "4U1UN0",
         ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));

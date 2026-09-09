@@ -93,6 +93,15 @@ technical notes asked to fix together.
    real form the earlier rounds accepted: `W1A`, `W5AU`, `4U1UN`, `3DA0RS`, `GB3LER/B`,
    `JW/LB2PG`, `VP2E/K5ARH/M`, and multi-digit special-event calls such as `LZ130LO`.
 
+   That letter suffix must run to the END of the segment (PR #131 review, round 5). "A letter
+   somewhere to the right of the separating digit" is weaker than the structure it was meant to
+   express: `W1A2` (and therefore `W1A2-1` and `W1A2/P`) satisfied it with a trailing digit
+   sitting OUTSIDE the suffix, and that typo would become the station identity on every telnet
+   and JSON spot. ITU RR 19.68A puts a letter last in every amateur callsign, so
+   `config::is_complete_callsign` now requires the segment's LAST character to be a letter, with
+   a digit somewhere between it and the segment's first letter. The accepted forms above are
+   unchanged -- every one of them already ends in a letter.
+
 ## Non-goals
 
 - Auto-generating the `N` band index. `manta-cli` still hardcodes a single DDC; a real per-band
