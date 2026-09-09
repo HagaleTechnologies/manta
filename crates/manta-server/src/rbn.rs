@@ -51,8 +51,20 @@ pub enum LineFormat {
 
 /// The frequency field's last character lands on this 1-indexed column,
 /// matching the live RBN capture. Equivalent to the classic AK1A 10-wide
-/// spotter field: `DX de ` (6) + a 7-character base callsign + `-#:` (3)
-/// is exactly 16 columns, leaving 8 for a 5-digit-MHz frequency.
+/// spotter field: `DX de ` (6) + a base callsign + `-#:` (3), padded out
+/// so an 8-character 5-digit-MHz frequency ends here.
+///
+/// This is an anchor, not a guarantee: `format_line` keeps a mandatory
+/// one-space separator (Decision 3), so the anchor holds only while
+/// `identity + freq` is at most 23 columns -- i.e. a base callsign of 6
+/// characters or fewer at 8 frequency characters. A 7-character base
+/// callsign (identity 16 + freq 8 = 24) needs that separator, so the
+/// frequency ends at column 25 and the rest of the line shifts one column
+/// right (`VE3ABCD` -> time at column 72). That drift is the documented
+/// choice in `docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md`
+/// Decision 3, pinned by
+/// `a_seven_character_spotter_shifts_the_whole_line_one_column_right`
+/// below; MAN-89's `CALL-N-#` SSIDs push most identities past it.
 const FREQ_END_COL: usize = 24;
 
 /// Minimum width of the callsign column (columns 27-41), so the mode field
@@ -191,17 +203,51 @@ mod tests {
     #[test]
     fn every_spot_type_label_fits_the_six_wide_type_field() {
         // BEACON is exactly 6 characters -- the width's binding constraint.
-        for spot_type in [
-            SpotType::Cq,
-            SpotType::De,
-            SpotType::Beacon,
-            SpotType::Unknown,
+        // The expected text is asserted alongside the column, so the test
+        // cannot pass with two labels swapped or every label emptied.
+        for (spot_type, label) in [
+            (SpotType::Cq, "CQ"),
+            (SpotType::De, "DE"),
+            (SpotType::Beacon, "BEACON"),
+            (SpotType::Unknown, ""),
         ] {
             let mut spot = capture_spot();
             spot.spot_type = spot_type;
             let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
             assert_eq!(col_of(&line, "0236Z"), 71, "{spot_type:?}: {line}");
+            // The type field is columns 63-68, left-justified in 6 columns.
+            assert_eq!(
+                &line[62..68],
+                format!("{label:<6}"),
+                "{spot_type:?}: {line}"
+            );
         }
+    }
+
+    /// Decision 3's one documented column of drift: a 7-character base
+    /// callsign makes `identity + freq` exactly 24 columns, so the mandatory
+    /// separator pushes the frequency to column 25 and the whole line one
+    /// column right. `FREQ_END_COL`'s doc comment says so; this pins it.
+    #[test]
+    fn a_seven_character_spotter_shifts_the_whole_line_one_column_right() {
+        let line = format_line(
+            &capture_spot(),
+            "VE3ABCD",
+            2 * 3600 + 36 * 60,
+            LineFormat::Rbn,
+        );
+        assert_eq!(
+            col_of(&line, "14011.90") + "14011.90".len() - 1,
+            25,
+            "line was: {line}"
+        );
+        assert_eq!(col_of(&line, "CW"), 43, "line was: {line}");
+        assert_eq!(col_of(&line, "0236Z"), 72, "line was: {line}");
+        // Never abuts: exactly one space separates identity from frequency.
+        assert!(
+            line.starts_with("DX de VE3ABCD-#: 14011.90"),
+            "line was: {line}"
+        );
     }
 
     #[test]

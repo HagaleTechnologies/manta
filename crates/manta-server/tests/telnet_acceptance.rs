@@ -723,7 +723,9 @@ async fn a_skimmer_mode_server_emits_the_no_mode_column_layout() {
 async fn sh_dx_history_also_honours_the_configured_line_format() {
     let (addr, bus, _metrics, _shutdown_tx, _tasks) =
         spawn_server_with_format(rbn::LineFormat::Skimmer).await;
-    bus.publish(sample_spot());
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot);
 
     let (mut reader, mut wr) = connect_and_login(addr).await;
     wr.write_all(b"sh/dx\r\n").await.unwrap();
@@ -733,5 +735,17 @@ async fn sh_dx_history_also_honours_the_configured_line_format() {
         .await
         .expect("timed out waiting for history line")
         .unwrap();
+    let line = line.trim_end();
+
     assert!(!line.contains(" CW "), "line was: {line:?}");
+    // Assert the positive property too, not just the absence of the mode
+    // column: a banner, a blank line or an error string would satisfy the
+    // negative on its own.
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(
+        line.find(&zulu).map(|i| i + 1),
+        Some(67),
+        "line was: {line:?}"
+    );
 }
