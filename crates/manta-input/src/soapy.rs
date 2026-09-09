@@ -50,7 +50,19 @@ impl SoapySdrIqSource {
         device.set_sample_rate(Rx, 0, fs)?;
         device.set_frequency(Rx, 0, center_freq_hz, ())?;
         match gain_db {
-            Some(db) => device.set_gain(Rx, 0, db)?,
+            // Some drivers (confirmed on a real SDRplay RSP1B) default AGC
+            // on and then silently ignore set_gain -- with AGC left
+            // enabled, activateStream() fails outright
+            // (sdrplay_api_Fail/NotSupported) rather than merely leaving
+            // the requested gain unapplied. Disable AGC first whenever the
+            // device supports the mode, so a manual gain actually takes
+            // and the stream activates.
+            Some(db) => {
+                if device.has_gain_mode(Rx, 0)? {
+                    device.set_gain_mode(Rx, 0, false)?;
+                }
+                device.set_gain(Rx, 0, db)?;
+            }
             None => {
                 if device.has_gain_mode(Rx, 0)? {
                     device.set_gain_mode(Rx, 0, true)?;
