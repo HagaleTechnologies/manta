@@ -59,13 +59,19 @@ same signature:
   SNR -- an earlier revision of this finding wrongly attributed it to
   that quantity and derived a "+6 dB above the noise floor" claim from
   it that doesn't follow from what's actually computed. **Also not
-  evidence of anything by itself**: `envelope.rs`'s rail-collapse floor
-  clamps `e_hi >= 2*e_lo` (SPEC §3.2), which makes
-  `20*log10(2) - 14.3 = -8.2794 dB` a hard mathematical lower bound any
-  weak/flat-envelope track hits, regardless of cause -- the near-constant
-  `snr_db` values here are exactly that clamp being hit repeatedly, not a
-  sign of some other deterministic mechanism. The real signal in this
-  data is the *frequency* clustering below, not the SNR values.
+  strong evidence by itself**: `envelope.rs`'s rail-collapse clamp
+  enforces `e_hi >= 2*e_lo` using the *raw* `e_lo` (SPEC §3.2), while
+  `snr_2500_db()` divides by `e_lo.max(E_LO_FLOOR)` -- and `e_lo` is only
+  floored to `E_LO_FLOOR` at track init, never again during the per-
+  sample EMA update that follows. If `e_lo` drifts below `E_LO_FLOOR`
+  afterward, the ratio actually used for SNR can be less than 2, so
+  `-8.2794 dB` is **not a proven hard lower bound**, just the value any
+  weak/flat-envelope track lands at or near under the common case where
+  `e_lo` stays at or above the floor. Retracting the "hard bound" framing
+  from an earlier revision of this finding -- the near-constant `snr_db`
+  values here are *consistent with* that clamp being hit repeatedly, not
+  guaranteed proof of it. Either way, the real signal in this data is the
+  *frequency* clustering below, not the SNR values.
 - WPM scattered widely and often implausible for real CW traffic/beacons
   (30.8-60.0 wpm)
 - callsigns frequently malformed (`3EMEEEE`, `ER1EEAE`, `4AEEEEE` --
@@ -80,8 +86,9 @@ variance. **But only the 6931.x cluster is dial-shift-confirmed as a
 passband-edge effect**: retuning from 7025 kHz to 7075 kHz (passband
 ~6979-7171 kHz) moved *that* cluster to the *new* passband's lower/upper
 edge (7168.2 kHz) instead of leaving it at 6931 kHz. The 6936.0, 6944.0,
-and 7064.0 kHz clusters sit well inside the 6930-7120 kHz passband, not
-at either edge -- the dial-shift test was never repeated against them,
+6968.0, and 7064.0 kHz clusters sit well inside the 6930-7120 kHz
+passband, not at either edge -- the dial-shift test was never repeated
+against any of them,
 so grouping them under the same "passband-edge artifact" label is not
 established. They could be a different fixed-bin spur (e.g. an
 individual 93.75 Hz channelizer boundary landing at a different absolute
