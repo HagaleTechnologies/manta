@@ -147,8 +147,15 @@ taken over whatever is present, and track creation is inhibited for the first
 Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
 **τ = 40 ms** (`α = 1 − e^{−2.667/40} = 0.0645`).
 
-- **Rise:** `S ≥ F + 6 dB` (`detector.on_snr_db = 6.0`) sustained for
-  **19 consecutive hops (≈ 50 ms)** — rejects impulse noise and clicks.
+- **Rise:** `S ≥ F + 6 dB` (`detector.on_snr_db = 6.0`) — an
+  *instantaneous* per-hop condition on the smoothed power `S`, evaluated
+  once per hop. Impulse noise and clicks are rejected by the CANDIDATE →
+  ACTIVE confirmation rule (§2.4: `confirm_hops` = 19 rise hops
+  accumulated within a `confirm_window_hops` = 75 window), not here — this
+  section defines only the gate boolean that rule consumes. Requiring 19
+  *consecutive* hops here as well would apply confirmation twice and
+  withhold `rise` for the short high-WPM dits MAN-3 fixed (see §2.4's
+  CANDIDATE confirmation deviation).
 - **Drop:** `S < F + 3 dB` (`detector.off_snr_db = 3.0`, i.e. 3 dB
   hysteresis) continuously for **hang = 5 000 ms** (1875 hops) — survives QSB
   troughs and inter-word gaps at slow speeds.
@@ -170,7 +177,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
-| any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
+| any → CLOSED | eviction: track cap reached and this is the lowest-ranked track, ranked `(promoted, current_snr_db)` ascending — every unconfirmed CANDIDATE is evicted before any ACTIVE/HANG track, and SNR orders tracks within one class (counted in metrics, per ARCHITECTURE §4). **[DEVIATION — lifecycle class ranked ahead of ARCHITECTURE §4's literal lowest-SNR rule, per MAN-3]**, see below. |
 
 All timers are hop-counted (integers), never wall-clock.
 
@@ -190,6 +197,20 @@ consecutively promotes on the identical hop as the literal rule (V1–V10's
 promotion hops are unchanged). See
 `docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md` for the
 window-size derivation and the measured false-track/CPU-budget impact.
+
+**Eviction-order deviation (MAN-3).** The literal rule evicts the
+lowest-`current_snr_db` track regardless of lifecycle. That was safe while
+a CANDIDATE died on its first non-rise hop, but the confirmation deviation
+above keeps one alive for up to `confirm_window_hops` (75) hops after it
+stops rising — so at `track_cap`, or under a wideband transient that
+spawns many staggered candidates, a loud CANDIDATE that goes on to expire
+`Unconfirmed` could evict an ACTIVE track and destroy a real decode in
+progress. Ranking lifecycle class first keeps the cap's purpose (bounding
+concurrent decoders and track memory, ARCHITECTURE §4) while spending the
+eviction on the track with nothing to lose. Within a class the rule is
+unchanged, so a saturated cap of promoted tracks still evicts the weakest
+of them. Determinism: the track map is ordered by id and the first minimum
+wins, so an exact `(class, SNR)` tie always evicts the lowest id (§8).
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
@@ -212,10 +233,18 @@ window-size derivation and the measured false-track/CPU-budget impact.
   overlap and so read the same max-power channel, not an edge case) the
   survivor is chosen by **lifecycle rank, then by lower id**; a track only
   loses a merge on SNR alone when it reads a **strictly** lower SNR than its
-  competitor. Lifecycle rank is the tuple `(promoted, has_emitted)`, higher
+  competitor. Lifecycle rank is the tuple `(promoted, decoder_hops)`, higher
   wins: a promoted (ACTIVE/HANG) track outranks a still-unconfirmed
-  CANDIDATE, and among promoted tracks one that has already put events on
-  the wire outranks one that has not. Track ids are **spawn** order, not
+  CANDIDATE, and among promoted tracks the one whose decoder has consumed
+  more hops (counted from its promotion hop, inclusive) outranks the
+  younger one. `decoder_hops` is hop-counted, never batch-counted: a
+  "has it emitted yet" flag is only settled once a whole `process_hops`
+  batch has drained, so a merge ranked on it would pick different
+  survivors for the same hop stream depending on how the caller chunked
+  its input, violating §8 determinism. Decoder age also separates two
+  tracks that are both promoted and both still silent — a state the
+  boolean pair could not distinguish, in which the id fallback below
+  would discard the more advanced decoder. Track ids are **spawn** order, not
   promotion order, so id alone would let a slowly-confirming low-id
   CANDIDATE evict a higher-id ACTIVE track that already holds decoder
   history — and that CANDIDATE may then simply expire `Unconfirmed`. Only

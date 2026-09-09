@@ -47,9 +47,17 @@ looped text, with track 6 (the lower id) reported even though track 16 held
 more (or equally complete) output.
 
 **Fix (Phase 2):** replaced the `min_track_id` reduction with
-`select_report_track` (`lib.rs`): most `CharDecoded` events wins, ties break
-to the lowest `track_id` (preserving the old behavior exactly on the
-all-telemetry-only case). Implemented as a pure function of the event
+`select_report_track` (`lib.rs`): most **rendered characters** wins, ties
+break to the lowest `track_id` (preserving the old behavior exactly on the
+all-telemetry-only case). "Rendered" is `Glyph::text_char().is_some()` --
+exactly the glyphs `events_to_text` keeps. Counting raw `CharDecoded`
+events instead would rank a track whose only glyphs are prosigns (`<AR>`,
+`<SK>`, ... -- all dropped from telnet-facing text by SPEC §4.4) above one
+carrying real letters, and hand `.text` back the empty string this
+decision exists to prevent. Detector-internal `TrackPromoted` events
+(docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md) are not decoder
+output and are excluded from the ranking entirely, so a candidate that
+promoted and then died before decoding anything is never selected. Implemented as a pure function of the event
 multiset via a `BTreeMap` scan (order-independent by construction --
 SPEC §8). Also split `decode_samples`'s two `bail!` sites: the pre-existing
 "no signal found (input shorter than one filter length or empty)" now fires
@@ -189,6 +197,54 @@ discovered *as a direct, causal consequence* of part 2's own relaxation --
 without it, part 2 is a net regression for exactly the boundary-straddling
 signals it was meant to help, which is precisely what live instrumentation
 against the ticket's own four cases caught before this shipped.
+
+## Round-6 review refinements (Codex, PR #96)
+
+Three follow-on findings against parts 1 and 3 above, all fixed in place;
+the SPEC sections they touch are updated with them.
+
+1. **Merge lifecycle rank is hop-counted, not batch-counted (P1).** Part
+   3's rank was `(promoted, has_emitted)`, and `has_emitted` is only
+   assigned after a whole `process_hops` batch has run and `drain_pool()`
+   has returned. A merge that happens mid-batch therefore read a value
+   that depended on the caller's chunk size: a small-chunk caller could
+   see `true` where a large-chunk caller still saw `false`, keep a
+   different survivor, and emit different text for the identical hop
+   stream -- a SPEC §8 determinism break. The rank is now
+   `(promoted, decoder_hops)`, where `decoder_hops` counts the hops the
+   track's decoder has actually been fed, advanced once per hop by
+   `step_hop`. Same fix answers the neighbouring finding that two tracks
+   which are both ACTIVE and both still silent used to tie at
+   `(true, false)` and fall through to the lower id, discarding the
+   substantially older decoder -- decoder age separates exactly that
+   state. SPEC §2.5 updated.
+2. **Eviction ranks lifecycle class ahead of SNR.** Part 2's widened
+   confirmation window keeps a CANDIDATE in `self.tracks` for up to 75
+   hops after it stops rising, so at `track_cap` (or under a wideband
+   transient spawning many staggered candidates) a loud candidate that
+   ultimately expires `Unconfirmed` could evict an ACTIVE track on
+   instantaneous SNR alone and destroy a real decode -- this ticket's own
+   failure mode arriving by another route. `evict_over_cap` now ranks
+   `(promoted, current_snr_db)` ascending: every unconfirmed candidate
+   goes before any ACTIVE/HANG track, and SNR still orders tracks within
+   one class, so a cap saturated with promoted tracks behaves exactly as
+   before. SPEC §2.4 carries this as a documented deviation from
+   ARCHITECTURE §4's literal lowest-SNR rule.
+3. **`report_freq_hz` no longer borrows another track's metadata.** The
+   round-2 fallback took the most recent `TrackMeta` from *any* track when
+   the selected track had none of its own, which in a passband carrying
+   several live signals could pair one signal's text with another
+   carrier's frequency. It is unnecessary now that every promoted track
+   emits its own `TrackPromoted` carrying its promotion-hop centroid
+   (docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md): the
+   selected track always has its own measurement, since a track cannot
+   decode a character without having promoted first. The fallback chain
+   is now own `TrackMeta` -> own `TrackPromoted` -> receiver center.
+   `select_report_track` also excludes `TrackPromoted` events from the
+   ranking entirely (they are detector telemetry, not decoder output) and
+   returns `Option`, so a stream carrying nothing but promotions reports
+   the "signal detected but nothing decoded" diagnosis instead of
+   selecting a track that decoded nothing.
 
 ## Measured results
 
@@ -341,7 +397,13 @@ unaffected by construction.
 - `docs/SPEC-decode-core.md` §2.4's CANDIDATE transition rows and §9's
   `[detector]` table now document `confirm_window_hops`/`confirm_window_ms`
   as a normative deviation from the literal "19 consecutive hops" wording,
-  citing this document.
+  citing this document. §2.3's `Rise` bullet defines the gate condition as
+  instantaneous, leaving the 19-of-75 confirmation rule solely to §2.4 --
+  the two sections would otherwise apply confirmation twice and withhold
+  `rise` for exactly the short high-WPM dits this ticket is about.
+- `docs/SPEC-decode-core.md` §2.4's eviction row and §2.5's merge
+  lifecycle rank carry the two round-6 refinements above (eviction class
+  ordering; `(promoted, decoder_hops)`).
 - `wiki/pages/detector-tracks.md` points at this document for both the
   CANDIDATE-confirmation deviation and the `select_report_track` reporting
   rule.

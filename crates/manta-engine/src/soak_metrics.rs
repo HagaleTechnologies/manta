@@ -266,6 +266,15 @@ pub fn soak_with_metrics(
             // just self.tracks.len().
             let active = tm.active_track_count();
             peak_active_tracks = peak_active_tracks.max(active);
+            // MAN-3 review round 6: kept current after every chunk, not
+            // only at the normal-success tail below. If the processing
+            // closure panics after tracks have promoted, unwinding skips
+            // that tail assignment entirely and the returned report reads
+            // `panicked: true` with `promoted_count: 0` -- erasing the
+            // very false-track-pressure evidence this metric was added to
+            // capture for unattended runs. Cheap: a u64 field read, same
+            // as `active_track_count()` above.
+            final_promoted_count = tm.promoted_count();
 
             if last_sample.elapsed() >= sample_interval {
                 last_sample = Instant::now();
