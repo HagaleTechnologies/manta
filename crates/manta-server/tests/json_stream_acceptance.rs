@@ -125,7 +125,7 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
     assert_eq!(value["frequency"], 14_027_100);
     assert_eq!(value["dxContinent"], "AS");
     assert_eq!(value["dxCqZone"], 25);
-    assert!(value["dxDxcc"].is_null());
+    assert_eq!(value["dxDxcc"], 339);
 }
 
 #[tokio::test]

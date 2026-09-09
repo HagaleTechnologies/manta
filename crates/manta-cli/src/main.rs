@@ -813,6 +813,46 @@ struct SpotServer {
     /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
     /// duration -- see `shutdown_runtime_after_drain`.
     tasks: manta_server::tasks::ClientTasks,
+    /// MAN-136/MAN-45: the same `cty::Table` handed to `JsonStreamConfig`,
+    /// kept here too so the publish callback can check resolvability once
+    /// per spot for `manta_spots_unresolved_geography_total` -- checking
+    /// inside `SpotMessage::from_spot` would scale with connected client
+    /// count instead of spot count.
+    cty: std::sync::Arc<manta_spot::cty::Table>,
+    /// Whether the operator's OWN station callsign (config, not decoder
+    /// output -- and not required to be cty-resolvable) already forces the
+    /// de-side `UNKNOWN_*` sentinels. Resolved ONCE at `start_spot_server`
+    /// time rather than per spot: `station_callsign` cannot change for the
+    /// life of the process, so re-running the same binary search on every
+    /// spot only re-derives a constant.
+    station_geography_unresolved: bool,
+}
+
+/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
+/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
+/// exactly the condition `manta_spots_unresolved_geography_total` counts.
+///
+/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
+/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
+/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
+/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
+/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
+/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
+/// alone would let those spots go out carrying `dxDxcc: -1` with the
+/// counter still at zero, silently withholding the one signal this metric
+/// exists to give (round-1 validate code-review finding 1).
+///
+/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
+/// (round-7 review finding 2): `cty.lookup` answers for it through the base
+/// call's prefix, but `from_spot` deliberately discards that answer and emits
+/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
+/// real position is unknown -- so the spot does carry the sentinels this
+/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
+/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
+/// the whole test.
+fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
+    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
+        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
@@ -1149,6 +1189,8 @@ fn start_spot_server(
             cty,
             shutdown_tx,
             tasks,
+            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            cty,
         },
     ))
 }
@@ -1456,12 +1498,27 @@ fn main() -> Result<()> {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
                         server.metrics.record_spot();
+<<<<<<< HEAD
                         // MAN-45: counted ONCE per spot at publish time, not
                         // inside `SpotMessage::from_spot` -- that runs once
                         // per connected JSON/WS client, which would scale
                         // the count with client count instead of spot
                         // count.
                         if server.cty.lookup(&spot.callsign).is_none() {
+=======
+                        // MAN-136/MAN-45: counted ONCE per spot here, NOT
+                        // inside `SpotMessage::from_spot` -- that runs once
+                        // per connected JSON/WS client (json_stream.rs:126),
+                        // so counting there would scale with client count
+                        // instead of spot count. Checks BOTH sides: the
+                        // operator's own station_callsign is config, not
+                        // decoder output, and isn't required to resolve --
+                        // but it also never changes, so its side is
+                        // resolved once at start_spot_server time.
+                        if geography_is_unresolved(&server.cty, &spot.callsign)
+                            || server.station_geography_unresolved
+                        {
+>>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
                             server.metrics.record_unresolved_geography();
                         }
                     }
@@ -2284,5 +2341,70 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    // MAN-136 round-1 validate code-review finding 1: the increment
+    // condition for `manta_spots_unresolved_geography_total` must match the
+    // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
+    // sentinels -- the RESOLVED ADIF entity number, not merely whether
+    // `cty.lookup` returned an entry.
+
+    const GEOGRAPHY_CTY_FIXTURE: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N;
+";
+    /// One `dxcc.tsv` row for the fixture above, in the vendored file's
+    /// `<primary-prefix>\t<adif-number>\t<name>` shape.
+    const GEOGRAPHY_DXCC_FIXTURE: &str = "K\t291\tUnited States\n";
+
+    #[test]
+    fn a_callsign_with_a_resolved_entity_number_is_not_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(cty.lookup("W1AW").and_then(|e| e.dxcc), Some(291));
+        assert!(!geography_is_unresolved(&cty, "W1AW"));
+    }
+
+    #[test]
+    fn an_unresolvable_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(cty.lookup("QQ1AAA").is_none(), "test premise");
+        assert!(geography_is_unresolved(&cty, "QQ1AAA"));
+    }
+
+    #[test]
+    fn a_maritime_or_aeronautical_mobile_callsign_is_counted_as_unresolved() {
+        // /MM and /AM resolve through the base prefix, so the entity-number
+        // test alone reads them as resolved -- but `SpotMessage::from_spot`
+        // emits UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE and null lat/lon for them,
+        // so the counter must not sit at zero while those go out.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(
+            cty.lookup("W1AW/MM").and_then(|e| e.dxcc),
+            Some(291),
+            "test premise: the base prefix still resolves"
+        );
+        assert!(geography_is_unresolved(&cty, "W1AW/MM"));
+        assert!(geography_is_unresolved(&cty, "W1AW/AM"));
+        assert!(!geography_is_unresolved(&cty, "W1AW/P"));
+    }
+
+    #[test]
+    fn a_cty_resolvable_callsign_with_no_dxcc_row_is_still_counted_as_unresolved() {
+        // The cty.dat/dxcc.tsv drift state: `cty.dat` was hand-refreshed
+        // (data/SOURCES.md has no refresh automation) without regenerating
+        // the TSV, so geography resolves -- non-null dxLat/dxLon -- while
+        // the entity number does not, and the spot goes out with
+        // `dxDxcc: -1`. Counting `lookup().is_none()` missed exactly this.
+        let cty = manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, "");
+        let entry = cty.lookup("W1AW").expect("geography still resolves");
+        assert_eq!(entry.dxcc, None, "test premise: only the number is missing");
+        assert_eq!(entry.continent, "NA");
+        assert!(
+            geography_is_unresolved(&cty, "W1AW"),
+            "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
+        );
     }
 }

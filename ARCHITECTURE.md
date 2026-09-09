@@ -237,7 +237,11 @@ transmission may never produce again).
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
-   refreshable) — a call with an unallocated prefix is rejected.
+   refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
+   also joined, on that same primary-prefix field, against a small vendored
+   ADIF DXCC entity-number table (`data/dxcc.tsv`, MAN-136) — refreshed
+   together, see `crates/manta-spot/data/SOURCES.md` — which is what lets
+   `manta-server`'s JSON stream populate `dxDxcc`/`deDxcc` (§7).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
@@ -290,7 +294,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts.
+  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
+  resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
+  `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
+  `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
+  see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -350,6 +359,7 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
+<<<<<<< HEAD
   `manta_spots_dropped_shutdown_total` (backlog abandoned on a CLEAN
   shutdown, before any write failed — the counter that distinguishes
   shutdown-time loss from socket-write loss),
@@ -368,6 +378,22 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
   (every other caller — `soak()`, the CPU-budget bench, both integration
   tests) is unchanged and pays nothing for this.
+=======
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
+  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
+  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
+  has no row in the vendored `dxcc.tsv`), per-protocol
+  client-connected gauges, `manta_source_health`, and the uplink counters
+  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
+  per-stage queue depths, which MAN-56 tracks as a separate gap.
+  **`manta_active_tracks` is served but not populated** (corrected
+  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
+  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
+  own comment says the engine exposes no hook for it yet — so every
+  production daemon run reports a constant `0`, not a real track count.
+  Listed separately from the "currently-implemented" set above so an
+  operator doesn't read a served-but-frozen placeholder as live data.
+>>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
