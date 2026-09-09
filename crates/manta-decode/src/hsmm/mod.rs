@@ -54,6 +54,24 @@ struct Anchor {
     sample_ts: u64,
     prefix: f64,
     tokens: Vec<Token>,
+    /// [Task 8 fix, review round 3] The minimum `HistEntry::sample_ts`
+    /// across every token's `hist` in this anchor, computed once at
+    /// creation. See `HsmmDecoder::push`'s `sealed`-pruning comment: this
+    /// is *not* the same as this anchor's own `sample_ts` -- `successor`
+    /// clones an ancestor's whole `hist` and only stamps the *new* entry
+    /// with the current anchor's timestamp, so an inherited older entry
+    /// (originally stamped by a since-evicted ancestor anchor) can still
+    /// be sitting in a still-live anchor's frozen tokens. `None` if no
+    /// token in this anchor has any hist entry yet.
+    min_hist_ts: Option<u64>,
+}
+
+fn min_hist_ts(tokens: &[Token]) -> Option<u64> {
+    tokens
+        .iter()
+        .flat_map(|t| t.hist.iter())
+        .map(|e| e.sample_ts)
+        .min()
 }
 
 /// Token-passing HSMM decoder: consumes per-hop evidence, maintains a beam
@@ -143,6 +161,7 @@ impl HsmmDecoder {
                 hop: ev.hop,
                 sample_ts: ev.sample_ts,
                 prefix: ev.prefix,
+                min_hist_ts: min_hist_ts(&seeds),
                 tokens: seeds.clone(),
             });
             self.live = seeds;
@@ -212,6 +231,7 @@ impl HsmmDecoder {
             hop: ev.hop,
             sample_ts: ev.sample_ts,
             prefix: ev.prefix,
+            min_hist_ts: min_hist_ts(&merged),
             tokens: merged,
         });
         while let Some(front) = self.anchors.front() {
@@ -221,17 +241,25 @@ impl HsmmDecoder {
                 break;
             }
         }
-        // [Task 8 fix, review round 2] Bound `sealed`'s growth: nothing
-        // older than the oldest still-live anchor's `sample_ts` can ever be
-        // re-derived by `push`'s candidate loop above (that anchor is the
-        // earliest possible source `successor` could still transition
-        // from), so any `sealed` entry older than it can never be checked
-        // against again and is safe to drop. Without this, `sealed` grows
-        // by one entry per committed glyph/word-boundary for the life of
-        // the track, each compared per token per anchor hop on every
-        // future `commit::commit` call.
-        match self.anchors.front() {
-            Some(front) => self.sealed.retain(|&(ts, _)| ts >= front.sample_ts),
+        // [Task 8 fix, review round 3] Bound `sealed`'s growth: the safe
+        // prune bound is the minimum `sample_ts` over EVERY hist entry of
+        // EVERY token in EVERY currently-live anchor -- not that anchor's
+        // own `sample_ts` (round 2's bug). `Token::successor` clones an
+        // ancestor's whole `hist` and only stamps the *new* entry with the
+        // current anchor's own timestamp; an inherited older entry keeps
+        // whatever timestamp it was originally stamped with, from a
+        // possibly-since-evicted ancestor anchor. So a still-live anchor's
+        // frozen tokens can carry a `hist` entry older than that anchor's
+        // OWN `sample_ts` (and older than the oldest anchor's own
+        // `sample_ts`, if that anchor is a newer one that inherited an old
+        // entry) -- pruning `sealed` by anchor timestamp alone could drop
+        // an entry a still-live anchor can still regenerate, reopening
+        // exactly the duplicate-commit failure this list exists to
+        // prevent. `Anchor::min_hist_ts` is computed once at anchor
+        // creation (O(1) amortized here: this is just a min-of-mins over
+        // already-live anchors, not a fresh per-token/per-hist rescan).
+        match self.anchors.iter().filter_map(|a| a.min_hist_ts).min() {
+            Some(bound) => self.sealed.retain(|&(ts, _)| ts >= bound),
             None => self.sealed.clear(),
         }
         out
