@@ -26,8 +26,13 @@ silence budget -- `Overflow` returns immediately without waiting out
 `TIMEOUT_US`, unlike `Timeout`, so retrying it unboundedly risked exactly
 the busy-loop-that-never-returns hazard `MAX_TIMEOUT_RETRIES`'s own doc
 comment already warns about for silence. Confirmed live afterward: one
-`listen` window alone absorbed 200+ consecutive overflow events and still
-completed and shut down cleanly on Ctrl-C.
+`listen` window alone logged 200+ `ErrorCode::Overflow` occurrences over
+its ~30-minute run (SoapySDR's own `O` status character, one per
+occurrence) and still completed and shut down cleanly on Ctrl-C -- an
+aggregate count across many separate `read()` calls, each recovering via
+a normal read afterward, not 200 in a single unbroken run against the
+100-count `MAX_OVERFLOW_RETRIES` bound (which would itself abort the
+session at the 100th consecutive occurrence within one `read()` call).
 
 This was a real reliability gap for any unattended run longer than a few
 minutes, not a hypothetical -- worth keeping in mind for the still-open
@@ -35,15 +40,24 @@ M2 Pi4 CPU-budget/24h-soak acceptance legs (CLAUDE.md Status): a
 resource-constrained Pi4 is *more* likely to overflow the ring buffer
 under load than this Mac Mini was, not less.
 
-## Finding 2 (field-confirmed, not fixed here): MAN-7/103's near-channel-edge bug produces plausible-looking false-positive spots
+## Finding 2 (new, unresolved -- likely distinct from MAN-7/103): a passband-edge artifact produces plausible-looking false-positive spots
 
 Across 10 completed 30-minute `listen --json` windows plus one partial
 (11 total, ~5.5h), 29 `Spot`s were confirmed -- but every one shares the
 same signature:
 
 - confidence pinned to 0.118-0.172 (the low end of the scale)
-- `snr_db` pinned to -8.28 to -7.29 dB -- indistinguishable from the
-  session's own background noise floor, not a real carrier
+- `snr_db` (the SPEC §2.3 2500 Hz-reference conversion,
+  `(S-F) - 14.3 dB`) pinned to -8.28 to -7.29 dB. That is *not* the same
+  as "no signal": a reported -8.28 dB here means the narrow 93.75 Hz
+  channel SNR `(S-F)` was still around +6 dB, i.e. consistently ~6-7 dB
+  above the local per-channel noise-floor estimate -- a real, structured
+  narrowband excess, just one this analysis can't yet distinguish from a
+  persistent artifact/spur vs. an actual off-air carrier. What *is*
+  suspicious is that the value is pinned nearly constant (-8.28 to
+  -7.29 dB) across 29 independent detections rather than varying the way
+  real fading/QRM would -- consistent with a deterministic mechanism, not
+  proof by itself that it's not a real signal.
 - WPM scattered widely and often implausible for real CW traffic/beacons
   (30.8-60.0 wpm)
 - callsigns frequently malformed (`3EMEEEE`, `ER1EEAE`, `4AEEEEE` --
@@ -56,22 +70,45 @@ identical values across *separate, non-overlapping* windows (6931.2-
 distributed -- a signature of a fixed decode artifact, not noise
 variance. Isolated with a dial-shift test: retuning from 7025 kHz to
 7075 kHz (passband ~6979-7171 kHz) moved the artifact to the *new*
-passband's edge (7168.2 kHz) instead of leaving it at 6931 kHz. This
-matches CLAUDE.md's already-tracked "V2: near-channel-edge WPM bug
-(MAN-7/103)" exactly -- first real-world field confirmation of its
-practical impact (spurious RBN-shaped spots, not just a WPM-accuracy
-metric), not a new bug.
+passband's edge (7168.2 kHz) instead of leaving it at 6931 kHz.
 
-Operational implication for anyone running `manta` against real RF before
-MAN-7/103 lands: `spots_confirmed`/emitted `Spot`s alone are not
-sufficient evidence of a real decode today. Cross-check `snr_db` against
-the session's own noise floor and `confidence` before trusting a spot,
-especially near a channelizer boundary.
+**Not the same bug as MAN-7/103 without more evidence, despite the
+"edge" coincidence.** MAN-7/103 (`crates/manta-cli/tests/
+golden_v2_v3.rs:23-55`, `#[ignore]`d pending
+<https://github.com/HagaleTechnologies/manta/issues/24>) is a WPM-
+*estimation* error (~29 vs. an expected 35 WPM) for a real keyed signal
+near one *individual* 93.75 Hz PFB channel edge -- the golden test shows
+a clean decode with correct WPM at channel center, and nothing in that
+regression shows the near-edge offset spawning tracks or spots from
+noise. What this session isolated tracks the edge of the entire 192 kHz
+*input passband* (a single boundary, not one of the many per-channel
+boundaries scattered through it) and produces spurious *detections*, not
+a WPM error on a real one. These could still share a root cause (e.g.
+channelizer transient response at a boundary), but that link isn't
+established here -- treat this as a separate, currently untracked
+front-end/passband-edge false-positive defect until individual-channel
+residuals and the detection path (not just the WPM path) are examined
+directly.
+
+Operational implication either way, for anyone running `manta` against
+real RF right now: `spots_confirmed`/emitted `Spot`s alone are not
+sufficient evidence of a real decode. A spot whose `snr_db` sits within
+about a dB of this session's own recurring floor value and whose
+confidence sits at the low end of the scale is suspect -- especially
+near a passband or channelizer boundary -- but confirming it's actually
+noise (rather than a real weak/repeating signal) needs more than the
+`snr_db` value alone, per the reference-bandwidth conversion above.
 
 ## Finding 3 (extends 2026-09-08's Finding 3, still open): no confirmed real off-air CW copy on 40m tonight
 
-Zero of the 29 confirmed spots were real signal by the above analysis.
-Max instantaneous `TrackMeta.snr_2500_db` touched positive values in
+None of the 29 confirmed spots are backed by a validated callsign at a
+clearly-above-population SNR -- by the signature in Finding 2 (pinned
+near-identical `snr_db`, low confidence, malformed text, edge-clustered
+frequencies) every one is far more consistent with the passband-edge
+artifact than with real copy, though Finding 2's caveat about the
+reference-bandwidth conversion means this is "no *evidence* of real
+copy," not a from-first-principles proof each one is noise. Max
+instantaneous `TrackMeta.snr_2500_db` touched positive values in
 several windows (best full-window case +5.6 dB; one anomalous +18.3 dB
 track, `track_id` 5700 at 7076576 Hz, appeared in the final partial
 window right as the session was cut short for a band switch to 20m --
@@ -90,8 +127,10 @@ SWR check before the next unattended run.
 ## Takeaway
 
 The overflow fix is a genuine reliability improvement, confirmed in the
-field, independent of whether 40m ever produces a real decode. MAN-7/103
-now has concrete field evidence beyond the WPM-accuracy angle it was
-originally tracked under. Off-air real-signal confirmation is still the
-one open item neither this run nor 2026-09-08's closed -- next attempted
-on 20m same night, see follow-up session notes.
+field, independent of whether 40m ever produces a real decode. This run
+also surfaced a second, separate, currently-untracked false-positive
+defect near the input passband edge -- plausibly but not confirmedly
+related to MAN-7/103 -- worth its own investigation rather than folding
+into that existing bug by assumption. Off-air real-signal confirmation is
+still the one open item neither this run nor 2026-09-08's closed -- next
+attempted on 20m same night, see follow-up session notes.
