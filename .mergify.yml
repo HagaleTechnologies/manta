@@ -91,7 +91,23 @@ queue_rules:
   - name: default
     merge_method: squash
     batch_size: 1
-    update_method: rebase
+    # merge, not rebase: this repo's ruleset also has
+    # strict_required_status_checks_policy: true ("Require branches to be
+    # up to date before merging"), and Mergify refuses to pair THAT with
+    # update_method: rebase unless a separate update_bot_account is
+    # configured (a rebase changes commit SHAs and needs an authorized
+    # account to attribute the push to) -- confirmed live: PR #90 sat with
+    # every real check green but the queue rule itself reporting
+    # action_required ("Configuration not compatible with
+    # required_status_checks ruleset rule") until this was caught, because
+    # no bot PR had ever gotten far enough to reach this step before
+    # catalyst-cloud-connector[bot] was trusted to auto-queue at all.
+    # update_method only affects the temporary in-place-checks update
+    # Mergify performs while validating a queued PR, never lands on main
+    # itself (squash discards that structure regardless) -- the PR
+    # branch's own linear history during that temporary window isn't
+    # worth the OAuth/bot-account setup update_bot_account would require.
+    update_method: merge
 
 pull_request_rules:
   - name: queue on green + threads resolved
