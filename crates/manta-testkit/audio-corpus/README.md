@@ -57,7 +57,17 @@ and conversion tooling notes, not the bytes.
   absent — so decoding the converted file needs a
   `B2_20251129_000000_7080kHz.json` sidecar with
   `{"center_freq_hz": 7080000}` alongside it, or spots/events will carry
-  baseband-relative rather than correct RF frequencies.
+  baseband-relative rather than correct RF frequencies. **Exact
+  conversion command** (Codex review, PR #144 -- without a pinned command
+  and checksums, "this recording, unmodified pipeline" doesn't actually
+  identify the benchmark input; bit-depth/normalization choices in the
+  conversion can shift weak-signal samples and so the reported spot
+  count):
+  `ffmpeg -i B2_20251129_000000_7080kHz.wav -c:a pcm_s16le B2_20251129_000000_7080kHz.wav`
+  (source, as received from George K5TR, unmodified: SHA-256
+  `74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2`;
+  converted, this repo's benchmark input: SHA-256
+  `d2ea524744fd9d551bd4e5f09103a1771588eb11d37054c4334078edd4d4a621`).
 
 ## Ground truth
 

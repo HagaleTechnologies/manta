@@ -151,6 +151,23 @@ def parse_iso(s):
     return dt
 
 
+def _finite_non_negative(name):
+    """argparse type for a tolerance option: rejects non-finite (nan/inf)
+    and negative values (Codex review, PR #144) -- `x > nan` is always
+    False in Python, so an un-validated `--time-tol-s nan` would silently
+    disable the time bound entirely (any spot, arbitrarily far from a
+    truth observation, would pass), and a negative tolerance would
+    silently reject even an exact (0-second/0-Hz) match."""
+    def parse(s):
+        v = float(s)
+        if not (v == v) or v in (float("inf"), float("-inf")) or v < 0:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be a finite, non-negative number, got {s!r}"
+            )
+        return v
+    return parse
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("decode_report")
@@ -158,8 +175,8 @@ def main():
     ap.add_argument("--capture-start", required=True, type=parse_iso,
                      help="Recording's capture start, ISO-8601 UTC (e.g. 2025-11-29T00:00:00Z)")
     ap.add_argument("--sample-rate-hz", required=True, type=float)
-    ap.add_argument("--freq-tol-hz", type=float, default=500.0)
-    ap.add_argument("--time-tol-s", type=float, default=90.0,
+    ap.add_argument("--freq-tol-hz", type=_finite_non_negative("--freq-tol-hz"), default=500.0)
+    ap.add_argument("--time-tol-s", type=_finite_non_negative("--time-tol-s"), default=90.0,
                      help="Max seconds between a manta spot and some real RBN observation of that call+freq (default: 90s, matching RepetitionGate's own window)")
     ap.add_argument("--show-samples", type=int, default=10)
     args = ap.parse_args()
