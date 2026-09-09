@@ -947,10 +947,13 @@ struct SpotServer {
 /// sized against the pre-MAN-45 25s value; against 50s here, a 30s
 /// container timeout SIGKILLs the daemon partway through the very drain
 /// this constant exists to allow, before it can record the abandoned
-/// backlog on `manta_spots_dropped_shutdown_total` -- recreating the
-/// silent truncation the drain work removed. Both are now 60s, leaving
-/// margin over this deadline. If this constant grows again, raise them
-/// with it.
+/// backlog on `manta_spots_dropped_write_failed_total` (the counter each
+/// handler's drain loop charges when its own `CLIENT_DRAIN_DEADLINE`
+/// expires -- `manta_spots_dropped_shutdown_total` covers only a client
+/// still in pre-login/handshake, before any write was attempted) --
+/// recreating the silent truncation the drain work removed. Both are now
+/// 60s, leaving margin over this deadline. If this constant grows again,
+/// raise them with it.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// How often the server runtime copies the engine's live track count into
@@ -1314,9 +1317,8 @@ fn main() -> Result<()> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-<<<<<<< HEAD
             let (server_runtime, spot_server, active_tracks, mut active_tracks_poller) =
-                match server_config {
+                match config {
                     Some(path) => {
                         // `epoch` feeds SpotBus's wall-clock conversion (every
                         // JSON `timestamp`/RBN Zulu field a client observes) --
@@ -1349,41 +1351,6 @@ fn main() -> Result<()> {
                                 .expect("epoch predates the Unix epoch")
                                 .as_nanos(),
                         };
-=======
-            let (server_runtime, spot_server) = match config {
-                Some(path) => {
-                    // `epoch` feeds SpotBus's wall-clock conversion (every
-                    // JSON `timestamp`/RBN Zulu field a client observes) --
-                    // a live session's epoch is this process's real start
-                    // time; a replay session's defaults to the replayed
-                    // file's own mtime, a genuine timestamp that's stable
-                    // across reruns of the SAME untouched file, but changes
-                    // across a copy/download/restore that doesn't preserve
-                    // filesystem metadata even though the recording's
-                    // content is identical -- pass --replay-epoch to pin an
-                    // exact value when that matters more than "whatever
-                    // this machine's copy says" (round-7 review finding;
-                    // see the flag's own doc comment for the full
-                    // rationale, and `epoch_for_replay_path`'s for why
-                    // neither "always now()" nor a content-hash alone was
-                    // right before this flag existed). `session_nonce` is
-                    // the separate, spot-id-uniqueness-only value:
-                    // recording-content-derived for file replay (so
-                    // different recordings never collide on id even at the
-                    // same track/sample position), nanosecond-precision-now
-                    // for a live session (so two live sessions started
-                    // within the same wall-clock second don't collide
-                    // either).
-                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                    let session_nonce: u128 = match &replay_path {
-                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
-                        // Live session: `epoch` above is already SystemTime::now().
-                        None => epoch
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .expect("epoch predates the Unix epoch")
-                            .as_nanos(),
-                    };
->>>>>>> e099a51739b83ee167e1bf8067876ce8bb27ae07
 
                         let (rt, server) =
                             start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;

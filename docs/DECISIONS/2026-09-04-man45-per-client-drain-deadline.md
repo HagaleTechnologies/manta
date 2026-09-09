@@ -81,11 +81,27 @@ bug shape, rather than another same-region point patch.
     replays of spots already published (and already counted once in
     `manta_spots_total`) — charging them again on an ordinary,
     no-write-failure shutdown fabricated data loss on that counter, up to
-    `RECENT_HISTORY_CAP` per client. Fixed by not charging the remaining
-    history at all (only a real write failure, at the pre-existing site a
-    few lines below, still charges `history.len() + rx.len()`); the live
-    `rx` backlog is now accounted for by the drain branch it defers to
-    (CR-2), not by this pre-check.
+    `RECENT_HISTORY_CAP` per client. Fixed by keeping replay loss OUT of
+    the write-failure counter; the live `rx` backlog is accounted for by
+    the drain branch this pre-check defers to (CR-2), not by the pre-check
+    itself.
+- **Rounds 18-19 (supersede CR-3's first form)**: CR-3 as originally
+  landed left the abandoned history entries counted NOWHERE, which
+  contradicted ARCHITECTURE §8's "every dropped/evicted/suppressed item is
+  counted" rule — a `sh/dx` replay interrupted by shutdown, or a replay
+  write that failed with an empty `rx`, reported zero loss. Round 18
+  removed `history.len()` from the write-failure counter at the replay
+  write-failure site too (previously `history.len() + rx.len()`); round 19
+  then gave the abandoned entries their own dedicated series,
+  `manta_spots_replay_abandoned_total`. **Current, normative state of the
+  telnet replay path** (`telnet.rs`, `Command::ShowDx`): the shutdown
+  pre-check records `history.len()` on
+  `manta_spots_replay_abandoned_total` and `break`s; a replay write failure
+  records `1 + history.len()` there (the `1 +` for the entry whose write
+  just failed) and charges ONLY the live `rx.len()` backlog to
+  `manta_spots_dropped_write_failed_total`. That keeps the write-failure
+  counter's "delivered + counted == published" arithmetic intact while
+  leaving no abandoned entry silent. Do not re-merge the two counters.
 
 ## Why this is architectural, not another numeric tuning
 
@@ -170,7 +186,10 @@ drain branch, up to ~1000s in the worst case. It now re-checks
 shutdown is observed, `break`s back to the `select!` loop's own drain
 branch (round 17, CR-2) instead of running the rest of the replay — the
 remaining history entries are simply not re-attempted (they were already
-published and counted once; round 17 CR-3), so its worst case matches the
+published and counted once in `manta_spots_total`; round 17 CR-3) but are
+recorded on `manta_spots_replay_abandoned_total` rather than on the
+live-delivery write-failure counter (rounds 18-19), so its worst case
+matches the
 live-write arm's fixed 20s instead of scaling with replay depth, and the
 live `rx` backlog left in the channel still gets a genuine chance at
 delivery via that drain branch rather than being abandoned outright.
