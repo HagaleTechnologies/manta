@@ -181,11 +181,8 @@ impl Lifecycle {
         }
     }
 
-    /// Query the current lifecycle state.
-    // Temporary: no non-test reader yet -- `Track::state` (the only
-    // present-day caller of this) is itself unused outside tests until a
-    // later task filters/reports tracks by lifecycle state.
-    #[allow(dead_code)]
+    /// Query the current lifecycle state. Read in production through
+    /// `Track::state` by `merge_keep_rank` (SPEC §2.5 tie-break).
     pub(crate) fn state(&self) -> LifecycleState {
         self.state
     }
@@ -319,6 +316,23 @@ pub(crate) struct Track {
     has_emitted: bool,
 }
 
+/// How much lifecycle progress a track has to lose in a `merge_converged`
+/// SNR tie: higher survives. Ordered `(promoted, has_emitted)` -- a track
+/// that has been through CANDIDATE -> ACTIVE outranks one still awaiting
+/// confirmation (which may yet expire `Unconfirmed`, taking the merged
+/// signal's only decode with it), and among promoted tracks the one that
+/// has already put events on the wire outranks one that has not.
+///
+/// Deliberately *not* a function of `id`: `TrackManager::spawn`'s `next_id`
+/// is spawn-ordered and says nothing about which track promoted first (see
+/// `merge_converged`'s tie-break comment). The caller falls back to the
+/// lower id only when this rank ties too, so the ordering stays total and
+/// deterministic (SPEC §8).
+fn merge_keep_rank(t: &Track) -> (bool, bool) {
+    let promoted = matches!(t.state(), LifecycleState::Active | LifecycleState::Hang);
+    (promoted, t.has_emitted)
+}
+
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
 fn wrapped_channel_offset(k: usize, n_channels: usize) -> f64 {
     let half = n_channels as i64 / 2;
@@ -348,10 +362,9 @@ impl Track {
         }
     }
 
-    /// Query the current lifecycle state. SPEC §2.4.
-    // Temporary: no non-test caller yet until a later task filters/reports
-    // tracks by lifecycle state (e.g. spot output limited to ACTIVE tracks).
-    #[allow(dead_code)]
+    /// Query the current lifecycle state. SPEC §2.4. Read by
+    /// `merge_keep_rank` to rank lifecycle progress ahead of spawn order in
+    /// `merge_converged`'s SNR tie-break.
     pub(crate) fn state(&self) -> LifecycleState {
         self.lifecycle.state()
     }
@@ -677,7 +690,8 @@ impl TrackManager {
     }
 
     /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
-    /// the lower-current-SNR one is closed.
+    /// the lower-current-SNR one is closed. Ties fall back to
+    /// `merge_keep_rank`, then to keeping the lower id.
     fn merge_converged(&mut self) -> Vec<u32> {
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         let mut to_close = Vec::new();
@@ -705,11 +719,36 @@ impl TrackManager {
                     // confirmed live for MAN-3's "DA"/"Z5" cases: dozens of
                     // promotions across a 12 s scene, every one merged away
                     // within a few hundred hops, none ever surviving the
-                    // ~375-hop `Demod` init window. `<` keeps the
-                    // incumbent on an exact tie (no evidence it's actually
-                    // weaker); only a track reading a STRICTLY lower SNR
-                    // now loses.
-                    let loser = if self.tracks[&a].current_snr_db < self.tracks[&b].current_snr_db {
+                    // ~375-hop `Demod` init window. Only a track reading a
+                    // STRICTLY lower SNR loses on SNR alone; an exact tie
+                    // falls through to `merge_keep_rank` below.
+                    //
+                    // Review round 1: id order is *spawn* order, not
+                    // promotion order -- `merge_converged` scans CANDIDATE
+                    // and ACTIVE tracks alike, so a low-id candidate that
+                    // accumulates rise hops slowly can still be unconfirmed
+                    // when a higher-id neighbour has already promoted and
+                    // built up decoder history. Breaking the tie on id
+                    // alone would discard that promoted track and keep a
+                    // candidate that may simply expire as `Unconfirmed` --
+                    // recreating this ticket's zero-output failure from the
+                    // other direction. Rank lifecycle progress (promoted,
+                    // and whether it has actually emitted) ahead of id, and
+                    // fall back to keeping the lower id only when even that
+                    // ties -- which is the exact case the `<`-over-`<=`
+                    // change above was made for, so the MAN-3 behaviour is
+                    // unchanged wherever both tracks are at the same
+                    // lifecycle stage.
+                    let (sa, sb) = (
+                        self.tracks[&a].current_snr_db,
+                        self.tracks[&b].current_snr_db,
+                    );
+                    let loser = if sa < sb {
+                        a
+                    } else if sb < sa {
+                        b
+                    } else if merge_keep_rank(&self.tracks[&a]) < merge_keep_rank(&self.tracks[&b])
+                    {
                         a
                     } else {
                         b
@@ -1414,6 +1453,65 @@ mod tests {
             tm.close_counts().merged,
             1,
             "issue #26: merge must be counted"
+        );
+    }
+
+    /// Build a converged pair on an exact SNR tie and return the surviving
+    /// track's id. `promote` names which of the two ids is driven all the
+    /// way through CANDIDATE -> ACTIVE (via the real `Lifecycle::on_hop`
+    /// path) before the merge runs; `None` leaves both unconfirmed.
+    fn merge_snr_tie_survivor(promote: Option<usize>) -> u32 {
+        let cfg = DetectorConfig::default();
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+
+        for (slot, id) in ids.iter().enumerate() {
+            let t = tm.tracks.get_mut(id).unwrap();
+            // Bit-identical SNR: both tracks read the same physical peak
+            // channel, the exact tie `merge_converged` must resolve.
+            t.current_snr_db = 14.0;
+            t.center = if slot == 0 { 20.4 } else { 21.1 };
+            if promote == Some(slot) {
+                // Real promotion path, not a hand-set state field.
+                for _ in 0..cfg.confirm_hops {
+                    t.lifecycle.on_hop(true, false, false);
+                }
+                assert_eq!(t.state(), LifecycleState::Active);
+            }
+        }
+
+        tm.merge_converged();
+        assert_eq!(tm.tracks.len(), 1, "converged pair must merge to one track");
+        *tm.tracks.keys().next().unwrap()
+    }
+
+    /// Review round 1: on an exact SNR tie, id order is *spawn* order and
+    /// says nothing about promotion order. A low-id CANDIDATE that is still
+    /// unconfirmed must not evict a higher-id track that has already
+    /// promoted and holds decoder history -- doing so throws away the only
+    /// track that can decode the merged signal, which is MAN-3's
+    /// zero-output failure arriving from the other direction. Lifecycle
+    /// progress outranks id; id decides only when that ties too (which is
+    /// the MAN-3 `<`-over-`<=` case, asserted here unchanged).
+    #[test]
+    fn merge_snr_tie_keeps_the_promoted_track_over_a_bare_candidate() {
+        assert_eq!(
+            merge_snr_tie_survivor(None),
+            1,
+            "both still CANDIDATE: the tie falls through to id, keeping the incumbent (MAN-3)"
+        );
+        assert_eq!(
+            merge_snr_tie_survivor(Some(1)),
+            2,
+            "the promoted higher-id track must outrank an unconfirmed lower-id candidate"
+        );
+        assert_eq!(
+            merge_snr_tie_survivor(Some(0)),
+            1,
+            "and symmetrically: a promoted lower-id track still survives"
         );
     }
 

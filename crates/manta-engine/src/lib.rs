@@ -117,17 +117,25 @@ pub struct DecodeReport {
 /// looped text). The correct decode was never lost -- it stayed in
 /// `DecodeReport::events` -- it was just excluded from `.text`.
 ///
-/// Rule: most `CharDecoded` events wins; ties break to the lowest
+/// Rule: most *rendered* characters wins; ties break to the lowest
 /// `track_id`. The all-tied-at-zero case (no track decoded anything) is a
 /// tie, so a telemetry-only stream still reports the lowest id exactly as
 /// before. `BTreeMap` gives a fixed ascending scan and the key is a total
 /// order, so the result depends only on the event multiset -- not on
 /// iteration order (SPEC §8 determinism).
+///
+/// "Rendered" is `Glyph::text_char().is_some()`, i.e. exactly the events
+/// `events_to_text` keeps: SPEC §4.4 drops every `Glyph::Prosign` from
+/// telnet-facing text, so a track whose only `CharDecoded` events are
+/// prosigns (`<AR>`, `<SK>`, ...) contributes *nothing* to `.text`.
+/// Counting raw `CharDecoded` would let such a track out-rank one carrying
+/// real letters and hand `.text` back an empty string -- the very failure
+/// this selector exists to prevent (review round 1).
 fn select_report_track(events: &[DecoderEvent]) -> u32 {
     let mut chars_per_track: BTreeMap<u32, usize> = BTreeMap::new();
     for e in events {
         let entry = chars_per_track.entry(track::event_track_id(e)).or_insert(0);
-        if matches!(e, DecoderEvent::CharDecoded { .. }) {
+        if matches!(e, DecoderEvent::CharDecoded { glyph, .. } if glyph.text_char().is_some()) {
             *entry += 1;
         }
     }
@@ -330,6 +338,30 @@ mod tests {
     fn report_track_ties_break_to_the_lowest_id() {
         assert_eq!(select_report_track(&[meta(9), meta(4), meta(7)]), 4);
         assert_eq!(select_report_track(&[ch(9, 1), ch(4, 2), meta(7)]), 4);
+    }
+
+    /// Review round 1: `events_to_text` drops every `Glyph::Prosign` (SPEC
+    /// §4.4), so a prosign-only track renders to an empty string. Ranking
+    /// raw `CharDecoded` counts would hand it `.text` over a track carrying
+    /// real letters -- reproducing the empty-`.text` failure this selector
+    /// exists to prevent.
+    #[test]
+    fn report_track_ranks_only_glyphs_that_render_into_text() {
+        let prosign = |track_id: u32, sample_ts: u64| DecoderEvent::CharDecoded {
+            track_id,
+            sample_ts,
+            glyph: Glyph::Prosign(manta_decode::tree::Prosign::Ar),
+            confidence: 0.9,
+        };
+        let events = vec![
+            prosign(3, 10),
+            prosign(3, 20),
+            prosign(3, 30),
+            ch(7, 100),
+            meta(7),
+        ];
+        assert_eq!(select_report_track(&events), 7);
+        assert_eq!(events_to_text(&events), "A");
     }
 
     /// SPEC §8: selection must be a pure function of the event stream, with
