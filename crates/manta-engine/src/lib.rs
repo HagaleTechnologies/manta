@@ -2,7 +2,13 @@
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
 pub mod listen;
+<<<<<<< HEAD
 pub use listen::{listen, listen_with_observers, ListenObservers};
+=======
+pub use listen::listen;
+pub mod doctor;
+pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
+>>>>>>> ea0b305d98310f0d3c611c2516e18c7388ce3a60
 pub mod soak;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
@@ -21,15 +27,18 @@ use manta_input::{read_all, IqSource, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
 
-/// Applies the calibration factor to a `TrackMeta` event's `freq_hz`,
-/// leaving every other event variant untouched. Used to calibrate the
-/// public-facing event stream (`DecodeReport::events`, `listen()`'s
-/// `on_event` callback) -- both consumed directly by `decode --json`/
-/// `listen --json` -- WITHOUT touching the copy fed to
-/// `manta_spot::Validator::ingest`, which already applies its own
-/// calibration internally; applying it here too would double-correct the
-/// validator's spot output (MAN-29 review round 3).
-pub(crate) fn calibrate_track_meta(ev: &DecoderEvent, factor: f64) -> DecoderEvent {
+/// Applies the calibration factor to every event variant that carries a
+/// `freq_hz` (`TrackMeta`, `TrackPromoted`), leaving every other variant
+/// untouched. Used to calibrate the public-facing event stream
+/// (`DecodeReport::events`, `listen()`'s `on_event` callback) -- both
+/// consumed directly by `decode --json`/`listen --json` -- WITHOUT
+/// touching the copy fed to `manta_spot::Validator::ingest`, which already
+/// applies its own calibration internally; applying it here too would
+/// double-correct the validator's spot output (MAN-29 review round 3).
+/// `TrackPromoted` calibration added in round 5 of the doctor review:
+/// otherwise a promoted track's first-reported frequency is raw while
+/// every later `TrackMeta`/spot for the same track is calibrated.
+pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEvent {
     match ev {
         DecoderEvent::TrackMeta {
             track_id,
@@ -40,8 +49,36 @@ pub(crate) fn calibrate_track_meta(ev: &DecoderEvent, factor: f64) -> DecoderEve
             snr_2500_db: *snr_2500_db,
             freq_hz: freq_hz * factor,
         },
+        DecoderEvent::TrackPromoted {
+            track_id,
+            sample_ts,
+            freq_hz,
+        } => DecoderEvent::TrackPromoted {
+            track_id: *track_id,
+            sample_ts: *sample_ts,
+            freq_hz: freq_hz * factor,
+        },
         other => other.clone(),
     }
+}
+
+/// `decode_samples`'s single-track selection: the lowest track_id among
+/// events that represent real decoder output. `TrackPromoted` is a
+/// detector-internal diagnostic signal (added for `manta_engine::doctor()`'s
+/// NoSignal check, see docs/DECISIONS/2026-09-09-doctor-track-promoted-
+/// event.md) with no decoder output of its own -- excluded here so an
+/// early, low-track-id candidate that was promoted and then merged/
+/// evicted/reached EOF before producing any real decoder event never gets
+/// selected over a later track that actually decoded something (round-5
+/// review finding). `None` means every event in `events` was a
+/// `TrackPromoted` (or `events` was empty, already handled by the caller
+/// before this is reached).
+fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
+    events
+        .iter()
+        .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+        .map(track::event_track_id)
+        .min()
 }
 
 /// M0 pipeline tunables. SPEC §5.
@@ -178,7 +215,9 @@ pub fn decode_samples(
     if events.is_empty() {
         bail!("no signal found (input shorter than one filter length or empty)");
     }
-    let min_track_id = events.iter().map(track::event_track_id).min().unwrap();
+    let Some(min_track_id) = primary_track_id(&events) else {
+        bail!("no signal found (only detector promotion events, no decoder output)");
+    };
     let this_track: Vec<DecoderEvent> = events
         .iter()
         .filter(|e| track::event_track_id(e) == min_track_id)
@@ -222,8 +261,12 @@ pub fn decode_samples(
     // peak memory on a long/dense offline decode for no reason (MAN-29
     // review round 4).
     for ev in events.iter_mut() {
-        if let DecoderEvent::TrackMeta { freq_hz, .. } = ev {
-            *freq_hz *= calibration_factor;
+        match ev {
+            DecoderEvent::TrackMeta { freq_hz, .. }
+            | DecoderEvent::TrackPromoted { freq_hz, .. } => {
+                *freq_hz *= calibration_factor;
+            }
+            _ => {}
         }
     }
     Ok(DecodeReport {
@@ -248,6 +291,55 @@ pub fn decode_wav(path: &Path, cfg: &PipelineConfig) -> Result<DecodeReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (round-5 review, P1): an early low-track-id candidate
+    /// that only ever produced a `TrackPromoted` (promoted, then merged/
+    /// evicted/EOF'd before any real decoder output) must never be
+    /// selected over a later track that actually decoded something.
+    #[test]
+    fn primary_track_id_skips_a_promotion_only_track() {
+        let events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 1,
+                sample_ts: 0,
+                freq_hz: 14_000_100.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 10,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::TrackMeta {
+                track_id: 2,
+                snr_2500_db: 20.0,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 2,
+                sample_ts: 20,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+            },
+        ];
+        assert_eq!(primary_track_id(&events), Some(2));
+    }
+
+    #[test]
+    fn primary_track_id_is_none_when_only_promotions_occurred() {
+        let events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 1,
+                sample_ts: 0,
+                freq_hz: 14_000_100.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 5,
+                freq_hz: 14_012_340.0,
+            },
+        ];
+        assert_eq!(primary_track_id(&events), None);
+    }
 
     /// MAN-31: `decode_samples` is one of the two production call sites
     /// that must apply an operator-supplied suppression list -- proves the

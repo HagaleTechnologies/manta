@@ -72,8 +72,10 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -116,8 +118,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -189,8 +191,10 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -230,8 +234,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -264,6 +268,96 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
+    },
+    /// Bounded-duration health check: is this source hearing anything real?
+    /// Runs the real decode pipeline for --duration, then reports track/SNR/
+    /// spot stats and a verdict -- distinguishes "no signal" from "signal but
+    /// not decoding" from "working end to end," which a bare `listen` run
+    /// with zero spots can't tell apart on its own.
+    Doctor {
+        /// Duration in seconds (3-3600; see manta_engine::doctor::{MIN_DURATION,MAX_DURATION}).
+        #[arg(long, default_value_t = 10)]
+        duration: u64,
+        #[arg(long, conflicts_with = "source")]
+        device: Option<String>,
+        #[arg(long, conflicts_with = "device")]
+        source: Option<PathBuf>,
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq.
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        kiwi_host: Option<String>,
+        /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
+        #[arg(long, default_value = "8073", requires = "kiwi_host")]
+        kiwi_port: u16,
+        /// RF center frequency in Hz. Required with --kiwi-host.
+        #[arg(long, requires = "kiwi_host")]
+        kiwi_freq: Option<f64>,
+        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
+        #[arg(long, requires = "kiwi_host", default_value = "")]
+        kiwi_password: String,
+        /// Per-source frequency-calibration correction, in ppm (config key
+        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
+        /// correction).
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
+        freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
+        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
+        #[arg(long)]
+        blocklist: Option<PathBuf>,
+        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
+        /// range per line (MAN-31).
+        #[arg(long)]
+        notch: Option<PathBuf>,
+        /// SoapySDR driver args (e.g. "driver=sdrplay"), feature `soapy`.
+        /// Requires --soapy-freq and --soapy-rate.
+        #[cfg(feature = "soapy")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        soapy_driver: Option<String>,
+        /// RF center frequency in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_rate: Option<f64>,
+        /// Gain in dB (omit for AGC, if the device supports it).
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_gain: Option<f64>,
+        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
+        /// Requires --hpsdr-freq and --hpsdr-rate.
+        #[cfg(feature = "hpsdr")]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port (default 1024, the standard Metis
+        /// discovery/control port).
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        hpsdr_port: u16,
+        /// RF center frequency in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
+        hpsdr_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
+        hpsdr_rate: Option<f64>,
+        /// Emit the DoctorReport as one JSON object on stdout instead of a
+        /// human-readable summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1455,8 +1549,146 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Doctor {
+            duration,
+            device,
+            source,
+            kiwi_host,
+            kiwi_port,
+            kiwi_freq,
+            kiwi_password,
+            freq_correction_ppm,
+            allowlist,
+            blocklist,
+            notch,
+            #[cfg(feature = "soapy")]
+            soapy_driver,
+            #[cfg(feature = "soapy")]
+            soapy_freq,
+            #[cfg(feature = "soapy")]
+            soapy_rate,
+            #[cfg(feature = "soapy")]
+            soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate,
+            json,
+        } => {
+            // Checked before any source is opened -- otherwise an invalid
+            // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
+            // connect/activate already spent real time (or hung/failed for
+            // an unrelated hardware reason), and the user never sees the
+            // actual duration error at all (round-5 review finding).
+            let duration_secs = duration;
+            if !(manta_engine::MIN_DURATION.as_secs()..=manta_engine::MAX_DURATION.as_secs())
+                .contains(&duration_secs)
+            {
+                bail!(
+                    "--duration must be between {} and {} seconds, got {duration_secs}",
+                    manta_engine::MIN_DURATION.as_secs(),
+                    manta_engine::MAX_DURATION.as_secs()
+                );
+            }
+            let kiwi = KiwiOpts {
+                host: kiwi_host,
+                port: kiwi_port,
+                freq: kiwi_freq,
+                password: kiwi_password,
+            };
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            #[cfg(feature = "hpsdr")]
+            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                host: hpsdr_host,
+                port: hpsdr_port,
+                freq: hpsdr_freq,
+                rate: hpsdr_rate,
+            })?;
+            #[cfg(not(feature = "hpsdr"))]
+            let hpsdr_source: Option<Box<dyn IqSource>> = None;
+            let src = match hpsdr_source {
+                Some(src) => src,
+                None => {
+                    #[cfg(feature = "soapy")]
+                    {
+                        open_source(
+                            device,
+                            source,
+                            kiwi,
+                            SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            },
+                        )?
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        open_source(device, source, kiwi)?
+                    }
+                }
+            };
+            let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
+            if json {
+                // `verdict()` is computed, not a stored field, so a plain
+                // `serde_json::to_string(&report)` omits the command's
+                // primary health classification entirely -- merge it in as
+                // an extra key rather than making JSON consumers duplicate
+                // the classification policy themselves.
+                let mut value = serde_json::to_value(&report)?;
+                if let serde_json::Value::Object(ref mut map) = value {
+                    map.insert(
+                        "verdict".to_string(),
+                        serde_json::to_value(report.verdict())?,
+                    );
+                }
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                print_doctor_report(&report);
+            }
+        }
     }
     Ok(())
+}
+
+/// Human-readable `manta doctor` summary. `--json` bypasses this entirely
+/// in favor of the raw `DoctorReport`.
+fn print_doctor_report(report: &manta_engine::DoctorReport) {
+    println!(
+        "source: {:.0} Hz sample rate, {:.1} Hz center, observed for {:.1}s",
+        report.sample_rate_hz,
+        report.center_freq_hz,
+        report.duration.as_secs_f64()
+    );
+    println!(
+        "tracks: {} promoted, {} TrackMeta updates, {} closed",
+        report.tracks_promoted, report.track_meta_count, report.tracks_closed
+    );
+    match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
+        (Some(min), Some(median), Some(max)) => {
+            println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
+        }
+        // `tracks_promoted` is verdict()'s own authoritative signal for
+        // "did anything really happen" -- match its logic exactly rather
+        // than re-deriving it from a different combination of fields.
+        _ if report.tracks_promoted == 0 => {
+            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
+        }
+        _ => println!(
+            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
+             run ended"
+        ),
+    }
+    println!(
+        "decode: {} chars ({} distinct), {} confirmed spots",
+        report.chars_decoded, report.distinct_chars, report.spots_confirmed
+    );
+    println!("verdict: {}", report.verdict().summary());
 }
 
 #[cfg(test)]
