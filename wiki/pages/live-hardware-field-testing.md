@@ -8,7 +8,7 @@ sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
 verified:
-  commit: 68701a730c3ecb877acd6ca6e4e76345c25a5759
+  commit: a1aad7da9e8cb98de7c2c68881b81d95c2bc98e6
   date: 2026-09-09
 links:
   - spot-validation
@@ -55,24 +55,41 @@ those for the full evidence and reasoning.
 
 ## A confirmed `Spot` is not proof of a real signal
 
-Don't trust `spots_confirmed > 0` (or a `Decoding` verdict) alone. The
-repetition gate ([[spot-validation]]) assumes bogus decodes are random
-noise that won't repeat identically — but a deterministic decode artifact
-at a fixed frequency repeats identically every time and passes the gate
-just as well. Field-confirmed 2026-09-09: 29/29 confirmed spots in an
-overnight 40m session shared one signature — confidence pinned to the
-low end (~0.12-0.17), often-implausible WPM, and (most tellingly)
-clustered at a handful of fixed frequencies recurring across separate,
-non-overlapping capture windows rather than randomly distributed. Only
-one of those clusters is dial-shift-confirmed as tracking the input
-passband edge specifically; the others sit well inside the passband with
-an unconfirmed mechanism. A dial-shift test (retune, see if a cluster
-moves with the new passband edge) is the fast way to check a given
-cluster. **Not confirmed as MAN-7/103** (that's a per-channel WPM-
-*estimation* bug on a real signal, not a detection/spot-generation bug)
-— see `docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md`
-Finding 2 for the full reasoning; treat this as a separate, still-
-untracked defect until proven otherwise.
+Don't trust `spots_confirmed > 0` (or a `Decoding` verdict) alone. Field-
+confirmed 2026-09-09: 29/29 confirmed spots in an overnight 40m session
+shared one signature — confidence pinned to the low end (~0.12-0.17),
+often-implausible WPM, malformed callsign text, and (tellingly) clustered
+at a handful of fixed frequencies recurring across separate,
+non-overlapping capture windows rather than randomly distributed.
+
+**Root mechanism identified (a later same-day session, follow-up to the
+finding below): every one of these 29 was a `SpotType::Beacon` spot**
+([[spot-validation]]'s BEACON exemption) — a single noise-decoded glimpse
+ending in a lone "T" word, tagged Beacon by the same coarse pattern real
+NCDXF-beacon power-steps decode to, and Beacon spots skip the repetition
+gate entirely by design. So the original theory below (a deterministic
+front-end artifact that repeats *identically* to survive the gate) isn't
+required to explain this data — a single occurrence was always enough,
+no repeat needed. This doesn't rule out a fixed-bin channelizer artifact
+also being the reason the *same* garbled text recurs at the *same*
+frequency across sessions (below) — it just means that artifact didn't
+need to fool the repetition gate to produce a public spot. PR #154
+(`crates/manta-spot/src/validator.rs`, `grammar.rs` — open as of this
+writing) adds a WPM-implausibility check scoped to `SpotType::Beacon`
+candidates specifically; a small residual (structurally plausible,
+not-implausibly-fast garble) isn't caught and is a known, accepted gap.
+
+The frequency-clustering data point from the original finding is still
+worth knowing when you see the same defect: only one of the observed
+clusters is dial-shift-confirmed as tracking the input passband edge
+specifically; the others sit well inside the passband with an unconfirmed
+mechanism. A dial-shift test (retune, see if a cluster moves with the new
+passband edge) is the fast way to check a given cluster. **Not confirmed
+as MAN-7/103** (that's a per-channel WPM-*estimation* bug on a real
+signal, not a detection/spot-generation bug) — see
+`docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md` Finding 2
+for the full original reasoning; treat the interior-passband clusters as
+a separate, still-untracked question until proven otherwise.
 
 **`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
 track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
@@ -85,6 +102,39 @@ guaranteed proof of it — either way it's completely unremarkable for
 both this artifact and a real weak signal, and proves nothing on its
 own. Frequency recurrence and confidence are the actual warning signs to
 check; don't lean on `snr_db` to distinguish real from artifact.
+
+## A quiet `doctor`/`listen` run on a non-CW signal doesn't mean the RF chain is broken
+
+manta's per-channel noise floor (`crates/manta-dsp/src/floor.rs`) is a
+25th-percentile order statistic over a ~10s rolling window (`RING_LEN=250`
+entries decimated every `DECIMATION_HOPS=15` hops at `HOP_MS=8/3ms` ≈
+10s) — deliberately below the mean specifically so CW's on/off keying
+(the signal is silent roughly half the time) doesn't inflate the floor
+estimate toward the keyed level (SPEC §2.1). A **100%-duty-cycle
+continuous tone — FT8, a carrier, anything not keyed on/off — gets
+absorbed into its own channel's floor estimate** almost entirely, so
+`doctor`'s reported SNR reads near-zero even sitting on top of a real,
+strong signal (confirmed: a real FT8 signal measured independently via
+raw spectral analysis at +17.8 dB showed near-zero `doctor` SNR in the
+same passband). This is intentional CW-specific design, not a bug — but
+it means `doctor`/`listen`'s SNR numbers are **not comparable to a raw
+spectral SNR measurement** for anything that isn't actually keyed CW.
+Don't use a quiet/low-SNR `doctor` verdict on a known-strong FT8/carrier
+signal as evidence the antenna/SDR chain is unhealthy — check with a
+direct spectral tool instead (or listen for real CW specifically).
+
+## A quiet band is often propagation, not a broken receiver
+
+40m being quiet during the day and 20m being quiet at night is normal HF
+ionospheric behavior, not evidence of an antenna/hardware problem: 40m
+needs darkness (daytime D-layer absorption kills it), 20m thrives in
+daylight. Confirmed 2026-09-09: a 9-point spectral sweep plus a real,
+clean 20m daytime CW catch (6 plausible, correctly-formatted callsigns)
+showed the antenna/RSP1B/tuner chain is healthy end-to-end — the quiet
+40m daytime results in the same session were fully explained by
+propagation, not a configuration problem. Before chasing a hardware
+explanation for "nothing heard," check whether the band/time-of-day
+combination is even expected to be active.
 
 ## Setup gotchas
 
