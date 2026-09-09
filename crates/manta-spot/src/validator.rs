@@ -699,20 +699,27 @@ impl Validator {
             // overnight noise-floor false positive from a real RSP1B/40m
             // session read implausibly fast -- avg 51.5 WPM, several
             // pinned at the tracker's own 60 WPM ceiling (SPEC-decode-
-            // core.md's tracked range is 8..60 WPM) -- while every
-            // confirmed-real spot from the same session topped out at
-            // 42.8 WPM. A noise-triggered "mark" tends to be the shortest
-            // detectable duration, which the speed tracker reads as
-            // extremely fast keying; real hand-sent CW essentially never
-            // sustains above the mid-40s. Checked ahead of `gate.record`
-            // (below) so an implausible decode doesn't even count toward
-            // any future repetition tally for the same garbled text.
+            // core.md's tracked range is 8..60 WPM) -- and every one of
+            // them reached a spot via the `SpotType::Beacon` repetition-
+            // gate exemption (ARCHITECTURE §6.4): that's the only path
+            // where a single low-evidence decode can reach public output
+            // with no independent second confirmation. Scoped to that
+            // path only -- Codex review on PR #154 found an earlier,
+            // unscoped version of this check rejected legitimate fast
+            // (45+ WPM) contest/computer-keyed CW reaching a spot through
+            // the ordinary two-repetition-confirmed path, which the
+            // decoder's own 8..60 WPM tracked range explicitly supports
+            // and which needs no extra scrutiny here: two independent
+            // confirmations of the same text is already much stronger
+            // evidence than anything this heuristic adds. Real NCDXF/IARU
+            // beacons ID at a fixed ~20-22 WPM, well under this threshold.
             // Exempted for allowlisted calls, same boundary as grammar/cty
-            // above -- an operator-vouched-for real station's own timing
-            // quirks shouldn't be second-guessed here.
-            if let Some(track) = self.tracks.get(&track_id) {
-                if track.wpm > MAX_PLAUSIBLE_WPM {
-                    return None;
+            // above.
+            if spot_type == SpotType::Beacon {
+                if let Some(track) = self.tracks.get(&track_id) {
+                    if track.wpm > MAX_PLAUSIBLE_WPM {
+                        return None;
+                    }
                 }
             }
         }
@@ -840,14 +847,39 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots[0].track_id, 1);
     }
 
-    /// Real-hardware finding (2026-09-09, docs/DECISIONS): every
-    /// overnight noise-floor false positive from a real RSP1B/40m session
-    /// read implausibly fast (avg 51.5 WPM); every confirmed-real spot
-    /// from the same session topped out at 42.8 WPM. An otherwise
-    /// perfectly valid, repeated, CTY-allocated callsign must still never
-    /// spot once its track's reported speed exceeds `MAX_PLAUSIBLE_WPM`.
+    /// Real-hardware finding (2026-09-09, docs/DECISIONS): every overnight
+    /// noise-floor false positive from a real RSP1B/40m session read
+    /// implausibly fast (avg 51.5 WPM) and reached a spot through the
+    /// `SpotType::Beacon` repetition-gate exemption -- the only path
+    /// where one low-evidence decode can reach public output. The WPM
+    /// gate is scoped to that path (Codex review on PR #154 found an
+    /// earlier, unscoped version rejected legitimate fast CW reaching a
+    /// spot through the ordinary repetition-confirmed path instead; see
+    /// `plausibly_fast_track_still_spots` below for that case).
     #[test]
-    fn implausibly_fast_track_never_spots() {
+    fn implausibly_fast_beacon_track_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        // "K5ARH T" parses as SpotType::Beacon (context::parse) -- exempt
+        // from the repetition gate, so one occurrence would otherwise spot.
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "a Beacon-type track reporting 60 WPM must never spot, got {spots:?}"
+        );
+    }
+
+    /// A non-Beacon (De-type) candidate at an implausible 60 WPM still
+    /// spots once repetition-confirmed -- the WPM gate must not reach
+    /// this path, matching real 45+ WPM contest/computer-keyed CW that
+    /// the decoder's own 8..60 WPM tracked range explicitly supports.
+    #[test]
+    fn implausibly_fast_non_beacon_track_still_spots() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
         v.ingest(&DecoderEvent::SpeedUpdate {
@@ -857,33 +889,35 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
-        assert!(
-            spots.is_empty(),
-            "a track reporting 60 WPM must never spot, got {spots:?}"
-        );
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::De);
     }
 
-    /// Sanity check for the test above: the same callsign at a plausible
-    /// speed still spots normally -- proves the WPM gate isn't rejecting
-    /// everything indiscriminately.
+    /// Sanity check: a plausible-speed Beacon-type candidate still spots
+    /// normally -- proves the WPM gate isn't rejecting Beacon spots
+    /// indiscriminately.
     #[test]
-    fn plausibly_fast_track_still_spots() {
+    fn plausibly_fast_beacon_track_still_spots() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
         v.ingest(&DecoderEvent::SpeedUpdate {
             track_id: 1,
-            wpm: 30.0,
+            wpm: 22.0,
         });
-        let words = ["DE", "K5ARH", "K"];
-        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
-        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
     /// MAN-28: allowlisted calls bypass grammar/cty/repetition entirely --
     /// the WPM plausibility gate follows the same exemption boundary, not
-    /// a stricter one.
+    /// a stricter one. "K5ARH" alone (before "T" arrives) spots once via
+    /// the allowlist's own no-context fallback (SpotType::Unknown), then
+    /// reclassifies to Beacon once "T" completes the power-step pattern --
+    /// both are expected to spot regardless of the 60 WPM track speed.
     #[test]
     fn allowlisted_call_bypasses_the_wpm_gate_too() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -893,12 +927,13 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let words = ["DE", "K5ARH", "K"];
+        let words = ["K5ARH", "T"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
-        assert_eq!(
-            spots.len(),
-            1,
-            "an allowlisted callsign must spot on the first decode regardless of WPM"
+        assert!(
+            spots
+                .iter()
+                .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+            "an allowlisted callsign must spot as Beacon regardless of WPM, got {spots:?}"
         );
     }
 
