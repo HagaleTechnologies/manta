@@ -35,8 +35,37 @@ const FREQ_BUCKET_HZ: f64 = 100.0;
 /// same instant twice.
 const MIN_OCCURRENCE_GAP_SECONDS: f64 = 1.0;
 
+/// Clamps well inside `i64`'s range so `record`'s `b - 1..=b + 1` neighbor
+/// arithmetic can never overflow (Codex review, PR #152) -- a non-finite
+/// or astronomically large `freq_hz` (e.g. a corrupted `center_freq_hz` in
+/// a WAV sidecar, `crates/manta-input/src/lib.rs`) would otherwise let the
+/// cast saturate to `i64::MAX`/`MIN`, and `b + 1`/`b - 1` on that panics in
+/// debug builds or wraps in release. No real RF frequency comes anywhere
+/// close to this bound.
+const SAFE_BUCKET_BOUND: f64 = (i64::MAX / 2) as f64;
+
 fn bucket(freq_hz: f64) -> i64 {
-    (freq_hz / FREQ_BUCKET_HZ).round() as i64
+    if !freq_hz.is_finite() {
+        return 0;
+    }
+    (freq_hz / FREQ_BUCKET_HZ)
+        .clamp(-SAFE_BUCKET_BOUND, SAFE_BUCKET_BOUND)
+        .round() as i64
+}
+
+#[derive(Default)]
+struct GateEntry {
+    /// Timestamps of *accepted* (distinct) occurrences -- what actually
+    /// drives the returned repetition count.
+    accepted: Vec<u64>,
+    /// Every track_id that has touched this entry -- accepted *or*
+    /// rejected as a near-duplicate -- and when it was last seen (Codex
+    /// review, PR #152, round 6): without this, a track whose first
+    /// decode was rejected as a near-duplicate of a *different* track's
+    /// could never establish its own identity here, so its own later,
+    /// genuinely distinct repeat would keep being compared against the
+    /// other track's timestamp instead of recognizing itself.
+    last_seen_by_track: BTreeMap<u32, u64>,
 }
 
 pub struct RepetitionGate {
@@ -49,7 +78,7 @@ pub struct RepetitionGate {
     /// 90s window the instant a track churned, regardless of whether the
     /// same callsign was still genuinely repeating. A frequency bucket
     /// survives that churn.
-    seen: BTreeMap<(i64, String), Vec<(u64, u32)>>,
+    seen: BTreeMap<(i64, String), GateEntry>,
     /// Cumulative count of `record()` calls, for life. MAN-19 round 3:
     /// the only direct evidence that this gate's state was ever touched
     /// at all -- a soak whose decoding regressed to metadata-only output
@@ -92,10 +121,13 @@ impl RepetitionGate {
     /// credit the same entry within milliseconds of each other. `track_id`
     /// is what actually distinguishes that from a real pattern (a CQing
     /// station double-calling its own callsign back-to-back within one
-    /// transmission): see `MIN_OCCURRENCE_GAP_SECONDS`'s doc. `entry`'s
-    /// timestamps are assumed non-decreasing (the pipeline resequences
-    /// events by `sample_ts` before they reach here, SPEC §6 rule 6), so
-    /// comparing against just the last one is sufficient.
+    /// transmission): see `MIN_OCCURRENCE_GAP_SECONDS`'s doc. Whether
+    /// *this* track has touched the entry before -- not just whether the
+    /// single most-recent accepted occurrence happened to be from it --
+    /// is what "same track" means here (`GateEntry::last_seen_by_track`'s
+    /// doc): a track's own first decode, even if rejected as a
+    /// near-duplicate of a different track's, must not block that same
+    /// track's own later, genuinely distinct repeat.
     pub fn record(&mut self, track_id: u32, freq_hz: f64, callsign: &str, sample_ts: u64) -> usize {
         self.records_total += 1;
         let b = bucket(freq_hz);
@@ -104,19 +136,23 @@ impl RepetitionGate {
             .find(|k| self.seen.contains_key(k))
             .unwrap_or((b, callsign.to_string()));
         let entry = self.seen.entry(key).or_default();
-        let is_distinct_occurrence = match entry.last() {
-            Some(&(last_ts, last_track)) => {
-                track_id == last_track
-                    || sample_ts.saturating_sub(last_ts) >= self.min_occurrence_gap_samples
+        let is_own_track_before = entry.last_seen_by_track.contains_key(&track_id);
+        let is_distinct_occurrence = if is_own_track_before {
+            true
+        } else {
+            match entry.accepted.last() {
+                Some(&last) => sample_ts.saturating_sub(last) >= self.min_occurrence_gap_samples,
+                None => true,
             }
-            None => true,
         };
+        entry.last_seen_by_track.insert(track_id, sample_ts);
         if is_distinct_occurrence {
-            entry.push((sample_ts, track_id));
+            entry.accepted.push(sample_ts);
         }
         let cutoff = sample_ts.saturating_sub(self.window_samples);
-        entry.retain(|&(ts, _)| ts >= cutoff);
-        entry.len()
+        entry.accepted.retain(|&ts| ts >= cutoff);
+        entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
+        entry.accepted.len()
     }
 
     /// See `records_total`'s doc.
@@ -154,9 +190,10 @@ impl RepetitionGate {
     /// keep `seen` bounded without needing a dedicated timer.
     pub fn sweep(&mut self, now_ts: u64) {
         let cutoff = now_ts.saturating_sub(self.window_samples);
-        self.seen.retain(|_, occurrences| {
-            occurrences.retain(|&(ts, _)| ts >= cutoff);
-            !occurrences.is_empty()
+        self.seen.retain(|_, entry| {
+            entry.accepted.retain(|&ts| ts >= cutoff);
+            entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
+            !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
     }
 }
@@ -283,6 +320,47 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
         assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 500), 2);
+    }
+
+    /// Codex review, PR #152: a non-finite or astronomically large
+    /// `freq_hz` (e.g. a corrupted sidecar `center_freq_hz`) must never
+    /// panic or wrap via `bucket`'s `± 1` neighbor arithmetic -- it's
+    /// clamped to a safe bucket instead.
+    #[test]
+    fn non_finite_and_extreme_frequencies_do_not_panic() {
+        let mut gate = RepetitionGate::new(FS);
+        for freq in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+        ] {
+            gate.record(1, freq, "K5ARH", 0);
+        }
+    }
+
+    /// Codex review, PR #152, round 6: a track's own decode, even if its
+    /// *first* appearance in an entry gets rejected as a near-duplicate of
+    /// a *different* track's, must still be able to establish its own
+    /// identity for a later, genuinely distinct repeat -- rejected
+    /// occurrences must not be forgotten outright, or the rejected
+    /// track's own next attempt gets compared against the wrong track's
+    /// timestamp again and is wrongly rejected a second time.
+    #[test]
+    fn a_tracks_own_repeat_counts_even_after_its_first_attempt_was_rejected() {
+        let mut gate = RepetitionGate::new(FS);
+        // Track 1 establishes the entry.
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        // Track 2's near-simultaneous decode is correctly rejected as a
+        // likely duplicate of track 1's.
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 500), 1);
+        // Track 2 decodes AGAIN, shortly after its own (rejected) first
+        // attempt -- this is track 2's own second word, not a duplicate
+        // of anyone else, and must count as a second distinct occurrence
+        // even though it's still well under the minimum gap from track
+        // 1's original timestamp.
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 600), 2);
     }
 
     /// MAN-19's original concern (unbounded growth under sustained track

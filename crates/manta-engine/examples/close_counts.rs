@@ -32,11 +32,16 @@ fn main() -> anyhow::Result<()> {
         MAX_DURATION,
         |_sample| {},
     )?;
-    // soak_with_metrics's watchdog stops processing once `duration`
-    // elapses regardless of whether the source reached EOF -- if that's
-    // what happened here, every count below is a partial report of an
-    // arbitrarily-truncated prefix of the file, not the whole thing, and
-    // must not be read as if it were.
+    // Two distinct ways this report can be a partial one, neither
+    // obvious from the printed counts alone -- both must fail loudly
+    // (Codex review, PR #152) rather than let a truncated or panicked
+    // run be read as if it were a clean, complete count.
+    if report.panicked {
+        anyhow::bail!(
+            "the decode pipeline panicked before finishing -- every count above is a \
+             PARTIAL report of whatever ran before the panic, not the whole file"
+        );
+    }
     if report.duration_actual >= MAX_DURATION {
         anyhow::bail!(
             "hit the {MAX_DURATION:?} processing cap before the file finished -- \

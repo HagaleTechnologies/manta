@@ -395,8 +395,22 @@ reaches full confidence. Emitted per character in the decoder output stream.
 
 ### 4.6 Per-callsign confidence (consumed by `manta-spot`)
 
+**[DEVIATION]** `r` is no longer strictly "on the track" -- MAN-166,
+2026-09-09 (`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`,
+`crates/manta-spot/src/gate.rs`). A real signal's `track_id` changes every
+time its track closes and reopens (e.g. a 5s silence timer), which a
+literal per-track `r` would reset on every churn regardless of whether the
+same callsign was still genuinely repeating -- confirmed as a real bug
+against a genuine 40m contest recording. `r` is counted per
+(frequency-bucket, callsign) instead, which survives that churn; a decode
+from a *different* track_id within a reasoned minimum gap of the most
+recent one is still rejected as a likely concurrent duplicate (two tracks
+decoding the same real transmission), while the same track_id always
+counts (one decode stream can't decode the same instant twice) --
+`RepetitionGate::record`'s own doc has the full mechanism.
+
 For a candidate callsign of `n` characters with confidences `c₁..c_n`,
-decoded `r` distinct times on the track within the 90 s window:
+decoded `r` distinct times within the 90 s window:
 
 ```
 c_call = (Π cᵢ)^(1/n) · (1 − 0.5^r)

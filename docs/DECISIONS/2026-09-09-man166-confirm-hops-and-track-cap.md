@@ -33,10 +33,26 @@ arbitrarily large number. Verified independent of `confirm_hops`: V10
 manta's Pi4 CPU-budget gate (MAN-18/MAN-49) -- explicitly out of scope
 here; the user waived that constraint for this investigation.
 
-Effect on the B2 benchmark (combined with the repetition-gate fix below
-and this `track_cap` change, `confirm_hops` still at 19): recall 4.2% ->
-4.7%, precision 31.0% -> ~30% (statistically flat -- see "why this barely
-moved recall" below).
+**Correction (Codex review, PR #152): the paragraph below describes a
+rejected experimental configuration, not what shipped.** The 886-track
+measurement above used `track_cap` raised all the way to 100,000
+(effectively uncapped, purely to observe organic demand) *combined with*
+`confirm_hops` lowered to 8 -- not the `confirm_hops: 19` this doc
+otherwise pins. That combination was never shipped; it's kept here only
+as the reasoning trail for how 886/1200 were derived and why `confirm_hops`
+alone was rejected (next section). **The real, shipped numbers** --
+`track_cap: 1200`, `confirm_hops: 19` unchanged, plus the repetition-gate
+fix -- are 29.9% -> 31.8% precision, 4.1% -> 4.4% recall (both metrics up;
+`crates/manta-testkit/audio-corpus/README.md` has the authoritative
+figures and is the one to trust if this doc and that README ever seem to
+disagree again).
+
+Effect of the *rejected* `confirm_hops: 8` + `track_cap: 100,000`
+experiment on the B2 benchmark, using the scorer as it existed *before*
+PR #144's later fixes (do not compare these numbers directly against the
+corrected ones elsewhere in this repo): recall 4.2% -> 4.7%, precision
+31.0% -> ~30% (statistically flat -- see "why this barely moved recall"
+below).
 
 ## confirm_hops: investigated, a real problem found, the obvious fix rejected
 

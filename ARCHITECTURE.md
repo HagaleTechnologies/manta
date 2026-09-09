@@ -241,13 +241,19 @@ transmission may never produce again).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
-   the same track before first spot (CW ops repeat their calls; single decodes
-   are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
-   SNR, SCP/cty hits). **Exemption**: messages already type-tagged `BEACON` by
-   step 1's context parse skip this gate entirely — NCDXF-style beacons ID
-   once per power-step cycle and legitimately won't repeat within the window
-   (MAN-28).
+4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
+   before first spot (CW ops repeat their calls; single decodes are
+   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+   `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
+   real signal's `track_id` changes across a close+reopen, so repetition is
+   tracked per frequency instead, with a minimum-gap check across
+   *different* track_ids to still reject two tracks concurrently decoding
+   one real transmission as a false second confirmation — see
+   `crates/manta-spot/src/gate.rs`. Confidence = f(decoder confidence,
+   repetitions, SNR, SCP/cty hits). **Exemption**: messages already
+   type-tagged `BEACON` by step 1's context parse skip this gate entirely
+   — NCDXF-style beacons ID once per power-step cycle and legitimately
+   won't repeat within the window (MAN-28).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
