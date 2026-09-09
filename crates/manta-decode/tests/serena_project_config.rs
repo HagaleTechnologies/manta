@@ -77,11 +77,29 @@ fn read(path: &Path) -> String {
 /// navigation only`, `- rust # language server` — does not turn into a CI
 /// failure. A `#` inside quotes, or one not preceded by whitespace (`a#b`), is
 /// part of the value and is kept.
+///
+/// Quote tracking honours YAML's two escape forms, because getting them wrong
+/// silently truncates a legitimate value at the escape rather than at a comment:
+/// a double-quoted scalar escapes a quote with a backslash (`"a \" b"`), a
+/// single-quoted one by doubling it (`'a '' b'`).
 fn strip_inline_comment(value: &str) -> &str {
     let bytes = value.as_bytes();
     let mut quote: Option<u8> = None;
-    for (i, &c) in bytes.iter().enumerate() {
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
         match quote {
+            // `\"` inside a double-quoted scalar is a literal quote, not the end
+            // of the scalar; skip the escape and the character it escapes.
+            Some(b'"') if c == b'\\' => {
+                i += 2;
+                continue;
+            }
+            // `''` inside a single-quoted scalar is a literal quote likewise.
+            Some(b'\'') if c == b'\'' && bytes.get(i + 1) == Some(&b'\'') => {
+                i += 2;
+                continue;
+            }
             Some(q) => {
                 if c == q {
                     quote = None;
@@ -95,6 +113,7 @@ fn strip_inline_comment(value: &str) -> &str {
                 }
             }
         }
+        i += 1;
     }
     value
 }
@@ -116,16 +135,21 @@ struct FlatYaml {
 fn parse_flat_yaml(src: &str) -> FlatYaml {
     let mut out = FlatYaml::default();
     let mut current_key: Option<String> = None;
-    let mut in_block_scalar = false;
+    let mut block_key: Option<String> = None;
 
     for raw_line in src.lines() {
-        if in_block_scalar {
+        if let Some(key) = block_key.clone() {
             // A block scalar's body is indented; the first non-indented,
-            // non-empty line ends it.
+            // non-empty line ends it. The body is kept verbatim (no inline-
+            // comment stripping): inside a block scalar a `#` is prose, not a
+            // comment.
             if raw_line.trim().is_empty() || raw_line.starts_with(char::is_whitespace) {
+                let body = out.scalars.entry(key).or_default();
+                body.push_str(raw_line.trim());
+                body.push('\n');
                 continue;
             }
-            in_block_scalar = false;
+            block_key = None;
         }
         let line = raw_line.trim_end();
         if line.is_empty() || line.trim_start().starts_with('#') {
@@ -151,7 +175,7 @@ fn parse_flat_yaml(src: &str) -> FlatYaml {
         let value = value.trim();
         out.lists.entry(key.clone()).or_default();
         if value == "|" || value == ">" {
-            in_block_scalar = true;
+            block_key = Some(key.clone());
             out.scalars.insert(key.clone(), String::new());
         } else {
             out.scalars.insert(key.clone(), unquote(value));
@@ -303,6 +327,15 @@ fn project_yml_ignores_the_noise_that_would_dominate_an_index_pass() {
     }
 }
 
+/// The subdirectories of a workspace member that hold first-party Rust the
+/// indexer has to see. `src` is mandatory; `tests`, `benches` and `examples`
+/// exist on some members only, and they are load-bearing rather than optional
+/// extras: MAN-72's acceptance probe for `find_referencing_symbols` returned
+/// cross-crate referents in `manta-engine/tests` and `manta-testkit/tests`, so
+/// an ignore pattern that hides them degrades exactly the lookup this config is
+/// here to provide.
+const MEMBER_RUST_DIRS: [&str; 4] = ["src", "tests", "benches", "examples"];
+
 /// Every `.rs` file beneath `dir`, as repo-root-relative slash-separated paths.
 /// Directory ancestors alone are not enough to guard the index: a file-selecting
 /// pattern (`*.rs`, `crates/**/*.rs`) shadows no directory at all, yet would
@@ -337,29 +370,36 @@ fn no_ignored_path_shadows_a_workspace_member_source_root() {
         "workspace member count changed; got {members:?}"
     );
     for member in &members {
-        let src = format!("{member}/src");
-        let src_dir = repo_root().join(&src);
-        assert!(src_dir.is_dir(), "{src} should exist");
-        for pattern in ignored {
-            assert!(
-                !pattern_shadows(pattern, &src),
-                "ignored_paths entry {pattern:?} shadows workspace source root {src}"
-            );
-        }
-        // The directory checks above miss file-selecting patterns (`*.rs`,
-        // `crates/**/*.rs`) — those shadow no directory yet still empty the
-        // symbol index, so every source file is checked too, not just its
-        // ancestors.
-        let mut sources = Vec::new();
-        rust_files_under(&repo_root(), &src_dir, &mut sources);
-        sources.sort();
-        assert!(!sources.is_empty(), "{src} contains no .rs files");
-        for source in &sources {
+        for sub in MEMBER_RUST_DIRS {
+            let rel = format!("{member}/{sub}");
+            let dir = repo_root().join(&rel);
+            if sub == "src" {
+                assert!(dir.is_dir(), "{rel} should exist");
+            } else if !dir.is_dir() {
+                // Only some members carry tests/benches/examples.
+                continue;
+            }
             for pattern in ignored {
                 assert!(
-                    !pattern_shadows(pattern, source),
-                    "ignored_paths entry {pattern:?} shadows workspace source file {source}"
+                    !pattern_shadows(pattern, &rel),
+                    "ignored_paths entry {pattern:?} shadows workspace source root {rel}"
                 );
+            }
+            // The directory checks above miss file-selecting patterns (`*.rs`,
+            // `crates/**/*.rs`) — those shadow no directory yet still empty the
+            // symbol index, so every source file is enumerated and checked too,
+            // not just its ancestors.
+            let mut sources = Vec::new();
+            rust_files_under(&repo_root(), &dir, &mut sources);
+            sources.sort();
+            assert!(!sources.is_empty(), "{rel} contains no .rs files");
+            for source in &sources {
+                for pattern in ignored {
+                    assert!(
+                        !pattern_shadows(pattern, source),
+                        "ignored_paths entry {pattern:?} shadows workspace source file {source}"
+                    );
+                }
             }
         }
     }
@@ -424,4 +464,78 @@ fn pattern_shadows_catches_file_selecting_globs() {
     // ...without flagging patterns that leave the source visible.
     assert!(!pattern_shadows("*.rs", "crates/manta-decode/src"));
     assert!(!pattern_shadows("/target", source));
+}
+
+#[test]
+fn quoted_scalars_survive_yaml_quote_escapes() {
+    // A `#` after an escaped quote is still inside the scalar; mis-tracking the
+    // escape would truncate the value at the backslash (or the doubled quote)
+    // and fail an exact-value assertion on a config Serena loads fine.
+    let cfg = parse_flat_yaml(concat!(
+        "double: \"a \\\" # b\" # trailing\n",
+        "single: 'it''s # fine' # trailing\n",
+    ));
+    assert_eq!(
+        cfg.scalars.get("double").map(String::as_str),
+        Some("a \\\" # b")
+    );
+    assert_eq!(
+        cfg.scalars.get("single").map(String::as_str),
+        Some("it''s # fine")
+    );
+}
+
+/// The canonical document order, read out of the `## Documents (read in this
+/// order)` section of CLAUDE.md itself (`AGENTS.md` is a symlink to it) rather
+/// than hardcoded here, so this guard tracks the canonical source instead of
+/// becoming a second copy of it that can drift.
+fn canonical_document_order() -> Vec<String> {
+    let claude_md = read(&repo_root().join("CLAUDE.md"));
+    let heading = "## Documents (read in this order)";
+    let start = claude_md
+        .find(heading)
+        .unwrap_or_else(|| panic!("CLAUDE.md has no {heading:?} section"));
+    let section = &claude_md[start + heading.len()..];
+    let end = section.find("\n## ").unwrap_or(section.len());
+    let docs: Vec<String> = section[..end]
+        .lines()
+        // Only the unindented list items are documents; the indented
+        // continuation lines belong to the preceding entry.
+        .filter_map(|line| line.strip_prefix("- `"))
+        .filter_map(|rest| rest.split('`').next())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        docs.len() >= 4,
+        "expected the four canonical documents; got {docs:?}"
+    );
+    docs
+}
+
+#[test]
+fn initial_prompt_mirrors_the_canonical_document_reading_order() {
+    // A Serena session starts from `initial_prompt`, so if it names a shorter or
+    // differently-ordered document set than CLAUDE.md/AGENTS.md mandate, agents
+    // driven through Serena skip the project's goals, non-goals and milestone
+    // acceptance criteria that the omitted documents carry.
+    let cfg = parse_flat_yaml(&read(&serena_dir().join("project.yml")));
+    let prompt = cfg
+        .scalars
+        .get("initial_prompt")
+        .expect("initial_prompt key missing");
+    assert!(
+        !prompt.trim().is_empty(),
+        "initial_prompt block scalar body is empty"
+    );
+    let mut previous = 0usize;
+    for doc in canonical_document_order() {
+        let at = prompt.find(&doc).unwrap_or_else(|| {
+            panic!("initial_prompt omits the canonical document {doc:?}: {prompt}")
+        });
+        assert!(
+            at >= previous,
+            "initial_prompt lists {doc:?} out of the mandated order: {prompt}"
+        );
+        previous = at;
+    }
 }
