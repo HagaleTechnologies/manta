@@ -629,3 +629,163 @@ async fn a_second_connection_from_the_same_ip_cannot_multiply_the_command_rate_b
          (already exhausted by connection A) was exceeded, got: {extra:?}"
     );
 }
+
+/// MAN-87 scenario 1: Windows `telnet.exe`, PuTTY's telnet mode and most
+/// DX-cluster client software send IAC option negotiation the instant the
+/// connection opens. Before the fix, the `0xFF` bytes failed the login
+/// read's UTF-8 validation and the connection was dropped with
+/// "login read rejected ... error=line contains invalid UTF-8" before the
+/// callsign was ever read.
+#[tokio::test]
+async fn a_client_that_negotiates_telnet_options_still_logs_in() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    // IAC WILL TERMINAL-TYPE(24), IAC DO SUPPRESS-GO-AHEAD(3), callsign.
+    wr.write_all(b"\xff\xfb\x18\xff\xfd\x03W5AU\r\n")
+        .await
+        .unwrap();
+
+    // The refusals and the greeting are separate writes -- read until both
+    // have arrived rather than assuming one TCP segment carries them.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must answer the negotiation, not stall")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+    // Every option is refused: IAC DONT TERMINAL-TYPE, IAC WONT SGA.
+    assert_eq!(
+        &got[..6],
+        &[0xff, 0xfe, 0x18, 0xff, 0xfc, 0x03],
+        "expected the negotiation to be refused, got {got:?}"
+    );
+}
+
+/// MAN-87 scenario 2: RFC 854's NVT encodes Enter as CR NUL, and macOS
+/// `telnet(1)` with piped stdin sends the callsign that way with no
+/// trailing newline at all, closing its write half afterwards.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_and_no_newline_is_accepted() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    drop(wr); // EOF, exactly as piped-stdin telnet does
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+        .await
+        .expect("server must not stall")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&rest).contains(STATION_CALL),
+        "expected the post-login prompt, got {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+}
+
+/// MAN-87 review round 2 (C1): the interactive case, not just piped
+/// stdin -- BSD/macOS `telnet(1)`'s `crlf` toggle defaults to FALSE, so
+/// Enter is sent as CR NUL while the client stays interactive (its write
+/// half is never closed). The test above only proves the EOF-after-CR-NUL
+/// case; without this fix the server never finds a line to trim and the
+/// client is dropped by the idle timeout instead of logging in.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_is_accepted_with_the_connection_kept_open() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` here -- an interactive client keeps
+    // its write half open, waiting on the post-login greeting.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Round-3 validation, code-review finding 1: `read_line_bounded_telnet`
+/// recognizes CR NUL as a line terminator (C1, above) but leaves both
+/// bytes in the assembled line. `trim_login` stripped them on the LOGIN
+/// path only -- the command path passed `cmd_line` straight to
+/// `command::parse`, whose `str::trim` does not strip NUL, so `"sh/dx\r\0"`
+/// tokenized to `["SH", "DX", "\0"]` and matched no command arm: an
+/// interactive BSD/macOS `telnet(1)` client (or Windows `telnet.exe`, or
+/// PuTTY telnet mode -- the exact clients this ticket exists to support)
+/// could log in but every command it issued silently did nothing. Proves
+/// the command line is now trimmed with the same predicate before parsing.
+#[tokio::test]
+async fn a_command_terminated_with_cr_nul_from_an_interactive_client_is_recognized() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+
+    // Published BEFORE login: pure history, reachable ONLY via a
+    // correctly-parsed `sh/dx` replay -- unlike a live-published spot,
+    // this proves the command was actually recognized as `ShowDx` rather
+    // than silently accepted-but-ignored as `Command::Unknown` (which
+    // would leave the connection alive with nothing to distinguish it).
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    bus.publish(spot);
+
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` -- an interactive client keeps its
+    // write half open, exactly as `crlf`-off BSD/macOS telnet(1) does.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+
+    // Issue "sh/dx" the same way this client's Enter key sends it: CR NUL,
+    // connection kept open.
+    wr.write_all("sh/dx\r\u{0}".as_bytes()).await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect(
+            "sh/dx over a CR-NUL-terminated command line must replay history, \
+             not be silently parsed as Unknown",
+        )
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}

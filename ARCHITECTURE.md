@@ -283,6 +283,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
   clients not to choke. This is the RBN/aggregator compatibility surface.
+  Telnet option negotiation (RFC 854 IAC) is stripped from the client's byte
+  stream and refused — every option, always — so that clients which negotiate
+  on connect can log in; manta implements no telnet options. See
+  `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md`.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the

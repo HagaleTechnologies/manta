@@ -4,11 +4,23 @@
 //! not be able to grow a read buffer without bound, and an idle client
 //! must not hold a spawned task open forever.
 
+use crate::iac::IacFilter;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub const MAX_LINE_BYTES: usize = 1024;
 pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on protocol-framing bytes (telnet IAC negotiation, including
+/// keepalives) consumed over a connection's whole lifetime -- distinct
+/// from `MAX_LINE_BYTES`, and checked against `IacFilter::framing_bytes`,
+/// which `reset_line` never clears. MAN-87 remediation (round-4
+/// validation, code-review finding F2): a much larger, session-lifetime
+/// budget accommodates realistic keepalive traffic (PuTTY's telnet
+/// keepalive is `IAC NOP`; even a keepalive every few seconds for weeks
+/// stays well under this) while still bounding a pure-framing flood to a
+/// fixed amount of work, since the counter is never released.
+pub const MAX_FRAMING_BYTES: usize = 1024 * 1024;
 
 /// Reads one line, accumulating at most `MAX_LINE_BYTES` before treating
 /// an unterminated line as a protocol violation (an `InvalidData` error)
@@ -99,6 +111,134 @@ pub async fn read_line_bounded_with_timeout<R: AsyncBufRead + Unpin>(
     tokio::time::timeout(IDLE_READ_TIMEOUT, read_line_bounded(reader, buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// `read_line_bounded`, but telnet-aware: RFC 854 IAC option-negotiation
+/// sequences are stripped from the byte stream before UTF-8 validation
+/// ever sees them, and refusals to answer them are queued on `filter`
+/// for the caller to write back (MAN-87).
+///
+/// Why a separate entry point rather than teaching `read_line_bounded`
+/// itself about IAC: its other two callers -- `metrics_http`'s HTTP
+/// request line and `uplink`'s inbound RBN stream -- are ASCII-by-
+/// contract protocols where `0xFF` is genuinely malformed input that
+/// must keep being rejected (`docs/DECISIONS/2026-09-02-man23-threat-
+/// model.md` finding 19). Only the telnet listener talks to clients that
+/// legitimately prepend binary negotiation.
+///
+/// The newline is searched for in the FILTERED output, not the raw
+/// chunk: `0x0A` occurs inside telnet framing as an option code
+/// (option 10, NAOCRD) and as subnegotiation payload, so scanning raw
+/// bytes would end the line in the middle of a negotiation sequence.
+///
+/// A bare `\n` is not the only line terminator recognized: RFC 854's NVT
+/// encodes Enter as `CR NUL` too, and that is what BSD/macOS `telnet(1)`
+/// sends by default (`crlf` toggle default FALSE) while keeping the
+/// connection open -- unlike the piped-stdin case, there is no EOF to
+/// fall back on, so without this a line never completes and the client
+/// is eventually dropped by the idle timeout (MAN-87 review round 2, C1).
+///
+/// The length cap counts RAW application-content bytes consumed
+/// (`filter.raw_line_bytes`), not surviving text bytes, so a client
+/// streaming endless negotiation with no completed line still can't grow
+/// `buf` without bound -- but as of MAN-87 remediation (round-4
+/// validation, code-review finding F2), protocol-framing bytes no longer
+/// count against this PER-LINE budget at all; they count against
+/// `filter.framing_bytes` (checked against `MAX_FRAMING_BYTES`), a
+/// separate, connection-lifetime budget that `reset_line` never clears.
+///
+/// MAN-87 review round 2 (C2) tried releasing the (then-shared) budget on
+/// pure-framing reads, to keep a client sending only occasional keepalive
+/// negotiation from accumulating it across a long session -- but that made
+/// the cap unreachable for a client that never lets a read return anything
+/// but framing (a flood of `IAC SB`/`IAC NOP`), and chunk-size dependent
+/// for everyone else (round-3 validation, code-review findings 2/3).
+/// Reverted. Splitting the budget in two (rather than reviving the C2
+/// release) gets both properties at once: framing bytes are tracked in
+/// their own counter that is large enough not to trip for realistic
+/// keepalive traffic, yet is still monotonic -- never released -- so a
+/// pure-framing flood remains bounded regardless of chunking.
+///
+/// Cancellation-safety matches `read_line_bounded`: every byte pulled
+/// off the reader is folded into `buf` and `filter` -- both caller-owned
+/// -- before `consume`, with no await point in between.
+pub async fn read_line_bounded_telnet<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    filter: &mut IacFilter,
+) -> std::io::Result<usize> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF
+        }
+        let mut consumed = 0usize;
+        let mut text = Vec::with_capacity(available.len());
+        let mut found_newline = false;
+        for &b in available {
+            consumed += 1;
+            if let Some(app) = filter.push(b) {
+                let prev = text
+                    .last()
+                    .copied()
+                    .or_else(|| buf.as_bytes().last().copied());
+                text.push(app);
+                if app == b'\n' || (app == 0 && prev == Some(b'\r')) {
+                    found_newline = true;
+                    break;
+                }
+            }
+        }
+        filter.raw_line_bytes += text.len();
+        filter.framing_bytes += consumed - text.len();
+        if filter.raw_line_bytes > MAX_LINE_BYTES {
+            reader.consume(consumed);
+            filter.reset_line();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds maximum length",
+            ));
+        }
+        if filter.framing_bytes > MAX_FRAMING_BYTES {
+            reader.consume(consumed);
+            filter.reset_line();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "excessive protocol negotiation",
+            ));
+        }
+        match std::str::from_utf8(&text) {
+            Ok(s) => buf.push_str(s),
+            Err(_) => {
+                reader.consume(consumed);
+                filter.reset_line();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line contains invalid UTF-8",
+                ));
+            }
+        }
+        reader.consume(consumed);
+        if found_newline {
+            filter.reset_line();
+            return Ok(buf.len());
+        }
+    }
+}
+
+/// `read_line_bounded_telnet`, plus the same idle-read deadline
+/// `read_line_bounded_with_timeout` applies.
+pub async fn read_line_bounded_telnet_with_timeout<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    filter: &mut IacFilter,
+) -> std::io::Result<usize> {
+    tokio::time::timeout(
+        IDLE_READ_TIMEOUT,
+        read_line_bounded_telnet(reader, buf, filter),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
 }
 
 #[cfg(test)]
@@ -219,5 +359,197 @@ mod tests {
         tokio::time::advance(IDLE_READ_TIMEOUT + Duration::from_secs(1)).await;
         let err = fut.await.expect_err("must time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_strips_negotiation_and_queues_refusals() {
+        let mut reader = BufReader::new(&b"\xff\xfb\x18\xff\xfd\x03W5AU\r\n"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "W5AU\r\n");
+        assert_eq!(n, 6);
+        assert_eq!(filter.take_replies(), vec![255, 254, 24, 255, 252, 3]);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_does_not_end_the_line_on_an_option_byte_of_0x0a() {
+        // Option 10 (NAOCRD) makes `IAC DO 10` contain a raw 0x0A -- a
+        // reader scanning raw bytes for the newline would cut the line
+        // in half here.
+        let mut reader = BufReader::new(&b"\xff\xfd\x0aW5AU\n"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "W5AU\n");
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_caps_a_flood_of_negotiation_that_never_ends_a_line() {
+        // Stripped bytes still count against MAX_FRAMING_BYTES (MAN-87
+        // remediation, round-4 validation, code-review finding F2: this
+        // budget used to be shared with the per-line content cap, now
+        // split out into its own connection-lifetime counter -- see
+        // `filter.framing_bytes`), so endless negotiation cannot hold a
+        // read open forever -- regardless of how the flood happens to be
+        // chunked on the wire. Driven through a small-buffer
+        // `tokio::io::duplex` (not a single `BufReader`-over-slice, where
+        // one `fill_buf` call hands over the whole flood at once) so the
+        // cap is proven across several genuinely separate reads, matching
+        // what a real socket delivers (round-3 validation, code-review
+        // finding 3: the prior version of this test passed only by
+        // accident of that single-chunk shortcut). This also covers
+        // finding 2: MAN-87 review round 2 (C2) released the (then-shared)
+        // budget on pure-framing reads to keep a legitimate slow
+        // keepalive-only client from tripping the cap, but that made the
+        // cap unreachable for exactly this flood -- reverted; splitting
+        // the budget instead of reviving that release keeps trickled
+        // negotiation that never completes a line capped the same as a
+        // single burst.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        let _writer = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent <= MAX_FRAMING_BYTES {
+                if write_half.write_all(b"\xff\xfb\x18").await.is_err() {
+                    return; // reader stopped reading once the cap tripped
+                }
+                sent += 3;
+            }
+        });
+
+        let err = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .expect_err("negotiation flood must hit the framing cap regardless of chunking");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_keepalive_only_traffic_does_not_trip_the_line_cap() {
+        // MAN-87 remediation (round-4 validation, code-review finding F2):
+        // PuTTY's telnet keepalive is `IAC NOP` (2 bytes). Before this fix,
+        // framing bytes counted against the same per-line budget as
+        // application content, reset only on line completion -- so a
+        // keepalive-only client (never completing a line) accumulated that
+        // budget across its whole session and was eventually disconnected
+        // with "line exceeds maximum length" after ~1024 raw bytes (~512
+        // keepalives), having sent nothing resembling a long line. 600
+        // pairs (1200 bytes) exceeds that old cap; with framing now
+        // tracked in its own separate, much larger budget, the connection
+        // survives and a real line sent afterwards still reads correctly.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        let _writer = tokio::spawn(async move {
+            for _ in 0..600 {
+                if write_half.write_all(b"\xff\xf1").await.is_err() {
+                    return;
+                }
+            }
+            let _ = write_half.write_all(b"W5AU\n").await;
+        });
+
+        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .expect("keepalive-only traffic must not trip the line cap");
+        assert_eq!(buf, "W5AU\n");
+        assert_eq!(n, 5);
+        assert_eq!(
+            filter.framing_bytes, 1200,
+            "framing bytes are still tracked, just in the separate, larger budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_still_rejects_genuinely_invalid_utf8() {
+        // 0xC3 0x28 is malformed UTF-8 and is NOT telnet framing -- the
+        // MAN-23 rejection must survive the IAC change.
+        let mut reader = BufReader::new(&b"ab\xc3\x28cd\n"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        let err = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .expect_err("must still reject malformed UTF-8");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_accepts_a_cr_nul_terminated_line_with_the_connection_kept_open() {
+        // MAN-87 review round 2 (C1): CR NUL must end a line even when the
+        // client keeps the connection open afterwards (interactive BSD/
+        // macOS telnet(1), `crlf` toggle default FALSE) -- not only when
+        // it is followed by EOF, which is all the piped-stdin case proves.
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        write_half.write_all(b"W5AU\r\0").await.unwrap();
+        tokio::task::yield_now().await;
+
+        let n = {
+            let fut = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(r) => r.expect("must accept the CR NUL terminated line"),
+                std::task::Poll::Pending => {
+                    panic!("must not stall waiting for EOF that never comes")
+                }
+            }
+        };
+        assert_eq!(buf, "W5AU\r\0");
+        assert_eq!(n, 6);
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_resumes_a_negotiation_split_across_a_cancellation() {
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        write_half.write_all(b"\xff\xfb").await.unwrap(); // IAC WILL, option pending
+        tokio::task::yield_now().await;
+        {
+            let fut = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Pending => {}
+                std::task::Poll::Ready(r) => panic!("must not complete yet, got {r:?}"),
+            }
+        }
+        write_half.write_all(b"\x18W5AU\n").await.unwrap();
+        read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(
+            buf, "W5AU\n",
+            "the split IAC sequence must not leak into the line"
+        );
+        assert_eq!(filter.take_replies(), vec![255, 254, 24]);
     }
 }
