@@ -523,3 +523,131 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
         "expected a clap conflict error, got: {stderr}"
     );
 }
+
+/// MAN-135 renamed the Hz-valued flags to a consistent `-hz` suffix and
+/// kept the old spellings as hidden aliases. Anyone's existing scripts
+/// and systemd units must keep working; this test is what says so.
+/// A bogus port makes the run fail at connect, well after clap has
+/// accepted (or rejected) the flag -- which is what we are testing.
+#[test]
+fn legacy_kiwi_freq_spelling_still_parses() {
+    for spelling in ["--kiwi-freq-hz", "--kiwi-freq"] {
+        let out = manta()
+            .args([
+                "soak",
+                "--duration",
+                "1",
+                "--kiwi-host",
+                "127.0.0.1",
+                "--kiwi-port",
+                "1",
+                spelling,
+                "7030000",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{spelling} should still be accepted, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "hpsdr")]
+fn legacy_hpsdr_freq_and_rate_spellings_still_parse() {
+    for spelling in ["--hpsdr-freq-hz", "--hpsdr-freq"] {
+        let out = manta()
+            .args([
+                "soak",
+                "--duration",
+                "1",
+                "--hpsdr-host",
+                "127.0.0.1",
+                "--hpsdr-port",
+                "1",
+                spelling,
+                "14000000",
+                "--hpsdr-rate",
+                "192000",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{spelling} should still be accepted, got: {stderr}"
+        );
+    }
+    for spelling in ["--hpsdr-rate-hz", "--hpsdr-rate"] {
+        let out = manta()
+            .args([
+                "soak",
+                "--duration",
+                "1",
+                "--hpsdr-host",
+                "127.0.0.1",
+                "--hpsdr-port",
+                "1",
+                "--hpsdr-freq-hz",
+                "14000000",
+                spelling,
+                "192000",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{spelling} should still be accepted, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "soapy")]
+fn legacy_soapy_freq_and_rate_spellings_still_parse() {
+    for spelling in ["--soapy-freq-hz", "--soapy-freq"] {
+        let out = manta()
+            .args([
+                "soak",
+                "--duration",
+                "1",
+                "--soapy-driver",
+                "driver=rtlsdr",
+                spelling,
+                "14000000",
+                "--soapy-rate",
+                "192000",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{spelling} should still be accepted, got: {stderr}"
+        );
+    }
+    for spelling in ["--soapy-rate-hz", "--soapy-rate"] {
+        let out = manta()
+            .args([
+                "soak",
+                "--duration",
+                "1",
+                "--soapy-driver",
+                "driver=rtlsdr",
+                "--soapy-freq-hz",
+                "14000000",
+                spelling,
+                "192000",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{spelling} should still be accepted, got: {stderr}"
+        );
+    }
+}

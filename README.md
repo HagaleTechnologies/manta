@@ -93,19 +93,21 @@ manta gen v1 --out /tmp/v1
 manta decode /tmp/v1/v1.wav
 
 # Copy live CW from a public KiwiSDR on 40 m
-manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
+manta listen --kiwi-host kiwi.example.org --kiwi-freq-hz 7030000
 
 # Copy from a local SDR via SoapySDR (build with --features soapy)
-manta listen --soapy-driver driver=rtlsdr --soapy-freq 7030000 --soapy-rate 240000
+manta listen --soapy-driver driver=rtlsdr --soapy-freq-hz 7030000 --soapy-rate-hz 240000
 
 # Copy from the default audio input (rig audio passband, 48 kHz)
 manta listen
 
 # Any of the above as JSON Lines instead of text
-manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
+manta listen --json --kiwi-host kiwi.example.org --kiwi-freq-hz 7030000
 ```
 
-`manta --help` lists every subcommand and flag.
+`manta --help` lists every subcommand and flag. The older `--kiwi-freq` /
+`--soapy-freq` / `--soapy-rate` / `--hpsdr-freq` / `--hpsdr-rate` spellings
+still work.
 
 ## Inputs
 
