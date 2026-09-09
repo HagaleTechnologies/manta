@@ -269,7 +269,6 @@ enum Command {
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
     },
-<<<<<<< HEAD
     /// Query a running manta daemon's health (MAN-44). Reads the same
     /// `/status` document the metrics listener serves on `GET /status` --
     /// no separate control socket, so this works identically on every
@@ -290,7 +289,7 @@ enum Command {
         /// Give up after this many seconds if the daemon doesn't respond.
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
-=======
+    },
     /// Bounded-duration health check: is this source hearing anything real?
     /// Runs the real decode pipeline for --duration, then reports track/SNR/
     /// spot stats and a verdict -- distinguishes "no signal" from "signal but
@@ -380,7 +379,6 @@ enum Command {
         /// human-readable summary.
         #[arg(long)]
         json: bool,
->>>>>>> ea0b305d98310f0d3c611c2516e18c7388ce3a60
     },
 }
 
@@ -1015,6 +1013,26 @@ fn start_spot_server(
         // connect/disconnect churn grows it without bound for the life of
         // the process (round-11 review finding).
         manta_server::tasks::spawn_reaper(tasks.clone());
+        // MAN-44 review: the ENTIRE uplink registry is published before
+        // `metrics_http::serve` is spawned below, never after. This is a
+        // multi-thread runtime, so the metrics/status endpoint starts
+        // accepting on another worker the instant its task is spawned --
+        // a readiness probe that raced this loop could observe a
+        // half-registered (or empty) registry and be told `disabled`, or
+        // a healthy-looking subset, for a daemon whose configured
+        // targets are in fact down. Registering first makes "every
+        // configured target is visible" true before the endpoint that
+        // reports it can be reached at all. The uplink tasks themselves
+        // are spawned afterwards -- a registered-but-not-yet-connected
+        // target reads as down/flapping, which is the honest answer
+        // during startup, whereas an unregistered one reads as
+        // not-configured, which is a lie.
+        let uplink_specs = manta_server::uplink::target_specs(&rbn_uplink_cfgs);
+        let uplink_tasks: Vec<_> = rbn_uplink_cfgs
+            .into_iter()
+            .zip(uplink_specs)
+            .map(|(uplink_cfg, spec)| (uplink_cfg, metrics.register_uplink_target(spec)))
+            .collect();
         tokio::spawn(manta_server::metrics_http::serve(
             metrics_listener,
             metrics.clone(),
@@ -1035,13 +1053,11 @@ fn start_spot_server(
         // at all when the Vec is empty). Each task owns its own SpotBus
         // subscription and backoff state, so one target being down never
         // affects another's delivery or retry timing. Registered BEFORE
-        // spawning (MAN-44) -- so a target that is disabled, or that
-        // never manages a single successful connection, still appears in
-        // `manta status`: an operator must be able to tell "configured
-        // and stuck" from "not configured at all".
-        let uplink_specs = manta_server::uplink::target_specs(&rbn_uplink_cfgs);
-        for (uplink_cfg, spec) in rbn_uplink_cfgs.into_iter().zip(uplink_specs) {
-            let target = metrics.register_uplink_target(spec);
+        // spawning (MAN-44, loop above) -- so a target that is disabled,
+        // or that never manages a single successful connection, still
+        // appears in `manta status`: an operator must be able to tell
+        // "configured and stuck" from "not configured at all".
+        for (uplink_cfg, target) in uplink_tasks {
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
@@ -1187,7 +1203,7 @@ fn run_status(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async move {
+    let outcome = rt.block_on(async move {
         let targets = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
@@ -1200,7 +1216,21 @@ fn run_status(
         fetch_status(&targets, timeout)
             .await
             .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
-    })
+    });
+    // MAN-44 review: the timeout above only DROPS the JoinHandle -- a
+    // `spawn_blocking` task cannot be aborted once it is running, so a
+    // wedged `ToSocketAddrs` keeps occupying a blocking-pool thread after
+    // `--timeout-secs` has already elapsed. Letting `rt` drop here would
+    // then block the caller a second time, for the resolver's own
+    // `resolv.conf` budget, which is exactly the wait `--timeout-secs`
+    // exists to bound: the timeout would fire and the command would still
+    // hang, wedging a monitoring invocation. `shutdown_background`
+    // detaches the runtime instead of joining it, so the bound the
+    // operator asked for is the bound they get; the orphaned lookup is
+    // pure-read, owns no caller-visible state, and dies with the process
+    // (which `Command::Status` reaches immediately after this returns).
+    rt.shutdown_background();
+    outcome
 }
 
 /// Exit code contract for scripting (cron/Nagios-style): `0` when every
@@ -1726,7 +1756,6 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-<<<<<<< HEAD
         Command::Status {
             server_config,
             addr,
@@ -1756,7 +1785,7 @@ fn main() -> Result<()> {
                 print!("{}", manta_server::status::render_human(&doc));
             }
             std::process::exit(status_exit_code(&doc));
-=======
+        }
         Command::Doctor {
             duration,
             device,
@@ -1859,7 +1888,6 @@ fn main() -> Result<()> {
             } else {
                 print_doctor_report(&report);
             }
->>>>>>> ea0b305d98310f0d3c611c2516e18c7388ce3a60
         }
     }
     Ok(())
