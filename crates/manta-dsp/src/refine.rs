@@ -23,9 +23,11 @@ fn sinc(x: f64) -> f64 {
     }
 }
 
-/// Design the 11-tap Hamming-windowed sinc lowpass at cutoff `bw_hz`,
-/// sample rate `fo = 375 Hz` (SPEC v2 §3). Designed once at startup in
-/// `f64`, stored `f32`, normalized for unity DC gain.
+/// Design the 11-tap Hamming-windowed sinc lowpass with two-sided
+/// bandwidth `bw_hz` (cutoff `fc = bw_hz / 2`, matching `proto.rs`'s
+/// `f_c = Δ/2` convention), sample rate `fo = 375 Hz` (SPEC v2 §3).
+/// Designed once at startup in `f64`, stored `f32`, normalized for unity
+/// DC gain.
 fn design_refine_fir(bw_hz: f32) -> [f32; TAPS] {
     let len = TAPS;
     let center = (len - 1) as f64 / 2.0;
@@ -61,9 +63,17 @@ pub struct Refiner {
 }
 
 impl Refiner {
-    /// `bw_hz`: lowpass cutoff (Hz) for the 11-tap FIR. `delta`: initial
-    /// fractional centroid offset, in channels.
+    /// `bw_hz`: two-sided lowpass bandwidth (Hz, `fc = bw_hz / 2`) for the
+    /// 11-tap FIR -- callers must not construct a `Refiner` when
+    /// `decode.refine_bw_hz` is 0 (disabled); `bw_hz = 0.0` here would
+    /// silently design a working (if very narrow) filter, not a bypass.
+    /// `delta`: initial fractional centroid offset, in channels.
     pub fn new(bw_hz: f32, delta: f32) -> Self {
+        debug_assert!(
+            bw_hz > 0.0,
+            "Refiner::new called with bw_hz <= 0.0; the caller must check \
+             decode.refine_bw_hz > 0 before constructing a Refiner at all"
+        );
         Refiner {
             taps: design_refine_fir(bw_hz),
             delta,
