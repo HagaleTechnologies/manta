@@ -17,6 +17,10 @@ const FLOOR_QUANTILE: f64 = 0.25;
 const BLOCK_CHANNELS: usize = 32;
 const BLOCK_ALLOWANCE_DB: f64 = 3.0;
 
+/// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
+/// alpha = 1 - e^(-2.667/40).
+const GATE_EMA_ALPHA: f64 = 0.0645;
+
 fn bin_index(power_db: f64) -> usize {
     (((power_db - HIST_MIN_DB) / BIN_WIDTH_DB).floor() as isize).clamp(0, HIST_BINS as isize - 1)
         as usize
@@ -100,6 +104,11 @@ pub struct FloorBank {
     floor_db: Vec<f64>,
     block_floor_db: Vec<f64>,
     hop_counter: u64,
+    /// Per-hop EMA (tau = 40 ms, same alpha as Gate) of each channel's dB
+    /// power, kept here so the decoder's spectral noise reference (SPEC v2
+    /// §2.2) needs no extra per-channel state.
+    smoothed_db: Vec<f64>,
+    smoothed_init: bool,
 }
 
 impl FloorBank {
@@ -111,6 +120,8 @@ impl FloorBank {
             floor_db: vec![HIST_MIN_DB; n_channels],
             block_floor_db: vec![HIST_MIN_DB; n_blocks],
             hop_counter: 0,
+            smoothed_db: vec![HIST_MIN_DB; n_channels],
+            smoothed_init: false,
         }
     }
 
@@ -129,6 +140,14 @@ impl FloorBank {
             power_db.len(),
             self.channels.len()
         );
+        if self.smoothed_init {
+            for (s, &p) in self.smoothed_db.iter_mut().zip(power_db) {
+                *s += GATE_EMA_ALPHA * (p - *s);
+            }
+        } else {
+            self.smoothed_db.copy_from_slice(power_db);
+            self.smoothed_init = true;
+        }
         if self.hop_counter % DECIMATION_HOPS == 0 {
             for (ch, &p) in self.channels.iter_mut().zip(power_db) {
                 ch.push(p);
@@ -150,11 +169,20 @@ impl FloorBank {
         let block = k / BLOCK_CHANNELS;
         self.floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB)
     }
-}
 
-/// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
-/// alpha = 1 - e^(-2.667/40).
-const GATE_EMA_ALPHA: f64 = 0.0645;
+    /// SPEC v2 §2.2: minimum of the 40 ms-smoothed power over the six
+    /// guard-banded neighbor channels c±2..c±4 (wrapping), in dB,
+    /// uncorrected for the min-of-six bias (the decoder applies it).
+    pub fn spectral_reference_db(&self, c: usize) -> f64 {
+        let n = self.smoothed_db.len() as isize;
+        let mut m = f64::INFINITY;
+        for d in [-4isize, -3, -2, 2, 3, 4] {
+            let k = (c as isize + d).rem_euclid(n) as usize;
+            m = m.min(self.smoothed_db[k]);
+        }
+        m
+    }
+}
 
 /// Per-channel EMA-smoothed power + rise/drop hysteresis booleans. SPEC
 /// §2.3. Carries **no** persistence/timing state (confirm-hop-counting,
@@ -399,5 +427,38 @@ mod tests {
             "after 500 more hops the EMA should have converged near -70.0, got {}",
             gate.smoothed_db(0)
         );
+    }
+
+    #[test]
+    fn spectral_reference_is_min_over_guard_banded_neighbors() {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[10] = -30.0; // the track itself
+        p[11] = -40.0; // guard cell, must be ignored
+        p[12] = -70.0;
+        p[13] = -85.0;
+        p[14] = -80.0; // c+2..c+4
+        p[8] = -60.0;
+        p[7] = -95.0;
+        p[6] = -75.0; // c-2..c-4
+        for _ in 0..400 {
+            bank.update(&p);
+        } // let the EMA settle
+        let r = bank.spectral_reference_db(10);
+        assert!(
+            (r - -95.0).abs() < 0.2,
+            "expected min over {{6,7,8,12,13,14}} = -95 dB, got {r}"
+        );
+    }
+
+    #[test]
+    fn spectral_reference_wraps_at_band_edges() {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[62] = -99.0; // c = 0 -> c-2 wraps to 62
+        for _ in 0..400 {
+            bank.update(&p);
+        }
+        assert!((bank.spectral_reference_db(0) - -99.0).abs() < 0.2);
     }
 }

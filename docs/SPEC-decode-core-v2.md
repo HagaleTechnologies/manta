@@ -101,8 +101,17 @@ For the decoder, each track computes per hop:
 gate EMA may be reused). `N_temp[t] = B_min · min(P_s[k, t−W … t])`,
 `W = round(noise_window_ms / 2.667)` hops, default `noise_window_ms =
 1500`. `B_min` is the bias correction for the minimum of the smoothed
-chi-square(2) power over the window; default `noise_min_bias_db = 2.5`
-(`B_min = 10^{0.25}`). Sliding minimum via monotonic deque.
+chi-square(2) power over the window; default `noise_min_bias_db = 2.16`
+(`B_min = 10^{0.216}`).
+
+**Calibration record (Task 3, `manta_decode::noise`):** measured via
+`temporal_minimum_is_unbiased_on_noise_within_half_db` — 60 s of
+375 Hz-hop, τ=40 ms-EMA-smoothed exponential (chi-square 2 DOF) noise
+power, `W` = 563 hops (1500 ms window). With `noise_min_bias_db = 0`
+(uncorrected), the running minimum read **-2.159 dB** low relative to
+the true mean. Setting `noise_min_bias_db = 2.16` zeroed the offset to
++0.001 dB, within the test's ±0.5 dB tolerance. Sliding minimum via
+monotonic deque.
 
 ### 2.2 Spectral reference (guard-banded neighbors)
 
@@ -309,7 +318,7 @@ engine = "legacy"           # "legacy" | "hsmm"
 sigma_u = 0.30              llr_clip = 10.0          hold_dits = 4
 fallback_hops = 8
 # §2
-noise_window_ms = 1500      noise_min_bias_db = 2.5
+noise_window_ms = 1500      noise_min_bias_db = 2.16
 spectral_min_bias_db = 1.5  spectral_beta = 0.5
 # §3
 refine_bw_hz = 0
