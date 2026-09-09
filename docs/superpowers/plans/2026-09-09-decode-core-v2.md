@@ -171,6 +171,8 @@ git commit -m "feat(scripts): score RBN benchmark against a single spotter (K5TR
 **Interfaces:**
 - Produces: `DecoderEvent::CharDecoded { …, alternatives: Vec<(Glyph, f32)> }`, `DecoderEvent::WordBoundary { …, confidence: f32 }`; helper `DecoderEvent::char_decoded(track_id, sample_ts, glyph, confidence)` and `DecoderEvent::word_boundary(track_id, sample_ts)` constructors that fill the defaults (every existing construction site in `decoder.rs` and tests switches to them).
 
+Scope note (design doc §8.3, MAN-167): this task adds the field to the wire type only. It does **not** add a `manta-spot` consumer or a dispensa JSON Schema change — `alternatives` stays internal to `manta-decode`'s event stream until MAN-167 is picked up.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
@@ -1885,7 +1887,11 @@ git commit -am "test(manta-decode): hsmm CPU bench and 3-run determinism gate"
 **Files:**
 - Create: `docs/DECISIONS/2026-09-XX-decode-core-v2-stage2-gate.md`
 - Modify: `crates/manta-cli/tests/golden_vr.rs` (remove `#[ignore]`), `crates/manta-cli/tests/golden_v*.rs` (add `--engine hsmm` copies of V1–V10, un-ignored only if they pass)
-- Modify: `README.md`, `AGENTS.md` Status (only the facts: which engine is default, measured numbers)
+- Modify: `README.md`, `AGENTS.md` Status (only the facts: which engine is default, measured numbers), `ROADMAP.md` (VR1–VR8 are already promoted to permanent M2 gates as of the docs PR that shipped this plan — this task records the pass/fail measurement against them, it does not decide whether they're gates)
+
+- [ ] **Step 0: Confirm the standing decisions before measuring**
+
+`decode.engine` stays a runtime switch permanently (never remove `Legacy`/`EdgeLegacy`); `alternatives` stays internal (do not add a dispensa field or a `manta-spot` consumer in this task — that's MAN-167); the narrowband refiner's `manta-engine` call site stays out of scope (that's MAN-168, Task 13 only builds the DSP module). VR1–VR8 are already normative in `ROADMAP.md`'s M2 section — this task measures against them, it doesn't debate whether they count.
 
 - [ ] **Step 1: Run the gate**
 
@@ -1914,7 +1920,7 @@ git commit -m "docs(manta): decode core v2 stage-2 gate results"
 
 **Files:**
 - Create: `crates/manta-dsp/src/refine.rs`; `pub mod refine;` in `manta-dsp/src/lib.rs`
-- The engine call site (`manta-engine/src/track.rs` line ≈ 571/597 where `hop.power[k].sqrt()` is pushed) is **not** part of this task; file a follow-up ticket referencing v2 §3 and coordinate with the tracker owner.
+- The engine call site (`manta-engine/src/track.rs` line ≈ 571/597 where `hop.power[k].sqrt()` is pushed) is **not** part of this task — deferred by decision (design doc §8.2) to **MAN-168**, which is the follow-up ticket already filed and cross-referenced. Do not touch `track.rs` in this task.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1949,7 +1955,7 @@ git commit -m "docs(manta): decode core v2 stage-2 gate results"
 - [ ] **Step 3: Run, commit**
 
 ```bash
-git commit -am "feat(manta-dsp): per-track narrowband refiner (SPEC v2 §3), engine call site deferred"
+git commit -am "feat(manta-dsp): per-track narrowband refiner (SPEC v2 §3), engine call site deferred to MAN-168"
 ```
 
 ---
