@@ -89,6 +89,41 @@ fn sample_spot() -> Spot {
     }
 }
 
+/// Read lines until `stop` matches one, returning every line read.
+///
+/// MAN-86 review: once the peer has closed, `read_line` returns `Ok(0)`
+/// forever, so a loop that only inspects the line's CONTENT spins until the
+/// harness kills it. `connect_and_login` below is shared by most tests in
+/// this file and has no surrounding timeout, so an early-close regression
+/// would hang the whole suite instead of naming the line it never saw.
+/// Zero bytes is EOF and fails immediately; the whole read is also bounded,
+/// so a server that stops writing without closing fails the same way.
+async fn read_lines_until(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    expecting: &str,
+    stop: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let collect = async {
+        let mut lines: Vec<String> = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert!(
+                n > 0,
+                "connection closed before {expecting}; lines seen: {lines:?}"
+            );
+            let done = stop(&line);
+            lines.push(line);
+            if done {
+                return lines;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), collect)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expecting}"))
+}
+
 async fn connect_and_login(
     addr: std::net::SocketAddr,
 ) -> (
@@ -102,33 +137,23 @@ async fn connect_and_login(
     // MAN-86: the greeting is now a multi-line CW-Skimmer-shaped banner,
     // not a single `login: ` line -- read until the callsign prompt rather
     // than assuming the first line is it.
-    let mut saw_banner = false;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        if line.contains("Welcome to") {
-            saw_banner = true;
-        }
-        if line.to_lowercase().contains("enter your callsign") {
-            break;
-        }
-    }
+    let banner = read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
     assert!(
-        saw_banner,
-        "expected a greeting banner before the callsign prompt"
+        banner.iter().any(|line| line.contains("Welcome to")),
+        "expected a greeting banner before the callsign prompt, got: {banner:?}"
     );
 
     wr.write_all(b"N0CALL\r\n").await.unwrap();
 
     // Consume the post-login greeting line(s) up through the station's
     // own prompt (`de W3XYZ-# >`) before the spot stream starts.
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        if line.contains(STATION_CALL) {
-            break;
-        }
-    }
+    read_lines_until(&mut reader, "the post-login station prompt", |line| {
+        line.contains(STATION_CALL)
+    })
+    .await;
 
     (reader, wr)
 }
@@ -763,13 +788,10 @@ async fn an_implausible_login_is_rejected_and_the_connection_closed() {
     let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
     let mut reader = BufReader::new(rd);
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).await.unwrap();
-        if l.to_lowercase().contains("enter your callsign") {
-            break;
-        }
-    }
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
     wr.write_all(b"NOT A CALLSIGN AT ALL\r\n").await.unwrap();
 
     let mut line = String::new();
@@ -797,13 +819,10 @@ async fn a_login_with_trailing_cr_nul_from_a_real_telnet_client_is_accepted() {
     let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
     let mut reader = BufReader::new(rd);
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).await.unwrap();
-        if l.to_lowercase().contains("enter your callsign") {
-            break;
-        }
-    }
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
     wr.write_all(b"N0CALL\r\x00\n").await.unwrap();
 
     let mut line = String::new();

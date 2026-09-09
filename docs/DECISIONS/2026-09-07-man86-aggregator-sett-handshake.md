@@ -134,6 +134,13 @@ Currently, the RBN recommends a value of "1".
    passband overlapping no allocation at all (a receiver test tone, a nonsense `--dial-freq-hz`)
    falls back to the raw passband rather than an empty list, since an empty list reads to
    Aggregator as "decoding nothing" — worse than an honest (if unlabeled) range.
+   **Amended (PR #128 review):** the passband width is the source's *RF bandwidth*
+   (`IqSource::rf_bandwidth_hz`), not its processing sample rate. The two are the same number for
+   every non-resampling source, but `KiwiIqSource` upsamples a ~12 kS/s receiver stream to
+   96 kS/s while asking the receiver for `low_cut=-5000 high_cut=5000` — advertising the sample
+   rate there claimed centre ±48 kHz of coverage Aggregator would then expect spots from, against
+   a real 10 kHz. `sample_rate()` remains the value `SpotBus` uses for sample-index-to-wall-clock
+   conversion; only coverage claims use the bandwidth.
 6. **Login validation is a permissive shape check, not authentication.** `ARCHITECTURE.md` §7
    already commits normatively to no client authentication on this listener. `manta_spot::grammar::
    is_plausible` was considered and rejected for this purpose: MAN-45 research finding 2 records it

@@ -61,15 +61,22 @@ impl fmt::Display for SettSettings {
 }
 
 /// The segments manta is actually decoding right now: the live passband
-/// (`centre ± rate/2`) clipped to each amateur allocation it overlaps.
-/// Skimmer Server reports what is CURRENTLY decodable, not what is
-/// configured (verified against a real two-SkimServ SETT capture) -- for
-/// manta, "currently decodable" IS the passband.
-pub fn segments_for_passband(center_freq_hz: f64, sample_rate_hz: f64) -> Vec<(f64, f64)> {
-    if !center_freq_hz.is_finite() || center_freq_hz <= 0.0 || !sample_rate_hz.is_finite() {
+/// (`centre ± bandwidth/2`) clipped to each amateur allocation it
+/// overlaps. Skimmer Server reports what is CURRENTLY decodable, not what
+/// is configured (verified against a real two-SkimServ SETT capture) --
+/// for manta, "currently decodable" IS the passband.
+///
+/// `bandwidth_hz` is the source's RF bandwidth
+/// (`IqSource::rf_bandwidth_hz`), NOT its processing sample rate. MAN-86
+/// review: they are the same number for every non-resampling source, but a
+/// KiwiSDR delivers a 10 kHz receiver passband upsampled to 96 kS/s, and
+/// passing the sample rate here advertised centre ±48 kHz of coverage
+/// Aggregator would then expect spots from.
+pub fn segments_for_passband(center_freq_hz: f64, bandwidth_hz: f64) -> Vec<(f64, f64)> {
+    if !center_freq_hz.is_finite() || center_freq_hz <= 0.0 || !bandwidth_hz.is_finite() {
         return Vec::new();
     }
-    let half = sample_rate_hz.abs() / 2.0;
+    let half = bandwidth_hz.abs() / 2.0;
     let (lo, hi) = (center_freq_hz - half, center_freq_hz + half);
     let clipped: Vec<(f64, f64)> = crate::band::allocations()
         .iter()
@@ -167,6 +174,23 @@ mod tests {
                 (10_100_000.0, 10_150_000.0),
                 (14_000_000.0, 14_350_000.0),
             ]
+        );
+    }
+
+    #[test]
+    fn a_narrow_rf_bandwidth_is_not_widened_to_the_processing_sample_rate() {
+        // MAN-86 review: a KiwiSDR is asked for low_cut=-5000/high_cut=5000
+        // and its 12 kS/s stream is upsampled to 96 kS/s, so the honest
+        // answer is centre +/-5 kHz. The 96 kS/s answer (13992.0-14088.0,
+        // clipped to 14000.0-14088.0) would have Aggregator expecting
+        // spots from 88 kHz of spectrum manta cannot hear.
+        assert_eq!(
+            segments_for_passband(14_040_000.0, 10_000.0),
+            vec![(14_035_000.0, 14_045_000.0)]
+        );
+        assert_ne!(
+            segments_for_passband(14_040_000.0, 10_000.0),
+            segments_for_passband(14_040_000.0, 96_000.0)
         );
     }
 

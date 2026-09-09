@@ -28,6 +28,27 @@ pub trait IqSource {
     fn sample_rate(&self) -> f64;
     /// The source's RF center frequency, Hz (0.0 if unknown).
     fn center_freq_hz(&self) -> f64;
+
+    /// The width of RF spectrum this source actually delivers, Hz --
+    /// which is NOT always `sample_rate()`.
+    ///
+    /// MAN-86 review: a source that resamples reports a *processing* rate
+    /// wider than the spectrum it carries. `KiwiIqSource` upsamples a
+    /// ~12 kS/s receiver stream to 96 kS/s while the receiver itself is
+    /// configured for a 10 kHz IQ passband, so reading `sample_rate()` as
+    /// the decodable width would make `SKIMMER/SETT` advertise centre
+    /// +/-48 kHz of coverage to Aggregator that no signal ever occupies.
+    /// Anything a consumer publishes as *coverage* (SETT segments) must
+    /// use this; anything that is a per-sample timing quantity (the
+    /// channelizer, `SpotBus`'s sample-index-to-wall-clock conversion)
+    /// must keep using `sample_rate()`.
+    ///
+    /// Defaults to `sample_rate()`, correct for every non-resampling
+    /// source (file, audio, SoapySDR, HPSDR), where the delivered
+    /// spectrum IS the Nyquist span of the stream.
+    fn rf_bandwidth_hz(&self) -> f64 {
+        self.sample_rate()
+    }
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
 

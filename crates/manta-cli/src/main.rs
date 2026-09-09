@@ -405,6 +405,15 @@ impl IqSource for FixedCenterFreqSource {
         self.freq_hz
     }
 
+    /// Only the centre frequency is overridden -- the wrapped source's own
+    /// RF bandwidth must still reach `SKIMMER/SETT`, or wrapping a
+    /// resampling source (KiwiSDR) in `--dial-freq-hz` would silently
+    /// re-introduce the "advertise the processing rate" bug this method
+    /// exists to prevent (MAN-86 review).
+    fn rf_bandwidth_hz(&self) -> f64 {
+        self.inner.rf_bandwidth_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -776,6 +785,14 @@ fn shutdown_runtime_after_drain(
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
+    // MAN-86 review: deliberately a SEPARATE argument from
+    // `sample_rate_hz`, not derived from it. `sample_rate_hz` is the
+    // per-sample timing quantity `SpotBus` needs to turn a sample index
+    // into wall clock; `rf_bandwidth_hz` is the width of spectrum the
+    // receiver actually delivers, and only that may be advertised to
+    // Aggregator as decodable coverage. They differ for any resampling
+    // source -- see `IqSource::rf_bandwidth_hz`.
+    rf_bandwidth_hz: f64,
     center_freq_hz: f64,
     epoch: std::time::SystemTime,
     session_nonce: u128,
@@ -857,7 +874,10 @@ fn start_spot_server(
             sett: manta_server::sett::SettSettings {
                 validation_level: manta_server::sett::ValidationLevel::Normal,
                 cq_only: false,
-                segments: manta_server::sett::segments_for_passband(center_freq_hz, sample_rate_hz),
+                segments: manta_server::sett::segments_for_passband(
+                    center_freq_hz,
+                    rf_bandwidth_hz,
+                ),
             },
         });
         tokio::spawn(manta_server::telnet::serve(
@@ -1155,6 +1175,7 @@ fn main() -> Result<()> {
                     let (rt, server) = start_spot_server(
                         &path,
                         src.sample_rate(),
+                        src.rf_bandwidth_hz(),
                         src.center_freq_hz(),
                         epoch,
                         session_nonce,
@@ -1627,8 +1648,9 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
-            14_040_000.0,
+            96_000.0,     // sample_rate_hz
+            96_000.0,     // rf_bandwidth_hz -- no resampling source here
+            14_040_000.0, // center_freq_hz
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -1678,8 +1700,9 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
-            14_040_000.0,
+            96_000.0,     // sample_rate_hz
+            96_000.0,     // rf_bandwidth_hz -- no resampling source here
+            14_040_000.0, // center_freq_hz
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -1726,8 +1749,9 @@ mod tests {
 
         let result = start_spot_server(
             cfg_file.path(),
-            96_000.0,
-            14_040_000.0,
+            96_000.0,     // sample_rate_hz
+            96_000.0,     // rf_bandwidth_hz -- no resampling source here
+            14_040_000.0, // center_freq_hz
             std::time::SystemTime::UNIX_EPOCH,
             0,
         );
@@ -1774,8 +1798,9 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
-            14_040_000.0,
+            96_000.0,     // sample_rate_hz
+            96_000.0,     // rf_bandwidth_hz -- no resampling source here
+            14_040_000.0, // center_freq_hz
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
