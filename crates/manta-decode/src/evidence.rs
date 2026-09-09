@@ -83,7 +83,7 @@ impl Evidence {
         // `self.h` here, shrinking the backward reach too and corrupting M
         // near the end of every stream.
         let mut out = Vec::new();
-        let next_center = if self.line.len() >= self.h + 1 {
+        let next_center = if self.line.len() > self.h {
             self.line.len() - self.h
         } else {
             0
@@ -301,7 +301,7 @@ mod tests {
         let h = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops).round() as usize;
 
         let mut scene = vec![1.0f32; warmup];
-        scene.extend(std::iter::repeat(0.3f32).take(tail));
+        scene.extend(std::iter::repeat_n(0.3f32, tail));
         let flushed = run(&scene, noise_amp);
         assert_eq!(flushed.len(), warmup + tail);
 
@@ -309,7 +309,7 @@ mod tests {
         // every hop up to `warmup + tail` is emitted by ordinary push() with
         // real lookahead, never by flush(), in this second run.
         let mut padded_scene = scene.clone();
-        padded_scene.extend(std::iter::repeat(0.3f32).take(h));
+        padded_scene.extend(std::iter::repeat_n(0.3f32, h));
         let padded = run(&padded_scene, noise_amp);
         assert!(padded.len() >= warmup + tail);
 
