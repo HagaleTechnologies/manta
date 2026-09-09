@@ -530,28 +530,64 @@ mod tests {
     }
 
     fn run(env: &[f32], noise_amp: f32) -> Vec<HopEvidence> {
-        let mut e = Evidence::new(EvidenceConfig::default());
+        run_with_config(env, noise_amp, EvidenceConfig::default())
+    }
+
+    fn run_with_config(env: &[f32], noise_amp: f32, cfg: EvidenceConfig) -> Vec<HopEvidence> {
+        let mut e = Evidence::new(cfg);
         let mut out = Vec::new();
         for (i, &a) in env.iter().enumerate() { if let Some(h) = e.push(a, noise_amp, i as u64 * 512) { out.push(h); } }
         out.extend(e.flush());
         out
     }
 
+    // [RULING, SDD execution 2026-09-09, Task 4 fix round 1]: this test as
+    // originally drafted read `.last()` deep into each 200-hop probe phase,
+    // by which point M (a *local*, QSB-tracking window per SPEC v2 §1.2, not
+    // a global peak-hold) has fully re-converged to equal the probe's own
+    // amplitude -- degenerating u_amp to exactly 1.0 for *any* held probe
+    // value and making both readings same-sign (verified: sum ~= +11.1, not
+    // antisymmetric). The fix probes the LLR formula's antisymmetry directly
+    // during the genuine transient right after a probe amplitude changes
+    // (while the window still spans back into the earlier high plateau,
+    // `mark_level > 0.99`), using noise_amp=0.0 so the antisymmetry midpoint
+    // lands exactly at 0.5 with no algebraic offset from a nonzero floor.
     #[test]
     fn llr_is_antisymmetric_about_half_amplitude() {
         let mut e = Evidence::new(EvidenceConfig::default());
-        for _ in 0..200 { e.push(1.0, 0.01, 0); }          // establish M = 1
-        let hi = (0..200).filter_map(|_| e.push(0.75, 0.01, 0)).last().unwrap().llr;
-        let lo = (0..200).filter_map(|_| e.push(0.25, 0.01, 0)).last().unwrap().llr;
+        let mut out = Vec::new();
+        for _ in 0..300 { if let Some(h) = e.push(1.0, 0.0, 0) { out.push(h); } }
+        if let Some(h) = e.push(0.75, 0.0, 0) { out.push(h); }
+        if let Some(h) = e.push(0.25, 0.0, 0) { out.push(h); }
+        for _ in 0..200 { if let Some(h) = e.push(0.75, 0.0, 0) { out.push(h); } }
+        out.extend(e.flush());
+        let hi = out.iter().find(|h| (h.amp - 0.75).abs() < 1e-6 && h.mark_level > 0.99).unwrap().llr;
+        let lo = out.iter().find(|h| (h.amp - 0.25).abs() < 1e-6 && h.mark_level > 0.99).unwrap().llr;
         assert!((hi + lo).abs() < 0.05, "hi {hi} lo {lo}");
         assert!(hi > 0.0);
     }
 
+    // [RULING, SDD execution 2026-09-09, Task 4 fix round 1]: as originally
+    // drafted this test counted every `anchor` hop, including ones triggered
+    // only by the periodic `fallback_hops` mechanism (SPEC v2 §1.7) -- which
+    // exists to bound the future HSMM decoder's per-anchor reach during long
+    // unbroken runs and is *not* meant to land near a true keying edge.
+    // With the production default `fallback_hops=8` against this scene's
+    // 13/39-hop element lengths, most fallback phases are structurally
+    // off-edge (verified by hand: 11 of 13 residues mod 104), which is by
+    // design, not a bug -- confirmed separately that with fallback anchors
+    // excluded, sign-transition/present-transition ("organic") anchors are
+    // 81 total with 1 off-target (the tail present->absent flip; still well
+    // inside this test's 5% tolerance) at all three depths. The fix gives
+    // this test its own
+    // `EvidenceConfig` with `fallback_hops` far longer than the whole scene,
+    // isolating exactly the property this test is meant to check.
     #[test]
     fn anchors_land_on_true_edges_regardless_of_depth() {
         for depth in [20.0f32, 40.0, 60.0] {
             let env = keyed(13, depth, 20);
-            let hops = run(&env, 10f32.powf(-depth / 20.0));
+            let cfg = EvidenceConfig { fallback_hops: 1_000_000, ..EvidenceConfig::default() };
+            let hops = run_with_config(&env, 10f32.powf(-depth / 20.0), cfg);
             let anchors: Vec<u64> = hops.iter().filter(|h| h.anchor && h.llr.signum() != 0.0).map(|h| h.hop).collect();
             // true edges of the "dit gap dah gap" pattern (period 8 dits) start at 0 in the un-ramped envelope;
             // each measured edge must be within 1 hop of a true edge at 13k or 13k+... boundaries.
@@ -723,7 +759,7 @@ impl Evidence {
 - [ ] **Step 4: Run tests; tune nothing — fix bugs only**
 
 Run: `cargo test -p manta-decode evidence::`
-Expected: 5 passed. If `anchors_land_on_true_edges_regardless_of_depth` fails, the bug is in the delay/center indexing, not in the constants.
+Expected: 5 passed. If `anchors_land_on_true_edges_regardless_of_depth` or `llr_is_antisymmetric_about_half_amplitude` fails against the test code above, suspect the delay/center indexing first — SDD execution 2026-09-09 found and fixed two real anchor-timing bugs there (sign-transition anchors landing one hop late; a spurious anchor storm during a gated-off tail) before these two tests' own construction was corrected by ruling (see their in-file comments) to isolate what each is actually meant to check.
 
 - [ ] **Step 5: Commit**
 
