@@ -5,7 +5,7 @@
 //! plain line-oriented text, and skipping IAC keeps this a small,
 //! auditable text protocol (MAN-22/23 harden it further).
 
-use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
+use crate::bounded_io::{read_telnet_line_bounded, read_telnet_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
@@ -215,6 +215,14 @@ fn operator_line(
 /// Trailing CR/NUL is STRIPPED, not rejected: RFC 854 encodes Enter as
 /// CR NUL and real telnet clients send it (MAN-86's ticket records this
 /// from macOS telnet). An EMBEDDED control character is still a rejection.
+/// PR #128 review: stripping it here is only reachable because the read
+/// path that feeds this function now COMPLETES a line on `CR NUL` as well
+/// as on `LF` (`bounded_io::read_telnet_line_bounded`) -- an NVT client
+/// sending `N0CALL\r\0` and nothing more previously never got its login
+/// line delivered here at all, and was dropped by the idle-read timeout
+/// 30 s later. `trim_matches` takes the CR and the NUL in either order and
+/// in any number, so both `\r\0` and a `\r\n`-terminated line arrive here
+/// as the bare callsign.
 fn sanitize_login(raw: &str) -> Option<String> {
     let call = raw
         .trim_matches(|c: char| c.is_whitespace() || c == '\u{0}')
@@ -393,7 +401,12 @@ async fn handle_client(
     );
     write_with_timeout(&mut wr, banner.as_bytes()).await?;
     let mut login_line = String::new();
-    match read_line_bounded_with_timeout(&mut reader, &mut login_line).await {
+    // The Telnet-specific variant (MAN-86/PR #128 review): a client that
+    // terminates with RFC 854's `CR NUL` instead of `CR LF` -- macOS
+    // `telnet` does -- otherwise never completes this line at all and is
+    // dropped by `IDLE_READ_TIMEOUT` 30 s later, having sent a perfectly
+    // valid callsign. `sanitize_login` below strips either terminator.
+    match read_telnet_line_bounded_with_timeout(&mut reader, &mut login_line).await {
         Ok(0) => {
             if log_enabled {
                 tracing::info!("telnet: client disconnected before completing login");
@@ -437,7 +450,7 @@ async fn handle_client(
     const DEFAULT_SHOW_DX_COUNT: usize = 10;
     let mut min_unique: Option<u32> = None;
     // Not cleared at the top of the loop, deliberately: `tokio::select!`
-    // can cancel `read_line_bounded_with_timeout` mid-line (a spot arrived
+    // can cancel `read_telnet_line_bounded_with_timeout` mid-line (a spot arrived
     // first), and the bytes it already consumed from `reader` were
     // already appended into `cmd_line` as a side effect before that
     // cancellation point -- clearing here would discard them, silently
@@ -503,7 +516,7 @@ async fn handle_client(
             // must never be disconnected just for staying quiet. (Round-5
             // review finding: this branch used to reuse the timed variant
             // here too, which cut off exactly that client after 30s.)
-            n = read_line_bounded(&mut reader, &mut cmd_line) => {
+            n = read_telnet_line_bounded(&mut reader, &mut cmd_line) => {
                 let n = match n {
                     Ok(n) => n,
                     Err(e) => {

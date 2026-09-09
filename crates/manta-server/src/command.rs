@@ -31,10 +31,15 @@ pub enum Command {
 }
 
 pub fn parse(line: &str) -> Command {
+    // NUL is a token separator alongside whitespace, not part of a token
+    // (MAN-86/PR #128 review): RFC 854 encodes Enter as `CR NUL`, so a
+    // macOS-`telnet`-style client's line arrives here as `BYE\r\0` --
+    // `split_whitespace` alone leaves a trailing `\0` token that turns
+    // every command from such a client into `Unknown`.
     let tokens: Vec<String> = line
-        .trim()
         .replace('/', " ")
-        .split_whitespace()
+        .split(|c: char| c.is_whitespace() || c == '\u{0}')
+        .filter(|t| !t.is_empty())
         .map(|t| t.to_uppercase())
         .collect();
     let t: Vec<&str> = tokens.iter().map(String::as_str).collect();
@@ -121,6 +126,21 @@ mod tests {
         assert_eq!(parse("BYE"), Command::Bye);
         assert_eq!(parse("bye"), Command::Bye);
         assert_eq!(parse("bye\r\n"), Command::Bye);
+    }
+
+    #[test]
+    fn a_cr_nul_terminated_line_parses_as_the_command_underneath_it() {
+        // PR #128 review: RFC 854 encodes Enter as `CR NUL`, so a macOS
+        // `telnet` client's line arrives here with a trailing NUL that
+        // `split_whitespace` alone would leave as its own token, turning
+        // every such command into `Unknown` -- the exact "Aggregator never
+        // gets an answer" failure MAN-86 exists to remove.
+        assert_eq!(parse("SKIMMER/SETT\r\u{0}"), Command::Sett);
+        assert_eq!(parse("BYE\r\u{0}"), Command::Bye);
+        assert_eq!(parse("sh/dx\r\u{0}"), Command::ShowDx { count: None });
+        // An embedded NUL still separates tokens rather than being folded
+        // into one, so a genuinely malformed line stays Unknown.
+        assert_eq!(parse("bye\u{0}now"), Command::Unknown);
     }
 
     #[test]

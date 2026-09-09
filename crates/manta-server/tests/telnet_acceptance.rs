@@ -820,6 +820,12 @@ async fn an_implausible_login_is_rejected_and_the_connection_closed() {
 async fn a_login_with_trailing_cr_nul_from_a_real_telnet_client_is_accepted() {
     // RFC 854's NVT Enter encoding must NOT be treated as garbage -- the
     // bytes are stripped, the callsign underneath is accepted.
+    //
+    // PR #128 review: `CR NUL` is sent with NO trailing `LF` (that IS the
+    // whole terminator on an NVT -- macOS `telnet` sends exactly these
+    // bytes). An earlier version of this test appended a `\n`, which made
+    // it pass against a read path that only ever completed on `\n` and
+    // hid a 30-second login timeout for every such client.
     let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
     let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
     let mut reader = BufReader::new(rd);
@@ -827,7 +833,7 @@ async fn a_login_with_trailing_cr_nul_from_a_real_telnet_client_is_accepted() {
         line.to_lowercase().contains("enter your callsign")
     })
     .await;
-    wr.write_all(b"N0CALL\r\x00\n").await.unwrap();
+    wr.write_all(b"N0CALL\r\x00").await.unwrap();
 
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
@@ -838,4 +844,41 @@ async fn a_login_with_trailing_cr_nul_from_a_real_telnet_client_is_accepted() {
         line.contains(STATION_CALL),
         "expected the post-login prompt, got: {line:?}"
     );
+}
+
+#[tokio::test]
+async fn sett_and_bye_terminated_with_cr_nul_only_are_answered() {
+    // PR #128 review: post-login commands from an NVT client arrive
+    // `SETT\r\0` / `BYE\r\0` with no `LF` at all. Before the Telnet read
+    // path recognized `CR NUL`, they stayed buffered indefinitely --
+    // Aggregator's SETT probe would never be answered, which is the exact
+    // failure (manual v6.0 §9.2) this ticket exists to remove.
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+    wr.write_all(b"N0CALL\r\x00").await.unwrap();
+    read_lines_until(&mut reader, "the post-login station prompt", |line| {
+        line.contains(STATION_CALL)
+    })
+    .await;
+
+    wr.write_all(b"SKIMMER/SETT\r\x00").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("SETT terminated with CR NUL must be answered")
+        .unwrap();
+    assert_eq!(line, "SETT: vlNormal 14000.0-14088.0\r\n");
+
+    wr.write_all(b"BYE\r\x00").await.unwrap();
+    let mut bye = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut bye))
+        .await
+        .expect("BYE terminated with CR NUL must be answered")
+        .unwrap();
+    assert_eq!(bye, "CU AGN!\r\n");
 }

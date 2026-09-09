@@ -226,6 +226,12 @@ pub struct ServerConfig {
     /// Maidenhead grid square, 4 or 6 characters, e.g. `"FN03GW"`. Optional.
     #[serde(default, deserialize_with = "deserialize_optional_grid")]
     pub operator_grid: Option<String>,
+    // PR #128 review: these three keys, their defaults (absent) and their
+    // validation rules are also listed in `docs/SPEC-decode-core.md` §9's
+    // `[server]` block -- the repository's canonical config-key table, and
+    // the only place an operator who has not read this source file will
+    // look for them. Changing a name, a default or a validation rule here
+    // means changing it there too.
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.

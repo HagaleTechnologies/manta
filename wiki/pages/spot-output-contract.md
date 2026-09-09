@@ -8,9 +8,10 @@ sources:
   - ARCHITECTURE.md
   - README.md
   - CLAUDE.md
+  - docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: c57458a
+  date: 2026-09-09
 links:
   - spot-validation
 ---
@@ -18,7 +19,8 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 
 ## Pointers
 
-- RBN telnet format and the command grammar manta supports (`sh/dx`, filters): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- RBN telnet format and the command grammar manta supports (`sh/dx`, filters, `SKIMMER/SETT`, `BYE`): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- **Aggregator compatibility is a gate, not a nicety** (MAN-86): the telnet surface opens with a CW-Skimmer-shaped greeting banner (software/version, operator name/call/QTH/grid, `Please enter your callsign: `), answers `SKIMMER/SETT` with the validation level and the live decodable segments, and closes on `BYE`. RBN's Aggregator will not forward spots from a source that never answers `SETT`. The exact wire format, its four primary sources, and the decisions behind each field live in `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md` — normative there, not restated here. Operator identity comes from the `[server]` `operator_name`/`operator_qth`/`operator_grid` config keys (docs/SPEC-decode-core.md §9).
 - JSON spot schema: **the schema is an ecosystem contract that belongs in the `dispensa` repo** (JSON Schema, ADR pending — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. When it lands, this page should point at the corresponding ADR in plain text.
 - cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
 

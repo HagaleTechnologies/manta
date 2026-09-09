@@ -160,17 +160,48 @@ Currently, the RBN recommends a value of "1".
    `W3XYZ-2` a real cluster client may use. `telnet::sanitize_login` instead accepts 3–16 characters
    of alphanumerics/`/`/`-`, containing at least one letter and one digit, after trimming
    surrounding whitespace and NUL bytes.
-7. **Trailing CR/NUL is stripped, not rejected.** RFC 854 encodes a Telnet NVT "Enter" keypress as
-   CR NUL; real clients (macOS `telnet`, per the ticket) send it. Rejecting on its mere presence
+7. **Trailing CR/NUL is stripped, not rejected — and it also TERMINATES the line.** RFC 854
+   encodes a Telnet NVT "Enter" keypress as CR NUL; real clients (macOS `telnet`, per the ticket)
+   send it. Rejecting on its mere presence
    would disconnect legitimate operators. `sanitize_login` strips it (and any other leading/trailing
    whitespace) before validating the remainder — an embedded (non-trailing) control character is
    still a rejection. One rejected attempt closes the connection immediately (no retry loop): this
    listener is unauthenticated by design, and a retry loop is free budget for a scanner.
+   **Amended (PR #128 review round 2):** stripping alone was not enough. An NVT client sends
+   `CR NUL` and nothing else — no `LF` — and the shared read path (`bounded_io::read_line_bounded`)
+   only completed a line on `LF`, so such a login never reached `sanitize_login` at all (the client
+   was dropped 30 s later by `IDLE_READ_TIMEOUT`) and a post-login `SKIMMER/SETT` or `BYE` sat in
+   the buffer indefinitely — precisely the "Aggregator never gets its SETT answer" failure this
+   ticket exists to remove, for every client that terminates that way. The Telnet listener now
+   reads through `bounded_io::read_telnet_line_bounded`, which completes a line on `LF` **or** on
+   `CR NUL` (including when the two bytes arrive in separate TCP segments); the metrics HTTP path
+   (`CRLF`-terminated per RFC 9112) and the outbound RBN uplink keep the strict `LF`-only
+   behavior. `command::parse` treats NUL as a token separator alongside whitespace for the same
+   reason — otherwise `BYE\r\0` parses as two tokens and is answered as `Unknown`.
 8. **The post-login prompt (`de <call>-# >`) is unchanged.** CW Skimmer's own post-login prompt has
    a different shape (`<call> de SKIMMER <date> <time>Z CwSkimmer > `, Source 1) — out of this
    ticket's three named scenarios, and filed as a follow-up (see MAN-86's plan document's
    Follow-ups section) rather than fixed inline, per
    `docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`.
+
+## Follow-ups (not fixed inline)
+
+Per `docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`, P2 findings raised after review
+round 1 are captured here rather than chased inline:
+
+- **Emitted spots are not constrained to the advertised SETT segments** (PR #128 review). The SETT
+  reply clips the live passband to the amateur allocation table (decision 5 above), but nothing on
+  the emission side applies a matching predicate, so a spot decoded at e.g. 13.995 MHz from a
+  96 kS/s passband centred on 14.040 MHz is still emitted outside the coverage manta advertised.
+  Neither of the reviewer's two options belongs in this ticket: advertising the *unclipped*
+  passband would reverse decision 5 (and invite Aggregator to expect spots from non-amateur
+  spectrum), while enforcing the allocation bounds at emission is a cross-crate change to the
+  deterministic decode path (`manta-engine`/`manta-spot`), not to the telnet handshake — and as
+  written it would suppress *every* spot from a file source run without `--dial-freq-hz`, whose
+  centre frequency is 0 Hz and whose spot frequencies are therefore baseband, outside every
+  allocation. That is the configuration the V1–V10 golden vectors run in, so this needs its own
+  ticket, its own golden-vector review, and a decision on what a source with no RF reference
+  should claim at all.
 
 ## Residual risk
 
