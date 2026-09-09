@@ -9,7 +9,12 @@
 //! validator already trusts for the plausibility gate (`manta_spot::cty`).
 //! When a callsign isn't cty-resolvable, each required field gets a named
 //! out-of-domain `UNKNOWN_*` sentinel below rather than a fabricated-looking
-//! real value or (where the contract forbids it) `null`.
+//! real value or (where the contract forbids it) `null`. A maritime-mobile
+//! (`/MM`) or aeronautical-mobile (`/AM`) call is the separate, KNOWN case:
+//! `cty.lookup` resolves it through its base prefix, but the station is by
+//! definition outside every DXCC entity, so it gets ADIF's own
+//! `NO_DXCC_ENTITY` (0) plus unknown continent/zone/lat/lon instead of its
+//! home entity's geography.
 
 use manta_spot::cty;
 use manta_spot::Spot;
@@ -32,6 +37,83 @@ pub const UNKNOWN_CONTINENT: &str = "";
 /// Emitted for `dxCqZone` when `cty.lookup` cannot resolve the callsign.
 /// Real CQ zones are 1-40, so 0 is unambiguously "unknown".
 pub const UNKNOWN_CQ_ZONE: u16 = 0;
+
+/// Emitted for `dxDxcc`/`deDxcc` when the callsign carries a maritime-mobile
+/// (`/MM`) or aeronautical-mobile (`/AM`) designator. This is ADIF's own
+/// entity code 0 -- "None: the contacted station is known to NOT be within a
+/// DXCC entity" -- and it is the exact case ADIF defines it for, so unlike
+/// `UNKNOWN_DXCC` no consumer has to learn a manta-local convention to read
+/// it. `cty.lookup` would otherwise happily resolve `K5ARH/MM` through its
+/// base prefix and report the United States (291) for a station that is, by
+/// the designator's own meaning, not there (round-7 review finding 2).
+pub const NO_DXCC_ENTITY: i64 = 0;
+
+/// True when `callsign` carries the maritime-mobile (`/MM`) or aeronautical-
+/// mobile (`/AM`) designator -- the two portable designators of
+/// `grammar::is_valid_portable`'s set that place a station outside every DXCC
+/// entity (at sea, or airborne). The others (`/P`, `/QRP`, `/M`, `/<digit>`)
+/// mean "somewhere else", which cty.dat's base-prefix answer still describes
+/// at entity granularity.
+///
+/// Split from the RIGHT: `grammar::is_plausible` only admits a single `/`,
+/// but MAN-28's Watch List allowlist bypasses the grammar gate entirely
+/// (`validator.rs:676-688`), so a compound call like `PJ4/K5ARH/MM` can reach
+/// here -- and it is just as maritime-mobile as the simple form.
+pub fn is_outside_any_dxcc_entity(callsign: &str) -> bool {
+    match callsign.rsplit_once('/') {
+        Some((_, designator)) => {
+            designator.eq_ignore_ascii_case("MM") || designator.eq_ignore_ascii_case("AM")
+        }
+        None => false,
+    }
+}
+
+/// The contract-required geography fields for ONE side of a spot, resolved
+/// together so `dxDxcc` can never disagree with the continent/CQ zone/lat/lon
+/// emitted beside it. `cq_zone` has no `de` counterpart on the wire schema
+/// and is simply unused for that side.
+struct Geography {
+    dxcc: i64,
+    continent: String,
+    cq_zone: u16,
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+impl Geography {
+    /// Resolves one callsign against `cty.dat` + the vendored `dxcc.tsv`.
+    ///
+    /// A `/MM` or `/AM` call short-circuits the lookup: reporting the base
+    /// call's home entity for it corrupts the geography of every maritime-
+    /// or aeronautical-mobile spot, so the entity number becomes ADIF's
+    /// `NO_DXCC_ENTITY` and the rest of the geography becomes the `UNKNOWN_*`
+    /// sentinels / `null` -- we know the station is not in its home entity,
+    /// and we do not know where it actually is.
+    fn resolve(callsign: &str, cty: &cty::Table) -> Self {
+        if is_outside_any_dxcc_entity(callsign) {
+            return Self {
+                dxcc: NO_DXCC_ENTITY,
+                continent: UNKNOWN_CONTINENT.to_string(),
+                cq_zone: UNKNOWN_CQ_ZONE,
+                lat: None,
+                lon: None,
+            };
+        }
+        let entry = cty.lookup(callsign);
+        Self {
+            dxcc: entry
+                .and_then(|e| e.dxcc)
+                .map(i64::from)
+                .unwrap_or(UNKNOWN_DXCC),
+            continent: entry
+                .map(|e| e.continent.clone())
+                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
+            cq_zone: entry.map(|e| e.cq_zone).unwrap_or(UNKNOWN_CQ_ZONE),
+            lat: entry.map(|e| e.lat),
+            lon: entry.map(|e| e.lon),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,8 +185,12 @@ impl SpotMessage {
         // contract-defined "geography unknown" signal a consumer can key on
         // today. Occurrences are counted as
         // `manta_spots_unresolved_geography_total` (main.rs, at publish).
-        let dx = cty.lookup(&spot.callsign);
-        let de = cty.lookup(station_call);
+        //
+        // `Geography::resolve` also handles the /MM and /AM designators, for
+        // which cty.dat DOES answer (through the base call's prefix) but the
+        // answer is wrong by definition -- see its doc comment.
+        let dx = Geography::resolve(&spot.callsign, cty);
+        let de = Geography::resolve(station_call, cty);
         // `band` must be derived from the SAME rounded value reported as
         // `frequency` -- computing it from the unrounded `spot.freq_hz`
         // separately (round-5 review finding) could disagree with
@@ -127,27 +213,17 @@ impl SpotMessage {
             mode: "CW",
             dx_call: spot.callsign.clone(),
             dx_grid: None,
-            dx_lat: dx.map(|e| e.lat),
-            dx_lon: dx.map(|e| e.lon),
-            dx_dxcc: dx
-                .and_then(|e| e.dxcc)
-                .map(i64::from)
-                .unwrap_or(UNKNOWN_DXCC),
-            dx_continent: dx
-                .map(|e| e.continent.clone())
-                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
-            dx_cq_zone: dx.map(|e| e.cq_zone).unwrap_or(UNKNOWN_CQ_ZONE),
+            dx_lat: dx.lat,
+            dx_lon: dx.lon,
+            dx_dxcc: dx.dxcc,
+            dx_continent: dx.continent,
+            dx_cq_zone: dx.cq_zone,
             de_call: station_call.to_string(),
             de_grid: None,
-            de_lat: de.map(|e| e.lat),
-            de_lon: de.map(|e| e.lon),
-            de_dxcc: de
-                .and_then(|e| e.dxcc)
-                .map(i64::from)
-                .unwrap_or(UNKNOWN_DXCC),
-            de_continent: de
-                .map(|e| e.continent.clone())
-                .unwrap_or_else(|| UNKNOWN_CONTINENT.to_string()),
+            de_lat: de.lat,
+            de_lon: de.lon,
+            de_dxcc: de.dxcc,
+            de_continent: de.continent,
             snr: Some(spot.snr_db.round() as i32),
             wpm: Some(spot.wpm.round() as i32),
             decode_confidence: Some(spot.confidence),
@@ -307,6 +383,98 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert!(msg.de_lat.is_none());
         // dx geography is unaffected.
         assert_eq!(msg.dx_dxcc, 339);
+    }
+
+    /// Round-7 review finding 2: `cty.lookup` resolves `K5ARH/MM` through the
+    /// base call's `K` prefix, so the entity mapping this ticket added used to
+    /// report the United States (291) for a station whose designator says it
+    /// is at sea (`/MM`) or airborne (`/AM`). ADIF entity code 0 -- "known NOT
+    /// to be within a DXCC entity" -- is precisely this case, and the rest of
+    /// the geography must not claim the home entity either: we know where the
+    /// station is NOT, and not where it is.
+    #[test]
+    fn maritime_and_aeronautical_mobile_calls_emit_adif_entity_zero() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        for call in ["K5ARH/MM", "K5ARH/AM", "k5arh/mm"] {
+            assert_eq!(
+                cty.lookup(call).and_then(|e| e.dxcc),
+                Some(291),
+                "test premise: {call}'s base prefix resolves to the home entity"
+            );
+            let mut spot = sample_spot();
+            spot.callsign = call.to_string();
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+
+            assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY, "{call}");
+            assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT, "{call}");
+            assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE, "{call}");
+            assert!(msg.dx_lat.is_none(), "{call}");
+            assert!(msg.dx_lon.is_none(), "{call}");
+            // The reporting station is an ordinary call -- unaffected.
+            assert_eq!(msg.de_dxcc, 291, "{call}");
+            assert_eq!(msg.de_continent, "NA", "{call}");
+        }
+    }
+
+    /// The station's own callsign gets the same rule: a shipboard or airborne
+    /// skimmer configures `station_callsign` as `.../MM` or `.../AM`, and its
+    /// home entity is just as wrong on the de side of the wire message.
+    #[test]
+    fn a_mobile_station_callsign_also_emits_adif_entity_zero() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W3XYZ/MM", &cty, "manta-0.1.0", 0, 0);
+
+        assert_eq!(msg.de_dxcc, NO_DXCC_ENTITY);
+        assert_eq!(msg.de_continent, UNKNOWN_CONTINENT);
+        assert!(msg.de_lat.is_none());
+        assert!(msg.de_lon.is_none());
+        // dx geography is unaffected.
+        assert_eq!(msg.dx_dxcc, 339);
+    }
+
+    /// Only `/MM` and `/AM` mean "outside every entity". The other designators
+    /// `grammar::is_valid_portable` accepts mean "somewhere else", which the
+    /// base prefix still describes correctly at entity granularity -- narrowing
+    /// them to code 0 would throw away geography manta actually knows.
+    #[test]
+    fn the_other_portable_designators_keep_their_home_entity() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        for call in ["K5ARH/P", "K5ARH/QRP", "K5ARH/M", "K5ARH/3", "K5ARH"] {
+            let mut spot = sample_spot();
+            spot.callsign = call.to_string();
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+
+            assert_eq!(msg.dx_dxcc, 291, "{call}");
+            assert_eq!(msg.dx_continent, "NA", "{call}");
+            assert_eq!(msg.dx_cq_zone, 5, "{call}");
+            assert!(msg.dx_lat.is_some(), "{call}");
+        }
+    }
+
+    /// MAN-28's Watch List allowlist bypasses `grammar::is_plausible`
+    /// entirely (validator.rs:676-688), so a compound call can reach
+    /// `from_spot` even though the grammar admits only one `/`. Its trailing
+    /// designator still decides -- `is_outside_any_dxcc_entity` splits from
+    /// the right.
+    #[test]
+    fn a_compound_call_with_a_trailing_mobile_designator_is_still_mobile() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.callsign = "KP4/K5ARH/MM".to_string();
+        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+
+        assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY);
+        assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE);
+    }
+
+    #[test]
+    fn is_outside_any_dxcc_entity_matches_only_the_two_mobile_designators() {
+        for call in ["K5ARH/MM", "K5ARH/AM", "k5arh/am", "KP4/K5ARH/MM"] {
+            assert!(is_outside_any_dxcc_entity(call), "{call}");
+        }
+        for call in ["K5ARH", "K5ARH/P", "K5ARH/M", "K5ARH/3", "MM0ABC", "AM1AB"] {
+            assert!(!is_outside_any_dxcc_entity(call), "{call}");
+        }
     }
 
     #[test]

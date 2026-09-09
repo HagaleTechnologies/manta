@@ -17,9 +17,10 @@ pub struct Metrics {
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
     /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
-    /// against `cty.dat`, so it was emitted with the `UNKNOWN_DXCC`/
-    /// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` sentinels instead of real
-    /// geography. ARCHITECTURE §8: "every dropped/evicted/suppressed item is
+    /// against `cty.dat` -- or resolved only through the base prefix of a
+    /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
+    /// was emitted with the `UNKNOWN_DXCC`/`UNKNOWN_CONTINENT`/
+    /// `UNKNOWN_CQ_ZONE` sentinels instead of real geography. ARCHITECTURE §8: "every dropped/evicted/suppressed item is
     /// counted" -- an operator otherwise has no way to notice this is
     /// happening. Incremented once per spot at publish time (`main.rs`), not
     /// inside `SpotMessage::from_spot` (which runs once per connected
@@ -276,7 +277,7 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat OR its entity carries no row in the vendored dxcc.tsv.\n",
+            "# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat, OR its entity carries no row in the vendored dxcc.tsv, OR it carries a /MM or /AM designator that places it outside any DXCC entity.\n",
         );
         out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
         out.push_str(&format!(

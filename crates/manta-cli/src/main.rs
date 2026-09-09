@@ -832,8 +832,18 @@ struct SpotServer {
 /// alone would let those spots go out carrying `dxDxcc: -1` with the
 /// counter still at zero, silently withholding the one signal this metric
 /// exists to give (round-1 validate code-review finding 1).
+///
+/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
+/// (round-7 review finding 2): `cty.lookup` answers for it through the base
+/// call's prefix, but `from_spot` deliberately discards that answer and emits
+/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
+/// real position is unknown -- so the spot does carry the sentinels this
+/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
+/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
+/// the whole test.
 fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
-    cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
+    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
+        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
@@ -2038,6 +2048,24 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
         assert!(cty.lookup("QQ1AAA").is_none(), "test premise");
         assert!(geography_is_unresolved(&cty, "QQ1AAA"));
+    }
+
+    #[test]
+    fn a_maritime_or_aeronautical_mobile_callsign_is_counted_as_unresolved() {
+        // /MM and /AM resolve through the base prefix, so the entity-number
+        // test alone reads them as resolved -- but `SpotMessage::from_spot`
+        // emits UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE and null lat/lon for them,
+        // so the counter must not sit at zero while those go out.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(
+            cty.lookup("W1AW/MM").and_then(|e| e.dxcc),
+            Some(291),
+            "test premise: the base prefix still resolves"
+        );
+        assert!(geography_is_unresolved(&cty, "W1AW/MM"));
+        assert!(geography_is_unresolved(&cty, "W1AW/AM"));
+        assert!(!geography_is_unresolved(&cty, "W1AW/P"));
     }
 
     #[test]

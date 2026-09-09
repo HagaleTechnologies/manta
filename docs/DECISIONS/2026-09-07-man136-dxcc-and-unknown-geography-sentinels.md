@@ -73,6 +73,30 @@ prefix is the stable key.
   values verbatim (see "Reconciliation with MAN-45" below), so the two don't
   diverge.
 
+## Maritime and aeronautical mobile: ADIF 0, not the home entity
+
+Added in round-7 review (finding 2). `cty::Table::lookup` resolves
+`K5ARH/MM` and `K5ARH/AM` through the base call's prefix, so the entity
+mapping above would have reported the United States (291) for a station
+whose designator says it is at sea or airborne. ADIF entity code 0 —
+"None: the contacted station is known to NOT be within a DXCC entity" — is
+defined for exactly this case, so `spot_message::NO_DXCC_ENTITY` (0) is
+emitted instead, and the rest of that side's geography (`dxContinent`,
+`dxCqZone`, `dxLat`/`dxLon`) falls back to the `UNKNOWN_*` sentinels/`null`
+rather than the home entity's real values: the designator tells us where the
+station is *not*, never where it *is*. This is the one place code 0 is
+correct and `UNKNOWN_DXCC` would be wrong — the distinction the `-1` choice
+above exists to preserve. Only `/MM` and `/AM` qualify; `/P`, `/QRP`, `/M`
+and `/<digit>` mean "somewhere else *within* an entity", which the base
+prefix still describes correctly at entity granularity. The check
+(`spot_message::is_outside_any_dxcc_entity`) splits the callsign from the
+right, because MAN-28's Watch List allowlist bypasses `grammar::is_plausible`
+and its single-`/` restriction entirely, so `KP4/K5ARH/MM` can reach the
+wire path. Because those spots go out carrying `UNKNOWN_CONTINENT`/
+`UNKNOWN_CQ_ZONE`, `manta_spots_unresolved_geography_total` counts them too
+(`main.rs`'s `geography_is_unresolved`), even though their entity number is
+the resolved value 0 rather than `-1`.
+
 ## What consumers should key on
 
 Two independent unknown-geography signals are emitted together whenever a
