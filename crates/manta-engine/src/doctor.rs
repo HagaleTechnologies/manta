@@ -39,6 +39,11 @@ pub enum Verdict {
     /// track. Check the antenna, the gain, and that the tuned passband
     /// actually overlaps where you expect signal.
     NoSignal,
+    /// Decoder evidence exists (a closed track, or decoded characters),
+    /// but not one `TrackMeta` landed before the last such track closed --
+    /// no SNR was ever measured. Distinct from `NoisyNoDecode`: this is
+    /// "unmeasured," not "measured and low."
+    ActivityNoSnr,
     /// Tracks opened, but every one reads at or below `NOISE_FLOOR_SNR_DB`
     /// and none produced a confirmed spot -- looks like noise-floor
     /// chatter, not real traffic, at least on this passband right now.
@@ -60,6 +65,11 @@ impl Verdict {
                 "NO_SIGNAL -- no decoder evidence at all (no track, no decoded character, no \
                  spot). Check antenna, gain, and that the tuned passband overlaps where you \
                  expect signal."
+            }
+            Verdict::ActivityNoSnr => {
+                "ACTIVITY_NO_SNR -- decoder activity happened (a track closed and/or characters \
+                 decoded) but no SNR was ever measured before it closed, and nothing confirmed \
+                 a spot. Can't yet say noise vs. real signal -- try a longer --duration."
             }
             Verdict::NoisyNoDecode => {
                 "NOISY_NO_DECODE -- tracks opened but every one reads at or below the noise \
@@ -142,10 +152,14 @@ impl DoctorReport {
         // wideband run can have several noise-floor tracks alongside one
         // real above-threshold carrier, which would otherwise average out
         // to a median at or below the noise floor and hide the one real
-        // signal that was actually observed.
+        // signal that was actually observed. `None` here means decoder
+        // evidence exists (checked above) but not one TrackMeta ever
+        // landed -- genuinely unmeasured, not "measured and low" --
+        // reported distinctly rather than folded into NoisyNoDecode.
         match self.snr_db_max {
             Some(max) if max > NOISE_FLOOR_SNR_DB => Verdict::WeakNoDecode,
-            _ => Verdict::NoisyNoDecode,
+            Some(_) => Verdict::NoisyNoDecode,
+            None => Verdict::ActivityNoSnr,
         }
     }
 }
@@ -456,7 +470,7 @@ mod tests {
             distinct_chars: 3,
             spots_confirmed: 0,
         };
-        assert_ne!(report.verdict(), Verdict::NoSignal);
+        assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
 
     /// Regression: `tracks_closed` (see its doc comment) only ever counts
@@ -478,7 +492,7 @@ mod tests {
             distinct_chars: 0,
             spots_confirmed: 0,
         };
-        assert_ne!(report.verdict(), Verdict::NoSignal);
+        assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
 
     #[test]

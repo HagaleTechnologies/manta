@@ -1517,7 +1517,16 @@ fn print_doctor_report(report: &manta_engine::DoctorReport) {
         (Some(min), Some(median), Some(max)) => {
             println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
         }
-        _ => println!("snr_2500_db: no TrackMeta events -- no track ever opened"),
+        // Not necessarily "no track opened" -- track_meta_count==0 alone
+        // doesn't rule out real decoder activity (chars_decoded/
+        // tracks_closed can still be nonzero; see verdict()/ActivityNoSnr).
+        _ if report.track_meta_count == 0
+            && report.chars_decoded == 0
+            && report.tracks_closed == 0 =>
+        {
+            println!("snr_2500_db: no TrackMeta events -- no track ever opened")
+        }
+        _ => println!("snr_2500_db: no TrackMeta events landed before the last track closed"),
     }
     println!(
         "decode: {} chars ({} distinct), {} confirmed spots",
