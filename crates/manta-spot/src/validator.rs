@@ -330,18 +330,18 @@ impl Validator {
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
-                let track = self.tracks.entry(*track_id).or_default();
-                track.wpm = *wpm;
-                let sample_ts = track.last_sample_ts;
-                // Retry: a Beacon-type candidate held back by
-                // `evaluate_candidate`'s WPM-plausibility check (an
-                // early, transiently-inflated speed estimate) is
-                // otherwise only re-evaluated by a later WordBoundary,
-                // which a short beacon transmission may never produce
-                // again -- silently losing it once the estimate settles
-                // (Codex review on PR #154, round 2). Mirrors the
-                // existing TrackMeta retry above (MAN-28 round 9).
-                self.try_spot(*track_id, sample_ts)
+                self.tracks.entry(*track_id).or_default().wpm = *wpm;
+                // No retry here -- see `TrackClosed`'s handler below.
+                // Round 2 of this same review tried retrying on every
+                // live SpeedUpdate, which round 5 then found reopens the
+                // exact false-positive risk this whole check exists to
+                // close: a noise track's speed estimate can oscillate
+                // across the cutoff (e.g. 46 -> 44 -> 47 WPM), and a
+                // Beacon-type spot emitted on the transient 44 WPM dip
+                // can't be retracted once the estimate rises again. A
+                // single decision at the track's true close has no such
+                // window.
+                Vec::new()
             }
             DecoderEvent::TrackMeta {
                 track_id,
@@ -374,6 +374,23 @@ impl Validator {
             // leak.
             DecoderEvent::TrackPromoted { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id } => {
+                // Codex review on PR #154, round 5: a Beacon candidate
+                // held back by evaluate_candidate's WPM-plausibility
+                // check gets exactly one last try here, using the
+                // track's TRUE FINAL speed -- manta-engine now guarantees
+                // an unthrottled final SpeedUpdate (TrackDecoder::
+                // finish()) is ordered immediately before this
+                // TrackClosed for the same track on every closure path
+                // (stream EOF, hang, silent, merge, evict alike -- not
+                // just overall EOF), so `track.wpm` already reflects the
+                // settled value by the time this handler runs. Replaces
+                // round 2's retry-on-every-live-SpeedUpdate design (see
+                // that arm's comment for why it was reactive-unsound).
+                let sample_ts = self.tracks.get(track_id).map(|t| t.last_sample_ts);
+                let spots = match sample_ts {
+                    Some(ts) => self.try_spot(*track_id, ts),
+                    None => Vec::new(),
+                };
                 // MAN-19: without this, `self.tracks` and `self.gate`'s
                 // per-track_id state both grow forever -- `TrackManager`
                 // never reuses a `track_id`, and until `TrackClosed`
@@ -383,7 +400,7 @@ impl Validator {
                 // churn.
                 self.tracks.remove(track_id);
                 self.gate.forget_track(*track_id);
-                Vec::new()
+                spots
             }
         }
     }
@@ -938,17 +955,70 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "should be held back at 60 WPM, got {spots:?}"
         );
 
+        // A live SpeedUpdate alone must NOT retry (round 5: reacting to
+        // every transient update reopens the oscillation false-positive
+        // this whole check exists to close) -- only TrackClosed does,
+        // once manta-engine's guaranteed final flush has updated
+        // track.wpm.
         let spots = v.ingest(&DecoderEvent::SpeedUpdate {
             track_id: 1,
             wpm: 22.0,
         });
+        assert!(
+            spots.is_empty(),
+            "a live SpeedUpdate alone must not retry a held-back candidate, got {spots:?}"
+        );
+
+        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
         assert_eq!(
             spots.len(),
             1,
-            "settling to a plausible WPM must retry and spot the held-back beacon"
+            "TrackClosed must give the held-back beacon exactly one final try using the settled WPM"
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review on PR #154, round 5: the core false-positive scenario
+    /// the retry-on-every-SpeedUpdate design reopened -- a noise track's
+    /// speed oscillates across the cutoff (46 -> 44 -> 47 WPM). The
+    /// intermediate dip below `MAX_PLAUSIBLE_WPM` must never itself spot;
+    /// only the track's eventual, true close decides.
+    #[test]
+    fn oscillating_wpm_never_spots_on_a_transient_dip_below_the_cutoff() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 46.0,
+        });
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty());
+
+        let spots = v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 44.0,
+        });
+        assert!(
+            spots.is_empty(),
+            "a transient dip below the cutoff must never itself spot, got {spots:?}"
+        );
+
+        let spots = v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 47.0,
+        });
+        assert!(spots.is_empty());
+
+        // If the track's true final speed is genuinely implausible, the
+        // close must still reject it -- oscillation-proofing must not
+        // turn into an unconditional pass at close.
+        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        assert!(
+            spots.is_empty(),
+            "a track truly closing above the cutoff must still be rejected, got {spots:?}"
+        );
     }
 
     /// Codex review on PR #154, round 3: a blocklisted callsign that
