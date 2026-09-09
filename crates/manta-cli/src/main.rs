@@ -275,7 +275,7 @@ enum Command {
     /// not decoding" from "working end to end," which a bare `listen` run
     /// with zero spots can't tell apart on its own.
     Doctor {
-        /// Duration in seconds.
+        /// Duration in seconds (3-3600; see manta_engine::doctor::{MIN_DURATION,MAX_DURATION}).
         #[arg(long, default_value_t = 10)]
         duration: u64,
         #[arg(long, conflicts_with = "source")]

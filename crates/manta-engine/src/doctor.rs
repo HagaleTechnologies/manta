@@ -63,7 +63,9 @@ impl Verdict {
             }
             Verdict::NoisyNoDecode => {
                 "NOISY_NO_DECODE -- tracks opened but every one reads at or below the noise \
-                 floor and nothing decoded. Looks like noise, not real CW traffic, right now."
+                 floor and nothing validated into a confirmed spot. Looks like noise, not real \
+                 CW traffic, right now (characters may still have been decoded off the noise \
+                 floor -- see chars_decoded)."
             }
             Verdict::WeakNoDecode => {
                 "WEAK_NO_DECODE -- real signal-level SNR seen, but nothing validated into a \
@@ -117,7 +119,7 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn verdict(&self) -> Verdict {
-        // Checked before the track_meta_count==0 case below: TrackMeta is
+        // Checked before the no-evidence-at-all case below: TrackMeta is
         // only emitted periodically (`SpeedUpdate`-adjacent cadence in
         // track.rs), so a short track can decode a char -- or, allowlisted,
         // even confirm a spot -- and close before its first TrackMeta
@@ -127,7 +129,13 @@ impl DoctorReport {
         if self.spots_confirmed > 0 {
             return Verdict::Decoding;
         }
-        if self.track_meta_count == 0 && self.chars_decoded == 0 {
+        // `tracks_closed` (see its doc comment) only ever counts a track
+        // that produced at least one other event before closing -- so a
+        // nonzero count here is itself proof some decoder event occurred
+        // (WordBoundary/SpeedUpdate, say) even in the edge case where that
+        // track happened to close before ever emitting TrackMeta or
+        // CharDecoded either.
+        if self.track_meta_count == 0 && self.chars_decoded == 0 && self.tracks_closed == 0 {
             return Verdict::NoSignal;
         }
         // Based on the STRONGEST track seen (max), not the median: a
@@ -165,6 +173,17 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
 /// bound to enforce in the first place.
 pub const MIN_DURATION: Duration = Duration::from_secs(3);
 
+/// Maximum accepted `--duration`. `doctor()` accumulates every `TrackMeta`
+/// SNR sample in memory for the whole run to compute `snr_db_median` at the
+/// end -- on a noisy full passband with sustained track churn, an
+/// unbounded duration means unbounded memory (tens of millions of floats
+/// over a 24h+ run). `doctor` is a bounded-duration health check, not a
+/// long-running monitor (that's `manta listen --server-config`'s
+/// Prometheus metrics), so a generous but real ceiling is the right fix,
+/// not a fancier streaming-quantile estimator for a tool that was never
+/// meant to run for hours in the first place.
+pub const MAX_DURATION: Duration = Duration::from_secs(3600);
+
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot
 /// stream into a `DoctorReport` instead of printing or serving it. Reuses
 /// the real pipeline verbatim (same channelizer, same `TrackManager`, same
@@ -182,6 +201,14 @@ pub fn doctor(
             "--duration must be at least {}s -- listen()'s fixed startup calibration window \
              isn't stop-aware, so a shorter duration would silently overrun it",
             MIN_DURATION.as_secs()
+        );
+    }
+    if duration > MAX_DURATION {
+        anyhow::bail!(
+            "--duration must be at most {}s -- doctor() accumulates every TrackMeta SNR sample \
+             in memory for the run's duration, so an unbounded --duration means unbounded \
+             memory; for a long-running check, use `manta listen --server-config` instead",
+            MAX_DURATION.as_secs()
         );
     }
 
@@ -430,6 +457,45 @@ mod tests {
             spots_confirmed: 0,
         };
         assert_ne!(report.verdict(), Verdict::NoSignal);
+    }
+
+    /// Regression: `tracks_closed` (see its doc comment) only ever counts
+    /// an eventful closure -- a track that closes having emitted only
+    /// WordBoundary/SpeedUpdate (no TrackMeta, no CharDecoded) still proves
+    /// real decoder activity and must not read as NoSignal.
+    #[test]
+    fn verdict_does_not_report_no_signal_when_a_track_closed_eventfully() {
+        let report = DoctorReport {
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: 0.0,
+            duration: Duration::from_secs(3),
+            track_meta_count: 0,
+            tracks_closed: 1,
+            snr_db_min: None,
+            snr_db_max: None,
+            snr_db_median: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+        };
+        assert_ne!(report.verdict(), Verdict::NoSignal);
+    }
+
+    #[test]
+    fn doctor_rejects_a_duration_longer_than_the_max() {
+        let start = Instant::now();
+        let result = doctor(
+            v1_source(),
+            &PipelineConfig::default(),
+            MAX_DURATION + Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "doctor() with a too-long --duration took {:?} -- it must reject before running \
+             the pipeline",
+            start.elapsed()
+        );
     }
 
     #[test]
