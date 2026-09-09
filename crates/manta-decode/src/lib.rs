@@ -2,6 +2,7 @@
 
 pub mod beam;
 pub mod decoder;
+pub mod edge_demod;
 pub mod envelope;
 pub mod events;
 pub mod evidence;
