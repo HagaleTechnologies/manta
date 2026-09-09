@@ -100,10 +100,13 @@ anywhere — `grep -rni rust-toolchain` over the crate returns nothing): `cross`
 derives its container toolchain by running `rustc --print sysroot` in the
 project directory (`src/rustc.rs:96-134`) and taking the sysroot's directory
 basename. That `rustc` is the rustup proxy, so with the pin present it
-resolves to `~/.rustup/toolchains/1.98.1-<host-triple>`, and `cross` installs
-exactly that toolchain, plus the target's `rust-std`, into its container
-(`src/lib.rs:433-473`). The pin reaches `cross`'s container transitively,
-with no `Cross.toml` change. `release-publish.yml` has no `pull_request`
+resolves to `~/.rustup/toolchains/1.98.1-<host-triple>`, and `cross` makes
+exactly that toolchain, plus the target's `rust-std`, available inside its
+container (`src/lib.rs:433-473`) — by mounting the host sysroot into the
+container rather than by installing a second copy of the toolchain there, a
+distinction that does not change the conclusion but does mean there is no
+in-container `rustup` step to go wrong. The pin reaches `cross`'s container
+transitively, with no `Cross.toml` change. `release-publish.yml` has no `pull_request`
 trigger at all, and `release.yml`'s `pull_request` trigger is path-filtered,
 so this was confirmed by source-level analysis in this session rather than a
 live `cross build`. To make sure a pin bump is never merged without those
@@ -125,15 +128,33 @@ having no pin at all. `scripts/check-rust-toolchain-pin.sh` makes that a
 failed required check instead: it asserts the pin file exists, names an exact
 `MAJOR.MINOR.PATCH` channel (not `stable`/`beta`/`nightly`/a two-component
 version), that the pinned channel is `>=` `Cargo.toml`'s `rust-version` MSRV
-floor, and that the active `rustc --version` matches the pin exactly. It
-needs no network and no `jq` (unlike
+floor, and that the active `rustc --version` matches the pin exactly.
+
+**What the guard does *not* cover, stated explicitly so the list above is not
+read as stronger than it is:** it inspects the `rustc` *its own process*
+resolves to, so of the three degradation modes named above it catches the
+first (a floating `channel`) and the third (a non-rustup `rustc` ahead of
+`PATH` in the same job), but *not* a `cargo +stable` / `rustc +stable`
+override in a **different** step — that override applies only to the
+invocation carrying it and is invisible from here. Nor can it detect a pin
+that is merely *stale* (an exact, `>=`-MSRV, but months-old release);
+staleness is what the manual bump procedure below exists for.
+
+It needs no network and no `jq` (unlike
 `scripts/check-dependabot-cargo-unlock.sh`, which needs both and is
 deliberately *not* wired into required CI for that reason), so it *is* wired
-into `.github/workflows/ci.yml`'s required `test` job, immediately after
-`Swatinem/rust-cache` and before `cargo fmt --all --check` — early enough
-that a mismatch is reported as itself, not as a confusing downstream
-fmt/clippy diff. `test-soapy`/`test-hpsdr` share the same checkout and runner
-images and are not separately instrumented, to keep the diff minimal.
+into `.github/workflows/ci.yml`'s required `test` job, immediately after the
+`dtolnay/rust-toolchain` step and *before* `Swatinem/rust-cache` — so it is
+the job's first rustup-proxy call from inside the checkout, and therefore the
+step where the pinned toolchain actually auto-installs. A mismatch (or a
+toolchain that will not install at all) is then reported as itself, rather
+than as an opaque `rust-cache` fingerprinting error or a confusing downstream
+fmt/clippy diff. (This ordering was corrected during PR #99's review round;
+the step originally sat after `rust-cache`, which made the "first
+rustup-proxy call" rationale untrue — `rust-cache` invokes `rustc -vV` /
+`cargo metadata` itself.) `test-soapy`/`test-hpsdr` share the same checkout
+and runner images and are not separately instrumented, to keep the diff
+minimal.
 
 Asserts on `rustc --version`, not `cargo --version`: Rust's release-channel
 manifest lists Cargo under its own, different version series (e.g.
@@ -167,10 +188,16 @@ Bumping the pin is manual by design — Dependabot has no ecosystem for
 `rust-toolchain.toml`. To bump:
 
 1. Fetch `https://static.rust-lang.org/dist/channel-rust-stable.toml` and
-   read the `[pkg.rust] version` line.
-2. Update `channel` in `rust-toolchain.toml` to that exact version, and
-   update the file's own comment to record the new version string and the
-   date it was read.
+   read the `[pkg.rust] version` line. Note that line is a *descriptive*
+   string, not a channel name — e.g. `version = "1.98.1 (48a229cea
+   2026-09-01)"`, carrying the commit hash and release date after the
+   version itself.
+2. Set `channel` in `rust-toolchain.toml` to the leading
+   `MAJOR.MINOR.PATCH` of that string only (`1.98.1` in the example above);
+   copying the whole string verbatim is not a valid channel, and
+   `scripts/check-rust-toolchain-pin.sh` rejects it. Record the *full*
+   version string and the date it was read in the file's own comment, so
+   the next bumper can see exactly which release the pin was derived from.
 3. Open a PR touching only `rust-toolchain.toml`. CI's required `test` job
    (`scripts/check-rust-toolchain-pin.sh`, `cargo fmt --all --check`, `cargo
    clippy --workspace --all-targets -- -D warnings`, `cargo test

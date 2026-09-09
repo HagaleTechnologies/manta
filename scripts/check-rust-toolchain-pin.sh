@@ -68,7 +68,33 @@ command -v rustc >/dev/null 2>&1 ||
 # rustc, not cargo: cargo's own version numbering is a separate series (the
 # release-channel manifest lists [pkg.cargo] version = "0.99.0" for Rust
 # 1.98.1), so asserting on `cargo --version` would be asserting on a coincidence.
-actual="$(rustc --version | awk '{print $2}')"
+#
+# The `command -v` preflight above only covers rustc being ABSENT. rustc can
+# also be present and still exit non-zero -- the realistic case is a bump-PR
+# typo (`channel = "1.99.9"`), where the rustup proxy resolves fine but cannot
+# download the named channel. Under `set -euo pipefail` that killed the
+# assignment outright, so the only thing CI showed was rustup's bare
+# `could not download nonexistent rust version ... 404` and never this
+# script's own guidance (reproduced directly; the exit code was already 1,
+# so this is message quality, not a false green).
+#
+# stdout and stderr are captured SEPARATELY, not merged with `2>&1`: on the
+# happy path this is often the first rustup-proxy call in the job, so rustup
+# writes its `info: syncing channel updates ...` auto-install lines to stderr
+# -- folding those into the captured stdout would put "info:" in $1 and make
+# the awk-extracted version wrong. Keep them apart, parse stdout only, and
+# forward stderr so that auto-install evidence still shows up in the CI log.
+rustc_err="$(mktemp)"
+if ! rustc_out="$(rustc --version 2>"$rustc_err")"; then
+  rustc_msg="$(cat "$rustc_err")"
+  rm -f "$rustc_err"
+  fail "\`rustc --version\` failed: ${rustc_msg:-no output}. $PIN_FILE pins $pinned -- if rustup is managing this checkout, check that channel is a real released version (a mistyped pin is the usual cause); if rustc is not rustup-managed, install $pinned."
+fi
+if [[ -s $rustc_err ]]; then
+  cat "$rustc_err" >&2
+fi
+rm -f "$rustc_err"
+actual="$(printf '%s\n' "$rustc_out" | awk '{print $2}')"
 [[ $actual == "$pinned" ]] ||
   fail "active rustc is $actual but $PIN_FILE pins $pinned. If rustup is managing this checkout, run any cargo command from the repo root to let it install the pin; if rustc is not rustup-managed, install $pinned."
 
