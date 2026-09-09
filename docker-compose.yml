@@ -50,9 +50,29 @@ services:
       - --kiwi-freq
       - "14050000"
 
+    # `:ro,Z` -- not a bare `:ro`. On a host with SELinux in enforcing mode
+    # (the Fedora/RHEL default) a bind-mounted host file keeps its host
+    # label, which the container's own domain cannot read: manta would fail
+    # to open /etc/manta/manta.toml and `restart: unless-stopped` would loop
+    # on it. `Z` asks Docker to relabel this file with a private container
+    # label (`z` for a label shared between containers) -- see
+    # https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label
+    # Note that this relabels the file ON THE HOST, permanently. On a host
+    # without SELinux the option is accepted and does nothing, so it is safe
+    # to ship enabled by default.
     volumes:
-      - ./manta.toml:/etc/manta/manta.toml:ro
+      - ./manta.toml:/etc/manta/manta.toml:ro,Z
 
+    # Container-side ports are manta's BUILT-IN defaults, and nothing
+    # propagates a TOML override into this file: if you set telnet_port,
+    # json_port or metrics_port in manta.toml, manta listens on the new port
+    # inside the container and these mappings keep forwarding to 7300/7301/
+    # 7302, leaving the service unreachable from the host. Change the
+    # right-hand (container) side of the affected line to the same value you
+    # put in manta.toml -- or leave the TOML ports commented out, as shipped,
+    # and remap only the left-hand (host) side, which is the simpler way to
+    # move a port for a container deployment. CI checks the shipped pairing
+    # against the code's defaults (crates/manta-cli/tests/packaging_examples.rs).
     ports:
       - "7300:7300"
       - "7301:7301"

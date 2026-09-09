@@ -20,6 +20,12 @@ const EXAMPLE_TOML: &str = "manta.example.toml";
 const SERVICE: &str = "packaging/systemd/manta.service";
 const PLIST: &str = "packaging/launchd/com.hagaletechnologies.manta.plist";
 const COMPOSE: &str = "docker-compose.yml";
+/// launchd has no size cap or rotation for `StandardOutPath`, so the
+/// rotation policy for the service agent's log ships as its own agent.
+const LOGROTATE_PLIST: &str = "packaging/launchd/com.hagaletechnologies.manta-logrotate.plist";
+/// Referenced by relative path from the shipped example config and the
+/// Compose file, so it has to be in the archive alongside them.
+const EXPOSURE_RUNBOOK: &str = "docs/RUNBOOKS/network-exposure.md";
 
 /// The all-defaults config: what the shipped file must be equivalent to.
 fn defaults() -> manta_server::config::ServerConfig {
@@ -240,22 +246,147 @@ fn systemd_unit_carries_the_required_directives() {
 #[test]
 fn launchd_plist_has_no_double_hyphen_inside_a_comment() {
     // XML forbids `--` inside `<!-- -->`; a flag name in a plist comment
-    // silently makes the whole file unparseable to launchd.
-    let text = read(PLIST);
-    let mut rest = text.as_str();
-    while let Some(start) = rest.find("<!--") {
-        let body_start = start + 4;
-        let end = rest[body_start..]
-            .find("-->")
-            .expect("unterminated XML comment");
-        let body = &rest[body_start..body_start + end];
-        assert!(
-            !body.contains("--"),
-            "XML comment contains a double hyphen, which makes the plist \
-             unparseable:\n{body}"
-        );
-        rest = &rest[body_start + end + 3..];
+    // silently makes the whole file unparseable to launchd. Both shipped
+    // plists are checked -- the rotation agent is as easy to break this way
+    // as the service agent.
+    for plist in [PLIST, LOGROTATE_PLIST] {
+        let text = read(plist);
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("<!--") {
+            let body_start = start + 4;
+            let end = rest[body_start..]
+                .find("-->")
+                .expect("unterminated XML comment");
+            let body = &rest[body_start..body_start + end];
+            assert!(
+                !body.contains("--"),
+                "{plist}: XML comment contains a double hyphen, which makes \
+                 the plist unparseable:\n{body}"
+            );
+            rest = &rest[body_start + end + 3..];
+        }
     }
+}
+
+/// The value of a `<key>k</key>` immediately followed by a `<string>`, as
+/// the shipped plists format it.
+fn plist_string(text: &str, key: &str) -> Option<String> {
+    let tail = text.split(&format!("<key>{key}</key>")).nth(1)?;
+    let v = tail.trim_start().strip_prefix("<string>")?;
+    Some(v.split("</string>").next()?.to_string())
+}
+
+/// launchd never rotates or caps the file `StandardOutPath` names, and
+/// manta's console stream is per decoded character, so the shipped 24/7
+/// agent needs a rotation policy shipped with it -- pointed at the same
+/// log the service agent actually writes, or it rotates nothing.
+#[test]
+fn a_rotation_policy_ships_for_the_launchagent_log() {
+    let service = read(PLIST);
+    let out =
+        plist_string(&service, "StandardOutPath").expect("service plist must set StandardOutPath");
+    let err = plist_string(&service, "StandardErrorPath")
+        .expect("service plist must set StandardErrorPath");
+    assert_eq!(out, err, "both streams are expected to share one file");
+
+    let rotate = read(LOGROTATE_PLIST);
+    assert_eq!(
+        plist_string(&rotate, "Label").as_deref(),
+        Some("com.hagaletechnologies.manta-logrotate"),
+        "Label must match this file's own name, as launchd expects"
+    );
+    assert!(
+        rotate.contains(&out),
+        "{LOGROTATE_PLIST} does not act on {out}, the log the service agent \
+         actually writes"
+    );
+    assert!(
+        rotate.contains("<key>StartInterval</key>"),
+        "the rotation agent must run periodically, not once"
+    );
+
+    // Rotating by rename would leave the renamed file growing: manta holds
+    // the descriptor launchd opened for it for its whole lifetime, so the
+    // policy has to truncate that same inode in place.
+    let script = rotate
+        .split("<key>ProgramArguments</key>")
+        .nth(1)
+        .expect("rotation agent must set ProgramArguments")
+        .split("</array>")
+        .next()
+        .unwrap();
+    assert!(
+        !script.contains("mv "),
+        "rotation must truncate the log in place, not rename it: the \
+         running manta keeps writing to the renamed inode:\n{script}"
+    );
+    assert!(
+        script.contains(&out),
+        "the rotation script itself must act on {out}, not just mention it \
+         in a comment:\n{script}"
+    );
+
+    let readme = read("packaging/README.md");
+    assert!(
+        readme.contains("com.hagaletechnologies.manta-logrotate.plist"),
+        "packaging/README.md never tells the operator to install the \
+         rotation agent, so the shipped file is inert"
+    );
+}
+
+/// A `gui/` LaunchAgent is a login-session job: it does not start at boot
+/// and is torn down at logout. An operator promised a 24/7 service has to
+/// be told that, and given the LaunchDaemon route for the sources that do
+/// not need per-user TCC audio access.
+#[test]
+fn macos_docs_address_the_login_session_limitation() {
+    let readme = read("packaging/README.md");
+    let section = readme
+        .split("## Installing on macOS")
+        .nth(1)
+        .expect("packaging/README.md must have a macOS install section");
+    let section = section.split("\n## ").next().unwrap();
+    for needle in [
+        "LaunchDaemon",
+        "launchctl bootstrap system",
+        "/Library/LaunchDaemons/",
+        "automatic login",
+    ] {
+        assert!(
+            section.contains(needle),
+            "the macOS section never mentions `{needle}`, so the \
+             LaunchAgent's login-session limitation is undocumented"
+        );
+    }
+}
+
+/// `launchctl kill` only DELIVERS the signal; it returns while manta is
+/// still draining. A documented stop sequence that boots the job out at
+/// that moment SIGTERMs the still-draining process -- the exact abrupt
+/// kill the sequence exists to avoid -- so the wait between the two is
+/// load-bearing.
+#[test]
+fn macos_stop_sequence_waits_for_the_drain_before_bootout() {
+    let readme = read("packaging/README.md");
+    let section = readme
+        .split("## Installing on macOS")
+        .nth(1)
+        .expect("packaging/README.md must have a macOS install section");
+    let section = section.split("\n## ").next().unwrap();
+    let kill = section
+        .find("launchctl kill SIGINT")
+        .expect("the macOS section must document the SIGINT stop");
+    let bootout = section[kill..]
+        .find("launchctl bootout")
+        .expect("the macOS section must document the bootout that follows")
+        + kill;
+    let between = &section[kill..bootout];
+    assert!(
+        between.contains("launchctl print") && between.contains("pid ="),
+        "nothing between `launchctl kill` and `launchctl bootout` waits for \
+         manta to exit; bootout would SIGTERM a still-draining process:\n\
+         {between}"
+    );
 }
 
 #[test]
@@ -367,6 +498,89 @@ fn compose_sets_the_grace_period_and_leaves_the_stop_signal_alone() {
     assert!(
         text.contains(":/etc/manta/manta.toml:ro"),
         "the config must be mounted read-only at the path `command:` reads"
+    );
+}
+
+/// The lines of one block-mapping key's list in `docker-compose.yml`
+/// (`ports:`, `volumes:`), trimmed of their `- ` and quotes.
+fn compose_list(key: &str) -> Vec<String> {
+    let text = read(COMPOSE);
+    let mut out = Vec::new();
+    let mut inside = false;
+    for raw in text.lines() {
+        let t = raw.trim();
+        if t == format!("{key}:") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        match t.strip_prefix("- ") {
+            Some(item) => out.push(item.trim_matches('"').to_string()),
+            // Any other non-comment line at this point has left the list.
+            None => break,
+        }
+    }
+    assert!(!out.is_empty(), "docker-compose.yml has no `{key}:` list");
+    out
+}
+
+/// A bind mount without `z`/`Z` keeps its host SELinux label, which the
+/// container's own domain cannot read: on an enforcing host (the
+/// Fedora/RHEL default) manta cannot open its config at all and
+/// `restart: unless-stopped` loops on it. The option is a no-op where
+/// SELinux is not enforcing, so the shipped file can carry it always.
+#[test]
+fn compose_config_mount_carries_an_selinux_relabel_option() {
+    let mount = compose_list("volumes")
+        .into_iter()
+        .find(|m| m.contains("/etc/manta/manta.toml"))
+        .expect("docker-compose.yml must mount the config");
+    let opts = mount.rsplit(':').next().unwrap();
+    assert!(
+        opts.split(',').any(|o| o == "z" || o == "Z"),
+        "the config bind mount needs an SELinux relabel option (`Z`, or `z` \
+         to share the label between containers): {mount}"
+    );
+}
+
+/// The container side of every published port is manta's built-in default
+/// -- nothing propagates a TOML override into the Compose file, so if the
+/// defaults ever move, these mappings forward to ports nothing listens on.
+#[test]
+fn compose_publishes_the_config_default_ports() {
+    let d = defaults();
+    let mut expected = vec![d.telnet_port, d.json_port, d.metrics_port];
+    expected.sort_unstable();
+
+    let mut published: Vec<u16> = compose_list("ports")
+        .iter()
+        .map(|m| {
+            m.rsplit(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap_or_else(|e| panic!("port mapping `{m}`: {e}"))
+        })
+        .collect();
+    published.sort_unstable();
+    assert_eq!(
+        published, expected,
+        "docker-compose.yml publishes container ports {published:?} but \
+         manta's defaults are {expected:?}"
+    );
+
+    // The operator has to be told this coupling exists: a TOML port change
+    // alone leaves the service unreachable from the host.
+    let text = read(COMPOSE);
+    assert!(
+        text.contains("telnet_port") && text.contains("manta.toml"),
+        "docker-compose.yml must document that a TOML port override needs \
+         the matching container-side mapping changed too"
     );
 }
 
@@ -491,7 +705,7 @@ fn release_archives_carry_every_unattended_asset() {
             "release step `{step}` never copies the `packaging/` tree"
         );
     }
-    for asset in [SERVICE, PLIST, "packaging/README.md"] {
+    for asset in [SERVICE, PLIST, LOGROTATE_PLIST, "packaging/README.md"] {
         assert!(
             repo_root().join(asset).is_file(),
             "`{asset}` is documented as shipped but is not in the tree"
@@ -501,5 +715,53 @@ fn release_archives_carry_every_unattended_asset() {
             "`{asset}` lives outside `packaging/`, so copying that tree does \
              not ship it -- the release workflow needs its own `cp` line"
         );
+    }
+}
+
+/// Every in-repo path a shipped asset points the operator at has to be in
+/// the archive too, at that same relative path. `manta.example.toml` tells
+/// a no-clone release user to read the network-exposure runbook before
+/// using the default `0.0.0.0` bind -- including for the unauthenticated
+/// metrics port -- so an archive without it leaves safety-critical
+/// guidance dangling at a path that does not exist.
+#[test]
+fn release_archives_carry_the_docs_the_shipped_assets_reference() {
+    let mut referenced: Vec<String> = Vec::new();
+    for asset in [EXAMPLE_TOML, COMPOSE] {
+        let text = read(asset);
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("docs/") {
+            let tail = &rest[i..];
+            let end = tail
+                .find(|c: char| c.is_whitespace() || "'\"`),;".contains(c))
+                .unwrap_or(tail.len());
+            let path = tail[..end].trim_end_matches('.');
+            assert!(
+                repo_root().join(path).is_file(),
+                "`{asset}` references `{path}`, which is not a file in this \
+                 repo"
+            );
+            if !referenced.iter().any(|p| p == path) {
+                referenced.push(path.to_string());
+            }
+            rest = &tail[end..];
+        }
+    }
+    assert!(
+        referenced.iter().any(|p| p == EXPOSURE_RUNBOOK),
+        "expected the shipped assets to point at `{EXPOSURE_RUNBOOK}`, \
+         found {referenced:?}"
+    );
+
+    for step in ["Package (Unix)", "Package (Windows)"] {
+        let body = release_step(step);
+        for path in &referenced {
+            assert!(
+                body.contains(path.as_str()),
+                "release step `{step}` never copies `{path}` into the \
+                 archive, but a shipped asset tells the operator to read it \
+                 at exactly that relative path"
+            );
+        }
     }
 }

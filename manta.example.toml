@@ -33,6 +33,12 @@ station_callsign = "N0CALL"
 # before exposing any of these ports to an untrusted network.
 # bind_addr = "0.0.0.0"
 
+# The three listener ports. Under Docker Compose these are the CONTAINER-side
+# ports the shipped docker-compose.yml publishes: changing one here without
+# changing the container side of the matching `ports:` entry leaves that
+# service unreachable from the host (docker-compose.yml says so at its
+# `ports:` block).
+#
 # RBN-format DX cluster telnet port.
 # telnet_port = 7300
 

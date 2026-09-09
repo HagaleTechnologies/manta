@@ -132,6 +132,15 @@ jobs:
           # under packaging/ ships without a second edit here.
           cp manta.example.toml docker-compose.yml "$dist/"
           cp -R packaging "$dist/packaging"
+          # manta.example.toml and docker-compose.yml both tell the operator
+          # to read docs/RUNBOOKS/network-exposure.md at that RELATIVE path
+          # before exposing a listener (including the unauthenticated
+          # metrics port). It lives outside packaging/, so the tree copy
+          # above does not pick it up -- ship it at the same relative path
+          # the references use, or that safety-critical guidance dangles for
+          # exactly the no-clone operator these assets exist for.
+          mkdir -p "$dist/docs/RUNBOOKS"
+          cp docs/RUNBOOKS/network-exposure.md "$dist/docs/RUNBOOKS/"
           tar -C dist -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
 
       - name: Package (Windows)
@@ -152,6 +161,12 @@ jobs:
           Copy-Item manta.example.toml $dist
           Copy-Item docker-compose.yml $dist
           Copy-Item -Recurse packaging (Join-Path $dist 'packaging')
+          # Same dangling-reference fix as the Unix step: the runbook that
+          # manta.example.toml and docker-compose.yml point at by relative
+          # path lives outside packaging/, so it needs its own copy, at that
+          # same relative path.
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs/RUNBOOKS') | Out-Null
+          Copy-Item 'docs/RUNBOOKS/network-exposure.md' (Join-Path $dist 'docs/RUNBOOKS')
           Compress-Archive -Path $dist -DestinationPath "${{ matrix.artifact }}.zip"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

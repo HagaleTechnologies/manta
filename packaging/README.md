@@ -4,18 +4,22 @@ This directory, plus `manta.example.toml` and `docker-compose.yml` at the
 repo root, are the files that let an operator who downloaded a release
 binary run manta as a 24/7 background service without hand-writing any of
 this. **Every release archive ships them**, at exactly these relative paths
-(`.github/workflows/release-publish.yml`), so the install commands below
-run verbatim from an extracted `manta-<platform>.tar.gz`/`.zip` — no clone
-required. CI checks all four against the code they describe
+(`.github/workflows/release-publish.yml`) — together with
+`docs/RUNBOOKS/network-exposure.md`, which the example config and the
+Compose file both point at by that relative path — so the install commands
+below run verbatim from an extracted `manta-<platform>.tar.gz`/`.zip` — no
+clone required. CI checks these files against the code they describe
 (`crates/manta-cli/tests/packaging_examples.rs`): a config key manta adds,
-a flag that gets renamed, or a stop-signal regression fails the build here,
-not silently in a stale example an operator copies later.
+a flag that gets renamed, a stop-signal regression, or a shipped file that
+stops being packaged fails the build here, not silently in a stale example
+an operator copies later.
 
 | File | Platform |
 | --- | --- |
 | [`manta.example.toml`](../manta.example.toml) | all — every `[server]`/`[[rbn_uplink]]` config key at its real default |
 | [`systemd/manta.service`](systemd/manta.service) | Linux |
 | [`launchd/com.hagaletechnologies.manta.plist`](launchd/com.hagaletechnologies.manta.plist) | macOS |
+| [`launchd/com.hagaletechnologies.manta-logrotate.plist`](launchd/com.hagaletechnologies.manta-logrotate.plist) | macOS — caps the LaunchAgent's log file, which launchd itself never rotates |
 | [`docker-compose.yml`](../docker-compose.yml) | anywhere Docker runs |
 
 ## Choosing a source
@@ -58,7 +62,7 @@ the process manager escalates to `SIGKILL`.
 | --- | --- | --- |
 | systemd | `SIGTERM` by default | `KillSignal=SIGINT` in the shipped unit retargets it, mirroring the Dockerfile's own `STOPSIGNAL SIGINT`. |
 | Docker / Compose | the image's `STOPSIGNAL` | Already `SIGINT` (set in `Dockerfile` under MAN-21) — no compose-level override needed or wanted. |
-| launchd | `SIGTERM`, always | **No signal-level fix exists.** launchd has no `KillSignal=`-equivalent key; stop, logout, and reboot all send `SIGTERM` unconditionally, so `launchctl bootout`/`stop` on a *running* manta is abrupt until manta itself handles `SIGTERM`. The shipped plist works around it from the other side: `KeepAlive` is the conditional `SuccessfulExit=false` form, so signalling `SIGINT` yourself drains manta *and leaves it down* instead of triggering an instant relaunch — see *Installing on macOS* below for the sequence. |
+| launchd | `SIGTERM`, always | **No signal-level fix exists.** launchd has no `KillSignal=`-equivalent key; stop, logout, and reboot all send `SIGTERM` unconditionally, so `launchctl bootout`/`stop` on a *running* manta is abrupt until manta itself handles `SIGTERM`. The shipped plist works around it from the other side: `KeepAlive` is the conditional `SuccessfulExit=false` form, so signalling `SIGINT` yourself drains manta *and leaves it down* instead of triggering an instant relaunch — see *Installing on macOS* below for the sequence, which has to wait for the drain to finish before it unloads the job, since `launchctl kill` returns as soon as the signal is delivered. |
 
 Once manta handles `SIGTERM` itself, `KillSignal=SIGINT` can be dropped
 from the systemd unit, the plist's `KeepAlive` can go back to a plain
@@ -133,30 +137,114 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hagaletechnologies.m
 launchctl print gui/$(id -u)/com.hagaletechnologies.manta
 ```
 
-This is a **LaunchAgent**, not a LaunchDaemon: macOS gates audio-input
-access behind a per-user TCC permission prompt that a system-wide
-LaunchDaemon can never be granted, so a LaunchAgent is the right default
-even for the shown KiwiSDR example, in case you later switch it to rig
-audio.
+### LaunchAgent or LaunchDaemon: pick one deliberately
 
-Stopping it cleanly is two steps, in that order:
+This ships as a **LaunchAgent**, in the per-user `gui/` domain, because
+macOS gates audio-input access behind a per-user TCC permission prompt that
+a system-wide LaunchDaemon can never be granted — so rig audio (`--device`)
+only ever works from an agent.
+
+The cost is that a `gui/` agent is a *login-session* job, not a boot-time
+one: [Apple's launchd
+guide](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
+distinguishes the two explicitly. As installed above, manta therefore does
+**not** start when the Mac boots — it starts when that user logs in to the
+GUI, and launchd tears it down again at logout. For a 24/7 skimmer that is
+usually not what you want, so choose:
+
+- **Rig audio (`--device`), or you are fine with the login requirement** —
+  keep the LaunchAgent, and make sure the machine actually stays logged in:
+  enable automatic login (System Settings → Users & Groups → Automatic
+  login) and do not log out. A locked screen is fine; a logged-out Mac runs
+  no agent.
+- **KiwiSDR, HPSDR or SoapySDR — no audio device, so no TCC prompt to
+  answer** — install the same plist as a system **LaunchDaemon** instead. It
+  starts at boot, survives logout, and needs no logged-in user:
+
+  ```
+  # Same plist, three edits: point StandardOutPath/StandardErrorPath and
+  # --server-config somewhere outside a user's home (a daemon has no
+  # ~/Library), and add a UserName so it does not run as root.
+  sudo install -d -m 0755 /usr/local/etc/manta /usr/local/var/log
+  sudo install -m 0644 manta.example.toml /usr/local/etc/manta/manta.toml
+  sudo "$EDITOR" /usr/local/etc/manta/manta.toml   # set station_callsign
+  sudo cp packaging/launchd/com.hagaletechnologies.manta.plist       /Library/LaunchDaemons/
+  sudo "$EDITOR" /Library/LaunchDaemons/com.hagaletechnologies.manta.plist
+  # in that copy: replace the three /Users/YOUR_USERNAME paths with
+  # /usr/local/etc/manta/manta.toml and /usr/local/var/log/manta.log, and
+  # add   <key>UserName</key><string>_manta</string>   (or your own
+  # unprivileged account) so the daemon does not run as root
+  sudo chown root:wheel /Library/LaunchDaemons/com.hagaletechnologies.manta.plist
+  sudo launchctl bootstrap system       /Library/LaunchDaemons/com.hagaletechnologies.manta.plist
+  ```
+
+  Everything else in this section applies unchanged, with `system/` in place
+  of `gui/$(id -u)` in every `launchctl` invocation — including the stop
+  sequence below and the log-rotation caveat, whose agent then has to be a
+  root-owned LaunchDaemon pointed at the daemon's own log path.
+
+### Log rotation is not automatic
+
+launchd appends both streams to the single file `StandardOutPath` names and
+never rotates or caps it, and manta's console output is one line per
+accepted spot plus one character per decoded character
+(`crates/manta-cli/src/main.rs`), so an active receiver grows
+`~/Library/Logs/manta.log` indefinitely — eventually filling the disk. This
+is a launchd-only problem: journald caps the systemd unit's output itself,
+and a container's logs go to Docker's own log driver.
+
+The shipped
+[`launchd/com.hagaletechnologies.manta-logrotate.plist`](launchd/com.hagaletechnologies.manta-logrotate.plist)
+is the rotation policy. Install it alongside the service agent:
 
 ```
-$ launchctl kill SIGINT gui/$(id -u)/com.hagaletechnologies.manta
-# manta drains and exits 0 (up to ExitTimeOut, 30s). KeepAlive is the
-# conditional SuccessfulExit=false form, so launchd treats that clean exit
-# as intentional and does NOT relaunch -- the job stays loaded but idle.
-$ launchctl bootout gui/$(id -u)/com.hagaletechnologies.manta
+$EDITOR packaging/launchd/com.hagaletechnologies.manta-logrotate.plist
+# replace YOUR_USERNAME (two places)
+cp packaging/launchd/com.hagaletechnologies.manta-logrotate.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hagaletechnologies.manta-logrotate.plist
+```
+
+It runs hourly, does nothing while the log is under 32 MiB, and otherwise
+truncates it in place down to its last 8 MiB — in place, because manta
+holds launchd's descriptor for that file open for its whole lifetime, so
+rotating by rename would leave the renamed file growing and the new one
+empty. Edit `cap`/`keep` in the plist's script to change either size.
+Alternatively, drop it and redirect `StandardOutPath`/`StandardErrorPath`
+to `/dev/null` if you do not want the log at all — but then the startup
+errors described under *Validate your config* above have nowhere to appear.
+
+Stopping it cleanly is three steps, in that order — signal, wait, unload
+(`system/...` in place of `gui/$(id -u)/...` if you installed it as a
+LaunchDaemon above):
+
+```
+$ svc=gui/$(id -u)/com.hagaletechnologies.manta
+$ launchctl kill SIGINT "$svc"
+# manta drains and exits 0. KeepAlive is the conditional
+# SuccessfulExit=false form, so launchd treats that clean exit as
+# intentional and does NOT relaunch -- the job stays loaded but idle.
+$ while launchctl print "$svc" 2>/dev/null | grep -qE '^[[:space:]]*pid = [0-9]+'
+  do sleep 1; done
+# WAIT for it. `launchctl kill` only DELIVERS the signal -- launchctl(1) says
+# it "[s]ends the specified signal to the service instance" and nothing more,
+# so it returns while manta is still draining its in-flight clients (up to
+# ExitTimeOut, 30 s). Booting out at that moment hits the still-running
+# process with launchd's unhandled SIGTERM and throws away exactly the drain
+# this sequence exists to preserve. A loaded-but-idle job prints no `pid =`
+# line, which is the signal that the drain has finished.
+$ launchctl bootout "$svc"
 # unloads the job for good. Nothing is running by now, so this sends no
 # signal to anything.
 ```
 
-That ordering is what makes the stop clean, and it only works because the
-plist's `KeepAlive` is conditional. Under the unconditional `<true/>` this
-file previously shipped, the drained process was relaunched the instant it
-exited and the `bootout` then killed the *replacement* with launchd's
-unhandled `SIGTERM` — the same abrupt kill the sequence was there to
-avoid.
+That ordering — signal, *wait*, then unload — is what makes the stop clean,
+and it only works because the plist's `KeepAlive` is conditional. Under the
+unconditional `<true/>` this file previously shipped, the drained process
+was relaunched the instant it exited and the `bootout` then killed the
+*replacement* with launchd's unhandled `SIGTERM` — the same abrupt kill the
+sequence was there to avoid. Skipping the wait reaches the same bad end by
+the other route: `bootout` arriving mid-drain `SIGTERM`s the process that
+is still draining.
 
 Running `launchctl bootout` (or `launchctl stop`) by itself, while manta
 is still running, skips the drain and is abrupt — see the `SIGTERM` caveat
