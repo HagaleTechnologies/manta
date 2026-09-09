@@ -3,6 +3,8 @@
 
 pub mod listen;
 pub use listen::listen;
+pub mod doctor;
+pub use doctor::{doctor, DoctorReport, Verdict};
 pub mod soak;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
