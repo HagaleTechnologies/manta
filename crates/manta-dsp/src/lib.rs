@@ -10,4 +10,5 @@ pub mod floor;
 pub mod freqest;
 pub mod hilbert;
 pub mod proto;
+pub mod refine;
 pub mod single;
