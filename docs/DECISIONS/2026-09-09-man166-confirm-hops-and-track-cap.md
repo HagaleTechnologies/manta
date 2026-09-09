@@ -18,8 +18,15 @@ old, slightly-inflated methodology -- directionally correct, not exact).
 Diagnosis (via `TrackManager::close_counts()`, `crates/manta-engine/
 examples/close_counts.rs`) found `unconfirmed` (Candidate never sustains
 `confirm_hops`) at 68.8% of all track churn (286,196 closes) and
-`evicted`+`merged` (`track_cap=500` pinned at its ceiling for the entire
-recording) at 29.7% (123,479 closes). This doc covers both.
+`evicted`+`merged` together at 29.7% (123,479 closes: 71,149 `evicted`,
+52,330 `merged`). This doc covers both, but **only `evicted` is actually
+attributable to cap pressure** -- `merge_converged()` always runs before
+`evict_over_cap()` in `step_hop` (SPEC §2.5's frequency-proximity
+convergence, an independent mechanism from the cap), and the uncapped
+experiment below shows `merged` closes actually *rose* (52,330 -> 56,739)
+when the cap was removed, the opposite of what pure cap pressure would
+predict (Codex review, PR #152, round 8 -- an earlier draft of this doc
+conflated the two under one "tracks killed purely to make room" framing).
 
 ## track_cap: raised 500 -> 1200
 

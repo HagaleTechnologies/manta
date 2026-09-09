@@ -130,7 +130,14 @@ impl RepetitionGate {
     /// apart). So a new decode first checks its own bucket *and* both
     /// neighbors for an existing entry under the same callsign, and joins
     /// that one if found, rather than always keying strictly by its own
-    /// freshly-computed bucket.
+    /// freshly-computed bucket. Joining also *moves* the entry to the
+    /// current home bucket (Codex review, PR #152, round 8): without
+    /// this, an entry stays pinned to wherever it was first created, and
+    /// a signal that drifts across more than one bucket boundary over
+    /// successive occurrences -- each individual hop within the +-1
+    /// tolerance -- can still end up more than one bucket away from that
+    /// fixed original anchor, missing a later hop's neighbor search
+    /// entirely even though every step along the way was adjacent.
     ///
     /// That widened net cuts the other way too (same review): two
     /// genuinely different, simultaneous tracks decoding the same real
@@ -140,13 +147,19 @@ impl RepetitionGate {
     /// credit the same entry within milliseconds of each other. `track_id`
     /// is what actually distinguishes that from a real pattern (a CQing
     /// station double-calling its own callsign back-to-back within one
-    /// transmission): see `MIN_OCCURRENCE_GAP_SECONDS`'s doc. Whether
-    /// *this* track has touched the entry before -- not just whether the
-    /// single most-recent accepted occurrence happened to be from it --
-    /// is what "same track" means here (`GateEntry::last_seen_by_track`'s
-    /// doc): a track's own first decode, even if rejected as a
-    /// near-duplicate of a different track's, must not block that same
-    /// track's own later, genuinely distinct repeat.
+    /// transmission): see `MIN_OCCURRENCE_GAP_SECONDS`'s doc. A track's
+    /// own first decode, even if rejected as a near-duplicate of a
+    /// different track's, must not block that same track's own later,
+    /// genuinely distinct repeat -- but that exemption only applies when
+    /// the track's own *previous* touch was itself recent (Codex review,
+    /// PR #152, round 8: bare historical presence, no matter how old,
+    /// must not grant a blanket bypass -- a long-lived duplicate-spawn
+    /// track touching this entry once, long ago, and then touching it
+    /// again right next to a DIFFERENT track's brand-new decode must
+    /// still be checked against that other track's near-simultaneous
+    /// activity, or an old rejected identity can manufacture a second
+    /// confirmation for what both times was really the same one
+    /// over-the-air occurrence).
     ///
     /// A non-finite `freq_hz` (NaN/±infinity -- should never happen from
     /// the real DSP pipeline, but a defensive guard, Codex review PR
@@ -168,18 +181,58 @@ impl RepetitionGate {
         // not just the lowest-numbered one that happens to still exist --
         // sweeps are throttled, so a stale-but-not-yet-swept neighbor
         // must not be preferred over a genuinely fresher one.
-        let key = (b - 1..=b + 1)
+        let matched_key = (b - 1..=b + 1)
             .map(|candidate| (candidate, callsign.to_string()))
             .filter_map(|k| {
                 let ts = self.seen.get(&k)?.most_recent()?;
                 Some((k, ts))
             })
             .max_by_key(|(_, ts)| *ts)
-            .map(|(k, _)| k)
-            .unwrap_or((b, callsign.to_string()));
-        let entry = self.seen.entry(key).or_default();
-        let is_own_track_before = entry.last_seen_by_track.contains_key(&track_id);
-        let is_distinct_occurrence = if is_own_track_before {
+            .map(|(k, _)| k);
+        let home_key = (b, callsign.to_string());
+        // Codex review, PR #152, round 8: a signal that drifts across
+        // MORE than one bucket boundary over successive occurrences (each
+        // hop individually within the +-1 neighbor tolerance) must move
+        // its anchor forward each time, not stay pinned to wherever the
+        // entry was first created -- otherwise a later hop's neighbor
+        // search (always +-1 from ITS OWN home bucket) can miss an entry
+        // that's now two or more buckets away from its original anchor,
+        // even though each individual hop was adjacent. Merges (not
+        // overwrites) into `home_key`, in case a genuinely distinct entry
+        // already lives there.
+        if let Some(found_key) = matched_key {
+            if found_key != home_key {
+                let moved = self.seen.remove(&found_key).unwrap();
+                let dest = self.seen.entry(home_key.clone()).or_default();
+                dest.accepted.extend(moved.accepted);
+                dest.accepted.sort_unstable();
+                for (tid, ts) in moved.last_seen_by_track {
+                    dest.last_seen_by_track
+                        .entry(tid)
+                        .and_modify(|existing| *existing = (*existing).max(ts))
+                        .or_insert(ts);
+                }
+            }
+        }
+        let entry = self.seen.entry(home_key).or_default();
+        // Codex review, PR #152, round 8: a track's own previous touch
+        // only exempts a NEW touch from the cross-track near-duplicate
+        // check when that previous touch is itself recent -- a genuine
+        // rapid double-call, per this gate's own documented intent ("well
+        // under a second apart"). Bare historical presence in
+        // `last_seen_by_track`, no matter how old, must NOT grant a
+        // blanket bypass: a long-lived duplicate-spawn track that touched
+        // this entry once, long ago, and then touches it again right next
+        // to a DIFFERENT track's brand-new decode must still be checked
+        // against that other track's near-simultaneous activity -- an old
+        // rejected identity must not be able to manufacture a second
+        // confirmation for what both times was really the same one
+        // over-the-air occurrence.
+        let is_rapid_own_repeat = entry
+            .last_seen_by_track
+            .get(&track_id)
+            .is_some_and(|&last| sample_ts.saturating_sub(last) < self.min_occurrence_gap_samples);
+        let is_distinct_occurrence = if is_rapid_own_repeat {
             true
         } else {
             match entry.accepted.last() {
@@ -454,6 +507,77 @@ mod tests {
             gate.seen.len(),
             0,
             "seen must not accumulate one entry per historical bucket once swept past the window"
+        );
+    }
+
+    /// Codex review, PR #152, round 8: a long-lived duplicate-spawn track
+    /// that touched an entry once, long ago, and was rejected then, must
+    /// NOT get a blanket "always distinct" pass on a much later touch just
+    /// because it has *some* historical presence. Track A accepts at t=0;
+    /// track B's near-simultaneous duplicate at t=0.5s is rejected. Both
+    /// tracks stay alive (no sweep ever fully clears B's identity). Track
+    /// A decodes again far later (a genuine new occurrence, correctly
+    /// distinct). Track B then decodes again *immediately after* -- a
+    /// fresh near-duplicate of A's new occurrence, not a continuation of
+    /// B's own ancient first touch -- and must still be rejected by the
+    /// cross-track gap check, not waved through because B "has touched
+    /// this before."
+    #[test]
+    fn an_old_rejected_identity_does_not_exempt_a_fresh_near_duplicate() {
+        let mut gate = RepetitionGate::new(FS);
+        let one_second = FS as u64;
+
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        // Track B's near-simultaneous duplicate of A's first decode is
+        // correctly rejected -- but B's identity is now on record.
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", one_second / 2), 1);
+
+        // Much later, but still inside the trailing 90s window: track A's
+        // genuine second occurrence.
+        let later = 89 * one_second;
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", later), 2);
+
+        // Immediately after: track B decodes again. This is near-
+        // simultaneous with A's fresh occurrence above, not with B's own
+        // ancient first touch (88+ seconds earlier) -- must be rejected
+        // as a likely duplicate of A's just-accepted occurrence, not
+        // waved through as "B's own repeat."
+        assert_eq!(
+            gate.record(2, 14_000_000.0, "K5ARH", later + one_second / 20),
+            2,
+            "an old rejected identity must not exempt a fresh near-duplicate of a DIFFERENT track's brand-new occurrence"
+        );
+    }
+
+    /// Codex review, PR #152, round 8: a signal drifting across more than
+    /// one bucket boundary over successive occurrences -- each individual
+    /// hop within the +-1 neighbor tolerance -- must still be recognized
+    /// as the same signal throughout. occurrence 1 lands in bucket b;
+    /// occurrence 2 (a near-duplicate, rejected) lands in bucket b+1;
+    /// occurrence 3 (a genuine later occurrence) lands in bucket b+2 --
+    /// adjacent to occurrence 2's bucket, but two buckets from occurrence
+    /// 1's original bucket. Without moving the entry's anchor forward on
+    /// each join, occurrence 3's neighbor search (b+1..=b+3) would miss
+    /// the entry entirely (still pinned at b) and wrongly start a fresh
+    /// count of 1 instead of continuing to 2.
+    #[test]
+    fn record_follows_a_signal_that_drifts_across_multiple_bucket_boundaries() {
+        let mut gate = RepetitionGate::new(FS);
+
+        // Occurrence 1: bucket 140000 (14_000_000 Hz).
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        // Occurrence 2: bucket 140001 (14_000_050 Hz) -- a near-
+        // simultaneous duplicate from a different track, rejected, but it
+        // joins (and should move the anchor to) bucket 140001.
+        assert_eq!(gate.record(2, 14_000_050.0, "K5ARH", 100), 1);
+        // Occurrence 3: bucket 140002 (14_000_200 Hz) -- adjacent to
+        // bucket 140001, two away from the original bucket 140000. A
+        // genuine later occurrence, comfortably past the
+        // minimum-occurrence gap.
+        assert_eq!(
+            gate.record(3, 14_000_200.0, "K5ARH", 300_000),
+            2,
+            "must follow the anchor across successive adjacent bucket hops, not stay pinned to the original bucket"
         );
     }
 }
