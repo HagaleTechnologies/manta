@@ -2501,7 +2501,6 @@ mod tests {
         assert!(accepted2, "second configured target must be connected to");
     }
 
-<<<<<<< HEAD
     // MAN-44: uplink health at a glance -- `manta status` + `GET /status`.
 
     #[test]
@@ -2912,7 +2911,9 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
-=======
+        );
+    }
+
     // MAN-136 round-1 validate code-review finding 1: the increment
     // condition for `manta_spots_unresolved_geography_total` must match the
     // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
@@ -2975,7 +2976,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(
             geography_is_unresolved(&cty, "W1AW"),
             "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
         );
     }
 }

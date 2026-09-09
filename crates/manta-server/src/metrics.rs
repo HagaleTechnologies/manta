@@ -320,6 +320,7 @@ impl Metrics {
             spots_dropped_lagged_total: AtomicU64::new(0),
             spots_suppressed_by_filter_total: AtomicU64::new(0),
             spots_dropped_write_failed_total: AtomicU64::new(0),
+            spots_unresolved_geography_total: AtomicU64::new(0),
             telnet_clients: AtomicI64::new(0),
             json_clients: AtomicI64::new(0),
             ws_clients: AtomicI64::new(0),
