@@ -187,7 +187,8 @@ impl RbnUplinkConfig {
 }
 
 /// The real on-disk daemon config file's shape: a `[server]` TOML table
-/// (this is the file `manta listen --server-config <path>` reads) --
+/// (this is the file `manta run --config <path>` reads; `manta listen`
+/// and `--server-config` remain deprecated aliases, D11/MAN-77) --
 /// distinct from `ServerConfig` itself so that struct can stay a plain,
 /// directly-deserializable value everywhere else (tests, future in-process
 /// construction) without every caller needing to know about the table
@@ -199,7 +200,7 @@ impl RbnUplinkConfig {
 /// INSIDE `[server]`/`[[rbn_uplink]]`, which those structs' own
 /// `deny_unknown_fields` already does. Denying unknown fields at THIS
 /// level too (an earlier version did) rejected every other real, valid
-/// table in the unified config, making `--server-config` unusable with
+/// table in the unified config, making `--config` unusable with
 /// the actual daemon config this repo's own docs describe (round-11
 /// review finding).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
