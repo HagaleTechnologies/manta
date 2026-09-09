@@ -64,6 +64,35 @@ permissions:
   contents: read
 
 jobs:
+  # Fails fast, in parallel with the build matrix, if the pushed tag and
+  # the workspace version disagree. Without this, tagging v0.2.0 without
+  # bumping Cargo.toml publishes a "v0.2.0" Release whose binaries answer
+  # `manta 0.1.0` to --version -- exactly the kind of dishonesty MAN-84
+  # exists to remove. Deliberately NOT a `needs:` of `build` (a skipped
+  # job makes its dependents skip too, and `build` must still run on
+  # workflow_dispatch, where there is no tag to check).
+  verify-version:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag must match [workspace.package] version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+          echo "tag=$GITHUB_REF_NAME -> $TAG_VERSION ; Cargo.toml -> $CARGO_VERSION"
+          if [[ -z "$CARGO_VERSION" ]]; then
+            echo "::error::Could not read [workspace.package] version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME implies version $TAG_VERSION but [workspace.package] version is $CARGO_VERSION. Bump Cargo.toml (and Cargo.lock) on main first, then retag."
+            exit 1
+          fi
+
   build:
     strategy:
       fail-fast: false
@@ -147,7 +176,12 @@ jobs:
           retention-days: 14
 
   docker-publish:
-    needs: build
+    needs: [verify-version, build]
+    # verify-version only runs `if: github.event_name == 'push'`, so it is
+    # SKIPPED (not failed) on workflow_dispatch -- this must accept skipped
+    # alongside success, or a manual dispatch publish would wrongly skip
+    # too. `!cancelled()` mirrors the `release` job's own guard below.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -214,8 +248,15 @@ jobs:
           tags: ${{ steps.version.outputs.tags }}
 
   release:
-    needs: [build, docker-publish]
-    if: github.event_name == 'push'
+    needs: [verify-version, build, docker-publish]
+    # NOT a plain `needs:` gate on docker-publish. MAN-84 makes the
+    # GitHub Release binaries the priority deliverable and explicitly
+    # does not block on GHCR (MAN-65 finding 4 / MAN-66); a first-ever
+    # GHCR package push is the leg most likely to fail, and a plain
+    # `needs:` would silently take the whole Release down with it.
+    # `!cancelled()` rather than `always()` so a cancelled run still
+    # cancels this job.
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.verify-version.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -231,4 +272,13 @@ jobs:
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
+          # GitHub's create-release API PRE-PENDS `body` to the notes it
+          # generates when generate_release_notes is also true, so this
+          # banner lands above the auto-generated changelog rather than
+          # replacing it (MAN-84 / decision D7, 2026-09-06 broad review).
           generate_release_notes: true
+          body: |
+            > **Pre-stability alpha, expect breakage.** manta has not yet
+            > cleared its own M2/M3 acceptance criteria (see ROADMAP.md).
+            > CLI flags, config keys, and the JSON spot schema can change
+            > without a deprecation path before 1.0.
