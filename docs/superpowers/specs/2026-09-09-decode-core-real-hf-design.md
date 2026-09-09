@@ -674,17 +674,24 @@ promises; the harness runs in minutes, so tuning is empirical.
 
 ---
 
-## 8. Open questions for Tony
+## 8. Decisions (2026-09-09, Tony)
 
-1. Is `decode.engine` as a runtime switch acceptable, or should the
-   legacy chain be removed once stage 2 passes its gate (less code, but
-   no A/B on live nodes)?
-2. Stage 1c touches the engine's track feed; sequence it after the
-   tracker session's `merge_converged` change lands, or design them
-   together?
-3. The additive `alternatives` field: expose it on the JSON spot stream
-   (needs a dispensa contract addition) or keep it internal to
-   `manta-spot` for now?
-4. Should the realism vectors (contest speed, deep keying, clicks,
-   co-channel) become M2/M3 gates alongside V1–V10, or a separate
-   "V-real" set?
+1. **`decode.engine` stays a runtime switch permanently.** The legacy
+   chain is not removed once stage 2 passes its gate — it stays
+   selectable (`legacy` / `edge-legacy` / `hsmm`) for live-node A/B and
+   as a fallback. No change to §5.8's config or the plan's Task 5/9.
+2. **Stage 1c (the narrowband refiner) is deferred, not designed
+   jointly.** `manta-dsp::refine` is built now (Plan Task 13); the
+   `manta-engine` track-feed call site is **not** touched here — it is
+   filed as MAN-168, to be done once the parallel tracker session's
+   `merge_converged`/ownership work lands in `track.rs`. This avoids a
+   concurrent edit to a file this design is deliberately not touching.
+3. **`alternatives` stays internal for now.** No dispensa wire-contract
+   change and no `manta-spot` consumer in this plan; `DecoderEvent`
+   carries the field (Plan Task 2) but nothing reads it yet. Filed as
+   MAN-167 to revisit once the HSMM engine clears its stage-2 gate and a
+   real rescoring design exists.
+4. **VR1–VR8 are promoted to permanent ROADMAP.md M2 acceptance gates**,
+   not a plan-scoped, one-time check — see `ROADMAP.md`'s M2 section
+   (updated in this same PR) and SPEC v2 §8.4. Every future decode-core
+   change must keep clearing them, the same standing as V1–V10.
