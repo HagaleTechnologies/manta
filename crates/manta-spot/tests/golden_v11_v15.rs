@@ -2,7 +2,7 @@
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::Glyph;
 use manta_spot::{Blocklist, Spot, SpotType, Validator};
 
@@ -76,7 +76,10 @@ fn v11_context_parse_sets_spot_type() {
         // A non-allowlisted Beacon candidate is never emitted before
         // TrackClosed (round 7 redesign) -- harmless no-op for the other
         // cases here, which already spotted via the repetition gate.
-        spots.extend(v.ingest(&DecoderEvent::TrackClosed { track_id: 1 }));
+        spots.extend(v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        }));
         let hit = spots
             .iter()
             .find(|s| s.callsign == "K5ARH")
@@ -194,7 +197,10 @@ fn v18_beacon_pattern_exempt_from_repetition_gate() {
         "a non-allowlisted Beacon candidate must never spot before TrackClosed \
          (round 7 redesign), got {spots:?}"
     );
-    let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+    let spots = v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    });
     assert_eq!(
         spots.len(),
         1,
@@ -531,7 +537,10 @@ fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
         "a non-allowlisted Beacon candidate must never spot before TrackClosed \
          (round 7 redesign), got {spots:?}"
     );
-    let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+    let spots = v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    });
     assert_eq!(
         spots.len(),
         1,
@@ -657,7 +666,10 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
         "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
     );
 
-    let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+    let spots = v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    });
     assert!(
         spots
             .iter()

@@ -10,7 +10,7 @@ use crate::gate::RepetitionGate;
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -216,6 +216,16 @@ pub fn calibration_factor_from_ppm(ppm: f64) -> Result<f64, InvalidCalibration> 
 pub struct SuppressionCounts {
     pub blocklist: u64,
     pub notch: u64,
+    /// A captured `PendingBeacon` permanently discarded to keep
+    /// `MAX_PENDING_BEACONS` bounded on a track that stays active
+    /// indefinitely (Codex review on PR #154, round 9) -- ARCHITECTURE
+    /// §8 requires every dropped item be counted, this one included.
+    pub pending_beacon_overflow: u64,
+    /// A captured `PendingBeacon` discarded because its track closed via
+    /// `ClosureKind::Bookkeeping` with no survivor (`Evicted`) -- not
+    /// evidence the physical signal ended, but with no successor
+    /// track_id to migrate the evidence to either (round 9).
+    pub pending_beacon_lost_to_eviction: u64,
 }
 
 pub struct Validator {
@@ -394,20 +404,33 @@ impl Validator {
             // exists to surface) creates no per-track_id state here to
             // leak.
             DecoderEvent::TrackPromoted { .. } => Vec::new(),
-            DecoderEvent::TrackClosed { track_id } => {
-                // Round 7 redesign: the ONE point where every captured
-                // non-allowlisted Beacon candidate for this track is
-                // judged, using its TRUE FINAL speed -- manta-engine
-                // guarantees a final speed flush (TrackDecoder::finish()/
-                // finish_speed_only()) is ordered immediately before this
-                // TrackClosed for the same track on every closure path
-                // (stream EOF, hang, silent, merge, evict alike), so
-                // `track.wpm` already reflects the settled value by the
-                // time this handler runs. See `resolve_pending_beacons`
-                // and `PendingBeacon`'s doc comments for why this
-                // replaced rounds 2-6's reactive, opportunistic-
-                // evaluation-plus-retry design.
-                let spots = self.resolve_pending_beacons(*track_id);
+            DecoderEvent::TrackClosed { track_id, closure } => {
+                // Round 7 redesign: `SignalEnded` is the ONE point where
+                // every captured non-allowlisted Beacon candidate for
+                // this track is judged, using its TRUE FINAL speed --
+                // manta-engine guarantees a final speed flush
+                // (TrackDecoder::finish()/finish_speed_only()) is ordered
+                // immediately before this TrackClosed for the same track.
+                // See `resolve_pending_beacons` and `PendingBeacon`'s doc
+                // comments for why this replaced rounds 2-6's reactive,
+                // opportunistic-evaluation-plus-retry design.
+                //
+                // `Bookkeeping` (round 9) is NOT proof the signal ended --
+                // the identity may continue on a merge survivor, or (an
+                // eviction) simply drop out of tracking while still
+                // transmitting. Resolving now against a not-yet-settled
+                // WPM would reopen exactly the oscillation risk the
+                // deferred design exists to close, so this migrates
+                // pending evidence to the survivor instead (to be judged
+                // by ITS OWN eventual true close), or discards it if there
+                // is none.
+                let spots = match closure {
+                    ClosureKind::SignalEnded => self.resolve_pending_beacons(*track_id),
+                    ClosureKind::Bookkeeping { survivor_track_id } => {
+                        self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
+                        Vec::new()
+                    }
+                };
                 // MAN-19: without this, `self.tracks` and `self.gate`'s
                 // per-track_id state both grow forever -- `TrackManager`
                 // never reuses a `track_id`, and until `TrackClosed`
@@ -897,7 +920,11 @@ impl Validator {
         if pending.len() >= MAX_PENDING_BEACONS {
             // Drop the oldest to bound growth on a track that stays alive
             // indefinitely (round 8) -- see MAX_PENDING_BEACONS's doc.
+            // Counted (ARCHITECTURE §8 -- round 9): this candidate's own
+            // source word was already marked attempted and won't be
+            // recaptured, so this is a real, permanent loss.
             pending.remove(0);
+            self.suppression_counts.pending_beacon_overflow += 1;
         }
         pending.push(PendingBeacon {
             candidate,
@@ -907,6 +934,40 @@ impl Validator {
             char_confidences,
         });
         None
+    }
+
+    /// A `ClosureKind::Bookkeeping` closure is not evidence this
+    /// identity's signal ended (round 9) -- move its `PendingBeacon`s to
+    /// the surviving track (a merge) so they're judged by ITS eventual
+    /// true close instead, or discard them (an eviction, no successor),
+    /// counted per ARCHITECTURE §8. No-op if there was nothing pending.
+    fn migrate_or_discard_pending_beacons(
+        &mut self,
+        track_id: u32,
+        survivor_track_id: Option<u32>,
+    ) {
+        let Some(track) = self.tracks.get_mut(&track_id) else {
+            return;
+        };
+        let pending = std::mem::take(&mut track.pending_beacons);
+        if pending.is_empty() {
+            return;
+        }
+        match survivor_track_id {
+            Some(survivor) => {
+                let survivor_track = self.tracks.entry(survivor).or_default();
+                for pb in pending {
+                    if survivor_track.pending_beacons.len() >= MAX_PENDING_BEACONS {
+                        survivor_track.pending_beacons.remove(0);
+                        self.suppression_counts.pending_beacon_overflow += 1;
+                    }
+                    survivor_track.pending_beacons.push(pb);
+                }
+            }
+            None => {
+                self.suppression_counts.pending_beacon_lost_to_eviction += pending.len() as u64;
+            }
+        }
     }
 
     /// The one point where every `PendingBeacon` captured for `track_id`
@@ -1077,7 +1138,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
         );
 
-        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
         assert!(
             spots.is_empty(),
             "a track whose true final speed is implausible must never spot, got {spots:?}"
@@ -1134,7 +1198,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             wpm: 22.0,
         });
 
-        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
         assert_eq!(
             spots.len(),
             1,
@@ -1188,11 +1255,19 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ts += 1_000_000;
         }
 
-        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
         assert!(
             spots.len() <= MAX_PENDING_BEACONS,
             "pending_beacons must stay bounded at {MAX_PENDING_BEACONS}, got {} spots",
             spots.len()
+        );
+        assert_eq!(
+            v.suppression_counts().pending_beacon_overflow,
+            (n - MAX_PENDING_BEACONS) as u64,
+            "every permanently-dropped overflow candidate must be counted (ARCHITECTURE §8)"
         );
     }
 
@@ -1233,7 +1308,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // Track 1 finally closes -- its captured (OLDER) Beacon candidate
         // must not emit now, and must not roll dedupe's watermark back to
         // its own stale timestamp.
-        let spots3 = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        let spots3 = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
         assert!(
             spots3.is_empty(),
             "an already-superseded deferred candidate must not emit, got {spots3:?}"
@@ -1243,6 +1321,88 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             Some(newer_ts),
             "resolving the stale deferred candidate must not roll the \
              dedupe watermark backward"
+        );
+    }
+
+    /// Codex review on PR #154, round 9: a Merged closure is not evidence
+    /// this identity's signal ended -- it may continue on the surviving
+    /// track. A captured Beacon candidate must migrate there instead of
+    /// being judged (or lost) at the loser's own close, then resolve once
+    /// the SURVIVOR truly closes, using the SURVIVOR's own final speed.
+    #[test]
+    fn merged_track_migrates_pending_beacon_to_the_survivor() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // Track 1 merges into track 2 -- bookkeeping only, not proof the
+        // signal ended.
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        assert!(
+            spots.is_empty(),
+            "a merge must never itself resolve the migrated candidate, got {spots:?}"
+        );
+
+        // The survivor eventually closes for real, at a plausible speed.
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 2,
+            wpm: 25.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(
+            spots.len(),
+            1,
+            "the migrated candidate must resolve at the survivor's true \
+             close, using the survivor's own final speed, got {spots:?}"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review on PR #154, round 9: an Evicted closure has no
+    /// survivor to migrate a captured Beacon candidate to -- it must be
+    /// discarded (never resolved), and counted per ARCHITECTURE §8.
+    #[test]
+    fn evicted_track_discards_pending_beacon_and_counts_it() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            },
+        });
+        assert!(
+            spots.is_empty(),
+            "an eviction with no survivor must never resolve the candidate, got {spots:?}"
+        );
+        assert_eq!(
+            v.suppression_counts().pending_beacon_lost_to_eviction,
+            1,
+            "the discarded candidate must be counted (ARCHITECTURE §8)"
         );
     }
 
@@ -1287,7 +1447,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
         );
 
-        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
@@ -1519,7 +1682,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "TrackMeta should have created an entry"
         );
 
-        v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
         assert!(
             !v.tracks.contains_key(&1),
             "TrackClosed must remove the track's state"
@@ -1534,7 +1700,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn track_closed_for_an_unknown_track_id_is_a_harmless_noop() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         assert_eq!(
-            v.ingest(&DecoderEvent::TrackClosed { track_id: 42 }),
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id: 42,
+                closure: ClosureKind::SignalEnded
+            }),
             vec![]
         );
         assert!(!v.tracks.contains_key(&42));
@@ -1550,7 +1719,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         for track_id in 0..10_000u32 {
             seed_meta(&mut v, track_id);
-            v.ingest(&DecoderEvent::TrackClosed { track_id });
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::SignalEnded,
+            });
         }
         assert_eq!(
             v.tracks.len(),
