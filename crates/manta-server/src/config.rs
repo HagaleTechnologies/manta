@@ -213,25 +213,44 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
-    /// Operator's given name, e.g. `"Art"`. Optional. Appears in the telnet
-    /// greeting banner CW Skimmer clients and RBN Aggregator read on
-    /// connect (MAN-86) -- Aggregator's Combined Skimmers tab
-    /// (manual v6.0 §9.2) exists precisely to hand-enter this same
-    /// information for sources that can't supply it.
+    // The three `operator_*` keys below feed the telnet greeting banner
+    // (MAN-86). They are ALSO listed, with these same defaults and
+    // validation rules, in `docs/SPEC-decode-core.md` §9's `[server]`
+    // block -- the repository's canonical config-key table, and the only
+    // place an operator who has not read this source file will look for
+    // them. Renaming a key, changing a default, or changing a validation
+    // rule here means changing it there too; each field's own doc comment
+    // below restates the rule so the two can be diffed by eye.
+    /// Operator's given name, e.g. `"Art"`. **Optional; default: absent**
+    /// (the field is omitted from the greeting line rather than rendered
+    /// as an empty placeholder). Appears in the telnet greeting banner CW
+    /// Skimmer clients and RBN Aggregator read on connect (MAN-86) --
+    /// Aggregator's Combined Skimmers tab (manual v6.0 §9.2) exists
+    /// precisely to hand-enter this same information for sources that
+    /// can't supply it. **Validated at deserialize time** by
+    /// `check_operator_text`: must be non-empty after trimming and must
+    /// contain no control characters, because it is interpolated verbatim
+    /// into every connecting client's banner (an embedded CR/LF would
+    /// forge cluster lines). A bad value fails daemon start.
     #[serde(default, deserialize_with = "deserialize_optional_operator_name")]
     pub operator_name: Option<String>,
-    /// Operator's QTH as free text, e.g. `"Richmond Hill, ON"`. Optional.
+    /// Operator's QTH as free text, e.g. `"Richmond Hill, ON"`.
+    /// **Optional; default: absent**, dropped from the greeting line when
+    /// unset. **Validated at deserialize time** by the same
+    /// `check_operator_text` rule as `operator_name` above -- non-empty
+    /// after trimming, no control characters -- and for the same
+    /// line-injection reason.
     #[serde(default, deserialize_with = "deserialize_optional_operator_qth")]
     pub operator_qth: Option<String>,
-    /// Maidenhead grid square, 4 or 6 characters, e.g. `"FN03GW"`. Optional.
+    /// Maidenhead grid square, e.g. `"FN03GW"`. **Optional; default:
+    /// absent**, dropped from the greeting line when unset. **Validated
+    /// at deserialize time** by `check_grid`: exactly 4 or 6 characters,
+    /// field letters `A`-`R`, square digits `0`-`9`, and (when 6)
+    /// subsquare letters `A`-`X`; case-insensitive. A malformed grid is
+    /// worse than an absent one -- Aggregator would record garbage as
+    /// this node's location.
     #[serde(default, deserialize_with = "deserialize_optional_grid")]
     pub operator_grid: Option<String>,
-    // PR #128 review: these three keys, their defaults (absent) and their
-    // validation rules are also listed in `docs/SPEC-decode-core.md` §9's
-    // `[server]` block -- the repository's canonical config-key table, and
-    // the only place an operator who has not read this source file will
-    // look for them. Changing a name, a default or a validation rule here
-    // means changing it there too.
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
