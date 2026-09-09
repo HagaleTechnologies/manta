@@ -49,7 +49,7 @@ fn track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
-        | DecoderEvent::TrackClosed { track_id } => *track_id,
+        | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
     }
 }
 

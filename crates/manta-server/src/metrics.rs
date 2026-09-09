@@ -3,12 +3,30 @@
 //! tracks..."; MAN-12 scenario 3 ("operators can inspect health without
 //! reading source"). `Metrics` owns what `manta-server` genuinely knows
 //! (spots published, connected clients per protocol) and exposes
-//! `set_active_tracks`/`set_source_health` for the daemon wiring layer to
-//! inject engine-owned numbers manta-server has no way to compute itself.
+//! `set_active_tracks`/`set_source_health`/`set_input_health` for the
+//! daemon wiring layer to inject engine-owned numbers manta-server has no
+//! way to compute itself.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
+
+/// Packet-level input-stream health for one source, injected by the daemon
+/// wiring layer (see module doc) -- `manta-server` has no `manta-input`
+/// dependency and cannot read these itself (MAN-56). Deliberately a
+/// separate type from `manta_input::InputHealthCounters` rather than a
+/// shared one: keeping the two crates' types disjoint is what preserves
+/// that dependency boundary; `manta-cli`, which depends on both, does the
+/// translation.
+///
+/// The values are the source's current *absolute* monotonic totals, not
+/// deltas -- `set_input_health` overwrites, it does not accumulate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputHealth {
+    pub dropped_packets: u64,
+    pub gaps_detected: u64,
+    pub malformed_packets: u64,
+}
 
 #[derive(Default)]
 pub struct Metrics {
@@ -16,6 +34,16 @@ pub struct Metrics {
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
+    /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
+    /// against `cty.dat` -- or resolved only through the base prefix of a
+    /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
+    /// was emitted with the `UNKNOWN_DXCC`/`UNKNOWN_CONTINENT`/
+    /// `UNKNOWN_CQ_ZONE` sentinels instead of real geography. ARCHITECTURE §8: "every dropped/evicted/suppressed item is
+    /// counted" -- an operator otherwise has no way to notice this is
+    /// happening. Incremented once per spot at publish time (`main.rs`), not
+    /// inside `SpotMessage::from_spot` (which runs once per connected
+    /// client).
+    spots_unresolved_geography_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -31,6 +59,12 @@ pub struct Metrics {
     /// worth graphing.
     pipeline_batches: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
+    /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
+    /// counters. Engine/input-owned figures, injected by the daemon wiring
+    /// layer on a timer -- see `manta-cli`'s `INPUT_HEALTH_POLL_INTERVAL`.
+    /// Sources with no wire-packet loss model never call `set_input_health`,
+    /// so they publish no series rather than a permanently-zero one.
+    input_health: RwLock<BTreeMap<String, InputHealth>>,
     uplink_sent_total: AtomicU64,
     uplink_suppressed_total: AtomicU64,
     uplink_lagged_total: AtomicU64,
@@ -91,6 +125,15 @@ impl Metrics {
     pub fn record_write_failed(&self, n: u64) {
         self.spots_dropped_write_failed_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// MAN-136/MAN-45: call once per spot (not per connected client) when
+    /// either the dx or de callsign didn't resolve against `cty.dat`, so the
+    /// wire message carries the `UNKNOWN_*` sentinels instead of real
+    /// geography.
+    pub fn record_unresolved_geography(&self) {
+        self.spots_unresolved_geography_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_telnet_clients(&self) {
@@ -164,6 +207,18 @@ impl Metrics {
             .write()
             .expect("source_health lock poisoned")
             .insert(source.to_string(), healthy);
+    }
+
+    /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
+    /// counters. Engine/input-owned figures, injected by the daemon wiring
+    /// layer on a timer -- see `main.rs`'s `INPUT_HEALTH_POLL_INTERVAL`.
+    /// Sources with no wire-packet loss model never call this, so they
+    /// publish no series rather than a permanently-zero one.
+    pub fn set_input_health(&self, source: &str, health: InputHealth) {
+        self.input_health
+            .write()
+            .expect("input_health lock poisoned")
+            .insert(source.to_string(), health);
     }
 
     // MAN-32: RBN uplink counters. ARCHITECTURE §8's "every
@@ -303,6 +358,16 @@ impl Metrics {
                 .load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat, OR its entity carries no row in the vendored dxcc.tsv, OR it carries a /MM or /AM designator that places it outside any DXCC entity.\n",
+        );
+        out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_unresolved_geography_total {}\n",
+            self.spots_unresolved_geography_total
+                .load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
         out.push_str("# TYPE manta_telnet_clients_connected gauge\n");
         out.push_str(&format!(
@@ -348,6 +413,50 @@ impl Metrics {
                 if *healthy { 1 } else { 0 }
             ));
         }
+
+        // MAN-56: input-layer packet loss/malformed counters. Absent, not
+        // zero, for sources with no wire-packet loss model -- the read
+        // guard is taken once for all three families below (one consistent
+        // view; three separate acquisitions could straddle a writer).
+        let input_health = self
+            .input_health
+            .read()
+            .expect("input_health lock poisoned");
+
+        out.push_str(
+            "# HELP manta_input_dropped_packets_total Input packets estimated lost in transit before reaching the decoder, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_dropped_packets_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_dropped_packets_total{{source=\"{source}\"}} {}\n",
+                h.dropped_packets
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_input_gaps_detected_total Distinct input-stream gap events detected, per source (one gap may account for several dropped packets).\n",
+        );
+        out.push_str("# TYPE manta_input_gaps_detected_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_gaps_detected_total{{source=\"{source}\"}} {}\n",
+                h.gaps_detected
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_input_malformed_packets_total Input datagrams discarded as malformed -- wrong length, or correct length but failed framing/sync validation (MAN-22), per source.\n",
+        );
+        out.push_str("# TYPE manta_input_malformed_packets_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_malformed_packets_total{{source=\"{source}\"}} {}\n",
+                h.malformed_packets
+            ));
+        }
+
+        drop(input_health);
 
         out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
@@ -479,6 +588,25 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_geography_is_counted_and_exposed() {
+        let m = Metrics::new();
+        m.record_unresolved_geography();
+        m.record_unresolved_geography();
+        assert!(m
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 2"));
+    }
+
+    #[test]
+    fn unresolved_geography_counter_is_present_at_zero_before_any_spot() {
+        // A counter that only appears once it fires is invisible to an operator
+        // building a dashboard -- the other spot counters all render at 0.
+        assert!(Metrics::new()
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 0"));
+    }
+
+    #[test]
     fn renders_per_source_health_as_labeled_gauge() {
         let m = Metrics::new();
         m.set_source_health("soapy0", true);
@@ -486,6 +614,82 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    // MAN-56: input-layer packet loss/malformed counters.
+
+    #[test]
+    fn renders_per_source_input_health_as_labeled_counters() {
+        let m = Metrics::new();
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 12,
+                gaps_detected: 3,
+                malformed_packets: 4,
+            },
+        );
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_dropped_packets_total counter"));
+        assert!(text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 12"#));
+        assert!(text.contains(r#"manta_input_gaps_detected_total{source="hpsdr"} 3"#));
+        assert!(text.contains(r#"manta_input_malformed_packets_total{source="hpsdr"} 4"#));
+    }
+
+    #[test]
+    fn input_health_reflects_the_latest_absolute_totals_not_a_sum() {
+        // The wiring layer pushes the source's current monotonic totals on
+        // a timer; two pushes must not double-count (MAN-56 D4).
+        let m = Metrics::new();
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 2,
+                ..Default::default()
+            },
+        );
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 5,
+                ..Default::default()
+            },
+        );
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 5"#));
+        assert!(!text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 7"#));
+    }
+
+    #[test]
+    fn sources_that_never_report_input_health_publish_no_series() {
+        // An absent series, not a frozen 0 -- ARCHITECTURE §8 already flags
+        // "served but never populated" (manta_active_tracks) as actively
+        // misleading to an operator.
+        let m = Metrics::new();
+        m.set_source_health("audio", true);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_malformed_packets_total counter"));
+        assert!(!text.contains("manta_input_malformed_packets_total{"));
+    }
+
+    #[test]
+    fn input_health_families_render_their_samples_contiguously() {
+        // Prometheus text format requires all samples of one metric family
+        // to be grouped; three sources interleaved per-family would be
+        // malformed.
+        let m = Metrics::new();
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 1,
+                gaps_detected: 1,
+                malformed_packets: 1,
+            },
+        );
+        let text = m.render_prometheus_text();
+        let dropped = text.find("manta_input_dropped_packets_total{").unwrap();
+        let gaps_help = text.find("# HELP manta_input_gaps_detected_total").unwrap();
+        assert!(dropped < gaps_help);
     }
 
     // MAN-32: RBN uplink counters.

@@ -82,7 +82,15 @@ as before, and is what the rest of this Quickstart assumes:
 
 ## Quickstart
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.85 or newer, and a `git` executable on `PATH`. Git is a
+build-time requirement, not just a way to clone this repo: manta depends on
+[`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git
+dependency, and `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`
+so cargo fetches it through the `git` binary rather than its built-in
+libgit2 transport (which intermittently fails to resolve a bare pinned rev
+on a cold cache). Without git on `PATH` the build fails at the fetch step,
+before compiling anything. Neither Rust nor git is needed to *run* the
+released binaries or the Docker image above.
 
 ```sh
 # Build
@@ -91,6 +99,12 @@ cargo build --release -p manta-cli
 # Decode a synthetic golden vector from a file (deterministic, no hardware)
 manta gen v1 --out /tmp/v1
 manta decode /tmp/v1/v1.wav
+
+# Run as a daemon: telnet cluster (:7300), JSON Lines/WebSocket (:7301),
+# metrics, and any configured RBN uplinks, all from one config file
+manta run --config manta.toml --kiwi-host kiwi.example.org --kiwi-freq 7030000
+
+# `listen` is an alias of `run`, kept for ad hoc audio and dev testing.
 
 # Copy live CW from a public KiwiSDR on 40 m
 manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
