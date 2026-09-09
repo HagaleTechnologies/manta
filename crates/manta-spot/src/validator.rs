@@ -294,6 +294,7 @@ impl Validator {
             DecoderEvent::WordBoundary {
                 track_id,
                 sample_ts,
+                ..
             } => {
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
@@ -747,18 +748,15 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut events = Vec::new();
         let mut ts = start_ts;
         for c in text.chars() {
-            events.push(DecoderEvent::CharDecoded {
+            events.push(DecoderEvent::char_decoded(
                 track_id,
-                sample_ts: ts,
-                glyph: Glyph::Char(c),
-                confidence: 0.95,
-            });
+                ts,
+                Glyph::Char(c),
+                0.95,
+            ));
             ts += 100;
         }
-        events.push(DecoderEvent::WordBoundary {
-            track_id,
-            sample_ts: ts,
-        });
+        events.push(DecoderEvent::word_boundary(track_id, ts));
         ts += 100;
         (events, ts)
     }
@@ -815,34 +813,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn error_prosign_discards_current_word() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         let events = vec![
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 0,
-                glyph: Glyph::Char('D'),
-                confidence: 0.9,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 100,
-                glyph: Glyph::Char('E'),
-                confidence: 0.9,
-            },
-            DecoderEvent::WordBoundary {
-                track_id: 1,
-                sample_ts: 200,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 300,
-                glyph: Glyph::Char('K'),
-                confidence: 0.9,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 400,
-                glyph: Glyph::Prosign(Prosign::Err),
-                confidence: 0.0,
-            },
+            DecoderEvent::char_decoded(1, 0, Glyph::Char('D'), 0.9),
+            DecoderEvent::char_decoded(1, 100, Glyph::Char('E'), 0.9),
+            DecoderEvent::word_boundary(1, 200),
+            DecoderEvent::char_decoded(1, 300, Glyph::Char('K'), 0.9),
+            DecoderEvent::char_decoded(1, 400, Glyph::Prosign(Prosign::Err), 0.0),
         ];
         // after the <ERR> prosign, the partial "K" must be gone.
         for e in &events {

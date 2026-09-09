@@ -107,10 +107,7 @@ impl TrackDecoder {
             let ts = self.last_ts;
             self.emit_char(ts, &mut events);
             if !self.word_flushed {
-                events.push(DecoderEvent::WordBoundary {
-                    track_id: self.track_id,
-                    sample_ts: ts,
-                });
+                events.push(DecoderEvent::word_boundary(self.track_id, ts));
             }
         }
         events
@@ -168,10 +165,7 @@ impl TrackDecoder {
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
-                    events.push(DecoderEvent::WordBoundary {
-                        track_id: self.track_id,
-                        sample_ts: run.start_ts,
-                    });
+                    events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                 }
             }
         }
@@ -210,10 +204,7 @@ impl TrackDecoder {
                 }
                 self.emit_char(ts, events);
                 if !self.word_flushed {
-                    events.push(DecoderEvent::WordBoundary {
-                        track_id: self.track_id,
-                        sample_ts: ts,
-                    });
+                    events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_flushed = true;
             }
@@ -238,12 +229,12 @@ impl TrackDecoder {
             q,
             &self.cfg.beam,
         ) {
-            Some(cd) => events.push(DecoderEvent::CharDecoded {
-                track_id: self.track_id,
+            Some(cd) => events.push(DecoderEvent::char_decoded(
+                self.track_id,
                 sample_ts,
-                glyph: cd.glyph,
-                confidence: cd.confidence,
-            }),
+                cd.glyph,
+                cd.confidence,
+            )),
             None => self.garble_count += 1,
         }
     }
@@ -387,32 +378,11 @@ mod tests {
     fn text_assembly_drops_prosigns_and_collapses_spaces() {
         use crate::tree::{Glyph, Prosign};
         let ev = vec![
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 0,
-                glyph: Glyph::Char('A'),
-                confidence: 1.0,
-            },
-            DecoderEvent::WordBoundary {
-                track_id: 1,
-                sample_ts: 1,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 2,
-                glyph: Glyph::Prosign(Prosign::Ar),
-                confidence: 1.0,
-            },
-            DecoderEvent::WordBoundary {
-                track_id: 1,
-                sample_ts: 3,
-            },
-            DecoderEvent::CharDecoded {
-                track_id: 1,
-                sample_ts: 4,
-                glyph: Glyph::Char('B'),
-                confidence: 1.0,
-            },
+            DecoderEvent::char_decoded(1, 0, Glyph::Char('A'), 1.0),
+            DecoderEvent::word_boundary(1, 1),
+            DecoderEvent::char_decoded(1, 2, Glyph::Prosign(Prosign::Ar), 1.0),
+            DecoderEvent::word_boundary(1, 3),
+            DecoderEvent::char_decoded(1, 4, Glyph::Char('B'), 1.0),
         ];
         assert_eq!(events_to_text(&ev), "A B");
     }

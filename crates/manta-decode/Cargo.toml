@@ -12,3 +12,4 @@ serde = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+serde_json = { workspace = true }
