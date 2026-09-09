@@ -8,7 +8,7 @@ sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
 verified:
-  commit: 89e39f897a2fca4641360c0f4ed9c42ad8f4cde8
+  commit: 68701a730c3ecb877acd6ca6e4e76345c25a5759
   date: 2026-09-09
 links:
   - spot-validation
@@ -75,13 +75,16 @@ Finding 2 for the full reasoning; treat this as a separate, still-
 untracked defect until proven otherwise.
 
 **`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
-track hits `envelope.rs`'s rail-collapse clamp (`e_hi >= 2*e_lo`,
-SPEC §3.2), which puts a hard floor of `20*log10(2) - 14.3 = -8.2794 dB`
-on `snr_db` regardless of cause — so a value pinned near that floor is
-completely expected for both this artifact *and* a real weak signal, and
-proves nothing either way. Frequency recurrence and confidence are the
-actual warning signs to check; don't lean on `snr_db` to distinguish real
-from artifact.
+track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
+`envelope.rs`'s rail-collapse clamp (`e_hi >= 2*e_lo`, SPEC §3.2) — but
+that's not a proven hard floor: `e_lo` is only clamped to `E_LO_FLOOR` at
+track init, and can drift below it during the per-sample EMA update that
+follows, in which case the SNR ratio actually used can go below 2. A
+value pinned near -8.2794 dB is *consistent with* the clamp firing, not
+guaranteed proof of it — either way it's completely unremarkable for
+both this artifact and a real weak signal, and proves nothing on its
+own. Frequency recurrence and confidence are the actual warning signs to
+check; don't lean on `snr_db` to distinguish real from artifact.
 
 ## Setup gotchas
 
