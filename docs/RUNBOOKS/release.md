@@ -187,20 +187,40 @@ README. Always deal with both:
 
 1. Delete the bad version tag from the package's GitHub UI (Package
    settings → Manage versions).
-2. Fix `:latest`. If there is an earlier good release, re-point it from any
-   machine with Docker and a GHCR write token — a `workflow_dispatch`
-   publish will *not* do this, since the workflow pushes `:latest` only for
-   real tag pushes:
+2. **Fix `:latest` — every time, not only after the first release.** A
+   `:latest` left pointing at a withdrawn image is the failure this step
+   exists to prevent, and it is the *normal* case: every real tag push
+   republishes `:latest`, so the second and every later bad release leaves
+   it stale exactly as the first one does. Which of the two branches below
+   applies depends only on whether an earlier good release exists — never
+   on skipping the step.
+
+   **a. An earlier good release exists — re-point `:latest` at it.** Do this
+   from any machine with Docker; a `workflow_dispatch` publish will *not* do
+   it for you, since the workflow pushes `:latest` only for real tag pushes.
+   The login is required even to *pull*, for as long as the package is
+   private (MAN-66), and the token needs `write:packages` for the push:
 
    ```sh
    IMAGE=ghcr.io/hagaletechnologies/manta
+   echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
    docker pull "$IMAGE:<last-good-version>"
    docker tag "$IMAGE:<last-good-version>" "$IMAGE:latest"
    docker push "$IMAGE:latest"
+   docker manifest inspect "$IMAGE:latest" >/dev/null && echo ":latest restored"
    ```
 
-   If the bad release was the first one, there is no good image to point at:
-   delete `:latest` in the same UI, and expect the README's `docker run`
-   command to fail until the next good tag republishes it.
+   **b. No good release exists yet (the bad one was the first) — delete
+   `:latest`.** There is nothing to point it at: delete the `latest` version
+   in the same Package settings → Manage versions UI, and expect the
+   README's `docker run` command to fail until the next good tag
+   republishes it. Deleting is the correct outcome here — leaving the tag
+   alive and bad is not.
+
+   Either way, confirm before you walk away: `docker manifest inspect
+   ghcr.io/hagaletechnologies/manta:latest` must either resolve to the
+   good image's digest (branch a) or fail with `manifest unknown`
+   (branch b). Anything else means `:latest` is still serving the bad
+   image.
 
 Then re-tag once the underlying problem is fixed.

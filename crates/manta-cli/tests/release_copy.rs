@@ -193,3 +193,93 @@ fn readme_names_no_stale_release_version() {
          update it in the same change that bumps the workspace."
     );
 }
+
+/// The body of a markdown `## ` section: the heading line plus every line up
+/// to (but not including) the next `## ` heading. Scoping an assertion to one
+/// section, rather than grepping the whole document, means prose in a
+/// NEIGHBOURING section can't satisfy a guard meant for this one — the same
+/// reason `job_block` exists for workflow jobs.
+fn markdown_section<'a>(doc: &'a str, heading: &str) -> &'a str {
+    let start = doc
+        .find(heading)
+        .unwrap_or_else(|| panic!("no {heading:?} section in document"));
+    let rest = &doc[start + heading.len()..];
+    let end = rest
+        .match_indices("\n## ")
+        .next()
+        .map_or(rest.len(), |(i, _)| i);
+    &doc[start..start + heading.len() + end]
+}
+
+/// Prose wraps at 80 columns, so any phrase long enough to be worth asserting
+/// on is likely to straddle a newline. Collapse every whitespace run to a
+/// single space (and lowercase) before matching.
+fn flatten(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+const RELEASE_RUNBOOK: &str = "docs/RUNBOOKS/release.md";
+
+/// MAN-84 codex review (P1): `wiki/INDEX.md` is this repo's required
+/// knowledge map (AGENTS.md), and the release runbook is normative — an
+/// operator who starts from the map and can't reach it will improvise the
+/// tag push instead. The link exists; this guard is what keeps it from being
+/// dropped by a later wiki regeneration, which is otherwise a silent
+/// regression no reviewer would notice.
+#[test]
+fn wiki_index_links_the_release_runbook() {
+    assert!(
+        repo_root().join(RELEASE_RUNBOOK).is_file(),
+        "{RELEASE_RUNBOOK} is missing — it is the normative release \
+         procedure referenced by wiki/INDEX.md and by README's release copy."
+    );
+    let index = read_repo_file("wiki/INDEX.md");
+    assert!(
+        index.contains(RELEASE_RUNBOOK),
+        "wiki/INDEX.md must contain an entry linking {RELEASE_RUNBOOK} \
+         (relative links from wiki/ are written `../docs/RUNBOOKS/release.md`). \
+         The index is the entry point agents and operators are told to read \
+         first, so an unlinked runbook is an undiscoverable one."
+    );
+}
+
+/// MAN-84 codex review (P2): `docker-publish` appends `$IMAGE:latest` to its
+/// tag list for *any* `push` event, so EVERY bad tagged release — not just a
+/// first one — leaves `ghcr.io/hagaletechnologies/manta:latest` pointing at
+/// the withdrawn image, while README's install command is
+/// `docker run …:latest`. The rollback section must therefore say that
+/// `:latest` is republished on every tag push, and must give both exits:
+/// re-point it at the last good image when one exists, delete it when none
+/// does. Asserted on those two structural markers rather than on whole
+/// sentences, so the section can be reworded without false-failing.
+#[test]
+fn release_runbook_rollback_always_handles_latest() {
+    let runbook = read_repo_file(RELEASE_RUNBOOK);
+    let rollback = flatten(markdown_section(&runbook, "## If the release is wrong"));
+
+    assert!(
+        rollback.contains("on *every* real tag push"),
+        "{RELEASE_RUNBOOK}'s rollback section must state that `:latest` is \
+         republished on *every* real tag push, not only the first — \
+         otherwise a reader unwinding the second or a later release will \
+         reasonably assume `:latest` was untouched and leave the bad image \
+         serving README's `docker run` command. Section was:\n{rollback}"
+    );
+    assert!(
+        rollback.contains(r#"docker push "$image:latest""#),
+        "{RELEASE_RUNBOOK}'s rollback section must show how to re-point \
+         `:latest` at the last good image (`docker push \"$IMAGE:latest\"`); \
+         nothing in the pipeline does it for you, since a workflow_dispatch \
+         publish never writes `:latest`. Section was:\n{rollback}"
+    );
+    assert!(
+        rollback.contains("delete the `latest` version"),
+        "{RELEASE_RUNBOOK}'s rollback section must also cover the case with \
+         no earlier good image to re-point at — deleting the `latest` \
+         version in the package UI — so `:latest` is never left serving a \
+         withdrawn release. Section was:\n{rollback}"
+    );
+}
