@@ -94,6 +94,20 @@ struct Word {
     /// non-exempt callsign spot after a type change alone inflated its
     /// rep count to 2 (MAN-28 round 9 review).
     last_reps: u32,
+    /// Set once this word's power-step (`<call> T`, MAN-37) candidacy has
+    /// been burned by the coarse CQ/DE framing guard. Guard-private, and
+    /// deliberately NOT the general `attempted` flag: `attempted` is also
+    /// set by any named-pattern evaluation of the same word, so gating the
+    /// `SuppressionCounts::power_step_guard` counter on it silently missed
+    /// real suppressions whenever some other pattern had already touched
+    /// the word without spotting it -- e.g. "CQ K5ARH T", where
+    /// `CQ_CALL_RE` marks `K5ARH` attempted one boundary early as an
+    /// unspotted `Cq` candidate (reps = 1 < 2), so the repetition-exempt
+    /// Beacon occurrence the guard then discarded was counted as zero
+    /// (MAN-48, Codex review on PR #90). Whether the guard suppressed an
+    /// occurrence is a property of the guard alone, so it needs its own
+    /// per-occurrence bit.
+    power_step_suppressed: bool,
 }
 
 /// A non-allowlisted Beacon-type candidate that has passed every
@@ -226,6 +240,32 @@ pub struct SuppressionCounts {
     /// evidence the physical signal ended, but with no successor
     /// track_id to migrate the evidence to either (round 9).
     pub pending_beacon_lost_to_eviction: u64,
+    /// Power-step beacon occurrences (MAN-37 `<call> T`) discarded by the
+    /// coarse whole-window CQ/DE framing guard -- see `context::parse`'s own
+    /// docs for why that guard is deliberately coarse. Counted once per
+    /// OCCURRENCE, on the first burn of that occurrence: `try_spot`
+    /// re-discovers and re-burns the same occurrence on every word boundary
+    /// until the triggering token ages out of the 16-word window, so counting
+    /// per burn call would report one missed beacon many times over (MAN-48,
+    /// deferred from Codex review on PR #65, round 9).
+    ///
+    /// "Once per occurrence" is tracked by `Word::power_step_suppressed`, a
+    /// bit private to this guard, NOT by the general `Word::attempted` flag:
+    /// a word can already be `attempted` because some other pattern
+    /// evaluated it and produced no spot (e.g. "CQ K5ARH T", where
+    /// `CQ_CALL_RE` offers `K5ARH` as a `Cq` candidate that fails the
+    /// two-repetition gate one boundary before the guard discards the
+    /// repetition-exempt Beacon candidate), and gating on `attempted` made
+    /// exactly those real, silent losses read as zero (Codex review on PR
+    /// #90). Every occurrence this guard discards is counted whatever else
+    /// happened to the same decoded word -- the Beacon classification was
+    /// thrown away either way, which is what this metric measures -- with one
+    /// exception: an occurrence already evaluated AS a Beacon before the
+    /// guard appeared (a clean "K5ARH T" that spotted, then a bare CQ/DE
+    /// arriving before it ages out) is re-burned but not counted, because the
+    /// guard destroyed no beacon candidacy there (Codex review on PR #90,
+    /// round 10). See `burn_suppressed_power_step_candidate`.
+    pub power_step_guard: u64,
 }
 
 pub struct Validator {
@@ -623,21 +663,57 @@ impl Validator {
     /// stale, already-suppressed match's callsign could get bound to a
     /// brand-new, unrelated word decoded later that merely shares the same
     /// callsign string (Codex review on PR #65, round 9).
+    ///
+    /// The first burn of an occurrence also counts it against
+    /// `SuppressionCounts::power_step_guard` (ARCHITECTURE §8: every
+    /// suppressed item is counted). The gate for that is the guard's own
+    /// `Word::power_step_suppressed` bit, not the general `attempted` flag:
+    /// `attempted` is shared with named-pattern evaluation, so a word some
+    /// other pattern had already touched without spotting it ("CQ K5ARH T")
+    /// had its very real guard suppression counted as zero (MAN-48, Codex
+    /// review on PR #90). `attempted` is still SET here -- that's what makes
+    /// the suppression survive the triggering token aging out, as described
+    /// above -- it just no longer decides whether to count.
+    ///
+    /// A word whose Beacon candidacy was ALREADY evaluated before the guard
+    /// appeared (`last_spot_type == Some(Beacon)`) is burned but NOT counted:
+    /// a clean "K5ARH T" resolves and emits, and only then does a bare CQ/DE
+    /// enter the rolling window and make this guard re-discover the same,
+    /// already-processed occurrence. Burning it is still right -- it stops
+    /// the occurrence re-spotting once the triggering token ages out -- but
+    /// the guard cost the operator no beacon there, so counting it would
+    /// report a miss that never happened and inflate the metric on exactly
+    /// the windows the guard handled well (MAN-48, Codex review on PR #90,
+    /// round 10). Only the power-step family and `BEACON_RE` ever produce
+    /// `Beacon`, and both mean the same thing here: this word's beacon
+    /// classification already got its evaluation.
     fn burn_suppressed_power_step_candidate(
         &mut self,
         track_id: u32,
         exact_seq: u64,
         involved_max_seq: u64,
     ) {
-        let Some(track) = self.tracks.get_mut(&track_id) else {
-            return;
+        let first_suppression = {
+            let Some(track) = self.tracks.get_mut(&track_id) else {
+                return;
+            };
+            let Some(word) = track.words.iter_mut().find(|w| w.seq == exact_seq) else {
+                return;
+            };
+            let involved_max_seq = involved_max_seq.max(word.seq);
+            // An occurrence whose Beacon candidacy was already evaluated
+            // before the guard appeared lost nothing to the guard -- see
+            // this function's own docs.
+            let already_processed = word.last_spot_type == Some(SpotType::Beacon);
+            let first_suppression = !word.power_step_suppressed && !already_processed;
+            word.power_step_suppressed = true;
+            word.attempted = true;
+            word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
+            first_suppression
         };
-        let Some(word) = track.words.iter_mut().find(|w| w.seq == exact_seq) else {
-            return;
-        };
-        let involved_max_seq = involved_max_seq.max(word.seq);
-        word.attempted = true;
-        word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
+        if first_suppression {
+            self.suppression_counts.power_step_guard += 1;
+        }
     }
 
     fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {

@@ -854,3 +854,196 @@ fn power_step_beacon_with_unmapped_exact_range_is_discarded_not_resolved_by_text
          standalone K5ARH by text, got {spots:?}"
     );
 }
+
+/// MAN-48 (deferred from Codex review on PR #65, round 9): the coarse CQ/DE
+/// guard used `\b`-delimited tokens, so punctuation glued to a decoded word
+/// ("DE/NOISE", "-CQ") satisfied it and suppressed -- and `Validator`
+/// permanently burned -- a perfectly valid power-step occurrence, losing the
+/// beacon outright if the transmission ended there. The framing token must be
+/// a complete decoded word.
+#[test]
+fn a_glued_cq_de_substring_does_not_suppress_a_power_step_beacon() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["DE/NOISE", "W1AW", "T"];
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    // A non-allowlisted Beacon candidate is never emitted before
+    // TrackClosed (round 7 redesign).
+    spots.extend(v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    }));
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
+        "W1AW must spot as Beacon -- \"DE/NOISE\" is one garbled decoded word, \
+         not the bare DE framing token the guard looks for, got {spots:?}"
+    );
+}
+
+/// MAN-48 (deferred from Codex review on PR #65, round 9). ARCHITECTURE §8:
+/// "Every dropped/evicted/suppressed item is counted. No silent loss anywhere
+/// in the pipeline." A power-step occurrence the coarse CQ/DE guard burns is
+/// permanently discarded with no spot, so it must be counted -- otherwise the
+/// deliberately coarse guard's missed-beacon rate is invisible to an
+/// operator. Exactly ONCE per occurrence: `try_spot` re-discovers and
+/// re-burns the same occurrence on every word boundary for as long as the
+/// triggering token stays in the 16-word window (~15 times here), so a naive
+/// increment inside the burn would report one missed beacon as fifteen.
+#[test]
+fn power_step_guard_suppressions_are_counted_once_per_occurrence() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    // "DX" (not a bare "CQ K5ARH") is deliberate: it's the round-1
+    // motivating case (see any_bare_cq_anywhere_suppresses_the_power_step_
+    // fallback) specifically because "DX" breaks CQ_CALL_RE's adjacency
+    // requirement, so K5ARH's word is untouched by any named pattern here --
+    // the power-step guard is the ONLY thing that ever marks it attempted.
+    // The case where a named pattern DID also touch the word ("CQ K5ARH T")
+    // is the next test's job; both must count exactly one suppression.
+    let words = ["CQ", "DX", "K5ARH", "T"];
+    run(&transmission_events(1, &words, 0), &mut v);
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        1,
+        "the burned K5ARH occurrence must be counted once"
+    );
+
+    // 14 more words: the guard keeps firing (and re-burning the same
+    // occurrence) on every boundary until CQ (and DX) finally age out of
+    // the window.
+    let filler: Vec<String> = (1..=14).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    run(&transmission_events(1, &filler_refs, 100_000), &mut v);
+
+    let counts = v.suppression_counts();
+    assert_eq!(
+        counts.power_step_guard, 1,
+        "re-burning the SAME occurrence on later boundaries must not recount it"
+    );
+    assert_eq!(counts.blocklist, 0);
+    assert_eq!(counts.notch, 0);
+}
+
+/// MAN-48 (Codex review on PR #90). The counter must be gated on
+/// guard-specific per-occurrence state, NOT on the general `Word::attempted`
+/// flag: `attempted` is shared with named-pattern evaluation, so a word some
+/// other pattern already *attempted without spotting* would slip through
+/// uncounted. "CQ K5ARH T" is exactly that shape -- `CQ_CALL_RE` offers
+/// `K5ARH` as a `Cq` candidate at the "K5ARH" boundary, which marks the word
+/// attempted and then fails the two-repetition gate (reps = 1 < 2, and `Cq`
+/// is not repetition-exempt), so no spot goes out. One boundary later the
+/// CQ/DE guard discards the repetition-exempt Beacon candidate for the same
+/// word. That beacon is permanently lost and nothing was ever spotted for
+/// it, so it must be counted exactly once.
+#[test]
+fn a_previously_attempted_but_unspotted_word_still_counts_its_suppression() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let spots = run(&transmission_events(1, &["CQ", "K5ARH", "T"], 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "nothing can spot here -- Cq fails the repetition gate and the \
+         repetition-exempt Beacon candidate is guard-suppressed, got {spots:?}"
+    );
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        1,
+        "the guard discarded a real beacon occurrence; a prior unspotted \
+         attempt by CQ_CALL_RE must not hide it"
+    );
+}
+
+/// MAN-48: counting stays once-per-occurrence even when another pattern
+/// spotted the same decoded word. "CQ K5ARH K5ARH T" spots K5ARH as Cq via
+/// CQ_CALL_RE in the same `try_spot` pass that burns its power-step
+/// candidacy -- the Beacon classification was still thrown away, which is
+/// what the metric measures, so it counts (once), and the Cq spot is
+/// unaffected. Making the count conditional on whether some *other* pattern
+/// happened to succeed is precisely the coupling Codex's PR #90 finding
+/// rejected.
+#[test]
+fn a_spotted_word_still_counts_its_guard_suppression_once() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let words = ["CQ", "K5ARH", "K5ARH", "T"];
+    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "K5ARH must still spot as Cq, got {spots:?}"
+    );
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        1,
+        "the Beacon candidacy for the trailing K5ARH was discarded by the guard"
+    );
+}
+
+/// MAN-48: a clean beacon window trips no guard at all, so nothing is
+/// counted -- the counter must not read as "suppressed" on the happy path.
+#[test]
+fn an_unsuppressed_power_step_beacon_counts_nothing() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let mut spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    // A non-allowlisted Beacon candidate is never emitted before
+    // TrackClosed (round 7 redesign).
+    spots.extend(v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    }));
+    assert_eq!(spots.len(), 1);
+    assert_eq!(v.suppression_counts().power_step_guard, 0);
+}
+
+/// MAN-48 (Codex review on PR #90, round 10). The counter measures beacons
+/// the guard *lost*, so an occurrence whose Beacon candidacy was already
+/// evaluated -- and spotted -- BEFORE any bare CQ/DE entered the window is
+/// not a loss at all. "K5ARH T" resolves and emits cleanly; when a bare
+/// "CQ" then arrives before those words age out of the 16-word window, the
+/// guard re-discovers the same occurrence and burns it (which is still
+/// correct -- it stops the occurrence re-spotting once the CQ ages out),
+/// but counting it would report a missed beacon the operator in fact
+/// received.
+#[test]
+fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    // Round 7 redesign: a non-allowlisted Beacon candidate is captured
+    // (setting word.last_spot_type = Some(Beacon), exactly the state the
+    // guard's own already_processed check looks for below), not emitted,
+    // until TrackClosed -- so this is empty here, not the eventual spot.
+    assert!(
+        spots.is_empty(),
+        "must be captured, not yet resolved, got {spots:?}"
+    );
+
+    // A bare CQ now enters the rolling window while "K5ARH T" is still in
+    // it, so the guard fires and re-burns the already-captured occurrence.
+    run(&transmission_events(1, &["CQ", "DX"], 100_000), &mut v);
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        0,
+        "the beacon was already captured before the guard appeared, so the \
+         guard suppressed nothing"
+    );
+
+    // The captured candidate must still resolve at the track's true
+    // close -- the later guard re-burn (which only marks
+    // power_step_suppressed, never touches pending_beacons) must not
+    // have destroyed it.
+    let spots = v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    });
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "the captured beacon must still resolve at true close, got {spots:?}"
+    );
+}
