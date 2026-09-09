@@ -264,6 +264,14 @@ pub fn decode_samples(
     // own output latency (the 1 Hz `TrackMeta` cadence, or §5's mark quorum
     // for a first character). Pointing an operator at detector thresholds for
     // that second case is actively misleading.
+    //
+    // Review round 3: the *prefix* has to split too. "no signal found" is
+    // the one thing that is demonstrably untrue of a promoted track -- the
+    // detector found a signal, held it above `on_snr_db` and confirmed it;
+    // only the decoder had nothing to say before it closed. Opening that
+    // branch with "no signal found" contradicts its own body ("N track(s)
+    // promoted") and is exactly the misdirection the split exists to stop,
+    // so the promoted branch leads with what actually happened.
     if events.is_empty() {
         let promoted = tm.promoted_count();
         if promoted == 0 {
@@ -274,11 +282,12 @@ pub fn decode_samples(
             );
         }
         bail!(
-            "no signal found: {total_hops} hops processed and {promoted} track(s) \
-             promoted above detector.on_snr_db, but none emitted before closing -- a \
-             promoted track needs a further ~1 s of decoding to reach its first 1 Hz \
-             TrackMeta, or enough marks for a first character (SPEC §2.4/§5); this is \
-             decoder-output latency, not a detector-threshold problem"
+            "signal detected but nothing decoded: {total_hops} hops processed and \
+             {promoted} track(s) promoted above detector.on_snr_db, but none emitted \
+             before closing -- a promoted track needs a further ~1 s of decoding to \
+             reach its first 1 Hz TrackMeta, or enough marks for a first character \
+             (SPEC §2.4/§5); this is decoder-output latency, not a detector-threshold \
+             problem"
         );
     }
     let report_track_id = select_report_track(&events);
