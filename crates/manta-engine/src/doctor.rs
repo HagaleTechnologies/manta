@@ -18,24 +18,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A run whose median `TrackMeta.snr_2500_db` sits at or below this reads
-/// as noise-floor chatter rather than a real signal. NOT a SPEC-defined
-/// value -- a doctor-local heuristic, calibrated against the real-hardware
-/// runs in docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md, where every
-/// track opened against band noise alone (no confirmed spot, an antenna
-/// that really was hearing real HF energy elsewhere in the same session)
-/// topped out at -0.9 dB. 0.0 dB is a deliberately conservative line above
-/// that observed ceiling, not a tight fit to it -- retune if it
-/// misclassifies a real run.
+/// A run whose STRONGEST `TrackMeta.snr_2500_db` (the max, not the median --
+/// see `verdict()`) sits at or below this reads as noise-floor chatter
+/// rather than a real signal. NOT a SPEC-defined value -- a doctor-local
+/// heuristic, calibrated against the real-hardware runs in
+/// docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md, where every track
+/// opened against band noise alone (no confirmed spot, an antenna that
+/// really was hearing real HF energy elsewhere in the same session) topped
+/// out at -0.9 dB. 0.0 dB is a deliberately conservative line above that
+/// observed ceiling, not a tight fit to it -- retune if it misclassifies a
+/// real run.
 pub const NOISE_FLOOR_SNR_DB: f32 = 0.0;
 
 /// `doctor()`'s classification of a run, from cheapest/most-damning signal
 /// to most reassuring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Verdict {
-    /// Not one `TrackMeta` event the whole run -- the detector never even
-    /// opened a track. Check the antenna, the gain, and that the tuned
-    /// passband actually overlaps where you expect signal.
+    /// No decoder evidence at all the whole run -- no `TrackMeta`, no
+    /// `CharDecoded`, no confirmed spot. The detector never even opened a
+    /// track. Check the antenna, the gain, and that the tuned passband
+    /// actually overlaps where you expect signal.
     NoSignal,
     /// Tracks opened, but every one reads at or below `NOISE_FLOOR_SNR_DB`
     /// and none produced a confirmed spot -- looks like noise-floor
@@ -55,8 +57,9 @@ impl Verdict {
     pub fn summary(&self) -> &'static str {
         match self {
             Verdict::NoSignal => {
-                "NO_SIGNAL -- no track ever opened. Check antenna, gain, and that the tuned \
-                 passband overlaps where you expect signal."
+                "NO_SIGNAL -- no decoder evidence at all (no track, no decoded character, no \
+                 spot). Check antenna, gain, and that the tuned passband overlaps where you \
+                 expect signal."
             }
             Verdict::NoisyNoDecode => {
                 "NOISY_NO_DECODE -- tracks opened but every one reads at or below the noise \
@@ -87,11 +90,14 @@ pub struct DoctorReport {
     /// updated -- a proxy for how much detector activity there was, not a
     /// distinct-track count; see `tracks_closed` for that).
     pub track_meta_count: usize,
-    /// Number of `TrackClosed` events seen -- the number of distinct
-    /// tracks the detector opened and later closed during the run. High
-    /// churn (many tracks, each short-lived) over a short window is itself
-    /// a signal: real CW holds a track open for as long as the operator is
-    /// sending, while noise tends to open and close constantly.
+    /// Number of `TrackClosed` events seen. `TrackManager` only emits
+    /// `TrackClosed` for a track that produced at least one other event
+    /// before closing (`has_emitted`, MAN-19, `track.rs`) -- an unpromoted
+    /// CANDIDATE, or a promoted track merged/evicted before its first
+    /// `process_hops` pass, closes with no event at all. So this counts
+    /// *eventful* tracks that closed, not every detector candidate opened
+    /// during the run -- it undercounts exactly the short-lived noise
+    /// churn it's meant to help surface.
     pub tracks_closed: usize,
     pub snr_db_min: Option<f32>,
     pub snr_db_max: Option<f32>,
@@ -111,15 +117,27 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn verdict(&self) -> Verdict {
-        if self.track_meta_count == 0 {
-            return Verdict::NoSignal;
-        }
+        // Checked before the track_meta_count==0 case below: TrackMeta is
+        // only emitted periodically (`SpeedUpdate`-adjacent cadence in
+        // track.rs), so a short track can decode a char -- or, allowlisted,
+        // even confirm a spot -- and close before its first TrackMeta
+        // update ever lands. A confirmed spot or decoded character is
+        // direct decoder-pipeline evidence and must never be reported as
+        // NoSignal just because TrackMeta happened not to land in time.
         if self.spots_confirmed > 0 {
             return Verdict::Decoding;
         }
-        match self.snr_db_median {
-            Some(median) if median <= NOISE_FLOOR_SNR_DB => Verdict::NoisyNoDecode,
-            _ => Verdict::WeakNoDecode,
+        if self.track_meta_count == 0 && self.chars_decoded == 0 {
+            return Verdict::NoSignal;
+        }
+        // Based on the STRONGEST track seen (max), not the median: a
+        // wideband run can have several noise-floor tracks alongside one
+        // real above-threshold carrier, which would otherwise average out
+        // to a median at or below the noise floor and hide the one real
+        // signal that was actually observed.
+        match self.snr_db_max {
+            Some(max) if max > NOISE_FLOOR_SNR_DB => Verdict::WeakNoDecode,
+            _ => Verdict::NoisyNoDecode,
         }
     }
 }
@@ -131,6 +149,16 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Some(values[values.len() / 2])
 }
+
+/// Minimum accepted `--duration`. `listen()`'s fixed ~2s startup
+/// calibration read loop (`CALIBRATION_SECONDS`, private to `listen.rs`)
+/// isn't stop-aware -- it reads and analyzes that window regardless of
+/// `stop`, so a shorter requested duration would silently overrun it while
+/// still reporting the shorter number back. Comfortably above that 2s
+/// floor, not a tight fit to it. Kept local to doctor rather than plumbed
+/// into `listen()` itself, since ordinary `manta listen` has no duration
+/// bound to enforce in the first place.
+pub const MIN_DURATION: Duration = Duration::from_secs(3);
 
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot
 /// stream into a `DoctorReport` instead of printing or serving it. Reuses
@@ -144,17 +172,32 @@ pub fn doctor(
 ) -> Result<DoctorReport> {
     manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
+    if duration < MIN_DURATION {
+        anyhow::bail!(
+            "--duration must be at least {}s -- listen()'s fixed startup calibration window \
+             isn't stop-aware, so a shorter duration would silently overrun it",
+            MIN_DURATION.as_secs()
+        );
+    }
 
     let sample_rate_hz = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
+    // Set right after `listen()` returns (below), whether that's because
+    // `duration` elapsed or because the source hit EOF/an error early --
+    // lets the watchdog thread wake and exit immediately instead of
+    // sleeping out the rest of `duration` before `watchdog.join()` can
+    // return, which would otherwise make a short-input or early-error run
+    // block for the full requested duration regardless.
+    let listen_done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = listen_done.clone();
     let start = Instant::now();
 
     const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
     let watchdog = std::thread::spawn(move || {
-        while start.elapsed() < duration {
+        while start.elapsed() < duration && !watchdog_done.load(Ordering::Relaxed) {
             let remaining = duration.saturating_sub(start.elapsed());
             std::thread::sleep(SAMPLE_INTERVAL.min(remaining.max(Duration::from_millis(1))));
         }
@@ -188,6 +231,8 @@ pub fn doctor(
         },
         |_spot| spots_confirmed += 1,
     );
+    let observed_duration = start.elapsed();
+    listen_done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
     result?;
 
@@ -202,7 +247,7 @@ pub fn doctor(
     Ok(DoctorReport {
         sample_rate_hz,
         center_freq_hz,
-        duration: start.elapsed(),
+        duration: observed_duration,
         track_meta_count,
         tracks_closed,
         snr_db_min,
@@ -274,12 +319,12 @@ mod tests {
     #[test]
     fn doctor_reports_no_signal_on_digital_silence() {
         let fs = manta_input::TARGET_RATE_HZ;
-        let silence = vec![0.0f32; fs as usize * 2];
+        let silence = vec![0.0f32; fs as usize * 4];
         let src: Box<dyn IqSource> = Box::new(
             AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(silence, fs)))
                 .unwrap(),
         );
-        let report = doctor(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
+        let report = doctor(src, &PipelineConfig::default(), Duration::from_secs(3)).unwrap();
         assert_eq!(report.verdict(), Verdict::NoSignal);
         assert_eq!(report.track_meta_count, 0);
         assert_eq!(report.spots_confirmed, 0);
@@ -336,5 +381,90 @@ mod tests {
             spots_confirmed: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
+    }
+
+    /// Regression: a wideband run with several noise-floor tracks (pulling
+    /// the median down) alongside one real above-threshold carrier must
+    /// still classify as WeakNoDecode, not NoisyNoDecode -- verdict() must
+    /// key off the strongest track observed (max), not the median.
+    #[test]
+    fn verdict_uses_the_strongest_track_not_the_median() {
+        let report = DoctorReport {
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: 14_025_000.0,
+            duration: Duration::from_secs(10),
+            track_meta_count: 20,
+            tracks_closed: 15,
+            snr_db_min: Some(-8.0),
+            snr_db_max: Some(12.0),
+            snr_db_median: Some(-6.0),
+            chars_decoded: 300,
+            distinct_chars: 3,
+            spots_confirmed: 0,
+        };
+        assert_eq!(report.verdict(), Verdict::WeakNoDecode);
+    }
+
+    /// Regression: TrackMeta is only emitted periodically, so a short
+    /// track can decode characters (or even confirm an allowlisted spot)
+    /// and close before its first TrackMeta update ever lands. That must
+    /// not read as NoSignal -- direct decode evidence exists.
+    #[test]
+    fn verdict_does_not_report_no_signal_when_chars_decoded_without_track_meta() {
+        let report = DoctorReport {
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: 0.0,
+            duration: Duration::from_secs(3),
+            track_meta_count: 0,
+            tracks_closed: 0,
+            snr_db_min: None,
+            snr_db_max: None,
+            snr_db_median: None,
+            chars_decoded: 4,
+            distinct_chars: 3,
+            spots_confirmed: 0,
+        };
+        assert_ne!(report.verdict(), Verdict::NoSignal);
+    }
+
+    #[test]
+    fn doctor_rejects_a_duration_shorter_than_startup_calibration() {
+        let start = Instant::now();
+        let result = doctor(
+            v1_source(),
+            &PipelineConfig::default(),
+            Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "doctor() with a too-short --duration took {:?} -- it must reject before running \
+             the pipeline for the requested (too-short) duration",
+            start.elapsed()
+        );
+    }
+
+    /// Regression: the watchdog must not keep the whole call blocked for
+    /// the full requested duration once `listen()` itself has already
+    /// returned (EOF on a short file, well before `duration` elapses).
+    #[test]
+    fn doctor_returns_promptly_when_the_source_ends_well_before_duration() {
+        let start = Instant::now();
+        // v1_source() is a few seconds of audio at most; --duration asks
+        // for far longer than that, so a fixed-duration watchdog with no
+        // early-exit signal would block this call for the full 30s.
+        let report = doctor(
+            v1_source(),
+            &PipelineConfig::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "doctor() took {:?} against a source that ended well within its 30s --duration -- \
+             the watchdog must exit as soon as listen() returns, not sleep out the full duration",
+            start.elapsed()
+        );
+        assert!(report.duration < Duration::from_secs(10));
     }
 }
