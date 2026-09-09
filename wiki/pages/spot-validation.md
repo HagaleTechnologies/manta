@@ -14,6 +14,7 @@ verified:
 links:
   - decode-chain
   - spot-output-contract
+  - live-hardware-field-testing
 ---
 Decoded CW text is noisy, so validation — not decoding — is what makes a spot trustworthy. Per track, over a rolling text window, `manta-spot` parses CQ/DE context, checks callsign plausibility against a bundled cty.dat prefix list, optionally cross-checks the SCP super-check-partial list, requires a call to repeat before first spot, and dedupes/aggregates re-spots. Two MAN-28 exemptions cut across that and are easy to miss: a BEACON-tagged message is exempt from the repetition requirement, and an operator-allowlisted callsign is exempt from the *requirement to obtain* a context match (the parse itself always still runs, and a real match still sets the type), from the grammar/cty.dat check *and* from the repetition requirement. The full pipeline and its parameters are described in ARCHITECTURE §6 — this page is the map, not the spec.
 
@@ -29,4 +30,10 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 
 ## Why it is shaped this way
 
+<<<<<<< HEAD
 The asymmetry is deliberate: false spots (bogus callsigns) are the failure mode that discredits the whole network, so the repetition gate and cty.dat rejection are tuned to make bogus spots rare — a V8/V8w pass criterion is *0 bogus callsigns*. The two exemptions are kept narrow for the same reason: BEACON lifts only the repetition gate (cty.dat rejection still applies), and the allowlist is opt-in per callsign by the operator who owns the consequences. Validated spots flow to [[spot-output-contract]].
+=======
+The asymmetry is deliberate: false spots (bogus callsigns) are the failure mode that discredits the whole network, so the repetition gate and cty.dat rejection are tuned to make bogus spots rare — a V8/V8w pass criterion is *0 bogus callsigns*. Validated spots flow to [[spot-output-contract]].
+
+The repetition gate assumes a bogus decode is random noise that won't repeat identically. A deterministic front-end artifact breaks that assumption — it produces the *same* garbled decode at a fixed frequency every time, so it repeats and passes the gate. Field-confirmed against real hardware (mechanism still under investigation, not yet tied to a specific tracked bug): [[live-hardware-field-testing]].
+>>>>>>> f48e9800d98b621505b97b59b890937054d6170e
