@@ -80,9 +80,12 @@ fn v1_passes_end_to_end_from_wav() {
     assert!((wpm - 20.0).abs() < 3.0, "wpm {wpm}");
 }
 
-/// SPEC v2 §8.4 Task 12: V1 with `--engine hsmm`, at the same SPEC §7 bars
-/// as the legacy copy above (CER < 0.02, freq err <= 10 Hz, single track).
-/// Measured 2026-09-09 as part of the stage-2 gate -- see
+/// SPEC v2 §8.4 Task 12: V1 with `--engine hsmm`. Checks only CER < 0.02
+/// and freq err <= 10 Hz -- unlike the legacy copy above, this does NOT
+/// re-check the single-track invariant or the non-gated "free bonus" WPM
+/// check (already failing on CER; no point expanding assertion scope on
+/// a known-failing, `#[ignore]`d test). Measured 2026-09-09 as part of
+/// the stage-2 gate -- see
 /// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md for the numbers.
 #[test]
 #[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]

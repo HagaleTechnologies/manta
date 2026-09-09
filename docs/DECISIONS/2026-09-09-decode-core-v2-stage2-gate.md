@@ -21,6 +21,13 @@ vectors decode to nothing at all; V8w decodes 0/34 strong pileup signals).
 
 ## 1. Oracle (SPEC v2 §8.3), B2/K5TR real recording, 221 windows
 
+**Corpus**: `B2_20251129_000000_7080kHz.wav` (`crates/manta-testkit/audio-corpus/`,
+git-ignored, 690 MB, ~15 minutes, 192 kS/s stereo IQ, 2025-11-29 CQ WW CW
+contest capture centered near 7.080 MHz) with its `.json` sidecar, scored
+against `ground-truth/B2_20251129_000000_7080kHz.rbn.csv` (26,803 lines
+including a header row -- RBN's raw daily-dump format for this
+recording's window).
+
 `cargo run --release -p manta-cli -- oracle <B2 wav> <B2 rbn csv> --engine
 <engine> --jsonl <out>`. `n` = 221 both engines (unchanged fixture set).
 
@@ -56,9 +63,12 @@ enough to clear the raised stage-2 bar (60 %/40 %, vs stage-1's 45 %/no
 
 `cargo run --release -p manta-cli -- decode --json --engine <engine> <B2
 wav>` (legacy: 743.8 s real / 634.8 s user / 88.5 s sys; hsmm: 889.9 s
-real / 2501.6 s user / 87.5 s sys -- hsmm uses ~2.8x the wall time and
-~3.9x the CPU time of legacy on this 15-minute recording, consistent
-with the CPU-budget overage measured in §4 below), scored with
+real / 2501.6 s user / 87.5 s sys -- hsmm uses ~1.2x the wall time
+(889.9/743.8) and ~3.9x the CPU time (2501.6/634.8) of legacy on this
+~15-minute recording. hsmm's own user-time/real-time ratio here (2501.6/889.9
+= ~2.8x) shows it parallelizing across multiple cores, not a
+comparison to legacy. Both the elevated CPU time and the parallelism
+are consistent with the CPU-budget overage measured in §6 below), scored with
 `scripts/score-against-rbn.py --capture-start 2025-11-29T00:00:00Z
 --sample-rate-hz 192000`.
 
@@ -80,15 +90,23 @@ HEAD's `scripts/score-against-rbn.py` (`02863cd`) was run locally,
 uncommitted, against both report JSONs -- it does not need `--spotter`;
 K5TR-only is obtained by pre-filtering the truth CSV to `callsign ==
 K5TR` rows before scoring (274 rows, 2 excluded by grammar -> 209 unique
-call+kHz bins, vs 1,451 all-RBN bins after 126 grammar-excluded).
+call+kHz bins, vs 1,441 all-RBN bins after 126 grammar-excluded).
 
 | metric | legacy | hsmm |
 |---|---|---|
 | manta spots emitted | 197 | 501 |
 | **K5TR-only recall** | 28/209 = **13.40 %** | 52/209 = **24.88 %** |
-| **K5TR-only precision** | 28/197 = **14.21 %** | 52/501 = **10.38 %** |
+| **K5TR-only precision (lower bound)** | 28/197 = **14.21 %** | 52/501 = **10.38 %** |
 | **all-RBN recall** | 59/1441 = **4.09 %** | 125/1441 = **8.68 %** |
 | **all-RBN precision** | 59/197 = **29.95 %** | 125/501 = **24.95 %** |
+
+"K5TR-only precision" is a **lower bound, not true precision**: it
+divides K5TR-attributed true positives by the *total* spot count (197 /
+501), not by K5TR's own true+false positives -- so a correctly-decoded
+spot that K5TR simply never heard (e.g. a station too weak for K5TR's
+own antenna/receiver, or on a band K5TR wasn't skimming that moment)
+counts as a false positive here even though it isn't one against the
+full RBN set. All-RBN precision above is the real precision figure.
 
 Legacy's all-RBN 29.9 % precision / 4.1 % recall matches this project's
 prior historical measurement (`docs/DECISIONS/2026-09-09-decoder-recall-research.md`
@@ -103,7 +121,7 @@ oracle numbers -- but it does so by emitting 2.5x as many spots (501 vs
 ROADMAP.md, is the formal recall/precision gate; §8.4 only gates the
 oracle/V/VR/determinism/bench numbers above and below), but it's the
 real side-by-side comparison Task 12 asked for: hsmm finds more real
-signals at the cost of more false spots, at a CPU cost §4 already shows
+signals at the cost of more false spots, at a CPU cost §6 already shows
 is 4.25x over budget.
 
 ## 3. V1-V10 (SPEC v1 §7) with `--engine hsmm`
@@ -114,7 +132,10 @@ under `legacy` for unrelated, already-filed bugs are explicitly IN SCOPE
 here, not exempted. New `_with_hsmm_engine` test functions added to
 `crates/manta-cli/tests/golden_v1.rs`, `golden_v2_v3.rs`,
 `golden_v7_v9_v10.rs`, `golden_v8_v8w.rs` at the same SPEC §7 bars as
-each vector's existing legacy copy.
+each vector's existing legacy copy, with one exception: V1's hsmm copy
+checks only CER and freq error (not the legacy copy's additional
+single-track invariant, nor its non-gated "free bonus" WPM check) --
+see that test's doc comment.
 
 | vector | gate | measured (hsmm) | pass? |
 |---|---|---|---|
@@ -122,7 +143,7 @@ each vector's existing legacy copy.
 | V2 | CER <= 0.01, wpm 35+/-2 | CER 0.0244 | **FAIL** |
 | V3 | CER <= 0.05 | CER 0.0270 | pass |
 | V4 | CER <= 0.05 | CER 0.0210 | pass |
-| V5 | CER <= 0.20, ZL2XYZ validated <= 90 s | CER 1.375 (empty/garbage decode) | **FAIL** |
+| V5 | CER <= 0.20, ZL2XYZ validated <= 90 s | CER 1.375 (over-generated/garbled decode) | **FAIL** |
 | V6 | CER <= 0.10, survives past midpoint | CER 0.0794 | pass |
 | V7 | 2 tracks, each CER <= 0.05, freq err <= 15 Hz | signal 0 passes; signal 1 CER 0.0540 (need <= 0.05) | **FAIL** (0.004 over) |
 | V8 | >= 45/50 validated, 0 bogus | 40/50 validated, 0 bogus | **FAIL** |
@@ -139,7 +160,7 @@ X X X K ..."` against expected `"CQ CQ DE G4XXX G4XXX K ..."`) -- a pure
 word/char-gap misclassification (every inter-character gap read as an
 inter-word gap) on this Farnsworth-spaced vector, not garbled content.
 This is the clearest single "word boundary" failure kind in the whole
-run (§5 below).
+run (§4 below).
 
 V7's failure is a 0.004 near-miss (CER 0.0540 vs 0.05 gate) on one of two
 co-existing signals -- the closest thing to a genuine pass in the fail
@@ -160,7 +181,7 @@ filter is the actual command that runs these 9 tests).
 |---|---|---|---|---|---|
 | VR1 (contest-40) | CER <= 0.05, WPM 40+/-2, word boundary >= 0.95 | **1.0000 (empty decode)** | 12.16 (vs true 40) | 0.0091 | **FAIL** |
 | VR2 (contest-45) | CER <= 0.10, WPM 45+/-3 | **1.0000 (empty decode)** | 47.12 (would pass alone) | 0.0079 | **FAIL** |
-| VR3 (deep-keying) | CER <= 0.02, dit 40ms+/-10% | **1.0000 (empty decode)** | 33.54 (dit 35.8ms, would pass alone) | 0.0128 | **FAIL** |
+| VR3 (deep-keying) | CER <= 0.02, dit 40ms+/-10% | **1.0000 (empty decode)** | 33.54 (dit 35.78ms, itself 4.22ms outside the +/-4ms/40ms bound -- fails the dit check too, not just CER) | 0.0128 | **FAIL** |
 | VR4 (hard-edges) | CER <= 0.10 | 0.9972 (1 char decoded of 360) | 32.70 | 0.0274 | **FAIL** |
 | VR5 (co-channel) | signal A CER <= 0.10, 0 bogus calls | 0.1299 | -- | -- | **FAIL** (0.030 over) |
 | VR6a (weighting 2.6) | CER <= 0.05 | 0.0324 | 29.54 | 1.0000 | **pass** |
@@ -238,10 +259,10 @@ PASS.**
 Task 11, cited here per the brief -- not re-run): **10.625 s mean
 [10.620 s, 10.630 s] for 300 tracks x 10 s**, against the SPEC v2 §8.4
 budget of <= 2.5 s wall (<= 25 % of real time) -- a **4.25x overage**.
-Filed as MAN-171 (not this task's job to fix). The B2 full-decode wall
-times in §2 above (legacy 743.8 s / hsmm 889.9 s for the same 15-minute
-recording, ~2.8x wall-time, ~3.9x CPU-time) are consistent with this
-being a real, present cost on real audio, not a synthetic-benchmark
+Filed as MAN-171 (not this task's job to fix). The B2 full-decode times
+in §2 above (legacy 743.8 s / hsmm 889.9 s wall, ~1.2x; 634.8 s / 2501.6 s
+user/CPU, ~3.9x, for the same ~15-minute recording) are consistent with
+this being a real, present cost on real audio, not a synthetic-benchmark
 artifact. **CPU-budget sub-gate: FAIL** (already established, cited not
 re-measured).
 
@@ -259,8 +280,9 @@ SPEC v2 §8.4 stage 2 requires ALL of: oracle `as_word >= 60 %`, `framed
 | determinism | pass |
 | CPU budget | FAIL (4.25x over, MAN-171) |
 
-**Overall: FAIL.** Four of six sub-gates fail, two of them (oracle,
-V/VR correctness) by a wide margin, not a near-miss. Hsmm is a
+**Overall: FAIL.** Five of six sub-gates fail (only determinism passes),
+three of them (oracle x2, V/VR correctness) by a wide margin, not a
+near-miss. Hsmm is a
 substantial, real improvement over `legacy` on every headline metric
 measured (oracle as_word/framed roughly doubled, RBN recall roughly
 doubled), but is not yet ready to be the default engine, and does not
@@ -288,9 +310,11 @@ yet clear the specific bars SPEC v2 §8.4 set for promotion.
 - `README.md`/`AGENTS.md`/`CLAUDE.md` Status section updated with the
   measured facts (default engine unchanged; hsmm implemented, measured,
   not yet promoted) -- see those files' diffs, not restated here.
-- `ROADMAP.md` M2's VR1-VR8 entries are unchanged by this task (already
-  normative gates per the docs PR that shipped this plan; this doc is
-  the measurement against them, per Step 0).
+- `ROADMAP.md` M2's VR1-VR8 entry gets a measured-status line added
+  (3/9 pass, gate not yet cleared, citing this doc); its **normative
+  status is unchanged** by this task -- VR1-VR8 were already gates per
+  the docs PR that shipped this plan, still are, and this task measures
+  against them rather than deciding whether they count, per Step 0.
 - No MAN-171-style new ticket filed for the correctness gaps in this
   doc: SPEC v2 §8.4/this plan's Task 12 is itself the tracking record
   for "hsmm doesn't clear stage 2 yet"; a follow-up implementation task
