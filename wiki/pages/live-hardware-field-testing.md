@@ -61,22 +61,27 @@ noise that won't repeat identically — but a deterministic decode artifact
 at a fixed frequency repeats identically every time and passes the gate
 just as well. Field-confirmed 2026-09-09: 29/29 confirmed spots in an
 overnight 40m session shared one signature — confidence pinned to the
-low end (~0.12-0.17), `snr_db` pinned to nearly the same value session-
-wide, often-implausible WPM — and clustered at a handful of fixed
-frequencies near the input passband edge across separate capture windows.
-A dial-shift test (retune, see if the artifact moves with the new
-passband edge) is the fast way to tell this from a real signal. **Not
-confirmed as MAN-7/103** (that's a per-channel WPM-*estimation* bug on a
-real signal, not a detection/spot-generation bug) — see
-`docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md` Finding 2
-for the full reasoning; treat this as a separate, still-untracked
-front-end/passband-edge defect until proven otherwise.
+low end (~0.12-0.17), often-implausible WPM, and (most tellingly)
+clustered at a handful of fixed frequencies recurring across separate,
+non-overlapping capture windows rather than randomly distributed. Only
+one of those clusters is dial-shift-confirmed as tracking the input
+passband edge specifically; the others sit well inside the passband with
+an unconfirmed mechanism. A dial-shift test (retune, see if a cluster
+moves with the new passband edge) is the fast way to check a given
+cluster. **Not confirmed as MAN-7/103** (that's a per-channel WPM-
+*estimation* bug on a real signal, not a detection/spot-generation bug)
+— see `docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md`
+Finding 2 for the full reasoning; treat this as a separate, still-
+untracked defect until proven otherwise.
 
-Before trusting a spot: check whether `snr_db` sits within about a dB of
-a value that recurs across many spots in the same session (not just
-whether it's >0 dB — `snr_db` is a 2500 Hz-reference-bandwidth
-conversion, so a negative value doesn't by itself mean no signal), and
-treat a suspiciously round/low confidence value as another warning sign.
+**`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
+track hits `envelope.rs`'s rail-collapse clamp (`e_hi >= 2*e_lo`,
+SPEC §3.2), which puts a hard floor of `20*log10(2) - 14.3 = -8.2794 dB`
+on `snr_db` regardless of cause — so a value pinned near that floor is
+completely expected for both this artifact *and* a real weak signal, and
+proves nothing either way. Frequency recurrence and confidence are the
+actual warning signs to check; don't lean on `snr_db` to distinguish real
+from artifact.
 
 ## Setup gotchas
 

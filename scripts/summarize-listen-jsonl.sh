@@ -10,6 +10,14 @@
 # tell you happened, not what it was.
 set -euo pipefail
 
+# A JSON number always uses '.' as its decimal separator regardless of
+# host locale, but `sort -n` and `awk` interpret numbers using the process
+# locale -- on a host whose LC_NUMERIC uses a different separator, the
+# numeric sort/average below can silently misorder or miscompute negative
+# SNRs (Codex review, PR #153, round 3). Force the C locale for this
+# script's own numeric processing.
+export LC_ALL=C
+
 command -v jq >/dev/null 2>&1 || {
   echo "ERROR: jq is required (install it before running this script)." >&2
   exit 2
@@ -61,9 +69,14 @@ fi
 echo
 echo "confirmed spots:"
 jq -c 'select(has("spot")) | .spot' "$file" | jq -r '
-  # Round to the nearest Hz, not kHz -- the channelizer spacing is 93.75 Hz,
-  # so whole-kHz rounding collapses ~10 distinct channel positions into one
-  # displayed value and hides exactly the clustering/dial-shift movement
-  # this script exists to help spot (Codex review, PR #153).
-  "  \(.callsign)\tfreq=\((.freq_hz | round) / 1000)kHz\tsnr_db=\(.snr_db | round)\tconfidence=\(.confidence)\twpm=\(.wpm | round)\ttype=\(.spot_type)"
+  # Round frequency to the nearest Hz, not kHz -- the channelizer spacing is
+  # 93.75 Hz, so whole-kHz rounding collapses ~10 distinct channel positions
+  # into one displayed value and hides exactly the clustering/dial-shift
+  # movement this script exists to help spot (Codex review, PR #153).
+  # Every other field (including snr_db and wpm, previously rounded, and
+  # track_id/sample_ts, previously omitted) is printed at full precision so
+  # this is genuinely the full Spot content, not a lossy subset (Codex
+  # review, PR #153, round 3) -- correlate a spot back to its TrackMeta/
+  # TrackPromoted/TrackClosed events in the same capture via track_id.
+  "  \(.callsign)\tfreq=\((.freq_hz | round) / 1000)kHz\tsnr_db=\(.snr_db)\tconfidence=\(.confidence)\twpm=\(.wpm)\ttype=\(.spot_type)\ttrack_id=\(.track_id)\tsample_ts=\(.sample_ts)"
 '
