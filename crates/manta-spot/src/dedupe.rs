@@ -31,6 +31,21 @@ impl Dedupe {
         (freq_hz / FREQ_BUCKET_HZ).round() as i64
     }
 
+    /// Read-only peek at the currently-recorded last-spot timestamp for
+    /// this `(callsign, freq_hz)` identity, if any -- lets a caller with
+    /// its own delayed/deferred observation detect when that observation
+    /// is already stale relative to newer activity, without itself
+    /// mutating dedupe state. Codex review on PR #154, round 8:
+    /// `manta-spot::Validator`'s deferred Beacon candidates (resolved at
+    /// `TrackClosed`, possibly well after capture) must never call
+    /// `should_emit` with a `sample_ts` older than what's already
+    /// recorded here -- that would silently roll the watermark backward
+    /// and let a later real spot escape the suppression window early.
+    pub(crate) fn last_sample_ts(&self, callsign: &str, freq_hz: f64) -> Option<u64> {
+        let key = (callsign.to_string(), Self::bucket(freq_hz));
+        self.last.get(&key).map(|s| s.sample_ts)
+    }
+
     /// True if a spot for this `(callsign, freq_hz)` should be emitted now
     /// -- no prior spot, the suppression window has elapsed, SNR improved
     /// by at least `SNR_IMPROVEMENT_DB`, or the spot type changed. Records
