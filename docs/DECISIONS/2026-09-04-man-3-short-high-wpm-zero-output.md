@@ -396,6 +396,64 @@ unaffected by construction.
   `manta-cli` surfaces it verbatim to the operator, which is the reason to
   make it truthful.
 
+## Round-7 review refinements (Codex, PR #96)
+
+Three further findings, all against round 6's own fixes.
+
+1. **The track cap is split per lifecycle class (P2).** Round 6's
+   `(promoted, current_snr_db)` ranking inside *one* shared cap protected
+   ACTIVE tracks, but starved every newcomer: once `track_cap` promoted
+   tracks are open, a freshly spawned CANDIDATE is over the cap on its
+   birth hop and is by construction the class minimum, so it is evicted
+   immediately -- and again on every subsequent rise. It can never
+   accumulate `confirm_hops`, so no signal, however strong, can take a
+   weak or hanging incumbent's slot, and the promoted-vs-promoted branch
+   was only reachable by hand-building a track map in a test. The two
+   classes now have independent bounds: `track_cap` (promoted/decoder-
+   owning tracks -- the cap ARCHITECTURE §4 is really about) and
+   `candidate_cap` (unconfirmed CANDIDATEs, default 500), each thinned by
+   evicting its own lowest-`current_snr_db` member (`evict_class`). Round
+   6's property is preserved *more* strongly -- a candidate is never
+   evicted in an ACTIVE track's place, because the classes no longer share
+   a budget at all -- while a candidate that confirms then contests
+   `track_cap` on SNR like any other promoted track. Total open tracks stay
+   bounded by `track_cap + candidate_cap` (1000 by default); a candidate
+   costs per-hop FSM bookkeeping only (no decoder, no pool slot) and lives
+   at most `confirm_window_hops`. Covered by
+   `a_stronger_signal_confirms_and_replaces_a_weaker_incumbent_at_the_cap`,
+   which drives the whole sequence through the real `step_hop` path rather
+   than a hand-built map, plus
+   `candidate_cap_evicts_the_quietest_candidate_not_a_promoted_track` and
+   `a_loud_candidate_never_costs_a_quiet_active_track_its_slot`. SPEC §2.4
+   updated.
+2. **The soak report's promotion/close counts survive a mid-chunk panic
+   (P2).** Round 6 refreshed `final_promoted_count` after every completed
+   chunk, which still lost every promotion made by the chunk that
+   *panicked* (a panic on a later hop inside `process_hops`, or while
+   ingesting a later event, unwinds before the snapshot). The channelizer
+   and `TrackManager` are now constructed in `soak_with_metrics`'s own
+   frame and merely borrowed by the `catch_unwind` closure, so `tm`
+   outlives the unwind and the authoritative counts are read from it
+   *after* the catch, at whatever value the panicking hop left them -- no
+   per-chunk snapshotting at all. `peak_active_tracks` deliberately stays
+   an in-loop sampled maximum: `finish()` empties the track map, so a
+   post-catch `active_track_count()` reads 0 on the success path. The
+   remaining gap is not reachable through this crate's public API: a panic
+   injected mid-`process_hops` would need a fault hook inside
+   `TrackManager`, so the guarantee here is structural (state that outlives
+   the unwind) rather than covered by a fault-injection test.
+3. **The zero-promotion diagnostic describes the cumulative rule (P2).**
+   `decode_samples`'s "no track was ever promoted" message still offered
+   only "below `detector.on_snr_db`, or shorter than the ~2.05 s
+   warmup+confirm floor" -- neither of which need be true after part 2:
+   a signal far longer than 2.05 s whose marks each clear the threshold can
+   still fail to accumulate `confirm_hops` rise hops inside any one
+   candidate's `confirm_window_hops` window. The message now names the
+   accumulation condition itself and quotes the real worst-case floor
+   (warmup + one full window, ~2.20 s at the defaults), computed from the
+   live `DetectorConfig` rather than hard-coded so it cannot drift from the
+   configuration it describes.
+
 ## SPEC / wiki cross-references
 
 - `docs/SPEC-decode-core.md` §2.4's CANDIDATE transition rows and §9's
@@ -406,8 +464,10 @@ unaffected by construction.
   the two sections would otherwise apply confirmation twice and withhold
   `rise` for exactly the short high-WPM dits this ticket is about.
 - `docs/SPEC-decode-core.md` §2.4's eviction row and §2.5's merge
-  lifecycle rank carry the two round-6 refinements above (eviction class
-  ordering; `(promoted, decoder_hops)`).
+  lifecycle rank carry the round-6 refinements above
+  (`(promoted, decoder_hops)`), with §2.4's eviction row and deviation
+  paragraph rewritten again for round 7's per-class bounds
+  (`track_cap` / `candidate_cap`).
 - `wiki/pages/detector-tracks.md` points at this document for both the
   CANDIDATE-confirmation deviation and the `select_report_track` reporting
   rule.

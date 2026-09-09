@@ -34,8 +34,28 @@ pub struct DetectorConfig {
     pub gc_hops: u64,
     /// SPEC §2.1: track creation inhibited for this many hops (2000ms) after start.
     pub warmup_hops: u64,
-    /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
+    /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks -- i.e.
+    /// the *decoder* cap. Only promoted (ACTIVE/HANG) tracks own a decoder
+    /// and count against it; unconfirmed CANDIDATEs are bounded separately
+    /// by `candidate_cap`.
     pub track_cap: usize,
+    /// MAN-3 review round 7 (not SPEC §9): max concurrent unconfirmed
+    /// CANDIDATE tracks, bounded independently of `track_cap`.
+    ///
+    /// Round 6 ranked lifecycle class ahead of SNR inside one shared cap so
+    /// a loud candidate that goes on to expire `Unconfirmed` could not
+    /// displace an ACTIVE track mid-decode. With a shared cap that ordering
+    /// has a fatal corollary: once `track_cap` promoted tracks are open,
+    /// every newly spawned candidate is over the cap on its birth hop and
+    /// is evicted immediately, on every subsequent rise -- so it can never
+    /// accumulate `confirm_hops`, and a genuinely stronger signal can never
+    /// take a weak or hanging incumbent's slot. Splitting the bound keeps
+    /// both properties: candidates never compete with decoders (they are
+    /// evicted only against each other, lowest current SNR first), and a
+    /// candidate that *does* confirm then contests `track_cap` on SNR like
+    /// any other promoted track. Total open tracks stay bounded by
+    /// `track_cap + candidate_cap`.
+    pub candidate_cap: usize,
 }
 
 impl Default for DetectorConfig {
@@ -77,6 +97,12 @@ impl Default for DetectorConfig {
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
+            // Same order as `track_cap`: a candidate costs only per-hop
+            // FSM bookkeeping (no decoder, no rayon pool slot), and it
+            // lives at most `confirm_window_hops` (200 ms) before closing
+            // `Unconfirmed`, so this bounds the transient population under
+            // a wideband burst without ever throttling real detections.
+            candidate_cap: 500,
         }
     }
 }
@@ -830,42 +856,67 @@ impl TrackManager {
         ever_emitted_closed
     }
 
-    /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
-    /// eviction, unconfirmed CANDIDATEs first.
+    /// SPEC §2.4/ARCHITECTURE §4: lowest-current-SNR eviction, applied
+    /// within each lifecycle class against that class's own bound --
+    /// `track_cap` for promoted (ACTIVE/HANG) tracks, `candidate_cap` for
+    /// unconfirmed CANDIDATEs.
     ///
-    /// Review round 6: MAN-3 widened the confirmation rule so a CANDIDATE
-    /// now lingers in `self.tracks` for up to `confirm_window_hops` (75)
-    /// hops after losing the rise condition, instead of dying on the first
-    /// non-rise hop. Near `track_cap` -- or under a wideband transient that
-    /// spawns many staggered candidates -- ranking purely on instantaneous
-    /// SNR therefore let a high-SNR candidate that goes on to expire
-    /// `Unconfirmed` displace an ACTIVE track and destroy a real decode,
-    /// which is this ticket's own failure mode arriving by another route.
-    /// Lifecycle class is ranked ahead of SNR: every unpromoted candidate
-    /// is evicted before any ACTIVE/HANG track, and SNR only orders tracks
-    /// within the same class. A promoted track can still be evicted once
-    /// the cap is full of promoted tracks, exactly as before.
+    /// Review round 6 made this one shared cap ranked by lifecycle class
+    /// (candidates evicted first, however loud), because MAN-3's widened
+    /// confirmation window keeps a CANDIDATE alive for up to
+    /// `confirm_window_hops` (75) hops after it stops rising, and under a
+    /// single cap a candidate that goes on to expire `Unconfirmed` could
+    /// otherwise displace an ACTIVE track mid-decode.
     ///
-    /// Determinism (SPEC §8): `self.tracks` is a `BTreeMap`, so `iter()` is
-    /// ascending by id and `min_by` keeps the FIRST minimum -- an exact tie
-    /// on (class, SNR) always evicts the lowest id.
+    /// Review round 7: with a single cap that class ordering starves
+    /// newcomers outright. Once `self.tracks` holds `track_cap` promoted
+    /// tracks, *every* freshly spawned candidate is over the cap on its
+    /// birth hop and is the class minimum, so it is evicted immediately --
+    /// and again on every subsequent rise. It can never accumulate
+    /// `confirm_hops`, so no signal, however strong, can ever take a weak
+    /// or hanging incumbent's slot, and the promoted-vs-promoted branch is
+    /// unreachable through the per-hop path. Splitting the bound keeps
+    /// round 6's property (a candidate is never evicted in an ACTIVE
+    /// track's place -- the two classes no longer share a budget at all)
+    /// without the starvation: candidates are bounded only against each
+    /// other, and a candidate that confirms then contests `track_cap` on
+    /// SNR like any other promoted track, so a stronger newcomer *does*
+    /// replace the weakest incumbent. Total open tracks stay bounded by
+    /// `track_cap + candidate_cap`.
     fn evict_over_cap(&mut self) -> Vec<u32> {
         let mut evicted = Vec::new();
-        while self.tracks.len() > self.cfg.track_cap {
-            let evict_rank = |t: &Track| {
-                let promoted = matches!(t.state(), LifecycleState::Active | LifecycleState::Hang);
-                (promoted, t.current_snr_db)
-            };
+        // Candidates first: a promotion inside this same batch would
+        // otherwise be judged against a candidate population that is about
+        // to shrink anyway, and evicting the cheap class first never
+        // changes which promoted track loses (the two bounds are now
+        // independent).
+        self.evict_class(false, self.cfg.candidate_cap, &mut evicted);
+        self.evict_class(true, self.cfg.track_cap, &mut evicted);
+        self.recompute_ownership();
+        evicted
+    }
+
+    /// Evict the lowest-`current_snr_db` members of one lifecycle class
+    /// until at most `cap` of them remain. `promoted_class` selects the
+    /// class: `true` = ACTIVE/HANG (decoder-owning), `false` = unconfirmed
+    /// CANDIDATE.
+    ///
+    /// Determinism (SPEC §8): `self.tracks` is a `BTreeMap`, so `iter()` is
+    /// ascending by id and `min_by` keeps the FIRST minimum -- an exact SNR
+    /// tie always evicts the lowest id.
+    fn evict_class(&mut self, promoted_class: bool, cap: usize, evicted: &mut Vec<u32>) {
+        let in_class = |t: &Track| {
+            matches!(t.state(), LifecycleState::Active | LifecycleState::Hang) == promoted_class
+        };
+        let mut remaining = self.tracks.values().filter(|t| in_class(t)).count();
+        while remaining > cap {
             let loser = *self
                 .tracks
                 .iter()
-                .min_by(|(_, a), (_, b)| {
-                    let (pa, sa) = evict_rank(a);
-                    let (pb, sb) = evict_rank(b);
-                    pa.cmp(&pb).then(sa.partial_cmp(&sb).unwrap())
-                })
+                .filter(|(_, t)| in_class(t))
+                .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
                 .map(|(id, _)| id)
-                .unwrap();
+                .expect("remaining > cap implies at least one member of this class");
             self.close_counts.record(CloseReason::Evicted);
             // MAN-19: only report as `TrackClosed`-worthy if it actually
             // emitted a real event -- see `step_hop`'s matching comment.
@@ -876,9 +927,8 @@ impl TrackManager {
             {
                 evicted.push(loser);
             }
+            remaining -= 1;
         }
-        self.recompute_ownership();
-        evicted
     }
 
     /// Process one `Channelizer::process()` slice: sequential per-hop
@@ -1373,11 +1423,13 @@ mod tests {
     }
 
     /// Review round 6 (P2): MAN-3's widened window keeps a CANDIDATE alive
-    /// for up to 75 hops after it stops rising, so at `track_cap` a loud
-    /// candidate that will expire `Unconfirmed` could out-live an ACTIVE
-    /// track under pure lowest-SNR eviction and destroy a real decode.
+    /// for up to 75 hops after it stops rising, so a loud candidate that
+    /// will expire `Unconfirmed` must never cost an ACTIVE track its
+    /// decoder slot. Round 7 keeps that property by giving the two classes
+    /// separate bounds: a saturated `track_cap` is not a reason to evict a
+    /// candidate at all, so both survive here.
     #[test]
-    fn eviction_drops_a_loud_candidate_before_a_quiet_active_track() {
+    fn a_loud_candidate_never_costs_a_quiet_active_track_its_slot() {
         let cfg = DetectorConfig {
             track_cap: 1,
             ..DetectorConfig::default()
@@ -1396,10 +1448,52 @@ mod tests {
             tm.tracks.contains_key(&1),
             "the ACTIVE track must survive a louder unconfirmed candidate"
         );
-        assert!(!tm.tracks.contains_key(&2), "the candidate must be evicted");
-        // The candidate never emitted, so it is not `TrackClosed`-worthy
-        // (MAN-19) and must not appear in the returned ids.
+        assert!(
+            tm.tracks.contains_key(&2),
+            "the candidate is under `candidate_cap` and must be left alone to \
+             accumulate confirm_hops -- evicting it here is the round-7 starvation bug"
+        );
         assert!(evicted.is_empty(), "got {evicted:?}");
+        assert_eq!(
+            tm.close_counts().evicted,
+            0,
+            "nothing was over its own bound; nothing may be evicted"
+        );
+    }
+
+    /// Review round 7 (P2): the candidate population has its own bound, and
+    /// it is spent on the quietest candidate -- never on a promoted track,
+    /// however weak that track is.
+    #[test]
+    fn candidate_cap_evicts_the_quietest_candidate_not_a_promoted_track() {
+        let cfg = DetectorConfig {
+            track_cap: 1,
+            candidate_cap: 1,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 0.0, cfg, DecodeConfig::default());
+        let mut active = promoted_track(1, 500);
+        active.current_snr_db = 7.0;
+        active.has_emitted = true;
+        let mut loud = Track::new(2, 100, &tm.cfg);
+        loud.current_snr_db = 40.0;
+        let mut quiet = Track::new(3, 200, &tm.cfg);
+        quiet.current_snr_db = 20.0;
+        tm.tracks.insert(1, active);
+        tm.tracks.insert(2, loud);
+        tm.tracks.insert(3, quiet);
+
+        tm.evict_over_cap();
+        assert!(
+            tm.tracks.contains_key(&1) && tm.tracks.contains_key(&2),
+            "the ACTIVE track and the loudest candidate must both survive, got {:?}",
+            tm.tracks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !tm.tracks.contains_key(&3),
+            "the quietest candidate is the one the candidate bound is spent on"
+        );
+        assert_eq!(tm.close_counts().evicted, 1);
     }
 
     /// A misconfigured window shorter than `confirm_hops` would make
@@ -1617,16 +1711,16 @@ mod tests {
         assert_eq!(tm.tracks.len(), 2);
     }
 
-    /// SPEC §2.4 eviction, with MAN-3's round-6 lifecycle-class deviation:
-    /// the cap still holds against a second, *stronger* signal, but the
-    /// track it spends the eviction on is the unconfirmed CANDIDATE, not
-    /// the ACTIVE track already decoding. Before that deviation the loud
-    /// newcomer evicted the incumbent on SNR alone -- and since MAN-3's
-    /// confirmation window keeps a candidate alive for up to 75 hops after
-    /// it stops rising, a candidate that never confirms at all could take
-    /// a real decode down with it.
+    /// SPEC §2.4 eviction through the ordinary per-hop path, with MAN-3's
+    /// round-7 split bounds: the *decoder* cap still holds at one track,
+    /// but a candidate born while it is saturated is no longer evicted on
+    /// its birth hop (round 6's shared cap did exactly that, on every
+    /// rise, so no newcomer could ever accumulate `confirm_hops` and the
+    /// promoted-vs-promoted eviction branch was unreachable outside a
+    /// hand-built map). A genuinely stronger signal now confirms and takes
+    /// the weaker incumbent's slot.
     #[test]
-    fn track_cap_evicts_an_unconfirmed_candidate_before_an_active_track() {
+    fn a_stronger_signal_confirms_and_replaces_a_weaker_incumbent_at_the_cap() {
         let cfg = DetectorConfig {
             track_cap: 1,
             ..DetectorConfig::default()
@@ -1634,29 +1728,37 @@ mod tests {
         let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
-        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // strong, spawns first
-        for m in (250 * 15)..(250 * 15 + 25) {
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // spawns and promotes first
+        for m in (250 * 15)..(250 * 15 + 50) {
             tm.step_hop(&hop(m, power.clone()), m);
         }
         assert_eq!(tm.tracks.len(), 1);
-        power[40] = 1e-9 * 10f32.powf(25.0 / 10.0); // stronger second signal, over cap
-        for m in (250 * 15 + 25)..(250 * 15 + 50) {
+        assert_eq!(
+            tm.tracks.values().next().unwrap().state(),
+            LifecycleState::Active,
+            "the incumbent must have promoted before the cap is contested"
+        );
+        power[40] = 1e-9 * 10f32.powf(30.0 / 10.0); // stronger second signal
+        for m in (250 * 15 + 50)..(250 * 15 + 200) {
             tm.step_hop(&hop(m, power.clone()), m);
         }
+        let promoted: Vec<&Track> = tm
+            .tracks
+            .values()
+            .filter(|t| matches!(t.state(), LifecycleState::Active | LifecycleState::Hang))
+            .collect();
         assert_eq!(
-            tm.tracks.len(),
+            promoted.len(),
             1,
-            "cap=1 must hold even with a second strong signal"
+            "the decoder cap must still hold at one promoted track, got {:?}",
+            tm.tracks
+                .iter()
+                .map(|(id, t)| (*id, t.birth_channel, t.state()))
+                .collect::<Vec<_>>()
         );
-        let survivor = tm.tracks.values().next().unwrap();
         assert_eq!(
-            survivor.state(),
-            LifecycleState::Active,
-            "the incumbent must have promoted by the time the cap is contested"
-        );
-        assert!(
-            survivor.birth_channel == 10,
-            "the ACTIVE incumbent must survive an unconfirmed candidate, however loud"
+            promoted[0].birth_channel, 40,
+            "the stronger newcomer must be able to confirm and win the slot"
         );
         assert!(
             tm.close_counts().evicted >= 1,
@@ -1665,8 +1767,9 @@ mod tests {
         );
     }
 
-    /// The deviation above only reorders *classes*: with the cap full of
-    /// promoted tracks, SPEC §2.4's lowest-SNR rule is unchanged.
+    /// With the decoder cap full of promoted tracks, SPEC §2.4's
+    /// lowest-SNR rule is unchanged -- and it is the branch the test above
+    /// reaches through `step_hop`, not a hand-built state.
     #[test]
     fn track_cap_still_evicts_the_lowest_snr_among_promoted_tracks() {
         let cfg = DetectorConfig {

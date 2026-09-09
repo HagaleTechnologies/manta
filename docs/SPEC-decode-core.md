@@ -177,7 +177,7 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
-| any → CLOSED | eviction: track cap reached and this is the lowest-ranked track, ranked `(promoted, current_snr_db)` ascending — every unconfirmed CANDIDATE is evicted before any ACTIVE/HANG track, and SNR orders tracks within one class (counted in metrics, per ARCHITECTURE §4). **[DEVIATION — lifecycle class ranked ahead of ARCHITECTURE §4's literal lowest-SNR rule, per MAN-3]**, see below. |
+| any → CLOSED | eviction: this track's own lifecycle class is over *its* bound and this is the lowest-`current_snr_db` member of that class — promoted (ACTIVE/HANG) tracks are bounded by `track_cap`, unconfirmed CANDIDATEs by `candidate_cap`, and the two classes never compete for the same slot (counted in metrics, per ARCHITECTURE §4). **[DEVIATION — ARCHITECTURE §4's literal single lowest-SNR cap is split into one bound per lifecycle class, per MAN-3]**, see below. |
 
 All timers are hop-counted (integers), never wall-clock.
 
@@ -199,18 +199,31 @@ promotion hops are unchanged). See
 window-size derivation and the measured false-track/CPU-budget impact.
 
 **Eviction-order deviation (MAN-3).** The literal rule evicts the
-lowest-`current_snr_db` track regardless of lifecycle. That was safe while
-a CANDIDATE died on its first non-rise hop, but the confirmation deviation
-above keeps one alive for up to `confirm_window_hops` (75) hops after it
-stops rising — so at `track_cap`, or under a wideband transient that
-spawns many staggered candidates, a loud CANDIDATE that goes on to expire
-`Unconfirmed` could evict an ACTIVE track and destroy a real decode in
-progress. Ranking lifecycle class first keeps the cap's purpose (bounding
-concurrent decoders and track memory, ARCHITECTURE §4) while spending the
-eviction on the track with nothing to lose. Within a class the rule is
-unchanged, so a saturated cap of promoted tracks still evicts the weakest
-of them. Determinism: the track map is ordered by id and the first minimum
-wins, so an exact `(class, SNR)` tie always evicts the lowest id (§8).
+lowest-`current_snr_db` track regardless of lifecycle, out of one shared
+cap. That was safe while a CANDIDATE died on its first non-rise hop, but
+the confirmation deviation above keeps one alive for up to
+`confirm_window_hops` (75) hops after it stops rising — so at `track_cap`,
+or under a wideband transient that spawns many staggered candidates, a
+loud CANDIDATE that goes on to expire `Unconfirmed` could evict an ACTIVE
+track and destroy a real decode in progress. Ranking lifecycle class ahead
+of SNR *inside one shared cap* fixes that but starves the other side: with
+`track_cap` promoted tracks open, every newly spawned CANDIDATE is over
+the cap on its birth hop and is the class minimum, so it is evicted
+immediately and again on every subsequent rise — it can never accumulate
+`confirm_hops`, and no signal, however strong, can ever take a weak or
+hanging incumbent's slot. The implemented rule therefore gives each class
+its own bound: promoted (ACTIVE/HANG) tracks are capped at `track_cap`
+(the decoder cap ARCHITECTURE §4 is really about), unconfirmed CANDIDATEs
+at `candidate_cap`, and each class is thinned by evicting its own
+lowest-`current_snr_db` member. A CANDIDATE is thus never evicted in an
+ACTIVE track's place, and a CANDIDATE that *does* confirm then contests
+`track_cap` on SNR like any other promoted track, so a stronger newcomer
+replaces the weakest incumbent. Total open tracks stay bounded by
+`track_cap + candidate_cap`. Determinism: the track map is ordered by id
+and the first minimum wins, so an exact SNR tie always evicts the lowest
+id (§8). `candidate_cap` (default 500) is a `DetectorConfig` field outside
+§9's literal `[detector]` table, on the same footing as `track_cap` — see
+docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md pin 1.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 

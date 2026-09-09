@@ -142,6 +142,32 @@ pub fn soak_with_metrics(
     manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    // MAN-3 review round 7: the channelizer and the `TrackManager` are
+    // built HERE, in this frame, and only *borrowed* by the processing
+    // closure below -- they used to be constructed inside it. Anything
+    // owned by that closure is dropped by the unwind when the loop panics,
+    // so the counters it holds could only survive as snapshots copied out
+    // before each panic-free chunk boundary. That still lost every
+    // promotion made by the *failing* chunk itself (a panic on a later hop
+    // inside `process_hops`, or while ingesting a later event, unwinds
+    // before the copy) -- exactly the false-track-pressure evidence an
+    // unattended run needs most. With `tm` outliving `catch_unwind`, the
+    // authoritative counts are read from it after the catch, at whatever
+    // value the panicking hop left them, with no per-chunk snapshotting at
+    // all. Built before the watchdog is spawned so a construction failure
+    // returns without leaving that thread sleeping out `duration`.
+    let fs = src.sample_rate();
+    let center_freq_hz = src.center_freq_hz();
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut tm = TrackManager::new(
+        ch.n_channels(),
+        fs,
+        center_freq_hz,
+        cfg.detector,
+        cfg.decode.clone(),
+    );
+
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
     // MAN-19 review round 1: distinct from `stop` (watchdog -> processing
@@ -159,9 +185,7 @@ pub fn soak_with_metrics(
     let mut spot_count = 0usize;
     let mut track_closed_count = 0usize;
     let mut peak_active_tracks = 0usize;
-    let mut final_close_counts = CloseCounts::default();
     let mut gate_records_total = 0u64;
-    let mut final_promoted_count = 0u64;
     let mut last_sample = Instant::now();
 
     let watchdog = std::thread::spawn(move || {
@@ -190,8 +214,6 @@ pub fn soak_with_metrics(
         // only so a NaN/out-of-range ppm fails fast, same as soak.rs.
         manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let fs = src.sample_rate();
-        let center_freq_hz = src.center_freq_hz();
 
         let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
         let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
@@ -203,16 +225,7 @@ pub fn soak_with_metrics(
             }
             filled += n;
         }
-        let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-            .map_err(|e| anyhow::anyhow!(e))?;
         let hop = ch.hop() as u64;
-        let mut tm = TrackManager::new(
-            ch.n_channels(),
-            fs,
-            center_freq_hz,
-            cfg.detector,
-            cfg.decode.clone(),
-        );
         let mut validator = Validator::bundled(fs)
             .with_freq_correction_ppm(cfg.freq_correction_ppm)
             .map_err(|e| anyhow::anyhow!(e))?
@@ -266,19 +279,9 @@ pub fn soak_with_metrics(
             // just self.tracks.len().
             let active = tm.active_track_count();
             peak_active_tracks = peak_active_tracks.max(active);
-            // MAN-3 review round 6: kept current after every chunk, not
-            // only at the normal-success tail below. If the processing
-            // closure panics after tracks have promoted, unwinding skips
-            // that tail assignment entirely and the returned report reads
-            // `panicked: true` with `promoted_count: 0` -- erasing the
-            // very false-track-pressure evidence this metric was added to
-            // capture for unattended runs. Cheap: a u64 field read, same
-            // as `active_track_count()` above.
-            final_promoted_count = tm.promoted_count();
 
             if last_sample.elapsed() >= sample_interval {
                 last_sample = Instant::now();
-                final_close_counts = tm.close_counts();
                 let rss = peak_rss_bytes();
                 if start.elapsed() >= WARMUP {
                     worst_growth = worst_growth.max(rss.saturating_sub(baseline_rss));
@@ -289,7 +292,7 @@ pub fn soak_with_metrics(
                     events_emitted: event_count,
                     spots_emitted: spot_count,
                     active_tracks: active,
-                    close_counts: final_close_counts,
+                    close_counts: tm.close_counts(),
                     promoted_count: tm.promoted_count(),
                 });
             }
@@ -308,9 +311,7 @@ pub fn soak_with_metrics(
             }
             spot_count += validator.ingest(&ev).len();
         }
-        final_close_counts = tm.close_counts();
         gate_records_total = validator.gate_records_total();
-        final_promoted_count = tm.promoted_count();
         // MAN-19 review round 1: `worst_growth` was otherwise only ever
         // updated inside the periodic `sample_interval` branch above -- any
         // growth after the last tick (or the whole run, if
@@ -333,6 +334,18 @@ pub fn soak_with_metrics(
     let processing_end = Instant::now();
     done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
+
+    // MAN-3 review round 7: read straight off the surviving `tm` -- these
+    // are the only counters that are exact on the panic path too, because
+    // `tm` is not owned by the closure the unwind tore down. A promotion
+    // (or close) recorded on the very hop that panicked is still counted
+    // here; the previous per-chunk snapshot could only ever report the
+    // state as of the last chunk that *finished*. `peak_active_tracks`
+    // deliberately stays a sampled maximum: `finish()` empties
+    // `self.tracks`, so a post-catch `active_track_count()` reads 0 on the
+    // success path and is not a substitute for the in-loop sampling.
+    let final_close_counts = tm.close_counts();
+    let final_promoted_count = tm.promoted_count();
 
     let panicked = match result {
         Ok(Ok(())) => false,

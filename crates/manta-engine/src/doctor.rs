@@ -147,9 +147,11 @@ impl DoctorReport {
         // `tracks_promoted` is the detector's own ground truth, not a
         // decode-timing proxy (TrackMeta/CharDecoded/TrackClosed all
         // depend on the decoder getting further than mere promotion --
-        // e.g. TrackMeta needs ~1s of decoder init on top of the ~2.05s
-        // worst-case warmup+confirm-hops promotion latency, which a short
-        // --duration run can end before reaching at all). Promotion alone
+        // e.g. TrackMeta needs ~1s of decoder init on top of promotion
+        // latency -- ~2.05s at best (750 warmup hops + 19 rise hops) and
+        // up to ~2.20s when the 19 rise hops take a full
+        // `confirm_window_hops` window to accumulate (MAN-3), which a
+        // short --duration run can end before reaching at all). Promotion alone
         // is what "the detector found a candidate" means.
         if self.tracks_promoted == 0 {
             return Verdict::NoSignal;

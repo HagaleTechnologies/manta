@@ -314,13 +314,37 @@ pub fn decode_samples(
     // the stream -- so the split keys off `select_report_track`, which
     // returns `None` for exactly the "no *decoder* output anywhere"
     // condition `events.is_empty()` used to stand for.
+    //
+    // Review round 7: the zero-promotion message must describe the
+    // *cumulative* confirmation rule this ticket introduced, not the old
+    // consecutive-rise one. A keyed signal well past the old ~2.05 s floor
+    // can still promote nothing: each mark may clear `detector.on_snr_db`
+    // and yet never accumulate `confirm_hops` rise hops inside one
+    // candidate's `confirm_window_hops` window (sparse keying, a gate that
+    // decays between elements, or EOF arriving mid-window). Both the
+    // threshold and the accumulation condition are named, and the duration
+    // floor quoted is the real worst case -- warmup plus one full
+    // confirmation window -- derived from the live config rather than a
+    // hard-coded constant that drifts when the config does.
     let Some(report_track_id) = select_report_track(&events) else {
         let promoted = tm.promoted_count();
         if promoted == 0 {
+            let d = &cfg.detector;
+            // `Lifecycle::new` clamps a window shorter than the required
+            // count up to it; mirror that so the quoted numbers match the
+            // rule actually enforced.
+            let window_hops = d.confirm_window_hops.max(d.confirm_hops);
+            let window_ms = window_hops as f64 / manta_decode::FO_HZ * 1000.0;
+            let floor_s = (d.warmup_hops + window_hops) as f64 / manta_decode::FO_HZ;
+            let confirm_hops = d.confirm_hops;
             bail!(
                 "no signal found: {total_hops} hops processed, but no track was ever \
-                 promoted (SPEC §2.4) -- signal below detector.on_snr_db, or shorter \
-                 than the ~2.05 s warmup+confirm floor"
+                 promoted (SPEC §2.4) -- no candidate ever accumulated \
+                 {confirm_hops} rise hops above detector.on_snr_db within its \
+                 {window_hops}-hop ({window_ms:.0} ms) confirmation window (signal \
+                 below threshold, or keying too sparse to hold the gate for that \
+                 many hops), or the input ended before the ~{floor_s:.2} s \
+                 worst-case warmup-plus-confirmation floor"
             );
         }
         bail!(
