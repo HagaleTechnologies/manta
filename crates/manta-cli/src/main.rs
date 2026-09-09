@@ -918,6 +918,22 @@ struct SpotServer {
 /// the drain arm is the only arm those loops can still select. The worst
 /// case therefore really is one already-selected branch body plus
 /// `CLIENT_DRAIN_DEADLINE`, which is what the value below is sized for.
+///
+/// MAN-45 remediate (round-19 P1, re-raised against an earlier head): the
+/// "one branch body" half of that budget is now also asserted END-TO-END,
+/// not only arithmetically here --
+/// `telnet_acceptance::shutdown_bounds_live_writes_to_at_most_one_before_the_drain`
+/// queues a backlog, signals shutdown before the client task can wake, and
+/// asserts across repeated trials that at most ONE live spot write precedes
+/// the drain and that every queued spot is then delivered or counted. "At
+/// most one", not zero, is deliberate: a handler already parked in
+/// `select!` when shutdown fires evaluated its preconditions before the
+/// flag was set, so it can still take the live-spot arm once -- which is
+/// precisely the single branch body this deadline budgets for, above. See
+/// that test's own doc comment for what it does and does not prove (with
+/// fast localhost writes the unguarded build stays inside the bound too;
+/// exceeding it needs a client that has stopped reading, so each write runs
+/// the full `WRITE_TIMEOUT`).
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// How often the server runtime copies the engine's live track count into

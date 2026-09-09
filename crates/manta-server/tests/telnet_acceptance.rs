@@ -504,6 +504,89 @@ async fn shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
     );
 }
 
+/// MAN-45 (PR #63 round-19 P1 review finding, re-raised against an earlier
+/// head): once shutdown is pending, a backlogged client must not keep
+/// winning the live-spot arm. `tokio::select!` picks a RANDOM ready arm, so
+/// before the `if !shutdown.has_changed()` preconditions landed on every
+/// write-capable arm (`telnet::handle_client`'s live-spot and command-read
+/// arms, `json_stream`'s TCP and WS equivalents) a client with a backlog
+/// could perform an UNBOUNDED number of two-`WRITE_TIMEOUT` live writes
+/// after shutdown was signalled and before its own `CLIENT_DRAIN_DEADLINE`
+/// clock ever started -- which `SHUTDOWN_DRAIN_DEADLINE`'s
+/// `2 * WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE` model (manta-cli's `main.rs`)
+/// cannot cover at any constant value.
+///
+/// The invariant is AT MOST ONE live write after shutdown, not zero: the
+/// preconditions are evaluated when `select!` is entered, so a handler
+/// already parked in `select!` when shutdown fires can still take the
+/// live-spot arm once (both arms are ready and the pick is random) before
+/// the next trip through the loop disables it for good. One is exactly what
+/// the outer deadline budgets for.
+///
+/// Repeated independent trials because `select!` picks a random ready arm,
+/// so one trial only samples one coin flip. Measured honesty note, from
+/// running this test against a build with both of `handle_client`'s
+/// preconditions deleted: that build ALSO stays within the bound here
+/// (`delivered` came out 0 or 1 in every trial, the same distribution the
+/// fixed build produces). Reaching two or more post-shutdown live writes
+/// needs writes slow enough to matter -- a client that has stopped reading,
+/// so each write runs against `WRITE_TIMEOUT` -- which is a tens-of-seconds
+/// test this suite deliberately does not carry. So this locks the observable
+/// invariant the outer `SHUTDOWN_DRAIN_DEADLINE` model depends on (at most
+/// one live write precedes the drain, and every published spot is either
+/// delivered or counted); it is a guard against that invariant regressing,
+/// not a demonstration that the preconditions are load-bearing in this
+/// fast-write scenario.
+#[tokio::test]
+async fn shutdown_bounds_live_writes_to_at_most_one_before_the_drain() {
+    const TRIALS: usize = 16;
+    const QUEUED: usize = 4;
+
+    for trial in 0..TRIALS {
+        // Zero drain deadline so the trial resolves immediately: whatever
+        // the live arm did NOT write is abandoned and counted rather than
+        // slowly written out, which is what makes `delivered` the exact
+        // count of post-shutdown LIVE writes.
+        let (addr, bus, metrics, shutdown_tx, _tasks) =
+            spawn_server_with_drain_deadline(Duration::ZERO).await;
+        let (mut reader, _wr) = connect_and_login(addr).await;
+
+        // Published and signalled without an intervening await (this test
+        // runs on the current-thread runtime), so the client task first
+        // wakes with the whole backlog queued AND shutdown already set --
+        // the exact interleaving the finding describes.
+        for _ in 0..QUEUED {
+            bus.publish(sample_spot());
+        }
+        let _ = shutdown_tx.send(true);
+
+        let mut delivered = 0usize;
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => delivered += 1,
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            delivered <= 1,
+            "trial {trial}: at most one live spot write may precede the shutdown drain \
+             (the outer SHUTDOWN_DRAIN_DEADLINE budgets for exactly one), got {delivered}",
+        );
+        assert_eq!(
+            delivered
+                + metrics.spots_dropped_write_failed_total() as usize
+                + metrics.spots_dropped_shutdown_total() as usize,
+            QUEUED,
+            "trial {trial}: every published spot must be delivered or counted, never neither",
+        );
+    }
+}
+
 #[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
     let (addr, _bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
