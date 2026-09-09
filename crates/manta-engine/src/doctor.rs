@@ -137,7 +137,11 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
 /// the real pipeline verbatim (same channelizer, same `TrackManager`, same
 /// `Validator`) -- doctor never reimplements or approximates the DSP, it
 /// only observes the same event stream `listen --json` already exposes.
-pub fn doctor(src: Box<dyn IqSource>, cfg: &PipelineConfig, duration: Duration) -> Result<DoctorReport> {
+pub fn doctor(
+    src: Box<dyn IqSource>,
+    cfg: &PipelineConfig,
+    duration: Duration,
+) -> Result<DoctorReport> {
     manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -256,7 +260,12 @@ mod tests {
 
     #[test]
     fn doctor_reports_decoding_on_a_clean_golden_signal() {
-        let report = doctor(v1_source(), &PipelineConfig::default(), Duration::from_secs(5)).unwrap();
+        let report = doctor(
+            v1_source(),
+            &PipelineConfig::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(report.verdict(), Verdict::Decoding);
         assert!(report.spots_confirmed > 0);
         assert!(report.track_meta_count > 0);
@@ -267,7 +276,8 @@ mod tests {
         let fs = manta_input::TARGET_RATE_HZ;
         let silence = vec![0.0f32; fs as usize * 2];
         let src: Box<dyn IqSource> = Box::new(
-            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(silence, fs))).unwrap(),
+            AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(silence, fs)))
+                .unwrap(),
         );
         let report = doctor(src, &PipelineConfig::default(), Duration::from_secs(1)).unwrap();
         assert_eq!(report.verdict(), Verdict::NoSignal);
