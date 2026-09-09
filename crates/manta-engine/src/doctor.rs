@@ -147,7 +147,12 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
         return None;
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    Some(values[values.len() / 2])
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
+    }
 }
 
 /// Minimum accepted `--duration`. `listen()`'s fixed ~2s startup
@@ -466,5 +471,25 @@ mod tests {
             start.elapsed()
         );
         assert!(report.duration < Duration::from_secs(10));
+    }
+
+    /// Regression: an even-length input must average the two middle
+    /// values, not just take the upper-middle element -- `[-2.0, 1.0]`'s
+    /// true median is `-0.5`, not `1.0`.
+    #[test]
+    fn median_averages_the_middle_pair_for_even_length_input() {
+        assert_eq!(median(vec![-2.0, 1.0]), Some(-0.5));
+        assert_eq!(median(vec![1.0, -2.0]), Some(-0.5));
+        assert_eq!(median(vec![1.0, 2.0, 3.0, 4.0]), Some(2.5));
+    }
+
+    #[test]
+    fn median_returns_the_middle_element_for_odd_length_input() {
+        assert_eq!(median(vec![3.0, 1.0, 2.0]), Some(2.0));
+    }
+
+    #[test]
+    fn median_returns_none_for_empty_input() {
+        assert_eq!(median(vec![]), None);
     }
 }
