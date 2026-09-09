@@ -241,3 +241,112 @@ fn v6_passes_end_to_end_from_wav() {
         "no CharDecoded event past the render midpoint"
     );
 }
+
+// --- SPEC v2 §8.4 Task 12: `--engine hsmm` copies of V2/V3/V4/V5/V6, at
+// the same SPEC §7 bars as their legacy counterparts above. SPEC v2 §8.1
+// requires hsmm to clear V2/V5/V6 (the legacy-only-known limitations),
+// not just V3/V4. Measured 2026-09-09 -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md for the numbers
+// and #[ignore] rationale on each.
+
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v2_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v2();
+    let (report, manifest) = decode_report_with_args(&spec, &["--engine", "hsmm"]);
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.01,
+        "V2/hsmm char accuracy must be >= 99 % (CER <= 0.01), got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+    let wpm = report["wpm"].as_f64().unwrap();
+    assert!((wpm - 35.0).abs() < 2.0, "wpm {wpm}");
+}
+
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+#[test]
+fn v3_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v3();
+    let (report, manifest) = decode_report_with_args(&spec, &["--engine", "hsmm"]);
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.05,
+        "V3/hsmm char accuracy must be >= 95 % (CER <= 0.05), got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+}
+
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+#[test]
+fn v4_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v4();
+    let (report, manifest) = decode_report_with_args(&spec, &["--engine", "hsmm"]);
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.05,
+        "V4/hsmm char accuracy must be >= 95 % (CER <= 0.05), got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+}
+
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v5_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v5();
+    let (report, manifest) = decode_report_with_args(&spec, &["--engine", "hsmm"]);
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.20,
+        "V5/hsmm char accuracy must be >= 80 % (CER <= 0.20), got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+    let validated_ts = report["spots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["callsign"].as_str() == Some("ZL2XYZ"))
+        .map(|s| s["sample_ts"].as_u64().unwrap() as f64)
+        .expect("ZL2XYZ never validated as a spot");
+    assert!(
+        validated_ts <= 90.0 * manifest.fs,
+        "ZL2XYZ validated at {:.1} s, expected <= 90 s",
+        validated_ts / manifest.fs
+    );
+}
+
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+#[test]
+fn v6_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v6();
+    let (report, manifest) = decode_report_with_args(&spec, &["--engine", "hsmm"]);
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.10,
+        "V6/hsmm char accuracy must be >= 90 % (CER <= 0.10), got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+    let events = report["events"].as_array().unwrap();
+    let half_ts = (manifest.duration_s / 2.0 * manifest.fs) as u64;
+    let survives_past_half = events.iter().any(|ev| {
+        ev["event"].as_str() == Some("CharDecoded")
+            && ev["sample_ts"].as_u64().unwrap_or(0) > half_ts
+    });
+    assert!(
+        survives_past_half,
+        "no CharDecoded event past the render midpoint"
+    );
+}

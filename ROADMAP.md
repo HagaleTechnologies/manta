@@ -62,7 +62,11 @@ KiwiSDR input.
   mark on real 25–60 dB-deep signals), because none of V1–V10 exercises
   contest speed above 35 WPM with deep keying and hard edges together. VR
   vectors are a standing acceptance bar for every future decode-core
-  change, not a one-time gate for the v2 redesign.
+  change, not a one-time gate for the v2 redesign. **Measured against
+  `engine = "hsmm"` 2026-09-09** (SPEC v2 §8.4 Task 12,
+  `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`): 3/9 pass
+  (VR6a, VR6b, VR7), 6/9 fail (VR1–VR5, VR8) — this gate is **not yet
+  cleared**.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
   of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. **Neither
   leg is currently a resolved pass** — see

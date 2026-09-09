@@ -20,7 +20,12 @@ is still open**: Pi4 CPU-budget leg (also paused pending MAN-100 through
 MAN-113 landing in full, not just MAN-107-113 above — D6) and 24 h
 live-SDR soak are unmet — both need physical hardware not
 reachable from this environment.
-`manta-dsp::single`/`freqest` deprecated in place.
+`manta-dsp::single`/`freqest` deprecated in place. `decode.engine` default
+is still `legacy`; `hsmm` (MAN-166 decode-core-v2) is implemented and
+CLI-reachable but not promoted — stage-2 gate measured FAIL 2026-09-09
+(oracle as_word 56%/framed 32% vs required 60%/40%; 4/11 V-vectors, 3/9
+VR-vectors pass) — see
+docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 
 ## Documents (read in this order)
 

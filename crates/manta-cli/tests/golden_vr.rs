@@ -4,12 +4,14 @@
 //! Farnsworth-free spacing) -- the gap that let the real-signal timing
 //! defect motivating this redesign go undetected.
 //!
-//! All eight tests here run `manta decode --json --engine hsmm` (SPEC v2's
-//! stage-2 engine) and are `#[ignore = "stage-2 gate, un-ignored by Task
-//! 12"]`: Task 12 measures whether the real `HsmmDecoder` actually clears
-//! these bars and un-ignores whichever pass. This task only has to prove
-//! the harness -- fixture generation, CLI invocation, JSON parsing, the
-//! assertions themselves -- is correct and doesn't panic.
+//! All nine tests here run `manta decode --json --engine hsmm` (SPEC v2's
+//! stage-2 engine). Task 12 (2026-09-09) measured the real `HsmmDecoder`
+//! against every one and un-ignored the three that clear their bars
+//! (vr6a, vr6b, vr7); the other six (vr1-vr5, vr8) stay
+//! `#[ignore = "stage-2 gate, un-ignored by Task 12"]` -- see
+//! docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md for the
+//! measured CER/WPM/word-boundary numbers and failure-kind analysis. The
+//! overall stage-2 gate (SPEC v2 §8.4) is FAIL.
 
 use std::collections::HashSet;
 use std::process::Command;
@@ -251,20 +253,23 @@ fn assert_vr6_passes(spec: &manta_testkit::vectors::VectorSpec) {
     );
 }
 
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
 fn vr6a_weighting_2_6_passes_end_to_end() {
     assert_vr6_passes(&manta_testkit::vectors::vr6a());
 }
 
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
 fn vr6b_weighting_3_4_passes_end_to_end() {
     assert_vr6_passes(&manta_testkit::vectors::vr6b());
 }
 
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 #[test]
-#[ignore = "stage-2 gate, un-ignored by Task 12"]
 fn vr7_tight_spacing_passes_end_to_end() {
     let spec = manta_testkit::vectors::vr7();
     let (report, manifest) = decode_report(&spec);

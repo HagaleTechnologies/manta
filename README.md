@@ -148,6 +148,14 @@ Pre-1.0. What exists and what does not:
   a few golden vectors (issues #25 and #28). Closing that gap is the M4 ML
   fusion stage, gated on beating the classical baseline under simulated
   fading.
+- **Decode engine:** `decode.engine` defaults to `legacy`. A rewritten
+  `hsmm` engine (MAN-166 decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
+  implemented and reachable via `--engine hsmm`, but its stage-2
+  measurement gate (`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`)
+  came back FAIL 2026-09-09: real B2/K5TR oracle recall roughly doubles
+  over `legacy` (`as_word` 27%→56%, `framed` 13%→32%) but falls short of
+  the 60%/40% bar, and most VR/V golden vectors still fail. Not yet a
+  default-engine candidate.
 
 [ROADMAP.md](ROADMAP.md) has the milestone breakdown with acceptance
 criteria.
