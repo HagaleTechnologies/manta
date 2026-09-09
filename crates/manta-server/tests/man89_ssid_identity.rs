@@ -97,23 +97,33 @@ async fn a_per_band_ssid_identity_reaches_the_telnet_wire_as_call_n_hash() {
     wr.write_all(b"N0CALL\r\n").await.unwrap();
 
     // Then: the node's post-login prompt carries the -N-# identity.
-    let station_prompt = loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        if line.contains(&cfg.station_callsign) {
-            break line;
+    // Bounded and EOF-checked (PR #131 review): an unbounded `read_line` loop
+    // spins forever on `Ok(0)` if a regression closes the connection after
+    // login, holding the whole test binary until the runner's global timeout
+    // instead of reporting the regression.
+    let station_prompt = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert_ne!(n, 0, "connection closed before the station prompt");
+            if line.contains(&cfg.station_callsign) {
+                break line;
+            }
         }
-    };
+    })
+    .await
+    .expect("timed out waiting for the station prompt");
     assert_eq!(station_prompt, "de W5AU-1-# >\r\n");
 
     // ... and so does every spot line.
     bus.publish(sample_spot());
 
     let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
         .await
         .expect("timed out waiting for spot line")
         .unwrap();
+    assert_ne!(n, 0, "connection closed before the spot line");
     assert!(line.starts_with("DX de W5AU-1-#:"), "{line:?}");
 
     // MAN-88 Decision 3's invariant, asserted layout-independently: the

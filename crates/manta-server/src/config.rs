@@ -104,9 +104,19 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     if segments.len() > 3 || segments.iter().any(|s| s.is_empty() || s.len() > 10) {
         return Err(format!("{call:?} is not a plausible callsign (structure)"));
     }
-    if !base.chars().any(|c| c.is_ascii_digit()) || !base.chars().any(|c| c.is_ascii_alphabetic()) {
+    // The letter-and-digit rule belongs to the SEGMENT that is the actual
+    // call, not to the whole string (PR #131 review): applied whole-string it
+    // accepts `ABC/123` and `A/1/B`, where no single segment can be a
+    // callsign, and that malformed identity then goes out on every telnet and
+    // JSON spot. Requiring only that ONE segment satisfy it keeps prefix
+    // (`JW/`) and portable/beacon suffix (`/P`, `/B`) segments -- which
+    // legitimately carry letters or digits alone -- accepted.
+    if !segments.iter().any(|s| {
+        s.chars().any(|c| c.is_ascii_digit()) && s.chars().any(|c| c.is_ascii_alphabetic())
+    }) {
         return Err(format!(
-            "{call:?} is not a plausible callsign (needs at least one letter and one digit)"
+            "{call:?} is not a plausible callsign \
+             (one segment must be a callsign: at least one letter and one digit)"
         ));
     }
     Ok(())
@@ -478,6 +488,11 @@ mod tests {
             "W3XYZ-1\r\nEVIL", // injection behind a valid-looking SSID
             "-1",              // no base
             "ZZ-1",            // base still has to be a callsign
+            // PR #131 review: letters and digits split ACROSS segments means no
+            // single segment can be the call.
+            "ABC/123",
+            "A/1/B",
+            "ABC/123-1",
         ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));

@@ -66,6 +66,16 @@ technical notes asked to fix together.
    identities without further change; this repo's `rbn.rs` and `spot_message.rs` tests assert
    that rule layout-independently rather than freezing absolute columns.
 
+7. **The "at least one letter and one digit" rule is per-segment, not whole-string** (PR #131
+   review). Applied to the whole base it accepts identities where the letters and the digits
+   live in *different* `/`-delimited segments — `ABC/123`, `A/1/B` — so no segment can be the
+   actual callsign, and the malformed value then goes out as the station identity on every
+   telnet and JSON spot. The rule now requires that **at least one** segment carry both a letter
+   and a digit, which is exactly the segment that is the call; prefix segments (`JW/`) and
+   portable/beacon suffixes (`/P`, `/B`, `/3`) legitimately carry letters or digits alone and
+   stay accepted. This is still a strict superset of `grammar::is_plausible`, which requires the
+   *first* segment to carry both.
+
 ## Non-goals
 
 - Auto-generating the `N` band index. `manta-cli` still hardcodes a single DDC; a real per-band
