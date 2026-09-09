@@ -854,10 +854,8 @@ fn power_step_guard_suppressions_are_counted_once_per_occurrence() {
     // fallback) specifically because "DX" breaks CQ_CALL_RE's adjacency
     // requirement, so K5ARH's word is untouched by any named pattern here --
     // the power-step guard is the ONLY thing that ever marks it attempted.
-    // A bare "CQ K5ARH T" would instead have CQ_CALL_RE mark K5ARH attempted
-    // (as an unspotted Cq candidate, reps=1<2) one word boundary before the
-    // burn ever runs, which is the already-attempted-via-another-route case
-    // the next test covers -- not what this test is isolating.
+    // The case where a named pattern DID also touch the word ("CQ K5ARH T")
+    // is the next test's job; both must count exactly one suppression.
     let words = ["CQ", "DX", "K5ARH", "T"];
     run(&transmission_events(1, &words, 0), &mut v);
     assert_eq!(
@@ -882,13 +880,45 @@ fn power_step_guard_suppressions_are_counted_once_per_occurrence() {
     assert_eq!(counts.notch, 0);
 }
 
-/// MAN-48: the counter measures occurrences the guard ALONE discarded -- it
-/// must not fire when the same decoded word was already evaluated through
-/// another route. "CQ K5ARH K5ARH T" spots K5ARH as Cq via CQ_CALL_RE before
-/// the burn runs in that same `try_spot` pass; nothing was silently lost, so
-/// counting it would overstate the guard's miss rate.
+/// MAN-48 (Codex review on PR #90). The counter must be gated on
+/// guard-specific per-occurrence state, NOT on the general `Word::attempted`
+/// flag: `attempted` is shared with named-pattern evaluation, so a word some
+/// other pattern already *attempted without spotting* would slip through
+/// uncounted. "CQ K5ARH T" is exactly that shape -- `CQ_CALL_RE` offers
+/// `K5ARH` as a `Cq` candidate at the "K5ARH" boundary, which marks the word
+/// attempted and then fails the two-repetition gate (reps = 1 < 2, and `Cq`
+/// is not repetition-exempt), so no spot goes out. One boundary later the
+/// CQ/DE guard discards the repetition-exempt Beacon candidate for the same
+/// word. That beacon is permanently lost and nothing was ever spotted for
+/// it, so it must be counted exactly once.
 #[test]
-fn an_already_evaluated_word_is_not_counted_as_a_guard_suppression() {
+fn a_previously_attempted_but_unspotted_word_still_counts_its_suppression() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let spots = run(&transmission_events(1, &["CQ", "K5ARH", "T"], 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "nothing can spot here -- Cq fails the repetition gate and the \
+         repetition-exempt Beacon candidate is guard-suppressed, got {spots:?}"
+    );
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        1,
+        "the guard discarded a real beacon occurrence; a prior unspotted \
+         attempt by CQ_CALL_RE must not hide it"
+    );
+}
+
+/// MAN-48: counting stays once-per-occurrence even when another pattern
+/// spotted the same decoded word. "CQ K5ARH K5ARH T" spots K5ARH as Cq via
+/// CQ_CALL_RE in the same `try_spot` pass that burns its power-step
+/// candidacy -- the Beacon classification was still thrown away, which is
+/// what the metric measures, so it counts (once), and the Cq spot is
+/// unaffected. Making the count conditional on whether some *other* pattern
+/// happened to succeed is precisely the coupling Codex's PR #90 finding
+/// rejected.
+#[test]
+fn a_spotted_word_still_counts_its_guard_suppression_once() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let words = ["CQ", "K5ARH", "K5ARH", "T"];
@@ -901,8 +931,8 @@ fn an_already_evaluated_word_is_not_counted_as_a_guard_suppression() {
     );
     assert_eq!(
         v.suppression_counts().power_step_guard,
-        0,
-        "the word was already attempted and spotted via the CQ named match"
+        1,
+        "the Beacon candidacy for the trailing K5ARH was discarded by the guard"
     );
 }
 

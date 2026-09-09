@@ -74,6 +74,20 @@ struct Word {
     /// non-exempt callsign spot after a type change alone inflated its
     /// rep count to 2 (MAN-28 round 9 review).
     last_reps: u32,
+    /// Set once this word's power-step (`<call> T`, MAN-37) candidacy has
+    /// been burned by the coarse CQ/DE framing guard. Guard-private, and
+    /// deliberately NOT the general `attempted` flag: `attempted` is also
+    /// set by any named-pattern evaluation of the same word, so gating the
+    /// `SuppressionCounts::power_step_guard` counter on it silently missed
+    /// real suppressions whenever some other pattern had already touched
+    /// the word without spotting it -- e.g. "CQ K5ARH T", where
+    /// `CQ_CALL_RE` marks `K5ARH` attempted one boundary early as an
+    /// unspotted `Cq` candidate (reps = 1 < 2), so the repetition-exempt
+    /// Beacon occurrence the guard then discarded was counted as zero
+    /// (MAN-48, Codex review on PR #90). Whether the guard suppressed an
+    /// occurrence is a property of the guard alone, so it needs its own
+    /// per-occurrence bit.
+    power_step_suppressed: bool,
 }
 
 #[derive(Default)]
@@ -175,15 +189,23 @@ pub struct SuppressionCounts {
     /// Power-step beacon occurrences (MAN-37 `<call> T`) discarded by the
     /// coarse whole-window CQ/DE framing guard -- see `context::parse`'s own
     /// docs for why that guard is deliberately coarse. Counted once per
-    /// OCCURRENCE, on the burn that first marks its decoded word attempted:
-    /// `try_spot` re-discovers and re-burns the same occurrence on every word
-    /// boundary until the triggering token ages out of the 16-word window, so
-    /// counting per burn call would report one missed beacon many times over
-    /// (MAN-48, deferred from Codex review on PR #65, round 9). A word
-    /// already attempted through another route (e.g. an accepted `CQ <call>`
-    /// named match on the same word) is deliberately NOT counted here -- it
-    /// was evaluated, not silently lost, so counting it would overstate the
-    /// guard's missed-beacon rate.
+    /// OCCURRENCE, on the first burn of that occurrence: `try_spot`
+    /// re-discovers and re-burns the same occurrence on every word boundary
+    /// until the triggering token ages out of the 16-word window, so counting
+    /// per burn call would report one missed beacon many times over (MAN-48,
+    /// deferred from Codex review on PR #65, round 9).
+    ///
+    /// "Once per occurrence" is tracked by `Word::power_step_suppressed`, a
+    /// bit private to this guard, NOT by the general `Word::attempted` flag:
+    /// a word can already be `attempted` because some other pattern
+    /// evaluated it and produced no spot (e.g. "CQ K5ARH T", where
+    /// `CQ_CALL_RE` offers `K5ARH` as a `Cq` candidate that fails the
+    /// two-repetition gate one boundary before the guard discards the
+    /// repetition-exempt Beacon candidate), and gating on `attempted` made
+    /// exactly those real, silent losses read as zero (Codex review on PR
+    /// #90). Every occurrence this guard discards is now counted, whatever
+    /// else happened to the same decoded word -- the Beacon classification
+    /// was thrown away either way, which is what this metric measures.
     pub power_step_guard: u64,
 }
 
@@ -541,12 +563,16 @@ impl Validator {
     /// brand-new, unrelated word decoded later that merely shares the same
     /// callsign string (Codex review on PR #65, round 9).
     ///
-    /// The first burn that marks a word attempted also counts the occurrence
-    /// against `SuppressionCounts::power_step_guard` (ARCHITECTURE §8: every
-    /// suppressed item is counted). The `attempted` gate is what makes that
-    /// once-per-occurrence rather than once-per-word-boundary -- the same
-    /// idiom `evaluate_candidate` already uses to keep the blocklist/notch
-    /// counters from double-counting across repeated re-evaluations (MAN-48).
+    /// The first burn of an occurrence also counts it against
+    /// `SuppressionCounts::power_step_guard` (ARCHITECTURE §8: every
+    /// suppressed item is counted). The gate for that is the guard's own
+    /// `Word::power_step_suppressed` bit, not the general `attempted` flag:
+    /// `attempted` is shared with named-pattern evaluation, so a word some
+    /// other pattern had already touched without spotting it ("CQ K5ARH T")
+    /// had its very real guard suppression counted as zero (MAN-48, Codex
+    /// review on PR #90). `attempted` is still SET here -- that's what makes
+    /// the suppression survive the triggering token aging out, as described
+    /// above -- it just no longer decides whether to count.
     fn burn_suppressed_power_step_candidate(
         &mut self,
         track_id: u32,
@@ -561,7 +587,8 @@ impl Validator {
                 return;
             };
             let involved_max_seq = involved_max_seq.max(word.seq);
-            let first_suppression = !word.attempted;
+            let first_suppression = !word.power_step_suppressed;
+            word.power_step_suppressed = true;
             word.attempted = true;
             word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
             first_suppression
