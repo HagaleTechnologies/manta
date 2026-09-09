@@ -98,9 +98,16 @@ pub struct DoctorReport {
     pub center_freq_hz: f64,
     /// How long the run actually observed the source for.
     pub duration: Duration,
+    /// Number of `TrackPromoted` events seen -- the detector's own ground
+    /// truth for "found a candidate signal," independent of whether the
+    /// decoder ever got far enough to produce a `TrackMeta`/`CharDecoded`/
+    /// `TrackClosed` afterward. This, not any decode-timing proxy, is what
+    /// `verdict()`'s `NoSignal` check keys off (see
+    /// docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md).
+    pub tracks_promoted: usize,
     /// Number of `TrackMeta` events seen (one per track, per hop it's
-    /// updated -- a proxy for how much detector activity there was, not a
-    /// distinct-track count; see `tracks_closed` for that).
+    /// updated -- a proxy for how much decoder activity there was, not a
+    /// distinct-track count).
     pub track_meta_count: usize,
     /// Number of `TrackClosed` events seen. `TrackManager` only emits
     /// `TrackClosed` for a track that produced at least one other event
@@ -108,13 +115,12 @@ pub struct DoctorReport {
     /// CANDIDATE, or a promoted track merged/evicted before its first
     /// `process_hops` pass, closes with no event at all. So this counts
     /// *eventful* tracks that closed, not every detector candidate opened
-    /// during the run -- it undercounts exactly the short-lived noise
-    /// churn it's meant to help surface.
+    /// during the run -- use `tracks_promoted` for that.
     pub tracks_closed: usize,
     pub snr_db_min: Option<f32>,
     pub snr_db_max: Option<f32>,
     /// Median of every `TrackMeta.snr_2500_db` seen, in dB. `None` if no
-    /// `TrackMeta` event occurred (see `Verdict::NoSignal`).
+    /// `TrackMeta` event occurred.
     pub snr_db_median: Option<f32>,
     /// Total `CharDecoded` events across every track.
     pub chars_decoded: usize,
@@ -129,23 +135,17 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn verdict(&self) -> Verdict {
-        // Checked before the no-evidence-at-all case below: TrackMeta is
-        // only emitted periodically (`SpeedUpdate`-adjacent cadence in
-        // track.rs), so a short track can decode a char -- or, allowlisted,
-        // even confirm a spot -- and close before its first TrackMeta
-        // update ever lands. A confirmed spot or decoded character is
-        // direct decoder-pipeline evidence and must never be reported as
-        // NoSignal just because TrackMeta happened not to land in time.
         if self.spots_confirmed > 0 {
             return Verdict::Decoding;
         }
-        // `tracks_closed` (see its doc comment) only ever counts a track
-        // that produced at least one other event before closing -- so a
-        // nonzero count here is itself proof some decoder event occurred
-        // (WordBoundary/SpeedUpdate, say) even in the edge case where that
-        // track happened to close before ever emitting TrackMeta or
-        // CharDecoded either.
-        if self.track_meta_count == 0 && self.chars_decoded == 0 && self.tracks_closed == 0 {
+        // `tracks_promoted` is the detector's own ground truth, not a
+        // decode-timing proxy (TrackMeta/CharDecoded/TrackClosed all
+        // depend on the decoder getting further than mere promotion --
+        // e.g. TrackMeta needs ~1s of decoder init on top of the ~2.05s
+        // worst-case warmup+confirm-hops promotion latency, which a short
+        // --duration run can end before reaching at all). Promotion alone
+        // is what "the detector found a candidate" means.
+        if self.tracks_promoted == 0 {
             return Verdict::NoSignal;
         }
         // Based on the STRONGEST track seen (max), not the median: a
@@ -250,6 +250,7 @@ pub fn doctor(
         stop_watchdog.store(true, Ordering::Relaxed);
     });
 
+    let mut tracks_promoted = 0usize;
     let mut track_meta_count = 0usize;
     let mut tracks_closed = 0usize;
     let mut snrs: Vec<f32> = Vec::new();
@@ -262,6 +263,7 @@ pub fn doctor(
         cfg,
         stop.clone(),
         |ev| match ev {
+            DecoderEvent::TrackPromoted { .. } => tracks_promoted += 1,
             DecoderEvent::TrackMeta { snr_2500_db, .. } => {
                 track_meta_count += 1;
                 snrs.push(*snr_2500_db);
@@ -294,6 +296,7 @@ pub fn doctor(
         sample_rate_hz,
         center_freq_hz,
         duration: observed_duration,
+        tracks_promoted,
         track_meta_count,
         tracks_closed,
         snr_db_min,
@@ -360,6 +363,7 @@ mod tests {
         assert_eq!(report.verdict(), Verdict::Decoding);
         assert!(report.spots_confirmed > 0);
         assert!(report.track_meta_count > 0);
+        assert!(report.tracks_promoted > 0);
     }
 
     #[test]
@@ -372,6 +376,7 @@ mod tests {
         );
         let report = doctor(src, &PipelineConfig::default(), Duration::from_secs(3)).unwrap();
         assert_eq!(report.verdict(), Verdict::NoSignal);
+        assert_eq!(report.tracks_promoted, 0);
         assert_eq!(report.track_meta_count, 0);
         assert_eq!(report.spots_confirmed, 0);
     }
@@ -399,6 +404,7 @@ mod tests {
             sample_rate_hz: 192_000.0,
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
+            tracks_promoted: 3,
             track_meta_count: 5,
             tracks_closed: 3,
             snr_db_min: Some(-8.0),
@@ -417,6 +423,7 @@ mod tests {
             sample_rate_hz: 192_000.0,
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
+            tracks_promoted: 1,
             track_meta_count: 5,
             tracks_closed: 1,
             snr_db_min: Some(5.0),
@@ -439,6 +446,7 @@ mod tests {
             sample_rate_hz: 192_000.0,
             center_freq_hz: 14_025_000.0,
             duration: Duration::from_secs(10),
+            tracks_promoted: 16,
             track_meta_count: 20,
             tracks_closed: 15,
             snr_db_min: Some(-8.0),
@@ -461,6 +469,7 @@ mod tests {
             sample_rate_hz: 48_000.0,
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
+            tracks_promoted: 1,
             track_meta_count: 0,
             tracks_closed: 0,
             snr_db_min: None,
@@ -483,8 +492,35 @@ mod tests {
             sample_rate_hz: 48_000.0,
             center_freq_hz: 0.0,
             duration: Duration::from_secs(3),
+            tracks_promoted: 1,
             track_meta_count: 0,
             tracks_closed: 1,
+            snr_db_min: None,
+            snr_db_max: None,
+            snr_db_median: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+        };
+        assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
+    }
+
+    /// Regression (round-4 review finding): a real signal rising just
+    /// after the ~2s detector warmup can reach `finish()` having only
+    /// promoted -- no TrackMeta (needs ~1s more decoder init), no
+    /// CharDecoded, no eventful TrackClosed (has_emitted stays false for a
+    /// promoted-but-otherwise-silent track). `TrackPromoted` is the one
+    /// signal that still fires in this exact case; must not read as
+    /// NoSignal.
+    #[test]
+    fn verdict_does_not_report_no_signal_when_only_promoted() {
+        let report = DoctorReport {
+            sample_rate_hz: 48_000.0,
+            center_freq_hz: 0.0,
+            duration: Duration::from_secs(3),
+            tracks_promoted: 1,
+            track_meta_count: 0,
+            tracks_closed: 0,
             snr_db_min: None,
             snr_db_max: None,
             snr_db_median: None,

@@ -482,7 +482,8 @@ impl TrackManager {
     /// input) is always `false` here; the decoder pool runs after this
     /// whole batch, so no per-hop decode result is available yet to feed
     /// back into the same hop's lifecycle bookkeeping.
-    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> Vec<u32> {
+    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> (Vec<u32>, Vec<DecoderEvent>) {
+        let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -531,6 +532,20 @@ impl TrackManager {
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
+                    // Emitted unconditionally here, at the exact hop the
+                    // detector made this decision -- NOT gated by
+                    // `has_emitted`/TrackClosed's same-batch-merge filter
+                    // (MAN-19) further down. A track promoted and merged
+                    // away within this same `process_hops` call still
+                    // really was promoted; that's exactly the ground truth
+                    // `doctor()`'s NoSignal check needs and the other event
+                    // kinds can't reliably provide (see events.rs's doc
+                    // comment on this variant).
+                    promoted_events.push(DecoderEvent::TrackPromoted {
+                        track_id: id,
+                        sample_ts,
+                        freq_hz,
+                    });
                 }
                 LifecycleEvent::None => {
                     // Feed the decoder every hop once it exists (ACTIVE *or*
@@ -610,7 +625,7 @@ impl TrackManager {
         self.recompute_ownership();
         closed.extend(self.merge_converged());
         closed.extend(self.evict_over_cap());
-        closed
+        (closed, promoted_events)
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -715,8 +730,11 @@ impl TrackManager {
         hop_to_sample_ts: impl Fn(u64) -> u64,
     ) -> Vec<DecoderEvent> {
         let mut closed_ids: Vec<u32> = Vec::new();
+        let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         for h in hops {
-            closed_ids.extend(self.step_hop(h, hop_to_sample_ts(h.m)));
+            let (closed, promoted) = self.step_hop(h, hop_to_sample_ts(h.m));
+            closed_ids.extend(closed);
+            promoted_events.extend(promoted);
         }
         let mut events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
@@ -733,7 +751,16 @@ impl TrackManager {
         // which is exactly what "did this track ever actually emit
         // anything" needs; a track promoted and closed within THIS same
         // call never reaches this loop before being removed, so it
-        // correctly stays `false`.
+        // correctly stays `false`. `events` here is still just
+        // `drain_pool()`'s output (decoder-produced events only) --
+        // `promoted_events` is deliberately extended in AFTER this loop,
+        // not before, so a bare promotion (no decoder output at all before
+        // a same-batch merge/evict) does NOT set `has_emitted` and does
+        // NOT retroactively earn that track a `TrackClosed` -- preserving
+        // MAN-19's exclusion. `TrackPromoted` is real, permanent signal
+        // for a *different* consumer (`doctor()`'s NoSignal check) with no
+        // per-track_id state to leak (manta-spot's `Validator` treats it as
+        // a pure no-op, never touching `self.tracks`).
         for e in &events {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
@@ -744,6 +771,7 @@ impl TrackManager {
                 }
             }
         }
+        events.extend(promoted_events);
         // MAN-19: emit one `TrackClosed` per track closed this batch (any
         // CloseReason) so downstream per-track_id state (`manta-spot`'s
         // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
@@ -866,7 +894,8 @@ impl TrackManager {
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
-        | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
+        | DecoderEvent::WordBoundary { sample_ts, .. }
+        | DecoderEvent::TrackPromoted { sample_ts, .. } => *sample_ts,
         DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
@@ -880,6 +909,7 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id } => *track_id,
     }
 }
@@ -1037,6 +1067,40 @@ mod tests {
             "a strong channel should spawn and promote a track"
         );
         assert_eq!(tm.tracks.len(), 1);
+    }
+
+    /// `step_hop` itself must return a `TrackPromoted` event at the exact
+    /// hop it promotes -- `manta_engine::doctor()`'s NoSignal check
+    /// (2026-09-09) depends on this being real, ground-truth signal, not
+    /// just an internal state-machine transition nothing outside
+    /// `TrackManager` ever observes.
+    #[test]
+    fn step_hop_emits_track_promoted_at_the_promotion_hop() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut saw_promotion = false;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted) = tm.step_hop(&hop(m, power.clone()), m);
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                saw_promotion = true;
+                break;
+            }
+        }
+        assert!(
+            saw_promotion,
+            "step_hop must return a TrackPromoted event at the hop it promotes a track"
+        );
     }
 
     #[test]

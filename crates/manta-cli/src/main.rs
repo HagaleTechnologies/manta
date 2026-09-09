@@ -1510,21 +1510,18 @@ fn print_doctor_report(report: &manta_engine::DoctorReport) {
         report.duration.as_secs_f64()
     );
     println!(
-        "tracks: {} TrackMeta updates, {} closed",
-        report.track_meta_count, report.tracks_closed
+        "tracks: {} promoted, {} TrackMeta updates, {} closed",
+        report.tracks_promoted, report.track_meta_count, report.tracks_closed
     );
     match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
         (Some(min), Some(median), Some(max)) => {
             println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
         }
-        // Not necessarily "no track opened" -- track_meta_count==0 alone
-        // doesn't rule out real decoder activity (chars_decoded/
-        // tracks_closed can still be nonzero; see verdict()/ActivityNoSnr).
-        _ if report.track_meta_count == 0
-            && report.chars_decoded == 0
-            && report.tracks_closed == 0 =>
-        {
-            println!("snr_2500_db: no TrackMeta events -- no track ever opened")
+        // `tracks_promoted` is verdict()'s own authoritative signal for
+        // "did anything really happen" -- match its logic exactly rather
+        // than re-deriving it from a different combination of fields.
+        _ if report.tracks_promoted == 0 => {
+            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
         }
         _ => println!("snr_2500_db: no TrackMeta events landed before the last track closed"),
     }
