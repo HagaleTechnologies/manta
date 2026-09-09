@@ -56,6 +56,23 @@ pub struct Metrics {
     /// failed") would otherwise mislead an operator into diagnosing a
     /// failing client socket when the real cause was a normal shutdown.
     spots_dropped_shutdown_total: AtomicU64,
+    /// MAN-45 remediate (code-review round 19, P2): history entries
+    /// abandoned mid-`sh/dx` replay -- the entry whose write just failed
+    /// plus every entry left unreplayed behind it, and the unreplayed
+    /// remainder when the replay loop defers to the shutdown drain.
+    ///
+    /// A DEDICATED counter (one of the two remedies the reviewer offered)
+    /// rather than more `record_write_failed` calls, for the same reason
+    /// `spots_dropped_shutdown_total` is separate: a replayed `sh/dx`
+    /// entry is a RE-send of a spot already published and already counted
+    /// once in `manta_spots_total` -- often already delivered live to this
+    /// same client before `sh/dx` was even issued. Summing it into
+    /// `spots_dropped_write_failed_total` would let that counter exceed
+    /// `manta_spots_total` and would break the "delivered + counted ==
+    /// published" invariant the acceptance suite asserts on it. Keeping it
+    /// here makes the loss VISIBLE (ARCHITECTURE §8: no silent loss)
+    /// without corrupting the live-delivery arithmetic.
+    spots_replay_abandoned_total: AtomicU64,
     /// MAN-45 (round-6 review finding): a spot whose `dxContinent`/
     /// `dxCqZone` fell back to the `spot_message::UNKNOWN_*` sentinels
     /// because `cty.lookup` couldn't resolve the (possibly Watch-List-
@@ -152,6 +169,21 @@ impl Metrics {
     /// counter untouched).
     pub fn spots_dropped_shutdown_total(&self) -> u64 {
         self.spots_dropped_shutdown_total.load(Ordering::Relaxed)
+    }
+
+    /// `n` `sh/dx` history entries were abandoned without being replayed
+    /// to the requesting client. See `spots_replay_abandoned_total`'s doc
+    /// comment for why this is its own counter rather than another caller
+    /// of `record_write_failed`.
+    pub fn record_replay_abandoned(&self, n: u64) {
+        self.spots_replay_abandoned_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Read accessor mirroring the other loss-counter getters, so an
+    /// acceptance test can assert replay loss independently of live loss.
+    pub fn spots_replay_abandoned_total(&self) -> u64 {
+        self.spots_replay_abandoned_total.load(Ordering::Relaxed)
     }
 
     /// MAN-45 (round-6 review finding): see `spots_unresolved_geography_total`'s
@@ -342,6 +374,15 @@ impl Metrics {
         out.push_str(&format!(
             "manta_spots_dropped_shutdown_total {}\n",
             self.spots_dropped_shutdown_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_replay_abandoned_total `sh/dx` history entries abandoned without being replayed, because the replay write failed or the daemon shut down mid-replay. Counted separately from live-delivery loss: these are re-sends of spots already counted in manta_spots_total.\n",
+        );
+        out.push_str("# TYPE manta_spots_replay_abandoned_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_replay_abandoned_total {}\n",
+            self.spots_replay_abandoned_total.load(Ordering::Relaxed)
         ));
 
         out.push_str(
@@ -573,6 +614,25 @@ mod tests {
     }
 
     /// MAN-45 (round-6 review finding).
+    /// MAN-45 remediate (code-review round 19, P2): abandoned `sh/dx`
+    /// replay entries must be VISIBLE (ARCHITECTURE §8) without inflating
+    /// `manta_spots_dropped_write_failed_total`, whose "delivered +
+    /// counted == published" invariant would break if re-sends of
+    /// already-published spots were summed into it.
+    #[test]
+    fn replay_abandoned_is_counted_separately_from_write_failed() {
+        let m = Metrics::new();
+        m.record_replay_abandoned(1 + 4);
+        m.record_replay_abandoned(3);
+        assert_eq!(m.spots_replay_abandoned_total(), 8);
+        assert_eq!(m.spots_dropped_write_failed_total(), 0);
+        assert_eq!(m.spots_dropped_shutdown_total(), 0);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_replay_abandoned_total counter"));
+        assert!(text.contains("manta_spots_replay_abandoned_total 8"));
+        assert!(text.contains("manta_spots_dropped_write_failed_total 0"));
+    }
+
     #[test]
     fn unresolved_geography_is_counted_and_exposed() {
         let m = Metrics::new();

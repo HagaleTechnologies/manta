@@ -54,14 +54,26 @@ STOPSIGNAL SIGINT
 
 # `docker stop`'s own default grace period (10s on Linux) before SIGKILL
 # is SHORTER than manta-cli's own supported graceful-shutdown drain
-# window (SHUTDOWN_DRAIN_DEADLINE, 25s -- crates/manta-cli/src/main.rs)
+# window (SHUTDOWN_DRAIN_DEADLINE, 50s -- crates/manta-cli/src/main.rs)
 # for a legitimately-slow client's final write (PR #78 review round 5).
 # STOPSIGNAL alone sends the right signal, but the container can still be
 # SIGKILLed mid-drain, dropping the final spots this fix exists to
 # preserve. A Dockerfile has no way to change the CALLER's stop grace
-# period -- operators must pass it explicitly: `docker stop -t 30
-# <container>`, or `--stop-timeout 30` on `docker run`, or the
+# period -- operators must pass it explicitly: `docker stop -t 60
+# <container>`, or `--stop-timeout 60` on `docker run`, or the
 # equivalent `stop_grace_period`/`terminationGracePeriodSeconds` on
 # Compose/Kubernetes. Documented in README's Docker install section too.
+#
+# MAN-45 remediate (code-review round 19, P1): 60, not the 30 this
+# comment and the README previously specified. MAN-45's per-client drain
+# work raised SHUTDOWN_DRAIN_DEADLINE from 25s to 50s (a stalled client
+# can burn up to 2 * telnet::WRITE_TIMEOUT = 20s finishing one in-flight
+# write and then a further CLIENT_DRAIN_DEADLINE = 20s draining its own
+# backlog). A 30s caller-side grace period is now SHORTER than the
+# window it is supposed to cover, so following it would SIGKILL the
+# daemon before it can record the abandoned backlog -- reintroducing the
+# exact silent truncation MAN-45 exists to remove. 60 leaves margin over
+# the 50s registry-wide deadline; if SHUTDOWN_DRAIN_DEADLINE ever grows
+# again, this number and README's must grow with it.
 ENTRYPOINT ["manta"]
 CMD ["--help"]

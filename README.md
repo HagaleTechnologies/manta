@@ -60,10 +60,17 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
 
 When running as a long-lived server (not `--help`), stop it with
-`docker stop -t 30 <container>` — Docker's own default 10-second grace
-period before SIGKILL is shorter than manta's supported drain window for
-a slow client's final write (up to 25s), so the default can cut a
-graceful shutdown off mid-drain.
+`docker stop -t 60 <container>` — Docker's own default 10-second grace
+period before SIGKILL is far shorter than manta's supported graceful-
+shutdown window (`SHUTDOWN_DRAIN_DEADLINE`, 60s as of MAN-45's
+per-client drain work: up to a 20s in-flight write to a stalled client
+plus that client's own 20s backlog drain, with registry-wide slack on
+top). A shorter timeout SIGKILLs the daemon mid-drain, before it can
+either deliver the remaining backlog or record it on
+`manta_spots_dropped_shutdown_total` — the silent truncation those
+counters exist to prevent. Use the same 60s value for
+`--stop-timeout` on `docker run`, `stop_grace_period` on Compose, and
+`terminationGracePeriodSeconds` on Kubernetes.
 
 Both are built by [`.github/workflows/release-publish.yml`](.github/workflows/release-publish.yml)
 directly from each tagged release's commit — every published binary

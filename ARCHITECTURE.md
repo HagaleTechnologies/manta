@@ -346,6 +346,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
+  `manta_spots_dropped_shutdown_total` (backlog abandoned on a CLEAN
+  shutdown, before any write failed — the counter that distinguishes
+  shutdown-time loss from socket-write loss),
+  `manta_spots_replay_abandoned_total` (`sh/dx` history entries never
+  replayed because the replay write failed or shutdown intervened — kept
+  out of the write-failure counter because a replay entry was already
+  counted once in `manta_spots_total`),
   `manta_spots_unresolved_geography_total`, `manta_active_tracks`,
   per-protocol client-connected gauges, `manta_source_health`, and the
   uplink counters (`crates/manta-server/src/metrics.rs`) — not input-layer

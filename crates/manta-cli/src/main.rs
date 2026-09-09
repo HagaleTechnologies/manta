@@ -934,6 +934,18 @@ struct SpotServer {
 /// fast localhost writes the unguarded build stays inside the bound too;
 /// exceeding it needs a client that has stopped reading, so each write runs
 /// the full `WRITE_TIMEOUT`).
+/// MAN-45 remediate (code-review round 19, P1): **changing this value is
+/// not self-contained** -- it is the floor for the CALLER-side stop grace
+/// period an operator must configure, and two documents state that period
+/// as a literal number: `README.md`'s Docker install section (`docker stop
+/// -t 60`) and `Dockerfile`'s STOPSIGNAL comment block. Both said 30s,
+/// sized against the pre-MAN-45 25s value; against 50s here, a 30s
+/// container timeout SIGKILLs the daemon partway through the very drain
+/// this constant exists to allow, before it can record the abandoned
+/// backlog on `manta_spots_dropped_shutdown_total` -- recreating the
+/// silent truncation the drain work removed. Both are now 60s, leaving
+/// margin over this deadline. If this constant grows again, raise them
+/// with it.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// How often the server runtime copies the engine's live track count into

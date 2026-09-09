@@ -602,13 +602,30 @@ async fn handle_client(
                             // live spots -- charging them on an ordinary,
                             // no-write-failure shutdown fabricated data
                             // loss on that counter (CR-3).
+                            //
+                            // MAN-45 remediate (code-review round 19, P2):
+                            // they are no longer SILENT either, though.
+                            // CR-3's argument was only ever about which
+                            // counter, not about whether the loss is
+                            // visible -- ARCHITECTURE §8 ("every
+                            // dropped/evicted/suppressed item is counted")
+                            // applies to abandoned replay entries as much
+                            // as it already does to replay entries a
+                            // filter suppresses a few lines below. They
+                            // now go to the dedicated
+                            // `manta_spots_replay_abandoned_total`, which
+                            // keeps `..._write_failed_total`'s
+                            // "delivered + counted == published"
+                            // arithmetic intact.
                             if shutdown.has_changed().unwrap_or(true) {
+                                let unreplayed = history.len();
                                 if log_enabled {
                                     tracing::info!(
-                                        unreplayed_history = history.len(),
+                                        unreplayed_history = unreplayed,
                                         "telnet: shutdown signalled mid sh/dx replay, deferring to the drain loop for the live backlog"
                                     );
                                 }
+                                metrics.record_replay_abandoned(unreplayed as u64);
                                 break;
                             }
                             let Some(bus_spot) = history.next() else {
@@ -632,30 +649,48 @@ async fn handle_client(
                                 // MAN-45 remediate (code-review round 18,
                                 // finding 1): the failed write itself and
                                 // the rest of `history`, however, are NOT
-                                // counted here -- both are replays of spots
-                                // already published (and already counted
-                                // once in `manta_spots_total`, often
-                                // already delivered live to this same
+                                // added to THAT counter -- both are replays
+                                // of spots already published (and already
+                                // counted once in `manta_spots_total`,
+                                // often already delivered live to this same
                                 // client before `sh/dx` was even issued),
-                                // not newly-lost live spots. This is the
-                                // exact CR-3 rationale applied a few dozen
-                                // lines above for the ordinary
-                                // no-write-failure shutdown break --
-                                // charging replay loss as real loss here
-                                // too, on the write-failure path, produced
-                                // a counter that could overcount actual
-                                // loss (and in principle exceed
-                                // `manta_spots_total`) and disagreed with
-                                // CR-3's own reasoning one function up.
+                                // not newly-lost live spots. Charging replay
+                                // loss to `..._write_failed_total` would let
+                                // it overcount actual loss (and in principle
+                                // exceed `manta_spots_total`).
+                                //
+                                // MAN-45 remediate (code-review round 19,
+                                // P2): but not counting them ANYWHERE made
+                                // this site report zero loss whenever `rx`
+                                // happened to be empty, even though the
+                                // in-flight entry and all `history.len()`
+                                // entries behind it are abandoned -- which
+                                // contradicted ARCHITECTURE §8's
+                                // no-silent-loss rule and the filter-
+                                // suppression counting this very loop does
+                                // for replay entries a few lines above.
+                                // They now go to the dedicated
+                                // `manta_spots_replay_abandoned_total`
+                                // (the reviewer's own second remedy), so
+                                // the loss is visible without corrupting
+                                // the live-delivery counter's arithmetic.
                                 // MAN-59 review round 2: returns Ok(()),
                                 // not Err -- log it directly.
+                                let unreplayed = history.len();
                                 if log_enabled {
-                                    tracing::warn!("telnet: sh/dx history write failed, disconnecting");
+                                    tracing::warn!(
+                                        unreplayed_history = unreplayed,
+                                        "telnet: sh/dx history write failed, disconnecting"
+                                    );
                                 }
                                 metrics.record_write_failed(crate::metrics::abandoned_spot_count(
                                     false,
                                     rx.len(),
                                 ));
+                                // `1 +` for the entry whose write just
+                                // failed, mirroring `abandoned_spot_count`'s
+                                // `in_flight_spot` term on the live path.
+                                metrics.record_replay_abandoned(1 + unreplayed as u64);
                                 return Ok(());
                             }
                         }
