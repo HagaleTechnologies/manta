@@ -127,17 +127,23 @@ impl RepetitionGate {
     /// buckets if the centroid happens to drift across a bucket boundary
     /// between them (Codex review, PR #152 -- e.g. 14,000,049 Hz then
     /// 14,000,051 Hz round to buckets 140000 and 140001 despite being 2 Hz
-    /// apart). So a new decode first checks its own bucket *and* both
-    /// neighbors for an existing entry under the same callsign, and joins
-    /// that one if found, rather than always keying strictly by its own
-    /// freshly-computed bucket. Joining also *moves* the entry to the
-    /// current home bucket (Codex review, PR #152, round 8): without
-    /// this, an entry stays pinned to wherever it was first created, and
-    /// a signal that drifts across more than one bucket boundary over
-    /// successive occurrences -- each individual hop within the +-1
-    /// tolerance -- can still end up more than one bucket away from that
-    /// fixed original anchor, missing a later hop's neighbor search
-    /// entirely even though every step along the way was adjacent.
+    /// apart). So a new decode whose own home bucket has never been
+    /// touched checks both neighbors for an existing entry under the same
+    /// callsign, and *moves* (renames) that one in if found, rather than
+    /// always keying strictly by its own freshly-computed bucket -- this
+    /// keeps a drifting signal's anchor following it forward across
+    /// successive hops, each individually within the +-1 tolerance, so a
+    /// later hop's own neighbor search can still find it. But a home
+    /// bucket that already HAS an entry always uses that entry directly,
+    /// never a neighbor's, however fresh (Codex review, PR #152, round 9):
+    /// two adjacent buckets can each independently hold a genuinely
+    /// distinct real signal's own history, and letting a fresher neighbor
+    /// outrank an already-established home identity could import that
+    /// DIFFERENT signal's history into this one -- worse, chaining that
+    /// across successive calls could transitively combine two entries
+    /// that were never actually the same signal. A neighbor is only ever
+    /// moved into an empty home, never merged into one that already holds
+    /// its own history.
     ///
     /// That widened net cuts the other way too (same review): two
     /// genuinely different, simultaneous tracks decoding the same real
@@ -176,42 +182,39 @@ impl RepetitionGate {
             return 0;
         }
         let b = bucket(freq_hz);
-        // Among the home bucket and both neighbors, join whichever
-        // existing entry is *freshest* (see `GateEntry::most_recent`),
-        // not just the lowest-numbered one that happens to still exist --
-        // sweeps are throttled, so a stale-but-not-yet-swept neighbor
-        // must not be preferred over a genuinely fresher one.
-        let matched_key = (b - 1..=b + 1)
-            .map(|candidate| (candidate, callsign.to_string()))
-            .filter_map(|k| {
-                let ts = self.seen.get(&k)?.most_recent()?;
-                Some((k, ts))
-            })
-            .max_by_key(|(_, ts)| *ts)
-            .map(|(k, _)| k);
         let home_key = (b, callsign.to_string());
-        // Codex review, PR #152, round 8: a signal that drifts across
-        // MORE than one bucket boundary over successive occurrences (each
-        // hop individually within the +-1 neighbor tolerance) must move
-        // its anchor forward each time, not stay pinned to wherever the
-        // entry was first created -- otherwise a later hop's neighbor
-        // search (always +-1 from ITS OWN home bucket) can miss an entry
-        // that's now two or more buckets away from its original anchor,
-        // even though each individual hop was adjacent. Merges (not
-        // overwrites) into `home_key`, in case a genuinely distinct entry
-        // already lives there.
-        if let Some(found_key) = matched_key {
-            if found_key != home_key {
+        // Codex review, PR #152, round 9: this call's own home bucket, if
+        // it already has an entry, is ALWAYS used directly -- never
+        // superseded by a neighbor, however fresh. Two adjacent buckets
+        // can each independently hold a genuinely distinct real signal's
+        // own history; letting a fresher neighbor outrank an already-
+        // established home identity (round 7/8's behavior) could import
+        // that DIFFERENT signal's history into this one, and worse,
+        // chaining that across successive calls could transitively merge
+        // two entries that were never actually the same signal at all.
+        // Neighbor search is strictly a fallback for when home has NEVER
+        // been touched -- the genuine boundary-drift case -- and even
+        // then it only ever *moves* (renames) a neighbor's entry into an
+        // empty home, never merges two already-populated entries
+        // together.
+        if !self.seen.contains_key(&home_key) {
+            // Among both neighbors, join whichever existing entry is
+            // *freshest* (see `GateEntry::most_recent`), not just the
+            // lowest-numbered one that happens to still exist -- sweeps
+            // are throttled, so a stale-but-not-yet-swept neighbor must
+            // not be preferred over a genuinely fresher one.
+            let matched_key = (b - 1..=b + 1)
+                .filter(|&candidate| candidate != b)
+                .map(|candidate| (candidate, callsign.to_string()))
+                .filter_map(|k| {
+                    let ts = self.seen.get(&k)?.most_recent()?;
+                    Some((k, ts))
+                })
+                .max_by_key(|(_, ts)| *ts)
+                .map(|(k, _)| k);
+            if let Some(found_key) = matched_key {
                 let moved = self.seen.remove(&found_key).unwrap();
-                let dest = self.seen.entry(home_key.clone()).or_default();
-                dest.accepted.extend(moved.accepted);
-                dest.accepted.sort_unstable();
-                for (tid, ts) in moved.last_seen_by_track {
-                    dest.last_seen_by_track
-                        .entry(tid)
-                        .and_modify(|existing| *existing = (*existing).max(ts))
-                        .or_insert(ts);
-                }
+                self.seen.insert(home_key.clone(), moved);
             }
         }
         let entry = self.seen.entry(home_key).or_default();
@@ -578,6 +581,42 @@ mod tests {
             gate.record(3, 14_000_200.0, "K5ARH", 300_000),
             2,
             "must follow the anchor across successive adjacent bucket hops, not stay pinned to the original bucket"
+        );
+    }
+
+    /// Codex review, PR #152, round 9: two entries at b-1 and b+1 each
+    /// independently accumulate their OWN single occurrence (two
+    /// genuinely distinct real signals, not one drifting one). A
+    /// near-simultaneous rejected decode at the empty home bucket b moves
+    /// b+1's entry in (a legitimate move, since b was empty). A SECOND
+    /// near-simultaneous rejected decode at b-1 must NOT then import b's
+    /// entry just because it's fresher -- b-1 already has its own
+    /// established identity, and combining the two would silently union
+    /// two unrelated signals' histories, manufacturing `reps == 2` when
+    /// neither frequency ever produced two distinct occurrences.
+    #[test]
+    fn record_never_merges_two_independently_established_entries() {
+        let mut gate = RepetitionGate::new(FS);
+
+        // b-1 (13_999_900 Hz): a one-off decode, its own entry.
+        assert_eq!(gate.record(1, 13_999_900.0, "K5ARH", 0), 1);
+        // b+1 (14_000_050 Hz): a separate one-off decode, its own entry.
+        assert_eq!(gate.record(2, 14_000_050.0, "K5ARH", 0), 1);
+        // A near-simultaneous rejected decode at home bucket b (empty) --
+        // legitimately moves the fresher neighbor (b+1) into b.
+        assert_eq!(gate.record(3, 14_000_000.0, "K5ARH", 100), 1);
+        // Another near-simultaneous rejected decode, this time at b-1 --
+        // which already has its OWN entry. Must use that entry directly,
+        // never importing b's (now more recently touched) entry.
+        assert_eq!(
+            gate.record(4, 13_999_900.0, "K5ARH", 150),
+            1,
+            "must never combine two independently-established entries just because one neighbor is fresher"
+        );
+        assert_eq!(
+            gate.len(),
+            2,
+            "b-1's and b's entries must remain two separate entries, not merged into one"
         );
     }
 }
