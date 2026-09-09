@@ -73,6 +73,12 @@ impl Evidence {
     pub fn new(cfg: EvidenceConfig) -> Self {
         let alpha_a = (1.0 - (-HOP_MS / cfg.tau_a_ms).exp()) as f32;
         let h = (cfg.hold_dits * cfg.u_init_hops).round().max(1.0) as usize;
+        debug_assert!(
+            h < MAX_RETAIN,
+            "h ({}) must stay well under MAX_RETAIN ({}) or Evidence silently drops un-emitted centers",
+            h,
+            MAX_RETAIN
+        );
         Evidence {
             cfg,
             alpha_a,
@@ -92,6 +98,12 @@ impl Evidence {
     /// emitted hop; the delay line simply grows or shrinks by the difference.
     pub fn set_u_ref(&mut self, u_hops: f32) {
         self.h = (self.cfg.hold_dits * u_hops).round().max(1.0) as usize;
+        debug_assert!(
+            self.h < MAX_RETAIN,
+            "h ({}) must stay well under MAX_RETAIN ({}) or Evidence silently drops un-emitted centers",
+            self.h,
+            MAX_RETAIN
+        );
     }
 
     pub fn push(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) -> Option<HopEvidence> {
@@ -113,8 +125,15 @@ impl Evidence {
             self.next_center_g = front_global;
         }
         let local = (self.next_center_g - front_global) as usize;
-        if local + self.h >= self.line.len() {
-            return None; // not enough forward lookahead yet
+        // `checked_add` guards against a pathological `h` (e.g. from an
+        // unvalidated `set_u_ref` input) overflowing `usize`; treat an
+        // overflow the same as "not enough lookahead yet" rather than
+        // panicking (debug) or wrapping into a spurious true / OOB index
+        // (release). The debug_assert!s in `new()`/`set_u_ref()` are the
+        // primary guard -- this is the release-build backstop.
+        match local.checked_add(self.h) {
+            Some(reach) if reach < self.line.len() => {}
+            _ => return None, // not enough forward lookahead yet (or overflow)
         }
         let ev = self.emit(local);
         self.next_center_g += 1;
