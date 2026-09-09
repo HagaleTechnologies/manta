@@ -109,7 +109,9 @@ fn push_word(b: &mut SegmentBuilder, word: &str, unit: f64, gap_unit: f64) -> Re
     let chars: Vec<char> = word.chars().collect();
     for (ci, c) in chars.iter().enumerate() {
         let Some(pattern) = pattern_for(*c) else {
-            bail!("character {c:?} has no Morse encoding");
+            // `'{c}'`, not `{c:?}`: this reaches an operator through
+            // `manta gen`'s error line (MAN-130).
+            bail!("character '{c}' has no Morse encoding");
         };
         let els: Vec<char> = pattern.chars().collect();
         for (ei, e) in els.iter().enumerate() {

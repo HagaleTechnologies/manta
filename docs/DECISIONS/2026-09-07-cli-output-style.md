@@ -54,6 +54,15 @@ itself (code 2) before `manta-cli`'s `run()` ever returns.
   for the telnet output and full Hz precision for the JSON stream — a
   distinct, pre-existing, deliberate design point this guide does not
   change.
+- **`SpotMessage.decode_confidence` (the `:7301` wire contract) stays
+  full-precision**, not two decimals. The two-decimal rule in the table
+  above is a *display* rule for operator-facing text; the JSON stream is an
+  ecosystem contract whose consumers must be able to recover the decoder's
+  own result and apply their own thresholds, so quantizing it there would
+  both destroy information and reclassify threshold-adjacent spots. Changing
+  that field's precision is a change to the external schema, made in the
+  schema's own process (the `dispensa` repo), not here. Pinned by
+  `spot_message.rs::decode_confidence_keeps_full_decoder_precision_on_the_wire`.
 - **`SpotType::rbn_flag()`'s blank `Unknown`** (`""`, not `"unknown"`) is a
   wire behaviour of the RBN cluster line's context column
   (`manta-server::rbn::format_line`) and must not change; `SpotType`'s

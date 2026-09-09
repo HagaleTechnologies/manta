@@ -55,7 +55,7 @@ pub fn spot_line(spot: &Spot) -> String {
 pub fn render_error(err: &anyhow::Error) -> String {
     let mut out = String::from("error");
     for cause in err.chain() {
-        let text = cause.to_string();
+        let text = one_line(&cause.to_string());
         if text.is_empty() {
             continue; // a Hint carries no text of its own
         }
@@ -63,6 +63,16 @@ pub fn render_error(err: &anyhow::Error) -> String {
         out.push_str(&text);
     }
     out
+}
+
+/// Flattens one cause's own `Display` onto a single physical line.
+/// Flattening the anyhow *chain* is not enough: an individual error can be
+/// multiline by itself — most notably `toml::de::Error` from a malformed
+/// `--server-config`, which renders a source snippet plus a caret over
+/// three or more lines — which would break the one-line error contract
+/// from the inside (MAN-130 remediation).
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// An operator-facing suggestion attached to an error chain with
@@ -136,6 +146,24 @@ mod tests {
             "error: open WAV ./nope.wav: No such file or directory (os error 2)"
         );
         assert_eq!(render_hint(&err), None);
+    }
+
+    /// A cause whose own `Display` spans several lines (a malformed
+    /// `--server-config`'s `toml::de::Error` snippet-and-caret is the real
+    /// case) must still render as ONE stderr line (MAN-130 remediation).
+    #[test]
+    fn a_multiline_cause_still_renders_on_one_line() {
+        let toml_like = "TOML parse error at line 2, column 9\n  |\n2 | port = \"nope\"\n  \
+                         |         ^^^^^^\ninvalid type: string, expected u16\n";
+        let err = anyhow::anyhow!("{toml_like}").context("read server config ./manta.toml");
+        let rendered = render_error(&err);
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+        assert!(!rendered.contains('\r'), "{rendered}");
+        assert_eq!(
+            rendered,
+            "error: read server config ./manta.toml: TOML parse error at line 2, column 9 | 2 | \
+             port = \"nope\" | ^^^^^^ invalid type: string, expected u16"
+        );
     }
 
     #[test]

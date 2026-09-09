@@ -47,7 +47,10 @@ impl AudioIqSource {
         use cpal::traits::{DeviceTrait, HostTrait};
         let device = match name {
             Some(n) => coppa_audio::find_input_device_by_name(n)
-                .ok_or_else(|| anyhow!("no input device matching {n:?}"))?,
+                // `'{n}'`, not `{n:?}`: this text is printed verbatim to an
+                // operator by `manta listen --device <missing>`, and no raw
+                // Rust Debug rendering reaches the terminal (MAN-130).
+                .ok_or_else(|| anyhow!("no input device matching '{n}'"))?,
             None => cpal::default_host()
                 .default_input_device()
                 .ok_or_else(|| anyhow!("no default input device"))?,

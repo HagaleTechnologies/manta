@@ -1004,12 +1004,12 @@ fn run() -> Result<std::process::ExitCode> {
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
             eprintln!(
-                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {:.1} Hz)",
+                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {} kHz)",
                 out.display(),
                 spec.name,
                 spec.name,
                 spec.name,
-                manifest.expected_freq_hz
+                fmt::khz(manifest.expected_freq_hz)
             );
         }
         Command::Listen {
@@ -1346,12 +1346,20 @@ fn run() -> Result<std::process::ExitCode> {
             };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             let passed = manta_engine::soak_passed(&report);
+            // `duration_s` is the interval the pipeline was ACTUALLY
+            // exercised (`SoakReport::ran_for`), not the request: a file
+            // source returns at EOF, so reporting the request would let a
+            // one-minute fixture be recorded as a successful 24 h soak
+            // (MAN-130 remediation). The request is reported beside it so a
+            // truncated run is visible rather than merely short.
+            let ran_for_s = report.ran_for.as_secs_f64();
             if json {
                 println!(
                     "{}",
                     serde_json::to_string(&serde_json::json!({
                         "passed": passed,
-                        "duration_s": duration,
+                        "duration_s": (ran_for_s * 10.0).round() / 10.0,
+                        "requested_duration_s": duration,
                         "events_emitted": report.events_emitted,
                         "rss_growth_bytes": report.rss_growth_bytes,
                         "panicked": report.panicked,
@@ -1359,7 +1367,7 @@ fn run() -> Result<std::process::ExitCode> {
                 );
             } else {
                 println!("soak: {}", if passed { "passed" } else { "FAILED" });
-                println!("  duration:    {duration} s");
+                println!("  duration:    {ran_for_s:.1} s (requested {duration} s)");
                 println!("  events:      {}", report.events_emitted);
                 println!(
                     "  rss growth:  {:.1} MiB",

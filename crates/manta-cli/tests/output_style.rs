@@ -130,6 +130,40 @@ fn a_missing_source_names_the_path_and_skips_the_rate_hint() {
     );
 }
 
+/// MAN-130 remediation: an unsupported WAV's sample format used to reach
+/// the operator as `hound::SampleFormat`'s Debug variant (`Int`/`Float`)
+/// through `manta-input`'s own error text.
+#[test]
+fn an_unsupported_wav_format_names_itself_in_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("int24.wav");
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 96_000,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    for _ in 0..64 {
+        w.write_sample(0i32).unwrap();
+    }
+    w.finalize().unwrap();
+
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unsupported WAV format"), "{stderr}");
+    assert!(
+        stderr.contains("integer/24-bit"),
+        "expected a human sample-format label: {stderr}"
+    );
+    for banned in ["Int/", "Float/"] {
+        assert!(
+            !stderr.contains(banned),
+            "SampleFormat Debug leaked ({banned}): {stderr}"
+        );
+    }
+}
+
 #[test]
 fn decode_summary_has_no_option_and_reads_in_khz() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,6 +275,34 @@ fn soak_json_is_one_object_on_stdout() {
     assert!(v["events_emitted"].as_u64().unwrap() > 0);
 }
 
+/// MAN-130 remediation: `duration_s` is the interval the pipeline was
+/// actually exercised, not the request. A file source returns at EOF, so a
+/// short fixture asked for a long soak must never be recorded as a long
+/// successful soak.
+#[test]
+fn soak_reports_the_measured_duration_not_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("cw48k.wav");
+    write_48k_cw_wav(&wav, "CQ CQ DE W1AW W1AW K", 20.0, 8.0);
+    let out = manta()
+        .args(["soak", "--duration", "60", "--json", "--source"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["requested_duration_s"], 60);
+    let measured = v["duration_s"].as_f64().unwrap();
+    assert!(
+        measured < 30.0,
+        "duration_s {measured} looks like the requested 60 s, not the measured run"
+    );
+}
+
 #[test]
 fn listen_text_mode_puts_only_spot_lines_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
@@ -325,6 +387,92 @@ fn no_debug_formatting_in_any_cli_print_macro() {
                 !debug_spec.is_match(args),
                 "{name}: Debug rendering leaked into a print macro: {args}"
             );
+        }
+    }
+}
+
+/// MAN-130 remediation: the scan above only covers the CLI's own print
+/// macros, but `fmt::render_error` prints the `Display` text of errors built
+/// by the crates the CLI *calls*, verbatim — so a `{:?}` there reaches the
+/// operator just the same. Two real leaks found that way: `manta listen
+/// --device <missing>` rendered the device name with `{n:?}`
+/// (`manta-input/src/audio.rs`) and an unsupported WAV exposed
+/// `hound::SampleFormat`'s Debug variant (`manta-input/src/lib.rs`).
+/// Scans every workspace crate an operator-facing error can come from, for
+/// a Debug spec inside an error-constructing call.
+#[test]
+fn no_debug_formatting_in_an_operator_facing_dependency_error() {
+    // `manta-cli` is covered by the print-macro scan above;
+    // `manta-soak-harness` is a non-operator-facing CI binary, an explicit
+    // exception in docs/DECISIONS/2026-09-07-cli-output-style.md.
+    const SKIPPED_CRATES: [&str; 2] = ["manta-cli", "manta-soak-harness"];
+    // Each of these constructs an error whose text the operator reads.
+    const ERROR_CTORS: [&str; 4] = ["anyhow!(", "bail!(", ".context(", "with_context("];
+
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manta-cli's parent is crates/");
+    let debug_spec = regex::Regex::new(r"\{[^{}]*:#?\?\}").unwrap();
+    let line_comment = regex::Regex::new(r"(?m)//[^\n]*").unwrap();
+
+    let mut scanned = 0usize;
+    for entry in std::fs::read_dir(crates_dir).unwrap() {
+        let dir = entry.unwrap().path();
+        let crate_name = dir.file_name().unwrap().to_string_lossy().to_string();
+        if SKIPPED_CRATES.contains(&crate_name.as_str()) {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_rs_files(&dir.join("src"), &mut files);
+        for file in files {
+            let src = std::fs::read_to_string(&file).unwrap();
+            // Drop the in-file test module (an assertion message may
+            // legitimately use `{:?}`) and every line comment (which may
+            // legitimately *quote* the banned spec, as the fixes for the
+            // two leaks above do).
+            let body = match src.find("#[cfg(test)]\nmod tests {") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+            let body = line_comment.replace_all(body, "");
+            scanned += 1;
+
+            for ctor in ERROR_CTORS {
+                let mut from = 0;
+                while let Some(i) = body[from..].find(ctor) {
+                    let start = from + i;
+                    // One statement's worth of text is enough context: an
+                    // error constructor's arguments never span a `;`.
+                    let end = body[start..]
+                        .find(';')
+                        .map(|j| start + j)
+                        .unwrap_or(body.len());
+                    assert!(
+                        !debug_spec.is_match(&body[start..end]),
+                        "{}: Debug rendering in an operator-facing error: {}",
+                        file.display(),
+                        &body[start..end]
+                    );
+                    from = start + ctor.len();
+                }
+            }
+        }
+    }
+    // Guard the guard: if the layout moves and this scans nothing, say so
+    // rather than pass vacuously.
+    assert!(scanned > 10, "scanned only {scanned} source files");
+}
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // a workspace member without a src/ dir
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
         }
     }
 }
