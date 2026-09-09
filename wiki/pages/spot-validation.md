@@ -12,6 +12,7 @@ verified:
 links:
   - decode-chain
   - spot-output-contract
+  - live-hardware-field-testing
 ---
 Decoded CW text is noisy, so validation — not decoding — is what makes a spot trustworthy. Per track, over a rolling text window, `manta-spot` parses CQ/DE context, checks callsign plausibility against a bundled cty.dat prefix list, optionally cross-checks the SCP super-check-partial list, requires a call to repeat before first spot, and dedupes/aggregates re-spots. The full pipeline and its parameters are described in ARCHITECTURE §6 — this page is the map, not the spec.
 
@@ -26,3 +27,5 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 ## Why it is shaped this way
 
 The asymmetry is deliberate: false spots (bogus callsigns) are the failure mode that discredits the whole network, so the repetition gate and cty.dat rejection are tuned to make bogus spots rare — a V8/V8w pass criterion is *0 bogus callsigns*. Validated spots flow to [[spot-output-contract]].
+
+The repetition gate assumes a bogus decode is random noise that won't repeat identically. MAN-7/103's near-channel-edge bug breaks that assumption — it produces the *same* garbled decode at a fixed channelizer boundary every time, so it repeats and passes the gate. Field-confirmed against real hardware: [[live-hardware-field-testing]].
