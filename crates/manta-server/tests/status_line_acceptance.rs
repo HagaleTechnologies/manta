@@ -33,7 +33,26 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
-#[tokio::test]
+/// Every `manta status:` line captured so far, as owned strings: the buffer
+/// is re-read between clock advances, so nothing may borrow from an
+/// intermediate snapshot of it.
+fn status_lines(captured: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    text.lines()
+        .filter(|l| l.contains("manta status:"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `start_paused` plus explicit advances, rather than a wall-clock sleep
+/// long enough to "probably" cover a few intervals (MAN-122 review round
+/// 3). On a current-thread executor descheduled long enough for both the
+/// task's 50 ms status timer and a parent wall-clock timer to come ready,
+/// the parent can resume first and observe an empty capture -- a
+/// scheduler-speed flake in a test that gates merging on two platforms.
+/// Here the clock only moves when this test moves it, and the test
+/// synchronizes on the first captured event instead of on elapsed time.
+#[tokio::test(start_paused = true)]
 async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_state() {
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     tracing_subscriber::fmt()
@@ -52,22 +71,39 @@ async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_st
     }
 
     let (_tx, rx) = tokio::sync::watch::channel(false);
-    let handle = status::spawn_status_line(metrics.clone(), Duration::from_millis(50), 1, rx)
+    let interval = Duration::from_millis(50);
+    let handle = status::spawn_status_line(metrics.clone(), interval, 1, rx)
         .expect("a non-zero interval must spawn the task");
 
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    // Advance one interval at a time until the first line is actually in the
+    // buffer: `advance` wakes the task, the `yield_now` lets it run through
+    // to its `tracing::info!` before this test reads the buffer again.
+    // Bounded, so a task that never emits fails with the capture in hand
+    // instead of hanging the suite.
+    let mut intervals = 0;
+    while status_lines(&captured).is_empty() {
+        assert!(
+            intervals < 20,
+            "no status line after {intervals} advances of the {interval:?} interval; \
+             captured: {:?}",
+            String::from_utf8(captured.lock().unwrap().clone()).unwrap()
+        );
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+        intervals += 1;
+    }
+
+    // Two further intervals, so the rate-limit assertion below has more than
+    // one interval of room to catch a task that emits per poll.
+    for _ in 0..2 {
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+        intervals += 1;
+    }
     handle.abort();
 
-    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("manta status:"))
-        .collect();
-    assert!(
-        !lines.is_empty(),
-        "no status line was emitted at all; captured: {text:?}"
-    );
-    let first = lines[0];
+    let lines = status_lines(&captured);
+    let first = &lines[0];
     for needle in [
         "tracks=3",
         "spots_per_min=",
@@ -78,8 +114,9 @@ async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_st
     }
     // Rate limiting: one line per interval, not a stream.
     assert!(
-        lines.len() <= 4,
-        "expected at most one line per 50 ms interval over 180 ms, got {}: {text:?}",
+        lines.len() <= intervals,
+        "expected at most one line per {interval:?} interval over {intervals} intervals, \
+         got {}: {lines:?}",
         lines.len()
     );
 }
