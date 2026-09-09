@@ -1521,7 +1521,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-<<<<<<< HEAD
 /// Which replaced CLI spelling the operator typed, if any.
 ///
 /// D11/MAN-77 promoted `listen --server-config` to `run --config`. clap
@@ -1582,7 +1581,8 @@ fn warn_deprecations() {
             ),
         }
     }
-=======
+}
+
 /// Human-readable `manta doctor` summary. `--json` bypasses this entirely
 /// in favor of the raw `DoctorReport`.
 fn print_doctor_report(report: &manta_engine::DoctorReport) {
@@ -1616,7 +1616,6 @@ fn print_doctor_report(report: &manta_engine::DoctorReport) {
         report.chars_decoded, report.distinct_chars, report.spots_confirmed
     );
     println!("verdict: {}", report.verdict().summary());
->>>>>>> 89e39f897a2fca4641360c0f4ed9c42ad8f4cde8
 }
 
 #[cfg(test)]
