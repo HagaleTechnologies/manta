@@ -1,5 +1,5 @@
-//! `manta` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
-//! The daemon (SDR input, servers) arrives at M2/M3 (ROADMAP).
+//! `manta` CLI: decode a WAV fixture, generate golden vectors, and run the
+//! daemon (SDR input, telnet/JSON/metrics servers, RBN uplinks) via `run`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -62,8 +62,13 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Decode a live off-air CW signal continuously from real audio.
-    Listen {
+    /// Run manta as a daemon, or copy live off-air CW continuously.
+    ///
+    /// D11/MAN-77: `run` is the daemon entry point. `listen` is kept as a
+    /// visible alias for ad hoc audio/dev testing (see
+    /// docs/DECISIONS/2026-09-06-broad-review-decisions.md).
+    #[command(visible_alias = "listen")]
+    Run {
         /// Input device name substring (default input device if omitted).
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
@@ -156,10 +161,10 @@ enum Command {
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
         /// (ARCHITECTURE §7-§8) alongside the decode loop.
-        #[arg(long)]
-        server_config: Option<PathBuf>,
+        #[arg(long, alias = "server-config")]
+        config: Option<PathBuf>,
         /// RF dial frequency in Hz, overriding the source's own
-        /// `center_freq_hz()`. Required with --server-config when the
+        /// `center_freq_hz()`. Required with --config when the
         /// source is a plain audio device or --source WAV file, since
         /// neither reports a real RF frequency (KiwiSDR/SoapySDR already
         /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
@@ -170,7 +175,7 @@ enum Command {
         /// Fixed replay epoch, Unix seconds -- overrides the replayed
         /// file's own mtime as the wall-clock instant SpotBus treats as
         /// `sample_ts == 0`. Only meaningful with --source (file replay)
-        /// and --server-config; ignored for a live source. Without this,
+        /// and --config; ignored for a live source. Without this,
         /// the epoch is the file's mtime, which is real and reproducible
         /// for an untouched file but changes if the file is copied,
         /// downloaded, or restored without preserving filesystem metadata
@@ -506,6 +511,10 @@ impl IqSource for FixedCenterFreqSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
     }
+
+    fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
+        self.inner.health_counters()
+    }
 }
 
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
@@ -789,7 +798,7 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
-/// Handles the `Listen` on-spot closure needs to feed a running spot server.
+/// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
@@ -804,6 +813,46 @@ struct SpotServer {
     /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
     /// duration -- see `shutdown_runtime_after_drain`.
     tasks: manta_server::tasks::ClientTasks,
+    /// MAN-136/MAN-45: the same `cty::Table` handed to `JsonStreamConfig`,
+    /// kept here too so the publish callback can check resolvability once
+    /// per spot for `manta_spots_unresolved_geography_total` -- checking
+    /// inside `SpotMessage::from_spot` would scale with connected client
+    /// count instead of spot count.
+    cty: std::sync::Arc<manta_spot::cty::Table>,
+    /// Whether the operator's OWN station callsign (config, not decoder
+    /// output -- and not required to be cty-resolvable) already forces the
+    /// de-side `UNKNOWN_*` sentinels. Resolved ONCE at `start_spot_server`
+    /// time rather than per spot: `station_callsign` cannot change for the
+    /// life of the process, so re-running the same binary search on every
+    /// spot only re-derives a constant.
+    station_geography_unresolved: bool,
+}
+
+/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
+/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
+/// exactly the condition `manta_spots_unresolved_geography_total` counts.
+///
+/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
+/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
+/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
+/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
+/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
+/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
+/// alone would let those spots go out carrying `dxDxcc: -1` with the
+/// counter still at zero, silently withholding the one signal this metric
+/// exists to give (round-1 validate code-review finding 1).
+///
+/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
+/// (round-7 review finding 2): `cty.lookup` answers for it through the base
+/// call's prefix, but `from_spot` deliberately discards that answer and emits
+/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
+/// real position is unknown -- so the spot does carry the sentinels this
+/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
+/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
+/// the whole test.
+fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
+    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
+        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
@@ -867,6 +916,30 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
+/// How often the daemon samples an input source's `InputHealthCounters`
+/// into `Metrics` (MAN-56). An order of magnitude below any realistic
+/// Prometheus scrape interval, so a scrape never sees more than ~1 s of
+/// staleness; the tick itself is three relaxed atomic loads and one
+/// `BTreeMap` insert. Deliberately slower than the `confirmed_live` poll
+/// (200 ms, see the `confirmed_live_handle` wiring below), which is tuned
+/// for a single startup transition rather than a forever-loop.
+const INPUT_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Snapshot `manta-input`'s counters into `manta-server`'s own,
+/// dependency-free mirror struct. The two crates deliberately share no
+/// type -- that disjointness is what keeps `manta-server` free of any
+/// `manta-input` dependency (ARCHITECTURE §3/§8) -- so `manta-cli`, which
+/// depends on both, is where the translation belongs.
+fn input_health_of(
+    counters: &manta_input::InputHealthCounters,
+) -> manta_server::metrics::InputHealth {
+    manta_server::metrics::InputHealth {
+        dropped_packets: counters.dropped_packets(),
+        gaps_detected: counters.gaps_detected(),
+        malformed_packets: counters.malformed_packets(),
+    }
+}
+
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
@@ -886,7 +959,7 @@ fn start_spot_server(
     // debugging without a code change.
     //
     // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
-    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // but `Command::Run --json` ALSO writes DecoderEvents/spots as
     // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
     // byte-identical spot logs" hard requirement means any interleaved
     // non-JSON tracing line corrupts that machine-readable stream for
@@ -958,7 +1031,7 @@ fn start_spot_server(
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus.clone(),
                 metrics: metrics.clone(),
-                cty,
+                cty: cty.clone(),
                 station_call: cfg.station_callsign.clone(),
                 decoder_version,
                 // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
@@ -1022,11 +1095,14 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
+            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            cty,
         },
     ))
 }
 
 fn main() -> Result<()> {
+    warn_deprecations();
     match Cli::parse().command {
         Command::Decode {
             path,
@@ -1067,7 +1143,7 @@ fn main() -> Result<()> {
                 manifest.expected_freq_hz
             );
         }
-        Command::Listen {
+        Command::Run {
             device,
             source,
             kiwi_host,
@@ -1095,7 +1171,7 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
-            server_config,
+            config,
             dial_freq_hz,
             replay_epoch,
         } => {
@@ -1124,9 +1200,9 @@ fn main() -> Result<()> {
                 "audio"
             };
 
-            if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            if config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
-                    "--dial-freq-hz is required with --server-config when using a plain \
+                    "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
                      frequency (KiwiSDR/SoapySDR already know theirs from \
                      --kiwi-freq/--soapy-freq)"
@@ -1181,15 +1257,15 @@ fn main() -> Result<()> {
             };
 
             // Kept alive for the process lifetime: dropping it would stop
-            // the spawned server tasks. `None` when --server-config wasn't
+            // the spawned server tasks. `None` when --config wasn't
             // given, in which case `spot_server` stays None too. `epoch`/
             // `session_nonce` are deliberately computed IN this branch, not
-            // above it -- `--source`-only replay (no --server-config) never
+            // above it -- `--source`-only replay (no --config) never
             // consumes either, and computing `session_nonce` means hashing
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match server_config {
+            let (server_runtime, spot_server) = match config {
                 Some(path) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
                     // JSON `timestamp`/RBN Zulu field a client observes) --
@@ -1254,6 +1330,33 @@ fn main() -> Result<()> {
                         }
                         None => server.metrics.set_source_health(source_name, true),
                     }
+
+                    // MAN-56: HPSDR's packet loss/malformed counters are
+                    // input-layer state manta-server cannot compute itself
+                    // (it has no manta-input dependency). Sample them into
+                    // Metrics on a timer, the same wiring-layer-injection
+                    // shape `set_source_health` uses above -- and read the
+                    // handle HERE, before `listen(src, ..)` below takes
+                    // ownership of the source for the rest of the run.
+                    // Sources with no wire-packet loss model return None
+                    // and publish no series at all, which is deliberate:
+                    // a permanently-zero counter reads as "no loss" rather
+                    // than "not measured" (cf. ARCHITECTURE §8's
+                    // manta_active_tracks caveat).
+                    if let Some(counters) = src.health_counters() {
+                        let metrics = server.metrics.clone();
+                        // Published once eagerly so the series exists (at
+                        // 0) from the very first scrape rather than only
+                        // after one poll interval.
+                        metrics.set_input_health(source_name, input_health_of(&counters));
+                        rt.spawn(async move {
+                            loop {
+                                tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                                metrics.set_input_health(source_name, input_health_of(&counters));
+                            }
+                        });
+                    }
+
                     (Some(rt), Some(server))
                 }
                 None => (None, None),
@@ -1292,11 +1395,25 @@ fn main() -> Result<()> {
                 // Provisional CLI-debugging text/JSON printed below is NOT
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
-                // ARCHITECTURE §7), fed here when --server-config is set.
+                // ARCHITECTURE §7), fed here when --config is set.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
                         server.metrics.record_spot();
+                        // MAN-136/MAN-45: counted ONCE per spot here, NOT
+                        // inside `SpotMessage::from_spot` -- that runs once
+                        // per connected JSON/WS client (json_stream.rs:126),
+                        // so counting there would scale with client count
+                        // instead of spot count. Checks BOTH sides: the
+                        // operator's own station_callsign is config, not
+                        // decoder output, and isn't required to resolve --
+                        // but it also never changes, so its side is
+                        // resolved once at start_spot_server time.
+                        if geography_is_unresolved(&server.cty, &spot.callsign)
+                            || server.station_geography_unresolved
+                        {
+                            server.metrics.record_unresolved_geography();
+                        }
                     }
                     if json {
                         println!("{}", serde_json::json!({ "spot": spot }));
@@ -1515,6 +1632,68 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Which replaced CLI spelling the operator typed, if any.
+///
+/// D11/MAN-77 promoted `listen --server-config` to `run --config`. clap
+/// cannot answer this: an alias is normalized to the subcommand's canonical
+/// name inside `Parser::possible_subcommand` before `ArgMatches` ever sees
+/// it, and `MatchedArg` records no alias spelling for flags either. So the
+/// only source of truth is raw argv, read before `Cli::parse()`.
+#[derive(Debug, PartialEq, Eq)]
+enum Deprecation {
+    /// `listen` used to start the daemon (i.e. with a config file). Plain
+    /// `listen --device`/`--kiwi-host` is NOT deprecated -- MAN-77's title
+    /// keeps `listen` for ad hoc audio/dev testing.
+    ListenVerb,
+    /// `--server-config`, under either verb.
+    ServerConfigFlag,
+}
+
+fn deprecations<I: IntoIterator<Item = String>>(args: I) -> Vec<Deprecation> {
+    let argv: Vec<String> = args.into_iter().collect();
+    let is_flag = |name: &str| {
+        argv.iter()
+            .any(|a| a == name || a.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
+    };
+    let mut out = Vec::new();
+    let has_config = is_flag("--config") || is_flag("--server-config");
+    if argv.get(1).map(String::as_str) == Some("listen") && has_config {
+        out.push(Deprecation::ListenVerb);
+    }
+    if is_flag("--server-config") {
+        out.push(Deprecation::ServerConfigFlag);
+    }
+    out
+}
+
+/// stderr, not `tracing::warn!`: the only `tracing_subscriber` init in this
+/// binary lives inside `start_spot_server`, so a parse-time `warn!` would be
+/// dropped. stderr is also the stream `--json`'s JSON Lines consumer never
+/// reads (see `start_spot_server`'s MAN-59 round-6 note), so this cannot
+/// corrupt the byte-identical spot log AGENTS.md requires.
+///
+/// Known, accepted limitation: a flag *value* that is literally the string
+/// `--server-config` (e.g. a blocklist path so named) would trigger a
+/// spurious notice, because the scan is positional-unaware by design -- it
+/// runs before clap, so it cannot know which tokens are values. The failure
+/// mode is one extra stderr line, never a wrong exit code or a changed
+/// behavior.
+fn warn_deprecations() {
+    let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+    for d in deprecations(argv) {
+        match d {
+            Deprecation::ListenVerb => eprintln!(
+                "warning: starting the daemon with `manta listen` is deprecated and will be \
+                 removed in a future release; use `manta run --config` instead."
+            ),
+            Deprecation::ServerConfigFlag => eprintln!(
+                "warning: `--server-config` is deprecated and will be removed in a future \
+                 release; use `--config` instead."
+            ),
+        }
+    }
+}
+
 /// Human-readable `manta doctor` summary. `--json` bypasses this entirely
 /// in favor of the raw `DoctorReport`.
 fn print_doctor_report(report: &manta_engine::DoctorReport) {
@@ -1560,6 +1739,41 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn deprecation_notices_fire_only_for_the_replaced_spellings() {
+        fn notices(argv: &[&str]) -> Vec<Deprecation> {
+            deprecations(argv.iter().map(|s| s.to_string()))
+        }
+        // D-3: the daemon-via-listen path is deprecated ...
+        assert_eq!(
+            notices(&["manta", "listen", "--server-config", "m.toml"]),
+            vec![Deprecation::ListenVerb, Deprecation::ServerConfigFlag]
+        );
+        assert_eq!(
+            notices(&["manta", "listen", "--config", "m.toml"]),
+            vec![Deprecation::ListenVerb]
+        );
+        // ... the ad hoc audio path the ticket title preserves is NOT.
+        assert_eq!(notices(&["manta", "listen", "--device", "hw:1"]), vec![]);
+        assert_eq!(notices(&["manta", "listen"]), vec![]);
+        // The flag is deprecated under either verb.
+        assert_eq!(
+            notices(&["manta", "run", "--server-config", "m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        // `--flag=value` form must be caught too.
+        assert_eq!(
+            notices(&["manta", "run", "--server-config=m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        // The canonical spelling is silent.
+        assert_eq!(notices(&["manta", "run", "--config", "m.toml"]), vec![]);
+        assert_eq!(notices(&["manta", "run", "--device", "hw:1"]), vec![]);
+        // Other subcommands are never implicated.
+        assert_eq!(notices(&["manta", "decode", "/tmp/v1.wav"]), vec![]);
+        assert_eq!(notices(&["manta", "soak", "--duration", "10"]), vec![]);
     }
 
     #[test]
@@ -1962,5 +2176,164 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    // MAN-56: input-layer health counters wiring.
+
+    /// A wrapper `IqSource` that forgets to forward `health_counters`
+    /// silently swallows the inner source's counters via the trait's
+    /// `None` default -- the metrics would just be absent, with nothing
+    /// failing loudly. Same hazard `confirmed_live_handle` carries; both
+    /// are asserted here.
+    #[test]
+    fn fixed_center_freq_source_forwards_both_optional_trait_signals() {
+        use manta_input::InputHealthCounters;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        struct StubSource {
+            counters: Arc<InputHealthCounters>,
+            live: Arc<AtomicBool>,
+        }
+        impl IqSource for StubSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
+                Some(self.live.clone())
+            }
+            fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+                Some(self.counters.clone())
+            }
+        }
+
+        let counters = Arc::new(InputHealthCounters::new());
+        let live = Arc::new(AtomicBool::new(false));
+        let wrapped = FixedCenterFreqSource {
+            inner: Box::new(StubSource {
+                counters: counters.clone(),
+                live: live.clone(),
+            }),
+            freq_hz: 14_025_000.0,
+        };
+
+        assert!(Arc::ptr_eq(&wrapped.health_counters().unwrap(), &counters));
+        assert!(Arc::ptr_eq(
+            &wrapped.confirmed_live_handle().unwrap(),
+            &live
+        ));
+    }
+
+    #[test]
+    fn input_health_of_snapshots_all_three_counters_without_transposing_them() {
+        // Three same-typed u64s: a transposition would be invisible to any
+        // test that used equal values (MAN-56 D7).
+        let c = manta_input::InputHealthCounters::new();
+        c.record_dropped(7);
+        c.record_gap();
+        c.record_gap();
+        c.record_malformed();
+        let h = input_health_of(&c);
+        assert_eq!(h.dropped_packets, 7);
+        assert_eq!(h.gaps_detected, 2);
+        assert_eq!(h.malformed_packets, 1);
+    }
+
+    #[test]
+    fn a_source_without_counters_publishes_no_input_health_series() {
+        struct StubSourceNoCounters;
+        impl IqSource for StubSourceNoCounters {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let m = manta_server::metrics::Metrics::new();
+        // Mirrors the wiring above: `None` means we never call
+        // set_input_health.
+        let src: Box<dyn IqSource> = Box::new(StubSourceNoCounters);
+        if let Some(c) = src.health_counters() {
+            m.set_input_health("file", input_health_of(&c));
+        }
+        assert!(!m
+            .render_prometheus_text()
+            .contains("manta_input_malformed_packets_total{"));
+    }
+
+    // MAN-136 round-1 validate code-review finding 1: the increment
+    // condition for `manta_spots_unresolved_geography_total` must match the
+    // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
+    // sentinels -- the RESOLVED ADIF entity number, not merely whether
+    // `cty.lookup` returned an entry.
+
+    const GEOGRAPHY_CTY_FIXTURE: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N;
+";
+    /// One `dxcc.tsv` row for the fixture above, in the vendored file's
+    /// `<primary-prefix>\t<adif-number>\t<name>` shape.
+    const GEOGRAPHY_DXCC_FIXTURE: &str = "K\t291\tUnited States\n";
+
+    #[test]
+    fn a_callsign_with_a_resolved_entity_number_is_not_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(cty.lookup("W1AW").and_then(|e| e.dxcc), Some(291));
+        assert!(!geography_is_unresolved(&cty, "W1AW"));
+    }
+
+    #[test]
+    fn an_unresolvable_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(cty.lookup("QQ1AAA").is_none(), "test premise");
+        assert!(geography_is_unresolved(&cty, "QQ1AAA"));
+    }
+
+    #[test]
+    fn a_maritime_or_aeronautical_mobile_callsign_is_counted_as_unresolved() {
+        // /MM and /AM resolve through the base prefix, so the entity-number
+        // test alone reads them as resolved -- but `SpotMessage::from_spot`
+        // emits UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE and null lat/lon for them,
+        // so the counter must not sit at zero while those go out.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(
+            cty.lookup("W1AW/MM").and_then(|e| e.dxcc),
+            Some(291),
+            "test premise: the base prefix still resolves"
+        );
+        assert!(geography_is_unresolved(&cty, "W1AW/MM"));
+        assert!(geography_is_unresolved(&cty, "W1AW/AM"));
+        assert!(!geography_is_unresolved(&cty, "W1AW/P"));
+    }
+
+    #[test]
+    fn a_cty_resolvable_callsign_with_no_dxcc_row_is_still_counted_as_unresolved() {
+        // The cty.dat/dxcc.tsv drift state: `cty.dat` was hand-refreshed
+        // (data/SOURCES.md has no refresh automation) without regenerating
+        // the TSV, so geography resolves -- non-null dxLat/dxLon -- while
+        // the entity number does not, and the spot goes out with
+        // `dxDxcc: -1`. Counting `lookup().is_none()` missed exactly this.
+        let cty = manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, "");
+        let entry = cty.lookup("W1AW").expect("geography still resolves");
+        assert_eq!(entry.dxcc, None, "test premise: only the number is missing");
+        assert_eq!(entry.continent, "NA");
+        assert!(
+            geography_is_unresolved(&cty, "W1AW"),
+            "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
+        );
     }
 }
