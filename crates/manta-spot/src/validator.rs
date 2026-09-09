@@ -8,6 +8,7 @@ use crate::cty;
 use crate::dedupe::Dedupe;
 use crate::gate::RepetitionGate;
 use crate::grammar;
+use crate::message;
 use crate::notch::NotchList;
 use crate::scp;
 use manta_decode::events::DecoderEvent;
@@ -35,6 +36,16 @@ pub struct Spot {
     pub confidence: f32,
     pub track_id: u32,
     pub sample_ts: u64,
+    /// MAN-33: the most recently decoded RST on this track, normalized to
+    /// three digits ("5NN" -> "599"), or None if none was decoded. Last
+    /// value wins -- unlike `spot_type`, an RST has no "better/worse"
+    /// ordering, so the promotion-only guard `Word` carries for
+    /// reclassification (MAN-28 rounds 8-13) deliberately does not apply.
+    pub rst: Option<String>,
+    /// MAN-33: this track sent a QRL frequency query. Sticky for the
+    /// track's lifetime -- there is no decoded event that would retract
+    /// one -- and cleared with the track by `TrackClosed`.
+    pub qrl_query: bool,
 }
 
 #[derive(Default)]
@@ -98,6 +109,11 @@ struct TrackState {
     /// Source of `Word::seq`; incremented each time a word is pushed to
     /// `words` (MAN-28 round 12 review).
     next_word_seq: u64,
+    /// MAN-33: see `Spot::rst`. Updated on every completed word.
+    rst: Option<String>,
+    /// MAN-33: see `Spot::qrl_query`. Set once, never cleared while the
+    /// track lives.
+    qrl_query: bool,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -298,6 +314,15 @@ impl Validator {
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
+                    // MAN-33: scan the word that just completed, not the
+                    // joined window -- "the most recently decoded RST"
+                    // (CW Skimmer's band-map semantics) is a per-track
+                    // fact, so an RST must not vanish when it ages out of
+                    // WORD_WINDOW. Also O(1) per word instead of a rescan.
+                    if let Some(rst) = message::parse_rst(&word.text) {
+                        track.rst = Some(rst);
+                    }
+                    track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
                     track.next_word_seq += 1;
                     track.words.push_back(word);
@@ -597,12 +622,14 @@ impl Validator {
         involved_max_seq: u64,
         exact_seq: Option<u64>,
     ) -> Option<Spot> {
-        let (freq_hz, snr_db, wpm) = {
+        let (freq_hz, snr_db, wpm, rst, qrl_query) = {
             let track = self.tracks.get(&track_id)?;
             (
                 track.freq_hz * self.freq_calibration,
                 track.snr_db,
                 track.wpm,
+                track.rst.clone(),
+                track.qrl_query,
             )
         };
         let (char_confidences, reclassifying) = {
@@ -737,6 +764,8 @@ impl Validator {
             confidence,
             track_id,
             sample_ts,
+            rst,
+            qrl_query,
         })
     }
 }

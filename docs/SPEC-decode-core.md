@@ -516,7 +516,9 @@ Unlike V1–V10 (testkit-synthesized IQ), these operate at the
 `Validator::ingest` directly, no IQ synthesis involved. V11-V15, V18-V30
 are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
-ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
+ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V31-V32
+(message-content annotations, MAN-33 -- also orthogonal, ARCHITECTURE §6
+step 1a) in `crates/manta-spot/tests/golden_v31_v32.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
@@ -540,6 +542,8 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37) | `BEACON`-tagged spot emits on the first decode, gate not applied -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern |
+| V31 | rst-extraction | A track decodes `TU 5NN` before its callsign spots; then a later `339` replaces it; then 17 filler words age the RST out of the 16-word window | The spot carries `rst = "599"`; the later report replaces it (`"339"`); an aged-out report is still reported (per-track, not per-window) |
+| V32 | qrl-query-flag | A track sends `QRL?` before calling CQ, vs. an ordinary CQ with no QRL | `qrl_query` true in the first case, false in the second; `TrackClosed` clears it |
 
 ---
 

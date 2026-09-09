@@ -1302,8 +1302,14 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
+                    let rst = spot
+                        .rst
+                        .as_deref()
+                        .map(|r| format!(" rst={r}"))
+                        .unwrap_or_default();
+                    let qrl = if spot.qrl_query { " QRL?" } else { "" };
                     eprintln!(
-                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
+                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}{rst}{qrl}",
                         spot.callsign,
                         spot.spot_type,
                         spot.freq_hz,

@@ -9,8 +9,8 @@ sources:
   - README.md
   - CLAUDE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: 5b9e747
+  date: 2026-09-09
 links:
   - spot-validation
 ---
@@ -25,3 +25,5 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 ## Status caveat
 
 The JSON schema is **not yet frozen in dispensa** — treat the field set as design-phase until the ADR lands. Do not restate fields here; the contract, once written, is authoritative. Validated spots reaching these surfaces come from [[spot-validation]].
+
+manta now emits two fields (`rst`, `qrlQuery`) ahead of the dispensa contract — MAN-33's message-content annotations, JSON stream only, never the telnet line. See `docs/DECISIONS/2026-09-09-man33-rst-qrl-spot-content.md` for the proposed schema fragment and why telnet is excluded; do not restate the fields here.

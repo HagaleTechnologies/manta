@@ -231,6 +231,17 @@ transmission may never produce again).
    guard against mistagging an ordinary, unrecognized CQ/DE call as
    Beacon). Context determines spot type (CQ / DE / BEACON) — RBN spots
    carry this flag.
+
+   **1a. Message-content annotations (MAN-33)**: alongside the context parse,
+   each completed word is scanned for an RST signal report (including the
+   `5NN` cut-number form, normalized to `599`) and a `QRL?` frequency query.
+   Both are carried on the spot as annotations — the most recently decoded
+   RST, and a QRL-query flag sticky for the track's lifetime. **Neither
+   gates any step below**: a callsign that fails grammar/cty/repetition is
+   not rescued by carrying an RST. They reach the JSON Lines stream (§7)
+   only; the RBN telnet line is a fixed compatibility format with no field
+   slot for them, matching CW Skimmer, which shows its own 599/QRL? labels
+   in the band map rather than in what it uploads.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
    refreshable) — a call with an unallocated prefix is rejected.
@@ -284,9 +295,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
   clients not to choke. This is the RBN/aggregator compatibility surface.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
-  (adds confidence, track id, decoder text context). This is the cqdx ingest
-  surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts.
+  (adds confidence, track id, decoder text context — including the `rst` and
+  `qrlQuery` message-content annotations from §6 step 1a, MAN-33). This is the
+  cqdx ingest surface; schema published in `dispensa` as a JSON Schema contract
+  alongside the existing ecosystem contracts.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline.
 - **Exposure policy (normative, not just observed behavior):** both servers are

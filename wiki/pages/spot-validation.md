@@ -19,6 +19,7 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 ## How it works
 
 - CQ/DE/beacon context parse sets spot type (carried in the RBN flag): ARCHITECTURE §6.1.
+- RST/QRL? message-content annotations (MAN-33) ride alongside an already-valid spot and gate none of the steps below: ARCHITECTURE §6.1a, `docs/DECISIONS/2026-09-09-man33-rst-qrl-spot-content.md`.
 - cty.dat prefix lookup rejects unallocated prefixes; SCP membership only *raises* confidence, never gates (rare/new calls must still spot, not just well-known ones): §6.2–6.3.
 - Repetition requirement (a call must decode more than once within a window before first spot) is the main garble filter: §6.4.
 - Dedupe key = (callsign, freq bucket) with a re-spot suppression window unless SNR improves or type changes: §6.5.
