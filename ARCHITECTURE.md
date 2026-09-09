@@ -359,7 +359,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
-<<<<<<< HEAD
   `manta_spots_dropped_shutdown_total` (backlog abandoned on a CLEAN
   shutdown, before any write failed — the counter that distinguishes
   shutdown-time loss from socket-write loss),
@@ -367,33 +366,22 @@ validation (MAN-28). Dedupe (step 5) still applies.
   replayed because the replay write failed or shutdown intervened — kept
   out of the write-failure counter because a replay entry was already
   counted once in `manta_spots_total`),
-  `manta_spots_unresolved_geography_total`, `manta_active_tracks`,
-  per-protocol client-connected gauges, `manta_source_health`, and the
-  uplink counters (`crates/manta-server/src/metrics.rs`) — not input-layer
-  overruns or per-stage queue depths, which MAN-56 tracks as a separate
-  gap. **`manta_active_tracks` is now populated** (MAN-45, corrected
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that
+  went out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or
+  de callsign didn't resolve against `cty.dat`, *or* it resolved but its
+  entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
+  or `/AM` designator that places it outside any DXCC entity),
+  `manta_active_tracks`, per-protocol client-connected gauges,
+  `manta_source_health`, and the uplink counters
+  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
+  per-stage queue depths, which MAN-56 tracks as a separate gap.
+  **`manta_active_tracks` is now populated** (MAN-45, corrected
   2026-09-04): `manta_engine::listen_with_observers` publishes
   `TrackManager::active_track_count()` into a shared handle as the decode
   loop runs (`ListenObservers`); the daemon's server runtime polls it into
   `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
   (every other caller — `soak()`, the CPU-budget bench, both integration
   tests) is unchanged and pays nothing for this.
-=======
-  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
-  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
-  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
-  has no row in the vendored `dxcc.tsv`), per-protocol
-  client-connected gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
-  **`manta_active_tracks` is served but not populated** (corrected
-  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
-  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
-  own comment says the engine exposes no hook for it yet — so every
-  production daemon run reports a constant `0`, not a real track count.
-  Listed separately from the "currently-implemented" set above so an
-  operator doesn't read a served-but-frozen placeholder as live data.
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`

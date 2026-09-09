@@ -1,5 +1,17 @@
 # MAN-45: unresolved-allowlisted-geography sentinels (spot_message.rs)
 
+> **Partly superseded by MAN-136** (`2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`),
+> which is now the authoritative record of what `SpotMessage::from_spot`
+> emits for an unresolvable callsign. Two claims below are stale as of that
+> ticket: `dxDxcc`/`deDxcc` are **not** nullable on dispensa's spots.v1 (all
+> five geography fields are required and non-nullable), and manta now
+> **does** vendor an ADIF DXCC-entity table (`dxcc.tsv`), so those two
+> fields carry a real entity number, the `UNKNOWN_DXCC` (-1) sentinel, or
+> ADIF's `NO_DXCC_ENTITY` (0) for a `/MM`/`/AM` call. What this document
+> still records correctly is the reasoning that ruled out the reviewer's
+> nullable-field suggestion and settled on out-of-domain sentinels — the
+> shape MAN-136 then extended to `dxDxcc`/`deDxcc`.
+
 PR #63 round 6 (chatgpt-codex-connector) flagged `SpotMessage::from_spot`'s
 fallback for a callsign `cty.lookup` cannot resolve: MAN-28's Watch List
 allowlist lets an operator emit a spot for a deliberately unallocated or

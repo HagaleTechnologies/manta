@@ -44,7 +44,6 @@ pub struct Metrics {
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
-<<<<<<< HEAD
     /// MAN-45 remediate (code-review round 18, finding 2): a client's
     /// subscribed backlog abandoned because the daemon shut down while
     /// that client was still in telnet's pre-login handshake or
@@ -74,12 +73,6 @@ pub struct Metrics {
     /// here makes the loss VISIBLE (ARCHITECTURE §8: no silent loss)
     /// without corrupting the live-delivery arithmetic.
     spots_replay_abandoned_total: AtomicU64,
-    /// MAN-45 (round-6 review finding): a spot whose `dxContinent`/
-    /// `dxCqZone` fell back to the `spot_message::UNKNOWN_*` sentinels
-    /// because `cty.lookup` couldn't resolve the (possibly Watch-List-
-    /// allowlisted) callsign. Counted once per SPOT at publish time, not
-    /// once per connected client -- see the call site's doc comment.
-=======
     /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
     /// against `cty.dat` -- or resolved only through the base prefix of a
     /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
@@ -89,7 +82,6 @@ pub struct Metrics {
     /// happening. Incremented once per spot at publish time (`main.rs`), not
     /// inside `SpotMessage::from_spot` (which runs once per connected
     /// client).
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
     spots_unresolved_geography_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
@@ -158,7 +150,6 @@ impl Metrics {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-<<<<<<< HEAD
     /// Read accessor for the write-failure counter, mirroring the
     /// `uplink_*_total` getters -- lets an acceptance test assert the
     /// "delivered + counted == published" invariant (ARCHITECTURE §8)
@@ -199,14 +190,10 @@ impl Metrics {
         self.spots_replay_abandoned_total.load(Ordering::Relaxed)
     }
 
-    /// MAN-45 (round-6 review finding): see `spots_unresolved_geography_total`'s
-    /// doc comment.
-=======
     /// MAN-136/MAN-45: call once per spot (not per connected client) when
     /// either the dx or de callsign didn't resolve against `cty.dat`, so the
     /// wire message carries the `UNKNOWN_*` sentinels instead of real
     /// geography.
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
     pub fn record_unresolved_geography(&self) {
         self.spots_unresolved_geography_total
             .fetch_add(1, Ordering::Relaxed);
@@ -387,7 +374,6 @@ impl Metrics {
         ));
 
         out.push_str(
-<<<<<<< HEAD
             "# HELP manta_spots_dropped_shutdown_total Spots abandoned because the daemon shut down while a client was still in its pre-login/handshake phase, before any socket write timed out or failed.\n",
         );
         out.push_str("# TYPE manta_spots_dropped_shutdown_total counter\n");
@@ -406,10 +392,7 @@ impl Metrics {
         ));
 
         out.push_str(
-            "# HELP manta_spots_unresolved_geography_total Spots emitted with unknown dxContinent/dxCqZone because cty.lookup could not resolve the (possibly Watch-List-allowlisted) callsign.\n",
-=======
             "# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat, OR its entity carries no row in the vendored dxcc.tsv, OR it carries a /MM or /AM designator that places it outside any DXCC entity.\n",
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
         );
         out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
         out.push_str(&format!(
@@ -654,16 +637,6 @@ mod tests {
         assert!(text.contains("# TYPE manta_spots_replay_abandoned_total counter"));
         assert!(text.contains("manta_spots_replay_abandoned_total 8"));
         assert!(text.contains("manta_spots_dropped_write_failed_total 0"));
-    }
-
-    #[test]
-    fn unresolved_geography_is_counted_and_exposed() {
-        let m = Metrics::new();
-        m.record_unresolved_geography();
-        m.record_unresolved_geography();
-        assert!(m
-            .render_prometheus_text()
-            .contains("manta_spots_unresolved_geography_total 2"));
     }
 
     #[test]

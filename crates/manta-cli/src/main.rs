@@ -798,10 +798,6 @@ fn build_pipeline_config(
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
-    /// MAN-45 (round-6 review finding): shared with the JSON/WS listener's
-    /// own copy so the `on_spot` callback below can count a spot whose
-    /// geography `cty.lookup` can't resolve, without re-parsing `cty.dat`.
-    cty: std::sync::Arc<manta_spot::cty::Table>,
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
@@ -1186,7 +1182,6 @@ fn start_spot_server(
         SpotServer {
             bus,
             metrics,
-            cty,
             shutdown_tx,
             tasks,
             station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
@@ -1498,14 +1493,6 @@ fn main() -> Result<()> {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
                         server.metrics.record_spot();
-<<<<<<< HEAD
-                        // MAN-45: counted ONCE per spot at publish time, not
-                        // inside `SpotMessage::from_spot` -- that runs once
-                        // per connected JSON/WS client, which would scale
-                        // the count with client count instead of spot
-                        // count.
-                        if server.cty.lookup(&spot.callsign).is_none() {
-=======
                         // MAN-136/MAN-45: counted ONCE per spot here, NOT
                         // inside `SpotMessage::from_spot` -- that runs once
                         // per connected JSON/WS client (json_stream.rs:126),
@@ -1518,7 +1505,6 @@ fn main() -> Result<()> {
                         if geography_is_unresolved(&server.cty, &spot.callsign)
                             || server.station_geography_unresolved
                         {
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
                             server.metrics.record_unresolved_geography();
                         }
                     }

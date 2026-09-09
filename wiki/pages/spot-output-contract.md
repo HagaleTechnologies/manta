@@ -9,13 +9,8 @@ sources:
   - README.md
   - CLAUDE.md
 verified:
-<<<<<<< HEAD
-  commit: 5b9e747
-  date: 2026-09-04
-=======
   commit: 01d1ea1
   date: 2026-09-07
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
 links:
   - spot-validation
 ---
@@ -28,10 +23,6 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 - **Unresolvable geography for an allowlisted call**: MAN-28's Watch List allowlist can make the validator emit a spot for a callsign `cty.lookup` can't resolve. `dxContinent`/`dxCqZone` emit out-of-domain sentinels rather than the contract-forbidden `null` (those two fields are required/non-nullable on the wire); `dxLat`/`dxLon` are already nullable and are the contract-legal "unknown" signal. See `docs/DECISIONS/2026-09-04-man45-unresolved-geography-sentinels.md` for the full rationale and the cross-repo question proposed to dispensa.
 - cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
 
-<<<<<<< HEAD
-Validated spots reaching these surfaces come from [[spot-validation]].
-=======
 ## Status caveat
 
 A schema now exists in dispensa and rejects malformed batches — this is no longer design-phase. `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are required and non-nullable on it; every spot carries real or named-sentinel values for all five (never `null`), per `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`, which is the authoritative record of what each field means when a callsign doesn't resolve — see that doc and ARCHITECTURE §7 rather than restating the field set here. Validated spots reaching these surfaces come from [[spot-validation]].
->>>>>>> a94ab3ba75f0b05e5ce6f081b7c38361f9941b7f
