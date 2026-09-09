@@ -151,9 +151,18 @@ Finally, confirm `README.md`'s release badge
   happened yet, and leave MAN-66 open until it has.
 - If `docker-publish` failed while `release` still published (the behavior
   this pipeline is deliberately configured to allow), re-run **only** that
-  job (`gh run rerun <run-id> --job <docker-publish-job-id>`) rather than
-  re-tagging. Do not delete and re-push the tag for a GHCR-only failure —
-  the GitHub Release binaries are the deliverable that matters.
+  job rather than re-tagging. `--job` wants the job's **`databaseId`**, not
+  the job number in the Actions URL — `gh run rerun --help` warns that the
+  URL's number returns `404 NOT FOUND` — so look the id up first:
+
+  ```sh
+  RUN_ID="$(gh run list --workflow release-publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+  gh run view "$RUN_ID" --json jobs --jq '.jobs[] | {name, databaseId}'
+  gh run rerun --job <the docker-publish databaseId from the line above>
+  ```
+
+  Do not delete and re-push the tag for a GHCR-only failure — the GitHub
+  Release binaries are the deliverable that matters.
 
 ## If the release is wrong
 
@@ -166,9 +175,32 @@ git push origin :refs/tags/v0.1.0   # removes the tag from origin
 git tag -d v0.1.0                   # removes the local tag
 ```
 
-**None of these remove the Docker image tag already pushed to GHCR** — a
+**None of these remove the Docker image tags already pushed to GHCR** — a
 `docker-publish` run that succeeded before you noticed the problem leaves
-`ghcr.io/hagaletechnologies/manta:0.1.0` (and, if this was the first tag,
-`:latest`) in place. Delete those manually from the package's GitHub UI
-(Package settings → Manage versions) if they need to go too, and re-tag
-once the underlying problem is fixed.
+both `ghcr.io/hagaletechnologies/manta:0.1.0` **and `:latest`** pointing at
+the bad image. `:latest` is republished on *every* real tag push, not just
+the first one (`release-publish.yml`'s `docker-publish` job appends
+`$IMAGE:latest` to its tag list for any `push` event), and README's install
+command is `docker run ghcr.io/hagaletechnologies/manta:latest` — so
+leaving `:latest` alone hands the bad image to every reader who follows the
+README. Always deal with both:
+
+1. Delete the bad version tag from the package's GitHub UI (Package
+   settings → Manage versions).
+2. Fix `:latest`. If there is an earlier good release, re-point it from any
+   machine with Docker and a GHCR write token — a `workflow_dispatch`
+   publish will *not* do this, since the workflow pushes `:latest` only for
+   real tag pushes:
+
+   ```sh
+   IMAGE=ghcr.io/hagaletechnologies/manta
+   docker pull "$IMAGE:<last-good-version>"
+   docker tag "$IMAGE:<last-good-version>" "$IMAGE:latest"
+   docker push "$IMAGE:latest"
+   ```
+
+   If the bad release was the first one, there is no good image to point at:
+   delete `:latest` in the same UI, and expect the README's `docker run`
+   command to fail until the next good tag republishes it.
+
+Then re-tag once the underlying problem is fixed.

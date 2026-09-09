@@ -133,9 +133,10 @@ test vectors.
 
 ## Status
 
-**Pre-stability alpha, expect breakage.** `v0.1.0` is manta's current
-version; it has not cleared its own M2/M3 acceptance gates (below). CLI
-flags, config keys, and the JSON spot schema can still change without a
+**Pre-stability alpha, expect breakage.** Every release so far is pre-1.0
+and has not cleared manta's own M2/M3 acceptance gates (below); the release
+badge at the top of this file shows which version is current. CLI flags,
+config keys, and the JSON spot schema can still change without a
 deprecation path before 1.0. What exists and what does not:
 
 - **Done:** single-signal decode from files and live audio (M1); the full

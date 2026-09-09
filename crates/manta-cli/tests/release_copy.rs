@@ -25,11 +25,54 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn read_lowercased(rel: &str) -> String {
+fn read_repo_file(rel: &str) -> String {
     let path = repo_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
-        .to_lowercase()
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+fn read_lowercased(rel: &str) -> String {
+    read_repo_file(rel).to_lowercase()
+}
+
+/// `version = "..."` from `Cargo.toml`'s `[workspace.package]` table — the
+/// single value `verify-version` checks a pushed tag against, and therefore
+/// the only version any repo prose may claim is current.
+fn workspace_version() -> String {
+    let manifest = read_repo_file("Cargo.toml");
+    let table = manifest
+        .split_once("[workspace.package]")
+        .expect("Cargo.toml has no [workspace.package] table")
+        .1;
+    let table = table.split_once("\n[").map_or(table, |(head, _)| head);
+    table
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("version"))
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
+        .map(|rest| rest.trim().trim_matches('"').to_string())
+        .expect("no `version =` key in [workspace.package]")
+}
+
+/// Every `vX.Y.Z` literal in `text`, returned without the leading `v`. A `v`
+/// that continues a word (`rev0.1.0`) is not a version reference and is
+/// skipped; a run of digits and dots that isn't exactly three numeric
+/// components (`v1.2`, `v1.2.3.4`) is not a release version either.
+fn version_literals(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    for (i, _) in text.char_indices().filter(|&(_, c)| c == 'v') {
+        if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let run: String = text[i + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let parts: Vec<&str> = run.split('.').collect();
+        if parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
+            found.push(run);
+        }
+    }
+    found
 }
 
 /// D7 pins this exact phrase. Compared case-insensitively: prose capitalises
@@ -124,5 +167,29 @@ fn github_release_is_not_gated_on_the_ghcr_push() {
          an emptied-out script: a tag whose version disagrees with the \
          workspace would otherwise publish a Release whose binaries answer \
          a different version to --version. Job block was:\n{verify_version_block}"
+    );
+}
+
+/// MAN-84 codex review: `README.md` is copied into every release archive, so
+/// a hard-coded "vX.Y.Z is current" sentence in it goes stale the moment the
+/// workspace is bumped — and the runbook only tells the operator to bump
+/// `Cargo.toml`/`Cargo.lock`. Prose that names no version at all passes (the
+/// release badge already renders the current one); prose that does name one
+/// must name the workspace's own version. Scoped to README because
+/// `docs/RUNBOOKS/release.md` deliberately uses `v0.1.0` as a worked example
+/// of the commands, not as a claim about what is current.
+#[test]
+fn readme_names_no_stale_release_version() {
+    let workspace = workspace_version();
+    let stale: Vec<String> = version_literals(&read_repo_file("README.md"))
+        .into_iter()
+        .filter(|v| *v != workspace)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "README.md refers to release version(s) {stale:?} but \
+         [workspace.package] version is {workspace:?}. Either drop the \
+         version from the prose (the release badge shows the current one) or \
+         update it in the same change that bumps the workspace."
     );
 }
