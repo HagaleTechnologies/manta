@@ -946,3 +946,35 @@ fn an_unsuppressed_power_step_beacon_counts_nothing() {
     assert_eq!(spots.len(), 1);
     assert_eq!(v.suppression_counts().power_step_guard, 0);
 }
+
+/// MAN-48 (Codex review on PR #90, round 10). The counter measures beacons
+/// the guard *lost*, so an occurrence whose Beacon candidacy was already
+/// evaluated -- and spotted -- BEFORE any bare CQ/DE entered the window is
+/// not a loss at all. "K5ARH T" resolves and emits cleanly; when a bare
+/// "CQ" then arrives before those words age out of the 16-word window, the
+/// guard re-discovers the same occurrence and burns it (which is still
+/// correct -- it stops the occurrence re-spotting once the CQ ages out),
+/// but counting it would report a missed beacon the operator in fact
+/// received.
+#[test]
+fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "the clean window must spot the beacon first, got {spots:?}"
+    );
+
+    // A bare CQ now enters the rolling window while "K5ARH T" is still in
+    // it, so the guard fires and re-burns the already-emitted occurrence.
+    run(&transmission_events(1, &["CQ", "DX"], 100_000), &mut v);
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        0,
+        "the beacon was already evaluated and emitted before the guard \
+         appeared, so the guard suppressed nothing"
+    );
+}

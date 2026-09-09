@@ -203,9 +203,14 @@ pub struct SuppressionCounts {
     /// two-repetition gate one boundary before the guard discards the
     /// repetition-exempt Beacon candidate), and gating on `attempted` made
     /// exactly those real, silent losses read as zero (Codex review on PR
-    /// #90). Every occurrence this guard discards is now counted, whatever
-    /// else happened to the same decoded word -- the Beacon classification
-    /// was thrown away either way, which is what this metric measures.
+    /// #90). Every occurrence this guard discards is counted whatever else
+    /// happened to the same decoded word -- the Beacon classification was
+    /// thrown away either way, which is what this metric measures -- with one
+    /// exception: an occurrence already evaluated AS a Beacon before the
+    /// guard appeared (a clean "K5ARH T" that spotted, then a bare CQ/DE
+    /// arriving before it ages out) is re-burned but not counted, because the
+    /// guard destroyed no beacon candidacy there (Codex review on PR #90,
+    /// round 10). See `burn_suppressed_power_step_candidate`.
     pub power_step_guard: u64,
 }
 
@@ -573,6 +578,19 @@ impl Validator {
     /// review on PR #90). `attempted` is still SET here -- that's what makes
     /// the suppression survive the triggering token aging out, as described
     /// above -- it just no longer decides whether to count.
+    ///
+    /// A word whose Beacon candidacy was ALREADY evaluated before the guard
+    /// appeared (`last_spot_type == Some(Beacon)`) is burned but NOT counted:
+    /// a clean "K5ARH T" resolves and emits, and only then does a bare CQ/DE
+    /// enter the rolling window and make this guard re-discover the same,
+    /// already-processed occurrence. Burning it is still right -- it stops
+    /// the occurrence re-spotting once the triggering token ages out -- but
+    /// the guard cost the operator no beacon there, so counting it would
+    /// report a miss that never happened and inflate the metric on exactly
+    /// the windows the guard handled well (MAN-48, Codex review on PR #90,
+    /// round 10). Only the power-step family and `BEACON_RE` ever produce
+    /// `Beacon`, and both mean the same thing here: this word's beacon
+    /// classification already got its evaluation.
     fn burn_suppressed_power_step_candidate(
         &mut self,
         track_id: u32,
@@ -587,7 +605,11 @@ impl Validator {
                 return;
             };
             let involved_max_seq = involved_max_seq.max(word.seq);
-            let first_suppression = !word.power_step_suppressed;
+            // An occurrence whose Beacon candidacy was already evaluated
+            // before the guard appeared lost nothing to the guard -- see
+            // this function's own docs.
+            let already_processed = word.last_spot_type == Some(SpotType::Beacon);
+            let first_suppression = !word.power_step_suppressed && !already_processed;
             word.power_step_suppressed = true;
             word.attempted = true;
             word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);

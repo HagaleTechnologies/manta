@@ -230,8 +230,10 @@ transmission may never produce again).
    token appears anywhere in the window at all (the token must be a
    complete decoded word, not a substring glued to punctuation inside
    one), a deliberately coarse guard against mistagging an ordinary,
-   unrecognized CQ/DE call as Beacon — each occurrence it suppresses is
-   counted once, as `SuppressionCounts::power_step_guard` (§8)). Context
+   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+   is counted once, as `SuppressionCounts::power_step_guard` (§8); an
+   occurrence already evaluated as a Beacon before the guard appeared is
+   not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
