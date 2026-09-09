@@ -359,9 +359,15 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
-  `manta_spots_dropped_shutdown_total` (backlog abandoned on a CLEAN
-  shutdown, before any write failed — the counter that distinguishes
-  shutdown-time loss from socket-write loss),
+  `manta_spots_dropped_shutdown_total` (backlog abandoned because the
+  daemon shut down while a client was still in its PRE-LOGIN/handshake
+  phase — telnet's login prompt/read/banner and the JSON stream's
+  WS-detection peek and WS-accept, the only sites that charge it — before
+  any socket write was attempted, let alone failed. It is NOT the
+  graceful-drain series: a per-client drain loop that exhausts
+  `tasks::CLIENT_DRAIN_DEADLINE` records whatever it abandons on
+  `manta_spots_dropped_write_failed_total` (§7), so that is the counter
+  to watch for drain-deadline loss),
   `manta_spots_replay_abandoned_total` (`sh/dx` history entries never
   replayed because the replay write failed or shutdown intervened — kept
   out of the write-failure counter because a replay entry was already
