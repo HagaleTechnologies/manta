@@ -68,6 +68,25 @@ struct GateEntry {
     last_seen_by_track: BTreeMap<u32, u64>,
 }
 
+impl GateEntry {
+    /// Most recent activity of any kind (accepted or merely seen),
+    /// `None` if this entry has nothing at all -- used to pick the
+    /// *freshest* eligible neighbor bucket in `record` (Codex review, PR
+    /// #152) rather than always the lowest-numbered one, which could
+    /// otherwise select a not-yet-swept but effectively-expired entry
+    /// (sweeps are throttled to a periodic interval, not run on every
+    /// call) ahead of a genuinely fresher one a different neighbor bucket
+    /// away.
+    fn most_recent(&self) -> Option<u64> {
+        self.accepted
+            .last()
+            .copied()
+            .into_iter()
+            .chain(self.last_seen_by_track.values().copied())
+            .max()
+    }
+}
+
 pub struct RepetitionGate {
     window_samples: u64,
     min_occurrence_gap_samples: u64,
@@ -128,12 +147,35 @@ impl RepetitionGate {
     /// doc): a track's own first decode, even if rejected as a
     /// near-duplicate of a different track's, must not block that same
     /// track's own later, genuinely distinct repeat.
+    ///
+    /// A non-finite `freq_hz` (NaN/±infinity -- should never happen from
+    /// the real DSP pipeline, but a defensive guard, Codex review PR
+    /// #152) is rejected outright: no entry is touched, and this returns
+    /// 0 (never `>= 2`, so it can never itself satisfy the repetition
+    /// gate). Silently mapping it to some fallback bucket instead would
+    /// risk cross-contaminating repetition credit with whatever a real
+    /// signal happens to already occupy there -- bucket 0 in particular
+    /// is already a live sentinel elsewhere in this codebase for "unknown
+    /// center frequency" (`WavIqSource`'s missing-sidecar default).
     pub fn record(&mut self, track_id: u32, freq_hz: f64, callsign: &str, sample_ts: u64) -> usize {
         self.records_total += 1;
+        if !freq_hz.is_finite() {
+            return 0;
+        }
         let b = bucket(freq_hz);
+        // Among the home bucket and both neighbors, join whichever
+        // existing entry is *freshest* (see `GateEntry::most_recent`),
+        // not just the lowest-numbered one that happens to still exist --
+        // sweeps are throttled, so a stale-but-not-yet-swept neighbor
+        // must not be preferred over a genuinely fresher one.
         let key = (b - 1..=b + 1)
             .map(|candidate| (candidate, callsign.to_string()))
-            .find(|k| self.seen.contains_key(k))
+            .filter_map(|k| {
+                let ts = self.seen.get(&k)?.most_recent()?;
+                Some((k, ts))
+            })
+            .max_by_key(|(_, ts)| *ts)
+            .map(|(k, _)| k)
             .unwrap_or((b, callsign.to_string()));
         let entry = self.seen.entry(key).or_default();
         let is_own_track_before = entry.last_seen_by_track.contains_key(&track_id);
@@ -322,22 +364,53 @@ mod tests {
         assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 500), 2);
     }
 
-    /// Codex review, PR #152: a non-finite or astronomically large
-    /// `freq_hz` (e.g. a corrupted sidecar `center_freq_hz`) must never
-    /// panic or wrap via `bucket`'s `± 1` neighbor arithmetic -- it's
-    /// clamped to a safe bucket instead.
+    /// Codex review, PR #152: a non-finite `freq_hz` (NaN/±infinity) must
+    /// be rejected outright -- no entry touched, `records_total` still
+    /// increments (it's a real call), but the returned count is always 0
+    /// and `seen` stays empty. An astronomically large but *finite*
+    /// `freq_hz` (e.g. `f64::MAX`, a corrupted sidecar `center_freq_hz`)
+    /// must instead never panic or wrap via `bucket`'s `± 1` neighbor
+    /// arithmetic -- it's clamped to a safe bucket and recorded normally.
     #[test]
     fn non_finite_and_extreme_frequencies_do_not_panic() {
         let mut gate = RepetitionGate::new(FS);
-        for freq in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::MAX,
-            f64::MIN,
-        ] {
+        for freq in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(gate.record(1, freq, "K5ARH", 0), 0);
+        }
+        assert!(
+            gate.is_empty(),
+            "non-finite frequencies must never create an entry"
+        );
+        for freq in [f64::MAX, f64::MIN] {
             gate.record(1, freq, "K5ARH", 0);
         }
+    }
+
+    /// Codex review, PR #152, round 7: among the home bucket and both
+    /// neighbors, `record` must join whichever existing entry is
+    /// *freshest*, not just the lowest-numbered bucket that happens to
+    /// still exist. Bucket `b-1` holds an old entry; bucket `b+1` holds a
+    /// more recent one. A naive "first matching neighbor" search would
+    /// join `b-1` (it sorts first regardless of recency) instead of the
+    /// entry a real drifting signal actually continued into.
+    #[test]
+    fn record_prefers_the_freshest_matching_neighbor_over_the_stale_one() {
+        let mut gate = RepetitionGate::new(FS);
+
+        // Bucket b-1 (14_999_900 Hz): an old decode.
+        gate.record(1, 14_999_900.0, "K5ARH", 0);
+        // Bucket b+1 (15_000_100 Hz): a more recent decode, different track.
+        gate.record(2, 15_000_100.0, "K5ARH", 500_000);
+
+        // A new decode at the home bucket (15_000_000 Hz), comfortably past
+        // the minimum-occurrence gap from bucket b+1's timestamp, must join
+        // the freshest neighbor (b+1) -- becoming its second occurrence --
+        // not the older, lowest-numbered one (b-1).
+        assert_eq!(
+            gate.record(3, 15_000_000.0, "K5ARH", 700_000),
+            2,
+            "must join the freshest neighbor entry, not the stale lowest-numbered one"
+        );
     }
 
     /// Codex review, PR #152, round 6: a track's own decode, even if its
