@@ -65,8 +65,10 @@ pub fn parse_rst(text: &str) -> Option<String> {
     })
 }
 
-/// True if `text` contains a QRL query token. See `QRL_RE` on why the `?` is
-/// optional.
+/// True if `text` contains a QRL query token: the literal `QRL?`, with the
+/// trailing `?` **required** -- bare `QRL` is the response ("the frequency is
+/// in use"), not the query, and does not match. See `QRL_RE` on why the `?` is
+/// required.
 pub fn is_qrl_query(text: &str) -> bool {
     QRL_RE.is_match(text)
 }
