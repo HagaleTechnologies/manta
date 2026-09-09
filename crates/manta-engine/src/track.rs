@@ -12,16 +12,50 @@ pub struct DetectorConfig {
     pub on_snr_db: f32,
     /// SPEC §9: off (drop) threshold in dB SNR.
     pub off_snr_db: f32,
-    /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
+    /// SPEC §2.3/§2.4: rise hops that must cumulatively accumulate within
+    /// `confirm_window_hops` before CANDIDATE -> ACTIVE.
     pub confirm_hops: u64,
+    /// MAN-3: hop window, counted from CANDIDATE birth, inside which
+    /// `confirm_hops` rise hops must accumulate for promotion.
+    /// **Deviation from SPEC §2.4's literal wording** ("rise sustained 19
+    /// hops" / "rise condition lost before 19 hops", i.e. *consecutive*) --
+    /// see docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md.
+    /// 19 consecutive hops is 50.7 ms of sustained smoothed key-down; at
+    /// 34-40 WPM a dit is only 30-35 ms and the Gate's tau=40 ms EMA decays
+    /// below the on-threshold across the inter-element gap, so only a dah
+    /// could ever confirm a track -- and only when the candidate happened to
+    /// be born on its leading edge. Values below `confirm_hops` are clamped
+    /// up to it (`Lifecycle::new`); a window shorter than the required count
+    /// would make promotion impossible.
+    pub confirm_window_hops: u64,
     /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED.
     pub hang_hops: u64,
     /// SPEC §2.4: no character emitted for this many hops (30000ms) -> CLOSED (garbage collect).
     pub gc_hops: u64,
     /// SPEC §2.1: track creation inhibited for this many hops (2000ms) after start.
     pub warmup_hops: u64,
-    /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
+    /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks -- i.e.
+    /// the *decoder* cap. Only promoted (ACTIVE/HANG) tracks own a decoder
+    /// and count against it; unconfirmed CANDIDATEs are bounded separately
+    /// by `candidate_cap`.
     pub track_cap: usize,
+    /// MAN-3 review round 7 (not SPEC §9): max concurrent unconfirmed
+    /// CANDIDATE tracks, bounded independently of `track_cap`.
+    ///
+    /// Round 6 ranked lifecycle class ahead of SNR inside one shared cap so
+    /// a loud candidate that goes on to expire `Unconfirmed` could not
+    /// displace an ACTIVE track mid-decode. With a shared cap that ordering
+    /// has a fatal corollary: once `track_cap` promoted tracks are open,
+    /// every newly spawned candidate is over the cap on its birth hop and
+    /// is evicted immediately, on every subsequent rise -- so it can never
+    /// accumulate `confirm_hops`, and a genuinely stronger signal can never
+    /// take a weak or hanging incumbent's slot. Splitting the bound keeps
+    /// both properties: candidates never compete with decoders (they are
+    /// evicted only against each other, lowest current SNR first), and a
+    /// candidate that *does* confirm then contests `track_cap` on SNR like
+    /// any other promoted track. Total open tracks stay bounded by
+    /// `track_cap + candidate_cap`.
+    pub candidate_cap: usize,
 }
 
 impl Default for DetectorConfig {
@@ -58,10 +92,17 @@ impl Default for DetectorConfig {
             on_snr_db: 12.0,
             off_snr_db: 3.0,
             confirm_hops: 19,
+            confirm_window_hops: 75, // 200 ms at the 375 Hz hop rate
             hang_hops: 1875,
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 500,
+            // Same order as `track_cap`: a candidate costs only per-hop
+            // FSM bookkeeping (no decoder, no rayon pool slot), and it
+            // lives at most `confirm_window_hops` (200 ms) before closing
+            // `Unconfirmed`, so this bounds the transient population under
+            // a wideband burst without ever throttling real detections.
+            candidate_cap: 500,
         }
     }
 }
@@ -80,7 +121,7 @@ pub(crate) enum LifecycleState {
 /// SPEC §2.4/§2.5: reason for track closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReason {
-    /// Rise never confirmed within `confirm_hops` (SPEC §2.4: CANDIDATE -> IDLE).
+    /// Rise never confirmed within `confirm_window_hops` (SPEC §2.4: CANDIDATE -> IDLE).
     Unconfirmed,
     /// Hang timer expired (SPEC §2.4: HANG -> CLOSED).
     HangExpired,
@@ -138,9 +179,12 @@ pub(crate) enum LifecycleEvent {
 pub(crate) struct Lifecycle {
     state: LifecycleState,
     confirm_count: u64,
+    /// Hops since birth, used only by CANDIDATE (MAN-3's confirm window).
+    candidate_age: u64,
     hang_count: u64,
     silent_count: u64,
     confirm_hops: u64,
+    confirm_window_hops: u64,
     hang_hops: u64,
     gc_hops: u64,
 }
@@ -151,19 +195,20 @@ impl Lifecycle {
         Lifecycle {
             state: LifecycleState::Candidate,
             confirm_count: 1, // this hop's rise already counts as the first
+            candidate_age: 1, // the birth hop, matching confirm_count above
             hang_count: 0,
             silent_count: 0,
             confirm_hops: cfg.confirm_hops,
+            // A window shorter than confirm_hops would make promotion
+            // impossible -- clamped, not honoured (MAN-3).
+            confirm_window_hops: cfg.confirm_window_hops.max(cfg.confirm_hops),
             hang_hops: cfg.hang_hops,
             gc_hops: cfg.gc_hops,
         }
     }
 
-    /// Query the current lifecycle state.
-    // Temporary: no non-test reader yet -- `Track::state` (the only
-    // present-day caller of this) is itself unused outside tests until a
-    // later task filters/reports tracks by lifecycle state.
-    #[allow(dead_code)]
+    /// Query the current lifecycle state. Read in production through
+    /// `Track::state` by `merge_keep_rank` (SPEC §2.5 tie-break).
     pub(crate) fn state(&self) -> LifecycleState {
         self.state
     }
@@ -191,13 +236,20 @@ impl Lifecycle {
     pub(crate) fn on_hop(&mut self, rise: bool, drop: bool, char_emitted: bool) -> LifecycleEvent {
         match self.state {
             LifecycleState::Candidate => {
+                self.candidate_age += 1;
                 if rise {
                     self.confirm_count += 1;
                     if self.confirm_count >= self.confirm_hops {
                         self.state = LifecycleState::Active;
                         return LifecycleEvent::Promoted;
                     }
-                } else {
+                }
+                // MAN-3: a non-rise hop no longer kills the candidate --
+                // only running out of window does. A dit at 39 WPM cannot
+                // hold the tau=40 ms smoothed gate up for 19 consecutive
+                // hops, so the old zero-tolerance rule made short, fast
+                // texts undetectable except by lucky dah alignment.
+                if self.candidate_age >= self.confirm_window_hops {
                     return LifecycleEvent::Closed(CloseReason::Unconfirmed);
                 }
                 LifecycleEvent::None
@@ -288,6 +340,56 @@ pub(crate) struct Track {
     /// (MAN-19 review round 1). `TrackClosed` emission checks this, not
     /// decoder presence.
     has_emitted: bool,
+    /// Hops this track's decoder has actually been fed (`pending.push`),
+    /// counted from its promotion hop inclusive; 0 while CANDIDATE.
+    ///
+    /// Review round 6 (P1): `merge_keep_rank` used to read `has_emitted`,
+    /// which `process_hops` only sets *after* a whole hop batch has run
+    /// and `drain_pool()` has returned -- so its value at any mid-batch
+    /// merge depends on where the caller happened to cut its chunks. A
+    /// small-chunk caller could see `true` where a large-chunk caller
+    /// still saw `false`, pick a different merge survivor, and emit
+    /// different text for the identical hop stream, violating SPEC §8
+    /// determinism (AGENTS.md's chunk-invariance rule). This counter is
+    /// advanced by `step_hop`, once per hop, so it is a pure function of
+    /// the hop stream and identical under every chunk partitioning.
+    ///
+    /// It also strictly refines the old rank: decoder age separates two
+    /// tracks that are both promoted and both still silent, which the
+    /// boolean pair could not, so the more advanced decoder is no longer
+    /// discarded by the lower-id fallback (round-6 P2 finding).
+    decoder_hops: u64,
+}
+
+/// How much lifecycle progress a track has to lose in a `merge_converged`
+/// SNR tie: higher survives. Ordered `(promoted, decoder_hops)` -- a track
+/// that has been through CANDIDATE -> ACTIVE outranks one still awaiting
+/// confirmation (which may yet expire `Unconfirmed`, taking the merged
+/// signal's only decode with it), and among promoted tracks the one whose
+/// decoder has consumed more hops outranks the younger one.
+///
+/// Review round 6: the second component used to be `has_emitted`, and both
+/// of that choice's problems are fixed by counting hops instead.
+/// (1) P1 -- `has_emitted` is only assigned after a whole `process_hops`
+/// batch drains, so its value during a mid-batch merge depended on the
+/// caller's chunk size and two callers could keep different survivors for
+/// the same hop stream (SPEC §8 determinism). `decoder_hops` is advanced
+/// once per hop by `step_hop`, so it is chunk-invariant by construction.
+/// (2) P2 -- when a low-id track uses most of the 75-hop confirmation
+/// window while its neighbour promotes promptly, both can be ACTIVE and
+/// both still silent at convergence; `(true, false)` for both fell through
+/// to the lower id and discarded the substantially more advanced decoder,
+/// re-creating this ticket's zero-output failure. Decoder age separates
+/// exactly that state.
+///
+/// Deliberately *not* a function of `id`: `TrackManager::spawn`'s `next_id`
+/// is spawn-ordered and says nothing about which track promoted first (see
+/// `merge_converged`'s tie-break comment). The caller falls back to the
+/// lower id only when this rank ties too, so the ordering stays total and
+/// deterministic (SPEC §8).
+fn merge_keep_rank(t: &Track) -> (bool, u64) {
+    let promoted = matches!(t.state(), LifecycleState::Active | LifecycleState::Hang);
+    (promoted, t.decoder_hops)
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -316,13 +418,13 @@ impl Track {
             decoder: None,
             pending: Vec::new(),
             has_emitted: false,
+            decoder_hops: 0,
         }
     }
 
-    /// Query the current lifecycle state. SPEC §2.4.
-    // Temporary: no non-test caller yet until a later task filters/reports
-    // tracks by lifecycle state (e.g. spot output limited to ACTIVE tracks).
-    #[allow(dead_code)]
+    /// Query the current lifecycle state. SPEC §2.4. Read by
+    /// `merge_keep_rank` to rank lifecycle progress ahead of spawn order in
+    /// `merge_converged`'s SNR tie-break.
     pub(crate) fn state(&self) -> LifecycleState {
         self.lifecycle.state()
     }
@@ -413,6 +515,8 @@ pub struct TrackManager {
     channel_spacing_hz: f64,
     /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
     close_counts: CloseCounts,
+    /// MAN-3: total CANDIDATE -> ACTIVE promotions, read via `promoted_count`.
+    promoted_count: u64,
 }
 
 impl TrackManager {
@@ -438,6 +542,7 @@ impl TrackManager {
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
+            promoted_count: 0,
         }
     }
 
@@ -453,6 +558,15 @@ impl TrackManager {
     /// (MAN-19) ahead of the real M3 Prometheus endpoint.
     pub fn close_counts(&self) -> CloseCounts {
         self.close_counts
+    }
+
+    /// Total CANDIDATE -> ACTIVE promotions over this manager's lifetime
+    /// (MAN-3). Complements `close_counts` (issue #26): a track that
+    /// promotes and dies before emitting anything is invisible in both the
+    /// event stream (`has_emitted` gating) and in `active_track_count`, so
+    /// promotions are the only measurable handle on false-track pressure.
+    pub fn promoted_count(&self) -> u64 {
+        self.promoted_count
     }
 
     /// Count of tracks currently open (`self.tracks`, SPEC §2.5). Alongside
@@ -532,6 +646,8 @@ impl TrackManager {
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
+                    track.decoder_hops += 1;
+                    self.promoted_count += 1;
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
@@ -572,6 +688,10 @@ impl TrackManager {
                             decoder.set_freq_hz(freq_hz);
                         }
                         track.pending.push((hop.power[k].sqrt(), sample_ts));
+                        // Hop-counted decoder age for `merge_keep_rank`
+                        // (round-6 P1): advanced here, per hop, so it can
+                        // never depend on where the caller cut its chunks.
+                        track.decoder_hops += 1;
                     }
                 }
             }
@@ -587,9 +707,10 @@ impl TrackManager {
         // without ever being promoted never appeared in the event stream
         // either; surfacing a `TrackClosed` for either case would
         // introduce a track_id into the stream that callers like
-        // `decode_samples` (which picks the *lowest* track_id present as
-        // its single-track report) never used to see, silently changing
-        // which track gets reported.
+        // `decode_samples` (which picks the track_id with the most
+        // `CharDecoded` events via `select_report_track`, ties broken to
+        // the lowest id) never used to see, silently changing which track
+        // gets reported.
         closed.retain(|id| {
             self.tracks
                 .remove(id)
@@ -649,7 +770,8 @@ impl TrackManager {
     }
 
     /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
-    /// the lower-current-SNR one is closed.
+    /// the lower-current-SNR one is closed. Ties fall back to
+    /// `merge_keep_rank`, then to keeping the lower id.
     fn merge_converged(&mut self) -> Vec<u32> {
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         let mut to_close = Vec::new();
@@ -661,7 +783,51 @@ impl TrackManager {
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
                 if (ca - cb).abs() < 1.0 {
-                    let loser = if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db
+                    // MAN-3: strict `<`, not `<=`. `a` is always the older
+                    // (lower-id, earlier-promoted) track here (`ids` is a
+                    // BTreeMap-ordered ascending scan). Two tracks whose
+                    // owned windows overlap (e.g. centers 149.x and 150.x,
+                    // windows {148,149,150} and {149,150,151}) routinely
+                    // `select_channel` onto the SAME physical peak channel
+                    // and so read *bit-identical* `current_snr_db` -- a
+                    // boundary-straddling signal (any true center whose
+                    // fractional channel offset isn't near 0/1) produces
+                    // this on nearly every convergence. The old `<=` broke
+                    // that tie in favor of `b` (the newer track) every
+                    // single time, so the established track was evicted by
+                    // its own newly-spawned neighbor over and over --
+                    // confirmed live for MAN-3's "DA"/"Z5" cases: dozens of
+                    // promotions across a 12 s scene, every one merged away
+                    // within a few hundred hops, none ever surviving the
+                    // ~375-hop `Demod` init window. Only a track reading a
+                    // STRICTLY lower SNR loses on SNR alone; an exact tie
+                    // falls through to `merge_keep_rank` below.
+                    //
+                    // Review round 1: id order is *spawn* order, not
+                    // promotion order -- `merge_converged` scans CANDIDATE
+                    // and ACTIVE tracks alike, so a low-id candidate that
+                    // accumulates rise hops slowly can still be unconfirmed
+                    // when a higher-id neighbour has already promoted and
+                    // built up decoder history. Breaking the tie on id
+                    // alone would discard that promoted track and keep a
+                    // candidate that may simply expire as `Unconfirmed` --
+                    // recreating this ticket's zero-output failure from the
+                    // other direction. Rank lifecycle progress (promoted,
+                    // and whether it has actually emitted) ahead of id, and
+                    // fall back to keeping the lower id only when even that
+                    // ties -- which is the exact case the `<`-over-`<=`
+                    // change above was made for, so the MAN-3 behaviour is
+                    // unchanged wherever both tracks are at the same
+                    // lifecycle stage.
+                    let (sa, sb) = (
+                        self.tracks[&a].current_snr_db,
+                        self.tracks[&b].current_snr_db,
+                    );
+                    let loser = if sa < sb {
+                        a
+                    } else if sb < sa {
+                        b
+                    } else if merge_keep_rank(&self.tracks[&a]) < merge_keep_rank(&self.tracks[&b])
                     {
                         a
                     } else {
@@ -690,17 +856,67 @@ impl TrackManager {
         ever_emitted_closed
     }
 
-    /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
-    /// eviction.
+    /// SPEC §2.4/ARCHITECTURE §4: lowest-current-SNR eviction, applied
+    /// within each lifecycle class against that class's own bound --
+    /// `track_cap` for promoted (ACTIVE/HANG) tracks, `candidate_cap` for
+    /// unconfirmed CANDIDATEs.
+    ///
+    /// Review round 6 made this one shared cap ranked by lifecycle class
+    /// (candidates evicted first, however loud), because MAN-3's widened
+    /// confirmation window keeps a CANDIDATE alive for up to
+    /// `confirm_window_hops` (75) hops after it stops rising, and under a
+    /// single cap a candidate that goes on to expire `Unconfirmed` could
+    /// otherwise displace an ACTIVE track mid-decode.
+    ///
+    /// Review round 7: with a single cap that class ordering starves
+    /// newcomers outright. Once `self.tracks` holds `track_cap` promoted
+    /// tracks, *every* freshly spawned candidate is over the cap on its
+    /// birth hop and is the class minimum, so it is evicted immediately --
+    /// and again on every subsequent rise. It can never accumulate
+    /// `confirm_hops`, so no signal, however strong, can ever take a weak
+    /// or hanging incumbent's slot, and the promoted-vs-promoted branch is
+    /// unreachable through the per-hop path. Splitting the bound keeps
+    /// round 6's property (a candidate is never evicted in an ACTIVE
+    /// track's place -- the two classes no longer share a budget at all)
+    /// without the starvation: candidates are bounded only against each
+    /// other, and a candidate that confirms then contests `track_cap` on
+    /// SNR like any other promoted track, so a stronger newcomer *does*
+    /// replace the weakest incumbent. Total open tracks stay bounded by
+    /// `track_cap + candidate_cap`.
     fn evict_over_cap(&mut self) -> Vec<u32> {
         let mut evicted = Vec::new();
-        while self.tracks.len() > self.cfg.track_cap {
+        // Candidates first: a promotion inside this same batch would
+        // otherwise be judged against a candidate population that is about
+        // to shrink anyway, and evicting the cheap class first never
+        // changes which promoted track loses (the two bounds are now
+        // independent).
+        self.evict_class(false, self.cfg.candidate_cap, &mut evicted);
+        self.evict_class(true, self.cfg.track_cap, &mut evicted);
+        self.recompute_ownership();
+        evicted
+    }
+
+    /// Evict the lowest-`current_snr_db` members of one lifecycle class
+    /// until at most `cap` of them remain. `promoted_class` selects the
+    /// class: `true` = ACTIVE/HANG (decoder-owning), `false` = unconfirmed
+    /// CANDIDATE.
+    ///
+    /// Determinism (SPEC §8): `self.tracks` is a `BTreeMap`, so `iter()` is
+    /// ascending by id and `min_by` keeps the FIRST minimum -- an exact SNR
+    /// tie always evicts the lowest id.
+    fn evict_class(&mut self, promoted_class: bool, cap: usize, evicted: &mut Vec<u32>) {
+        let in_class = |t: &Track| {
+            matches!(t.state(), LifecycleState::Active | LifecycleState::Hang) == promoted_class
+        };
+        let mut remaining = self.tracks.values().filter(|t| in_class(t)).count();
+        while remaining > cap {
             let loser = *self
                 .tracks
                 .iter()
+                .filter(|(_, t)| in_class(t))
                 .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
                 .map(|(id, _)| id)
-                .unwrap();
+                .expect("remaining > cap implies at least one member of this class");
             self.close_counts.record(CloseReason::Evicted);
             // MAN-19: only report as `TrackClosed`-worthy if it actually
             // emitted a real event -- see `step_hop`'s matching comment.
@@ -711,9 +927,8 @@ impl TrackManager {
             {
                 evicted.push(loser);
             }
+            remaining -= 1;
         }
-        self.recompute_ownership();
-        evicted
     }
 
     /// Process one `Channelizer::process()` slice: sequential per-hop
@@ -1001,13 +1216,16 @@ mod tests {
     }
 
     #[test]
-    fn candidate_closes_unconfirmed_on_any_non_rise_hop() {
+    fn candidate_survives_a_single_non_rise_hop_within_the_window() {
+        // MAN-3: the old zero-tolerance rule closed a CANDIDATE on the
+        // first non-rise hop; this test used to assert exactly that. Now a
+        // non-rise hop is tolerated as long as the confirm window (default
+        // 200 ms, clamped up from `confirm_hops` here) hasn't expired --
+        // see `candidate_closes_unconfirmed_when_the_window_expires` for
+        // the window-bound behavior this replaces it with.
         let mut lc = Lifecycle::new(&cfg());
         assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
-        assert_eq!(
-            lc.on_hop(false, true, false),
-            LifecycleEvent::Closed(CloseReason::Unconfirmed)
-        );
+        assert_eq!(lc.on_hop(false, true, false), LifecycleEvent::None);
     }
 
     #[test]
@@ -1073,6 +1291,291 @@ mod tests {
         for _ in 0..19 {
             assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::None);
         }
+    }
+
+    /// MAN-3: at 34-39 WPM the Gate's tau=40 ms EMA decays below the
+    /// on-threshold across each inter-element gap, so no dit can ever hold
+    /// 19 *consecutive* rise hops -- only a dah can, and only if the
+    /// candidate was born on its leading edge. This pattern (11 rise, 6
+    /// non-rise, 12 rise: two dits at ~37 WPM) must confirm; before this
+    /// fix it closed `Unconfirmed` on hop 13.
+    #[test]
+    fn candidate_confirms_on_cumulative_rise_across_a_gap() {
+        let cfg = DetectorConfig::default();
+        let mut lc = Lifecycle::new(&cfg); // birth hop counts as rise #1
+        let pattern = [(true, 11), (false, 6), (true, 12)];
+        let mut promoted = false;
+        for (rise, n) in pattern {
+            for _ in 0..n {
+                match lc.on_hop(rise, false, false) {
+                    LifecycleEvent::Promoted => {
+                        promoted = true;
+                        break;
+                    }
+                    LifecycleEvent::Closed(r) => panic!("closed {r:?} -- must survive the gap"),
+                    LifecycleEvent::None => {}
+                }
+            }
+            if promoted {
+                break;
+            }
+        }
+        assert!(
+            promoted,
+            "19 cumulative rise hops inside the window must promote"
+        );
+    }
+
+    /// The window is a real bound, not an unbounded accumulator: sparse
+    /// noise rises must still close the candidate.
+    #[test]
+    fn candidate_closes_unconfirmed_when_the_window_expires() {
+        let cfg = DetectorConfig::default();
+        let mut lc = Lifecycle::new(&cfg);
+        // One rise every 5th hop: 15 rises over the whole 75-hop window < 19.
+        for hop in 1..cfg.confirm_window_hops {
+            let rise = hop % 5 == 0;
+            if let LifecycleEvent::Closed(reason) = lc.on_hop(rise, false, false) {
+                assert_eq!(reason, CloseReason::Unconfirmed);
+                assert_eq!(
+                    hop,
+                    cfg.confirm_window_hops - 1,
+                    "must close exactly at window expiry"
+                );
+                return;
+            }
+        }
+        panic!("candidate never closed -- confirm_window_hops is not bounding it");
+    }
+
+    /// Slow signals are bit-unchanged: 19 consecutive rise hops still
+    /// promote on exactly the 19th hop, so V1-V10's promotion hops do not
+    /// move.
+    #[test]
+    fn consecutive_rise_still_promotes_on_the_nineteenth_hop() {
+        let cfg = DetectorConfig::default();
+        let mut lc = Lifecycle::new(&cfg);
+        for hop in 2..cfg.confirm_hops {
+            assert_eq!(
+                lc.on_hop(true, false, false),
+                LifecycleEvent::None,
+                "hop {hop}"
+            );
+        }
+        assert_eq!(lc.on_hop(true, false, false), LifecycleEvent::Promoted);
+    }
+
+    /// Build a promoted (ACTIVE) track with a chosen decoder age, without
+    /// running a whole channelizer scene through it.
+    fn promoted_track(id: u32, decoder_hops: u64) -> Track {
+        let cfg = DetectorConfig::default();
+        let mut t = Track::new(id, 100, &cfg);
+        for _ in 0..cfg.confirm_hops {
+            let _ = t.lifecycle.on_hop(true, false, false);
+        }
+        assert_eq!(t.state(), LifecycleState::Active);
+        t.decoder_hops = decoder_hops;
+        t
+    }
+
+    /// Review round 6 (P2): two tracks can both be ACTIVE and both still
+    /// silent when their centers converge -- a low-id candidate that used
+    /// most of the 75-hop window against a neighbour that promoted
+    /// promptly. The old `(promoted, has_emitted)` rank returned
+    /// `(true, false)` for both, so the lower-id fallback discarded the
+    /// substantially more advanced decoder. Decoder age separates them.
+    #[test]
+    fn merge_rank_prefers_the_older_decoder_between_two_silent_active_tracks() {
+        let young = promoted_track(1, 3);
+        let old = promoted_track(2, 400);
+        assert!(
+            merge_keep_rank(&young) < merge_keep_rank(&old),
+            "the track with more decoder history must survive the tie"
+        );
+    }
+
+    /// Review round 6 (P1): `has_emitted` is only assigned once a whole
+    /// `process_hops` batch has drained, so a merge ranking that read it
+    /// could pick different survivors for the same hop stream depending on
+    /// the caller's chunk size (SPEC §8 determinism). The rank must be
+    /// blind to it.
+    #[test]
+    fn merge_rank_ignores_batch_boundary_has_emitted() {
+        let mut a = promoted_track(1, 200);
+        let b = promoted_track(2, 200);
+        let before = merge_keep_rank(&a);
+        a.has_emitted = true;
+        assert_eq!(
+            merge_keep_rank(&a),
+            before,
+            "has_emitted must not move the merge rank"
+        );
+        assert_eq!(merge_keep_rank(&a), merge_keep_rank(&b));
+    }
+
+    /// A CANDIDATE outranks nothing: it must always be evicted before a
+    /// promoted track, however loud it is this hop.
+    #[test]
+    fn merge_rank_puts_any_candidate_below_a_promoted_track() {
+        let cfg = DetectorConfig::default();
+        let candidate = Track::new(9, 100, &cfg);
+        assert!(merge_keep_rank(&candidate) < merge_keep_rank(&promoted_track(1, 0)));
+    }
+
+    /// Review round 6 (P2): MAN-3's widened window keeps a CANDIDATE alive
+    /// for up to 75 hops after it stops rising, so a loud candidate that
+    /// will expire `Unconfirmed` must never cost an ACTIVE track its
+    /// decoder slot. Round 7 keeps that property by giving the two classes
+    /// separate bounds: a saturated `track_cap` is not a reason to evict a
+    /// candidate at all, so both survive here.
+    #[test]
+    fn a_loud_candidate_never_costs_a_quiet_active_track_its_slot() {
+        let cfg = DetectorConfig {
+            track_cap: 1,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 0.0, cfg, DecodeConfig::default());
+        let mut active = promoted_track(1, 500);
+        active.current_snr_db = 7.0;
+        active.has_emitted = true;
+        let mut candidate = Track::new(2, 100, &tm.cfg);
+        candidate.current_snr_db = 40.0;
+        tm.tracks.insert(1, active);
+        tm.tracks.insert(2, candidate);
+
+        let evicted = tm.evict_over_cap();
+        assert!(
+            tm.tracks.contains_key(&1),
+            "the ACTIVE track must survive a louder unconfirmed candidate"
+        );
+        assert!(
+            tm.tracks.contains_key(&2),
+            "the candidate is under `candidate_cap` and must be left alone to \
+             accumulate confirm_hops -- evicting it here is the round-7 starvation bug"
+        );
+        assert!(evicted.is_empty(), "got {evicted:?}");
+        assert_eq!(
+            tm.close_counts().evicted,
+            0,
+            "nothing was over its own bound; nothing may be evicted"
+        );
+    }
+
+    /// Review round 7 (P2): the candidate population has its own bound, and
+    /// it is spent on the quietest candidate -- never on a promoted track,
+    /// however weak that track is.
+    #[test]
+    fn candidate_cap_evicts_the_quietest_candidate_not_a_promoted_track() {
+        let cfg = DetectorConfig {
+            track_cap: 1,
+            candidate_cap: 1,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 0.0, cfg, DecodeConfig::default());
+        let mut active = promoted_track(1, 500);
+        active.current_snr_db = 7.0;
+        active.has_emitted = true;
+        let mut loud = Track::new(2, 100, &tm.cfg);
+        loud.current_snr_db = 40.0;
+        let mut quiet = Track::new(3, 200, &tm.cfg);
+        quiet.current_snr_db = 20.0;
+        tm.tracks.insert(1, active);
+        tm.tracks.insert(2, loud);
+        tm.tracks.insert(3, quiet);
+
+        tm.evict_over_cap();
+        assert!(
+            tm.tracks.contains_key(&1) && tm.tracks.contains_key(&2),
+            "the ACTIVE track and the loudest candidate must both survive, got {:?}",
+            tm.tracks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !tm.tracks.contains_key(&3),
+            "the quietest candidate is the one the candidate bound is spent on"
+        );
+        assert_eq!(tm.close_counts().evicted, 1);
+    }
+
+    /// A misconfigured window shorter than `confirm_hops` would make
+    /// promotion impossible -- it is clamped, not honoured.
+    #[test]
+    fn confirm_window_shorter_than_confirm_hops_is_clamped() {
+        let cfg = DetectorConfig {
+            confirm_window_hops: 5,
+            ..DetectorConfig::default()
+        };
+        let mut lc = Lifecycle::new(&cfg);
+        let mut promoted = false;
+        for _ in 0..cfg.confirm_hops {
+            if lc.on_hop(true, false, false) == LifecycleEvent::Promoted {
+                promoted = true;
+            }
+        }
+        assert!(
+            promoted,
+            "window must clamp up to confirm_hops, never below it"
+        );
+    }
+
+    /// MAN-3 measurement gate: a looser CANDIDATE confirmation rule must
+    /// not buy short-signal detection with false tracks. `on_snr_db = 12.0`
+    /// is the lever that drives noise-only promotions to zero (see `impl
+    /// Default for DetectorConfig`); this test proves the window change
+    /// did not undo that.
+    #[test]
+    fn noise_only_scene_promotes_no_tracks() {
+        use manta_dsp::channelizer::Channelizer;
+        let fs = 96_000.0;
+        for seed in [1u64, 2, 3] {
+            let (iq, _) = manta_testkit::scene::render_scene(&[], fs, 60.0, Some(seed)).unwrap();
+            let mut ch = Channelizer::new(fs, 0.0).unwrap();
+            let hop_samples = ch.hop() as u64;
+            let mut tm = TrackManager::new(
+                ch.n_channels(),
+                fs,
+                0.0,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            );
+            for chunk in iq.chunks(4096) {
+                let hops = ch.process(chunk);
+                tm.process_hops(&hops, |m| m * hop_samples);
+            }
+            tm.finish();
+            assert_eq!(
+                tm.promoted_count(),
+                0,
+                "seed {seed}: pure AWGN must promote zero tracks (58 s past the 2 s \
+                 warmup, 1024 channels)"
+            );
+        }
+    }
+
+    /// V1 (one clean +20 dB signal, 1024 channels, 120 s) must still
+    /// promote exactly one track -- the same invariant
+    /// `active_track_decodes_real_text` asserts on the event stream, but
+    /// measured at promotion time so a track that promotes and dies before
+    /// emitting anything cannot hide.
+    #[test]
+    fn v1_promotes_exactly_one_track() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            tm.process_hops(&hops, |m| m * hop_samples);
+        }
+        tm.finish();
+        assert_eq!(tm.promoted_count(), 1, "V1 is single-signal");
     }
 
     use manta_decode::decoder::DecodeConfig;
@@ -1208,8 +1711,16 @@ mod tests {
         assert_eq!(tm.tracks.len(), 2);
     }
 
+    /// SPEC §2.4 eviction through the ordinary per-hop path, with MAN-3's
+    /// round-7 split bounds: the *decoder* cap still holds at one track,
+    /// but a candidate born while it is saturated is no longer evicted on
+    /// its birth hop (round 6's shared cap did exactly that, on every
+    /// rise, so no newcomer could ever accumulate `confirm_hops` and the
+    /// promoted-vs-promoted eviction branch was unreachable outside a
+    /// hand-built map). A genuinely stronger signal now confirms and takes
+    /// the weaker incumbent's slot.
     #[test]
-    fn track_cap_evicts_lowest_snr() {
+    fn a_stronger_signal_confirms_and_replaces_a_weaker_incumbent_at_the_cap() {
         let cfg = DetectorConfig {
             track_cap: 1,
             ..DetectorConfig::default()
@@ -1217,28 +1728,66 @@ mod tests {
         let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
-        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // strong, spawns first
-        for m in (250 * 15)..(250 * 15 + 25) {
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // spawns and promotes first
+        for m in (250 * 15)..(250 * 15 + 50) {
             tm.step_hop(&hop(m, power.clone()), m);
         }
         assert_eq!(tm.tracks.len(), 1);
-        power[40] = 1e-9 * 10f32.powf(25.0 / 10.0); // stronger second signal, over cap
-        for m in (250 * 15 + 25)..(250 * 15 + 50) {
+        assert_eq!(
+            tm.tracks.values().next().unwrap().state(),
+            LifecycleState::Active,
+            "the incumbent must have promoted before the cap is contested"
+        );
+        power[40] = 1e-9 * 10f32.powf(30.0 / 10.0); // stronger second signal
+        for m in (250 * 15 + 50)..(250 * 15 + 200) {
             tm.step_hop(&hop(m, power.clone()), m);
         }
+        let promoted: Vec<&Track> = tm
+            .tracks
+            .values()
+            .filter(|t| matches!(t.state(), LifecycleState::Active | LifecycleState::Hang))
+            .collect();
         assert_eq!(
-            tm.tracks.len(),
+            promoted.len(),
             1,
-            "cap=1 must hold even with a second strong signal"
+            "the decoder cap must still hold at one promoted track, got {:?}",
+            tm.tracks
+                .iter()
+                .map(|(id, t)| (*id, t.birth_channel, t.state()))
+                .collect::<Vec<_>>()
         );
-        assert!(
-            tm.tracks.values().next().unwrap().birth_channel == 40,
-            "the lower-SNR (weaker) track must be the one evicted"
+        assert_eq!(
+            promoted[0].birth_channel, 40,
+            "the stronger newcomer must be able to confirm and win the slot"
         );
         assert!(
             tm.close_counts().evicted >= 1,
             "issue #26: eviction must be counted, got {:?}",
             tm.close_counts()
+        );
+    }
+
+    /// With the decoder cap full of promoted tracks, SPEC §2.4's
+    /// lowest-SNR rule is unchanged -- and it is the branch the test above
+    /// reaches through `step_hop`, not a hand-built state.
+    #[test]
+    fn track_cap_still_evicts_the_lowest_snr_among_promoted_tracks() {
+        let cfg = DetectorConfig {
+            track_cap: 1,
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 0.0, cfg, DecodeConfig::default());
+        let mut weak = promoted_track(1, 500);
+        weak.current_snr_db = 7.0;
+        let mut strong = promoted_track(2, 10);
+        strong.current_snr_db = 25.0;
+        tm.tracks.insert(1, weak);
+        tm.tracks.insert(2, strong);
+
+        tm.evict_over_cap();
+        assert!(
+            tm.tracks.contains_key(&2) && !tm.tracks.contains_key(&1),
+            "among promoted tracks the weakest is still the one evicted"
         );
     }
 
@@ -1322,6 +1871,65 @@ mod tests {
             tm.close_counts().merged,
             1,
             "issue #26: merge must be counted"
+        );
+    }
+
+    /// Build a converged pair on an exact SNR tie and return the surviving
+    /// track's id. `promote` names which of the two ids is driven all the
+    /// way through CANDIDATE -> ACTIVE (via the real `Lifecycle::on_hop`
+    /// path) before the merge runs; `None` leaves both unconfirmed.
+    fn merge_snr_tie_survivor(promote: Option<usize>) -> u32 {
+        let cfg = DetectorConfig::default();
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+
+        for (slot, id) in ids.iter().enumerate() {
+            let t = tm.tracks.get_mut(id).unwrap();
+            // Bit-identical SNR: both tracks read the same physical peak
+            // channel, the exact tie `merge_converged` must resolve.
+            t.current_snr_db = 14.0;
+            t.center = if slot == 0 { 20.4 } else { 21.1 };
+            if promote == Some(slot) {
+                // Real promotion path, not a hand-set state field.
+                for _ in 0..cfg.confirm_hops {
+                    t.lifecycle.on_hop(true, false, false);
+                }
+                assert_eq!(t.state(), LifecycleState::Active);
+            }
+        }
+
+        tm.merge_converged();
+        assert_eq!(tm.tracks.len(), 1, "converged pair must merge to one track");
+        *tm.tracks.keys().next().unwrap()
+    }
+
+    /// Review round 1: on an exact SNR tie, id order is *spawn* order and
+    /// says nothing about promotion order. A low-id CANDIDATE that is still
+    /// unconfirmed must not evict a higher-id track that has already
+    /// promoted and holds decoder history -- doing so throws away the only
+    /// track that can decode the merged signal, which is MAN-3's
+    /// zero-output failure arriving from the other direction. Lifecycle
+    /// progress outranks id; id decides only when that ties too (which is
+    /// the MAN-3 `<`-over-`<=` case, asserted here unchanged).
+    #[test]
+    fn merge_snr_tie_keeps_the_promoted_track_over_a_bare_candidate() {
+        assert_eq!(
+            merge_snr_tie_survivor(None),
+            1,
+            "both still CANDIDATE: the tie falls through to id, keeping the incumbent (MAN-3)"
+        );
+        assert_eq!(
+            merge_snr_tie_survivor(Some(1)),
+            2,
+            "the promoted higher-id track must outrank an unconfirmed lower-id candidate"
+        );
+        assert_eq!(
+            merge_snr_tie_survivor(Some(0)),
+            1,
+            "and symmetrically: a promoted lower-id track still survives"
         );
     }
 

@@ -147,8 +147,15 @@ taken over whatever is present, and track creation is inhibited for the first
 Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
 **τ = 40 ms** (`α = 1 − e^{−2.667/40} = 0.0645`).
 
-- **Rise:** `S ≥ F + 6 dB` (`detector.on_snr_db = 6.0`) sustained for
-  **19 consecutive hops (≈ 50 ms)** — rejects impulse noise and clicks.
+- **Rise:** `S ≥ F + 6 dB` (`detector.on_snr_db = 6.0`) — an
+  *instantaneous* per-hop condition on the smoothed power `S`, evaluated
+  once per hop. Impulse noise and clicks are rejected by the CANDIDATE →
+  ACTIVE confirmation rule (§2.4: `confirm_hops` = 19 rise hops
+  accumulated within a `confirm_window_hops` = 75 window), not here — this
+  section defines only the gate boolean that rule consumes. Requiring 19
+  *consecutive* hops here as well would apply confirmation twice and
+  withhold `rise` for the short high-WPM dits MAN-3 fixed (see §2.4's
+  CANDIDATE confirmation deviation).
 - **Drop:** `S < F + 3 dB` (`detector.off_snr_db = 3.0`, i.e. 3 dB
   hysteresis) continuously for **hang = 5 000 ms** (1875 hops) — survives QSB
   troughs and inter-word gaps at slow speeds.
@@ -164,15 +171,59 @@ States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
 | Transition | Condition |
 |---|---|
 | IDLE → CANDIDATE | rise condition first met on channel `k`, and `k` is not owned by an existing track (§2.5) |
-| CANDIDATE → ACTIVE | rise sustained 19 hops → lease decoder from pool |
-| CANDIDATE → IDLE | rise condition lost before 19 hops |
+| CANDIDATE → ACTIVE | `confirm_hops` (19) rise hops accumulated within `confirm_window_hops` (75, i.e. 200 ms) of CANDIDATE birth → lease decoder from pool. **[DEVIATION — widened from literal "19 *consecutive*" per MAN-3]**, see below. |
+| CANDIDATE → IDLE | `confirm_window_hops` elapses with fewer than `confirm_hops` rise hops accumulated |
 | ACTIVE → HANG | drop condition met (below off threshold) |
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
-| any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4) |
+| any → CLOSED | eviction: this track's own lifecycle class is over *its* bound and this is the lowest-`current_snr_db` member of that class — promoted (ACTIVE/HANG) tracks are bounded by `track_cap`, unconfirmed CANDIDATEs by `candidate_cap`, and the two classes never compete for the same slot (counted in metrics, per ARCHITECTURE §4). **[DEVIATION — ARCHITECTURE §4's literal single lowest-SNR cap is split into one bound per lifecycle class, per MAN-3]**, see below. |
 
 All timers are hop-counted (integers), never wall-clock.
+
+**CANDIDATE confirmation deviation (MAN-3).** The literal "19 *consecutive*
+rise hops" rule made CANDIDATE confirmation depend on lucky phase alignment
+at high WPM: 19 consecutive hops is 50.7 ms of sustained smoothed key-down,
+but at 34–40 WPM a dit is only 30–35 ms, and the Gate's τ = 40 ms EMA (§2.3)
+decays back below the on-threshold across the following inter-element gap —
+so only a *dah* could ever hold the rise condition for 19 straight hops, and
+only if the CANDIDATE happened to be born exactly on its leading edge.
+Everything else (most CANDIDATEs, empirically) died `Unconfirmed` before
+ever reaching a decoder. The implemented rule instead accumulates
+`confirm_hops` rise hops **cumulatively** within a bounded
+`confirm_window_hops` (200 ms) window from CANDIDATE birth — a strict
+relaxation: any signal slow enough that 19 rise hops already arrive
+consecutively promotes on the identical hop as the literal rule (V1–V10's
+promotion hops are unchanged). See
+`docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md` for the
+window-size derivation and the measured false-track/CPU-budget impact.
+
+**Eviction-order deviation (MAN-3).** The literal rule evicts the
+lowest-`current_snr_db` track regardless of lifecycle, out of one shared
+cap. That was safe while a CANDIDATE died on its first non-rise hop, but
+the confirmation deviation above keeps one alive for up to
+`confirm_window_hops` (75) hops after it stops rising — so at `track_cap`,
+or under a wideband transient that spawns many staggered candidates, a
+loud CANDIDATE that goes on to expire `Unconfirmed` could evict an ACTIVE
+track and destroy a real decode in progress. Ranking lifecycle class ahead
+of SNR *inside one shared cap* fixes that but starves the other side: with
+`track_cap` promoted tracks open, every newly spawned CANDIDATE is over
+the cap on its birth hop and is the class minimum, so it is evicted
+immediately and again on every subsequent rise — it can never accumulate
+`confirm_hops`, and no signal, however strong, can ever take a weak or
+hanging incumbent's slot. The implemented rule therefore gives each class
+its own bound: promoted (ACTIVE/HANG) tracks are capped at `track_cap`
+(the decoder cap ARCHITECTURE §4 is really about), unconfirmed CANDIDATEs
+at `candidate_cap`, and each class is thinned by evicting its own
+lowest-`current_snr_db` member. A CANDIDATE is thus never evicted in an
+ACTIVE track's place, and a CANDIDATE that *does* confirm then contests
+`track_cap` on SNR like any other promoted track, so a stronger newcomer
+replaces the weakest incumbent. Total open tracks stay bounded by
+`track_cap + candidate_cap`. Determinism: the track map is ordered by id
+and the first minimum wins, so an exact SNR tie always evicts the lowest
+id (§8). `candidate_cap` (default 500) is a `DetectorConfig` field outside
+§9's literal `[detector]` table, on the same footing as `track_cap` — see
+docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md pin 1.
 
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
@@ -190,7 +241,30 @@ All timers are hop-counted (integers), never wall-clock.
 - Two tracks whose centers converge within 1.0 channel (interference or
   drift-collision) are merged: the lower-SNR track is CLOSED with reason
   `merged` (counted); its decoder state is discarded (text already emitted
-  stands).
+  stands). **[DEVIATION — tie-break added per MAN-3]** On an exact
+  `current_snr_db` tie (the common case for two tracks whose owned windows
+  overlap and so read the same max-power channel, not an edge case) the
+  survivor is chosen by **lifecycle rank, then by lower id**; a track only
+  loses a merge on SNR alone when it reads a **strictly** lower SNR than its
+  competitor. Lifecycle rank is the tuple `(promoted, decoder_hops)`, higher
+  wins: a promoted (ACTIVE/HANG) track outranks a still-unconfirmed
+  CANDIDATE, and among promoted tracks the one whose decoder has consumed
+  more hops (counted from its promotion hop, inclusive) outranks the
+  younger one. `decoder_hops` is hop-counted, never batch-counted: a
+  "has it emitted yet" flag is only settled once a whole `process_hops`
+  batch has drained, so a merge ranked on it would pick different
+  survivors for the same hop stream depending on how the caller chunked
+  its input, violating §8 determinism. Decoder age also separates two
+  tracks that are both promoted and both still silent — a state the
+  boolean pair could not distinguish, in which the id fallback below
+  would discard the more advanced decoder. Track ids are **spawn** order, not
+  promotion order, so id alone would let a slowly-confirming low-id
+  CANDIDATE evict a higher-id ACTIVE track that already holds decoder
+  history — and that CANDIDATE may then simply expire `Unconfirmed`. Only
+  when the lifecycle rank also ties does the *incumbent* (lower-id, older)
+  track survive; that last case is the one this deviation was measured for,
+  so both tracks are at the same lifecycle stage whenever it applies. See
+  docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md.
 
 ---
 
@@ -563,8 +637,9 @@ All normative constants above, with defaults:
 ```toml
 [detector]
 on_snr_db = 6.0        off_snr_db = 3.0
-confirm_ms = 50        hang_ms = 5000
-gc_ms = 30000          warmup_ms = 2000
+confirm_ms = 50        confirm_window_ms = 200  # MAN-3, §2.4
+hang_ms = 5000         gc_ms = 30000
+warmup_ms = 2000
 floor_quantile = 0.25  floor_window_ms = 10000
 block_channels = 32    block_allowance_db = 3.0
 
