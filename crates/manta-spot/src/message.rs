@@ -13,8 +13,9 @@
 //! band (CW Skimmer manual, Band map).
 //!
 //! Deliberately lightweight, in the same spirit as `context`: see this
-//! module's tests for the two accepted limitations (a three-digit serial
-//! number is RST-shaped; bare `QRL` counts as the query).
+//! module's tests for the accepted limitations (a three-digit serial number is
+//! RST-shaped; a `QRL?` whose `?` did not survive the decoder reads as a bare
+//! `QRL` response and is not flagged).
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -27,13 +28,22 @@ use std::sync::LazyLock;
 static RST_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([1-5])([1-9N])([1-9N])\b").unwrap());
 
-/// The QRL query. The trailing `?` is deliberately NOT required: the decoder's
-/// `?` is overloaded -- `manta_decode::beam` emits `Glyph::Char('?')` at
-/// confidence 0.0 for a character whose beam survivors carry no glyph (SPEC
-/// §4.4.4) -- so keying on it would make detection depend on whether one
-/// low-confidence character happened to survive. Bare `QRL` ("the frequency is
-/// in use") and `QRL?` ("is it in use?") are the same operator cue anyway.
-static QRL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bQRL\b").unwrap());
+/// The QRL *query*. The trailing `?` IS required (review finding on PR #159):
+/// bare `QRL` and `QRL?` are opposite halves of the same exchange -- `QRL`
+/// asserts "the frequency **is** in use" (a response), `QRL?` asks "is it in
+/// use?" (the query). Only the interrogative form is CW Skimmer's band-map
+/// "QRL?" cue, and `Spot::qrl_query` is named for the query, so flagging a
+/// bare response as a query would permanently misreport it to JSON consumers.
+///
+/// Accepted cost of requiring the `?`: the decoder's `?` is overloaded --
+/// `manta_decode::beam` emits `Glyph::Char('?')` at confidence 0.0 for a
+/// character whose beam survivors carry no glyph (SPEC §4.4.4) -- so a `QRL?`
+/// whose `?` was lost decodes as bare `QRL` and is (correctly, given the
+/// evidence actually decoded) not flagged, while a bare `QRL` followed by an
+/// unresolvable character can read as a query. Both are one-character
+/// misreadings of the decoded text; neither invents an interrogative the text
+/// does not show.
+static QRL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bQRL\?").unwrap());
 
 /// Resolves the one cut number an RST can contain.
 fn uncut(c: char) -> char {
@@ -118,18 +128,25 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_qrl_with_or_without_the_question_mark() {
-        // `?` is overloaded: beam.rs also emits Glyph::Char('?') as the
-        // glyphless-survivor placeholder (SPEC 4.4.4), so requiring it would make
-        // detection depend on one low-confidence character. See plan decision D3.
-        for text in ["QRL?", "QRL", "QRL? DE K5ARH", "K5ARH 5NN QRL?"] {
+    fn recognizes_the_interrogative_qrl_form() {
+        for text in ["QRL?", "QRL? DE K5ARH", "K5ARH 5NN QRL?", "QRL?K"] {
             assert!(is_qrl_query(text), "text was {text:?}");
         }
     }
 
     #[test]
+    fn a_bare_qrl_response_is_not_a_query() {
+        // Review finding (PR #159): bare `QRL` states "the frequency IS in
+        // use" -- the answer, not the question. Flagging it as `qrl_query`
+        // would tell JSON consumers the station sent `QRL?` when it did not.
+        for text in ["QRL", "QRL DE K5ARH", "TU QRL"] {
+            assert!(!is_qrl_query(text), "text was {text:?}");
+        }
+    }
+
+    #[test]
     fn does_not_match_qrl_inside_another_token() {
-        for text in ["QRLX", "VQRL", "CQ TEST K5ARH", "5NN"] {
+        for text in ["QRLX", "QRLX?", "VQRL?", "CQ TEST K5ARH", "5NN"] {
             assert!(!is_qrl_query(text), "text was {text:?}");
         }
     }

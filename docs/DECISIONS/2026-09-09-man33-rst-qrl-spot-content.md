@@ -47,19 +47,34 @@ Rejected: a bare `\d{3}` (misses the ticket's own `5NN` example); a full
 cut-number alphabet (widens false positives for zero additional RST
 coverage).
 
-## Decision 2: QRL recognition matches bare `QRL`, with or without `?`
+## Decision 2: QRL recognition requires the literal `?`
 
-`manta_decode::beam` emits `Glyph::Char('?')` at confidence 0.0 as the
-glyphless-survivor placeholder (SPEC §4.4.4) whenever beam survivors carry no
-glyph — `?` is therefore overloaded between "a real question mark was sent"
-and "something failed to decode and got a placeholder". Requiring the literal
-`?` would make detection depend on whether one low-confidence character
-happened to survive the beam. Bare `QRL` ("the frequency is in use") and
-`QRL?` ("is it in use?") are the same operator cue CW Skimmer's band map
-exists to surface, so both match: `(?i)\bQRL\b`.
+**Revised on the PR #159 review round.** The original decision matched bare
+`QRL` too, on the grounds that `manta_decode::beam` emits `Glyph::Char('?')`
+at confidence 0.0 as the glyphless-survivor placeholder (SPEC §4.4.4), so `?`
+is overloaded between "a real question mark was sent" and "something failed to
+decode" — keying on it makes detection depend on one low-confidence character.
 
-Rejected: requiring the literal `?` (brittle against the overloaded glyph);
-treating `QRZ?` as equivalent (different meaning, out of scope).
+That reasoning is still true, but it was outweighed: `QRL` and `QRL?` are
+opposite halves of the same exchange, not two spellings of one cue. Bare `QRL`
+**asserts** "the frequency is in use" (the response); `QRL?` **asks** (the
+query). The field is named `qrl_query` and its wire name is `qrlQuery`, so
+matching the response permanently reports to JSON consumers that the station
+sent `QRL?` when it did not — and the ticket's own acceptance criterion is
+written on the interrogative form. CW Skimmer's band-map label is `QRL?` for
+the same reason. The regex is therefore `(?i)\bQRL\?`.
+
+Accepted cost, symmetric and one character wide in each direction: a genuine
+`QRL?` whose `?` did not survive the beam decodes as bare `QRL` and is not
+flagged, and a bare `QRL` followed by an unresolvable character can read as a
+query. Neither invents an interrogative the decoded text does not show, which
+the previous rule did by construction.
+
+Rejected: a third state distinguishing bare/uncertain `QRL` from `QRL?` (the
+reviewer's other offered option) — it would widen the same unratified wire
+contract Decision 5 is already trying to keep narrow, for a cue CW Skimmer
+does not surface at all; and treating `QRZ?` as equivalent (different meaning,
+out of scope).
 
 ## Decision 3: RST is last-value-wins per track; QRL? is sticky per track
 
@@ -114,6 +129,19 @@ of the cross-repo contract. Residual risk (a strict-mode validator on the
 cqdx side rejecting the two unknown keys) is bounded and tracked as FU-1
 below.
 
+**Bounded further on the PR #159 review round:** both fields are
+`#[serde(skip_serializing_if = ...)]`, so a spot carrying no RST and no QRL?
+serializes byte-identically to the pre-MAN-33 wire. A strict consumer
+therefore cannot reject the *stream*; at worst it rejects the individual
+spots that actually carry the new information, which is the smallest exposure
+available without dropping the feature's only operator-facing surface (the
+CLI debug line is a developer aid, not a band map). The reviewer's preferred
+remedy — ratify in dispensa first, or omit the keys entirely until then —
+cannot be executed from this repo: dispensa is a separate repository this
+container holds no checkout or credential for, and omitting the keys entirely
+would leave the ticket's JSON deliverable unimplemented. FU-1 stays open and
+this thread is parked for a human, not resolved.
+
 Proposed dispensa schema fragment, ready to lift verbatim:
 
 ```jsonc
@@ -121,12 +149,12 @@ Proposed dispensa schema fragment, ready to lift verbatim:
 "rst": {
   "type": ["string", "null"],
   "pattern": "^[1-5][1-9][1-9]$",
-  "description": "Most recent RST signal report decoded from the spotted station's transmission, normalized to three digits (CW cut number 'N' resolved to 9, so '5NN' is reported as '599'). Null when no report was decoded. Advisory band-map context, not a QSO record.",
+  "description": "Most recent RST signal report decoded on this track, normalized to three digits (CW cut number 'N' resolved to 9, so '5NN' is reported as '599'). Advisory band-map context, not a QSO record: a track can carry both sides of a QSO, so the report is not necessarily one the spotted station received. Absent (key omitted) when no report was decoded.",
   "examples": ["599", "579"]
 },
 "qrlQuery": {
   "type": "boolean",
-  "description": "The spotted station sent a QRL frequency query ('is this frequency in use?') during this track's lifetime. Sticky once observed. Mirrors CW Skimmer's band-map QRL? label.",
+  "description": "This track sent the interrogative 'QRL?' ('is this frequency in use?') during its lifetime. A bare 'QRL' response is deliberately NOT counted. Sticky once observed. Mirrors CW Skimmer's band-map QRL? label. Absent (key omitted) when false.",
   "default": false
 }
 ```
@@ -175,7 +203,8 @@ invent operator-facing variability the feature doesn't have.
   `crates/manta-spot/tests/golden_v31_v32.rs`; table entries in
   `docs/SPEC-decode-core.md` §7.1.
 - `SpotMessage` (`crates/manta-server/src/spot_message.rs`) gains `rst`/
-  `qrlQuery` on the JSON Lines/WebSocket wire.
+  `qrlQuery` on the JSON Lines/WebSocket wire, both omitted from the wire
+  when empty (Decision 5).
 - `manta-cli`'s debug line gains optional ` rst=599`/` QRL?` suffixes, empty
   (byte-identical output) for an ordinary spot; `--json` mode picks up both
   fields automatically since it serializes `Spot` directly.
@@ -193,7 +222,9 @@ invent operator-facing variability the feature doesn't have.
   can win under last-value-wins. Pinned by a dedicated test
   (`a_three_digit_serial_can_be_mistaken_for_an_rst`) so a future change to
   this is a deliberate act, not an accidental regression.
-- Bare `QRL` (no `?`) counts as the query (Decision 2).
+- A `QRL?` whose `?` was lost to the decoder reads as a bare `QRL` response
+  and is not flagged; a bare `QRL` immediately followed by an unresolvable
+  character can read as a query (Decision 2).
 - No on-air validation of either recognizer was possible — no transcribed,
   ground-truth CW corpus exists in this repo (the WPX/VP8GEO captures noted
   elsewhere in the project's review history are untranscribed and not

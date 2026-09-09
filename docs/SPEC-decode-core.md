@@ -543,7 +543,7 @@ step 1a) in `crates/manta-spot/tests/golden_v31_v32.rs`.
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37) | `BEACON`-tagged spot emits on the first decode, gate not applied -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern |
 | V31 | rst-extraction | A track decodes `TU 5NN` before its callsign spots; then a later `339` replaces it; then 17 filler words age the RST out of the 16-word window | The spot carries `rst = "599"`; the later report replaces it (`"339"`); an aged-out report is still reported (per-track, not per-window) |
-| V32 | qrl-query-flag | A track sends `QRL?` before calling CQ, vs. an ordinary CQ with no QRL | `qrl_query` true in the first case, false in the second; `TrackClosed` clears it |
+| V32 | qrl-query-flag | A track sends `QRL?` before calling CQ, vs. a bare `QRL` response, vs. an ordinary CQ with no QRL | `qrl_query` true only in the first case (the interrogative form is required); false for the bare response and the ordinary CQ; `TrackClosed` clears it |
 
 ---
 

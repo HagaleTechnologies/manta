@@ -115,6 +115,21 @@ fn v32_spot_is_flagged_when_the_track_sent_a_qrl_query() {
 }
 
 #[test]
+fn v32_a_bare_qrl_response_is_not_flagged_as_a_query() {
+    // Review finding (PR #159): `QRL` without the `?` says the frequency IS
+    // in use -- the answer to the question, not the question. It must not
+    // set `qrl_query`.
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let spots = run(
+        &transmission_events(1, &["QRL", "QRL", "CQ", "K5ARH", "CQ", "K5ARH"], 0),
+        &mut v,
+    );
+    assert_eq!(spots.len(), 1, "spots were {spots:?}");
+    assert!(!spots[0].qrl_query);
+}
+
+#[test]
 fn v32_an_ordinary_cq_is_not_flagged() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
