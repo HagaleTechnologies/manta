@@ -183,6 +183,18 @@ impl RepetitionGate {
         }
         let b = bucket(freq_hz);
         let home_key = (b, callsign.to_string());
+        let cutoff = sample_ts.saturating_sub(self.window_samples);
+        // Codex review, PR #152, round 10: a home entry that's aged past
+        // the trailing window but hasn't been swept yet (sweeps are
+        // throttled, not run on every call) must not block a genuinely
+        // fresh neighbor -- discard it before the "prefer home" rule
+        // below gets a chance to pin a decode to dead history.
+        if let Some(existing) = self.seen.get(&home_key) {
+            let home_expired = existing.most_recent().is_none_or(|ts| ts < cutoff);
+            if home_expired {
+                self.seen.remove(&home_key);
+            }
+        }
         // Codex review, PR #152, round 9: this call's own home bucket, if
         // it already has an entry, is ALWAYS used directly -- never
         // superseded by a neighbor, however fresh. Two adjacent buckets
@@ -193,10 +205,10 @@ impl RepetitionGate {
         // chaining that across successive calls could transitively merge
         // two entries that were never actually the same signal at all.
         // Neighbor search is strictly a fallback for when home has NEVER
-        // been touched -- the genuine boundary-drift case -- and even
-        // then it only ever *moves* (renames) a neighbor's entry into an
-        // empty home, never merges two already-populated entries
-        // together.
+        // been touched (or was just discarded as expired above) -- the
+        // genuine boundary-drift case -- and even then it only ever
+        // *moves* (renames) a neighbor's entry into an empty home, never
+        // merges two already-populated entries together.
         if !self.seen.contains_key(&home_key) {
             // Among both neighbors, join whichever existing entry is
             // *freshest* (see `GateEntry::most_recent`), not just the
@@ -235,11 +247,22 @@ impl RepetitionGate {
             .last_seen_by_track
             .get(&track_id)
             .is_some_and(|&last| sample_ts.saturating_sub(last) < self.min_occurrence_gap_samples);
+        // Codex review, PR #152, round 10: the cross-track gap check
+        // compares against the entry's MOST RECENT activity overall
+        // (`GateEntry::most_recent` -- accepted or merely seen), not just
+        // the last *accepted* timestamp. With three or more duplicate
+        // tracks staggered just under the gap threshold from each other
+        // (A accepted at 0, B rejected at 0.9s, C at 1.1s), comparing only
+        // against A's accepted timestamp lets C clear the gap (1.1s) even
+        // though C is only 0.2s after B's rejected touch -- still very
+        // likely the same over-the-air occurrence. Using the latest touch
+        // from ANY track keeps the exclusion window extending as long as
+        // near-duplicate touches keep arriving, closing that gap.
         let is_distinct_occurrence = if is_rapid_own_repeat {
             true
         } else {
-            match entry.accepted.last() {
-                Some(&last) => sample_ts.saturating_sub(last) >= self.min_occurrence_gap_samples,
+            match entry.most_recent() {
+                Some(last) => sample_ts.saturating_sub(last) >= self.min_occurrence_gap_samples,
                 None => true,
             }
         };
@@ -247,7 +270,6 @@ impl RepetitionGate {
         if is_distinct_occurrence {
             entry.accepted.push(sample_ts);
         }
-        let cutoff = sample_ts.saturating_sub(self.window_samples);
         entry.accepted.retain(|&ts| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
         entry.accepted.len()
@@ -617,6 +639,69 @@ mod tests {
             gate.len(),
             2,
             "b-1's and b's entries must remain two separate entries, not merged into one"
+        );
+    }
+
+    /// Codex review, PR #152, round 10: a home entry that's aged past the
+    /// trailing window but hasn't been swept yet must be discarded, not
+    /// allowed to block a genuinely fresh neighbor -- otherwise round 9's
+    /// "always prefer home" rule can pin a decode to dead history and
+    /// suppress a valid spot.
+    #[test]
+    fn an_expired_home_does_not_block_a_fresh_neighbor() {
+        let mut gate = RepetitionGate::new(FS);
+        let window_samples = (WINDOW_SECONDS * FS) as u64;
+
+        // Home bucket (140000): a stale entry, its only touch at t=0.
+        let mut stale = GateEntry::default();
+        stale.accepted.push(0);
+        stale.last_seen_by_track.insert(1, 0);
+        gate.seen.insert((140000, "K5ARH".to_string()), stale);
+
+        // Neighbor bucket b+1 (140001): a fresh entry, comfortably within
+        // the window as of the decisive call below.
+        let fresh_ts = window_samples - 200_000;
+        let mut fresh = GateEntry::default();
+        fresh.accepted.push(fresh_ts);
+        fresh.last_seen_by_track.insert(2, fresh_ts);
+        gate.seen.insert((140001, "K5ARH".to_string()), fresh);
+
+        // A decode arrives at home (b) just past the window boundary
+        // relative to the stale entry (t=0), but still well within the
+        // window relative to the fresh neighbor.
+        let now = window_samples + 1;
+        assert_eq!(
+            gate.record(3, 14_000_000.0, "K5ARH", now),
+            2,
+            "an expired home must be discarded, not block a fresh neighbor's history"
+        );
+    }
+
+    /// Codex review, PR #152, round 10: with three or more duplicate
+    /// tracks reporting one transmission, each staggered just under the
+    /// minimum-occurrence gap from the PREVIOUS one but not from the
+    /// first accepted occurrence, comparing only against the last
+    /// *accepted* timestamp lets the later ones slip through. Track A
+    /// accepted at 0s, track B rejected at 0.9s (a near-duplicate of A),
+    /// track C at 1.1s -- 1.1s clears the 1.0s gap from A's accepted
+    /// timestamp, but C is only 0.2s after B's rejected touch. Must
+    /// compare against the entry's most recent activity overall, not just
+    /// the last accepted occurrence.
+    #[test]
+    fn near_duplicate_gap_is_measured_from_the_latest_touch_not_just_the_last_accepted() {
+        let mut gate = RepetitionGate::new(FS);
+        let one_second = FS as u64;
+
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(
+            gate.record(2, 14_000_000.0, "K5ARH", 9 * one_second / 10),
+            1,
+            "B is a near-duplicate of A, correctly rejected"
+        );
+        assert_eq!(
+            gate.record(3, 14_000_000.0, "K5ARH", 11 * one_second / 10),
+            1,
+            "C is only 0.2s after B's rejected touch -- still a likely duplicate of the same occurrence, must not clear the gap just because it's 1.1s past A's accepted timestamp"
         );
     }
 }

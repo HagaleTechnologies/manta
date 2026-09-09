@@ -93,10 +93,18 @@ impl Default for DetectorConfig {
     /// SPEC value), raised to 1200, same MAN-166 decision doc. 500 was
     /// never stress-tested against real contest-band signal density: on
     /// the B2 recording it was pinned at its ceiling for the *entire* 15
-    /// minutes, forcing 71,149 `evicted` + 52,330 `merged` closes (30% of
-    /// all churn) as real, confirmed signals were killed purely to make
-    /// room for competitors. Removing the cap entirely on that same
-    /// recording measured real organic peak demand at 886 concurrent
+    /// minutes, forcing 71,149 `evicted` closes (cap pressure alone --
+    /// `evict_over_cap()` fires only when `tracks.len() > cap`) as real,
+    /// confirmed signals were killed purely to make room for competitors.
+    /// `merged` (52,330 closes, `merge_converged()`'s independent
+    /// frequency-proximity convergence, SPEC §2.5, always run before
+    /// `evict_over_cap()` in `step_hop`) is a *separate* mechanism, not
+    /// cap pressure -- the decision doc's own uncapped experiment shows
+    /// `merged` closes actually *rose* (52,330 -> 56,739) when the cap was
+    /// removed, the opposite of what cap pressure would predict (Codex
+    /// review, PR #152, round 10 -- corrected an earlier version of this
+    /// comment that conflated the two). Removing the cap entirely on that
+    /// same recording measured real organic peak demand at 886 concurrent
     /// active tracks; 1200 keeps meaningful headroom above that without
     /// picking an arbitrarily huge number. (Any relationship to manta's
     /// Pi4 CPU-budget gate, MAN-18/MAN-49, is explicitly out of scope for
