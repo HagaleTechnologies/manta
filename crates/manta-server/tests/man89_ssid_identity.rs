@@ -86,8 +86,17 @@ async fn a_per_band_ssid_identity_reaches_the_telnet_wire_as_call_n_hash() {
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
 
+    // Bounded for the same reason as the reads below (PR #131 review round 2):
+    // if the server accepts the connection but regresses before writing its
+    // login prompt, a bare `read_line` blocks forever and holds the whole test
+    // binary until the runner's global timeout instead of reporting the
+    // handshake failure.
     let mut login_prompt = String::new();
-    reader.read_line(&mut login_prompt).await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut login_prompt))
+        .await
+        .expect("timed out waiting for the login prompt")
+        .unwrap();
+    assert_ne!(n, 0, "connection closed before the login prompt");
     assert!(
         login_prompt.to_lowercase().contains("login")
             || login_prompt.to_lowercase().contains("call"),
