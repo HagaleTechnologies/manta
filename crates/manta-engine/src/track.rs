@@ -796,8 +796,8 @@ impl TrackManager {
         events.sort_by_key(|e| {
             (
                 effective_sort_ts(e, &promoted_ts_by_track),
-                event_kind_tier(e),
                 event_track_id(e),
+                event_kind_tier(e),
             )
         });
         events
@@ -1390,7 +1390,7 @@ mod tests {
     /// ordering.
     /// Sorts `events` exactly as `process_hops` does: builds the
     /// per-track promotion-timestamp map, then applies the same
-    /// `(effective_sort_ts, event_kind_tier, track_id)` key.
+    /// `(effective_sort_ts, track_id, event_kind_tier)` key.
     fn sort_like_process_hops(events: &mut [DecoderEvent]) {
         let promoted_ts_by_track: std::collections::HashMap<u32, u64> = events
             .iter()
@@ -1400,8 +1400,8 @@ mod tests {
         events.sort_by_key(|e| {
             (
                 effective_sort_ts(e, &promoted_ts_by_track),
-                event_kind_tier(e),
                 event_track_id(e),
+                event_kind_tier(e),
             )
         });
     }
@@ -1511,6 +1511,36 @@ mod tests {
             promoted2_idx < speedupdate2_idx,
             "track 2's TrackPromoted must still sort before its own track's SpeedUpdate, got \
              {events:?}"
+        );
+    }
+
+    /// Regression (round-9 review): at an EQUAL effective timestamp
+    /// across different tracks, `track_id` must be compared before the
+    /// kind tier -- SPEC §6 rule 6 is `(sample_ts, track_id)`, not
+    /// `(sample_ts, kind, track_id)`. Track 1's real ts=100 CharDecoded
+    /// and track 2's ts=100 TrackPromoted tie on timestamp; track 1 must
+    /// win the tie-break since 1 < 2, even though `TrackPromoted`'s own
+    /// kind tier would otherwise put it first.
+    #[test]
+    fn sort_breaks_ties_by_track_id_before_kind() {
+        let mut events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 100,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 1,
+                sample_ts: 100,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+            },
+        ];
+        sort_like_process_hops(&mut events);
+        assert!(
+            matches!(events[0], DecoderEvent::CharDecoded { track_id: 1, .. }),
+            "track 1's CharDecoded must sort before track 2's TrackPromoted at an equal \
+             timestamp (track_id 1 < 2), got {events:?}"
         );
     }
 
