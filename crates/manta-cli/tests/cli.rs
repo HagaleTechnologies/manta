@@ -73,36 +73,38 @@ fn unknown_vector_errors() {
     assert!(!out.status.success());
 }
 
-/// `Engine::Hsmm` is a fully implemented engine since Task 8
-/// (`TrackDecoder::push_hop_hsmm`), but not yet enabled on this command --
-/// see `parse_engine`. `--engine hsmm` must be rejected as a clean clap
-/// argument error before any pipeline/decode work starts.
+/// `Engine::Hsmm` is a fully implemented, reviewed engine since Task 8
+/// (`TrackDecoder::push_hop_hsmm`) and, as of Task 11, is no longer
+/// rejected by `parse_engine` on any command: `--engine hsmm` must run the
+/// real decode pipeline end to end (not just parse), the same as `legacy`/
+/// `edge-legacy`.
 #[test]
-fn engine_hsmm_is_a_clean_error_not_a_panic() {
-    // clap's own value_parser rejects "hsmm" before any file I/O or decode
-    // work, so a nonexistent path is fine here (same pattern as
-    // server_config_without_dial_freq_for_audio_source_is_a_clean_error).
+fn decode_engine_hsmm_runs_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
     let out = manta()
-        .args(["decode", "--engine", "hsmm", "/nonexistent.wav"])
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join("v1.wav"))
         .output()
         .unwrap();
-    assert!(
-        !out.status.success(),
-        "expected --engine hsmm to be rejected"
-    );
-    // A clap parse error exits before ever touching the WAV/decode pipeline,
-    // so this must be clap's own clean argument-error path, not a panic
-    // (no "panicked at" in stderr, and clap's own exit code 2).
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("panicked at"),
         "must not panic; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("hsmm"),
-        "error should mention hsmm; stderr: {stderr}"
+        out.status.success(),
+        "--engine hsmm must run successfully; stderr: {stderr}"
     );
-    assert_eq!(out.status.code(), Some(2), "clap arg-error exit code");
+    // A parseable DecodeReport proves the hsmm engine ran the full
+    // decode -> JSON-report pipeline, not just that clap accepted the flag.
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["events"].is_array());
 }
 
 #[test]
@@ -142,6 +144,9 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
 /// SPEC v2 §0/§7: `manta listen` gets the same `--engine` flag `manta
 /// decode` already has (Task 6), threaded through to the same
 /// `PipelineConfig`/`DecodeConfig` `manta_engine::listen` reads (Task 9).
+/// `hsmm` (Task 8, no longer CLI-gated as of Task 11) is included alongside
+/// `legacy`/`edge-legacy` -- all three are recognized `Engine` values with
+/// no rejection anywhere in this command.
 /// A full decode-success run (as `decode_accepts_engine_flag`, Task 9
 /// brief, does for `decode`) isn't used here: `--source` requires a real
 /// 48 kHz mono audio WAV (`AudioIqSource`, not `decode`'s 96 kHz complex-IQ
@@ -158,7 +163,7 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
 /// `open_source`.
 #[test]
 fn listen_accepts_engine_flag_for_every_valid_value() {
-    for engine in ["legacy", "edge-legacy"] {
+    for engine in ["legacy", "edge-legacy", "hsmm"] {
         let out = manta()
             .args(["listen", "--engine", engine, "--source", "/nonexistent.wav"])
             .output()
@@ -177,38 +182,18 @@ fn listen_accepts_engine_flag_for_every_valid_value() {
     }
 }
 
-/// Same restriction as `decode`'s `engine_hsmm_is_a_clean_error_not_a_panic`
-/// (`parse_engine` is shared by both commands' `--engine` value parser) --
-/// `listen --engine hsmm` must fail the same clean, pre-pipeline way.
-#[test]
-fn listen_engine_hsmm_is_a_clean_error_not_a_panic() {
-    let out = manta()
-        .args(["listen", "--engine", "hsmm", "--source", "/nonexistent.wav"])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "expected --engine hsmm to be rejected"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("panicked at"),
-        "must not panic; stderr: {stderr}"
-    );
-    assert!(stderr.contains("hsmm"), "stderr: {stderr}");
-    assert_eq!(out.status.code(), Some(2), "clap arg-error exit code");
-}
-
 /// Regression, black-box: SPEC v2 §7 requires an explicit `--engine` to
 /// override `[decode]`'s `engine` key. An earlier version validated
 /// `engine = "hsmm"` at TOML-deserialize time -- BEFORE the CLI override
 /// was ever consulted -- so a config file staging `engine = "hsmm"` failed
 /// immediately even with `--engine legacy` on the command line, and the
-/// override never got a chance to run. Exercises the actual `manta`
-/// subprocess (not just the internal merge/reject functions) both ways: an
-/// override must let the run past the hsmm gate (it then fails for the
-/// unrelated, expected reason -- the nonexistent source file, not "hsmm"),
-/// and no override must still be rejected for hsmm specifically.
+/// override never got a chance to run. As of Task 11 `hsmm` is no longer
+/// CLI-gated at all, but the precedence rule this test protects still
+/// matters: exercises the actual `manta` subprocess (not just the internal
+/// merge functions) both ways -- an explicit `--engine legacy` must beat a
+/// hsmm-staged file, and with no override the file's own `hsmm` value must
+/// be honored (both cases failing only for the expected, unrelated
+/// downstream reason: the nonexistent source file).
 #[test]
 fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
     use std::io::Write as _;
@@ -225,8 +210,9 @@ fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
     .unwrap();
     f.flush().unwrap();
 
-    // With --engine legacy: must get PAST the hsmm gate and fail instead
-    // for the expected downstream reason (source file doesn't exist).
+    // With --engine legacy: the override must win over the file's hsmm
+    // value and fail only for the expected downstream reason (source file
+    // doesn't exist).
     let out = manta()
         .args(["listen", "--engine", "legacy", "--server-config"])
         .arg(f.path())
@@ -235,30 +221,37 @@ fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
         .unwrap();
     assert!(
         !out.status.success(),
-        "expected a failure (nonexistent source), just not the hsmm one"
+        "expected a failure (nonexistent source)"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "--engine must not be rejected as a bad argument"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("hsmm"),
-        "an explicit --engine override must beat the file's hsmm value; stderr: {stderr}"
-    );
     assert!(
         stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
         "expected the nonexistent-source-file error, got: {stderr}"
     );
 
-    // With NO --engine override: the file's own hsmm value must still be
-    // rejected -- fixing the ordering bug above must not accidentally make
-    // hsmm reachable with no override at all.
+    // With NO --engine override: the file's own hsmm value is honored (not
+    // rejected) and the run still fails only for the same unrelated,
+    // expected reason.
     let out = manta()
         .args(["listen", "--server-config"])
         .arg(f.path())
         .args(["--source", "/nonexistent.wav", "--dial-freq-hz", "14027000"])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "expected the hsmm rejection");
+    assert!(
+        !out.status.success(),
+        "expected a failure (nonexistent source)"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("hsmm"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+        "expected the nonexistent-source-file error, got: {stderr}"
+    );
 }
 
 #[test]

@@ -12,7 +12,10 @@ use crate::HOP_MS;
 use std::collections::VecDeque;
 
 /// Decode engine selection (SPEC v2 §0): which timing/beam chain and which
-/// keying-decision front end feeds it. `Hsmm` is not reachable until Task 8.
+/// keying-decision front end feeds it. `Hsmm` (`TrackDecoder::push_hop_hsmm`)
+/// has been fully implemented and reviewed since Task 8; it is still
+/// experimental/unmeasured for production use (that's what Tasks 11-12
+/// measure), but it is reachable from every CLI command as of Task 11.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Engine {

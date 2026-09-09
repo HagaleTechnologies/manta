@@ -24,15 +24,13 @@
 //! `u_init_hops`, `NoiseConfig::tau_ms`, `HsmmConfig::u_min`/`u_max`) to
 //! those runtime structs themselves.
 //!
-//! `engine = "hsmm"` parses here without complaint -- deliberately. The
-//! production-facing gate on `Engine::Hsmm` (the same one `manta-cli`'s
-//! `parse_engine` applies to `--engine`) is NOT enforced at deserialize
-//! time: rejecting it here would reject a `[decode]` table staging
-//! `engine = "hsmm"` even when an explicit `--engine legacy`/`--engine
-//! edge-legacy` is right there to override it, breaking SPEC v2 §7's
-//! CLI-wins-when-given precedence rule. The caller (`manta-cli`'s
-//! `Command::Listen`) validates the FINAL, merged engine -- after any CLI
-//! override has already been applied -- exactly once.
+//! `engine = "hsmm"` parses here without complaint. As of Task 11,
+//! `manta-cli`'s `parse_engine` no longer gates `--engine hsmm` either --
+//! `Hsmm` is a fully implemented, reviewed engine (Task 8) reachable like
+//! `legacy`/`edge-legacy` everywhere. `merge_cli_engine` in `manta-cli`
+//! still applies SPEC v2 §7's CLI-wins-when-given precedence: an explicit
+//! `--engine` overrides whatever this table's `engine` key says, hsmm or
+//! not.
 
 use crate::decoder::{DecodeConfig, Engine};
 use crate::evidence::EvidenceConfig;
@@ -304,12 +302,11 @@ mod tests {
 
     #[test]
     fn hsmm_engine_parses_permissively_at_this_layer() {
-        // The production-readiness gate on Engine::Hsmm is enforced by the
-        // CALLER (manta-cli's Command::Listen) on the final, CLI-merged
-        // engine value -- NOT here at deserialize time. Rejecting it here
-        // would reject a [decode] table staging engine = "hsmm" even when
-        // an explicit --engine override is there specifically to replace
-        // it, breaking SPEC v2 §7's CLI-wins-when-given precedence rule.
+        // Engine::Hsmm has no CLI-level gate anywhere as of Task 11, but
+        // this layer never depended on that gate to begin with -- it just
+        // parses whatever `engine` value is given, letting the CALLER
+        // (manta-cli's merge_cli_engine) apply SPEC v2 §7's
+        // CLI-wins-when-given precedence over this file's value.
         let file: DecodeConfigFile = toml::from_str(
             r#"
             [decode]

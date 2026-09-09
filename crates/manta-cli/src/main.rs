@@ -54,9 +54,10 @@ enum Command {
         /// range per line (MAN-31).
         #[arg(long)]
         notch: Option<PathBuf>,
-        /// Decode engine (SPEC v2 §0): `legacy` (default) or `edge-legacy`.
-        /// (`hsmm` is a fully implemented `Engine` variant since Task 8 but
-        /// not yet enabled on this command -- see `parse_engine`.)
+        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
+        /// `hsmm` (fully implemented and reviewed since Task 8; still
+        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
+        /// 11-12 measure it).
         #[arg(long, default_value = "legacy", value_parser = parse_engine)]
         engine: Engine,
     },
@@ -201,10 +202,10 @@ enum Command {
         /// this machine's copy of the file happens to say."
         #[arg(long, value_parser = parse_replay_epoch)]
         replay_epoch: Option<i64>,
-        /// Decode engine (SPEC v2 §0): `legacy` (default) or `edge-legacy`.
-        /// (`hsmm` is a recognized `Engine` variant, implemented since Task
-        /// 8, but not yet enabled on a production-facing command -- see
-        /// `parse_engine`.) Unset (rather than defaulting to `legacy`) so
+        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
+        /// `hsmm` (fully implemented and reviewed since Task 8; still
+        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
+        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
         /// an explicit flag can be told apart from an absent one: when
         /// `--server-config`'s `[decode]` table also sets `engine`, this
         /// flag takes precedence over it when given, and the file's value
@@ -460,19 +461,14 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
+/// `Engine::Hsmm` (Task 8: `TrackDecoder::push_hop_hsmm`) is a real, fully
+/// implemented and reviewed engine as of Task 11 -- it parses through like
+/// `legacy`/`edge-legacy`. It remains experimental/unmeasured for
+/// production use (SPEC v2 §8.4, Tasks 11-12 measure it), but that's a
+/// deployment/support-posture question for operators choosing `--engine
+/// hsmm` explicitly, not a reason to reject it at the CLI.
 fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
-    let engine: Engine = s.parse()?;
-    // `Engine::Hsmm` is a real, fully implemented engine (Task 8:
-    // `TrackDecoder::push_hop_hsmm`) -- this is no longer a
-    // not-implemented-yet guard. It stays rejected here because enabling
-    // `--engine hsmm` on a production-facing command is a bigger decision
-    // (rollout/support posture, not code-readiness) than any single task's
-    // scope; nothing in the plan has made that call yet. Lift this once
-    // that decision is made, not before.
-    if engine == Engine::Hsmm {
-        return Err("the hsmm engine is not enabled on this command yet".to_string());
-    }
-    Ok(engine)
+    s.parse()
 }
 
 /// Derives the replay session's wall-clock epoch (fed to `SpotBus`, and
@@ -782,29 +778,6 @@ fn merge_cli_engine(
         file_decode.engine = engine;
     }
     file_decode
-}
-
-/// Same production-readiness gate as `parse_engine`'s CLI-level rejection
-/// of `--engine hsmm`, applied here to the FINAL, CLI-merged engine value
-/// -- i.e. called AFTER `merge_cli_engine`, never before. `[decode].engine
-/// = "hsmm"` parses without complaint (`manta_decode::config_file`), so an
-/// operator staging that in a config file can still override it with
-/// `--engine legacy`/`--engine edge-legacy`; gating any earlier (e.g. at
-/// TOML deserialize time) would reject the file before that override ever
-/// got a chance to apply, breaking SPEC v2 §7's CLI-wins-when-given
-/// precedence rule. Only reachable via a config file today -- clap's
-/// `parse_engine` value parser already keeps `--engine hsmm` itself from
-/// ever producing `Some(Engine::Hsmm)` here.
-fn reject_hsmm_engine(
-    decode: manta_decode::decoder::DecodeConfig,
-) -> Result<manta_decode::decoder::DecodeConfig> {
-    if decode.engine == Engine::Hsmm {
-        bail!(
-            "the hsmm engine is not enabled on this command yet \
-             ([decode].engine = \"hsmm\" in --server-config, not overridden by --engine)"
-        );
-    }
-    Ok(decode)
 }
 
 /// Handles the `Listen` on-spot closure needs to feed a running spot server.
@@ -1200,12 +1173,11 @@ fn main() -> Result<()> {
             };
             // SPEC v2 §7: `[decode]` (from --server-config, if given) is
             // the baseline; an explicit --engine overrides just its
-            // `engine` key (merge_cli_engine). hsmm is validated on the
-            // FINAL merged value (reject_hsmm_engine), not at TOML parse
-            // time, so a file staging engine = "hsmm" can still be
-            // overridden by an explicit --engine.
+            // `engine` key (merge_cli_engine). `engine = "hsmm"` is a fully
+            // implemented and reviewed engine (Task 8) and needs no gate
+            // here as of Task 11.
             let decode_from_file = load_decode_config_file(server_config.as_deref())?;
-            let decode_cfg = reject_hsmm_engine(merge_cli_engine(engine, decode_from_file))?;
+            let decode_cfg = merge_cli_engine(engine, decode_from_file);
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm,
                 allowlist,
@@ -1568,37 +1540,19 @@ mod tests {
         assert_eq!(cfg.hsmm.beam, 10);
     }
 
-    #[test]
-    fn reject_hsmm_engine_passes_through_a_non_hsmm_engine() {
-        let cfg = manta_decode::decoder::DecodeConfig {
-            engine: Engine::EdgeLegacy,
-            ..manta_decode::decoder::DecodeConfig::default()
-        };
-        let result = reject_hsmm_engine(cfg).unwrap();
-        assert_eq!(result.engine, Engine::EdgeLegacy);
-    }
-
-    #[test]
-    fn reject_hsmm_engine_rejects_hsmm() {
-        let cfg = manta_decode::decoder::DecodeConfig {
-            engine: Engine::Hsmm,
-            ..manta_decode::decoder::DecodeConfig::default()
-        };
-        assert!(reject_hsmm_engine(cfg).is_err());
-    }
-
     /// Regression: an earlier version of this task rejected `engine =
     /// "hsmm"` at TOML-deserialize time (inside `load_decode_config_file`,
     /// i.e. BEFORE `merge_cli_engine` ever runs), which meant an explicit
     /// `--engine legacy` could never override a config file staging
     /// `engine = "hsmm"` -- the file's parse error fired first, and the
-    /// override never got a chance to apply. This exercises the actual
-    /// three-function call sequence `Command::Listen`'s handler uses
-    /// (`load_decode_config_file` -> `merge_cli_engine` ->
-    /// `reject_hsmm_engine`) to prove that ordering fix: the CLI override
-    /// must both be ABLE to run (no earlier hard failure) and WIN.
+    /// override never got a chance to apply. As of Task 11, `hsmm` is no
+    /// longer rejected anywhere in this path, but the precedence rule this
+    /// test protects (an explicit `--engine` beats the file's `engine` key)
+    /// still matters, so it's kept with `hsmm` as the file-staged value to
+    /// prove `merge_cli_engine` reads the CLI override, not the file, when
+    /// both are given.
     #[test]
-    fn cli_engine_override_lets_a_hsmm_staged_file_through() {
+    fn cli_engine_override_beats_a_hsmm_staged_file() {
         let f = write_temp_file(
             br#"
             [server]
@@ -1613,20 +1567,19 @@ mod tests {
             Engine::Hsmm,
             "the file's own value must still be hsmm going into the merge"
         );
-        let result = reject_hsmm_engine(merge_cli_engine(Some(Engine::Legacy), file_decode));
+        let result = merge_cli_engine(Some(Engine::Legacy), file_decode);
         assert_eq!(
-            result.unwrap().engine,
+            result.engine,
             Engine::Legacy,
             "an explicit --engine must override a hsmm-staged file"
         );
     }
 
-    /// The other direction of the same regression: with NO CLI override,
-    /// a file staging `engine = "hsmm"` must still be rejected -- fixing
-    /// the ordering bug above must not accidentally make hsmm reachable
-    /// with no override at all.
+    /// The other direction: with NO CLI override, a file staging `engine =
+    /// "hsmm"` is honored (not rejected) -- `hsmm` is a fully implemented,
+    /// reviewed engine (Task 8) with no CLI-level gate as of Task 11.
     #[test]
-    fn hsmm_staged_file_is_still_rejected_without_a_cli_override() {
+    fn hsmm_staged_file_is_honored_without_a_cli_override() {
         let f = write_temp_file(
             br#"
             [decode]
@@ -1634,8 +1587,8 @@ mod tests {
             "#,
         );
         let file_decode = load_decode_config_file(Some(f.path())).unwrap();
-        let result = reject_hsmm_engine(merge_cli_engine(None, file_decode));
-        assert!(result.is_err());
+        let result = merge_cli_engine(None, file_decode);
+        assert_eq!(result.engine, Engine::Hsmm);
     }
 
     #[test]
