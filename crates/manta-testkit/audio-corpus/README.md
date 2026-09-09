@@ -77,12 +77,15 @@ recall/precision) for real M3-grade validation, not just synthetic
 fixtures.
 
 First baseline run (2026-09-08, this recording, unmodified pipeline):
-**197 manta spots vs. 1,451 RBN truth bins -> 31.0% precision, 4.2%
-recall**, alongside 41,174 distinct tracks opened over the 15 minutes
-(613k characters decoded) for those 197 spots -- the detector is opening
-far more tracks than the real simultaneous-signal count implies, and most
-never survive to a validated spot. See MAN ticket for the tracking issue
-this baseline was filed against.
+**197 manta spots vs. 1,441 scoreable RBN truth bins -> 29.9% precision,
+4.1% recall** (revised after a Codex review on PR #144 caught two real
+scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
+grammar can structurally never accept counted as misses; both fixed in
+`scripts/score-against-rbn.py`, see that script's docstring), alongside
+41,174 distinct tracks opened over the 15 minutes (613k characters
+decoded) for those 197 spots -- the detector is opening far more tracks
+than the real simultaneous-signal count implies, and most never survive
+to a validated spot. Filed as MAN-166.
 
 `vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` have no verified ground truth
 (no confirmed capture UTC/band/frequency, no time-aligned transcript) --
