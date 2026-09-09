@@ -995,7 +995,14 @@ fn main() -> Result<()> {
                 eprintln!("spots: {}", report.spots.len());
             }
         }
-        Command::Oracle { path, rbn_csv, spotter, window_s, engine, jsonl } => {
+        Command::Oracle {
+            path,
+            rbn_csv,
+            spotter,
+            window_s,
+            engine,
+            jsonl,
+        } => {
             let mut src = manta_input::WavIqSource::open(&path)?;
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
             let iq = manta_input::read_all(&mut src)?;
@@ -1004,10 +1011,14 @@ fn main() -> Result<()> {
                 engine,
                 ..Default::default()
             };
-            let (results, summary) = manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
+            let (results, summary) =
+                manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
                 let mut w = std::io::BufWriter::new(std::fs::File::create(p)?);
-                for r in &results { use std::io::Write; writeln!(w, "{}", serde_json::to_string(r)?)?; }
+                for r in &results {
+                    use std::io::Write;
+                    writeln!(w, "{}", serde_json::to_string(r)?)?;
+                }
             }
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }

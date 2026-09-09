@@ -17,7 +17,14 @@ pub struct EvidenceConfig {
 
 impl Default for EvidenceConfig {
     fn default() -> Self {
-        EvidenceConfig { sigma_u: 0.30, llr_clip: 10.0, hold_dits: 4.0, fallback_hops: 8, tau_a_ms: 8.0, u_init_hops: 15.0 }
+        EvidenceConfig {
+            sigma_u: 0.30,
+            llr_clip: 10.0,
+            hold_dits: 4.0,
+            fallback_hops: 8,
+            tau_a_ms: 8.0,
+            u_init_hops: 15.0,
+        }
     }
 }
 
@@ -53,7 +60,18 @@ impl Evidence {
     pub fn new(cfg: EvidenceConfig) -> Self {
         let alpha_a = (1.0 - (-HOP_MS / cfg.tau_a_ms).exp()) as f32;
         let h = (cfg.hold_dits * cfg.u_init_hops).round().max(1.0) as usize;
-        Evidence { cfg, alpha_a, a_s: None, h, line: VecDeque::new(), hop_in: 0, hop_out: 0, prefix: 0.0, last_sign: 0, last_present: false }
+        Evidence {
+            cfg,
+            alpha_a,
+            a_s: None,
+            h,
+            line: VecDeque::new(),
+            hop_in: 0,
+            hop_out: 0,
+            prefix: 0.0,
+            last_sign: 0,
+            last_present: false,
+        }
     }
 
     /// SPEC v2 §1.2: h = round(hold_dits * u_ref). Takes effect for the next
@@ -63,13 +81,20 @@ impl Evidence {
     }
 
     pub fn push(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) -> Option<HopEvidence> {
-        let a_s = match self.a_s { None => amp, Some(p) => p + self.alpha_a * (amp - p) };
+        let a_s = match self.a_s {
+            None => amp,
+            Some(p) => p + self.alpha_a * (amp - p),
+        };
         self.a_s = Some(a_s);
         self.line.push_back((amp, a_s, noise_amp, sample_ts));
         self.hop_in += 1;
         // Emit once we have h hops of look-ahead past the center element.
-        if self.line.len() > 2 * self.h + 1 { self.line.pop_front(); }
-        if self.line.len() < self.h + 1 { return None; }
+        if self.line.len() > 2 * self.h + 1 {
+            self.line.pop_front();
+        }
+        if self.line.len() < self.h + 1 {
+            return None;
+        }
         let center = self.line.len() - 1 - self.h;
         Some(self.emit(center))
     }
@@ -101,15 +126,24 @@ impl Evidence {
         let lo = center.saturating_sub(self.h);
         let hi = (center + self.h).min(self.line.len() - 1);
         let mut m = 0.0f32;
-        for i in lo..=hi { m = m.max(self.line[i].1); }
+        for i in lo..=hi {
+            m = m.max(self.line[i].1);
+        }
         let present = m >= 2.0 * n;
         let llr = if present {
             let u = ((amp - n) / (m - n).max(1e-9)).clamp(-0.5, 1.5);
-            ((u - 0.5) / (self.cfg.sigma_u * self.cfg.sigma_u)).clamp(-self.cfg.llr_clip, self.cfg.llr_clip)
+            ((u - 0.5) / (self.cfg.sigma_u * self.cfg.sigma_u))
+                .clamp(-self.cfg.llr_clip, self.cfg.llr_clip)
         } else {
             -self.cfg.llr_clip
         };
-        let sign: i8 = if llr > 0.0 { 1 } else if llr < 0.0 { -1 } else { 0 };
+        let sign: i8 = if llr > 0.0 {
+            1
+        } else if llr < 0.0 {
+            -1
+        } else {
+            0
+        };
 
         // Edge trigger (SPEC v2 §1.7): a hop is an anchor at a half-amplitude
         // crossing. The crossing sample itself is ambiguous between "last hop
@@ -135,7 +169,13 @@ impl Evidence {
                     let u = ((next_amp - n) / (m - n).max(1e-9)).clamp(-0.5, 1.5);
                     let next_llr = ((u - 0.5) / (self.cfg.sigma_u * self.cfg.sigma_u))
                         .clamp(-self.cfg.llr_clip, self.cfg.llr_clip);
-                    let next_sign: i8 = if next_llr > 0.0 { 1 } else if next_llr < 0.0 { -1 } else { 0 };
+                    let next_sign: i8 = if next_llr > 0.0 {
+                        1
+                    } else if next_llr < 0.0 {
+                        -1
+                    } else {
+                        0
+                    };
                     next_sign != sign
                 }
                 None => sign != self.last_sign,
@@ -147,7 +187,17 @@ impl Evidence {
         self.last_sign = sign;
         self.last_present = present;
         self.prefix += llr as f64;
-        let ev = HopEvidence { hop: self.hop_out, sample_ts: ts, llr, present, anchor, prefix: self.prefix, amp, mark_level: m, noise_level: n };
+        let ev = HopEvidence {
+            hop: self.hop_out,
+            sample_ts: ts,
+            llr,
+            present,
+            anchor,
+            prefix: self.prefix,
+            amp,
+            mark_level: m,
+            noise_level: n,
+        };
         self.hop_out += 1;
         ev
     }
@@ -163,11 +213,30 @@ mod tests {
     fn keyed(dit_hops: usize, depth_db: f32, reps: usize) -> Vec<f32> {
         let lo = 10f32.powf(-depth_db / 20.0);
         let mut v = Vec::new();
-        let seg = |v: &mut Vec<f32>, on: bool, n: usize| for _ in 0..n { v.push(if on { 1.0 } else { lo }); };
-        for _ in 0..reps { seg(&mut v, true, dit_hops); seg(&mut v, false, dit_hops); seg(&mut v, true, 3 * dit_hops); seg(&mut v, false, 3 * dit_hops); }
+        let seg = |v: &mut Vec<f32>, on: bool, n: usize| {
+            for _ in 0..n {
+                v.push(if on { 1.0 } else { lo });
+            }
+        };
+        for _ in 0..reps {
+            seg(&mut v, true, dit_hops);
+            seg(&mut v, false, dit_hops);
+            seg(&mut v, true, 3 * dit_hops);
+            seg(&mut v, false, 3 * dit_hops);
+        }
         // 4-hop ramps
         let mut out = v.clone();
-        for i in 1..v.len() { if (v[i] - v[i-1]).abs() > 0.1 { for j in 0..4 { let k = i + j; if k < out.len() { let f = (j as f32 + 0.5) / 4.0; out[k] = v[i-1] + f * (v[i] - v[i-1]); } } } }
+        for i in 1..v.len() {
+            if (v[i] - v[i - 1]).abs() > 0.1 {
+                for j in 0..4 {
+                    let k = i + j;
+                    if k < out.len() {
+                        let f = (j as f32 + 0.5) / 4.0;
+                        out[k] = v[i - 1] + f * (v[i] - v[i - 1]);
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -178,7 +247,11 @@ mod tests {
     fn run_with_config(env: &[f32], noise_amp: f32, cfg: EvidenceConfig) -> Vec<HopEvidence> {
         let mut e = Evidence::new(cfg);
         let mut out = Vec::new();
-        for (i, &a) in env.iter().enumerate() { if let Some(h) = e.push(a, noise_amp, i as u64 * 512) { out.push(h); } }
+        for (i, &a) in env.iter().enumerate() {
+            if let Some(h) = e.push(a, noise_amp, i as u64 * 512) {
+                out.push(h);
+            }
+        }
         out.extend(e.flush());
         out
     }
@@ -198,13 +271,33 @@ mod tests {
     fn llr_is_antisymmetric_about_half_amplitude() {
         let mut e = Evidence::new(EvidenceConfig::default());
         let mut out = Vec::new();
-        for _ in 0..300 { if let Some(h) = e.push(1.0, 0.0, 0) { out.push(h); } }
-        if let Some(h) = e.push(0.75, 0.0, 0) { out.push(h); }
-        if let Some(h) = e.push(0.25, 0.0, 0) { out.push(h); }
-        for _ in 0..200 { if let Some(h) = e.push(0.75, 0.0, 0) { out.push(h); } }
+        for _ in 0..300 {
+            if let Some(h) = e.push(1.0, 0.0, 0) {
+                out.push(h);
+            }
+        }
+        if let Some(h) = e.push(0.75, 0.0, 0) {
+            out.push(h);
+        }
+        if let Some(h) = e.push(0.25, 0.0, 0) {
+            out.push(h);
+        }
+        for _ in 0..200 {
+            if let Some(h) = e.push(0.75, 0.0, 0) {
+                out.push(h);
+            }
+        }
         out.extend(e.flush());
-        let hi = out.iter().find(|h| (h.amp - 0.75).abs() < 1e-6 && h.mark_level > 0.99).unwrap().llr;
-        let lo = out.iter().find(|h| (h.amp - 0.25).abs() < 1e-6 && h.mark_level > 0.99).unwrap().llr;
+        let hi = out
+            .iter()
+            .find(|h| (h.amp - 0.75).abs() < 1e-6 && h.mark_level > 0.99)
+            .unwrap()
+            .llr;
+        let lo = out
+            .iter()
+            .find(|h| (h.amp - 0.25).abs() < 1e-6 && h.mark_level > 0.99)
+            .unwrap()
+            .llr;
         assert!((hi + lo).abs() < 0.05, "hi {hi} lo {lo}");
         assert!(hi > 0.0);
     }
@@ -228,18 +321,39 @@ mod tests {
     fn anchors_land_on_true_edges_regardless_of_depth() {
         for depth in [20.0f32, 40.0, 60.0] {
             let env = keyed(13, depth, 20);
-            let cfg = EvidenceConfig { fallback_hops: 1_000_000, ..EvidenceConfig::default() };
+            let cfg = EvidenceConfig {
+                fallback_hops: 1_000_000,
+                ..EvidenceConfig::default()
+            };
             let hops = run_with_config(&env, 10f32.powf(-depth / 20.0), cfg);
-            let anchors: Vec<u64> = hops.iter().filter(|h| h.anchor && h.llr.signum() != 0.0).map(|h| h.hop).collect();
+            let anchors: Vec<u64> = hops
+                .iter()
+                .filter(|h| h.anchor && h.llr.signum() != 0.0)
+                .map(|h| h.hop)
+                .collect();
             // true edges of the "dit gap dah gap" pattern (period 8 dits) start at 0 in the un-ramped envelope;
             // each measured edge must be within 1 hop of a true edge at 13k or 13k+... boundaries.
             let mut off_by = 0;
             for &a in &anchors {
                 let m = a % (8 * 13);
-                let nearest = [0u64, 13, 26, 65].iter().map(|&t| (m as i64 - t as i64).abs().min(104 - (m as i64 - t as i64).abs())).min().unwrap();
-                if nearest > 1 { off_by += 1; }
+                let nearest = [0u64, 13, 26, 65]
+                    .iter()
+                    .map(|&t| {
+                        (m as i64 - t as i64)
+                            .abs()
+                            .min(104 - (m as i64 - t as i64).abs())
+                    })
+                    .min()
+                    .unwrap();
+                if nearest > 1 {
+                    off_by += 1;
+                }
             }
-            assert!(off_by * 20 < anchors.len(), "depth {depth}: {off_by}/{} anchors more than 1 hop from a true edge", anchors.len());
+            assert!(
+                off_by * 20 < anchors.len(),
+                "depth {depth}: {off_by}/{} anchors more than 1 hop from a true edge",
+                anchors.len()
+            );
         }
     }
 
@@ -248,8 +362,21 @@ mod tests {
         let env = keyed(13, 60.0, 10);
         let hops = run(&env, 0.001);
         // Count consecutive positive-llr runs after warm-up: dits must be 13±1, dahs 39±1.
-        let mut runs = Vec::new(); let mut cur = 0; let mut sign = false;
-        for h in hops.iter().skip(200) { let s = h.llr > 0.0; if s == sign { cur += 1; } else { if sign { runs.push(cur); } cur = 1; sign = s; } }
+        let mut runs = Vec::new();
+        let mut cur = 0;
+        let mut sign = false;
+        for h in hops.iter().skip(200) {
+            let s = h.llr > 0.0;
+            if s == sign {
+                cur += 1;
+            } else {
+                if sign {
+                    runs.push(cur);
+                }
+                cur = 1;
+                sign = s;
+            }
+        }
         let dits = runs.iter().filter(|&&r| (12..=14).contains(&r)).count();
         let dahs = runs.iter().filter(|&&r| (38..=40).contains(&r)).count();
         assert!(dits >= 8 && dahs >= 8, "runs {runs:?}");
@@ -266,8 +393,14 @@ mod tests {
     #[test]
     fn delay_equals_hold_window() {
         let mut e = Evidence::new(EvidenceConfig::default());
-        let h = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops).round() as usize;
-        for i in 0..h { assert!(e.push(1.0, 0.01, i as u64).is_none(), "hop {i} emitted early"); }
+        let h = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops)
+            .round() as usize;
+        for i in 0..h {
+            assert!(
+                e.push(1.0, 0.01, i as u64).is_none(),
+                "hop {i} emitted early"
+            );
+        }
         assert!(e.push(1.0, 0.01, h as u64).is_some());
     }
 
@@ -298,7 +431,8 @@ mod tests {
         let warmup = 150usize;
         let tail = 40usize; // < h (60): full backward reach still spans back into the mark
         let noise_amp = 0.1f32;
-        let h = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops).round() as usize;
+        let h = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops)
+            .round() as usize;
 
         let mut scene = vec![1.0f32; warmup];
         scene.extend(std::iter::repeat_n(0.3f32, tail));
@@ -327,7 +461,10 @@ mod tests {
         }
 
         let last = flushed.last().unwrap();
-        assert!(last.present, "tail should still be gated present given the held mark level");
+        assert!(
+            last.present,
+            "tail should still be gated present given the held mark level"
+        );
         assert!(
             last.llr < 0.0,
             "tail amplitude 0.3 under a held mark of 1.0 must read space-like, not a phantom mark: llr={}",

@@ -110,7 +110,9 @@ mod tests {
         let mut s = seed;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
             out.push((-u.ln() as f32) * mean);
         }
@@ -131,7 +133,10 @@ mod tests {
             }
         }
         let est_db = 10.0 * (acc / n as f64 / 1.0e-6).log10();
-        assert!(est_db.abs() < 0.5, "temporal noise estimate off by {est_db:.2} dB");
+        assert!(
+            est_db.abs() < 0.5,
+            "temporal noise estimate off by {est_db:.2} dB"
+        );
     }
 
     #[test]
@@ -142,6 +147,9 @@ mod tests {
         }
         let quiet = t.push(1.0e-6, Some(1.0e-6));
         let burst = t.push(1.0e-6, Some(1.0e-3)); // neighbors 30 dB up
-        assert!(burst > 100.0 * quiet, "spectral burst must lift N: quiet {quiet:e} burst {burst:e}");
+        assert!(
+            burst > 100.0 * quiet,
+            "spectral burst must lift N: quiet {quiet:e} burst {burst:e}"
+        );
     }
 }
