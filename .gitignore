@@ -18,6 +18,10 @@ secrets*
 .idea/
 .vscode/
 
+# Python cache from scripts/ tooling (e.g. score-against-rbn.py).
+__pycache__/
+*.pyc
+
 # Local worktree scratch space (superpowers:using-git-worktrees).
 .worktrees/
 
@@ -33,9 +37,16 @@ secrets*
 # Catalyst thoughts/ symlink (points outside the repo to the shared diario store)
 thoughts/
 
+# Local-only scratch space for material that shouldn't be committed or
+# described in tracked files (never pushed, never referenced by name).
+.private/
+
 # Real-audio corpus kept local-only -- either too big for git history
 # without LFS, or pending confirmed redistribution rights from the source.
 # See crates/manta-testkit/audio-corpus/README.md.
 crates/manta-testkit/audio-corpus/wpx_cw_iq_96khz.wav
 crates/manta-testkit/audio-corpus/vp8geo_cw.mp3
 crates/manta-testkit/audio-corpus/vp8geo_cw_48khz.wav
+crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.wav
+crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.json
+crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.source.wav

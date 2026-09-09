@@ -11,11 +11,15 @@ M1 implemented (live audio decode; manual W1AW live-copy run still
 outstanding). All M2 sub-projects implemented (PFB channelizer;
 detector/track manager + decoder pool; V8/V8w pileup + CPU-budget bench;
 SoapySDR input; KiwiSDR input) — see docs/DECISIONS/2026-07-1[7-9]*.md and
-2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2/V5/V6/V8w are tracked
-known classical-decoder fading-robustness limitations (`#[ignore]`d,
-issues #25/#28), deferred to M4 ML fusion by design, not M2 blockers. **M2
-acceptance is still open**: Pi4 CPU-budget leg and 24 h live-SDR soak are
-unmet — both need physical hardware not reachable from this environment.
+2026-07-2[4-5]*.md. V1/V3/V4/V7/V8/V9/V10 green; V2 is a tracked
+near-channel-edge WPM bug (MAN-7/103), unrelated to fading. **V5/V6/V8w's
+fading-robustness gap is classical-DSP work to fix before M4** (MAN-107
+through MAN-113), not deferred to M4 ML fusion by design — see
+docs/DECISIONS/2026-09-06-broad-review-decisions.md D8. **M2 acceptance
+is still open**: Pi4 CPU-budget leg (also paused pending MAN-100 through
+MAN-113 landing in full, not just MAN-107-113 above — D6) and 24 h
+live-SDR soak are unmet — both need physical hardware not
+reachable from this environment.
 `manta-dsp::single`/`freqest` deprecated in place.
 
 ## Documents (read in this order)
