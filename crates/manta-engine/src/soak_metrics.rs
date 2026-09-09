@@ -185,7 +185,7 @@ pub fn soak_with_metrics(
         // file did, double-applies the correction to every spot's
         // frequency (and to notch/dedupe bucketing) whenever
         // `freq_correction_ppm != 0.0` -- matching `lib.rs`'s
-        // `calibrate_track_meta` doc, which explicitly warns against
+        // `calibrate_freq_events` doc, which explicitly warns against
         // feeding its output to `Validator::ingest`. Validated up front
         // only so a NaN/out-of-range ppm fails fast, same as soak.rs.
         manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)

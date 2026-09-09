@@ -34,6 +34,23 @@ const TIMEOUT_US: i64 = 100_000;
 /// promptly, not blocking forever).
 const MAX_TIMEOUT_RETRIES: u32 = 20;
 
+/// Bound on consecutive `ErrorCode::Overflow` retries before giving up and
+/// propagating a real `Err`. A single overflow just means this call's
+/// chunk was dropped by a full ring buffer -- normal under brief USB/
+/// scheduling pressure on a live SDR, and observed in practice on an
+/// SDRplay RSP1B several minutes into a sustained 192 kS/s capture -- so
+/// it's retried rather than torn down like `MAX_TIMEOUT_RETRIES` silence.
+/// Unlike `Timeout`, `Overflow` returns immediately without waiting out
+/// `TIMEOUT_US`, so retrying it unboundedly could busy-loop forever
+/// without `read()` ever returning if overflows kept recurring back-to-
+/// back -- the same Ctrl-C-responsiveness hazard `MAX_TIMEOUT_RETRIES`
+/// already guards against for silence, so this gets its own bound rather
+/// than sharing that counter (a burst of overflows shouldn't spend down
+/// the tolerance-for-a-dead-source budget and vice versa). A sustained run
+/// of overflows this long means the host genuinely can't keep up, which
+/// should surface as a real error instead of spinning forever.
+const MAX_OVERFLOW_RETRIES: u32 = 100;
+
 impl SoapySdrIqSource {
     /// Open `driver_args` (e.g. `"driver=rtlsdr"`), tune to `fs`/
     /// `center_freq_hz`, set `gain_db` (or enable AGC if `None` and the
@@ -50,7 +67,19 @@ impl SoapySdrIqSource {
         device.set_sample_rate(Rx, 0, fs)?;
         device.set_frequency(Rx, 0, center_freq_hz, ())?;
         match gain_db {
-            Some(db) => device.set_gain(Rx, 0, db)?,
+            // Some drivers (confirmed on a real SDRplay RSP1B) default AGC
+            // on and then silently ignore set_gain -- with AGC left
+            // enabled, activateStream() fails outright
+            // (sdrplay_api_Fail/NotSupported) rather than merely leaving
+            // the requested gain unapplied. Disable AGC first whenever the
+            // device supports the mode, so a manual gain actually takes
+            // and the stream activates.
+            Some(db) => {
+                if device.has_gain_mode(Rx, 0)? {
+                    device.set_gain_mode(Rx, 0, false)?;
+                }
+                device.set_gain(Rx, 0, db)?;
+            }
             None => {
                 if device.has_gain_mode(Rx, 0)? {
                     device.set_gain_mode(Rx, 0, true)?;
@@ -81,24 +110,40 @@ impl IqSource for SoapySdrIqSource {
         self.center_freq_hz
     }
 
-    /// A per-call SoapySDR read timeout (`ErrorCode::Timeout`) is a normal,
-    /// expected event on a live stream -- not end-of-stream and not fatal --
-    /// so it is retried internally (bounded by `MAX_TIMEOUT_RETRIES`) rather
-    /// than surfaced to the caller; any other error still propagates as `Err`
-    /// immediately.
+    /// A per-call SoapySDR read timeout (`ErrorCode::Timeout`) or buffer
+    /// overflow (`ErrorCode::Overflow`) is a normal, expected event on a
+    /// live stream -- neither is end-of-stream nor fatal on its own -- so
+    /// each is retried internally against its own bound (`MAX_TIMEOUT_
+    /// RETRIES`, `MAX_OVERFLOW_RETRIES`) rather than surfaced to the
+    /// caller; any other error still propagates as `Err` immediately.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        for _ in 0..MAX_TIMEOUT_RETRIES {
+        let mut timeout_retries = 0;
+        let mut overflow_retries = 0;
+        loop {
             match self.stream.read(&mut [buf], TIMEOUT_US) {
                 Ok(n) => return Ok(n),
-                Err(e) if e.code == ErrorCode::Timeout => continue,
+                Err(e) if e.code == ErrorCode::Timeout => {
+                    timeout_retries += 1;
+                    if timeout_retries >= MAX_TIMEOUT_RETRIES {
+                        anyhow::bail!(
+                            "SoapySDR read timed out after {} consecutive attempts (~{}s of silence)",
+                            MAX_TIMEOUT_RETRIES,
+                            (MAX_TIMEOUT_RETRIES as i64 * TIMEOUT_US) / 1_000_000
+                        );
+                    }
+                }
+                Err(e) if e.code == ErrorCode::Overflow => {
+                    overflow_retries += 1;
+                    if overflow_retries >= MAX_OVERFLOW_RETRIES {
+                        anyhow::bail!(
+                            "SoapySDR stream overflowed on {} consecutive reads -- host cannot keep up",
+                            MAX_OVERFLOW_RETRIES
+                        );
+                    }
+                }
                 Err(e) => return Err(e.into()),
             }
         }
-        anyhow::bail!(
-            "SoapySDR read timed out after {} consecutive attempts (~{}s of silence)",
-            MAX_TIMEOUT_RETRIES,
-            (MAX_TIMEOUT_RETRIES as i64 * TIMEOUT_US) / 1_000_000
-        )
     }
 }
 
