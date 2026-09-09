@@ -253,8 +253,15 @@ fn wiki_index_links_the_release_runbook() {
 /// `docker run …:latest`. The rollback section must therefore say that
 /// `:latest` is republished on every tag push, and must give both exits:
 /// re-point it at the last good image when one exists, delete it when none
-/// does. Asserted on those two structural markers rather than on whole
+/// does. Asserted on those structural markers rather than on whole
 /// sentences, so the section can be reworded without false-failing.
+///
+/// A later round of the same review (P2) established *how* the re-point has
+/// to be done: `docker pull` + `docker tag` + `docker push` resolves the
+/// multi-platform image to the host architecture and would republish
+/// `:latest` as single-arch, so this guard now requires the server-side
+/// manifest-list copy (`docker buildx imagetools create`) and explicitly
+/// forbids the round-trip it used to require.
 #[test]
 fn release_runbook_rollback_always_handles_latest() {
     let runbook = read_repo_file(RELEASE_RUNBOOK);
@@ -269,11 +276,31 @@ fn release_runbook_rollback_always_handles_latest() {
          serving README's `docker run` command. Section was:\n{rollback}"
     );
     assert!(
-        rollback.contains(r#"docker push "$image:latest""#),
+        rollback.contains("docker buildx imagetools create"),
         "{RELEASE_RUNBOOK}'s rollback section must show how to re-point \
-         `:latest` at the last good image (`docker push \"$IMAGE:latest\"`); \
-         nothing in the pipeline does it for you, since a workflow_dispatch \
-         publish never writes `:latest`. Section was:\n{rollback}"
+         `:latest` at the last good image (`docker buildx imagetools \
+         create`); nothing in the pipeline does it for you, since a \
+         workflow_dispatch publish never writes `:latest`. Section \
+         was:\n{rollback}"
+    );
+    assert!(
+        !rollback.contains(r#"docker push "$image:latest""#),
+        "{RELEASE_RUNBOOK}'s rollback section must NOT restore `:latest` by \
+         pushing a locally retagged pull: on a single-platform Docker engine \
+         `docker pull` resolves the multi-platform image to the host's own \
+         architecture, so `docker tag` + `docker push` republishes `:latest` \
+         as single-arch while docker-publish and README both promise \
+         linux/amd64 AND linux/arm64. Copy the manifest list server-side \
+         with `docker buildx imagetools create` instead. Section \
+         was:\n{rollback}"
+    );
+    assert!(
+        rollback.contains("linux/arm64"),
+        "{RELEASE_RUNBOOK}'s rollback section must name the platforms \
+         `:latest` has to keep (linux/amd64 and linux/arm64), so the \
+         operator has something to check the restored tag against rather \
+         than trusting that any resolvable digest is correct. Section \
+         was:\n{rollback}"
     );
     assert!(
         rollback.contains("delete the `latest` version"),

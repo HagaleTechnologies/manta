@@ -19,13 +19,26 @@ checked by anything, so write it by hand as shown below.
 
 ## Before you push the tag
 
-1. **`origin/main` is clean and up to date:**
+1. **`origin/main` is clean and up to date.** Check *this checkout* for
+   uncommitted work **first** — before touching the working tree at all:
 
    ```sh
    git fetch origin
+   git status --porcelain   # must print nothing; stop here if it does
+   ```
+
+   If that printed anything, **stop**: commit or stash it, or cut the
+   release from a scratch worktree instead
+   (`git worktree add /tmp/manta-release main`, then work there). Do
+   **not** reach for `git reset --hard origin/main` to "get clean" — it
+   destroys uncommitted tracked work irreversibly, and it does it *before*
+   any later cleanliness check can tell you what was lost. Once the tree is
+   clean, fast-forward instead, which fails loudly rather than discarding
+   local commits:
+
+   ```sh
    git switch main
-   git reset --hard origin/main
-   git status --porcelain   # must be empty
+   git merge --ff-only origin/main
    ```
 
 2. **The tag version matches `[workspace.package]` in `Cargo.toml`.** The
@@ -114,10 +127,21 @@ Expected shape and rough durations:
 ## Verify the release is real
 
 Don't trust the green checkmarks alone — check the artifact as an operator
-would, from a directory that is **not** a clone of this repo:
+would, from a directory that is **not** a clone of this repo.
+
+Because that directory has no manta remote, `gh` has nothing to infer the
+repository from and every command below would abort before checking a
+single artifact. So each one names the repo explicitly with `-R/--repo`
+(`gh release view --help`); if you'd rather not repeat it, export it once
+for the shell instead and drop the flags:
 
 ```sh
-gh release view v0.1.0 --json assets --jq '.assets[].name'
+export GH_REPO=HagaleTechnologies/manta   # alternative to --repo below
+```
+
+```sh
+gh release view v0.1.0 --repo HagaleTechnologies/manta \
+  --json assets --jq '.assets[].name'
 ```
 
 Expect exactly five archives: `manta-macos-x86_64.tar.gz`,
@@ -125,7 +149,8 @@ Expect exactly five archives: `manta-macos-x86_64.tar.gz`,
 `manta-linux-arm64.tar.gz`, `manta-windows-x86_64.zip`.
 
 ```sh
-gh release view v0.1.0 --json body --jq .body | head -5
+gh release view v0.1.0 --repo HagaleTechnologies/manta \
+  --json body --jq .body | head -5
 ```
 
 Expect the pre-stability-alpha banner **above** the auto-generated
@@ -142,13 +167,25 @@ Then, from a scratch directory with no manta checkout and no Rust
 toolchain assumed:
 
 ```sh
-mkdir -p /tmp/manta-release-check && cd /tmp/manta-release-check
-gh release download v0.1.0 --pattern 'manta-linux-x86_64.tar.gz'
-tar xzf manta-linux-x86_64.tar.gz
-cd manta-linux-x86_64
-./manta --version                          # expect: manta 0.1.0
-./manta gen v1 --out ./v1 && ./manta decode ./v1/v1.wav   # expect W1AW text, spots: 1
+CHECK_DIR="$(mktemp -d)" && cd "$CHECK_DIR" \
+  && gh release download v0.1.0 --repo HagaleTechnologies/manta \
+       --pattern 'manta-linux-x86_64.tar.gz' \
+  && tar xzf manta-linux-x86_64.tar.gz \
+  && cd manta-linux-x86_64 \
+  && ./manta --version \
+  && ./manta gen v1 --out ./v1 && ./manta decode ./v1/v1.wav
+# expect: `manta 0.1.0`, then the W1AW text and `spots: 1`
 ```
+
+Use `mktemp -d`, not a fixed path like `/tmp/manta-release-check`, and keep
+the `&&` chain. A reused directory still holds the *previous* run's archive
+and unpacked binary; `gh release download` refuses to overwrite an existing
+file unless you pass `--clobber` (`gh release download --help`), so on a
+second run the download fails — and in an interactive shell, with no
+`set -e` to stop it, the unpack-and-run steps then happily validate the
+*old* asset and report success for a release you never downloaded. A fresh
+directory each time makes that impossible; the `&&` chain means a failed
+download never reaches `./manta --version` even if you do reuse one.
 
 Repeat the download-unpack-run check for at least one non-Linux archive on
 a machine of that platform — the macOS, Windows, and `arm64` legs are built
@@ -190,6 +227,9 @@ Finally, confirm `README.md`'s release badge
   RUN_ID="$(gh run list --workflow release-publish.yml --event push \
               --commit "$TAG_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')"
   gh run view "$RUN_ID" --json jobs --jq '.jobs[] | {name, databaseId}'
+  # NOT a docker-publish-only rerun: this also re-runs verify-version and
+  # all five build legs (`--job` reruns the job "including dependencies"),
+  # so budget the full 10-25 minute release build, not a Docker-only leg.
   gh run rerun --job <the docker-publish databaseId from the line above>
   ```
 
@@ -241,19 +281,30 @@ README. Always deal with both:
    on skipping the step.
 
    **a. An earlier good release exists — re-point `:latest` at it.** Do this
-   from any machine with Docker; a `workflow_dispatch` publish will *not* do
-   it for you, since the workflow pushes `:latest` only for real tag pushes.
-   The login is required even to *pull*, for as long as the package is
-   private (MAN-66), and the token needs `write:packages` for the push:
+   from any machine with Docker and `buildx`; a `workflow_dispatch` publish
+   will *not* do it for you, since the workflow pushes `:latest` only for
+   real tag pushes. The login is required even to *read* the existing tag,
+   for as long as the package is private (MAN-66), and the token needs
+   `read:packages` plus `write:packages` to copy one tag onto another:
 
    ```sh
    IMAGE=ghcr.io/hagaletechnologies/manta
    echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
-   docker pull "$IMAGE:<last-good-version>"
-   docker tag "$IMAGE:<last-good-version>" "$IMAGE:latest"
-   docker push "$IMAGE:latest"
-   docker manifest inspect "$IMAGE:latest" >/dev/null && echo ":latest restored"
+   docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:<last-good-version>"
+   docker buildx imagetools inspect "$IMAGE:latest"   # expect BOTH platforms
    ```
+
+   `docker buildx imagetools create` copies the **manifest list** between
+   tags server-side, which is what keeps `:latest` multi-platform. Do
+   **not** restore it with `docker pull` + `docker tag` + `docker push`:
+   on an ordinary single-platform Docker engine a pull resolves a
+   multi-platform image down to the host's own OS/architecture
+   ([Multi-platform builds](https://docs.docker.com/build/building/multi-platform/)),
+   so re-pushing that local image would republish `:latest` as amd64-only
+   or arm64-only while `docker-publish` and README both promise
+   `linux/amd64` *and* `linux/arm64` — silently breaking `docker run` for
+   every reader on the other architecture. The `imagetools inspect` line
+   is the check: it must list both platforms.
 
    **b. No good release exists yet (the bad one was the first) — delete
    `:latest`.** There is nothing to point it at: delete the `latest` version
@@ -264,8 +315,9 @@ README. Always deal with both:
 
    Either way, confirm before you walk away: `docker manifest inspect
    ghcr.io/hagaletechnologies/manta:latest` must either resolve to the
-   good image's digest (branch a) or fail with `manifest unknown`
-   (branch b). Anything else means `:latest` is still serving the bad
-   image.
+   good image's digest **with both `linux/amd64` and `linux/arm64` in its
+   manifest list** (branch a) or fail with `manifest unknown` (branch b).
+   Anything else — including a digest that resolves but lists only one
+   platform — means `:latest` is still not what README promises.
 
 Then re-tag once the underlying problem is fixed.
