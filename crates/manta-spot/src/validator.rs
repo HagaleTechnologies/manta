@@ -22,6 +22,16 @@ use std::collections::{BTreeMap, VecDeque};
 /// `dedupe.rs`).
 const WORD_WINDOW: usize = 16;
 
+/// A track reporting faster than this is treated as implausible for real
+/// hand-sent CW, not evaluated for a spot at all (see the call site in
+/// `evaluate_candidate` for the full real-hardware evidence). NOT a
+/// SPEC-defined value -- a validator-local heuristic, conservatively
+/// above every confirmed-real spot observed so far (42.8 WPM) and well
+/// below the speed tracker's own 60 WPM ceiling, chosen to catch the
+/// noise-artifact zone without risking a genuinely fast (if rare) real
+/// operator.
+const MAX_PLAUSIBLE_WPM: f32 = 45.0;
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -685,6 +695,26 @@ impl Validator {
             if !self.cty.is_allocated(&candidate) {
                 return None;
             }
+            // Real-hardware finding (2026-09-09, docs/DECISIONS): every
+            // overnight noise-floor false positive from a real RSP1B/40m
+            // session read implausibly fast -- avg 51.5 WPM, several
+            // pinned at the tracker's own 60 WPM ceiling (SPEC-decode-
+            // core.md's tracked range is 8..60 WPM) -- while every
+            // confirmed-real spot from the same session topped out at
+            // 42.8 WPM. A noise-triggered "mark" tends to be the shortest
+            // detectable duration, which the speed tracker reads as
+            // extremely fast keying; real hand-sent CW essentially never
+            // sustains above the mid-40s. Checked ahead of `gate.record`
+            // (below) so an implausible decode doesn't even count toward
+            // any future repetition tally for the same garbled text.
+            // Exempted for allowlisted calls, same boundary as grammar/cty
+            // above -- an operator-vouched-for real station's own timing
+            // quirks shouldn't be second-guessed here.
+            if let Some(track) = self.tracks.get(&track_id) {
+                if track.wpm > MAX_PLAUSIBLE_WPM {
+                    return None;
+                }
+            }
         }
 
         // A reclassification is the same decode re-typed, not a new one --
@@ -808,6 +838,68 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::De);
         assert_eq!(spots[0].track_id, 1);
+    }
+
+    /// Real-hardware finding (2026-09-09, docs/DECISIONS): every
+    /// overnight noise-floor false positive from a real RSP1B/40m session
+    /// read implausibly fast (avg 51.5 WPM); every confirmed-real spot
+    /// from the same session topped out at 42.8 WPM. An otherwise
+    /// perfectly valid, repeated, CTY-allocated callsign must still never
+    /// spot once its track's reported speed exceeds `MAX_PLAUSIBLE_WPM`.
+    #[test]
+    fn implausibly_fast_track_never_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(
+            spots.is_empty(),
+            "a track reporting 60 WPM must never spot, got {spots:?}"
+        );
+    }
+
+    /// Sanity check for the test above: the same callsign at a plausible
+    /// speed still spots normally -- proves the WPM gate isn't rejecting
+    /// everything indiscriminately.
+    #[test]
+    fn plausibly_fast_track_still_spots() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 30.0,
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    /// MAN-28: allowlisted calls bypass grammar/cty/repetition entirely --
+    /// the WPM plausibility gate follows the same exemption boundary, not
+    /// a stricter one.
+    #[test]
+    fn allowlisted_call_bypasses_the_wpm_gate_too() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        v.allowlist("K5ARH");
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert_eq!(
+            spots.len(),
+            1,
+            "an allowlisted callsign must spot on the first decode regardless of WPM"
+        );
     }
 
     #[test]
