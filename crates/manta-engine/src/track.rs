@@ -1156,7 +1156,6 @@ mod tests {
         assert_eq!(tm.tracks.len(), 1);
     }
 
-<<<<<<< HEAD
     /// MAN-122 review round 1, the exact failure the reviewer described: a
     /// steady unmodulated carrier promotes a real track and leases it a
     /// real decoder, but the demodulator never latches, so the decoder
@@ -1167,15 +1166,6 @@ mod tests {
     /// decoder is genuinely running; `decoding_track_count()` reports 1.
     #[test]
     fn decoding_track_count_sees_a_promoted_track_that_has_emitted_nothing() {
-=======
-    /// `step_hop` itself must return a `TrackPromoted` event at the exact
-    /// hop it promotes -- `manta_engine::doctor()`'s NoSignal check
-    /// (2026-09-09) depends on this being real, ground-truth signal, not
-    /// just an internal state-machine transition nothing outside
-    /// `TrackManager` ever observes.
-    #[test]
-    fn step_hop_emits_track_promoted_at_the_promotion_hop() {
->>>>>>> 89e39f897a2fca4641360c0f4ed9c42ad8f4cde8
         let mut tm = TrackManager::new(
             64,
             96_000.0,
@@ -1186,22 +1176,28 @@ mod tests {
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
-<<<<<<< HEAD
         let start = 250 * 15;
         let hops: Vec<HopOutput> = (start..start + 120)
             .map(|m| hop(m, power.clone()))
             .collect();
         let events = tm.process_hops(&hops, |m| m);
 
+        // `TrackPromoted` is a state-machine event `process_hops` emits for
+        // `doctor()`'s NoSignal check (2026-09-09 decision doc), NOT decoder
+        // output -- the point here is that the *decoder* produced nothing.
+        let decoded: Vec<&DecoderEvent> = events
+            .iter()
+            .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+            .collect();
         assert!(
-            events.is_empty(),
-            "an unmodulated carrier must not decode anything -- got {events:?}"
+            decoded.is_empty(),
+            "an unmodulated carrier must not decode anything -- got {decoded:?}"
         );
         assert_eq!(
             tm.decoding_track_count(),
             1,
             "the promoted track holds a leased decoder and must be counted \
-             even though it has emitted no event"
+             even though its decoder has emitted no event"
         );
         // The distinction this method exists for: `active_track_count()`
         // is a different question (every entry, CANDIDATEs included) and
@@ -1227,7 +1223,26 @@ mod tests {
             tm.decoding_track_count(),
             0,
             "a CANDIDATE has leased no decoder and nothing is decoding it"
-=======
+        );
+    }
+
+    /// `step_hop` itself must return a `TrackPromoted` event at the exact
+    /// hop it promotes -- `manta_engine::doctor()`'s NoSignal check
+    /// (2026-09-09) depends on this being real, ground-truth signal, not
+    /// just an internal state-machine transition nothing outside
+    /// `TrackManager` ever observes.
+    #[test]
+    fn step_hop_emits_track_promoted_at_the_promotion_hop() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         let mut saw_promotion = false;
         for m in (250 * 15)..(250 * 15 + 60) {
             let (_, promoted) = tm.step_hop(&hop(m, power.clone()), m);
@@ -1242,7 +1257,6 @@ mod tests {
         assert!(
             saw_promotion,
             "step_hop must return a TrackPromoted event at the hop it promotes a track"
->>>>>>> 89e39f897a2fca4641360c0f4ed9c42ad8f4cde8
         );
     }
 
