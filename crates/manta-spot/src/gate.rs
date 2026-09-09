@@ -10,14 +10,22 @@ const WINDOW_SECONDS: f64 = 90.0;
 
 pub struct RepetitionGate {
     window_samples: u64,
-    seen: BTreeMap<(u32, String), Vec<u64>>,
+    /// Keyed by a frequency bucket (not `track_id`, MAN-166): a real
+    /// signal's `track_id` changes every time its track closes and
+    /// reopens (e.g. `CloseReason::HangExpired`'s 5s silence timer), so
+    /// keying repetition memory by `track_id` defeated this gate's own
+    /// 90s window the instant a track churned, regardless of whether the
+    /// same callsign was still genuinely repeating. A frequency bucket
+    /// survives that churn; see `Validator`'s `freq_bucket` for how the
+    /// bucket is derived.
+    seen: BTreeMap<(i64, String), Vec<u64>>,
     /// Cumulative count of `record()` calls, for life. MAN-19 round 3:
     /// the only direct evidence that this gate's state was ever touched
     /// at all -- a soak whose decoding regressed to metadata-only output
     /// (TrackMeta/SpeedUpdate, no CharDecoded ever reaching a candidate
     /// word) could still open/close tracks and pass every other
     /// workload-activity check while never calling `record`, leaving
-    /// `forget_track`'s half of the leak fix completely unexercised.
+    /// `sweep`'s half of the leak fix completely unexercised.
     records_total: u64,
 }
 
@@ -30,14 +38,14 @@ impl RepetitionGate {
         }
     }
 
-    /// Records one decode of `callsign` on `track_id` at `sample_ts`.
+    /// Records one decode of `callsign` at `freq_bucket` at `sample_ts`.
     /// Returns the number of distinct decodes within the trailing window
     /// (including this one).
-    pub fn record(&mut self, track_id: u32, callsign: &str, sample_ts: u64) -> usize {
+    pub fn record(&mut self, freq_bucket: i64, callsign: &str, sample_ts: u64) -> usize {
         self.records_total += 1;
         let entry = self
             .seen
-            .entry((track_id, callsign.to_string()))
+            .entry((freq_bucket, callsign.to_string()))
             .or_default();
         entry.push(sample_ts);
         let cutoff = sample_ts.saturating_sub(self.window_samples);
@@ -50,23 +58,26 @@ impl RepetitionGate {
         self.records_total
     }
 
-    /// Drops every recorded decode for `track_id`. MAN-19: without this,
-    /// `seen`'s key space grows forever under sustained track churn --
-    /// `record`'s own `retain` only prunes an entry's *timestamps*, and
-    /// only when that same key is recorded again; a track that goes
-    /// silent for good leaves its now-stale key sitting in the map with
-    /// no further `record` call ever revisiting it to notice. Call once a
-    /// track closes (any `CloseReason` -- `DecoderEvent::TrackClosed`).
-    pub fn forget_track(&mut self, track_id: u32) {
-        let keys: Vec<(u32, String)> = self
-            .seen
-            .range((track_id, String::new())..)
-            .take_while(|(k, _)| k.0 == track_id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in keys {
-            self.seen.remove(&k);
-        }
+    /// Prunes every entry down to its timestamps within the trailing 90s
+    /// window as of `now_ts`, dropping any entry left empty. MAN-166:
+    /// this is the gate's *only* forgetting mechanism -- purely
+    /// time-based, matching the 90s window's own intent, rather than tied
+    /// to a track's ephemeral lifecycle (that was the MAN-19 fix's bug:
+    /// forgetting on every `TrackClosed` discarded genuinely-live
+    /// repetition memory the instant a real signal's track churned).
+    /// Still bounds memory the way MAN-19 needed: without a periodic
+    /// sweep, an entry whose bucket+callsign is never recorded again
+    /// would sit in `seen` forever, since `record`'s own `retain` only
+    /// prunes an entry's timestamps when that same key is recorded again.
+    /// Call periodically -- `Validator::ingest` calls this once per
+    /// `TrackClosed`, which fires often enough under real track churn to
+    /// keep `seen` bounded without needing a dedicated timer.
+    pub fn sweep(&mut self, now_ts: u64) {
+        let cutoff = now_ts.saturating_sub(self.window_samples);
+        self.seen.retain(|_, timestamps| {
+            timestamps.retain(|&ts| ts >= cutoff);
+            !timestamps.is_empty()
+        });
     }
 }
 
@@ -79,69 +90,86 @@ mod tests {
     #[test]
     fn first_decode_counts_as_one() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(1, "K5ARH", 0), 1);
+        assert_eq!(gate.record(70_800, "K5ARH", 0), 1);
     }
 
     #[test]
     fn second_decode_within_window_counts_as_two() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, "K5ARH", 0);
-        assert_eq!(gate.record(1, "K5ARH", 100_000), 2);
+        gate.record(70_800, "K5ARH", 0);
+        assert_eq!(gate.record(70_800, "K5ARH", 100_000), 2);
     }
 
     #[test]
     fn decode_outside_window_resets_the_count() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, "K5ARH", 0);
+        gate.record(70_800, "K5ARH", 0);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
-        assert_eq!(gate.record(1, "K5ARH", window_samples + 1), 1);
+        assert_eq!(gate.record(70_800, "K5ARH", window_samples + 1), 1);
     }
 
     #[test]
-    fn different_tracks_and_callsigns_are_independent() {
+    fn different_frequency_buckets_and_callsigns_are_independent() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, "K5ARH", 0);
-        assert_eq!(gate.record(2, "K5ARH", 0), 1);
-        assert_eq!(gate.record(1, "W1AW", 0), 1);
+        gate.record(70_800, "K5ARH", 0);
+        assert_eq!(gate.record(70_801, "K5ARH", 0), 1);
+        assert_eq!(gate.record(70_800, "W1AW", 0), 1);
     }
 
-    /// MAN-19: `forget_track` must remove every `(track_id, *)` key --
-    /// otherwise `seen` grows one entry per distinct (track_id, callsign)
-    /// pair ever recorded, forever, since `track_id`s are never reused and
-    /// nothing else ever revisits an abandoned key to prune it.
+    /// A real signal's track closing and reopening under a new `track_id`
+    /// (e.g. `CloseReason::HangExpired`) must not reset its repetition
+    /// count -- that's the whole point of keying by frequency bucket
+    /// instead of `track_id` (MAN-166). Two `record` calls for the same
+    /// bucket+callsign, with a `sweep` between them (as `Validator::ingest`
+    /// does on every `TrackClosed`), still accumulate to 2.
     #[test]
-    fn forget_track_removes_every_entry_for_that_track_only() {
+    fn sweep_between_two_records_does_not_reset_the_count() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(1, "K5ARH", 0);
-        gate.record(1, "W1AW", 0);
-        gate.record(2, "K5ARH", 0);
-        assert_eq!(gate.seen.len(), 3);
-
-        gate.forget_track(1);
-        assert_eq!(gate.seen.len(), 1, "only track 2's entry should remain");
-        assert!(gate.seen.contains_key(&(2, "K5ARH".to_string())));
-
-        // A track with no recorded decodes at all is a no-op, not an error.
-        gate.forget_track(99);
-        assert_eq!(gate.seen.len(), 1);
+        gate.record(70_800, "K5ARH", 0);
+        gate.sweep(0);
+        assert_eq!(gate.record(70_800, "K5ARH", 100_000), 2);
     }
 
-    /// MAN-19: reproduces the soak's actual failure mode -- many distinct,
-    /// never-reused track_ids each recording once and closing. Without
-    /// `forget_track` wired in (this test calls it explicitly, the way
-    /// `Validator::ingest`'s `TrackClosed` arm does in production), `seen`
-    /// would have 10,000 entries here instead of 0.
+    /// `sweep` prunes only entries whose timestamps have fully aged out of
+    /// the trailing 90s window as of `now_ts` -- a still-live entry must
+    /// survive.
     #[test]
-    fn sustained_track_churn_stays_bounded_when_each_track_is_forgotten_on_close() {
+    fn sweep_prunes_only_entries_older_than_the_window() {
         let mut gate = RepetitionGate::new(FS);
-        for track_id in 0..10_000u32 {
-            gate.record(track_id, "K5ARH", 0);
-            gate.forget_track(track_id);
+        gate.record(70_800, "K5ARH", 0); // will age out
+        gate.record(70_900, "W1AW", 0); // will still be live
+
+        let window_samples = (WINDOW_SECONDS * FS) as u64;
+        let now = window_samples + 1;
+        gate.record(70_900, "W1AW", now); // refreshes W1AW's timestamp
+        gate.sweep(now);
+
+        assert!(
+            !gate.seen.contains_key(&(70_800, "K5ARH".to_string())),
+            "K5ARH's only decode is older than the window and must be pruned"
+        );
+        assert!(
+            gate.seen.contains_key(&(70_900, "W1AW".to_string())),
+            "W1AW was just recorded at `now` and must survive"
+        );
+    }
+
+    /// MAN-19's original concern (unbounded growth under sustained track
+    /// churn) still holds with the new key: many distinct frequency
+    /// buckets, each recorded once and then aged out, must not accumulate
+    /// forever once swept.
+    #[test]
+    fn sustained_churn_stays_bounded_once_swept_past_the_window() {
+        let mut gate = RepetitionGate::new(FS);
+        let window_samples = (WINDOW_SECONDS * FS) as u64;
+        for bucket in 0..10_000i64 {
+            gate.record(bucket, "K5ARH", 0);
         }
+        gate.sweep(window_samples + 1);
         assert_eq!(
             gate.seen.len(),
             0,
-            "seen must not accumulate one entry per historical track_id"
+            "seen must not accumulate one entry per historical bucket once swept past the window"
         );
     }
 }
