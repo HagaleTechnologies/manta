@@ -1101,7 +1101,18 @@ fn main() -> Result<()> {
                 "v4" => manta_testkit::vectors::v4(),
                 "v5" => manta_testkit::vectors::v5(),
                 "v6" => manta_testkit::vectors::v6(),
-                other => bail!("unknown vector {other:?} (available: v1-v6)"),
+                "vr1" => manta_testkit::vectors::vr1(),
+                "vr2" => manta_testkit::vectors::vr2(),
+                "vr3" => manta_testkit::vectors::vr3(),
+                "vr4" => manta_testkit::vectors::vr4(),
+                "vr5" => manta_testkit::vectors::vr5(),
+                "vr6a" => manta_testkit::vectors::vr6a(),
+                "vr6b" => manta_testkit::vectors::vr6b(),
+                "vr7" => manta_testkit::vectors::vr7(),
+                "vr8" => manta_testkit::vectors::vr8(),
+                other => bail!(
+                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)"
+                ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
