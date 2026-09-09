@@ -89,9 +89,29 @@ impl HsmmDecoder {
     }
 
     /// The best live token's tracked speed (hops/dit), for `Evidence::set_u_ref`
-    /// and WPM reporting. `None` before the first anchor.
+    /// and WPM reporting. `None` before the first anchor -- and also, per
+    /// [Task 8 fix, review round 2], before *any* live token has processed
+    /// real evidence. `self.live` is reset to a completely fresh, unscored
+    /// seed set (`score == 0.0`, `hist` empty) on every keying re-onset
+    /// (`push`'s `present && !self.present` branch), and stays that way for
+    /// however many hops it takes before `d` (the gap between an anchor and
+    /// `ev.hop`) grows large enough for any seed's own duration prior to
+    /// validate a candidate. `self.live` is sorted best-first once it holds
+    /// real candidates, but immediately after a reseed it is *unsorted* raw
+    /// seeds -- `live.first()` would then just be whichever seed happened
+    /// to be pushed first (`cfg.seed_units_hops[0]`, 9.0 hops = 50 WPM),
+    /// with zero evidence behind it. Reported directly to `set_u_ref`/
+    /// `report_wpm` every such hop, this produced a spurious `SpeedUpdate`
+    /// at an implausible WPM on every real inter-word or inter-transmission
+    /// gap. Skipping any token that still looks exactly like a fresh seed
+    /// closes this: a real token's score is the sum of at least one
+    /// segment's evidence/duration/type-prior terms, which is practically
+    /// never exactly `0.0`.
     pub fn best_u(&self) -> Option<f32> {
-        self.live.first().map(|t| t.u)
+        self.live
+            .iter()
+            .find(|t| !(t.score == 0.0 && t.hist.is_empty()))
+            .map(|t| t.u)
     }
 
     fn seed(&mut self, hop: u64) -> Vec<Token> {
@@ -201,6 +221,19 @@ impl HsmmDecoder {
                 break;
             }
         }
+        // [Task 8 fix, review round 2] Bound `sealed`'s growth: nothing
+        // older than the oldest still-live anchor's `sample_ts` can ever be
+        // re-derived by `push`'s candidate loop above (that anchor is the
+        // earliest possible source `successor` could still transition
+        // from), so any `sealed` entry older than it can never be checked
+        // against again and is safe to drop. Without this, `sealed` grows
+        // by one entry per committed glyph/word-boundary for the life of
+        // the track, each compared per token per anchor hop on every
+        // future `commit::commit` call.
+        match self.anchors.front() {
+            Some(front) => self.sealed.retain(|&(ts, _)| ts >= front.sample_ts),
+            None => self.sealed.clear(),
+        }
         out
     }
 
@@ -248,5 +281,69 @@ impl HsmmDecoder {
         }
         self.live.clear();
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(hop: u64, present: bool, anchor: bool) -> HopEvidence {
+        HopEvidence {
+            hop,
+            sample_ts: hop * 256,
+            llr: if present { 10.0 } else { -10.0 },
+            present,
+            anchor,
+            prefix: if present { hop as f64 * 10.0 } else { 0.0 },
+            amp: if present { 1.0 } else { 0.01 },
+            mark_level: 1.0,
+            noise_level: 0.1,
+        }
+    }
+
+    #[test]
+    fn best_u_ignores_unscored_seeds() {
+        // [Task 8 fix, review round 2] Direct, deterministic regression
+        // test for the bug described in `best_u`'s doc comment: a reseed
+        // (`present` rising edge) resets `self.live` to raw, completely
+        // unscored seed tokens (`score == 0.0`, `hist` empty). Before this
+        // fix, `best_u()` still returned a speed from `live.first()` in
+        // this state -- always `cfg.seed_units_hops[0]` = 9.0 hops (50
+        // WPM) -- with zero evidence behind it. Constructing the
+        // `HopEvidence` directly (rather than driving this through the
+        // full `Evidence`/`NoiseTracker` pipeline, which is noisy during
+        // legitimate multi-seed convergence and would conflate this exact,
+        // deterministic bug with that unrelated transient behavior) lets
+        // this test target precisely the reseed moment.
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        assert_eq!(dec.best_u(), None, "no anchor yet");
+        // Rising edge with `anchor: false`: `push` seeds `self.live` and
+        // returns before running the anchor/candidate-generation step, so
+        // `self.live` is left as the raw, just-created seed set.
+        dec.push(&ev(100, true, false));
+        assert_eq!(
+            dec.best_u(),
+            None,
+            "must not report a speed from a freshly-seeded, zero-evidence token"
+        );
+    }
+
+    #[test]
+    fn best_u_reports_once_a_token_has_real_evidence() {
+        // Companion to `best_u_ignores_unscored_seeds`: once a seed has
+        // actually taken a segment transition (real evidence folded into
+        // its score), `best_u` must report it again -- the fix must not
+        // regress into permanently withholding a speed once one exists.
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        dec.push(&ev(100, true, false)); // reseed: raw seeds, best_u() == None
+                                         // A long, unbroken mark: dit_hops = 13 fits several seeds' Dit
+                                         // window (u=9 range [5.4,13.5], u=13 range [7.8,19.5]) and is an
+                                         // anchor step, so `push` runs candidate generation this time.
+        dec.push(&ev(113, true, true));
+        assert!(
+            dec.best_u().is_some(),
+            "a token with real, scored evidence must be reported"
+        );
     }
 }

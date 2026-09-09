@@ -88,23 +88,35 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
 /// instant (same `sample_ts`, `glyph: None` vs `Some(_)`, since a
 /// closing transition emits at most one of each) commit in its own
 /// right once evidence resolves it.
+///
+/// [Task 8 fix, review round 2]: the strip runs at the *top of every loop
+/// iteration*, not just once on entry. Committing one entry can reveal a
+/// new front entry on some token that a *different* token/anchor lineage
+/// already sealed independently in an earlier call (e.g. one surviving
+/// token holds `[X@ts1, Y@ts2, ...]` while the beam already committed a
+/// different glyph `X'` at `ts1` from a sibling token, sealing `(ts1,
+/// X')` -- this token's own, disagreeing `(ts1, X)` front entry must be
+/// silently dropped, not re-committed as a duplicate/contradictory event,
+/// once it becomes the front after some earlier removal in this same
+/// call). Re-checking every iteration catches that without needing a
+/// second, separately-maintained check.
 pub fn commit(
     tokens: &mut Vec<Token>,
     now_hop: u64,
     cfg: &HsmmConfig,
     sealed: &mut Vec<(u64, Option<Glyph>)>,
 ) -> Vec<Committed> {
-    for t in tokens.iter_mut() {
-        while t
-            .hist
-            .first()
-            .is_some_and(|e| sealed.contains(&(e.sample_ts, e.glyph)))
-        {
-            t.hist.remove(0);
-        }
-    }
     let mut out = Vec::new();
     loop {
+        for t in tokens.iter_mut() {
+            while t
+                .hist
+                .first()
+                .is_some_and(|e| sealed.contains(&(e.sample_ts, e.glyph)))
+            {
+                t.hist.remove(0);
+            }
+        }
         if tokens.is_empty() || tokens[0].hist.is_empty() {
             break;
         }
@@ -112,7 +124,12 @@ pub fn commit(
         let consensus = tokens
             .iter()
             .all(|t| t.hist.first().map(|e| e.glyph) == Some(head.glyph));
-        let forced = (now_hop - head.born_hop) as f32 > cfg.lookahead_dits * tokens[0].u;
+        // `saturating_sub`: `now_hop` is always >= any live token's
+        // `born_hop` (both derived from the same monotonic evidence hop
+        // counter), but make that invariant explicit rather than relying
+        // on it silently.
+        let forced =
+            now_hop.saturating_sub(head.born_hop) as f32 > cfg.lookahead_dits * tokens[0].u;
         if !consensus && !forced {
             break;
         }

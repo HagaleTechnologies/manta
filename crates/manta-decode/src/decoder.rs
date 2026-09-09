@@ -9,6 +9,7 @@ use crate::hsmm::{Committed, HsmmConfig, HsmmDecoder};
 use crate::noise::{NoiseConfig, NoiseTracker};
 use crate::timing::{GapClass, GapClassifier, SpeedTracker};
 use crate::HOP_MS;
+use std::collections::VecDeque;
 
 /// Decode engine selection (SPEC v2 §0): which timing/beam chain and which
 /// keying-decision front end feeds it. `Hsmm` is not reachable until Task 8.
@@ -98,11 +99,16 @@ pub struct TrackDecoder {
     /// `Legacy` engine keeps using `demod.snr_2500_db()` directly). Set by
     /// `snr_from_evidence`, read by `emit_char`'s `q` and by `tick_meta`.
     last_snr: Option<f32>,
-    /// [Task 8] Running peak of every `last_snr` this track has ever
-    /// measured while a mark was present; see `emit_committed`'s doc
-    /// comment for why `Hsmm`'s confidence scaling reads this instead of
-    /// `last_snr`.
-    best_snr: Option<f32>,
+    /// [Task 8 fix, review round 2] Ring buffer of `(hop, sample_ts, snr)`
+    /// recorded on every real-mark hop (see `snr_from_evidence`'s doc
+    /// comment) and pruned to a fixed worst-case retention window. Used by
+    /// `emit_committed` to look up the SNR nearest a commit's own
+    /// `sample_ts` -- the statistically correct answer to "what was the
+    /// channel like when this character was actually keyed" -- rather
+    /// than a single running value that either goes stale (the
+    /// pre-fix bug) or, if made a running peak instead, latches onto one
+    /// outlier reading for the rest of the track's life.
+    snr_history: VecDeque<(u64, u64, f32)>,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
 }
@@ -143,7 +149,7 @@ impl TrackDecoder {
             hop_count: 0,
             last_ts: 0,
             last_snr: None,
-            best_snr: None,
+            snr_history: VecDeque::new(),
             garble_count: 0,
         }
     }
@@ -227,15 +233,17 @@ impl TrackDecoder {
     /// Translate one `hsmm::Committed` entry into a `DecoderEvent`, applying
     /// the same SPEC §4.5 `q` confidence scaling `emit_char` uses.
     ///
-    /// [Task 8 fix] Reads `best_snr` (peak-hold), not `last_snr`
-    /// (instantaneous) -- see `snr_from_evidence`'s doc comment: a
-    /// commit's `sample_ts` can be far behind `self.last_ts` (SPEC v2
-    /// §4.8's partial traceback), so the *current* instantaneous SNR is
-    /// the wrong statistic for scaling confidence in a character that was
-    /// actually keyed earlier, often at a measurably better SNR.
+    /// [Task 8 fix, review round 2] Reads the `snr_history` ring buffer at
+    /// `c.sample_ts` (the instant the underlying marks were actually
+    /// keyed), not `self.last_snr` (the instant of this *commit*, which
+    /// can land many hops later under SPEC v2 §4.8's partial traceback --
+    /// see `snr_from_evidence`'s doc comment) and not a running peak
+    /// (rejected: a single outlier during a `present` hop would
+    /// permanently pin confidence scaling at a value the channel never
+    /// sustained, for the rest of the track's life).
     fn emit_committed(&mut self, c: Committed, events: &mut Vec<DecoderEvent>) {
         let q = self
-            .best_snr
+            .snr_near(c.sample_ts)
             .map(|s| (s / 20.0).clamp(0.3, 1.0))
             .unwrap_or(1.0);
         match c.glyph {
@@ -312,6 +320,16 @@ impl TrackDecoder {
     ///    window just isn't seeing a mark nearby), so an unconditionally
     ///    updated estimate reads deeply negative deep into a trailing
     ///    silence (observed: -26.9 dB by the time a final "U" committed).
+    ///    This also means `last_snr` stays `None` -- and `tick_meta`
+    ///    correspondingly emits no `TrackMeta` at all -- until the track's
+    ///    first real mark is observed, instead of firing immediately with
+    ///    a nonsensical negative-SNR reading against a still-silent
+    ///    channel; `TrackMeta` still arrives normally from that point on
+    ///    (never permanently suppressed, verified by
+    ///    `edge_legacy_track_meta_arrives_once_evidence_exists`), and its
+    ///    per-hop value keeps genuinely degrading/recovering with the
+    ///    channel exactly as before, unaffected by the `snr_history` fix
+    ///    below.
     /// 2. Even gated to real marks, `NoiseTracker`'s own `noise_window_ms`
     ///    (1500 ms, SPEC v2 §2's calibrated default) is far shorter than
     ///    this test's whole message: an early, fully-settled low sample
@@ -325,18 +343,43 @@ impl TrackDecoder {
     ///    ongoing-track noise tracking, not for holding a single
     ///    early-message best estimate for the rest of a long message.
     ///
-    /// `best_snr` (peak-hold across the whole track) fixes both for
-    /// `Hsmm`'s confidence scaling without touching `last_snr` itself --
-    /// `tick_meta`'s `TrackMeta` reporting (a genuine live-health signal)
-    /// keeps reading the instantaneous, correctly-degrading `last_snr`,
-    /// unchanged from Task 5.
+    /// `snr_history` (a small ring buffer of every reading taken while
+    /// `present`, looked up by `emit_committed` at each commit's own
+    /// `sample_ts`) fixes both for `Hsmm`'s confidence scaling without
+    /// touching `last_snr` itself -- `tick_meta`'s `TrackMeta` reporting
+    /// keeps reading the instantaneous `last_snr`, whose only behavior
+    /// change from Task 5 is finding 1 above (no reading, hence no
+    /// `TrackMeta`, before the first real mark).
     fn snr_from_evidence(&mut self, ev: &HopEvidence) {
         if !ev.present {
             return;
         }
         let snr = 20.0 * (ev.mark_level / ev.noise_level.max(1e-18)).log10() - SNR_BW_CORR_DB;
         self.last_snr = Some(snr);
-        self.best_snr = Some(self.best_snr.map_or(snr, |b| b.max(snr)));
+        self.snr_history.push_back((ev.hop, ev.sample_ts, snr));
+        // Bound retention to the largest window `HsmmDecoder`'s own anchors
+        // could ever use (SPEC v2 §4.6's `80 * u_max` hops), computed from
+        // the static config ceiling -- not the live, transiently-wrong
+        // tracked speed -- so this always covers every `sample_ts` a
+        // commit could still reference.
+        let prune_hops = (80.0 * self.cfg.hsmm.u_max).ceil() as u64;
+        while let Some(&(h, _, _)) = self.snr_history.front() {
+            if ev.hop - h > prune_hops {
+                self.snr_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// The `snr_history` reading nearest `sample_ts` (SPEC v2 §4.5's `q`
+    /// input for `Hsmm`, see `emit_committed`'s doc comment), or `None` if
+    /// no mark has ever been observed.
+    fn snr_near(&self, sample_ts: u64) -> Option<f32> {
+        self.snr_history
+            .iter()
+            .min_by_key(|&&(_, ts, _)| ts.abs_diff(sample_ts))
+            .map(|&(_, _, snr)| snr)
     }
 
     /// End of stream: flush the demod and any open character/word. SPEC §5.
@@ -690,6 +733,114 @@ mod tests {
     }
 
     #[test]
+    fn edge_legacy_flush_path_confidence_is_not_crushed_on_a_clean_scene() {
+        // [Task 8 fix, review round 2] `finish()`'s `EdgeLegacy` branch
+        // force-closes whatever mark/space `EdgeDemod` still has open via
+        // `self.edge.finish()`, then gap-classifies and commits it --
+        // closing "K" without any following real mark to naturally end its
+        // keying, exactly like `check_flush_edge`'s in-stream timeout path.
+        //
+        // [Verification note, round 2]: I could NOT reproduce the specific
+        // "~3.3x improvement from the `ev.present` gate alone" delta by
+        // direct A/B (gate present vs removed) comparison on this or any
+        // deep-keying scene I tried, and I want to be precise about why
+        // rather than just asserting the round-1 claim again. The keying
+        // gate is `present = mark_level >= 2*noise_level`; the instant
+        // `present` transitions to false is, by that same definition,
+        // exactly where the RAW ratio crosses 2.0 (6 dB) -- which, after
+        // the fixed 14.3 dB bandwidth correction, reports as ~-8.3 dB,
+        // already inside `q`'s `[0.3, 1.0]` clamp floor. Gated or not,
+        // `last_snr` is identical for every hop up to that transition
+        // (both read the same value while `present` is true); the only
+        // difference is what happens *after*, and since both an
+        // unconditionally-continuing decay and a gate-frozen ~-8.3 dB
+        // value clamp to the *same* `q = 0.3`, `EdgeLegacy`'s reported
+        // `CharDecoded` confidence comes out byte-for-byte identical with
+        // the gate removed, confirmed by direct comparison at every
+        // trailing-silence length I tried (11 through 600 extra hops past
+        // this scene's own marks). So for `EdgeLegacy` specifically, the
+        // gate's *observable* effect is confined to suppressing
+        // `TrackMeta` before the first mark (covered by the next test),
+        // not to confidence scaling -- the confidence-scaling fix
+        // (`snr_history`, item 6) only actually changes behavior for
+        // `Hsmm`, whose commits are delayed far enough to land well past
+        // a transition rather than right at one.
+        //
+        // What *is* true and worth pinning as a regression test: a clean,
+        // deep-keyed scene's flush-closed final character must not be
+        // crushed toward the 0.3 floor merely because it closed without a
+        // following mark. This holds as long as the trailing gap actually
+        // fed to the decoder stays comfortably short of the point where
+        // the keying gate's own windowed peak-hold (SPEC v2 §1.2) decays
+        // past its 6 dB threshold (empirically, a handful of dits here);
+        // once it doesn't, `q`'s floor legitimately applies regardless of
+        // this fix, which is expected, not a defect.
+        let lo = 10f32.powf(-45.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        // Truncate rect_envelope_depth's own 8-dit synthetic tail down to a
+        // short 4-dit trailing gap -- enough for `finish()` to force-close
+        // "K" without a following mark, comfortably short of the keying
+        // gate's own decay window.
+        let full = rect_envelope_depth("CQ K", 11, 45.0);
+        env.extend(&full[..full.len() - 8 * 11 + 4 * 11]);
+        let cfg = DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let conf = events
+            .iter()
+            .find_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    glyph: crate::tree::Glyph::Char('K'),
+                    confidence,
+                    ..
+                } => Some(*confidence),
+                _ => None,
+            })
+            .expect("K should have decoded, flushed by finish() without a following mark");
+        assert!(
+            conf > 0.9,
+            "flush-path confidence should reflect the clean keying, not be \
+             crushed toward the 0.3 floor: {conf}"
+        );
+    }
+
+    #[test]
+    fn edge_legacy_track_meta_arrives_once_evidence_exists() {
+        // [Task 8 fix, review round 2] `snr_from_evidence`'s `ev.present`
+        // gate means `last_snr` (hence `TrackMeta`) doesn't fire while a
+        // track has never seen a mark (previously it fired immediately with
+        // a nonsensical negative-SNR reading against pure silence); confirm
+        // this isn't a permanent suppression -- it must still arrive once
+        // real keying is observed.
+        let lo = 10f32.powf(-45.0 / 20.0);
+        let mut env: Vec<f32> = vec![lo; 4];
+        env.extend(rect_envelope_depth("CQ TEST W5AU W5AU TEST", 11, 45.0));
+        let cfg = DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. })),
+            "TrackMeta must eventually arrive once real keying occurs: {events:?}"
+        );
+    }
+
+    #[test]
     fn legacy_engine_is_untouched() {
         let env = rect_envelope("CQ CQ DE W1AW", 18);
         assert_eq!(decode_with(Engine::Legacy, &env), "CQ CQ DE W1AW");
@@ -864,15 +1015,28 @@ mod tests {
         };
         let mut dec = TrackDecoder::new(1, cfg);
         let mut first_char_hop = None;
+        let mut char_decoded_count = 0u32;
         for (i, &a) in env.iter().enumerate() {
             for e in dec.push_envelope(a, i as u64 * 256) {
-                if matches!(e, DecoderEvent::CharDecoded { .. }) && first_char_hop.is_none() {
-                    first_char_hop = Some(i);
+                if matches!(e, DecoderEvent::CharDecoded { .. }) {
+                    char_decoded_count += 1;
+                    if first_char_hop.is_none() {
+                        first_char_hop = Some(i);
+                    }
                 }
             }
         }
         let h = first_char_hop.expect("E was never committed");
         assert!(h < 13 + 13 * 25 + 60, "committed at hop {h}");
+        // [Task 8 fix, review round 2] Bug 2's stale-anchor re-derivation
+        // duplicated this exact commit six-fold before the `(sample_ts,
+        // glyph)` seal fix -- this test originally only checked the FIRST
+        // commit hop, so that regression would have sailed straight past
+        // it. Pin the count too.
+        assert_eq!(
+            char_decoded_count, 1,
+            "E must be committed exactly once, not duplicated by a stale anchor"
+        );
     }
 
     #[test]
@@ -924,6 +1088,118 @@ mod tests {
             confs.iter().sum::<f32>() / confs.len() as f32 > 0.6,
             "clean text should be confident: {confs:?}"
         );
+    }
+
+    #[test]
+    fn hsmm_no_spurious_speed_update_on_reseed() {
+        // [Task 8 fix, review round 2] `HsmmDecoder::push` resets `self.live`
+        // to a completely fresh, unscored seed set on every keying re-onset
+        // (present rising edge). Before the `best_u` fix, `push_hop_hsmm`'s
+        // `if let Some(u) = self.hsmm.best_u()` read `live.first()` on
+        // literally every such hop -- including however many hops it takes
+        // before any seed has processed real evidence -- returning
+        // `cfg.seed_units_hops[0]` (9.0 hops), i.e. EXACTLY 450.0/9.0 = 50.0
+        // WPM (an exact float division of two exact constants, so this is a
+        // precise, reproducible signature: `self.live.first()` right after
+        // a reseed is always the FIRST seed in definition order, never a
+        // different one, until candidate generation actually runs). This
+        // scene has TWO words ("E" and "E"), so the second word's mark
+        // onset re-triggers the reseed path after a real, multi-dit
+        // inter-word gap.
+        //
+        // [Verification note] `hsmm::tests::best_u_ignores_unscored_seeds`
+        // is the precise, deterministic regression test for the underlying
+        // mechanism (constructing the exact reseed state directly). This
+        // E2E test intentionally does NOT additionally assert a tight WPM
+        // band across every `SpeedUpdate`: I verified by hand that even
+        // with this fix, several seeds legitimately produce transient,
+        // widely-varying `SpeedUpdate`s while multiple speed hypotheses
+        // compete during a cold start (e.g. `HsmmDecoder::best_u`'s
+        // `hsmm_speed_converges_from_seeds` sibling test already only
+        // checks the LAST `SpeedUpdate` for exactly this reason) --
+        // including some that legitimately land exactly on another seed's
+        // own raw WPM (e.g. 25.0 = 450/18) via a non-speed-updating segment
+        // (SPEC v2 §4.3: `WGap`/`Silence` don't call `speed_alpha`), which
+        // is a real, scored token, not the zero-evidence bug. Asserting a
+        // blanket plausible-WPM range would either be too loose to catch
+        // anything or too strict and flag that legitimate noise; asserting
+        // "never exactly 50.0" is the one check that is both precise to
+        // this specific, fixed bug and free of that false-positive risk.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(rect_envelope_depth("E E", 13, 40.0));
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        for e in &events {
+            if let DecoderEvent::SpeedUpdate { wpm, .. } = e {
+                assert!(
+                    (wpm - 50.0).abs() > 1e-3,
+                    "SpeedUpdate reports exactly the raw, zero-evidence seed's WPM \
+                     (450/9.0 = 50.0) -- unscored-seed reseed artifact: {events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hsmm_alternatives_populated_on_beam_disagreement() {
+        // [Task 8 fix, review round 2] `hsmm_confidence_and_alternatives_are_populated`
+        // only ever exercises a clean 40 dB scene where the beam always
+        // agrees, so `commit::margin`'s alternative-extraction/dedup/
+        // ordering/`.take(2)` logic (SPEC v2 §4.9, the actual point of this
+        // task) had zero coverage. This scene hand-crafts one 20-hop mark:
+        // with the default seed set `[9, 13, 18, 26, 38]` hops, a 20-hop
+        // mark is simultaneously a valid Dah for the u=9 seed (range
+        // [16.2, 40.5]) and a valid Dit for the u=18/26 seeds (ranges
+        // [10.8, 27] / [15.6, 39]) -- genuine, simultaneous disagreement
+        // over the element itself (not just speed), each side surviving
+        // merge under a different node/rounded-u key, so the eventual
+        // commit for this character must carry the losing interpretation(s)
+        // as `alternatives`.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(std::iter::repeat_n(1.0, 20)); // the ambiguous mark
+        env.extend(std::iter::repeat_n(lo, 800)); // long trailing silence forces a decision
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let alt_lists: Vec<&Vec<(crate::tree::Glyph, f32)>> = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { alternatives, .. } => Some(alternatives),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !alt_lists.is_empty(),
+            "expected at least one CharDecoded event: {events:?}"
+        );
+        assert!(
+            alt_lists.iter().any(|a| !a.is_empty()),
+            "expected genuine beam disagreement to populate at least one \
+             CharDecoded's alternatives: {events:?}"
+        );
+        for a in &alt_lists {
+            assert!(
+                a.len() <= 2,
+                "alternatives must carry at most 2 entries: {a:?}"
+            );
+        }
     }
 
     #[test]
