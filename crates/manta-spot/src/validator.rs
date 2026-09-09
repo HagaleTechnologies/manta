@@ -319,8 +319,18 @@ impl Validator {
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
-                self.tracks.entry(*track_id).or_default().wpm = *wpm;
-                Vec::new()
+                let track = self.tracks.entry(*track_id).or_default();
+                track.wpm = *wpm;
+                let sample_ts = track.last_sample_ts;
+                // Retry: a Beacon-type candidate held back by
+                // `evaluate_candidate`'s WPM-plausibility check (an
+                // early, transiently-inflated speed estimate) is
+                // otherwise only re-evaluated by a later WordBoundary,
+                // which a short beacon transmission may never produce
+                // again -- silently losing it once the estimate settles
+                // (Codex review on PR #154, round 2). Mirrors the
+                // existing TrackMeta retry above (MAN-28 round 9).
+                self.try_spot(*track_id, sample_ts)
             }
             DecoderEvent::TrackMeta {
                 track_id,
@@ -615,6 +625,44 @@ impl Validator {
                 track.wpm,
             )
         };
+
+        // Real-hardware finding (2026-09-09, docs/DECISIONS): every
+        // overnight noise-floor false positive from a real RSP1B/40m
+        // session read implausibly fast -- avg 51.5 WPM, several pinned
+        // at the tracker's own 60 WPM ceiling (SPEC-decode-core.md's
+        // tracked range is 8..60 WPM) -- and every one of them reached a
+        // spot via the `SpotType::Beacon` repetition-gate exemption
+        // (ARCHITECTURE Sec6.4): that's the only path where a single
+        // low-evidence decode can reach public output with no
+        // independent second confirmation. Scoped to that path only --
+        // Codex review on PR #154 found an earlier, unscoped version of
+        // this check rejected legitimate fast (45+ WPM) contest/
+        // computer-keyed CW reaching a spot through the ordinary
+        // two-repetition-confirmed path, which the decoder's own
+        // 8..60 WPM tracked range explicitly supports and which needs no
+        // extra scrutiny here. Real NCDXF/IARU beacons ID at a fixed
+        // ~20-22 WPM, well under this threshold. Exempted for allowlisted
+        // calls, same boundary as grammar/cty below.
+        //
+        // Checked here, BEFORE the word.attempted bookkeeping below --
+        // round 2 of the same review found that rejecting after marking
+        // `attempted` permanently loses a real beacon whose early speed
+        // estimate is transiently inflated past the ceiling: `SpeedUpdate`
+        // only stores the new value (see `ingest`) and a later
+        // `WordBoundary` would find `word.attempted` already set with a
+        // matching `last_spot_type`, short-circuiting before this check
+        // ever runs again. Returning before any mutation leaves the word
+        // eligible for `try_spot`'s retry -- `ingest`'s `SpeedUpdate` arm
+        // now calls it, mirroring the existing `TrackMeta` retry pattern
+        // (MAN-28 round 9) for the same reason: a short track may never
+        // produce another `WordBoundary` to retry on naturally.
+        if !self.allowlist.contains(&candidate)
+            && spot_type == SpotType::Beacon
+            && wpm > MAX_PLAUSIBLE_WPM
+        {
+            return None;
+        }
+
         let (char_confidences, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             // Named patterns resolve by text, always to the NEWEST word
@@ -695,33 +743,9 @@ impl Validator {
             if !self.cty.is_allocated(&candidate) {
                 return None;
             }
-            // Real-hardware finding (2026-09-09, docs/DECISIONS): every
-            // overnight noise-floor false positive from a real RSP1B/40m
-            // session read implausibly fast -- avg 51.5 WPM, several
-            // pinned at the tracker's own 60 WPM ceiling (SPEC-decode-
-            // core.md's tracked range is 8..60 WPM) -- and every one of
-            // them reached a spot via the `SpotType::Beacon` repetition-
-            // gate exemption (ARCHITECTURE §6.4): that's the only path
-            // where a single low-evidence decode can reach public output
-            // with no independent second confirmation. Scoped to that
-            // path only -- Codex review on PR #154 found an earlier,
-            // unscoped version of this check rejected legitimate fast
-            // (45+ WPM) contest/computer-keyed CW reaching a spot through
-            // the ordinary two-repetition-confirmed path, which the
-            // decoder's own 8..60 WPM tracked range explicitly supports
-            // and which needs no extra scrutiny here: two independent
-            // confirmations of the same text is already much stronger
-            // evidence than anything this heuristic adds. Real NCDXF/IARU
-            // beacons ID at a fixed ~20-22 WPM, well under this threshold.
-            // Exempted for allowlisted calls, same boundary as grammar/cty
-            // above.
-            if spot_type == SpotType::Beacon {
-                if let Some(track) = self.tracks.get(&track_id) {
-                    if track.wpm > MAX_PLAUSIBLE_WPM {
-                        return None;
-                    }
-                }
-            }
+            // The Beacon-WPM plausibility check runs earlier in this
+            // function, before the word.attempted bookkeeping above --
+            // see the comment there.
         }
 
         // A reclassification is the same decode re-typed, not a new one --
@@ -872,6 +896,38 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             spots.is_empty(),
             "a Beacon-type track reporting 60 WPM must never spot, got {spots:?}"
         );
+    }
+
+    /// Codex review on PR #154, round 2: a Beacon candidate held back by
+    /// an early, transiently-inflated WPM estimate must still spot once
+    /// `SpeedUpdate` corrects it -- even with no further `WordBoundary`
+    /// (the short-track case the reviewer specifically flagged).
+    #[test]
+    fn beacon_held_back_by_wpm_spots_once_speed_update_settles() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "should be held back at 60 WPM, got {spots:?}"
+        );
+
+        let spots = v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        assert_eq!(
+            spots.len(),
+            1,
+            "settling to a plausible WPM must retry and spot the held-back beacon"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
     /// A non-Beacon (De-type) candidate at an implausible 60 WPM still
