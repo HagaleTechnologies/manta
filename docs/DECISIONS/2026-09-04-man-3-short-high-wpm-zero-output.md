@@ -173,8 +173,12 @@ Two things, together, are the mechanism:
 
 **Fix:** `merge_converged`'s comparison changed from `<=` to strict `<`
 (`crates/manta-engine/src/track.rs`, one operator), with the exact tie then
-ranked by `merge_keep_rank` -- `(promoted, has_emitted)`, higher survives --
-before falling back to the lower id. The rank matters because ids are *spawn*
+ranked by `merge_keep_rank` -- `(promoted, decoder_hops)`, higher survives --
+before falling back to the lower id. (As shipped in this part the rank's
+second component was `has_emitted`; round-6 review replaced it with the
+hop-counted `decoder_hops` for chunk-invariance and decoder-age
+resolution -- see "Round-6 review refinements" §1 below, which is the
+current normative rule, and SPEC §2.5.) The rank matters because ids are *spawn*
 order, not promotion order: a slowly-confirming low-id CANDIDATE must not
 evict a higher-id ACTIVE track that already holds decoder history, since that
 CANDIDATE may then simply expire `Unconfirmed` and recreate this ticket's
