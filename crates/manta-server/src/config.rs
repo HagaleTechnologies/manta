@@ -47,6 +47,12 @@ fn is_valid_ssid(ssid: &str) -> bool {
         && !ssid.starts_with('0')
 }
 
+/// The shortest thing that can be a callsign: an ITU call is at minimum a
+/// one-character prefix, a digit and a one-character suffix (`W1A`). Applied
+/// to the `/`-delimited segment that must be the call itself, not only to the
+/// slash-composed base -- see `check_operator_callsign`.
+const MIN_CALLSIGN_LEN: usize = 3;
+
 /// Validates an operator-supplied station identity -- `[server].station_callsign`
 /// and MAN-32's `login_callsign`. Shared by both so the rule, and the
 /// line-injection concern it guards against (see
@@ -85,10 +91,11 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
             "{call:?} is not a plausible callsign (an SSID must be -1 through -99)"
         ));
     }
-    // Base length: 3 (shortest real base) to 20 (a prefix/base/suffix triple
-    // with room to spare) -- an outer bound on what gets interpolated into
-    // every output line, not a claim about callsign structure.
-    if base.len() < 3 || base.len() > 20 {
+    // Base length: `MIN_CALLSIGN_LEN` (the call itself cannot be shorter, so
+    // neither can the base that contains it) to 20 (a prefix/base/suffix
+    // triple with room to spare) -- an outer bound on what gets interpolated
+    // into every output line, not a claim about callsign structure.
+    if base.len() < MIN_CALLSIGN_LEN || base.len() > 20 {
         return Err(format!("{call:?} is not a plausible callsign (length)"));
     }
     if !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
@@ -111,12 +118,21 @@ fn check_operator_callsign(call: &str) -> Result<(), String> {
     // JSON spot. Requiring only that ONE segment satisfy it keeps prefix
     // (`JW/`) and portable/beacon suffix (`/P`, `/B`) segments -- which
     // legitimately carry letters or digits alone -- accepted.
+    // That segment must also be long enough to BE a callsign (PR #131 review,
+    // round 3). Length applied only to the slash-composed base lets `A1/B`,
+    // `W1/P` and `W1/P-1` through: the base clears `MIN_CALLSIGN_LEN` while a
+    // two-character segment supplies the letter and the digit, so no segment
+    // is a complete call and the typo becomes the station identity on every
+    // telnet and JSON spot.
     if !segments.iter().any(|s| {
-        s.chars().any(|c| c.is_ascii_digit()) && s.chars().any(|c| c.is_ascii_alphabetic())
+        s.len() >= MIN_CALLSIGN_LEN
+            && s.chars().any(|c| c.is_ascii_digit())
+            && s.chars().any(|c| c.is_ascii_alphabetic())
     }) {
         return Err(format!(
-            "{call:?} is not a plausible callsign \
-             (one segment must be a callsign: at least one letter and one digit)"
+            "{call:?} is not a plausible callsign (one segment must be a complete \
+             callsign: at least {MIN_CALLSIGN_LEN} characters, with at least one \
+             letter and one digit)"
         ));
     }
     Ok(())
@@ -444,6 +460,7 @@ mod tests {
             "K5ARH/P",
             "VP2E/K5ARH/M", // prefix AND suffix
             "3DA0RS",       // digit-leading prefix
+            "W1A/P",        // the shortest real call, MIN_CALLSIGN_LEN exactly
             "w3xyz",        // lowercase accepted ...
         ] {
             let cfg: ServerConfig = toml::from_str(&format!(r#"station_callsign = {good:?}"#))
@@ -493,6 +510,13 @@ mod tests {
             "ABC/123",
             "A/1/B",
             "ABC/123-1",
+            // PR #131 review round 3: the qualifying segment must itself be a
+            // complete callsign -- a two-character segment carrying the letter
+            // and the digit is a typo, not a call, however long the base is.
+            "A1/B",
+            "W1/P",
+            "W1/P-1",
+            "AB/1C",
         ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));

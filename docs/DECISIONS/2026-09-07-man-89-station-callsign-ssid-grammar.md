@@ -76,6 +76,13 @@ technical notes asked to fix together.
    stay accepted. This is still a strict superset of `grammar::is_plausible`, which requires the
    *first* segment to carry both.
 
+   The qualifying segment must ALSO be at least `MIN_CALLSIGN_LEN` (3) characters -- the minimum
+   ITU call structure of prefix + digit + suffix (`W1A`) -- not only the slash-composed base (PR
+   #131 review, round 3). Applying the length bound to the base alone accepted `A1/B`, `W1/P` and
+   `W1/P-1`: the base clears 3 characters while a two-character segment supplies the letter and
+   the digit, so no segment is a complete call and the operator's typo becomes the station
+   identity on every telnet and JSON spot.
+
 ## Non-goals
 
 - Auto-generating the `N` band index. `manta-cli` still hardcodes a single DDC; a real per-band
