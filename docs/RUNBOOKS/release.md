@@ -74,10 +74,26 @@ the five-target `build` matrix, `docker-publish`, and `release`).
 
 ## Watch the run
 
+Resolve the run by **the commit your tag points at** and the `push` event —
+not by global recency. `--limit 1` alone returns the newest run of the
+workflow, which is somebody else's run if a second tag push or a
+`workflow_dispatch` publish started around the same time, and every later
+step in this runbook (including the recovery block under "After") reuses
+this run id:
+
 ```sh
-gh run list --workflow release-publish.yml --limit 1
-gh run watch "$(gh run list --workflow release-publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+TAG=v0.1.0
+TAG_SHA="$(git rev-list -n 1 "$TAG")"   # annotated tag -> the commit it points at
+RUN_ID="$(gh run list --workflow release-publish.yml --event push \
+            --commit "$TAG_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')"
+echo "watching run $RUN_ID"
+gh run watch "$RUN_ID"
 ```
+
+`--commit` and `--event` are both `gh run list` filters (`gh run list
+--help`). If the tag has been deleted and re-pushed against the *same*
+commit, this matches the old run as well — `--limit 1` takes the newest,
+which is the one you just started.
 
 Expected shape and rough durations:
 
@@ -150,19 +166,48 @@ Finally, confirm `README.md`'s release badge
   release blocker** — close out the release even if this step hasn't
   happened yet, and leave MAN-66 open until it has.
 - If `docker-publish` failed while `release` still published (the behavior
-  this pipeline is deliberately configured to allow), re-run **only** that
-  job rather than re-tagging. `--job` wants the job's **`databaseId`**, not
-  the job number in the Actions URL — `gh run rerun --help` warns that the
-  URL's number returns `404 NOT FOUND` — so look the id up first:
+  this pipeline is deliberately configured to allow), fix GHCR without
+  re-tagging. Do **not** delete and re-push the tag for a GHCR-only failure
+  — the GitHub Release binaries are the deliverable that matters.
+
+  Two ways, and the cheap-looking one isn't:
+
+  **a. Re-run the job in CI — but this is not a job-only retry.** `gh run
+  rerun --job` reruns that job *"including dependencies"* (`gh run rerun
+  --help`), and `release-publish.yml` declares `docker-publish` as
+  `needs: [verify-version, build]`. So every GHCR retry this way also
+  repeats `verify-version` **and the whole five-leg `build` matrix** — the
+  full 10–25 minute release build, not a targeted 10–20 minute Docker leg.
+  Budget for that before you reach for it. `--job` also wants the job's
+  **`databaseId`**, not the job number in the Actions URL — `gh run rerun
+  --help` warns that the URL's number returns `404 NOT FOUND` — so look the
+  id up first, resolving the run by the tagged commit (same lookup as
+  "Watch the run", never `--limit 1` on its own):
 
   ```sh
-  RUN_ID="$(gh run list --workflow release-publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+  TAG=v0.1.0
+  TAG_SHA="$(git rev-list -n 1 "$TAG")"
+  RUN_ID="$(gh run list --workflow release-publish.yml --event push \
+              --commit "$TAG_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')"
   gh run view "$RUN_ID" --json jobs --jq '.jobs[] | {name, databaseId}'
   gh run rerun --job <the docker-publish databaseId from the line above>
   ```
 
-  Do not delete and re-push the tag for a GHCR-only failure — the GitHub
-  Release binaries are the deliverable that matters.
+  **b. Push the image by hand.** Usually faster, and it touches nothing but
+  GHCR. From any machine with Docker and a `write:packages` token, at the
+  tagged commit:
+
+  ```sh
+  IMAGE=ghcr.io/hagaletechnologies/manta
+  echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
+  docker buildx build --platform linux/amd64,linux/arm64 \
+    -t "$IMAGE:0.1.0" -t "$IMAGE:latest" --push .
+  ```
+
+  A `workflow_dispatch` publish is **not** a third option: that path tags
+  the image `dispatch-<run_id>` and never `:latest` (see `docker-publish`'s
+  "Determine version, image, and tag list" step), so it cannot repair
+  `:0.1.0` or `:latest`.
 
 ## If the release is wrong
 
