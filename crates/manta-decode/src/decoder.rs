@@ -1040,6 +1040,46 @@ mod tests {
     }
 
     #[test]
+    fn hsmm_does_not_duplicate_commits_across_anchor_eviction() {
+        use crate::tree::Glyph;
+        // [Task 8 fix, review round 4] "K" at 13 hops/dit, then ~120 dits
+        // of silence: long enough for the anchor that stamped K's hist
+        // entry to age out of `reach_sil` while a newer, still-live
+        // anchor's frozen token carries the inherited entry -- the exact
+        // window round 3's `min_hist_ts`-only prune bound could
+        // (non-structurally) fail to cover.
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(rect_envelope_depth("K", 13, 40.0));
+        env.extend(std::iter::repeat_n(0.01f32, 13 * 120));
+        let cfg = DecodeConfig {
+            engine: Engine::Hsmm,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut seen: Vec<(u64, Glyph)> = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            for e in dec.push_envelope(a, i as u64 * 256) {
+                if let DecoderEvent::CharDecoded {
+                    sample_ts, glyph, ..
+                } = e
+                {
+                    assert!(
+                        !seen.contains(&(sample_ts, glyph)),
+                        "duplicate commit {glyph:?}@{sample_ts} (seen {} so far)",
+                        seen.len()
+                    );
+                    seen.push((sample_ts, glyph));
+                }
+            }
+        }
+        assert!(
+            seen.iter().any(|(_, g)| *g == Glyph::Char('K')),
+            "K never decoded: {seen:?}"
+        );
+    }
+
+    #[test]
     fn hsmm_is_bit_deterministic() {
         let env = rect_envelope_depth("CQ TEST W5AU", 13, 40.0);
         let run = || {

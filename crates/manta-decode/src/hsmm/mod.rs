@@ -241,26 +241,31 @@ impl HsmmDecoder {
                 break;
             }
         }
-        // [Task 8 fix, review round 3] Bound `sealed`'s growth: the safe
-        // prune bound is the minimum `sample_ts` over EVERY hist entry of
-        // EVERY token in EVERY currently-live anchor -- not that anchor's
-        // own `sample_ts` (round 2's bug). `Token::successor` clones an
+        // [Task 8 fix, review round 4] Bound `sealed`'s growth: the safe
+        // prune bound is the minimum `sample_ts` over BOTH (a) every hist
+        // entry of every token in every currently-live anchor (round 3's
+        // `min_hist_ts`, needed because `Token::successor` clones an
         // ancestor's whole `hist` and only stamps the *new* entry with the
-        // current anchor's own timestamp; an inherited older entry keeps
-        // whatever timestamp it was originally stamped with, from a
-        // possibly-since-evicted ancestor anchor. So a still-live anchor's
-        // frozen tokens can carry a `hist` entry older than that anchor's
-        // OWN `sample_ts` (and older than the oldest anchor's own
-        // `sample_ts`, if that anchor is a newer one that inherited an old
-        // entry) -- pruning `sealed` by anchor timestamp alone could drop
-        // an entry a still-live anchor can still regenerate, reopening
-        // exactly the duplicate-commit failure this list exists to
-        // prevent. `Anchor::min_hist_ts` is computed once at anchor
-        // creation (O(1) amortized here: this is just a min-of-mins over
-        // already-live anchors, not a fresh per-token/per-hist rescan).
-        match self.anchors.iter().filter_map(|a| a.min_hist_ts).min() {
-            Some(bound) => self.sealed.retain(|&(ts, _)| ts >= bound),
-            None => self.sealed.clear(),
+        // current anchor's own timestamp, so an inherited older entry can
+        // outlive the ancestor anchor that originally produced it) AND (b)
+        // every live anchor's own `sample_ts` (round 3 missed this half:
+        // `successor` can also stamp a *brand new* hist entry at a live
+        // anchor's own `sample_ts` via `seg_start_ts = a.sample_ts` --  a
+        // value that isn't in anyone's `hist` yet, so no `min_hist_ts`
+        // reflects it; worse, an anchor whose tokens' hist was just fully
+        // drained by a commit reports `min_hist_ts == None`, and round 3's
+        // `None -> clear()` fallback would discard every real seal once
+        // every live anchor was in that state). `anchors` is FIFO by hop
+        // and `sample_ts` is monotone in hop, so `front.sample_ts` is
+        // exactly the min over every live anchor's own timestamp -- no
+        // need to scan all anchors for that half.
+        let hist_bound = self.anchors.iter().filter_map(|a| a.min_hist_ts).min();
+        let front_ts = self.anchors.front().map(|a| a.sample_ts);
+        match (hist_bound, front_ts) {
+            (Some(h), Some(f)) => self.sealed.retain(|&(ts, _)| ts >= h.min(f)),
+            (Some(h), None) => self.sealed.retain(|&(ts, _)| ts >= h),
+            (None, Some(f)) => self.sealed.retain(|&(ts, _)| ts >= f),
+            (None, None) => self.sealed.clear(),
         }
         out
     }
