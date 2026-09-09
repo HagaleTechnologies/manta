@@ -54,12 +54,21 @@ enum Command {
         /// range per line (MAN-31).
         #[arg(long)]
         notch: Option<PathBuf>,
+        /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
+        /// given, its values are the baseline; an explicit --engine overrides
+        /// just the `engine` key (merge_cli_engine).
+        #[arg(long)]
+        server_config: Option<PathBuf>,
         /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
         /// `hsmm` (fully implemented and reviewed since Task 8; still
         /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
-        /// 11-12 measure it).
-        #[arg(long, default_value = "legacy", value_parser = parse_engine)]
-        engine: Engine,
+        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
+        /// an explicit flag can be told apart from an absent one: when
+        /// --server-config's `[decode]` table also sets `engine`, this flag
+        /// takes precedence over it when given, and the file's value is the
+        /// baseline otherwise (SPEC v2 §7).
+        #[arg(long, value_parser = parse_engine)]
+        engine: Option<Engine>,
     },
     /// Real-signal decode oracle: decode each RBN-spotted station's channel
     /// directly (tracker bypassed) and report callsign recovery (SPEC v2 §8.3).
@@ -73,8 +82,21 @@ enum Command {
         spotter: String,
         #[arg(long, default_value_t = 40.0)]
         window_s: f64,
-        #[arg(long, default_value = "legacy", value_parser = parse_engine)]
-        engine: Engine,
+        /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
+        /// given, its values are the baseline; an explicit --engine overrides
+        /// just the `engine` key (merge_cli_engine).
+        #[arg(long)]
+        server_config: Option<PathBuf>,
+        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
+        /// `hsmm` (fully implemented and reviewed since Task 8; still
+        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
+        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
+        /// an explicit flag can be told apart from an absent one: when
+        /// --server-config's `[decode]` table also sets `engine`, this flag
+        /// takes precedence over it when given, and the file's value is the
+        /// baseline otherwise (SPEC v2 §7).
+        #[arg(long, value_parser = parse_engine)]
+        engine: Option<Engine>,
         /// Write per-spot results as JSON Lines here (summary always goes to stdout).
         #[arg(long)]
         jsonl: Option<PathBuf>,
@@ -1026,10 +1048,19 @@ fn main() -> Result<()> {
             allowlist,
             blocklist,
             notch,
+            server_config,
             engine,
         } => {
-            let cfg =
-                build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch, engine)?;
+            let decode_from_file = load_decode_config_file(server_config.as_deref())?;
+            let decode_cfg = merge_cli_engine(engine, decode_from_file);
+            let mut cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                decode_cfg.engine,
+            )?;
+            cfg.decode = decode_cfg;
             let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -1044,6 +1075,7 @@ fn main() -> Result<()> {
             rbn_csv,
             spotter,
             window_s,
+            server_config,
             engine,
             jsonl,
         } => {
@@ -1051,10 +1083,8 @@ fn main() -> Result<()> {
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
             let iq = manta_input::read_all(&mut src)?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter)?;
-            let cfg = manta_decode::decoder::DecodeConfig {
-                engine,
-                ..Default::default()
-            };
+            let decode_from_file = load_decode_config_file(server_config.as_deref())?;
+            let cfg = merge_cli_engine(engine, decode_from_file);
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {

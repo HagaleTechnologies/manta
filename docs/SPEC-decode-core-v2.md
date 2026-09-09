@@ -1,9 +1,17 @@
 # SPEC — Decode Core v2 (evidence front end + HSMM sequence decoder)
 
-Status: **draft v1, proposed** (2026-09-09, MAN-166). Companion to
+Status: **implemented, stage-2 gate FAILED** (2026-09-09, MAN-166). §1
+(Evidence), §2 (noise reference), §4-6 (HSMM decoder + determinism), §7
+(config), §8.2-8.3 (golden vectors + oracle) are implemented; §3 (narrowband
+refiner) is implemented as a standalone module with its `manta-engine` call
+site deferred to MAN-168; §2.2's spectral-CFAR reference term
+(`FloorBank::spectral_reference_db`) has no production caller yet, also
+pending the MAN-168 call site (see §2.3's note below). The stage-2 gate
+(§8.4) was measured and **failed** —
+`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` has the full
+result; `decode.engine` stays default `legacy`. Companion to
 `docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` (the
-rationale and evidence) and `docs/SPEC-decode-core.md` (v1). Nothing here
-is implemented.
+rationale and evidence) and `docs/SPEC-decode-core.md` (v1).
 
 Relationship to v1: §1 (channelizer), §2.1–§2.5 (detection floor, gate,
 track lifecycle, ownership), §5 (events), §6 (determinism), §7 (vectors)
@@ -130,6 +138,17 @@ also leaks into `k±2…4`, so the reference rises with it and §1.6
 discounts exactly those hops; a clean CW neighbor contributes only when
 it is the minimum of six cells.
 
+**Implementation note (added post-measurement):** as of the stage-2 gate
+measurement, `FloorBank::spectral_reference_db` has no production caller —
+every real decode path (`manta decode`, `manta oracle`) passes
+`spectral_ref_power: None`, so `N[t] = N_temp[t]` always and the
+`max(N_temp, β·B_spec·N_spec)` branch above never activates outside its own
+unit tests. The only real per-track feed is `manta-engine`'s track lifecycle
+(`track.rs`), which this plan's tasks were not permitted to touch (see the
+plan's Global Constraints) — wiring this term is therefore part of MAN-168's
+scope, not yet done. The stage-2 gate's oracle/RBN numbers and VR5
+(co-channel) were measured with this term OFF.
+
 ### 2.4 Calibration test
 
 On a noise-only channelizer output (testkit AWGN, no signal), the mean
@@ -148,13 +167,18 @@ track with fractional centroid `c_f` (v1 §1.4) and nearest channel
 1. `y[t] = X[c, t] · e^{−j 2π δ Δ t / fo}` (phase accumulator in `f64`,
    wrapped each hop; `Δ = 93.75 Hz`).
 2. `z[t] = Σ_{i=0}^{10} g[i] · y[t−i]`, `g` = 11-tap windowed-sinc
-   lowpass at `fo` with cutoff `refine_bw_hz` (Hamming window), unity DC
-   gain, designed once at startup in `f64`, stored `f32`.
+   lowpass at `fo` with two-sided bandwidth `refine_bw_hz` (cutoff
+   `refine_bw_hz / 2`) (Hamming window), unity DC gain, designed once at
+   startup in `f64`, stored `f32`.
 3. `a[t] = |z[t]|` replaces v1 §3's `sqrt(max-power owned channel)` as
    §1's input.
 
-Recommended `refine_bw_hz = 30` (10–90 % step rise ≈ 12 ms; at 45 WPM a
-dit is 27 ms). The channel selection `c` follows the centroid; a change
+Recommended `refine_bw_hz = 30` (10–90 % step rise ≈ 16 ms, measured by
+direct step-response simulation of the shipped 11-tap filter at
+`fo = 375 Hz`; at 45 WPM a dit is ≈ 27 ms, so this fills roughly half a
+dit -- MAN-168 should re-derive this budget against the real
+implementation before wiring the engine call site). The channel
+selection `c` follows the centroid; a change
 of `c` resets the FIR history (one lost hop of evidence, `llr = 0`).
 The call site is `manta-engine`'s per-hop track feed (one line); this
 section specifies the module, not the engine change.

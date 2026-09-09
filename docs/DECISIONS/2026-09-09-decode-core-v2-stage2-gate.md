@@ -225,7 +225,13 @@ filter is the actual command that runs these 9 tests).
   present, or worse, in `hsmm`. **Implicated knob**: none identified with
   confidence within this task's budget; this looks like a genuine
   algorithmic gap (classical fading resilience), not a single scalar to
-  retune, consistent with this project's stated M4 ML-fusion boundary.
+  retune, consistent with this project's stated M4 ML-fusion boundary. One
+  untested lever worth noting for a future pass: the spectral CFAR
+  reference term (SPEC v2 §2.2/§2.3, `FloorBank::spectral_reference_db`)
+  had no production caller for this entire measurement (every real decode
+  path passes `spectral_ref_power: None`), so any re-measurement after
+  MAN-168 wires it may move these specific numbers, especially VR5
+  (co-channel).
 
 ### One bounded tuning iteration (brief Step 3, "at most one knob per iteration")
 

@@ -44,3 +44,4 @@ crates/manta-testkit/audio-corpus/wpx_cw_iq_96khz.wav
 crates/manta-testkit/audio-corpus/vp8geo_cw.mp3
 crates/manta-testkit/audio-corpus/vp8geo_cw_48khz.wav
 crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.wav
+crates/manta-testkit/audio-corpus/ground-truth/

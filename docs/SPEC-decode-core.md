@@ -583,8 +583,9 @@ allowlist = []
 evidence/noise/HSMM tunables, additive over this table -- see that
 document's §7 for the full v2 key list and defaults. Parsed by
 `manta_decode::config_file::DecodeConfigFile` and threaded into
-`manta engine`'s (soon `run`'s, MAN-77) `--engine`/`--server-config`
-handling in `manta-cli`.
+`manta-cli`'s `Listen` (and, after MAN-166 Task 13's follow-up, `Decode`/
+`Oracle`) subcommands' `--engine`/`--server-config` handling -- soon `run`'s
+per MAN-77.
 
 ## 10. Deviations from ARCHITECTURE.md
 

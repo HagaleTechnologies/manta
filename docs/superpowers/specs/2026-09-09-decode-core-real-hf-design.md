@@ -4,7 +4,10 @@ Status: **proposed** (2026-09-09, overnight brainstorming pass on MAN-166).
 Companion documents: `docs/SPEC-decode-core-v2.md` (normative spec for the
 recommended approach) and
 `docs/superpowers/plans/2026-09-09-decode-core-v2.md` (implementation
-plan). Nothing in this document is implemented.
+plan). This design was implemented as MAN-166's decode-core-v2 branch; the
+stage-2 gate it proposed was measured and FAILED (see
+`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`) -- `decode.engine`
+stays default `legacy`.
 
 Scope: the per-track decode core — `manta-decode` (envelope → keying →
 timing → Morse decode) plus the two `manta-dsp` inputs it depends on

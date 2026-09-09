@@ -66,15 +66,20 @@ RBN spots from `B2_20251129_000000_7080kHz.wav` capture time (2025-11-29
 Beacon Network. Ground truth can be scored via `scripts/score-against-rbn.py`:
 
 ```bash
-python3 scripts/score-against-rbn.py <rbn-daily-dump.csv>                        # all spotters
-python3 scripts/score-against-rbn.py <rbn-daily-dump.csv> --spotter K5TR         # K5TR only (co-located reference)
-python3 scripts/score-against-rbn.py <rbn-daily-dump.csv> --min-spotters 2       # consensus (≥2 spotters)
+python3 scripts/score-against-rbn.py <decode_report.json> <rbn-daily-dump.csv> \
+    --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000                    # all spotters
+python3 scripts/score-against-rbn.py <decode_report.json> <rbn-daily-dump.csv> \
+    --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000 --spotter K5TR     # K5TR only
+python3 scripts/score-against-rbn.py <decode_report.json> <rbn-daily-dump.csv> \
+    --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000 --min-spotters 2   # consensus
 ```
 
-**2026-09-09 baseline** (`B2_20251129_000000_7080kHz.wav`, first 15 min, vs
-manta on 2026-09-09 implementation):
-- **K5TR-only** (`--spotter K5TR`): 55/210 = 26.2% recall, 24.3% precision
-- **All spotters** (no filter): 68/1451 = 4.7% recall, 30.1% precision
+**Baseline numbers**: see `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for
+the current, canonical legacy-vs-hsmm recall/precision measurement against this recording
+(both K5TR-only and all-RBN). Do not duplicate those numbers here — this file previously
+carried an independent, now-stale copy that drifted out of sync with the real scorer after
+`scripts/score-against-rbn.py` was reconciled with `origin/main`'s richer implementation
+(MAN-166 Task 12a); avoid re-introducing that drift.
 
 Spotter filtering is useful for co-located reference validation (K5TR's signal
 path is nearly identical to manta's hardware); consensus filtering (multi-spotter agreement) is useful for rejecting receiver artifacts that don't appear on multiple independent systems.

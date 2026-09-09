@@ -124,7 +124,7 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
   capture) rather than all worldwide RBN spotters; recall against the full
   worldwide set is secondary/informational, since most of those bins are
   heard only by distant skimmers manta's own antenna cannot reach (56 % of
-  B2's 1,451 worldwide bins were heard by exactly one skimmer). Numbers
+  B2's 1,441 worldwide bins were heard by exactly one skimmer). Numbers
   published in the repo, whatever they are.
 - cqdx ingests the JSON stream in a dev environment.
 - 7-day unattended soak feeding spots continuously.
