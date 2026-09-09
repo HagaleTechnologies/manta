@@ -9,7 +9,7 @@ sources:
   - docs/SPEC-decode-core.md#46-per-callsign-confidence-consumed-by-manta-spot
   - docs/SPEC-decode-core.md#9-configuration-keys
 verified:
-  commit: 5b9e747
+  commit: f48e980
   date: 2026-09-09
 links:
   - decode-chain
@@ -30,10 +30,6 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 
 ## Why it is shaped this way
 
-<<<<<<< HEAD
 The asymmetry is deliberate: false spots (bogus callsigns) are the failure mode that discredits the whole network, so the repetition gate and cty.dat rejection are tuned to make bogus spots rare — a V8/V8w pass criterion is *0 bogus callsigns*. The two exemptions are kept narrow for the same reason: BEACON lifts only the repetition gate (cty.dat rejection still applies), and the allowlist is opt-in per callsign by the operator who owns the consequences. Validated spots flow to [[spot-output-contract]].
-=======
-The asymmetry is deliberate: false spots (bogus callsigns) are the failure mode that discredits the whole network, so the repetition gate and cty.dat rejection are tuned to make bogus spots rare — a V8/V8w pass criterion is *0 bogus callsigns*. Validated spots flow to [[spot-output-contract]].
 
 The repetition gate assumes a bogus decode is random noise that won't repeat identically. A deterministic front-end artifact breaks that assumption — it produces the *same* garbled decode at a fixed frequency every time, so it repeats and passes the gate. Field-confirmed against real hardware (mechanism still under investigation, not yet tied to a specific tracked bug): [[live-hardware-field-testing]].
->>>>>>> f48e9800d98b621505b97b59b890937054d6170e
