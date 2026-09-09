@@ -4,6 +4,7 @@ pub mod beam;
 pub mod decoder;
 pub mod envelope;
 pub mod events;
+pub mod evidence;
 pub mod noise;
 pub mod timing;
 pub mod tree;
