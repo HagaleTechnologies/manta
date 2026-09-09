@@ -3,7 +3,10 @@
 This directory, plus `manta.example.toml` and `docker-compose.yml` at the
 repo root, are the files that let an operator who downloaded a release
 binary run manta as a 24/7 background service without hand-writing any of
-this. CI checks all four against the code they describe
+this. **Every release archive ships them**, at exactly these relative paths
+(`.github/workflows/release-publish.yml`), so the install commands below
+run verbatim from an extracted `manta-<platform>.tar.gz`/`.zip` — no clone
+required. CI checks all four against the code they describe
 (`crates/manta-cli/tests/packaging_examples.rs`): a config key manta adds,
 a flag that gets renamed, or a stop-signal regression fails the build here,
 not silently in a stale example an operator copies later.

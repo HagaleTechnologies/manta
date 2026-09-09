@@ -83,7 +83,9 @@ as before, and is what the rest of this Quickstart assumes:
 ## Running unattended
 
 `manta` is a daemon, and the repo ships the files that make it behave like
-one so you do not have to write them:
+one so you do not have to write them — every release archive carries them
+next to the binary, at these same relative paths, so the prebuilt-binary
+path above needs no clone:
 
 - [`manta.example.toml`](manta.example.toml) — every config key, at its real
   built-in default. Copy it, set `station_callsign`, and it starts as-is.

@@ -385,3 +385,58 @@ fn every_stop_budget_clears_the_drain_window() {
     assert!(read(PLIST).contains("<integer>30</integer>"));
     assert!(read(COMPOSE).contains("stop_grace_period: 30s"));
 }
+
+// -------------------------------------------------- shipped in the release
+
+const RELEASE_WORKFLOW: &str = ".github/workflows/release-publish.yml";
+
+/// The body of one `- name: <step>` block in the release workflow's build
+/// job: everything up to the next step at the same indentation.
+fn release_step(name: &str) -> String {
+    let text = read(RELEASE_WORKFLOW);
+    let marker = format!("      - name: {name}\n");
+    let start = text
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{RELEASE_WORKFLOW} has no `{name}` step"))
+        + marker.len();
+    let rest = &text[start..];
+    let end = rest.find("\n      - ").map(|i| i + 1).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// packaging/README.md tells an operator who downloaded a release binary to
+/// copy these files -- which only works if the archive actually contains
+/// them. A packaging step that drops one turns every install command in
+/// that file into a dangling reference to a checkout the operator was told
+/// they would not need.
+#[test]
+fn release_archives_carry_every_unattended_asset() {
+    for step in ["Package (Unix)", "Package (Windows)"] {
+        let body = release_step(step);
+        for asset in [EXAMPLE_TOML, COMPOSE] {
+            assert!(
+                body.contains(asset),
+                "release step `{step}` never copies `{asset}` into the archive"
+            );
+        }
+        // The units and packaging/README.md ship as the whole `packaging`
+        // tree, so a new file added there needs no second edit in the
+        // workflow -- assert the tree is copied, then that the files this
+        // test knows about are in fact inside it.
+        assert!(
+            body.contains("packaging"),
+            "release step `{step}` never copies the `packaging/` tree"
+        );
+    }
+    for asset in [SERVICE, PLIST, "packaging/README.md"] {
+        assert!(
+            repo_root().join(asset).is_file(),
+            "`{asset}` is documented as shipped but is not in the tree"
+        );
+        assert!(
+            asset.starts_with("packaging/"),
+            "`{asset}` lives outside `packaging/`, so copying that tree does \
+             not ship it -- the release workflow needs its own `cp` line"
+        );
+    }
+}
