@@ -18,6 +18,10 @@ secrets*
 .idea/
 .vscode/
 
+# Python cache from scripts/ tooling (e.g. score-against-rbn.py).
+__pycache__/
+*.pyc
+
 # Local worktree scratch space (superpowers:using-git-worktrees).
 .worktrees/
 
