@@ -303,9 +303,19 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 8. Configuration & observability
 
-- Single TOML config (coppa convention): device, center freq, band plan
-  (CW segment limits — don't decode/spot outside them), thresholds, track cap,
-  server ports, cty/scp paths, station callsign (spotter ID).
+- **Single TOML config, implemented (MAN-74):** `manta run --config <path>`
+  (`manta listen`'s canonical alias) reads one `manta.toml` covering source
+  selection/device/center-freq (`[input]`), operator allow/block/notch lists
+  (`[spot]`), detector/decode tuning incl. track cap (`[detector]`/
+  `[decode]`), and server ports/station callsign (`[server]`,
+  `[[rbn_uplink]]`) — see `docs/SPEC-decode-core.md` §9 for the full key
+  table, precedence (CLI flag > `MANTA_<TABLE>_<KEY>` env var > file >
+  default), and which of §9's keys are compile-time constants pending a
+  follow-up ticket rather than truly configurable yet. **Still
+  aspirational, deliberately out of MAN-74's scope (broad-review R-09):**
+  band plan (CW segment limits — don't decode/spot outside them) and
+  runtime-loadable `cty`/`scp` paths (both compiled in via `include_str!`
+  today) have no config surface at all yet.
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):

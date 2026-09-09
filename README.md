@@ -103,6 +103,12 @@ manta listen
 
 # Any of the above as JSON Lines instead of text
 manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
+
+# A 24/7 deployment from one TOML file instead of a long flag line --
+# source, allow/block/notch lists, ppm correction, decode/detector
+# tuning, and the telnet/JSON/metrics servers all live in manta.toml
+# (docs/SPEC-decode-core.md §9). `run` is `listen`'s daemon-flavored alias.
+manta run --config manta.toml
 ```
 
 `manta --help` lists every subcommand and flag.

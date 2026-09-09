@@ -558,33 +558,106 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 
 ## 9. Configuration keys
 
+MAN-74: `manta-cli::config::ConfigFile` (`crates/manta-cli/src/config.rs`) is
+the loader for the single `manta.toml` these tables live in, reachable via
+`manta listen`/`manta run`/`manta soak --config <path>` (`--server-config` is
+a deprecated alias of `--config`, scoped to `listen`/`run` only -- `soak`
+never accepted it). Precedence, per key: **CLI flag > `MANTA_<TABLE>_<KEY>`
+environment variable > this file > the built-in default below.** The env
+tier addresses `[server]`, `[input]`, `[spot]`, `[detector]`, and `[decode]`
+(e.g. `MANTA_DETECTOR_ON_SNR_DB=10.0`); `[[rbn_uplink]]` is an
+array-of-tables with no unambiguous `MANTA_RBN_UPLINK_*` spelling for "which
+target", so it is env-inaccessible by design (a `MANTA_RBN_UPLINK_*` name is
+a hard error, not a silent no-op). `manta decode`/`manta gen` never read a
+config file or `MANTA_*` variable at all -- SPEC §6's "file input ->
+byte-identical spot logs" determinism contract runs through `decode`, and an
+ambient, machine-specific override would break it.
+
+`[input]` is a tagged union (`type` selects the variant), so the env tier
+can only add/override a *sibling* key once `type` is already known --
+either from the file's own `[input].type`, or from `MANTA_INPUT_TYPE` set
+alongside the other `MANTA_INPUT_*` variables. A `MANTA_INPUT_*` variable
+with no `type` anywhere (file or env) is a `missing field \`type\`` error,
+not a silent no-op or a guessed variant.
+
+Unknown top-level tables, and unknown keys within a modeled table, are a
+parse error naming the offending table/key -- there is no silent-ignore
+tier below "built-in default".
+
 All normative constants above, with defaults:
 
 ```toml
 [detector]
-on_snr_db = 6.0        off_snr_db = 3.0
+# NOTE: on_snr_db's shipped default is 12.0, not the 6.0 this section
+# used to state -- see manta_engine::DetectorConfig's `impl Default` doc
+# comment for the empirical justification (6.0 produced 298 spurious
+# tracks against a single clean signal in the V1 golden vector).
+# `ConfigFile::resolve_detector` overlays onto that Rust `Default`, never
+# onto this table's literal text, so omitting a key can never regress an
+# operator to the stale 6.0 value.
+on_snr_db = 12.0       off_snr_db = 3.0
 confirm_ms = 50        hang_ms = 5000
 gc_ms = 30000          warmup_ms = 2000
-floor_quantile = 0.25  floor_window_ms = 10000
-block_channels = 32    block_allowance_db = 3.0
+track_cap = 500        # ARCHITECTURE §4, not in the original literal table
+
+# Documented here but NOT YET CONFIGURABLE -- each is a compile-time
+# constant in manta-dsp::floor, sizing fixed per-channel-hop arrays;
+# turning either into a runtime value means heap-allocating in the
+# channel-hop hot path, against the Pi-4 CPU budget the criterion benches
+# enforce. Setting any of these four keys is a rejected, actionable error
+# naming manta-dsp::floor, not a silent no-op. Making them configurable is
+# tracked as a MAN-74 follow-up.
+# floor_quantile = 0.25  floor_window_ms = 10000
+# block_channels = 32    block_allowance_db = 3.0
 
 [decode]
 timing_sigma = 0.25    beam_width = 4
 debounce_ms = 12       hyst_up = 1.25       hyst_down = 0.80
-tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
-mu_ratio_bounds = [2.2, 4.5]
-char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
-cluster_alpha = 0.15
+tau_lo_ms = 500        tau_hi_init_ms = 200 # exists in code, not previously listed here
+tau_hi_bounds_ms = [100, 400]
+flush_gap_dits = 7.0
 
+# Documented here but NOT YET CONFIGURABLE -- each is a compile-time
+# constant in manta-decode::timing, same rejected-not-ignored treatment
+# and MAN-74 follow-up as [detector]'s four keys above.
+# mu_ratio_bounds = [2.2, 4.5]
+# char_gap_dits = 1.6   word_gap_dits = 5.0
+# cluster_alpha = 0.15
+
+# One of five variants, tagged by `type`; `type` is required whenever
+# [input] is present. Shared keys (freq_correction_ppm, dial_freq_hz)
+# are valid on every variant. A `soapy`/`hpsdr` source always PARSES
+# (regardless of Cargo features), but fails at source-open time naming
+# the required `--features` flag if the binary wasn't built with it.
 [input]
+type = "audio"                  # "audio" | "file" | "kiwi" | "soapy" | "hpsdr"
+# device = "USB Audio CODEC"    # audio only; omit for the default input device
+# path = "recording.wav"        # file only; relative to this config file's directory
+# host = "kiwi.example.com"     # kiwi/hpsdr
+# port = 8073                   # kiwi (default 8073) / hpsdr (default 1024)
+# freq_hz = 14025000.0          # kiwi/soapy/hpsdr: RF center frequency
+# password = ""                 # kiwi only
+# driver = "driver=rtlsdr"      # soapy only
+# rate_hz = 192000.0            # soapy/hpsdr: sample rate
+# gain_db = 20.0                # soapy only; omit for AGC
+#
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]
 # (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29.
 freq_correction_ppm = 0.0
+# RF dial frequency in Hz, overriding the source's own reported center
+# frequency -- required (here or via --dial-freq-hz) when [server] is set
+# and the source is "audio"/"file" (neither reports a real RF frequency).
+# dial_freq_hz = 14025000.0
 
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 allowlist = []
+# Operator bad-callsign blocklist / notched-frequency-range list (MAN-31),
+# each the same flat-text format --blocklist/--notch already read, one
+# entry per line. Relative to this config file's directory.
+# blocklist_path = "blocklist.txt"
+# notch_path = "notch.txt"
 ```
 
 ## 10. Deviations from ARCHITECTURE.md
