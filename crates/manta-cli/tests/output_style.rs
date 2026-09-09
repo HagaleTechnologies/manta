@@ -73,6 +73,44 @@ fn an_unknown_vector_is_not_debug_quoted() {
     );
 }
 
+/// MAN-130 review: the vector name is operator-supplied and lands in an
+/// error `render_error` prints straight to a terminal. The Debug rendering
+/// this ticket removed escaped control bytes for free; the human style has
+/// to escape them deliberately, or `manta gen $'\e[2Jbad'` clears the
+/// screen it is reporting the failure on.
+#[test]
+fn an_unknown_vector_cannot_smuggle_a_terminal_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = manta()
+        .args(["gen", "\u{1b}[2Jbad", "--out"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "raw escape sequence reached the terminal: {stderr:?}"
+    );
+    assert!(stderr.contains("unknown vector '"), "{stderr}");
+    assert!(stderr.contains("[2Jbad"), "{stderr}");
+}
+
+/// MAN-130 review: flattening an error onto one line must not rewrite the
+/// path it names. `split_whitespace()` reported `/tmp/foo  bar.wav` as
+/// `/tmp/foo bar.wav`, sending the operator after a file that does not
+/// exist.
+#[test]
+fn an_error_reports_the_path_the_operator_actually_gave() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("two  spaces.wav");
+    let out = manta().arg("decode").arg(&wav).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("open WAV {}", wav.display())),
+        "path whitespace was rewritten: {stderr}"
+    );
+}
+
 #[test]
 fn clap_usage_errors_still_exit_2_and_stay_lowercase() {
     let out = manta().arg("decode").output().unwrap();
@@ -181,8 +219,11 @@ fn decode_summary_has_no_option_and_reads_in_khz() {
     assert!(!stderr.contains("Some("), "Option Debug leaked: {stderr}");
     assert!(!stderr.contains("None"), "Option Debug leaked: {stderr}");
     // frequency reads in kHz to one decimal, e.g. "frequency: 14012.3 kHz"
+    // `WPM`, the unit spelling the style table and `listen`'s spot line
+    // both use -- one operator-facing vocabulary across commands (MAN-130
+    // review).
     let re =
-        regex::Regex::new(r"frequency: \d+\.\d kHz  speed: (\d+|unknown) wpm  spots: \d+").unwrap();
+        regex::Regex::new(r"frequency: \d+\.\d kHz  speed: (\d+|unknown) WPM  spots: \d+").unwrap();
     assert!(re.is_match(&stderr), "{stderr}");
 }
 

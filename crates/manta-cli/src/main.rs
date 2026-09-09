@@ -820,8 +820,16 @@ fn start_spot_server(
     // non-JSON tracing line corrupts that machine-readable stream for
     // real consumers and breaks deterministic-replay byte-identity.
     // stderr is a separate stream a JSON-Lines consumer never reads.
+    // `fmt::monitor_aware_stderr`, not `std::io::stderr`: `listen`'s live
+    // character monitor writes stderr WITHOUT a trailing newline, and the
+    // telnet/JSON tasks this function spawns log connections and
+    // disconnections to the same stream while `listen` is still running --
+    // so a record written straight to stderr lands in the middle of the
+    // monitor's line (`CQ DE W1AW2026-.. raw TCP client connected`). The
+    // monitor-aware writer closes that line first and holds the stderr
+    // lock for the whole record (MAN-130 review).
     let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(fmt::monitor_aware_stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -958,6 +966,9 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
+            // The `error:` line starts in column zero even if a live
+            // monitor left stderr mid-line (MAN-130).
+            fmt::end_monitor_line();
             eprintln!("{}", fmt::render_error(&err));
             if let Some(hint) = fmt::render_hint(&err) {
                 eprintln!("{hint}");
@@ -984,7 +995,7 @@ fn run() -> Result<std::process::ExitCode> {
             } else {
                 println!("{}", report.text);
                 eprintln!(
-                    "frequency: {} kHz  speed: {} wpm  spots: {}",
+                    "frequency: {} kHz  speed: {} WPM  spots: {}",
                     fmt::khz(report.freq_hz),
                     fmt::wpm_opt(report.wpm),
                     report.spots.len()
@@ -999,7 +1010,16 @@ fn run() -> Result<std::process::ExitCode> {
                 "v4" => manta_testkit::vectors::v4(),
                 "v5" => manta_testkit::vectors::v5(),
                 "v6" => manta_testkit::vectors::v6(),
-                other => bail!("unknown vector '{other}' (available: v1-v6)"),
+                // `escape_debug`, not `other` verbatim: the argument is
+                // operator-supplied and `render_error` prints this text to a
+                // terminal, so an embedded escape sequence
+                // (`manta gen $'\e[2Jbad'`) would otherwise clear or
+                // recolour the screen. Single quotes stay -- this is the
+                // human style, not Rust's `{:?}` (MAN-130 review).
+                other => bail!(
+                    "unknown vector '{}' (available: v1-v6)",
+                    other.escape_debug()
+                ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
@@ -1213,10 +1233,11 @@ fn run() -> Result<std::process::ExitCode> {
             // newline (it grows a character at a time, live), so whatever
             // stderr prints next would otherwise be appended to it --
             // `CQ DE W1AWerror: ...` when the source fails mid-run, e.g. a
-            // KiwiSDR disconnect. Track whether the monitor put anything on
-            // the line so the listen path can terminate it before returning,
-            // on the error path and on a clean EOF alike (MAN-130).
-            let monitor_dirty = std::cell::Cell::new(false);
+            // KiwiSDR disconnect, or a spot-server log line mid-run. Every
+            // write goes through `fmt`'s shared monitor-line state, which
+            // remembers that the line is open so the error path, the clean
+            // EOF path and the `tracing` writer alike can close it before
+            // writing (MAN-130).
             let listen_result = manta_engine::listen(
                 src,
                 &cfg,
@@ -1227,23 +1248,17 @@ fn run() -> Result<std::process::ExitCode> {
                         return;
                     }
                     use manta_decode::events::DecoderEvent;
-                    use std::io::Write as _;
                     // The live per-character monitor is a diagnostic (is it
                     // hearing anything?), not the command's product -- it
                     // goes to stderr so the spot lines on stdout stay clean.
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
                             if let Some(c) = glyph.text_char() {
-                                eprint!("{c}");
-                                monitor_dirty.set(true);
-                                let _ = std::io::stderr().flush();
+                                let mut buf = [0u8; 4];
+                                fmt::monitor_write(c.encode_utf8(&mut buf));
                             }
                         }
-                        DecoderEvent::WordBoundary { .. } => {
-                            eprint!(" ");
-                            monitor_dirty.set(true);
-                            let _ = std::io::stderr().flush();
-                        }
+                        DecoderEvent::WordBoundary { .. } => fmt::monitor_write(" "),
                         _ => {}
                     }
                 },
@@ -1270,10 +1285,9 @@ fn run() -> Result<std::process::ExitCode> {
             // `error:` line `main` renders from `listen_result?` below --
             // and any shutdown-time log line from the block that follows --
             // must start in column zero, not glued to the last decoded
-            // character (MAN-130).
-            if monitor_dirty.get() {
-                eprintln!();
-            }
+            // character (MAN-130). No-op if the monitor never wrote, or if
+            // a `tracing` record already closed the line.
+            fmt::end_monitor_line();
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from

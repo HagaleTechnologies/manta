@@ -31,12 +31,37 @@ stdout carries the command's product; stderr carries everything else
 | `listen` | spot lines (`--json`: JSON Lines of spots/events) | live per-character monitor (text mode only) |
 | `soak` | the report (text or `--json`) | nothing on success |
 
-A live monitor writes stderr without a trailing newline, so whoever owns it
-must terminate that line before anything else writes to stderr — otherwise
-the next write is glued to it (`CQ DE W1AWerror: ...`). `listen` closes the
-character monitor's line as soon as `manta_engine::listen` returns, on the
-error path and on a clean EOF alike, so the `error:` line below always
-starts in column zero.
+A live monitor writes stderr without a trailing newline, so **every other
+writer on that stream closes the monitor's line before its own first byte**
+— otherwise its output is glued to the monitor's (`CQ DE W1AWerror: ...`,
+or `CQ DE W1AW2026-.. json_stream: raw TCP client connected` from a spot-
+server task logging mid-run). Closing the line once, after
+`manta_engine::listen` returns, is not enough: the daemon's `tracing`
+records are emitted from the server's own threads while `listen` is still
+decoding. `manta-cli`'s `fmt::MonitorLine` holds that shared open/closed
+state:
+
+- `fmt::monitor_write` appends monitor text under the stderr lock and marks
+  the line open;
+- `fmt::monitor_aware_stderr` is the `tracing` subscriber's writer — it
+  closes the line, then holds the stderr lock for the whole record, so a log
+  line always starts in column zero and the monitor resumes on a line of its
+  own;
+- `fmt::end_monitor_line` closes it on the way out of `listen` (clean EOF
+  and error path alike) and in `main` before the `error:` line.
+
+`terminate` is idempotent, so calling it unconditionally never emits a
+stray blank line.
+
+An error is rendered onto one physical line by rewriting **line breaks
+only** — plus the indentation a multiline diagnostic puts around them.
+Interior spaces and tabs are part of the value being reported
+(`/tmp/foo  bar.wav` is not `/tmp/foo bar.wav`) and are preserved.
+Non-whitespace control characters are escaped (`\u{1b}`), both in
+`fmt::render_error` and at the operator-supplied values that feed it (`manta
+gen $'\e[2Jbad'`), so an error can never clear, recolour or otherwise
+falsify the terminal it is printed on — something the Debug rendering this
+guide replaced did for free.
 
 ## Errors and hints
 
