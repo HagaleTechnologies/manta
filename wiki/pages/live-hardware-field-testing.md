@@ -27,11 +27,16 @@ those for the full evidence and reasoning.
 ## `doctor` vs `listen` for a field test
 
 - `manta doctor --duration <secs> --json` is the right first check: bounded,
-  self-terminating, gives a verdict (`NoSignal`/`NoisyNoDecode`/
-  `WeakNoDecode`/`Decoding`) from track/SNR/decode stats. It does **not**
-  expose what a confirmed spot actually contained — the callback that
-  counts them throws the `Spot` away (`crates/manta-engine/src/
-  doctor.rs`'s `|_spot| spots_confirmed += 1`).
+  self-terminating, gives a verdict from track/SNR/decode stats —
+  `NoSignal` (no decoder evidence at all), `ActivityNoSnr` (a track opened
+  or decoded characters, but the run ended before any `TrackMeta` landed —
+  "unmeasured," not "measured and low"; retry with a longer `--duration`),
+  `NoisyNoDecode` (every track read at or below the noise floor),
+  `WeakNoDecode` (real signal-level SNR, but nothing validated into a
+  spot), or `Decoding` (at least one confirmed spot; the full path works
+  end to end). It does **not** expose what a confirmed spot actually
+  contained — the callback that counts them throws the `Spot` away
+  (`crates/manta-engine/src/doctor.rs`'s `|_spot| spots_confirmed += 1`).
 - `manta listen --json` is what you need to actually see spot content
   (callsign, SNR, confidence, WPM). It has no `--duration` flag — bound it
   yourself:
@@ -52,21 +57,26 @@ those for the full evidence and reasoning.
 
 Don't trust `spots_confirmed > 0` (or a `Decoding` verdict) alone. The
 repetition gate ([[spot-validation]]) assumes bogus decodes are random
-noise that won't repeat identically — but MAN-7/103 (near-channel-edge
-WPM bug, ROADMAP/CLAUDE.md Status) produces a *deterministic* garbled
-decode at a fixed channelizer boundary, so it repeats and passes the gate
-every time. Field-confirmed 2026-09-09: 29/29 confirmed spots in an
+noise that won't repeat identically — but a deterministic decode artifact
+at a fixed frequency repeats identically every time and passes the gate
+just as well. Field-confirmed 2026-09-09: 29/29 confirmed spots in an
 overnight 40m session shared one signature — confidence pinned to the
-low end (~0.12-0.17), `snr_db` at the session's own noise floor, often-
-implausible WPM — and clustered at a handful of fixed frequencies across
-separate capture windows. A dial-shift test (retune, see if the artifact
-moves with the new passband edge) is the fast way to tell a real signal
-from this artifact.
+low end (~0.12-0.17), `snr_db` pinned to nearly the same value session-
+wide, often-implausible WPM — and clustered at a handful of fixed
+frequencies near the input passband edge across separate capture windows.
+A dial-shift test (retune, see if the artifact moves with the new
+passband edge) is the fast way to tell this from a real signal. **Not
+confirmed as MAN-7/103** (that's a per-channel WPM-*estimation* bug on a
+real signal, not a detection/spot-generation bug) — see
+`docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md` Finding 2
+for the full reasoning; treat this as a separate, still-untracked
+front-end/passband-edge defect until proven otherwise.
 
-Before trusting a spot: check `snr_db` against the capture's own
-`TrackMeta` noise floor (not just >0 dB), and treat anything within ~1 dB
-of the floor or at a suspiciously round confidence value as suspect until
-MAN-7/103 is fixed.
+Before trusting a spot: check whether `snr_db` sits within about a dB of
+a value that recurs across many spots in the same session (not just
+whether it's >0 dB — `snr_db` is a 2500 Hz-reference-bandwidth
+conversion, so a negative value doesn't by itself mean no signal), and
+treat a suspiciously round/low confidence value as another warning sign.
 
 ## Setup gotchas
 
