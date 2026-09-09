@@ -61,6 +61,24 @@ enum Command {
         #[arg(long, default_value = "legacy", value_parser = parse_engine)]
         engine: Engine,
     },
+    /// Real-signal decode oracle: decode each RBN-spotted station's channel
+    /// directly (tracker bypassed) and report callsign recovery (SPEC v2 §8.3).
+    Oracle {
+        /// Stereo IQ WAV with <stem>.json sidecar.
+        path: PathBuf,
+        /// RBN daily-dump CSV pre-filtered to the recording's window.
+        rbn_csv: PathBuf,
+        /// Spotter whose spots define the reference set (the co-located skimmer).
+        #[arg(long, default_value = "K5TR")]
+        spotter: String,
+        #[arg(long, default_value_t = 40.0)]
+        window_s: f64,
+        #[arg(long, default_value = "legacy", value_parser = parse_engine)]
+        engine: Engine,
+        /// Write per-spot results as JSON Lines here (summary always goes to stdout).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+    },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
         /// Vector name (M0: "v1").
@@ -976,6 +994,22 @@ fn main() -> Result<()> {
                 eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
                 eprintln!("spots: {}", report.spots.len());
             }
+        }
+        Command::Oracle { path, rbn_csv, spotter, window_s, engine, jsonl } => {
+            let mut src = manta_input::WavIqSource::open(&path)?;
+            let (fs, center) = (src.sample_rate(), src.center_freq_hz());
+            let iq = manta_input::read_all(&mut src)?;
+            let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter)?;
+            let cfg = manta_decode::decoder::DecodeConfig {
+                engine,
+                ..Default::default()
+            };
+            let (results, summary) = manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
+            if let Some(p) = jsonl {
+                let mut w = std::io::BufWriter::new(std::fs::File::create(p)?);
+                for r in &results { use std::io::Write; writeln!(w, "{}", serde_json::to_string(r)?)?; }
+            }
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
