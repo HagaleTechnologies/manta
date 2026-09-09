@@ -73,6 +73,39 @@ fn unknown_vector_errors() {
     assert!(!out.status.success());
 }
 
+/// `Engine::Hsmm` is a real enum variant (`manta-decode`'s internal engine
+/// dispatch needs it) but `TrackDecoder::push_hop_hsmm` is still
+/// `unimplemented!("Task 8")`. `--engine hsmm` must be rejected as a clean
+/// clap argument error before any pipeline/decode work starts -- never
+/// accepted and left to panic on the first hop.
+#[test]
+fn engine_hsmm_is_a_clean_error_not_a_panic() {
+    // clap's own value_parser rejects "hsmm" before any file I/O or decode
+    // work, so a nonexistent path is fine here (same pattern as
+    // server_config_without_dial_freq_for_audio_source_is_a_clean_error).
+    let out = manta()
+        .args(["decode", "--engine", "hsmm", "/nonexistent.wav"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected --engine hsmm to be rejected"
+    );
+    // A clap parse error exits before ever touching the WAV/decode pipeline,
+    // so this must be clap's own clean argument-error path, not a panic
+    // (no "panicked at" in stderr, and clap's own exit code 2).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "must not panic; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("hsmm"),
+        "error should mention hsmm; stderr: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(2), "clap arg-error exit code");
+}
+
 #[test]
 fn kiwi_host_without_freq_is_a_clean_error() {
     let out = manta()

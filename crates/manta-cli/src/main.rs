@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::PathBuf;
@@ -53,6 +54,12 @@ enum Command {
         /// range per line (MAN-31).
         #[arg(long)]
         notch: Option<PathBuf>,
+        /// Decode engine (SPEC v2 §0): `legacy` (default) or `edge-legacy`.
+        /// (`hsmm` is a recognized `Engine` variant but not implemented yet
+        /// -- Task 8 -- and is rejected here with a clean error rather than
+        /// accepted and left to panic mid-decode.)
+        #[arg(long, default_value = "legacy", value_parser = parse_engine)]
+        engine: Engine,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
@@ -426,6 +433,20 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
+fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
+    let engine: Engine = s.parse()?;
+    // `Engine::Hsmm` is a real enum variant (needed by manta-decode's
+    // internal engine dispatch) but `TrackDecoder::push_hop_hsmm` is still
+    // `unimplemented!("Task 8")` -- accepting it here would let a user pass
+    // `--engine hsmm` and get a panic on the first hop instead of a clean
+    // error, since the brief's "not reachable from any test" assumption
+    // stops holding once a real CLI flag exists.
+    if engine == Engine::Hsmm {
+        return Err("the hsmm engine is not implemented yet (Task 8)".to_string());
+    }
+    Ok(engine)
+}
+
 /// Derives the replay session's wall-clock epoch (fed to `SpotBus`, and
 /// from there into every JSON `timestamp`/RBN Zulu field a client
 /// observes) from the replayed file's own filesystem modification time.
@@ -676,12 +697,14 @@ fn build_pipeline_config(
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    engine: Engine,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist,
         ..Default::default()
     };
+    cfg.decode.engine = engine;
     if let Some(path) = blocklist {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading blocklist file {}", path.display()))?;
@@ -941,8 +964,10 @@ fn main() -> Result<()> {
             allowlist,
             blocklist,
             notch,
+            engine,
         } => {
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            let cfg =
+                build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch, engine)?;
             let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -1045,7 +1070,13 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            let cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                Engine::Legacy,
+            )?;
             #[cfg(feature = "hpsdr")]
             let hpsdr_source = open_hpsdr_source(HpsdrOpts {
                 host: hpsdr_host,
@@ -1275,7 +1306,13 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            let cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                Engine::Legacy,
+            )?;
             #[cfg(feature = "hpsdr")]
             let hpsdr_source = open_hpsdr_source(HpsdrOpts {
                 host: hpsdr_host,

@@ -7,10 +7,20 @@ use std::process::Command;
 fn decode_report(
     spec: &manta_testkit::vectors::VectorSpec,
 ) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
+    decode_report_with_args(spec, &[])
+}
+
+/// Same as `decode_report`, with extra CLI args (e.g. `--engine
+/// edge-legacy`, Task 5's SPEC v2 §0 engine switch) appended after `--json`.
+fn decode_report_with_args(
+    spec: &manta_testkit::vectors::VectorSpec,
+    extra_args: &[&str],
+) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
     let dir = tempfile::tempdir().unwrap();
     let manifest = manta_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", "--json"])
+        .args(extra_args)
         .arg(dir.path().join(format!("{}.wav", spec.name)))
         .output()
         .unwrap();
@@ -59,6 +69,50 @@ fn decode_report(
 fn v2_passes_end_to_end_from_wav() {
     let spec = manta_testkit::vectors::v2();
     let (report, manifest) = decode_report(&spec);
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.01,
+        "V2 char accuracy must be >= 99 % (CER <= 0.01), got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+    let wpm = report["wpm"].as_f64().unwrap();
+    assert!((wpm - 35.0).abs() < 2.0, "wpm {wpm}");
+}
+
+/// V2 with Task 5's `EdgeLegacy` engine (SPEC v2 §0), exercising the
+/// `manta decode --engine edge-legacy` CLI surface added alongside it.
+/// Unlike `v2_passes_end_to_end_from_wav` above, this vector is fully
+/// synthetic (`manta_testkit::vectors::v2`) and needs no external corpus.
+///
+/// [Finding, Task 5 execution]: measured, this does NOT pass yet -- CER
+/// 0.0244 (need <= 0.01), decoded text starting `"A DE JA1ABC..."` against
+/// expected `"CQ CQ DE JA1ABC..."`. This is the SAME root cause diagnosed
+/// and worked around in `manta_decode::decoder`'s
+/// `edge_legacy_decodes_contest_speed_deep_keying` unit test: `NoiseTracker`
+/// and `Evidence` both initialize their very first smoothed sample directly
+/// from that sample's own value (no history to blend against yet), so if
+/// the scene's true leading edge is a mark rather than a settled noise
+/// floor, the noise estimate starts pinned near the mark level and the
+/// evidence gate stays closed until a later gap forces it down -- garbling
+/// or dropping whatever keying happened before that point. The unit test
+/// could work around it with a 4-hop noise-floor lead-in it fully controls;
+/// this end-to-end CLI test decodes a vector built by
+/// `manta_testkit::vectors::v2()` through the real IQ pipeline
+/// (`manta_engine::decode_wav`), which has no equivalent lead-in and is out
+/// of Task 5's file scope (`manta-testkit`) to add. Left `#[ignore]`d
+/// pending a proper fix -- likely a `NoiseTracker`/`Evidence` warm-up phase
+/// analogous to the `Legacy` engine's `Demod::Phase::Init` -- rather than
+/// widening the CER tolerance or hacking the vector generator, per this
+/// plan's own guidance for genuine decoder bugs (see
+/// `v2_passes_end_to_end_from_wav` above for the same policy applied to a
+/// different bug).
+#[test]
+#[ignore]
+fn v2_passes_with_edge_legacy_engine() {
+    let spec = manta_testkit::vectors::v2();
+    let (report, manifest) = decode_report_with_args(&spec, &["--engine", "edge-legacy"]);
     let decoded = report["text"].as_str().unwrap();
     let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
     assert!(
