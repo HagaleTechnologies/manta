@@ -22,6 +22,27 @@ use std::collections::{BTreeMap, VecDeque};
 /// `dedupe.rs`).
 const WORD_WINDOW: usize = 16;
 
+/// Width of a `RepetitionGate` frequency bucket, in Hz (MAN-166). Buckets
+/// a track's reported frequency for repetition-gate identity, so a real
+/// signal's repeated decodes still count toward `RepetitionGate::record`'s
+/// 2-decode confirmation even after its track closes and reopens under a
+/// new `track_id` at a slightly different centroid. 100 Hz is empirically
+/// justified: real fragments of the same signal, captured across a track
+/// closing and reopening, clustered within a 50 Hz bin in manta's B2
+/// golden-vector recording (MAN-166) -- 100 Hz gives margin for centroid
+/// drift between fragments while staying well inside the spacing between
+/// distinct real signals in a dense contest band (rarely under a few
+/// hundred Hz). The key also includes the callsign text, so even a
+/// coincidental bucket collision between two distinct real signals can
+/// only cross-contaminate if they also decode to the exact same text --
+/// not a realistic concern.
+const FREQ_BUCKET_HZ: f64 = 100.0;
+
+/// See `FREQ_BUCKET_HZ`'s doc.
+fn freq_bucket(freq_hz: f64) -> i64 {
+    (freq_hz / FREQ_BUCKET_HZ).round() as i64
+}
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -343,15 +364,34 @@ impl Validator {
             // leak.
             DecoderEvent::TrackPromoted { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id } => {
-                // MAN-19: without this, `self.tracks` and `self.gate`'s
-                // per-track_id state both grow forever -- `TrackManager`
-                // never reuses a `track_id`, and until `TrackClosed`
-                // existed neither structure had any signal that one would
-                // never be seen again. Confirmed as the soak's actual
-                // unbounded-RSS-growth root cause under sustained track
-                // churn.
+                // MAN-19: without removing `self.tracks`' entry,
+                // per-track_id word/grammar-context state grows forever --
+                // `TrackManager` never reuses a `track_id`, and until
+                // `TrackClosed` existed nothing had any signal that one
+                // would never be seen again. Confirmed as the soak's
+                // actual unbounded-RSS-growth root cause under sustained
+                // track churn.
+                //
+                // `self.gate` is swept, not forgotten by `track_id`
+                // (MAN-166): the repetition gate is keyed by frequency
+                // bucket, which a closing-and-reopening real signal keeps
+                // across the churn this event represents -- forgetting it
+                // here, the way `self.tracks` correctly is, would defeat
+                // the gate's whole 90s window the instant a track closed.
+                // `sweep` still bounds `gate`'s memory the way MAN-19
+                // needed, just on elapsed time instead of track lifetime.
+                // Uses this track's own last-seen `sample_ts` (0, a safe
+                // no-op sweep, if it closed before ever reporting one) as
+                // the current-time reference, since `Validator` otherwise
+                // carries no clock of its own (SPEC-decode-core.md §6
+                // rule 2: sample_ts-based, never wall clock).
+                let last_ts = self
+                    .tracks
+                    .get(track_id)
+                    .map(|t| t.last_sample_ts)
+                    .unwrap_or(0);
                 self.tracks.remove(track_id);
-                self.gate.forget_track(*track_id);
+                self.gate.sweep(last_ts);
                 Vec::new()
             }
         }
@@ -703,7 +743,7 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate.record(track_id, &candidate, sample_ts) as u32
+            self.gate.record(freq_bucket(freq_hz), &candidate, sample_ts) as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -872,6 +912,61 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::De);
+    }
+
+    /// MAN-166: a real signal's track closing and reopening under a new
+    /// `track_id` (e.g. `CloseReason::HangExpired`'s 5s silence timer, or
+    /// `Merged`/`Evicted`) must not reset its repetition confirmation --
+    /// the callsign is still genuinely repeating within the gate's 90s
+    /// window, just under a different `track_id` at roughly the same
+    /// frequency.
+    #[test]
+    fn repetition_survives_a_track_closing_and_reopening_at_the_same_frequency() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH", "K"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        run(&[DecoderEvent::TrackClosed { track_id: 1 }], &mut v);
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 2,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket
+        });
+        let spots = run(&transmission_events(2, &words, 100_000), &mut v);
+
+        assert_eq!(
+            spots.len(),
+            1,
+            "second confirmation, on a new track_id but the same frequency, must spot"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].track_id, 2);
+    }
+
+    /// Two distinct real signals, far enough apart to land in different
+    /// frequency buckets, must never share repetition credit even if they
+    /// happen to decode the same text.
+    #[test]
+    fn different_frequency_buckets_never_share_repetition_credit() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 2,
+            snr_2500_db: 20.0,
+            freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 100_000), &mut v));
+        assert!(
+            spots.is_empty(),
+            "one decode each, at different frequencies, must not share repetition credit"
+        );
     }
 
     /// MAN-29: a configured per-source frequency-calibration correction
