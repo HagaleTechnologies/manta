@@ -103,13 +103,17 @@ basename. That `rustc` is the rustup proxy, so with the pin present it
 resolves to `~/.rustup/toolchains/1.98.1-<host-triple>`, and `cross` installs
 exactly that toolchain, plus the target's `rust-std`, into its container
 (`src/lib.rs:433-473`). The pin reaches `cross`'s container transitively,
-with no `Cross.toml` change. `release.yml`/`release-publish.yml` don't run on
-PRs, so this was confirmed by source-level analysis in this session rather
-than a live release run; the next tagged release is the first opportunity to
-confirm this from real `cross build` logs (no `warn_host_version_mismatch`
-per `cross` `src/lib.rs:581-603`). If a mismatch ever appears there, the
-contained fix is a `cross`-leg-only `toolchain:` input — not a change to this
-pin.
+with no `Cross.toml` change. `release-publish.yml` has no `pull_request`
+trigger at all, and `release.yml`'s `pull_request` trigger is path-filtered,
+so this was confirmed by source-level analysis in this session rather than a
+live `cross build`. To make sure a pin bump is never merged without those
+legs actually running, `rust-toolchain.toml` is listed in `release.yml`'s
+`pull_request.paths` (added in PR #99's review round): a bump PR touching
+only that file still builds every Windows/macOS/`cross`/Docker leg, which is
+the first opportunity to confirm the pin from real `cross build` logs (no
+`warn_host_version_mismatch` per `cross` `src/lib.rs:581-603`). If a mismatch
+ever appears there, the contained fix is a `cross`-leg-only `toolchain:`
+input — not a change to this pin.
 
 ### The guard: `scripts/check-rust-toolchain-pin.sh`
 
@@ -170,8 +174,13 @@ Bumping the pin is manual by design — Dependabot has no ecosystem for
 3. Open a PR touching only `rust-toolchain.toml`. CI's required `test` job
    (`scripts/check-rust-toolchain-pin.sh`, `cargo fmt --all --check`, `cargo
    clippy --workspace --all-targets -- -D warnings`, `cargo test
-   --workspace`) is the acceptance gate — a new stable release's added lints
-   or rustfmt style changes surface there and nowhere else.
+   --workspace`) is the acceptance gate for lint/format drift — a new stable
+   release's added lints or rustfmt style changes surface there. Because
+   `rust-toolchain.toml` is in `release.yml`'s `pull_request.paths`, that
+   same PR also runs the (non-required, build-only) release matrix, so a
+   target-specific regression on Windows, macOS, the `cross`-built Linux
+   legs, or the Docker builder stage surfaces on the bump PR instead of at
+   the next `v*` tag.
 4. Bump when a contributor needs a newer language/library feature or a
    security fix land, and otherwise at least once per release cycle, so no
    single bump ever has to absorb more than one cycle's worth of lint/format
