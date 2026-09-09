@@ -116,6 +116,16 @@ impl SpotMessage {
             de_continent: de.map(|e| e.continent.clone()).unwrap_or_default(),
             snr: Some(spot.snr_db.round() as i32),
             wpm: Some(spot.wpm.round() as i32),
+            // Full decoder precision, deliberately NOT rounded (MAN-130
+            // remediation). The two-decimal rule in
+            // docs/DECISIONS/2026-09-07-cli-output-style.md governs
+            // human-readable CLI output only: the :7301 feed is an
+            // ecosystem contract whose consumers must be able to recover
+            // the decoder's own result and compare it against their own
+            // thresholds, and quantizing here would silently reclassify
+            // threshold-adjacent spots. Changing this wire field's
+            // precision belongs in the schema's external process, not
+            // here.
             decode_confidence: Some(spot.confidence),
             decoder_version: Some(decoder_version.to_string()),
             channelizer_resolution_hz: None,
@@ -221,6 +231,22 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
 
         assert_eq!(msg.dx_dxcc, None);
         assert_eq!(msg.de_dxcc, None);
+    }
+
+    /// MAN-130 remediation: the :7301 JSON feed is full-fidelity. An
+    /// earlier round quantized `decodeConfidence` to two decimals to match
+    /// the CLI's human style; that made the decoder's own result
+    /// unrecoverable for consumers and could flip a threshold-adjacent
+    /// spot's classification. Two decimals is a *display* rule.
+    #[test]
+    fn decode_confidence_keeps_full_decoder_precision_on_the_wire() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.confidence = 0.269_430_5; // the value captured on the live :7301 wire
+        let msg = SpotMessage::from_spot(&spot, "W5AU", &cty, "manta-0.1.0", 0, 1);
+        assert_eq!(msg.decode_confidence, Some(0.269_430_5));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"decodeConfidence\":0.2694305"), "{json}");
     }
 
     #[test]

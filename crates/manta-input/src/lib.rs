@@ -54,6 +54,16 @@ pub struct Sidecar {
     pub center_freq_hz: f64,
 }
 
+/// The operator-facing name of a WAV sample format. `hound::SampleFormat`
+/// has no `Display`, and its `Debug` (`Float`/`Int`) is a Rust variant name
+/// that must not reach the terminal (MAN-130).
+fn sample_format_label(f: hound::SampleFormat) -> &'static str {
+    match f {
+        hound::SampleFormat::Float => "float",
+        hound::SampleFormat::Int => "integer",
+    }
+}
+
 /// Stereo WAV file (ch0=I, ch1=Q) as an IqSource, with an optional `<stem>.json` sidecar for center frequency. ARCHITECTURE §3.
 pub struct WavIqSource {
     samples: Vec<Complex32>,
@@ -79,7 +89,13 @@ impl WavIqSource {
                 .samples::<i16>()
                 .map(|s| s.map(|v| v as f32 / 32768.0))
                 .collect::<Result<_, _>>()?,
-            (f, b) => bail!("unsupported WAV format {f:?}/{b}-bit (need Float32 or Int16)"),
+            // A human label for the sample format, not `SampleFormat`'s
+            // Debug variant: `manta decode <unsupported.wav>` prints this
+            // text verbatim to an operator (MAN-130).
+            (f, b) => bail!(
+                "unsupported WAV format {}/{b}-bit (need 32-bit float or 16-bit integer)",
+                sample_format_label(f)
+            ),
         };
         let samples = interleaved
             .chunks_exact(2)

@@ -883,6 +883,7 @@ dependencies = [
  "clap",
  "coppa-audio",
  "ctrlc",
+ "hound",
  "manta-decode",
  "manta-engine",
  "manta-input",
@@ -890,6 +891,7 @@ dependencies = [
  "manta-spot",
  "manta-testkit",
  "num-complex",
+ "regex",
  "serde_json",
  "tempfile",
  "tokio",
@@ -992,6 +994,7 @@ dependencies = [
  "manta-decode",
  "regex",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

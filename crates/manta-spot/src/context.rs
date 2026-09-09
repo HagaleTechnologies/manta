@@ -15,11 +15,42 @@ use std::sync::LazyLock;
 /// The context a decoded callsign was found in. Carried on `Spot` as the
 /// RBN spot-type flag (ARCHITECTURE §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum SpotType {
     Cq,
     De,
     Beacon,
     Unknown,
+}
+
+impl SpotType {
+    /// The RBN cluster-line context flag. `Unknown` is the empty string:
+    /// the `DX de` line's context column is blank when manta has no
+    /// context to report. Wire format -- do not change.
+    pub fn rbn_flag(self) -> &'static str {
+        match self {
+            SpotType::Cq => "CQ",
+            SpotType::De => "DE",
+            SpotType::Beacon => "BEACON",
+            SpotType::Unknown => "",
+        }
+    }
+}
+
+impl std::fmt::Display for SpotType {
+    /// Human-readable label for terminal output. Differs from `rbn_flag`
+    /// only for `Unknown`, which reads as a word rather than a blank column.
+    ///
+    /// Uses `Formatter::pad`, not `write_str`: `pad` is the only writer that
+    /// honours the format spec's width/fill/alignment, and `fmt::spot_line`
+    /// relies on `{:<7}` to keep the `conf` column aligned across `CQ`,
+    /// `BEACON` and `unknown` rows.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            SpotType::Unknown => "unknown",
+            other => other.rbn_flag(),
+        })
+    }
 }
 
 /// One `parse` match: callsign (uppercased), spot type, the full match's
@@ -235,6 +266,45 @@ pub fn power_step_candidates(text: &str) -> Vec<(String, Range<usize>, Range<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spot_type_renders_a_human_label_not_a_rust_variant() {
+        assert_eq!(SpotType::Cq.to_string(), "CQ");
+        assert_eq!(SpotType::De.to_string(), "DE");
+        assert_eq!(SpotType::Beacon.to_string(), "BEACON");
+        assert_eq!(SpotType::Unknown.to_string(), "unknown");
+    }
+
+    /// `fmt::spot_line` aligns its context column with `{:<7}`, which only
+    /// works if `Display` writes through `Formatter::pad` -- `write_str`
+    /// silently ignores width/fill/alignment (MAN-130 remediation).
+    #[test]
+    fn spot_type_display_honours_a_width_spec() {
+        assert_eq!(format!("[{:<7}]", SpotType::Cq), "[CQ     ]");
+        assert_eq!(format!("[{:<7}]", SpotType::Beacon), "[BEACON ]");
+        assert_eq!(format!("[{:<7}]", SpotType::Unknown), "[unknown]");
+    }
+
+    /// `#[serde(rename_all = "UPPERCASE")]` is an output decision, not an
+    /// incidental derive setting: `--json` renders `"CQ"`, not the Rust
+    /// variant `"Cq"`. See docs/DECISIONS/2026-09-07-cli-output-style.md.
+    #[test]
+    fn spot_type_serializes_as_the_human_label() {
+        assert_eq!(serde_json::to_string(&SpotType::Cq).unwrap(), "\"CQ\"");
+        assert_eq!(
+            serde_json::to_string(&SpotType::Unknown).unwrap(),
+            "\"UNKNOWN\""
+        );
+    }
+
+    /// The RBN cluster line's context column is BLANK for `Unknown` -- a
+    /// wire behaviour `format_line` has always had. `Display` must not be
+    /// used there.
+    #[test]
+    fn rbn_flag_keeps_unknown_blank() {
+        assert_eq!(SpotType::Unknown.rbn_flag(), "");
+        assert_eq!(SpotType::Cq.rbn_flag(), "CQ");
+    }
 
     /// Asserts only the candidate/type of every returned match, ignoring
     /// byte ranges (exercised by their own tests below) and order.

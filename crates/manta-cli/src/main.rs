@@ -7,6 +7,8 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::PathBuf;
 
+mod fmt;
+
 #[derive(Parser)]
 #[command(
     name = "manta",
@@ -186,6 +188,9 @@ enum Command {
         /// Duration in seconds.
         #[arg(long)]
         duration: u64,
+        /// Emit the soak report as one JSON object on stdout.
+        #[arg(long)]
+        json: bool,
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
         #[arg(long, conflicts_with = "device")]
@@ -475,7 +480,27 @@ fn open_source(
 
 fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
-        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+        Some(path) => {
+            let src = manta_input::AudioIqSource::from_wav_file(&path).map_err(|e| {
+                // Name the file first -- an error that says only "No such
+                // file or directory" leaves the operator guessing which of
+                // several paths on the command line was wrong.
+                let e = e.context(format!("open audio source {}", path.display()));
+                // The hint is about the file's *contents* (rate/layout), so
+                // it only helps when there is a file to have contents: on a
+                // mistyped path it sends the operator off to check a sample
+                // rate that was never the problem.
+                if path.is_file() {
+                    e.context(fmt::Hint(
+                        "--source takes a 48 kHz mono audio WAV; use `manta decode <file>` for \
+                         an IQ WAV",
+                    ))
+                } else {
+                    e
+                }
+            })?;
+            Box::new(src)
+        }
         None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
 }
@@ -515,7 +540,7 @@ impl IqSource for FixedCenterFreqSource {
 fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     let ppm: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| e.to_string())?;
     Ok(ppm)
 }
@@ -653,11 +678,12 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !hz.is_finite() || hz <= 0.0 {
-        return Err(format!(
-            "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
-        ));
+        // Clap's own frame already prints `invalid value '<v>' for
+        // '--dial-freq-hz <..>': `, so the flag name and the value belong
+        // to it, not to this message (MAN-130).
+        return Err("must be a finite, positive number of Hz".to_string());
     }
     Ok(hz)
 }
@@ -691,11 +717,10 @@ const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --hpsdr-rate {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !hz.is_finite() || !(MIN_HPSDR_RATE_HZ..=MAX_HPSDR_RATE_HZ).contains(&hz) {
         return Err(format!(
-            "--hpsdr-rate must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
-             {MAX_HPSDR_RATE_HZ}, got {hz}"
+            "must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and {MAX_HPSDR_RATE_HZ}"
         ));
     }
     Ok(hz)
@@ -711,11 +736,9 @@ fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --hpsdr-freq {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseFloatError| e.to_string())?;
     if !hz.is_finite() || hz <= 0.0 {
-        return Err(format!(
-            "--hpsdr-freq must be a finite, positive number of Hz, got {hz}"
-        ));
+        return Err("must be a finite, positive number of Hz".to_string());
     }
     Ok(hz)
 }
@@ -742,11 +765,10 @@ const MAX_REPLAY_EPOCH_SECS: i64 = 4_102_444_800;
 fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
     let secs: i64 = s
         .parse()
-        .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
     if !(0..=MAX_REPLAY_EPOCH_SECS).contains(&secs) {
         return Err(format!(
-            "--replay-epoch must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
-             (2100-01-01), got {secs}"
+            "must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} (2100-01-01)"
         ));
     }
     Ok(secs)
@@ -892,8 +914,16 @@ fn start_spot_server(
     // non-JSON tracing line corrupts that machine-readable stream for
     // real consumers and breaks deterministic-replay byte-identity.
     // stderr is a separate stream a JSON-Lines consumer never reads.
+    // `fmt::monitor_aware_stderr`, not `std::io::stderr`: `listen`'s live
+    // character monitor writes stderr WITHOUT a trailing newline, and the
+    // telnet/JSON tasks this function spawns log connections and
+    // disconnections to the same stream while `listen` is still running --
+    // so a record written straight to stderr lands in the middle of the
+    // monitor's line (`CQ DE W1AW2026-.. raw TCP client connected`). The
+    // monitor-aware writer closes that line first and holds the stderr
+    // lock for the whole record (MAN-130 review).
     let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(fmt::monitor_aware_stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -1026,7 +1056,23 @@ fn start_spot_server(
     ))
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            // The `error:` line starts in column zero even if a live
+            // monitor left stderr mid-line (MAN-130).
+            fmt::end_monitor_line();
+            eprintln!("{}", fmt::render_error(&err));
+            if let Some(hint) = fmt::render_hint(&err) {
+                eprintln!("{hint}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<std::process::ExitCode> {
     match Cli::parse().command {
         Command::Decode {
             path,
@@ -1042,8 +1088,12 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!("{}", report.text);
-                eprintln!("freq_hz: {:.1}  wpm: {:?}", report.freq_hz, report.wpm);
-                eprintln!("spots: {}", report.spots.len());
+                eprintln!(
+                    "frequency: {} kHz  speed: {} WPM  spots: {}",
+                    fmt::khz(report.freq_hz),
+                    fmt::wpm_opt(report.wpm),
+                    report.spots.len()
+                );
             }
         }
         Command::Gen { vector, out } => {
@@ -1054,17 +1104,26 @@ fn main() -> Result<()> {
                 "v4" => manta_testkit::vectors::v4(),
                 "v5" => manta_testkit::vectors::v5(),
                 "v6" => manta_testkit::vectors::v6(),
-                other => bail!("unknown vector {other:?} (available: v1-v6)"),
+                // `escape_debug`, not `other` verbatim: the argument is
+                // operator-supplied and `render_error` prints this text to a
+                // terminal, so an embedded escape sequence
+                // (`manta gen $'\e[2Jbad'`) would otherwise clear or
+                // recolour the screen. Single quotes stay -- this is the
+                // human style, not Rust's `{:?}` (MAN-130 review).
+                other => bail!(
+                    "unknown vector '{}' (available: v1-v6)",
+                    other.escape_debug()
+                ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
             eprintln!(
-                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {:.1} Hz)",
+                "wrote {}/{{{}.wav,{}.json,{}.manifest.json}} (expected freq {} kHz)",
                 out.display(),
                 spec.name,
                 spec.name,
                 spec.name,
-                manifest.expected_freq_hz
+                fmt::khz(manifest.expected_freq_hz)
             );
         }
         Command::Listen {
@@ -1264,6 +1323,15 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            // The character monitor writes to stderr WITHOUT a trailing
+            // newline (it grows a character at a time, live), so whatever
+            // stderr prints next would otherwise be appended to it --
+            // `CQ DE W1AWerror: ...` when the source fails mid-run, e.g. a
+            // KiwiSDR disconnect, or a spot-server log line mid-run. Every
+            // write goes through `fmt`'s shared monitor-line state, which
+            // remembers that the line is open so the error path, the clean
+            // EOF path and the `tracing` writer alike can close it before
+            // writing (MAN-130).
             let listen_result = manta_engine::listen(
                 src,
                 &cfg,
@@ -1274,18 +1342,17 @@ fn main() -> Result<()> {
                         return;
                     }
                     use manta_decode::events::DecoderEvent;
-                    use std::io::Write as _;
+                    // The live per-character monitor is a diagnostic (is it
+                    // hearing anything?), not the command's product -- it
+                    // goes to stderr so the spot lines on stdout stay clean.
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
                             if let Some(c) = glyph.text_char() {
-                                print!("{c}");
-                                let _ = std::io::stdout().flush();
+                                let mut buf = [0u8; 4];
+                                fmt::monitor_write(c.encode_utf8(&mut buf));
                             }
                         }
-                        DecoderEvent::WordBoundary { .. } => {
-                            print!(" ");
-                            let _ = std::io::stdout().flush();
-                        }
+                        DecoderEvent::WordBoundary { .. } => fmt::monitor_write(" "),
                         _ => {}
                     }
                 },
@@ -1293,6 +1360,7 @@ fn main() -> Result<()> {
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
                 // ARCHITECTURE §7), fed here when --server-config is set.
+                // The spot is the product: it goes to stdout in both modes.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
@@ -1302,17 +1370,18 @@ fn main() -> Result<()> {
                         println!("{}", serde_json::json!({ "spot": spot }));
                         return;
                     }
-                    eprintln!(
-                        "SPOT: {} ({:?}) {:.1} Hz {:.0} dB {:.0} wpm conf={:.2}",
-                        spot.callsign,
-                        spot.spot_type,
-                        spot.freq_hz,
-                        spot.snr_db,
-                        spot.wpm,
-                        spot.confidence
-                    );
+                    println!("{}", fmt::spot_line(spot));
                 },
             );
+
+            // Close the monitor's unterminated line the moment `listen`
+            // returns, before anything else can write to stderr: the
+            // `error:` line `main` renders from `listen_result?` below --
+            // and any shutdown-time log line from the block that follows --
+            // must start in column zero, not glued to the last decoded
+            // character (MAN-130). No-op if the monitor never wrote, or if
+            // a `tracing` record already closed the line.
+            fmt::end_monitor_line();
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from
@@ -1336,6 +1405,7 @@ fn main() -> Result<()> {
         }
         Command::Soak {
             duration,
+            json,
             device,
             source,
             kiwi_host,
@@ -1403,9 +1473,41 @@ fn main() -> Result<()> {
                 }
             };
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
-            eprintln!("{report:?}");
-            if !manta_engine::soak_passed(&report) {
-                std::process::exit(1);
+            let passed = manta_engine::soak_passed(&report);
+            // `duration_s` is the interval the pipeline was ACTUALLY
+            // exercised (`SoakReport::ran_for`), not the request: a file
+            // source returns at EOF, so reporting the request would let a
+            // one-minute fixture be recorded as a successful 24 h soak
+            // (MAN-130 remediation). The request is reported beside it so a
+            // truncated run is visible rather than merely short.
+            let ran_for_s = report.ran_for.as_secs_f64();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "passed": passed,
+                        "duration_s": (ran_for_s * 10.0).round() / 10.0,
+                        "requested_duration_s": duration,
+                        "events_emitted": report.events_emitted,
+                        "rss_growth_bytes": report.rss_growth_bytes,
+                        "panicked": report.panicked,
+                    }))?
+                );
+            } else {
+                println!("soak: {}", if passed { "passed" } else { "FAILED" });
+                println!("  duration:    {ran_for_s:.1} s (requested {duration} s)");
+                println!("  events:      {}", report.events_emitted);
+                println!(
+                    "  rss growth:  {:.1} MiB",
+                    report.rss_growth_bytes as f64 / (1024.0 * 1024.0)
+                );
+                println!(
+                    "  panicked:    {}",
+                    if report.panicked { "yes" } else { "no" }
+                );
+            }
+            if !passed {
+                return Ok(std::process::ExitCode::FAILURE);
             }
         }
         Command::Doctor {
@@ -1512,7 +1614,7 @@ fn main() -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Human-readable `manta doctor` summary. `--json` bypasses this entirely
