@@ -55,17 +55,23 @@ pub const NO_DXCC_ENTITY: i64 = 0;
 /// mean "somewhere else", which cty.dat's base-prefix answer still describes
 /// at entity granularity.
 ///
-/// Split from the RIGHT: `grammar::is_plausible` only admits a single `/`,
-/// but MAN-28's Watch List allowlist bypasses the grammar gate entirely
-/// (`validator.rs:676-688`), so a compound call like `PJ4/K5ARH/MM` can reach
-/// here -- and it is just as maritime-mobile as the simple form.
+/// Checks EVERY segment after the first, not just the trailing one:
+/// `grammar::is_plausible` only admits a single `/`, but MAN-28's Watch List
+/// allowlist bypasses the grammar gate entirely (`validator.rs:676-688`), so
+/// a compound call like `PJ4/K5ARH/MM` -- or one that carries a further
+/// designator after the mobile one, `K5ARH/MM/QRP` -- can reach here, and
+/// both are just as maritime-mobile as the simple form. A trailing-segment-
+/// only test would hand the latter its base prefix's home entity, which is
+/// the exact corruption this function exists to prevent.
+///
+/// The FIRST segment is deliberately exempt: it is the base call or a
+/// prefix-override, never a designator, and `MM`/`AM` are real DXCC prefixes
+/// there (Scotland, Spain) -- `MM/K5ARH` is a station IN Scotland, whose
+/// geography cty.dat describes correctly.
 pub fn is_outside_any_dxcc_entity(callsign: &str) -> bool {
-    match callsign.rsplit_once('/') {
-        Some((_, designator)) => {
-            designator.eq_ignore_ascii_case("MM") || designator.eq_ignore_ascii_case("AM")
-        }
-        None => false,
-    }
+    callsign.split('/').skip(1).any(|designator| {
+        designator.eq_ignore_ascii_case("MM") || designator.eq_ignore_ascii_case("AM")
+    })
 }
 
 /// The contract-required geography fields for ONE side of a spot, resolved
@@ -453,26 +459,52 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
 
     /// MAN-28's Watch List allowlist bypasses `grammar::is_plausible`
     /// entirely (validator.rs:676-688), so a compound call can reach
-    /// `from_spot` even though the grammar admits only one `/`. Its trailing
-    /// designator still decides -- `is_outside_any_dxcc_entity` splits from
-    /// the right.
+    /// `from_spot` even though the grammar admits only one `/`. A mobile
+    /// designator anywhere after the first segment still decides --
+    /// `is_outside_any_dxcc_entity` tests all of them, so the marker counts
+    /// wherever in the compound it sits.
     #[test]
-    fn a_compound_call_with_a_trailing_mobile_designator_is_still_mobile() {
+    fn a_compound_call_with_a_mobile_designator_is_still_mobile() {
         let cty = cty::Table::parse(CTY_FIXTURE);
-        let mut spot = sample_spot();
-        spot.callsign = "KP4/K5ARH/MM".to_string();
-        let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
+        // Trailing, and -- since the allowlist admits any number of `/`
+        // segments -- NOT trailing: a rsplit-once test would hand
+        // `K5ARH/MM/QRP` the United States (291) it is by definition not in.
+        for call in ["KP4/K5ARH/MM", "K5ARH/MM/QRP", "K5ARH/AM/P"] {
+            let mut spot = sample_spot();
+            spot.callsign = call.to_string();
+            let msg = SpotMessage::from_spot(&spot, "W3XYZ", &cty, "manta-0.1.0", 0, 0);
 
-        assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY);
-        assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE);
+            assert_eq!(msg.dx_dxcc, NO_DXCC_ENTITY, "{call}");
+            assert_eq!(msg.dx_cq_zone, UNKNOWN_CQ_ZONE, "{call}");
+            assert_eq!(msg.dx_continent, UNKNOWN_CONTINENT, "{call}");
+            assert!(msg.dx_lat.is_none(), "{call}");
+        }
     }
 
     #[test]
     fn is_outside_any_dxcc_entity_matches_only_the_two_mobile_designators() {
-        for call in ["K5ARH/MM", "K5ARH/AM", "k5arh/am", "KP4/K5ARH/MM"] {
+        for call in [
+            "K5ARH/MM",
+            "K5ARH/AM",
+            "k5arh/am",
+            "KP4/K5ARH/MM",
+            "K5ARH/MM/QRP",
+        ] {
             assert!(is_outside_any_dxcc_entity(call), "{call}");
         }
-        for call in ["K5ARH", "K5ARH/P", "K5ARH/M", "K5ARH/3", "MM0ABC", "AM1AB"] {
+        // `MM`/`AM` in the FIRST segment are the Scottish and Spanish
+        // prefixes, not designators: `MM/K5ARH` is a station in Scotland and
+        // keeps the geography cty.dat resolves for it.
+        for call in [
+            "K5ARH",
+            "K5ARH/P",
+            "K5ARH/M",
+            "K5ARH/3",
+            "MM0ABC",
+            "AM1AB",
+            "MM/K5ARH",
+            "AM/K5ARH/P",
+        ] {
             assert!(!is_outside_any_dxcc_entity(call), "{call}");
         }
     }
