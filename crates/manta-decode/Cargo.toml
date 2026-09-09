@@ -14,3 +14,8 @@ serde = { workspace = true }
 approx = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hsmm_300_tracks"
+harness = false
