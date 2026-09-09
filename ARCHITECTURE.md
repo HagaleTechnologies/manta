@@ -249,7 +249,11 @@ transmission may never produce again).
    in the band map rather than in what it uploads.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
-   refreshable) — a call with an unallocated prefix is rejected.
+   refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
+   also joined, on that same primary-prefix field, against a small vendored
+   ADIF DXCC entity-number table (`data/dxcc.tsv`, MAN-136) — refreshed
+   together, see `crates/manta-spot/data/SOURCES.md` — which is what lets
+   `manta-server`'s JSON stream populate `dxDxcc`/`deDxcc` (§7).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
@@ -300,11 +304,22 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
   clients not to choke. This is the RBN/aggregator compatibility surface.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
+<<<<<<< HEAD
   (adds confidence, track id, decoder text context — including the `rst` and
   `qrlQuery` message-content annotations from §6 step 1a, MAN-33, each omitted
   from the wire when empty because they are not yet ratified in the dispensa
   contract). This is the cqdx ingest surface; schema published in `dispensa` as a JSON Schema contract
   alongside the existing ecosystem contracts.
+=======
+  (adds confidence, track id, decoder text context). This is the cqdx ingest
+  surface; schema published in `dispensa` as a JSON Schema contract alongside the
+  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
+  resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
+  `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
+  `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
+  see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+>>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline.
 - **Exposure policy (normative, not just observed behavior):** both servers are
@@ -342,8 +357,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
   currently-implemented subset is `manta_spots_total`,
   `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
+  `manta_spots_dropped_write_failed_total`,
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
+  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
+  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
+  has no row in the vendored `dxcc.tsv`), per-protocol
+  client-connected gauges, `manta_source_health`, and the uplink counters
   (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
   per-stage queue depths, which MAN-56 tracks as a separate gap.
   **`manta_active_tracks` is served but not populated** (corrected

@@ -16,6 +16,16 @@ pub struct Metrics {
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
+    /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
+    /// against `cty.dat` -- or resolved only through the base prefix of a
+    /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
+    /// was emitted with the `UNKNOWN_DXCC`/`UNKNOWN_CONTINENT`/
+    /// `UNKNOWN_CQ_ZONE` sentinels instead of real geography. ARCHITECTURE §8: "every dropped/evicted/suppressed item is
+    /// counted" -- an operator otherwise has no way to notice this is
+    /// happening. Incremented once per spot at publish time (`main.rs`), not
+    /// inside `SpotMessage::from_spot` (which runs once per connected
+    /// client).
+    spots_unresolved_geography_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
@@ -81,6 +91,15 @@ impl Metrics {
     pub fn record_write_failed(&self, n: u64) {
         self.spots_dropped_write_failed_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// MAN-136/MAN-45: call once per spot (not per connected client) when
+    /// either the dx or de callsign didn't resolve against `cty.dat`, so the
+    /// wire message carries the `UNKNOWN_*` sentinels instead of real
+    /// geography.
+    pub fn record_unresolved_geography(&self) {
+        self.spots_unresolved_geography_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_telnet_clients(&self) {
@@ -257,6 +276,16 @@ impl Metrics {
                 .load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat, OR its entity carries no row in the vendored dxcc.tsv, OR it carries a /MM or /AM designator that places it outside any DXCC entity.\n",
+        );
+        out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_unresolved_geography_total {}\n",
+            self.spots_unresolved_geography_total
+                .load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
         out.push_str("# TYPE manta_telnet_clients_connected gauge\n");
         out.push_str(&format!(
@@ -430,6 +459,25 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_dropped_write_failed_total counter"));
         assert!(text.contains("manta_spots_dropped_write_failed_total 7"));
+    }
+
+    #[test]
+    fn unresolved_geography_is_counted_and_exposed() {
+        let m = Metrics::new();
+        m.record_unresolved_geography();
+        m.record_unresolved_geography();
+        assert!(m
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 2"));
+    }
+
+    #[test]
+    fn unresolved_geography_counter_is_present_at_zero_before_any_spot() {
+        // A counter that only appears once it fires is invisible to an operator
+        // building a dashboard -- the other spot counters all render at 0.
+        assert!(Metrics::new()
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 0"));
     }
 
     #[test]

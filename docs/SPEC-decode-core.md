@@ -409,12 +409,31 @@ and are specified in `manta-spot`, not here. The ≥ 2-repetition gate for
 first spot is unchanged for non-beacon, non-allowlisted spot types; a
 message already type-tagged `BEACON` by the context parse (ARCHITECTURE §6
 step 1), or a callsign the operator has explicitly allowlisted (ARCHITECTURE
-§6's Watch List), is exempt from this gate and may spot on its first decode
-(MAN-28) — `r` still feeds `c_call` above unchanged, so a single-decode spot
-of either kind still carries the `r=1` confidence penalty. An allowlisted
-callsign also bypasses ARCHITECTURE §6 steps 1 (context parse -- tagged
-`SpotType::Unknown` when no CQ/DE/UP/beacon pattern matched) and 2
-(grammar/cty) entirely.
+§6's Watch List), is exempt from this gate — never needs a second, distinct
+decode (MAN-28). `r` still feeds `c_call` above unchanged, so a spot of
+either kind still carries the `r=1` confidence penalty at the repetition
+count it actually resolved with. An allowlisted callsign also bypasses
+ARCHITECTURE §6 steps 1 (context parse -- tagged `SpotType::Unknown` when no
+CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, and may spot
+the instant its pattern completes, as before.
+
+**Beacon emission timing (amended 2026-09-09, see
+`docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md`):** a
+non-allowlisted `BEACON`-tagged candidate no longer spots "on the first
+decode" in the sense of immediately as it's parsed. It is captured (grammar/
+cty/blocklist/notch checked immediately, as always) but held until the
+track's true close (`TrackClosed`), and only then evaluated against the
+track's true final reported speed (an implausibly fast final speed --
+`manta-spot`'s `MAX_PLAUSIBLE_WPM`, a validator-local heuristic, not a SPEC
+value -- permanently discards it; nothing here is retried). This was found
+necessary in practice: a live WPM reading taken at the moment of first
+decode is not yet the track's true, settled value, and gating emission on
+it (in either direction) reopened exactly the noise-artifact false-positive
+problem the heuristic exists to close. The repetition-gate exemption itself
+is unchanged -- a non-allowlisted beacon still never needs a second, distinct
+decode -- only the MOMENT of emission moved from "first decode" to "track
+close." An allowlisted callsign is unaffected by this and still spots
+immediately.
 
 ---
 
@@ -529,7 +548,7 @@ step 1a) in `crates/manta-spot/tests/golden_v31_v32.rs`.
 | V15 | dedupe | Repeat spot inside the 10 min window, then an SNR jump >= 6 dB | Suppressed inside the window; allowed after the SNR jump |
 | V16 | bad-call blocklist | Callsign present vs. absent from the operator's bad-call list | Present → 0 spots; absent → spots normally |
 | V17 | notched frequency | Track frequency inside vs. outside a notched range | Inside → 0 spots; outside → spots normally |
-| V18 | beacon-repetition-exemption | 1 decode of a `V V V <call>` beacon pattern | `BEACON`-tagged spot emits on the first decode, gate not applied (MAN-28) |
+| V18 | beacon-repetition-exemption | 1 decode of a `V V V <call>` beacon pattern, track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes -- repetition gate not applied regardless (MAN-28); emission TIMING moved to track-close 2026-09-09, see §4's amendment note -- no spot before `TrackClosed` |
 | V19 | allowlist-bypass | A single decode of a callsign with an unallocated cty prefix, explicitly allowlisted | Spots despite failing grammar/cty and despite only 1 decode (MAN-28 Watch List) |
 | V20 | allowlist-no-context | An allowlisted callsign decoded with no CQ/DE/UP/beacon framing at all | Spots, tagged `SpotType::Unknown` (MAN-28 Watch List, the primary NCDXF-beacon case) |
 | V21 | allowlist-independent-of-context | A stale, already-attempted context match (e.g. `CQ K5ARH`, decoded once, never spotted) sits in the window when a different, freshly-allowlisted word arrives | The allowlisted word still spots -- context-match and allowlist candidates are evaluated independently, not one-or-the-other by priority (MAN-28 Watch List) |
@@ -541,9 +560,13 @@ step 1a) in `crates/manta-spot/tests/golden_v31_v32.rs`.
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
+<<<<<<< HEAD
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37) | `BEACON`-tagged spot emits on the first decode, gate not applied -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern |
 | V31 | rst-extraction | A track decodes `TU 5NN` before its callsign spots; then a later `339` replaces it; then 17 filler words age the RST out of the 16-word window | The spot carries `rst = "599"`; the later report replaces it (`"339"`); an aged-out report is still reported (per-track, not per-window) |
 | V32 | qrl-query-flag | A track sends `QRL?` before calling CQ, vs. a bare `QRL` response, vs. an ordinary CQ with no QRL | `qrl_query` true only in the first case (the interrogative form is required); false for the bare response and the ordinary CQ; `TrackClosed` clears it |
+=======
+| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+>>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
 
 ---
 

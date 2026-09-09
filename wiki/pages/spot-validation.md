@@ -28,6 +28,7 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 - Populate the Watch List with the repeatable `--allowlist <CALL>` flag on `manta decode`/`listen`/`soak`/`doctor` — every subcommand that runs the decode pipeline takes it (`crates/manta-cli/src/main.rs`, all four `allowlist: Vec<String>` args forwarded through `build_pipeline_config`), and that flag is the only path wired up today. SPEC §9's `[spot] allowlist` TOML key is **spec-only**: the daemon config file loader deserializes just `[server]` and `[[rbn_uplink]]` (`crates/manta-server/src/config.rs`, `DaemonConfigFile`), so an `allowlist` under `[spot]` in a `--server-config` file is read by nothing and enables no exemption.
 - Dedupe key = (callsign, freq bucket) with a re-spot suppression window unless SNR improves or type changes: §6.5.
 - `Validator::tracks`/`RepetitionGate::seen` are per-track_id state that must be freed on `DecoderEvent::TrackClosed` — the normative teardown contract (a real, measured leak this bug produced) lives in `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`, not here.
+- An operator-allowlisted callsign (MAN-28's Watch List) can bypass the cty.dat prefix gate entirely, so a spot can reach [[spot-output-contract]] for a call cty.dat genuinely can't resolve — see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md` for what manta emits in that case.
 
 ## Why it is shaped this way
 
