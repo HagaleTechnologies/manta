@@ -54,7 +54,20 @@ pub struct Evidence {
     prefix: f64,
     last_sign: i8,
     last_present: bool,
+    /// Global (push-order) index of the next center to emit. Independent of
+    /// `self.h`, which may change between pushes via `set_u_ref` — this is
+    /// what makes speed changes safe: emission order and count depend only
+    /// on this counter advancing by exactly 1 per successful emission,
+    /// never on `h`.
+    next_center_g: u64,
 }
+
+/// Generous fixed retention cap for the delay line, independent of `h` --
+/// large enough for any realistic `hold_dits * u_max` (SPEC v2 §7: u_max
+/// default 56 hops, hold_dits default 4 -> h ~= 224 at the extreme; retaining
+/// several multiples of that bounds memory without ever needing to trim in
+/// a way that's coupled to a changing `h`).
+const MAX_RETAIN: usize = 4096;
 
 impl Evidence {
     pub fn new(cfg: EvidenceConfig) -> Self {
@@ -71,6 +84,7 @@ impl Evidence {
             prefix: 0.0,
             last_sign: 0,
             last_present: false,
+            next_center_g: 0,
         }
     }
 
@@ -88,33 +102,43 @@ impl Evidence {
         self.a_s = Some(a_s);
         self.line.push_back((amp, a_s, noise_amp, sample_ts));
         self.hop_in += 1;
-        // Emit once we have h hops of look-ahead past the center element.
-        if self.line.len() > 2 * self.h + 1 {
+        if self.line.len() > MAX_RETAIN {
             self.line.pop_front();
         }
-        if self.line.len() < self.h + 1 {
-            return None;
+        let front_global = self.hop_in - self.line.len() as u64;
+        if self.next_center_g < front_global {
+            // Fell behind the retained window (should not happen with a
+            // generous MAX_RETAIN in practice); jump to the oldest
+            // available sample rather than panic on the subtraction below.
+            self.next_center_g = front_global;
         }
-        let center = self.line.len() - 1 - self.h;
-        Some(self.emit(center))
+        let local = (self.next_center_g - front_global) as usize;
+        if local + self.h >= self.line.len() {
+            return None; // not enough forward lookahead yet
+        }
+        let ev = self.emit(local);
+        self.next_center_g += 1;
+        Some(ev)
     }
 
     pub fn flush(&mut self) -> Vec<HopEvidence> {
-        // SDD execution 2026-09-09, Task 4 fix round 1: no new input arrives
-        // during flush, so every already-buffered element keeps its full
-        // backward reach at the current `h` -- only the forward reach is
-        // genuinely limited by `line.len()-1`, which `emit()`'s existing
-        // `.min()` already handles correctly. The original version mutated
-        // `self.h` here, shrinking the backward reach too and corrupting M
-        // near the end of every stream.
+        // SDD execution 2026-09-09, Task 8a: `next_center_g` is a global,
+        // `h`-independent counter, so draining here needs no special-casing
+        // of `self.h` at all (unlike the old center-derivation this
+        // replaced) -- just keep emitting the next global center until the
+        // buffer is exhausted.
         let mut out = Vec::new();
-        let next_center = if self.line.len() > self.h {
-            self.line.len() - self.h
-        } else {
-            0
-        };
-        for center in next_center..self.line.len() {
-            out.push(self.emit(center));
+        loop {
+            let front_global = self.hop_in - self.line.len() as u64;
+            if self.next_center_g < front_global {
+                self.next_center_g = front_global;
+            }
+            let local = (self.next_center_g - front_global) as usize;
+            if local >= self.line.len() {
+                break;
+            }
+            out.push(self.emit(local));
+            self.next_center_g += 1;
         }
         out
     }
@@ -470,5 +494,81 @@ mod tests {
             "tail amplitude 0.3 under a held mark of 1.0 must read space-like, not a phantom mark: llr={}",
             last.llr
         );
+    }
+
+    // [Task 8a, SDD execution 2026-09-09] Reproduces Task 4 review's deferred
+    // I3 finding: the old `push`/`flush` derived `center = line.len()-1-h`
+    // from the CURRENT `self.h`, so a mid-stream `set_u_ref` (Task 8's HSMM
+    // decoder is the first real caller) shifts which buffered sample is
+    // treated as "center" for the next emission -- duplicating an
+    // already-emitted sample, skipping one entirely, or corrupting the
+    // `prefix` running sum. This test feeds a varying-amplitude stream
+    // through two mid-stream `set_u_ref` calls (h shrinks, then grows far
+    // past its original value) and checks the emitted stream is a clean,
+    // order-preserving, one-to-one image of the input regardless.
+    #[test]
+    fn set_u_ref_mid_stream_preserves_emission_order_and_prefix() {
+        let mut e = Evidence::new(EvidenceConfig::default());
+        e.set_u_ref(20.0); // h = 4*20 = 80
+        let n_hops = 300usize;
+        let mut fed_amps = Vec::with_capacity(n_hops);
+        let mut out = Vec::with_capacity(n_hops);
+        for i in 0..n_hops {
+            // Varying but always well above the noise floor, so the keying
+            // gate stays present throughout -- this test is about ordering,
+            // not the gate/LLR math (already covered elsewhere).
+            let amp = 0.6 + 0.3 * ((i as f32) * 0.037).sin();
+            fed_amps.push(amp);
+            if i == 100 {
+                e.set_u_ref(10.0); // h shrinks to 40
+            }
+            if i == 200 {
+                e.set_u_ref(40.0); // h grows to 160, past its original value
+            }
+            if let Some(h) = e.push(amp, 0.05, i as u64) {
+                out.push(h);
+            }
+        }
+        out.extend(e.flush());
+
+        // Every fed hop must be emitted exactly once: no duplicate, no gap.
+        assert_eq!(
+            out.len(),
+            n_hops,
+            "expected exactly one emission per pushed hop"
+        );
+
+        // (a) hop indices are exactly 0..N-1 with no duplicate or gap.
+        let hops: Vec<u64> = out.iter().map(|h| h.hop).collect();
+        let expected: Vec<u64> = (0..out.len() as u64).collect();
+        assert_eq!(
+            hops, expected,
+            "hop sequence must be contiguous with no dup/gap"
+        );
+
+        // (b) amp values, read in order, exactly match what was fed -- this
+        // is what actually catches a duplicated/skipped center sample: the
+        // old code kept the hop counter contiguous even while silently
+        // rebinding it to the wrong buffered sample.
+        for (i, h) in out.iter().enumerate() {
+            assert!(
+                (h.amp - fed_amps[i]).abs() < 1e-6,
+                "hop {i}: emitted amp {} != fed amp {} (sample duplicated or skipped)",
+                h.amp,
+                fed_amps[i]
+            );
+        }
+
+        // (c) prefix is a clean running sum of llr in emission order -- no
+        // out-of-order or duplicate emission folded an extra/missing term
+        // into it.
+        for i in 1..out.len() {
+            let delta = out[i].prefix - out[i - 1].prefix;
+            assert!(
+                (delta - out[i].llr as f64).abs() < 1e-6,
+                "hop {i}: prefix delta {delta} != llr {} (prefix corrupted)",
+                out[i].llr
+            );
+        }
     }
 }
