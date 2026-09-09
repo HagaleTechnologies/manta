@@ -139,7 +139,16 @@ def match(manta_spots, truth_by_key, freq_tol_hz, time_tol_s):
 
 
 def parse_iso(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    """Parses --capture-start. A timezone-naive value (no trailing Z or
+    explicit offset) is assumed UTC, matching every other timestamp this
+    script handles (RBN truth rows, sample_ts-derived spot times) --
+    otherwise a naive value here would crash the time-tolerance matching
+    in `match()` (Codex review, PR #144) the first time it's subtracted
+    against an RBN truth row's timezone-aware UTC timestamp."""
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def main():
