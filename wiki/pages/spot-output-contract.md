@@ -9,8 +9,8 @@ sources:
   - README.md
   - CLAUDE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: 01d1ea1
+  date: 2026-09-07
 links:
   - spot-validation
 ---
@@ -24,4 +24,4 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 
 ## Status caveat
 
-The JSON schema is **not yet frozen in dispensa** — treat the field set as design-phase until the ADR lands. Do not restate fields here; the contract, once written, is authoritative. Validated spots reaching these surfaces come from [[spot-validation]].
+A schema now exists in dispensa and rejects malformed batches — this is no longer design-phase. `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are required and non-nullable on it; every spot carries real or named-sentinel values for all five (never `null`), per `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`, which is the authoritative record of what each field means when a callsign doesn't resolve — see that doc and ARCHITECTURE §7 rather than restating the field set here. Validated spots reaching these surfaces come from [[spot-validation]].
