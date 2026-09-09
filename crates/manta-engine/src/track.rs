@@ -482,7 +482,8 @@ impl TrackManager {
     /// input) is always `false` here; the decoder pool runs after this
     /// whole batch, so no per-hop decode result is available yet to feed
     /// back into the same hop's lifecycle bookkeeping.
-    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> Vec<u32> {
+    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> (Vec<u32>, Vec<DecoderEvent>) {
+        let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -531,6 +532,20 @@ impl TrackManager {
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     track.pending.push((hop.power[k].sqrt(), sample_ts));
+                    // Emitted unconditionally here, at the exact hop the
+                    // detector made this decision -- NOT gated by
+                    // `has_emitted`/TrackClosed's same-batch-merge filter
+                    // (MAN-19) further down. A track promoted and merged
+                    // away within this same `process_hops` call still
+                    // really was promoted; that's exactly the ground truth
+                    // `doctor()`'s NoSignal check needs and the other event
+                    // kinds can't reliably provide (see events.rs's doc
+                    // comment on this variant).
+                    promoted_events.push(DecoderEvent::TrackPromoted {
+                        track_id: id,
+                        sample_ts,
+                        freq_hz,
+                    });
                 }
                 LifecycleEvent::None => {
                     // Feed the decoder every hop once it exists (ACTIVE *or*
@@ -610,7 +625,7 @@ impl TrackManager {
         self.recompute_ownership();
         closed.extend(self.merge_converged());
         closed.extend(self.evict_over_cap());
-        closed
+        (closed, promoted_events)
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -715,10 +730,13 @@ impl TrackManager {
         hop_to_sample_ts: impl Fn(u64) -> u64,
     ) -> Vec<DecoderEvent> {
         let mut closed_ids: Vec<u32> = Vec::new();
+        let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         for h in hops {
-            closed_ids.extend(self.step_hop(h, hop_to_sample_ts(h.m)));
+            let (closed, promoted) = self.step_hop(h, hop_to_sample_ts(h.m));
+            closed_ids.extend(closed);
+            promoted_events.extend(promoted);
         }
-        let mut events = self.drain_pool();
+        let pool_events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
         // actually decoded a character this batch. `step_hop` advances it
         // every hop with `char_emitted = false` (the pool has not run yet),
@@ -733,8 +751,17 @@ impl TrackManager {
         // which is exactly what "did this track ever actually emit
         // anything" needs; a track promoted and closed within THIS same
         // call never reaches this loop before being removed, so it
-        // correctly stays `false`.
-        for e in &events {
+        // correctly stays `false`. `events` here is still just
+        // `drain_pool()`'s output (decoder-produced events only) --
+        // `promoted_events` is deliberately extended in AFTER this loop,
+        // not before, so a bare promotion (no decoder output at all before
+        // a same-batch merge/evict) does NOT set `has_emitted` and does
+        // NOT retroactively earn that track a `TrackClosed` -- preserving
+        // MAN-19's exclusion. `TrackPromoted` is real, permanent signal
+        // for a *different* consumer (`doctor()`'s NoSignal check) with no
+        // per-track_id state to leak (manta-spot's `Validator` treats it as
+        // a pure no-op, never touching `self.tracks`).
+        for e in &pool_events {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
             }
@@ -744,6 +771,16 @@ impl TrackManager {
                 }
             }
         }
+        // Per-track promotion timestamp, for `effective_sort_ts` below --
+        // only tracks promoted THIS batch appear here, which is exactly
+        // the set `effective_sort_ts` needs to special-case (see its doc
+        // comment).
+        let promoted_ts_by_track: std::collections::HashMap<u32, u64> = promoted_events
+            .iter()
+            .map(|e| (event_track_id(e), event_sample_ts(e)))
+            .collect();
+        let mut events = pool_events;
+        events.extend(promoted_events);
         // MAN-19: emit one `TrackClosed` per track closed this batch (any
         // CloseReason) so downstream per-track_id state (`manta-spot`'s
         // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
@@ -756,7 +793,13 @@ impl TrackManager {
                 .into_iter()
                 .map(|track_id| DecoderEvent::TrackClosed { track_id }),
         );
-        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        events.sort_by_key(|e| {
+            (
+                effective_sort_ts(e, &promoted_ts_by_track),
+                event_track_id(e),
+                event_kind_tier(e),
+            )
+        });
         events
     }
 
@@ -866,9 +909,58 @@ impl TrackManager {
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
-        | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
+        | DecoderEvent::WordBoundary { sample_ts, .. }
+        | DecoderEvent::TrackPromoted { sample_ts, .. } => *sample_ts,
         DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
+    }
+}
+
+/// `SpeedUpdate`/`TrackMeta` carry no real timestamp of their own (0,
+/// "no ordering claim" -- true whenever their track had no same-batch
+/// promotion, the overwhelming common case, left completely unchanged
+/// here). But when the SAME track also has a `TrackPromoted` THIS batch,
+/// sorting them at a flat 0 can place them before that promotion's real,
+/// later timestamp -- backwards, since promotion logically precedes any
+/// output the newly-created decoder produces. Two earlier attempts got
+/// this wrong: pinning `TrackPromoted` to 0 too "fixed" same-track order
+/// but broke cross-track order (a promotion could then sort before an
+/// unrelated OTHER track's genuinely-earlier event, round-7 review); a
+/// post-sort remove/insert pass fixed that but could itself jump a
+/// promotion across an unrelated track's real, intervening timestamp
+/// (round-8 review) -- neither extra pass composes safely with a plain
+/// `(sample_ts, track_id)` sort.
+///
+/// The actual fix: express it ENTIRELY as a sort key, no post-processing.
+/// A pinned event borrows its OWN track's same-batch promotion timestamp
+/// (if one exists) instead of a flat 0 -- landing it in the correct
+/// global chronological neighborhood, exactly where that promotion
+/// already correctly sorts -- and an explicit tier (`TrackPromoted` = 0,
+/// everything else = 1) breaks the resulting tie in the promotion's
+/// favor. A single total-order sort composes safely by construction;
+/// there is nothing left to accidentally disturb.
+fn effective_sort_ts(
+    e: &DecoderEvent,
+    promoted_ts_by_track: &std::collections::HashMap<u32, u64>,
+) -> u64 {
+    match e {
+        DecoderEvent::SpeedUpdate { track_id, .. } | DecoderEvent::TrackMeta { track_id, .. } => {
+            promoted_ts_by_track.get(track_id).copied().unwrap_or(0)
+        }
+        other => event_sample_ts(other),
+    }
+}
+
+/// Tertiary sort key, after `(effective_sort_ts, track_id)`: `TrackPromoted`
+/// sorts before every other kind whenever they tie (which only happens
+/// when a pinned event borrows its own track's promotion timestamp via
+/// `effective_sort_ts` above, or by pure numeric coincidence -- itself
+/// harmless, since SPEC doesn't define a relative order for two
+/// genuinely-identical real timestamps beyond `(sample_ts, track_id)`).
+fn event_kind_tier(e: &DecoderEvent) -> u8 {
+    match e {
+        DecoderEvent::TrackPromoted { .. } => 0,
+        _ => 1,
     }
 }
 
@@ -880,6 +972,7 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id } => *track_id,
     }
 }
@@ -1037,6 +1130,40 @@ mod tests {
             "a strong channel should spawn and promote a track"
         );
         assert_eq!(tm.tracks.len(), 1);
+    }
+
+    /// `step_hop` itself must return a `TrackPromoted` event at the exact
+    /// hop it promotes -- `manta_engine::doctor()`'s NoSignal check
+    /// (2026-09-09) depends on this being real, ground-truth signal, not
+    /// just an internal state-machine transition nothing outside
+    /// `TrackManager` ever observes.
+    #[test]
+    fn step_hop_emits_track_promoted_at_the_promotion_hop() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut saw_promotion = false;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted) = tm.step_hop(&hop(m, power.clone()), m);
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                saw_promotion = true;
+                break;
+            }
+        }
+        assert!(
+            saw_promotion,
+            "step_hop must return a TrackPromoted event at the hop it promotes a track"
+        );
     }
 
     #[test]
@@ -1251,6 +1378,221 @@ mod tests {
             "expected CER < 0.02 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
             rendered.keyed_texts[0],
             text
+        );
+    }
+
+    /// Regression (round-7 review): an earlier fix for the same-track
+    /// ordering problem below (pinning `TrackPromoted` to ts=0, like
+    /// SpeedUpdate/TrackMeta) broke this instead -- a DIFFERENT track's
+    /// genuinely-earlier real-timestamped `CharDecoded` must still sort
+    /// before a LATER track's `TrackPromoted`, honoring `TrackPromoted`'s
+    /// real, meaningful timestamp for cross-track (SPEC §6 rule 6, global)
+    /// ordering.
+    /// Sorts `events` exactly as `process_hops` does: builds the
+    /// per-track promotion-timestamp map, then applies the same
+    /// `(effective_sort_ts, track_id, event_kind_tier)` key.
+    fn sort_like_process_hops(events: &mut [DecoderEvent]) {
+        let promoted_ts_by_track: std::collections::HashMap<u32, u64> = events
+            .iter()
+            .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            .map(|e| (event_track_id(e), event_sample_ts(e)))
+            .collect();
+        events.sort_by_key(|e| {
+            (
+                effective_sort_ts(e, &promoted_ts_by_track),
+                event_track_id(e),
+                event_kind_tier(e),
+            )
+        });
+    }
+
+    #[test]
+    fn sort_preserves_cross_track_chronological_order() {
+        let mut events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 100,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 1,
+                sample_ts: 50,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+            },
+        ];
+        sort_like_process_hops(&mut events);
+        let char_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::CharDecoded { .. }))
+            .unwrap();
+        let promoted_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            .unwrap();
+        assert!(
+            char_idx < promoted_idx,
+            "track 1's real ts=50 CharDecoded must sort before track 2's real ts=100 \
+             TrackPromoted -- global chronological order, not per-track"
+        );
+    }
+
+    /// Regression (round-6 review, still required after later fixes):
+    /// within the SAME track, a promotion must still sort before that
+    /// track's own same-batch SpeedUpdate/TrackMeta (both pinned at
+    /// ts=0 by default), even though `TrackPromoted` now carries its own
+    /// real, larger timestamp.
+    #[test]
+    fn sort_puts_a_promotion_before_its_own_tracks_pinned_events() {
+        let mut events = vec![
+            DecoderEvent::SpeedUpdate {
+                track_id: 5,
+                wpm: 20.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 5,
+                sample_ts: 5000,
+                freq_hz: 14_012_340.0,
+            },
+        ];
+        sort_like_process_hops(&mut events);
+        assert!(
+            matches!(events[0], DecoderEvent::TrackPromoted { .. }),
+            "TrackPromoted must sort before its own track's SpeedUpdate, got {events:?}"
+        );
+    }
+
+    /// Regression (round-8 review): the exact scenario an earlier
+    /// remove/insert-based fix for the test above got wrong -- track 2
+    /// has a pinned SpeedUpdate AND is promoted (ts=100) in the same
+    /// batch; track 1 has a real CharDecoded at ts=50, chronologically
+    /// BETWEEN the pinned event's old ts=0 and the promotion's ts=100.
+    /// The promotion must still land before its own track's SpeedUpdate,
+    /// but must NOT jump across track 1's genuinely-earlier event to do
+    /// it.
+    #[test]
+    fn sort_does_not_jump_a_promotion_across_an_earlier_unrelated_track_event() {
+        let mut events = vec![
+            DecoderEvent::SpeedUpdate {
+                track_id: 2,
+                wpm: 20.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 1,
+                sample_ts: 50,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 100,
+                freq_hz: 14_012_340.0,
+            },
+        ];
+        sort_like_process_hops(&mut events);
+        let char1_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::CharDecoded { track_id: 1, .. }))
+            .unwrap();
+        let promoted2_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackPromoted { track_id: 2, .. }))
+            .unwrap();
+        let speedupdate2_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::SpeedUpdate { track_id: 2, .. }))
+            .unwrap();
+        assert!(
+            char1_idx < promoted2_idx,
+            "track 1's real ts=50 CharDecoded must still sort before track 2's ts=100 \
+             TrackPromoted, got {events:?}"
+        );
+        assert!(
+            promoted2_idx < speedupdate2_idx,
+            "track 2's TrackPromoted must still sort before its own track's SpeedUpdate, got \
+             {events:?}"
+        );
+    }
+
+    /// Regression (round-9 review): at an EQUAL effective timestamp
+    /// across different tracks, `track_id` must be compared before the
+    /// kind tier -- SPEC §6 rule 6 is `(sample_ts, track_id)`, not
+    /// `(sample_ts, kind, track_id)`. Track 1's real ts=100 CharDecoded
+    /// and track 2's ts=100 TrackPromoted tie on timestamp; track 1 must
+    /// win the tie-break since 1 < 2, even though `TrackPromoted`'s own
+    /// kind tier would otherwise put it first.
+    #[test]
+    fn sort_breaks_ties_by_track_id_before_kind() {
+        let mut events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 100,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 1,
+                sample_ts: 100,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+            },
+        ];
+        sort_like_process_hops(&mut events);
+        assert!(
+            matches!(events[0], DecoderEvent::CharDecoded { track_id: 1, .. }),
+            "track 1's CharDecoded must sort before track 2's TrackPromoted at an equal \
+             timestamp (track_id 1 < 2), got {events:?}"
+        );
+    }
+
+    /// Regression (round-6 review): a single `process_hops` call spanning
+    /// enough hops to include both a track's promotion and its first
+    /// decoder-output event (a long unchunked batch -- e.g. `listen()`'s
+    /// single startup-calibration `process_hops` call, or a caller feeding
+    /// large chunks) must never sort that later decoder update before the
+    /// `TrackPromoted` that logically preceded it.
+    #[test]
+    fn process_hops_orders_track_promoted_before_same_batch_decoder_updates() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        // The whole file as ONE process_hops call (not chunked the way
+        // listen()'s real-time main loop feeds it) -- guarantees this
+        // track's promotion and its first decoder-output event land in
+        // the same returned batch.
+        let hops = ch.process(&rendered.samples);
+        let events = tm.process_hops(&hops, |m| m * hop_samples);
+        let promoted_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackPromoted { .. }));
+        let first_decoder_update_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                DecoderEvent::TrackMeta { .. }
+                    | DecoderEvent::SpeedUpdate { .. }
+                    | DecoderEvent::CharDecoded { .. }
+                    | DecoderEvent::WordBoundary { .. }
+            )
+        });
+        let (Some(promoted_idx), Some(decoder_idx)) = (promoted_idx, first_decoder_update_idx)
+        else {
+            panic!(
+                "expected both a TrackPromoted and at least one decoder-output event in this \
+                 batch -- got {events:?}"
+            );
+        };
+        assert!(
+            promoted_idx < decoder_idx,
+            "TrackPromoted (index {promoted_idx}) must sort before the first decoder-output \
+             event (index {decoder_idx})"
         );
     }
 

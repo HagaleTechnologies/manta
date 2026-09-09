@@ -423,10 +423,19 @@ callsign also bypasses ARCHITECTURE §6 steps 1 (context parse -- tagged
 Per track, an ordered event stream:
 
 ```
-CharDecoded { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
-WordBoundary { track_id, sample_ts: u64 }
-SpeedUpdate { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
-TrackMeta   { track_id, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
+CharDecoded    { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
+WordBoundary   { track_id, sample_ts: u64 }
+SpeedUpdate    { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
+TrackMeta      { track_id, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
+TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;
+                 added post-freeze, 2026-09-09 — the exact hop a track is
+                 promoted from CANDIDATE to ACTIVE, independent of whether the
+                 decoder subsequently produces anything. See
+                 docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md.)
+TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
+                 and will never emit another event under this track_id; only
+                 emitted for a track that produced at least one other event
+                 first.)
 ```
 
 `sample_ts` is the input-stream sample counter (u64, monotonic from stream
