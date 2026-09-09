@@ -794,7 +794,7 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
-/// Handles the `Listen` on-spot closure needs to feed a running spot server.
+/// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
@@ -891,7 +891,7 @@ fn start_spot_server(
     // debugging without a code change.
     //
     // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
-    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // but `Command::Run --json` ALSO writes DecoderEvents/spots as
     // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
     // byte-identical spot logs" hard requirement means any interleaved
     // non-JSON tracing line corrupts that machine-readable stream for
