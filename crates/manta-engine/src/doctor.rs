@@ -209,7 +209,7 @@ pub const MIN_DURATION: Duration = Duration::from_secs(3);
 /// end -- on a noisy full passband with sustained track churn, an
 /// unbounded duration means unbounded memory (tens of millions of floats
 /// over a 24h+ run). `doctor` is a bounded-duration health check, not a
-/// long-running monitor (that's `manta listen --server-config`'s
+/// long-running monitor (that's `manta run --config`'s
 /// Prometheus metrics), so a generous but real ceiling is the right fix,
 /// not a fancier streaming-quantile estimator for a tool that was never
 /// meant to run for hours in the first place.
@@ -289,7 +289,7 @@ pub fn doctor(
         anyhow::bail!(
             "--duration must be at most {}s -- doctor() accumulates every TrackMeta SNR sample \
              in memory for the run's duration, so an unbounded --duration means unbounded \
-             memory; for a long-running check, use `manta listen --server-config` instead",
+             memory; for a long-running check, use `manta run --config` instead",
             MAX_DURATION.as_secs()
         );
     }
@@ -677,6 +677,19 @@ mod tests {
             MAX_DURATION + Duration::from_secs(1),
         );
         assert!(result.is_err());
+        // D11/MAN-77: the advice this error gives has to name the canonical
+        // daemon verb. Recommending the deprecated `listen --server-config`
+        // spelling sends the operator straight into two deprecation warnings
+        // (Codex P2 on PR #125).
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("manta run --config"),
+            "the too-long --duration error must point at the canonical daemon command, got: {msg}"
+        );
+        assert!(
+            !msg.contains("--server-config"),
+            "the too-long --duration error must not recommend the deprecated flag, got: {msg}"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "doctor() with a too-long --duration took {:?} -- it must reject before running \
