@@ -138,6 +138,16 @@ struct TrackState {
     freq_hz: f64,
     snr_db: f32,
     wpm: f32,
+    /// Set once a real `SpeedUpdate` has been received for this track_id.
+    /// `wpm` holds a bogus `0.0` default until then, which is BELOW
+    /// `MAX_PLAUSIBLE_WPM` -- without this flag a survivor track that
+    /// closes before its own speed tracker ever reports (e.g. a merge
+    /// migrates evidence into it moments before it closes) would resolve
+    /// its migrated `pending_beacons` as if 0.0 WPM were a confirmed final
+    /// speed, admitting a candidate whose actual, never-recorded speed may
+    /// have been at the 60 WPM noise ceiling (Codex review on PR #154,
+    /// round 10).
+    wpm_confirmed: bool,
     /// Set once a real `TrackMeta` event has been received. `freq_hz`/
     /// `snr_db` hold bogus `0.0` defaults until then (decoder.rs emits
     /// `TrackMeta` only every 375 hops -- a fast decode can complete
@@ -403,7 +413,9 @@ impl Validator {
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
-                self.tracks.entry(*track_id).or_default().wpm = *wpm;
+                let track = self.tracks.entry(*track_id).or_default();
+                track.wpm = *wpm;
+                track.wpm_confirmed = true;
                 // No retry here, and no Beacon-WPM decision here either
                 // (round 7 redesign) -- a non-allowlisted Beacon
                 // candidate is only ever judged once, at `TrackClosed`,
@@ -1059,13 +1071,21 @@ impl Validator {
     /// value covers every pending candidate on this track -- it's a
     /// track-level property, not a per-candidate one.
     fn resolve_pending_beacons(&mut self, track_id: u32) -> Vec<Spot> {
-        let (wpm, pending) = {
+        let (wpm, wpm_confirmed, pending) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
                 return Vec::new();
             };
-            (track.wpm, std::mem::take(&mut track.pending_beacons))
+            (
+                track.wpm,
+                track.wpm_confirmed,
+                std::mem::take(&mut track.pending_beacons),
+            )
         };
-        if pending.is_empty() || wpm > MAX_PLAUSIBLE_WPM {
+        // An unconfirmed `wpm` (still its `0.0` default) is not evidence of
+        // a genuine slow speed -- refuse to resolve rather than let a
+        // never-measured survivor pass the plausibility check on a
+        // placeholder value (round 10).
+        if pending.is_empty() || !wpm_confirmed || wpm > MAX_PLAUSIBLE_WPM {
             return Vec::new();
         }
         pending

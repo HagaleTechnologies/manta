@@ -721,17 +721,30 @@ impl TrackManager {
             }
         }
         self.recompute_ownership();
-        // Round 9 (PR #154): HangExpired/Silent are both a genuine
-        // end-of-signal for THIS track_id's own history -- by the time
-        // either fires, nothing more will ever be seen under this
-        // identity, whether or not it was ever decoded (Silent's own
-        // 30 s-of-no-characters threshold is long enough that any
-        // transient WPM misread from before it has long since settled).
-        // Merged/Evicted are pure bookkeeping instead -- see
-        // `merge_converged`/`evict_over_cap`.
+        // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
+        // RF gap -- proof the signal actually ended. Silent fires after 30 s
+        // of no *decoded character*, which a continuous carrier or other
+        // undecodable signal satisfies just as well as a real end-of-signal;
+        // `finish_decoder_speed_only()` above deliberately can't force such
+        // a still-open run to resolve, so the WPM it reports can still be a
+        // stale, transient pre-carrier estimate. Judging a deferred Beacon
+        // against that stale value would readmit exactly the false-positive
+        // class this PR exists to close. So Silent gets `Bookkeeping` (no
+        // survivor) like Merged/Evicted -- its pending beacons are counted
+        // and discarded, never resolved, since no genuine signal-ending
+        // observation is available for them.
         let mut closed_with_kind: Vec<(u32, ClosureKind)> = closed
             .into_iter()
-            .map(|id| (id, ClosureKind::SignalEnded))
+            .map(|id| {
+                let kind = if close_reasons.get(&id) == Some(&CloseReason::HangExpired) {
+                    ClosureKind::SignalEnded
+                } else {
+                    ClosureKind::Bookkeeping {
+                        survivor_track_id: None,
+                    }
+                };
+                (id, kind)
+            })
             .collect();
         let (merged_ids, merged_flush) = self.merge_converged();
         closed_with_kind.extend(merged_ids);

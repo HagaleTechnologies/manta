@@ -58,6 +58,23 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
     });
 }
 
+/// A real `TrackDecoder::finish()`/`finish_speed_only()` always reports a
+/// final `SpeedUpdate` (`flush_final_speed`, bypassing the live throttle)
+/// before its `TrackClosed` -- `resolve_pending_beacons` requires that
+/// confirmed WPM before it will judge any captured Beacon (round 10: an
+/// unconfirmed `wpm` is indistinguishable from a real 0 WPM otherwise).
+/// These golden tests build their event streams by hand, so they need to
+/// supply that SpeedUpdate explicitly too. 22.0 WPM matches real NCDXF/IARU
+/// beacon speed and sits well under `MAX_PLAUSIBLE_WPM` (45.0).
+fn close_track(v: &mut Validator, track_id: u32, closure: ClosureKind) -> Vec<Spot> {
+    let mut spots = v.ingest(&DecoderEvent::SpeedUpdate {
+        track_id,
+        wpm: 22.0,
+    });
+    spots.extend(v.ingest(&DecoderEvent::TrackClosed { track_id, closure }));
+    spots
+}
+
 #[test]
 fn v11_context_parse_sets_spot_type() {
     let cases: &[(&[&str], SpotType)] = &[
@@ -76,10 +93,7 @@ fn v11_context_parse_sets_spot_type() {
         // A non-allowlisted Beacon candidate is never emitted before
         // TrackClosed (round 7 redesign) -- harmless no-op for the other
         // cases here, which already spotted via the repetition gate.
-        spots.extend(v.ingest(&DecoderEvent::TrackClosed {
-            track_id: 1,
-            closure: ClosureKind::SignalEnded,
-        }));
+        spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
         let hit = spots
             .iter()
             .find(|s| s.callsign == "K5ARH")
@@ -197,10 +211,7 @@ fn v18_beacon_pattern_exempt_from_repetition_gate() {
         "a non-allowlisted Beacon candidate must never spot before TrackClosed \
          (round 7 redesign), got {spots:?}"
     );
-    let spots = v.ingest(&DecoderEvent::TrackClosed {
-        track_id: 1,
-        closure: ClosureKind::SignalEnded,
-    });
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert_eq!(
         spots.len(),
         1,
@@ -537,10 +548,7 @@ fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
         "a non-allowlisted Beacon candidate must never spot before TrackClosed \
          (round 7 redesign), got {spots:?}"
     );
-    let spots = v.ingest(&DecoderEvent::TrackClosed {
-        track_id: 1,
-        closure: ClosureKind::SignalEnded,
-    });
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert_eq!(
         spots.len(),
         1,
@@ -666,10 +674,7 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
         "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
     );
 
-    let spots = v.ingest(&DecoderEvent::TrackClosed {
-        track_id: 1,
-        closure: ClosureKind::SignalEnded,
-    });
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert!(
         spots
             .iter()
@@ -869,10 +874,7 @@ fn a_glued_cq_de_substring_does_not_suppress_a_power_step_beacon() {
     let mut spots = run(&transmission_events(1, &words, 0), &mut v);
     // A non-allowlisted Beacon candidate is never emitted before
     // TrackClosed (round 7 redesign).
-    spots.extend(v.ingest(&DecoderEvent::TrackClosed {
-        track_id: 1,
-        closure: ClosureKind::SignalEnded,
-    }));
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
     assert!(
         spots
             .iter()
@@ -991,10 +993,7 @@ fn an_unsuppressed_power_step_beacon_counts_nothing() {
     let mut spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
     // A non-allowlisted Beacon candidate is never emitted before
     // TrackClosed (round 7 redesign).
-    spots.extend(v.ingest(&DecoderEvent::TrackClosed {
-        track_id: 1,
-        closure: ClosureKind::SignalEnded,
-    }));
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
     assert_eq!(spots.len(), 1);
     assert_eq!(v.suppression_counts().power_step_guard, 0);
 }
@@ -1036,10 +1035,7 @@ fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
     // close -- the later guard re-burn (which only marks
     // power_step_suppressed, never touches pending_beacons) must not
     // have destroyed it.
-    let spots = v.ingest(&DecoderEvent::TrackClosed {
-        track_id: 1,
-        closure: ClosureKind::SignalEnded,
-    });
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert!(
         spots
             .iter()
