@@ -84,6 +84,17 @@ struct Word {
     /// non-exempt callsign spot after a type change alone inflated its
     /// rep count to 2 (MAN-28 round 9 review).
     last_reps: u32,
+    /// Set when this word's most recent evaluation was rejected solely by
+    /// the Beacon-WPM plausibility check (see `evaluate_candidate`) --
+    /// distinct from an ordinary `attempted` rejection (grammar/cty/
+    /// blocklist/notch), which is permanent. A WPM rejection is transient:
+    /// the track's speed estimate can still settle to a plausible value,
+    /// and this flag is what lets that later retry bypass the normal
+    /// same-type `attempted` guard without also bypassing it for a
+    /// genuinely permanent rejection (Codex review on PR #154, round 2).
+    /// Cleared at the start of every re-evaluation and re-set only if the
+    /// WPM check rejects again.
+    held_back_by_wpm: bool,
 }
 
 #[derive(Default)]
@@ -626,43 +637,6 @@ impl Validator {
             )
         };
 
-        // Real-hardware finding (2026-09-09, docs/DECISIONS): every
-        // overnight noise-floor false positive from a real RSP1B/40m
-        // session read implausibly fast -- avg 51.5 WPM, several pinned
-        // at the tracker's own 60 WPM ceiling (SPEC-decode-core.md's
-        // tracked range is 8..60 WPM) -- and every one of them reached a
-        // spot via the `SpotType::Beacon` repetition-gate exemption
-        // (ARCHITECTURE Sec6.4): that's the only path where a single
-        // low-evidence decode can reach public output with no
-        // independent second confirmation. Scoped to that path only --
-        // Codex review on PR #154 found an earlier, unscoped version of
-        // this check rejected legitimate fast (45+ WPM) contest/
-        // computer-keyed CW reaching a spot through the ordinary
-        // two-repetition-confirmed path, which the decoder's own
-        // 8..60 WPM tracked range explicitly supports and which needs no
-        // extra scrutiny here. Real NCDXF/IARU beacons ID at a fixed
-        // ~20-22 WPM, well under this threshold. Exempted for allowlisted
-        // calls, same boundary as grammar/cty below.
-        //
-        // Checked here, BEFORE the word.attempted bookkeeping below --
-        // round 2 of the same review found that rejecting after marking
-        // `attempted` permanently loses a real beacon whose early speed
-        // estimate is transiently inflated past the ceiling: `SpeedUpdate`
-        // only stores the new value (see `ingest`) and a later
-        // `WordBoundary` would find `word.attempted` already set with a
-        // matching `last_spot_type`, short-circuiting before this check
-        // ever runs again. Returning before any mutation leaves the word
-        // eligible for `try_spot`'s retry -- `ingest`'s `SpeedUpdate` arm
-        // now calls it, mirroring the existing `TrackMeta` retry pattern
-        // (MAN-28 round 9) for the same reason: a short track may never
-        // produce another `WordBoundary` to retry on naturally.
-        if !self.allowlist.contains(&candidate)
-            && spot_type == SpotType::Beacon
-            && wpm > MAX_PLAUSIBLE_WPM
-        {
-            return None;
-        }
-
         let (char_confidences, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             // Named patterns resolve by text, always to the NEWEST word
@@ -703,26 +677,42 @@ impl Validator {
                 // context types (round 12), both merely because an older
                 // framing word (DE, CQ) fell out of the 16-word window,
                 // not because anything new arrived.
-                if word.last_spot_type == Some(spot_type)
-                    || involved_max_seq <= word.classified_max_seq
+                //
+                // `held_back_by_wpm` is a second, narrower carve-out: a
+                // Beacon candidate rejected only by the WPM-plausibility
+                // check below never got a genuine attempt at spotting, so
+                // it must retry once the track's speed estimate settles
+                // (Codex review on PR #154, round 2) even though its type
+                // and involved_max_seq haven't changed.
+                if (word.last_spot_type == Some(spot_type)
+                    || involved_max_seq <= word.classified_max_seq)
+                    && !word.held_back_by_wpm
                 {
                     return None;
                 }
             }
-            let reclassifying = word.attempted;
+            let held_back_by_wpm = word.held_back_by_wpm;
+            let reclassifying = word.attempted && !held_back_by_wpm;
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
             word.classified_max_seq = involved_max_seq;
+            // Tentatively cleared; re-set below if the WPM check rejects
+            // this same attempt again.
+            word.held_back_by_wpm = false;
             (word.confidences.clone(), reclassifying)
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
-        // checked ahead of, both the automatic validation pipeline and the
-        // MAN-28 allowlist below: an explicit blocklist/notch entry is the
-        // operator's more specific, deliberate override and must not be
-        // silently defeated by a broader allowlist entry. Each hit is
-        // counted (ARCHITECTURE §8) so it reads as a deliberate
-        // suppression, not silent coverage loss.
+        // checked ahead of, both the automatic validation pipeline (the
+        // WPM heuristic below included) and the MAN-28 allowlist further
+        // down: an explicit blocklist/notch entry is the operator's more
+        // specific, deliberate override and must not be silently defeated
+        // by a broader allowlist entry, nor left uncounted by an earlier
+        // automatic rejection (ARCHITECTURE §8 -- Codex review on PR #154,
+        // round 3, found an earlier revision's WPM check bypassing this
+        // and leaving `suppression_counts` at zero for a candidate that
+        // was, in fact, operator-suppressed). Each hit is counted so it
+        // reads as a deliberate suppression, not silent coverage loss.
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
             return None;
@@ -743,9 +733,40 @@ impl Validator {
             if !self.cty.is_allocated(&candidate) {
                 return None;
             }
-            // The Beacon-WPM plausibility check runs earlier in this
-            // function, before the word.attempted bookkeeping above --
-            // see the comment there.
+            // Real-hardware finding (2026-09-09, docs/DECISIONS): every
+            // overnight noise-floor false positive from a real RSP1B/40m
+            // session read implausibly fast -- avg 51.5 WPM, several
+            // pinned at the tracker's own 60 WPM ceiling (SPEC-decode-
+            // core.md's tracked range is 8..60 WPM) -- and every one of
+            // them reached a spot via the `SpotType::Beacon` repetition-
+            // gate exemption (ARCHITECTURE §6.4): that's the only path
+            // where a single low-evidence decode can reach public output
+            // with no independent second confirmation. Scoped to that
+            // path only -- an earlier, unscoped version of this check
+            // rejected legitimate fast (45+ WPM) contest/computer-keyed
+            // CW reaching a spot through the ordinary two-repetition-
+            // confirmed path, which the decoder's own 8..60 WPM tracked
+            // range explicitly supports and needs no extra scrutiny here.
+            // Real NCDXF/IARU beacons ID at a fixed ~20-22 WPM, well
+            // under this threshold.
+            //
+            // A rejection here marks `held_back_by_wpm` (not a permanent
+            // `attempted`-guard block) so a later retry -- another
+            // WordBoundary, or the SpeedUpdate-triggered try_spot in
+            // `ingest` -- can still succeed once the estimate settles.
+            if spot_type == SpotType::Beacon && wpm > MAX_PLAUSIBLE_WPM {
+                if let Some(track) = self.tracks.get_mut(&track_id) {
+                    let word = if let Some(seq) = exact_seq {
+                        track.words.iter_mut().find(|w| w.seq == seq)
+                    } else {
+                        track.words.iter_mut().rev().find(|w| w.text == candidate)
+                    };
+                    if let Some(word) = word {
+                        word.held_back_by_wpm = true;
+                    }
+                }
+                return None;
+            }
         }
 
         // A reclassification is the same decode re-typed, not a new one --
@@ -928,6 +949,25 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review on PR #154, round 3: a blocklisted callsign that
+    /// would ALSO fail the Beacon-WPM gate must still count as an
+    /// explicit operator suppression (ARCHITECTURE §8), not be silently
+    /// swallowed by the automatic WPM rejection first.
+    #[test]
+    fn blocklisted_beacon_above_max_wpm_still_counts_as_suppressed() {
+        let blocklist = Blocklist::parse("K5ARH\n");
+        let mut v = Validator::new(FS, CTY_FIXTURE, None).with_blocklist(blocklist);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty());
+        assert_eq!(v.suppression_counts().blocklist, 1);
     }
 
     /// A non-Beacon (De-type) candidate at an implausible 60 WPM still
