@@ -55,11 +55,14 @@ same signature:
   contrast). It is **not** the detector's `(S-F)` signal-vs-local-floor
   SNR -- an earlier revision of this finding wrongly attributed it to
   that quantity and derived a "+6 dB above the noise floor" claim from
-  it that doesn't follow from what's actually computed. What the pinned
-  value *does* establish: this track's keying-rail contrast is nearly
-  identical across all 29 independent detections rather than varying the
-  way real fading/QRM would -- consistent with a deterministic mechanism,
-  not proof by itself of anything about signal-vs-floor.
+  it that doesn't follow from what's actually computed. **Also not
+  evidence of anything by itself**: `envelope.rs`'s rail-collapse floor
+  clamps `e_hi >= 2*e_lo` (SPEC §3.2), which makes
+  `20*log10(2) - 14.3 = -8.2794 dB` a hard mathematical lower bound any
+  weak/flat-envelope track hits, regardless of cause -- the near-constant
+  `snr_db` values here are exactly that clamp being hit repeatedly, not a
+  sign of some other deterministic mechanism. The real signal in this
+  data is the *frequency* clustering below, not the SNR values.
 - WPM scattered widely and often implausible for real CW traffic/beacons
   (30.8-60.0 wpm)
 - callsigns frequently malformed (`3EMEEEE`, `ER1EEAE`, `4AEEEEE` --
@@ -104,12 +107,13 @@ directly.
 
 Operational implication either way, for anyone running `manta` against
 real RF right now: `spots_confirmed`/emitted `Spot`s alone are not
-sufficient evidence of a real decode. A spot whose `snr_db` sits within
-about a dB of this session's own recurring floor value and whose
-confidence sits at the low end of the scale is suspect -- especially
-near a passband or channelizer boundary -- but confirming it's actually
-noise (rather than a real weak/repeating signal) needs more than the
-`snr_db` value alone.
+sufficient evidence of a real decode, and `snr_db` alone doesn't help
+tell the difference (see the clamp-floor caveat above -- a low `snr_db`
+is just as consistent with a weak real signal as with this artifact). A
+spot recurring at the same frequency across separate, non-overlapping
+capture windows, especially near a passband or channelizer boundary, and
+carrying a suspiciously low/round confidence value, is the actual warning
+sign worth checking for.
 
 **`manta doctor` specifically is fully blind to this.**
 `DoctorReport::verdict()` (`crates/manta-engine/src/doctor.rs:143-146`)
@@ -126,11 +130,13 @@ be quick, automated, and wrong at the same time.
 
 None of the 29 confirmed spots are backed by a validated callsign at a
 clearly-varying, above-population SNR -- by the signature in Finding 2
-(pinned near-identical `snr_db`, low confidence, malformed text,
-fixed-frequency clustering) every one is far more consistent with a
-deterministic artifact (confirmed passband-edge for the 6931.x cluster,
-unconfirmed mechanism for the rest) than with real copy, though this is
-"no *evidence* of real copy," not a from-first-principles proof each one
+(low confidence, malformed text, and above all fixed-frequency clustering
+across separate windows -- `snr_db` itself is not independently
+informative here, see Finding 2's clamp-floor caveat) every one is far
+more consistent with a deterministic artifact (confirmed passband-edge
+for the 6931.x cluster, unconfirmed mechanism for the rest) than with
+real copy, though this is "no *evidence* of real copy," not a
+from-first-principles proof each one
 is noise. Max
 instantaneous `TrackMeta.snr_2500_db` touched positive values in
 several windows (best full-window case +5.6 dB; one anomalous +18.3 dB
