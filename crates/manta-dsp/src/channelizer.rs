@@ -65,16 +65,30 @@ pub struct Channelizer {
 }
 
 impl Channelizer {
+    /// Whether `fs` is a rate this channelizer supports (`fs/93.75` a
+    /// power of two) -- exactly the predicate `new` enforces, exposed so a
+    /// caller can reject an unsupported rate BEFORE anything is sized from
+    /// it. `manta_engine::listen` allocates a `CALIBRATION_SECONDS * fs`
+    /// buffer, so a source reporting a wild rate (a malformed WAV header
+    /// claiming ~4 GS/s, say) would try to allocate tens of GiB and abort
+    /// the process before `new` ever got to return this error (MAN-121
+    /// review). Non-finite and negative rates answer `false`: `nf.round()
+    /// as usize` saturates them to 0, which is not a power of two.
+    pub fn supports_rate(fs: f64) -> bool {
+        let nf = fs / CHANNEL_SPACING_HZ;
+        let n = nf.round() as usize;
+        (nf - n as f64).abs() <= 1e-9 && n.is_power_of_two()
+    }
+
     /// A channelizer for a supported table rate (`fs/93.75` a power of
     /// two). SPEC §1.1.
     pub fn new(fs: f64, center_freq_hz: f64) -> Result<Self, String> {
-        let nf = fs / CHANNEL_SPACING_HZ;
-        let n = nf.round() as usize;
-        if (nf - n as f64).abs() > 1e-9 || !n.is_power_of_two() {
+        if !Self::supports_rate(fs) {
             return Err(format!(
                 "unsupported sample rate {fs}: fs/93.75 must be a power of two"
             ));
         }
+        let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
         Ok(Channelizer {
             n,
             hop: n / 4,

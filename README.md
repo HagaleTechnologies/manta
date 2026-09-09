@@ -92,6 +92,28 @@ cargo build --release -p manta-cli
 manta gen v1 --out /tmp/v1
 manta decode /tmp/v1/v1.wav
 
+# See a real spot on the DX cluster telnet port -- no radio required.
+# --realtime paces the 120 s recording in wall-clock time (instead of
+# draining it in ~3 s) so a client has time to connect; the spot itself
+# appears about 12 s in.
+cat > server.toml <<'TOML'
+[server]
+station_callsign = "N0CALL"
+# Loopback only: without this, bind_addr defaults to 0.0.0.0 and this demo
+# would publish the telnet, JSON/WebSocket and metrics ports on every
+# interface -- see docs/RUNBOOKS/network-exposure.md before dropping it.
+bind_addr = "127.0.0.1"
+TOML
+manta listen --source /tmp/v1/v1.wav --server-config server.toml --realtime
+# then, in another terminal, any time in the next two minutes:
+telnet localhost 7300
+# at the "login:" prompt, type any callsign and press Enter -- this is a
+# real login, not optional, and the server only starts streaming spots to
+# you once it lands
+# then, at the "de N0CALL-# >" prompt: type sh/dx to see the spot, or just
+# wait -- if you logged in within the first ~12 s, the spot arrives on its
+# own once decoded, with no further command needed
+
 # Copy live CW from a public KiwiSDR on 40 m
 manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
 
@@ -111,7 +133,7 @@ manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
 
 | Source | How | Status |
 | --- | --- | --- |
-| IQ / audio WAV file | `decode`, `listen --source` | Working |
+| IQ / audio WAV file | `decode`, `listen --source` | Working -- `listen --source` takes a 2-channel IQ WAV (what `decode`/`gen` use, sidecar-aware; any channelizer rate other than 48 kHz, or 48 kHz with a `<stem>.json` sidecar) or a 48 kHz mono/stereo rig-audio WAV (48 kHz stereo with no sidecar downmixes like mono); add `--realtime`/`--loop` to pace or repeat file replay (`--loop` requires `--realtime` when `--server-config` is given, so looped spots aren't published with runaway future timestamps). A "channelizer rate" is any `fs` where `fs / 93.75` is a power of two -- 12/24/48/96/192/384 kHz and so on, not 44.1 or 100 kHz |
 | Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` | Working |
 | RTL-SDR, Airspy, SDRplay, HackRF, and anything else SoapySDR drives | `listen --soapy-driver`, feature `soapy` | Working, needs hardware soak |
@@ -122,10 +144,11 @@ enforced by criterion benches.
 
 ## Outputs
 
-- Decoded text or JSON Lines on stdout today.
+- Decoded text or JSON Lines on stdout.
 - RBN-format `DX de` spots over the DX cluster telnet protocol (port 7300)
-  and a JSON Lines / WebSocket stream (port 7301): in progress, see
-  [ROADMAP.md](ROADMAP.md) milestone M3.
+  and a JSON Lines / WebSocket stream (port 7301), started with
+  `listen --server-config`; see the Quickstart above for a hardware-free
+  demo, and [ROADMAP.md](ROADMAP.md) milestone M3 for acceptance status.
 
 The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden

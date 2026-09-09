@@ -107,6 +107,270 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
     assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
 }
 
+/// MAN-121 Scenario 1: the README's own `manta gen v1 --out /tmp/v1` output
+/// is 2-channel IQ WAV at 96 kHz, which `listen --source` used to hard-reject
+/// with "AudioIqSource requires 48000 Hz, got 96000" -- it should decode
+/// instead, exactly as `manta decode` already does.
+#[test]
+fn listen_source_accepts_the_iq_wav_that_gen_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["listen", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("requires 48000 Hz"), "stderr: {stderr}");
+    assert!(out.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|l| l.contains("\"spot\"")),
+        "expected at least one spot line, got stdout: {stdout}"
+    );
+}
+
+/// MAN-121: a 2-channel IQ WAV with a sidecar already knows its own RF
+/// center frequency (`WavIqSource` reads it), so `--server-config` must not
+/// demand `--dial-freq-hz` for it the way it does for a plain audio source.
+#[test]
+fn listen_server_config_needs_no_dial_freq_for_a_sidecar_backed_iq_wav() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let toml_path = dir.path().join("server.toml");
+    std::fs::write(
+        &toml_path,
+        "[server]\nstation_callsign = \"W5AU\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .arg("--server-config")
+        .arg(&toml_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    assert!(out.status.success(), "stderr: {stderr}");
+}
+
+/// A plain mono 48 kHz audio WAV still has no real RF reference, so the
+/// existing gate must still fire for it -- only sidecar-backed IQ WAVs are
+/// exempted.
+#[test]
+fn listen_server_config_still_requires_dial_freq_for_a_mono_wav() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("rig.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 48_000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    for _ in 0..480 {
+        w.write_sample(0.0f32).unwrap();
+    }
+    w.finalize().unwrap();
+
+    let toml_path = dir.path().join("server.toml");
+    std::fs::write(
+        &toml_path,
+        "[server]\nstation_callsign = \"W5AU\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
+    )
+    .unwrap();
+
+    let out = manta()
+        .args(["listen", "--source"])
+        .arg(&wav)
+        .arg("--server-config")
+        .arg(&toml_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+}
+
+/// MAN-121 Decision 5: `--realtime` only decides WHEN samples are
+/// delivered, never WHICH -- output must be byte-identical either way, the
+/// determinism guarantee the broad review demands of any pacing change.
+#[test]
+fn realtime_replay_is_byte_identical_to_unpaced_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join("v1.wav");
+
+    let unpaced = manta()
+        .args(["listen", "--source"])
+        .arg(&wav)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(unpaced.status.success());
+
+    let paced = manta()
+        .args(["listen", "--source"])
+        .arg(&wav)
+        .arg("--json")
+        .arg("--realtime")
+        .output()
+        .unwrap();
+    assert!(
+        paced.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&paced.stderr)
+    );
+
+    assert_eq!(unpaced.stdout, paced.stdout);
+}
+
+#[test]
+fn realtime_requires_source() {
+    let out = manta().args(["listen", "--realtime"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--source <SOURCE>"), "stderr: {stderr}");
+}
+
+/// MAN-121 Decision 6: `--loop` restarts the file at EOF, so a demo can be
+/// left running past a single pass's worth of events.
+#[test]
+fn loop_replay_keeps_producing_events_past_the_end_of_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 5.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join("v1.wav");
+
+    // One unpaced pass, for a baseline event count.
+    let single_pass = manta()
+        .args(["listen", "--source"])
+        .arg(&wav)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(single_pass.status.success());
+    let single_pass_lines = String::from_utf8_lossy(&single_pass.stdout).lines().count();
+
+    // Looped: kill it after a wall-clock budget comfortably exceeding one
+    // unpaced pass, so it must have wrapped at least once.
+    let mut child = manta()
+        .args(["listen", "--source"])
+        .arg(&wav)
+        .arg("--json")
+        .arg("--loop")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let looped_lines = String::from_utf8_lossy(&out.stdout).lines().count();
+
+    assert!(
+        looped_lines > single_pass_lines,
+        "expected --loop to produce more events than a single pass \
+         ({single_pass_lines}), got {looped_lines}"
+    );
+}
+
+#[test]
+fn loop_requires_source() {
+    let out = manta().args(["listen", "--loop"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--source <SOURCE>"), "stderr: {stderr}");
+}
+
+/// Round-14 review: an unpaced `--loop` never ends and advances its sample
+/// clock ~30-40x faster than wall time, so a networked one would publish
+/// spots timestamped ever further into the future to real clients. Like the
+/// --dial-freq-hz gate, it is a flag error checked ahead of all file I/O,
+/// so nonexistent paths still provoke exactly this message.
+#[test]
+fn loop_with_server_config_but_no_realtime_is_a_clean_error() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+            "--dial-freq-hz",
+            "14027000",
+            "--loop",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a clean failure for a networked unpaced loop"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--realtime"), "stderr: {stderr}");
+}
+
+/// The same combination WITH --realtime passes the flag gate -- it must
+/// fail on the missing file instead, proving the gate above is about
+/// pacing and not about `--loop` plus `--server-config` as such.
+#[test]
+fn loop_with_server_config_and_realtime_passes_the_flag_gate() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+            "--dial-freq-hz",
+            "14027000",
+            "--loop",
+            "--realtime",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("also requires --realtime"),
+        "the pacing gate must not fire when --realtime is given: {stderr}"
+    );
+    assert!(
+        stderr.contains("/nonexistent.wav"),
+        "expected the missing-file error instead: {stderr}"
+    );
+}
+
 #[test]
 fn dial_freq_hz_rejects_non_finite_and_non_positive_values() {
     for bad in ["nan", "inf", "-inf", "0", "-14027000"] {
