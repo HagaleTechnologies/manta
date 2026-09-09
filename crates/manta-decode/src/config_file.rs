@@ -23,37 +23,25 @@
 //! demod`/`beam: BeamConfig`/`flush_gap_dits`, `EvidenceConfig::tau_a_ms`/
 //! `u_init_hops`, `NoiseConfig::tau_ms`, `HsmmConfig::u_min`/`u_max`) to
 //! those runtime structs themselves.
+//!
+//! `engine = "hsmm"` parses here without complaint -- deliberately. The
+//! production-facing gate on `Engine::Hsmm` (the same one `manta-cli`'s
+//! `parse_engine` applies to `--engine`) is NOT enforced at deserialize
+//! time: rejecting it here would reject a `[decode]` table staging
+//! `engine = "hsmm"` even when an explicit `--engine legacy`/`--engine
+//! edge-legacy` is right there to override it, breaking SPEC v2 §7's
+//! CLI-wins-when-given precedence rule. The caller (`manta-cli`'s
+//! `Command::Listen`) validates the FINAL, merged engine -- after any CLI
+//! override has already been applied -- exactly once.
 
 use crate::decoder::{DecodeConfig, Engine};
 use crate::evidence::EvidenceConfig;
 use crate::hsmm::HsmmConfig;
 use crate::noise::NoiseConfig;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 
 fn default_engine() -> Engine {
     Engine::Legacy
-}
-
-/// Same restriction as `manta-cli`'s `parse_engine` value parser for
-/// `--engine` (SPEC v2 §0): `Engine::Hsmm` is a fully implemented engine
-/// (Task 8) but not yet approved for a production-facing config surface --
-/// a `[decode]` table in a daemon's `--server-config` is, if anything, MORE
-/// production-facing than a one-off `manta decode --engine` invocation, so
-/// it gets the same gate rather than a looser one. Lifting this is a
-/// bigger decision than this module's scope (tracked alongside the CLI
-/// flag's own restriction).
-fn deserialize_engine<'de, D>(deserializer: D) -> Result<Engine, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let engine = Engine::deserialize(deserializer)?;
-    if engine == Engine::Hsmm {
-        return Err(serde::de::Error::custom(
-            "decode.engine = \"hsmm\" is not enabled in a [decode] config file yet \
-             (same restriction as manta-cli's --engine hsmm)",
-        ));
-    }
-    Ok(engine)
 }
 
 fn default_sigma_u() -> f32 {
@@ -120,7 +108,7 @@ fn default_conf_kappa() -> f32 {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecodeConfigToml {
-    #[serde(default = "default_engine", deserialize_with = "deserialize_engine")]
+    #[serde(default = "default_engine")]
     pub engine: Engine,
     // SPEC v2 §1 (EvidenceConfig)
     #[serde(default = "default_sigma_u")]
@@ -315,18 +303,21 @@ mod tests {
     }
 
     #[test]
-    fn hsmm_engine_is_rejected_in_a_decode_config_file() {
-        let result: Result<DecodeConfigFile, _> = toml::from_str(
+    fn hsmm_engine_parses_permissively_at_this_layer() {
+        // The production-readiness gate on Engine::Hsmm is enforced by the
+        // CALLER (manta-cli's Command::Listen) on the final, CLI-merged
+        // engine value -- NOT here at deserialize time. Rejecting it here
+        // would reject a [decode] table staging engine = "hsmm" even when
+        // an explicit --engine override is there specifically to replace
+        // it, breaking SPEC v2 §7's CLI-wins-when-given precedence rule.
+        let file: DecodeConfigFile = toml::from_str(
             r#"
             [decode]
             engine = "hsmm"
             "#,
-        );
-        assert!(
-            result.is_err(),
-            "decode.engine = \"hsmm\" must be rejected, same as --engine hsmm"
-        );
-        assert!(result.unwrap_err().to_string().contains("hsmm"));
+        )
+        .unwrap();
+        assert_eq!(file.decode.engine, Engine::Hsmm);
     }
 
     #[test]

@@ -199,6 +199,68 @@ fn listen_engine_hsmm_is_a_clean_error_not_a_panic() {
     assert_eq!(out.status.code(), Some(2), "clap arg-error exit code");
 }
 
+/// Regression, black-box: SPEC v2 §7 requires an explicit `--engine` to
+/// override `[decode]`'s `engine` key. An earlier version validated
+/// `engine = "hsmm"` at TOML-deserialize time -- BEFORE the CLI override
+/// was ever consulted -- so a config file staging `engine = "hsmm"` failed
+/// immediately even with `--engine legacy` on the command line, and the
+/// override never got a chance to run. Exercises the actual `manta`
+/// subprocess (not just the internal merge/reject functions) both ways: an
+/// override must let the run past the hsmm gate (it then fails for the
+/// unrelated, expected reason -- the nonexistent source file, not "hsmm"),
+/// and no override must still be rejected for hsmm specifically.
+#[test]
+fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
+    use std::io::Write as _;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        f,
+        r#"
+        [server]
+        station_callsign = "W3XYZ"
+        [decode]
+        engine = "hsmm"
+        "#
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    // With --engine legacy: must get PAST the hsmm gate and fail instead
+    // for the expected downstream reason (source file doesn't exist).
+    let out = manta()
+        .args(["listen", "--engine", "legacy", "--server-config"])
+        .arg(f.path())
+        .args(["--source", "/nonexistent.wav", "--dial-freq-hz", "14027000"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a failure (nonexistent source), just not the hsmm one"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("hsmm"),
+        "an explicit --engine override must beat the file's hsmm value; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+        "expected the nonexistent-source-file error, got: {stderr}"
+    );
+
+    // With NO --engine override: the file's own hsmm value must still be
+    // rejected -- fixing the ordering bug above must not accidentally make
+    // hsmm reachable with no override at all.
+    let out = manta()
+        .args(["listen", "--server-config"])
+        .arg(f.path())
+        .args(["--source", "/nonexistent.wav", "--dial-freq-hz", "14027000"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected the hsmm rejection");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("hsmm"), "stderr: {stderr}");
+}
+
 #[test]
 fn dial_freq_hz_rejects_non_finite_and_non_positive_values() {
     for bad in ["nan", "inf", "-inf", "0", "-14027000"] {

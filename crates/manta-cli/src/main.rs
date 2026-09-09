@@ -784,6 +784,29 @@ fn merge_cli_engine(
     file_decode
 }
 
+/// Same production-readiness gate as `parse_engine`'s CLI-level rejection
+/// of `--engine hsmm`, applied here to the FINAL, CLI-merged engine value
+/// -- i.e. called AFTER `merge_cli_engine`, never before. `[decode].engine
+/// = "hsmm"` parses without complaint (`manta_decode::config_file`), so an
+/// operator staging that in a config file can still override it with
+/// `--engine legacy`/`--engine edge-legacy`; gating any earlier (e.g. at
+/// TOML deserialize time) would reject the file before that override ever
+/// got a chance to apply, breaking SPEC v2 §7's CLI-wins-when-given
+/// precedence rule. Only reachable via a config file today -- clap's
+/// `parse_engine` value parser already keeps `--engine hsmm` itself from
+/// ever producing `Some(Engine::Hsmm)` here.
+fn reject_hsmm_engine(
+    decode: manta_decode::decoder::DecodeConfig,
+) -> Result<manta_decode::decoder::DecodeConfig> {
+    if decode.engine == Engine::Hsmm {
+        bail!(
+            "the hsmm engine is not enabled on this command yet \
+             ([decode].engine = \"hsmm\" in --server-config, not overridden by --engine)"
+        );
+    }
+    Ok(decode)
+}
+
 /// Handles the `Listen` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
@@ -1166,9 +1189,12 @@ fn main() -> Result<()> {
             };
             // SPEC v2 §7: `[decode]` (from --server-config, if given) is
             // the baseline; an explicit --engine overrides just its
-            // `engine` key (merge_cli_engine).
+            // `engine` key (merge_cli_engine). hsmm is validated on the
+            // FINAL merged value (reject_hsmm_engine), not at TOML parse
+            // time, so a file staging engine = "hsmm" can still be
+            // overridden by an explicit --engine.
             let decode_from_file = load_decode_config_file(server_config.as_deref())?;
-            let decode_cfg = merge_cli_engine(engine, decode_from_file);
+            let decode_cfg = reject_hsmm_engine(merge_cli_engine(engine, decode_from_file))?;
             let mut cfg = build_pipeline_config(
                 freq_correction_ppm,
                 allowlist,
@@ -1529,6 +1555,76 @@ mod tests {
         assert_eq!(cfg.engine, Engine::EdgeLegacy);
         assert_eq!(cfg.evidence.sigma_u, 0.31);
         assert_eq!(cfg.hsmm.beam, 10);
+    }
+
+    #[test]
+    fn reject_hsmm_engine_passes_through_a_non_hsmm_engine() {
+        let cfg = manta_decode::decoder::DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..manta_decode::decoder::DecodeConfig::default()
+        };
+        let result = reject_hsmm_engine(cfg).unwrap();
+        assert_eq!(result.engine, Engine::EdgeLegacy);
+    }
+
+    #[test]
+    fn reject_hsmm_engine_rejects_hsmm() {
+        let cfg = manta_decode::decoder::DecodeConfig {
+            engine: Engine::Hsmm,
+            ..manta_decode::decoder::DecodeConfig::default()
+        };
+        assert!(reject_hsmm_engine(cfg).is_err());
+    }
+
+    /// Regression: an earlier version of this task rejected `engine =
+    /// "hsmm"` at TOML-deserialize time (inside `load_decode_config_file`,
+    /// i.e. BEFORE `merge_cli_engine` ever runs), which meant an explicit
+    /// `--engine legacy` could never override a config file staging
+    /// `engine = "hsmm"` -- the file's parse error fired first, and the
+    /// override never got a chance to apply. This exercises the actual
+    /// three-function call sequence `Command::Listen`'s handler uses
+    /// (`load_decode_config_file` -> `merge_cli_engine` ->
+    /// `reject_hsmm_engine`) to prove that ordering fix: the CLI override
+    /// must both be ABLE to run (no earlier hard failure) and WIN.
+    #[test]
+    fn cli_engine_override_lets_a_hsmm_staged_file_through() {
+        let f = write_temp_file(
+            br#"
+            [server]
+            station_callsign = "W3XYZ"
+            [decode]
+            engine = "hsmm"
+            "#,
+        );
+        let file_decode = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(
+            file_decode.engine,
+            Engine::Hsmm,
+            "the file's own value must still be hsmm going into the merge"
+        );
+        let result = reject_hsmm_engine(merge_cli_engine(Some(Engine::Legacy), file_decode));
+        assert_eq!(
+            result.unwrap().engine,
+            Engine::Legacy,
+            "an explicit --engine must override a hsmm-staged file"
+        );
+    }
+
+    /// The other direction of the same regression: with NO CLI override,
+    /// a file staging `engine = "hsmm"` must still be rejected -- fixing
+    /// the ordering bug above must not accidentally make hsmm reachable
+    /// with no override at all.
+    #[test]
+    fn hsmm_staged_file_is_still_rejected_without_a_cli_override() {
+        let f = write_temp_file(
+            br#"
+            [decode]
+            engine = "hsmm"
+            "#,
+        );
+        let file_decode = load_decode_config_file(Some(f.path())).unwrap();
+        let result = reject_hsmm_engine(merge_cli_engine(None, file_decode));
+        assert!(result.is_err());
     }
 
     #[test]
