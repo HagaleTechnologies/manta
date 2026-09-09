@@ -110,15 +110,22 @@ points at two further open problems, neither fixed here:
 
 1. **`merge_converged`'s "within 1.0 channel" merge threshold** (SPEC
    §2.5, `crates/manta-engine/src/track.rs`) assumes one real signal never
-   sits within 1 channel (~47Hz) of another. In a dense real contest
-   pileup that assumption is frequently false -- two genuinely distinct
-   real signals packed within ~50-100Hz apart is a normal, common
-   real-conditions pattern. SPEC §2.5 explicitly frames any such
-   convergence as "interference or drift-collision" of what should be
-   treated as the same signal; that's a spectral-resolution/signal-density
-   modeling assumption, not an implementation bug, so changing it needs
-   the same rigor as an `on_snr_db`-class deviation (or a channelizer/
-   ownership-arbitration redesign), not a quick threshold tweak.
+   sits within 1 channel (**93.75Hz** -- `CHANNEL_SPACING_HZ`,
+   `crates/manta-dsp/src/channelizer.rs`; corrected here, Codex review PR
+   #152 -- an earlier draft of this doc said ~47Hz, half the real value)
+   of another. In a dense real contest pileup that assumption is
+   frequently false -- two genuinely distinct real signals packed within
+   under 93.75Hz apart is a normal, common real-conditions pattern. SPEC
+   §2.5 explicitly frames any such convergence as "interference or
+   drift-collision" of what should be treated as the same signal; that's
+   a spectral-resolution/signal-density modeling assumption, not an
+   implementation bug, so changing it needs the same rigor as an
+   `on_snr_db`-class deviation (or a channelizer/ownership-arbitration
+   redesign), not a quick threshold tweak. A follow-up measurement (birth
+   `channel` gap between merged pairs on B2, MAN-166 ticket history) found
+   most merges start ~3 channels (~281Hz) apart at track birth, not
+   already-adjacent -- consistent with either explanation and not yet
+   disambiguated; see that ticket comment for the caveat.
 2. **Raw per-character decode accuracy under genuine HF noise/QRM** may be
    the dominant remaining gap: most surviving real spots reflect only one
    clean decode ever captured, suggesting the decode-core itself struggles

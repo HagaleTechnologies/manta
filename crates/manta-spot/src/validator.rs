@@ -22,27 +22,6 @@ use std::collections::{BTreeMap, VecDeque};
 /// `dedupe.rs`).
 const WORD_WINDOW: usize = 16;
 
-/// Width of a `RepetitionGate` frequency bucket, in Hz (MAN-166). Buckets
-/// a track's reported frequency for repetition-gate identity, so a real
-/// signal's repeated decodes still count toward `RepetitionGate::record`'s
-/// 2-decode confirmation even after its track closes and reopens under a
-/// new `track_id` at a slightly different centroid. 100 Hz is empirically
-/// justified: real fragments of the same signal, captured across a track
-/// closing and reopening, clustered within a 50 Hz bin in manta's B2
-/// golden-vector recording (MAN-166) -- 100 Hz gives margin for centroid
-/// drift between fragments while staying well inside the spacing between
-/// distinct real signals in a dense contest band (rarely under a few
-/// hundred Hz). The key also includes the callsign text, so even a
-/// coincidental bucket collision between two distinct real signals can
-/// only cross-contaminate if they also decode to the exact same text --
-/// not a realistic concern.
-const FREQ_BUCKET_HZ: f64 = 100.0;
-
-/// See `FREQ_BUCKET_HZ`'s doc.
-fn freq_bucket(freq_hz: f64) -> i64 {
-    (freq_hz / FREQ_BUCKET_HZ).round() as i64
-}
-
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -206,6 +185,17 @@ pub struct Validator {
     blocklist: Blocklist,
     notch: NotchList,
     suppression_counts: SuppressionCounts,
+    /// The latest `sample_ts` seen across every track (not per-track --
+    /// see `TrackState::last_sample_ts` for that), used to `sweep` the
+    /// repetition gate on `TrackClosed` (MAN-166, Codex review PR #152).
+    /// A closing track's *own* `last_sample_ts` is not a safe stand-in:
+    /// it can be stale or still 0 (a track that emitted metadata but no
+    /// `WordBoundary`), which would make that sweep a no-op and leave
+    /// other, genuinely-expired gate entries growing unbounded forever --
+    /// this field is the only thing that's actually monotonic across the
+    /// whole `Validator`, matching SPEC-decode-core.md §6 rule 2
+    /// (sample_ts-based, never wall clock).
+    now_ts: u64,
 }
 
 impl Validator {
@@ -221,6 +211,7 @@ impl Validator {
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
             suppression_counts: SuppressionCounts::default(),
+            now_ts: 0,
         }
     }
 
@@ -294,8 +285,9 @@ impl Validator {
                 track_id,
                 glyph,
                 confidence,
-                ..
+                sample_ts,
             } => {
+                self.now_ts = self.now_ts.max(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
                 match glyph {
                     Glyph::Char(c) => {
@@ -316,6 +308,7 @@ impl Validator {
                 track_id,
                 sample_ts,
             } => {
+                self.now_ts = self.now_ts.max(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
@@ -362,7 +355,10 @@ impl Validator {
             // before producing any other event (the exact case this event
             // exists to surface) creates no per-track_id state here to
             // leak.
-            DecoderEvent::TrackPromoted { .. } => Vec::new(),
+            DecoderEvent::TrackPromoted { sample_ts, .. } => {
+                self.now_ts = self.now_ts.max(*sample_ts);
+                Vec::new()
+            }
             DecoderEvent::TrackClosed { track_id } => {
                 // MAN-19: without removing `self.tracks`' entry,
                 // per-track_id word/grammar-context state grows forever --
@@ -380,18 +376,21 @@ impl Validator {
                 // the gate's whole 90s window the instant a track closed.
                 // `sweep` still bounds `gate`'s memory the way MAN-19
                 // needed, just on elapsed time instead of track lifetime.
-                // Uses this track's own last-seen `sample_ts` (0, a safe
-                // no-op sweep, if it closed before ever reporting one) as
-                // the current-time reference, since `Validator` otherwise
-                // carries no clock of its own (SPEC-decode-core.md §6
-                // rule 2: sample_ts-based, never wall clock).
-                let last_ts = self
-                    .tracks
-                    .get(track_id)
-                    .map(|t| t.last_sample_ts)
-                    .unwrap_or(0);
+                // Uses `self.now_ts` (Codex review, PR #152), not this
+                // closing track's own `last_sample_ts`: a track that
+                // emitted metadata but no `WordBoundary` still has
+                // `last_sample_ts == 0`, and sweeping with that stale
+                // value is a no-op (`sweep`'s cutoff saturates to 0),
+                // leaving every *other* genuinely-expired gate entry to
+                // grow unbounded forever -- reintroducing the exact
+                // MAN-19 leak this mechanism exists to prevent.
+                // `now_ts` is the latest `sample_ts` seen across every
+                // event this `Validator` has ever ingested, so it's
+                // monotonic regardless of which specific track is
+                // closing (SPEC-decode-core.md §6 rule 2: sample_ts-based,
+                // never wall clock).
                 self.tracks.remove(track_id);
-                self.gate.sweep(last_ts);
+                self.gate.sweep(self.now_ts);
                 Vec::new()
             }
         }
@@ -743,8 +742,7 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate
-                .record(freq_bucket(freq_hz), &candidate, sample_ts) as u32
+            self.gate.record(freq_hz, &candidate, sample_ts) as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -1131,7 +1129,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     /// MAN-19: reproduces the soak's actual failure mode at unit-test
     /// scale -- many distinct, never-reused track_ids, each getting real
     /// activity (TrackMeta) then closing. Without `TrackClosed` wired
-    /// through to `self.tracks.remove`/`self.gate.forget_track`, `tracks`
+    /// through to `self.tracks.remove`/`self.gate.sweep`, `tracks`
     /// would have 10,000 entries here instead of 0.
     #[test]
     fn sustained_track_churn_stays_bounded() {
@@ -1144,6 +1142,60 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             v.tracks.len(),
             0,
             "Validator.tracks must not accumulate one entry per historical track_id"
+        );
+    }
+
+    /// Codex review, PR #152: `TrackClosed`'s sweep must use a
+    /// validator-wide monotonic clock, not the closing track's own
+    /// `last_sample_ts` -- a track that closes having emitted metadata
+    /// but no `WordBoundary` still has `last_sample_ts == 0`, so sweeping
+    /// with that stale value is a no-op (`sweep`'s own cutoff saturates to
+    /// 0) and leaves the gate's `seen` map growing without bound under
+    /// exactly this kind of churn, reintroducing the MAN-19 leak this
+    /// mechanism exists to prevent.
+    #[test]
+    fn gate_stays_bounded_under_churn_even_when_closing_tracks_have_a_stale_own_timestamp() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let window_samples = (90.0 * FS) as u64;
+        let words = ["DE", "K5ARH", "K"];
+
+        // Many distinct real signals (different frequencies, one gate
+        // entry each), each confirmed once early (small sample_ts) then
+        // closed -- every one of these tracks' own `last_sample_ts` stays
+        // small/stale relative to the far-future check below.
+        for track_id in 0..2_000u32 {
+            v.ingest(&DecoderEvent::TrackMeta {
+                track_id,
+                snr_2500_db: 20.0,
+                freq_hz: 14_000_000.0 + (track_id as f64) * 1000.0,
+            });
+            run(&transmission_events(track_id, &words, 0), &mut v);
+            v.ingest(&DecoderEvent::TrackClosed { track_id });
+        }
+        assert!(
+            v.gate.len() > 0,
+            "sanity check: the loop above must actually have populated the gate"
+        );
+
+        // A real WordBoundary, far past the 90s window, advances the
+        // validator's own clock -- this is the only source of "now" a
+        // correct implementation has, since every closing track above was
+        // stuck at an early, stale `last_sample_ts`.
+        // Comfortably past window_samples relative to the small
+        // (hundreds-of-samples) timestamps every track above used, so the
+        // 2,000 old entries are genuinely expired, not just past a cutoff
+        // that's still behind their own real timestamps.
+        seed_meta(&mut v, 99_999);
+        v.ingest(&DecoderEvent::WordBoundary {
+            track_id: 99_999,
+            sample_ts: window_samples * 2,
+        });
+        v.ingest(&DecoderEvent::TrackClosed { track_id: 99_999 });
+
+        assert_eq!(
+            v.gate.len(),
+            0,
+            "gate must not accumulate one entry per historical frequency once genuinely swept past the window"
         );
     }
 }
