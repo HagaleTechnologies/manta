@@ -232,7 +232,15 @@ impl IqSource for SampleBoundedSource {
         if self.samples_read >= self.max_samples {
             return Ok(0);
         }
-        let remaining = (self.max_samples - self.samples_read) as usize;
+        // Saturate, don't truncate: on a 32-bit target a long, high-rate
+        // run's `remaining` count can exceed `usize::MAX` (round-7 review
+        // finding -- e.g. 1.536 MS/s for 3600s is ~5.53 billion samples).
+        // A bare `as usize` cast wraps, and if it ever wraps to exactly
+        // 0 the read is called with an empty buffer, which returns Ok(0)
+        // -- `listen()` reads that as EOF, ending the whole run early.
+        // Saturating first means `cap` is only ever bounded by `buf.len()`
+        // itself (already a real usize), never spuriously zero.
+        let remaining = usize::try_from(self.max_samples - self.samples_read).unwrap_or(usize::MAX);
         let cap = remaining.min(buf.len());
         let n = self.inner.read(&mut buf[..cap])?;
         self.samples_read += n as u64;

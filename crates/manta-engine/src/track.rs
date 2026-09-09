@@ -771,19 +771,8 @@ impl TrackManager {
                 }
             }
         }
-        // `promoted_events` goes first, `pool_events` after -- both land in
-        // `event_sample_ts`'s ties-at-0 tier (below), so `sort_by_key`'s
-        // stability preserves this relative order for the same track_id:
-        // a promotion always precedes any SpeedUpdate/TrackMeta this same
-        // batch's queued decoder output produced for that track. With
-        // shipped defaults this batch-collision can't happen (promotion
-        // needs ~2.05s worst case, TrackMeta/SpeedUpdate need ~1s more on
-        // top of that -- see docs/DECISIONS/2026-09-09-doctor-track-
-        // promoted-event.md), but a caller supplying much shorter warmup_hops/
-        // confirm_hops could reach it within one two-second calibration
-        // batch (round-6 review finding).
-        let mut events = promoted_events;
-        events.extend(pool_events);
+        let mut events = pool_events;
+        events.extend(promoted_events);
         // MAN-19: emit one `TrackClosed` per track closed this batch (any
         // CloseReason) so downstream per-track_id state (`manta-spot`'s
         // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
@@ -797,6 +786,11 @@ impl TrackManager {
                 .map(|track_id| DecoderEvent::TrackClosed { track_id }),
         );
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        // See this function's doc comment: a real-timestamped promotion
+        // can still land after its own track's ts=0-pinned SpeedUpdate/
+        // TrackMeta from the same batch; this targeted pass fixes just
+        // that, without disturbing the real chronological sort above.
+        reorder_promotions_before_same_track_pinned_events(&mut events);
         events
     }
 
@@ -906,22 +900,79 @@ impl TrackManager {
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
-        | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
-        // `TrackPromoted` carries a real `sample_ts` field (accurate,
-        // useful to external JSON consumers), but for THIS resequencing
-        // key it's treated like SpeedUpdate/TrackMeta -- ties at 0, no
-        // cross-batch ordering claim -- specifically so `process_hops`'s
-        // stable sort can use vec order (promoted_events placed before
-        // pool_events) to guarantee a promotion always precedes any
-        // same-batch decoder update for its own track_id (round-6 review
-        // finding). Giving it its own real positive timestamp here would
-        // put it in the wrong tier entirely: 0 < any real sample_ts, so
-        // SpeedUpdate/TrackMeta (always 0) would otherwise always sort
-        // before a same-track promotion that logically preceded them.
-        DecoderEvent::SpeedUpdate { .. }
-        | DecoderEvent::TrackMeta { .. }
-        | DecoderEvent::TrackPromoted { .. } => 0,
+        | DecoderEvent::WordBoundary { sample_ts, .. }
+        // `TrackPromoted`'s real, meaningful sample_ts governs its GLOBAL
+        // position here (round-7 review: an earlier attempt pinned this
+        // to 0 like SpeedUpdate/TrackMeta, which fixed same-track
+        // ordering against those two but broke cross-track ordering
+        // against OTHER tracks' genuinely-timestamped CharDecoded/
+        // WordBoundary -- SPEC §6 rule 6 is a GLOBAL, not per-track,
+        // ordering contract). The narrower same-track concern that
+        // motivated pinning it to 0 (a promotion sorting after its own
+        // track's same-batch SpeedUpdate/TrackMeta) is handled instead by
+        // `reorder_promotions_before_same_track_pinned_events`, a
+        // targeted post-sort pass -- see `process_hops`.
+        | DecoderEvent::TrackPromoted { sample_ts, .. } => *sample_ts,
+        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
+    }
+}
+
+/// `SpeedUpdate`/`TrackMeta` carry no real timestamp at all (pinned to 0
+/// in `event_sample_ts`, "no ordering claim") -- fine on their own, but a
+/// promotion's real timestamp (however early) can never sort before that
+/// sentinel via a plain numeric key, so a track promoted and then, in the
+/// SAME batch, immediately producing a `SpeedUpdate`/`TrackMeta` could
+/// have that update sort first, ahead of the promotion that logically
+/// preceded it (round-6 review finding; only reachable with much shorter
+/// warmup_hops/confirm_hops than the shipped default, or any single large
+/// unchunked batch). A single sort key can't express both this and
+/// `TrackPromoted`'s otherwise-correct global chronological position
+/// (round-7 review finding), so this runs as a small, explicit second
+/// pass on the already-sorted batch: for each track_id whose
+/// `TrackPromoted` currently sits after that same track's earliest
+/// `SpeedUpdate`/`TrackMeta`, move the promotion to just before it,
+/// leaving every other event's relative order untouched. Recomputes
+/// indices from scratch each iteration rather than trying to
+/// incrementally patch them after a move -- correctness over cleverness
+/// for a function that runs once per batch, on at most a few hundred
+/// events (`track_cap`).
+fn reorder_promotions_before_same_track_pinned_events(events: &mut Vec<DecoderEvent>) {
+    // Bounded defensively at events.len() iterations -- each real fix
+    // strictly narrows the gap between a promotion and its own track's
+    // earliest pinned-tier event, so this should terminate in at most a
+    // handful of passes; the cap just guarantees no possible infinite
+    // loop rather than relying solely on that reasoning.
+    for _ in 0..events.len() {
+        let mut promoted_idx: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        let mut earliest_pinned_idx: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        for (i, e) in events.iter().enumerate() {
+            match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => {
+                    promoted_idx.entry(*track_id).or_insert(i);
+                }
+                DecoderEvent::SpeedUpdate { track_id, .. }
+                | DecoderEvent::TrackMeta { track_id, .. } => {
+                    earliest_pinned_idx.entry(*track_id).or_insert(i);
+                }
+                _ => {}
+            }
+        }
+        let violation = promoted_idx.into_iter().find_map(|(track_id, p_i)| {
+            earliest_pinned_idx
+                .get(&track_id)
+                .copied()
+                .and_then(|pin_i| (p_i > pin_i).then_some((p_i, pin_i)))
+        });
+        match violation {
+            Some((p_i, pin_i)) => {
+                let ev = events.remove(p_i);
+                events.insert(pin_i, ev);
+            }
+            None => break,
+        }
     }
 }
 
@@ -1339,6 +1390,75 @@ mod tests {
             "expected CER < 0.02 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
             rendered.keyed_texts[0],
             text
+        );
+    }
+
+    /// Regression (round-7 review): an earlier fix for the same-track
+    /// ordering problem below (pinning `TrackPromoted` to ts=0, like
+    /// SpeedUpdate/TrackMeta) broke this instead -- a DIFFERENT track's
+    /// genuinely-earlier real-timestamped `CharDecoded` must still sort
+    /// before a LATER track's `TrackPromoted`, honoring `TrackPromoted`'s
+    /// real, meaningful timestamp for cross-track (SPEC §6 rule 6, global)
+    /// ordering.
+    #[test]
+    fn sort_and_reorder_preserves_cross_track_chronological_order() {
+        let mut events = vec![
+            DecoderEvent::TrackPromoted {
+                track_id: 2,
+                sample_ts: 100,
+                freq_hz: 14_012_340.0,
+            },
+            DecoderEvent::CharDecoded {
+                track_id: 1,
+                sample_ts: 50,
+                glyph: manta_decode::tree::Glyph::Char('W'),
+                confidence: 1.0,
+            },
+        ];
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        reorder_promotions_before_same_track_pinned_events(&mut events);
+        let char_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::CharDecoded { .. }))
+            .unwrap();
+        let promoted_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            .unwrap();
+        assert!(
+            char_idx < promoted_idx,
+            "track 1's real ts=50 CharDecoded must sort before track 2's real ts=100 \
+             TrackPromoted -- global chronological order, not per-track"
+        );
+    }
+
+    /// Regression (round-6 review, still required after round-7's fix):
+    /// within the SAME track, a promotion must still sort before that
+    /// track's own same-batch SpeedUpdate/TrackMeta (both pinned at
+    /// ts=0), even though `TrackPromoted` now carries its own real,
+    /// larger timestamp.
+    #[test]
+    fn reorder_moves_a_promotion_before_its_own_tracks_pinned_events() {
+        let mut events = vec![
+            DecoderEvent::SpeedUpdate {
+                track_id: 5,
+                wpm: 20.0,
+            },
+            DecoderEvent::TrackPromoted {
+                track_id: 5,
+                sample_ts: 5000,
+                freq_hz: 14_012_340.0,
+            },
+        ];
+        events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        // Confirms the setup actually reproduces the problem this test
+        // guards against: without the reorder pass, ts=0 sorts first.
+        assert!(matches!(events[0], DecoderEvent::SpeedUpdate { .. }));
+        reorder_promotions_before_same_track_pinned_events(&mut events);
+        assert!(
+            matches!(events[0], DecoderEvent::TrackPromoted { .. }),
+            "TrackPromoted must sort before its own track's SpeedUpdate after reordering, got \
+             {events:?}"
         );
     }
 
