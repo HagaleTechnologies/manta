@@ -1,5 +1,5 @@
-//! `manta` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
-//! The daemon (SDR input, servers) arrives at M2/M3 (ROADMAP).
+//! `manta` CLI: decode a WAV fixture, generate golden vectors, and run the
+//! daemon (SDR input, telnet/JSON/metrics servers, RBN uplinks) via `run`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -62,8 +62,13 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Decode a live off-air CW signal continuously from real audio.
-    Listen {
+    /// Run manta as a daemon, or copy live off-air CW continuously.
+    ///
+    /// D11/MAN-77: `run` is the daemon entry point. `listen` is kept as a
+    /// visible alias for ad hoc audio/dev testing (see
+    /// docs/DECISIONS/2026-09-06-broad-review-decisions.md).
+    #[command(visible_alias = "listen")]
+    Run {
         /// Input device name substring (default input device if omitted).
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
@@ -156,10 +161,10 @@ enum Command {
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
         /// (ARCHITECTURE §7-§8) alongside the decode loop.
-        #[arg(long)]
-        server_config: Option<PathBuf>,
+        #[arg(long, alias = "server-config")]
+        config: Option<PathBuf>,
         /// RF dial frequency in Hz, overriding the source's own
-        /// `center_freq_hz()`. Required with --server-config when the
+        /// `center_freq_hz()`. Required with --config when the
         /// source is a plain audio device or --source WAV file, since
         /// neither reports a real RF frequency (KiwiSDR/SoapySDR already
         /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
@@ -170,7 +175,7 @@ enum Command {
         /// Fixed replay epoch, Unix seconds -- overrides the replayed
         /// file's own mtime as the wall-clock instant SpotBus treats as
         /// `sample_ts == 0`. Only meaningful with --source (file replay)
-        /// and --server-config; ignored for a live source. Without this,
+        /// and --config; ignored for a live source. Without this,
         /// the epoch is the file's mtime, which is real and reproducible
         /// for an untouched file but changes if the file is copied,
         /// downloaded, or restored without preserving filesystem metadata
@@ -789,7 +794,7 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
-/// Handles the `Listen` on-spot closure needs to feed a running spot server.
+/// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
@@ -886,7 +891,7 @@ fn start_spot_server(
     // debugging without a code change.
     //
     // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
-    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // but `Command::Run --json` ALSO writes DecoderEvents/spots as
     // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
     // byte-identical spot logs" hard requirement means any interleaved
     // non-JSON tracing line corrupts that machine-readable stream for
@@ -1027,6 +1032,7 @@ fn start_spot_server(
 }
 
 fn main() -> Result<()> {
+    warn_deprecations();
     match Cli::parse().command {
         Command::Decode {
             path,
@@ -1067,7 +1073,7 @@ fn main() -> Result<()> {
                 manifest.expected_freq_hz
             );
         }
-        Command::Listen {
+        Command::Run {
             device,
             source,
             kiwi_host,
@@ -1095,7 +1101,7 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
-            server_config,
+            config,
             dial_freq_hz,
             replay_epoch,
         } => {
@@ -1124,9 +1130,9 @@ fn main() -> Result<()> {
                 "audio"
             };
 
-            if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            if config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
-                    "--dial-freq-hz is required with --server-config when using a plain \
+                    "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
                      frequency (KiwiSDR/SoapySDR already know theirs from \
                      --kiwi-freq/--soapy-freq)"
@@ -1181,15 +1187,15 @@ fn main() -> Result<()> {
             };
 
             // Kept alive for the process lifetime: dropping it would stop
-            // the spawned server tasks. `None` when --server-config wasn't
+            // the spawned server tasks. `None` when --config wasn't
             // given, in which case `spot_server` stays None too. `epoch`/
             // `session_nonce` are deliberately computed IN this branch, not
-            // above it -- `--source`-only replay (no --server-config) never
+            // above it -- `--source`-only replay (no --config) never
             // consumes either, and computing `session_nonce` means hashing
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match server_config {
+            let (server_runtime, spot_server) = match config {
                 Some(path) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
                     // JSON `timestamp`/RBN Zulu field a client observes) --
@@ -1292,7 +1298,7 @@ fn main() -> Result<()> {
                 // Provisional CLI-debugging text/JSON printed below is NOT
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
-                // ARCHITECTURE §7), fed here when --server-config is set.
+                // ARCHITECTURE §7), fed here when --config is set.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
@@ -1521,6 +1527,68 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Which replaced CLI spelling the operator typed, if any.
+///
+/// D11/MAN-77 promoted `listen --server-config` to `run --config`. clap
+/// cannot answer this: an alias is normalized to the subcommand's canonical
+/// name inside `Parser::possible_subcommand` before `ArgMatches` ever sees
+/// it, and `MatchedArg` records no alias spelling for flags either. So the
+/// only source of truth is raw argv, read before `Cli::parse()`.
+#[derive(Debug, PartialEq, Eq)]
+enum Deprecation {
+    /// `listen` used to start the daemon (i.e. with a config file). Plain
+    /// `listen --device`/`--kiwi-host` is NOT deprecated -- MAN-77's title
+    /// keeps `listen` for ad hoc audio/dev testing.
+    ListenVerb,
+    /// `--server-config`, under either verb.
+    ServerConfigFlag,
+}
+
+fn deprecations<I: IntoIterator<Item = String>>(args: I) -> Vec<Deprecation> {
+    let argv: Vec<String> = args.into_iter().collect();
+    let is_flag = |name: &str| {
+        argv.iter()
+            .any(|a| a == name || a.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
+    };
+    let mut out = Vec::new();
+    let has_config = is_flag("--config") || is_flag("--server-config");
+    if argv.get(1).map(String::as_str) == Some("listen") && has_config {
+        out.push(Deprecation::ListenVerb);
+    }
+    if is_flag("--server-config") {
+        out.push(Deprecation::ServerConfigFlag);
+    }
+    out
+}
+
+/// stderr, not `tracing::warn!`: the only `tracing_subscriber` init in this
+/// binary lives inside `start_spot_server`, so a parse-time `warn!` would be
+/// dropped. stderr is also the stream `--json`'s JSON Lines consumer never
+/// reads (see `start_spot_server`'s MAN-59 round-6 note), so this cannot
+/// corrupt the byte-identical spot log AGENTS.md requires.
+///
+/// Known, accepted limitation: a flag *value* that is literally the string
+/// `--server-config` (e.g. a blocklist path so named) would trigger a
+/// spurious notice, because the scan is positional-unaware by design -- it
+/// runs before clap, so it cannot know which tokens are values. The failure
+/// mode is one extra stderr line, never a wrong exit code or a changed
+/// behavior.
+fn warn_deprecations() {
+    let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+    for d in deprecations(argv) {
+        match d {
+            Deprecation::ListenVerb => eprintln!(
+                "warning: starting the daemon with `manta listen` is deprecated and will be \
+                 removed in a future release; use `manta run --config` instead."
+            ),
+            Deprecation::ServerConfigFlag => eprintln!(
+                "warning: `--server-config` is deprecated and will be removed in a future \
+                 release; use `--config` instead."
+            ),
+        }
+    }
+}
+
 /// Human-readable `manta doctor` summary. `--json` bypasses this entirely
 /// in favor of the raw `DoctorReport`.
 fn print_doctor_report(report: &manta_engine::DoctorReport) {
@@ -1566,6 +1634,41 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn deprecation_notices_fire_only_for_the_replaced_spellings() {
+        fn notices(argv: &[&str]) -> Vec<Deprecation> {
+            deprecations(argv.iter().map(|s| s.to_string()))
+        }
+        // D-3: the daemon-via-listen path is deprecated ...
+        assert_eq!(
+            notices(&["manta", "listen", "--server-config", "m.toml"]),
+            vec![Deprecation::ListenVerb, Deprecation::ServerConfigFlag]
+        );
+        assert_eq!(
+            notices(&["manta", "listen", "--config", "m.toml"]),
+            vec![Deprecation::ListenVerb]
+        );
+        // ... the ad hoc audio path the ticket title preserves is NOT.
+        assert_eq!(notices(&["manta", "listen", "--device", "hw:1"]), vec![]);
+        assert_eq!(notices(&["manta", "listen"]), vec![]);
+        // The flag is deprecated under either verb.
+        assert_eq!(
+            notices(&["manta", "run", "--server-config", "m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        // `--flag=value` form must be caught too.
+        assert_eq!(
+            notices(&["manta", "run", "--server-config=m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        // The canonical spelling is silent.
+        assert_eq!(notices(&["manta", "run", "--config", "m.toml"]), vec![]);
+        assert_eq!(notices(&["manta", "run", "--device", "hw:1"]), vec![]);
+        // Other subcommands are never implicated.
+        assert_eq!(notices(&["manta", "decode", "/tmp/v1.wav"]), vec![]);
+        assert_eq!(notices(&["manta", "soak", "--duration", "10"]), vec![]);
     }
 
     #[test]

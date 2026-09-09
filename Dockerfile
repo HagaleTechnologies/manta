@@ -15,9 +15,21 @@
 
 FROM rust:1-slim-bookworm AS builder
 
+# `git` is a BUILD-TIME requirement here, not a convenience: this repo's
+# own .cargo/config.toml sets `[net] git-fetch-with-cli = true`, and it is
+# copied into the build context by the `COPY . .` below (.dockerignore does
+# not exclude .cargo). Under that setting cargo shells out to the `git`
+# binary to fetch the coppa-{dsp,audio,channel} git dependencies instead of
+# using its built-in libgit2 transport -- and `rust:1-slim-*` ships no git
+# (unlike the non-slim `rust:1-*`, which inherits one from buildpack-deps).
+# Without it the fetch fails to spawn at all: `could not execute process
+# 'git fetch ...' (never executed) / No such file or directory (os error 2)`,
+# and `cargo build` exits 101 before compiling a single crate (PR #65
+# docker-build failure, MAN-48).
 RUN apt-get update && apt-get install --no-install-recommends -y \
     libasound2-dev \
     pkg-config \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
