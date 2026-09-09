@@ -2,7 +2,7 @@
 //! vectors. (V16-V17, MAN-31's operator suppression vectors, live in
 //! golden_v16_v17.rs.)
 
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::Glyph;
 use manta_spot::{Blocklist, Spot, SpotType, Validator};
 
@@ -58,6 +58,23 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
     });
 }
 
+/// A real `TrackDecoder::finish()`/`finish_speed_only()` always reports a
+/// final `SpeedUpdate` (`flush_final_speed`, bypassing the live throttle)
+/// before its `TrackClosed` -- `resolve_pending_beacons` requires that
+/// confirmed WPM before it will judge any captured Beacon (round 10: an
+/// unconfirmed `wpm` is indistinguishable from a real 0 WPM otherwise).
+/// These golden tests build their event streams by hand, so they need to
+/// supply that SpeedUpdate explicitly too. 22.0 WPM matches real NCDXF/IARU
+/// beacon speed and sits well under `MAX_PLAUSIBLE_WPM` (45.0).
+fn close_track(v: &mut Validator, track_id: u32, closure: ClosureKind) -> Vec<Spot> {
+    let mut spots = v.ingest(&DecoderEvent::SpeedUpdate {
+        track_id,
+        wpm: 22.0,
+    });
+    spots.extend(v.ingest(&DecoderEvent::TrackClosed { track_id, closure }));
+    spots
+}
+
 #[test]
 fn v11_context_parse_sets_spot_type() {
     let cases: &[(&[&str], SpotType)] = &[
@@ -73,6 +90,10 @@ fn v11_context_parse_sets_spot_type() {
         seed_meta(&mut v, 1);
         let mut spots = run(&transmission_events(1, words, 0), &mut v);
         spots.extend(run(&transmission_events(1, words, 100_000), &mut v));
+        // A non-allowlisted Beacon candidate is never emitted before
+        // TrackClosed (round 7 redesign) -- harmless no-op for the other
+        // cases here, which already spotted via the repetition gate.
+        spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
         let hit = spots
             .iter()
             .find(|s| s.callsign == "K5ARH")
@@ -185,10 +206,17 @@ fn v18_beacon_pattern_exempt_from_repetition_gate() {
     seed_meta(&mut v, 1);
     let words = ["V", "V", "V", "K5ARH"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "a non-allowlisted Beacon candidate must never spot before TrackClosed \
+         (round 7 redesign), got {spots:?}"
+    );
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert_eq!(
         spots.len(),
         1,
-        "a BEACON-tagged spot must emit on the first decode"
+        "a BEACON-tagged spot must emit on the first decode -- no repetition needed, \
+         just the track's true close"
     );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
@@ -515,10 +543,17 @@ fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
     seed_meta(&mut v, 1);
     let words = ["K5ARH", "T"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "a non-allowlisted Beacon candidate must never spot before TrackClosed \
+         (round 7 redesign), got {spots:?}"
+    );
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert_eq!(
         spots.len(),
         1,
-        "a power-step BEACON-tagged spot must emit on the first decode"
+        "a power-step BEACON-tagged spot must emit on the first decode -- no \
+         repetition needed, just the track's true close"
     );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
@@ -630,11 +665,21 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
     });
+    // Round 7 redesign: a non-allowlisted Beacon candidate is only ever
+    // captured here (has_meta's retry lets it be captured at all, having
+    // never been attempted before), not emitted -- both occurrences only
+    // spot once the track truly closes.
+    assert!(
+        spots.is_empty(),
+        "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
+    );
+
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert!(
         spots
             .iter()
             .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
-        "W1AW must spot as Beacon once metadata arrives, got {spots:?}"
+        "W1AW must spot as Beacon once the track closes, got {spots:?}"
     );
     assert!(
         spots
@@ -826,7 +871,10 @@ fn a_glued_cq_de_substring_does_not_suppress_a_power_step_beacon() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let words = ["DE/NOISE", "W1AW", "T"];
-    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    // A non-allowlisted Beacon candidate is never emitted before
+    // TrackClosed (round 7 redesign).
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
     assert!(
         spots
             .iter()
@@ -942,7 +990,10 @@ fn a_spotted_word_still_counts_its_guard_suppression_once() {
 fn an_unsuppressed_power_step_beacon_counts_nothing() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
-    let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    let mut spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    // A non-allowlisted Beacon candidate is never emitted before
+    // TrackClosed (round 7 redesign).
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
     assert_eq!(spots.len(), 1);
     assert_eq!(v.suppression_counts().power_step_guard, 0);
 }
@@ -961,20 +1012,34 @@ fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    // Round 7 redesign: a non-allowlisted Beacon candidate is captured
+    // (setting word.last_spot_type = Some(Beacon), exactly the state the
+    // guard's own already_processed check looks for below), not emitted,
+    // until TrackClosed -- so this is empty here, not the eventual spot.
     assert!(
-        spots
-            .iter()
-            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
-        "the clean window must spot the beacon first, got {spots:?}"
+        spots.is_empty(),
+        "must be captured, not yet resolved, got {spots:?}"
     );
 
     // A bare CQ now enters the rolling window while "K5ARH T" is still in
-    // it, so the guard fires and re-burns the already-emitted occurrence.
+    // it, so the guard fires and re-burns the already-captured occurrence.
     run(&transmission_events(1, &["CQ", "DX"], 100_000), &mut v);
     assert_eq!(
         v.suppression_counts().power_step_guard,
         0,
-        "the beacon was already evaluated and emitted before the guard \
-         appeared, so the guard suppressed nothing"
+        "the beacon was already captured before the guard appeared, so the \
+         guard suppressed nothing"
+    );
+
+    // The captured candidate must still resolve at the track's true
+    // close -- the later guard re-burn (which only marks
+    // power_step_suppressed, never touches pending_beacons) must not
+    // have destroyed it.
+    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
+        "the captured beacon must still resolve at true close, got {spots:?}"
     );
 }

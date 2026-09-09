@@ -98,6 +98,11 @@ impl TrackDecoder {
     }
 
     /// End of stream: flush the demod and any open character/word. SPEC §5.
+    /// Only valid where a genuine, sustained on-air gap has actually been
+    /// observed (stream EOF, or manta-engine's HangExpired/Silent
+    /// closures) -- see `finish_speed_only` for closures that are pure
+    /// track bookkeeping instead (Merged/Evicted), where forcing an
+    /// in-progress mark sequence to resolve would fabricate content.
     pub fn finish(&mut self) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
         for run in self.demod.finish() {
@@ -113,7 +118,61 @@ impl TrackDecoder {
                 });
             }
         }
+        self.flush_final_speed(&mut events);
         events
+    }
+
+    /// Codex review on PR #154, round 7: a track closed via Merged/Evicted
+    /// (manta-engine::track.rs) is pure bookkeeping -- the RF signal could
+    /// still be genuinely mid-character at that instant, unlike a real
+    /// end-of-signal where a sustained real gap has already been
+    /// observed. `finish()` forces `Demod` to close its currently-open
+    /// run (mark OR space, whatever's mid-flight) and any accumulated
+    /// `cur_marks` to resolve into a character -- correct for a genuine
+    /// trailing gap, but fabricating one here previously let a mid-
+    /// character merge/eviction manufacture a synthetic character (e.g.
+    /// "T", forming the exact `<call> T` Beacon pattern from noise) out
+    /// of an in-progress, unconfirmed mark. This variant reports only the
+    /// speed estimate from marks ALREADY fully confirmed by ordinary
+    /// `push_envelope` calls -- no forced closure of anything still open.
+    pub fn finish_speed_only(&mut self) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        // `held` has already passed its own debounce confirmation --
+        // genuinely observed data, unlike `open` (still accumulating,
+        // could yet be an unconfirmed short blip). Safe to process
+        // through the ordinary (not forcing) run pipeline once nothing
+        // more will ever arrive for this decoder (round 8: without this,
+        // a mark/space fully confirmed just before a merge/eviction could
+        // sit unprocessed, leaving the "final" WPM stale on the wrong
+        // side of a consumer's cutoff even after `pending` was drained).
+        if let Some(run) = self.demod.take_held() {
+            self.on_run(run, &mut events);
+        }
+        self.flush_final_speed(&mut events);
+        events
+    }
+
+    /// Unconditional final report, bypassing WPM_REPORT_DELTA -- a
+    /// consumer that gates a decision on the track's true final speed
+    /// (manta-spot's Beacon-WPM plausibility check, added PR #154) has no
+    /// other event to observe it on. The live >= 1 WPM throttle exists to
+    /// reduce mid-stream chatter and stays as-is; this is an addition for
+    /// track finalization only, not a change to live reporting (round 4:
+    /// the tracker's speed can settle across a threshold-relevant
+    /// boundary the live throttle was never designed to catch, e.g.
+    /// 45.6 -> 44.9 WPM, and a short single-transmission track like a
+    /// beacon ID may never produce another WordBoundary to retry on
+    /// naturally).
+    fn flush_final_speed(&mut self, events: &mut Vec<DecoderEvent>) {
+        if let Some(w) = self.tracker.wpm() {
+            if self.last_reported_wpm != Some(w) {
+                self.last_reported_wpm = Some(w);
+                events.push(DecoderEvent::SpeedUpdate {
+                    track_id: self.track_id,
+                    wpm: w,
+                });
+            }
+        }
     }
 
     fn on_run(&mut self, run: Run, events: &mut Vec<DecoderEvent>) {
@@ -348,6 +407,81 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, DecoderEvent::TrackMeta { freq_hz, .. } if *freq_hz == 14_012_340.0)
         ));
+    }
+
+    /// Codex review on PR #154, round 4: the live path (`process_run`)
+    /// only reports a `SpeedUpdate` on a >= `WPM_REPORT_DELTA` change from
+    /// the last REPORTED value, so a track whose true estimate settles by
+    /// less than that delta never gets a correcting report -- a consumer
+    /// gating a decision on the track's true final speed (manta-spot's
+    /// Beacon-WPM check) has no other event to observe it on for a short,
+    /// single-transmission track. `finish()` must flush the true value
+    /// unconditionally.
+    #[test]
+    fn finish_flushes_a_final_speed_update_even_below_the_report_delta() {
+        let env = rect_envelope("CQ CQ DE W1AW W1AW K", 18);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let wpm_now = dec.tracker.wpm().expect("tracker must be ready by now");
+        // Pretend the last LIVE report already claimed a value stale by
+        // less than WPM_REPORT_DELTA -- the live path would never correct
+        // this on its own.
+        dec.last_reported_wpm = Some(wpm_now + (WPM_REPORT_DELTA - 0.1));
+
+        let finish_events = dec.finish();
+        assert!(
+            finish_events.iter().any(
+                |e| matches!(e, DecoderEvent::SpeedUpdate { wpm, .. } if (*wpm - wpm_now).abs() < 0.01)
+            ),
+            "finish() must flush the true final wpm even when it's within \
+             WPM_REPORT_DELTA of the last reported value, got {finish_events:?}"
+        );
+    }
+
+    /// Codex review on PR #154, round 7: `finish()` forces whatever's
+    /// still "open" (an in-progress mark with no real trailing gap yet
+    /// observed) to resolve into a character -- correct for a genuine
+    /// end-of-signal, but a fabrication when the closure is pure
+    /// bookkeeping (manta-engine's Merged/Evicted). `finish_speed_only`
+    /// must never do this: only marks ALREADY closed by a real observed
+    /// gap (via ordinary `push_envelope` calls) may ever decode.
+    #[test]
+    fn finish_speed_only_does_not_fabricate_a_character_from_an_open_mark() {
+        let prefix = rect_envelope("PARIS", 18);
+        // A long dangling mark with NO trailing gap at all -- genuinely
+        // still "open" in `Demod`'s internal state, not a real completed
+        // run under any interpretation.
+        let dangling_mark = vec![1.0_f32; 60];
+
+        let mut dec_finish = TrackDecoder::new(1, DecodeConfig::default());
+        let mut dec_speed_only = TrackDecoder::new(2, DecodeConfig::default());
+        for (ts, &a) in prefix.iter().chain(dangling_mark.iter()).enumerate() {
+            let ts = ts as u64;
+            dec_finish.push_envelope(a, ts);
+            dec_speed_only.push_envelope(a, ts);
+        }
+
+        let full_finish_events = dec_finish.finish();
+        assert!(
+            full_finish_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::CharDecoded { .. })),
+            "sanity check: finish() should force the dangling mark into a \
+             character, got {full_finish_events:?}"
+        );
+
+        let speed_only_events = dec_speed_only.finish_speed_only();
+        assert!(
+            !speed_only_events.iter().any(|e| matches!(
+                e,
+                DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. }
+            )),
+            "finish_speed_only must never fabricate a character/word from \
+             an in-progress mark, got {speed_only_events:?}"
+        );
     }
 
     #[test]
