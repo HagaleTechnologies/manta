@@ -20,6 +20,16 @@ pub struct Metrics {
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
+    /// Monotonic count of batches the decode pipeline has processed, bumped
+    /// once per pipeline batch by the daemon wiring layer (MAN-122 review
+    /// round 2). Its VALUE is meaningless to an operator; what matters is
+    /// that it keeps moving -- a status line that reports `tracks=N` off a
+    /// stale gauge while the synchronous decode loop is wedged (a blocked
+    /// `IqSource::read` after an audio device stops delivering callbacks,
+    /// say) claims the daemon is decoding when it is not. Deliberately not
+    /// exported in the Prometheus text: it is a liveness edge, not a figure
+    /// worth graphing.
+    pipeline_batches: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
     uplink_sent_total: AtomicU64,
     uplink_suppressed_total: AtomicU64,
@@ -124,6 +134,17 @@ impl Metrics {
 
     pub fn active_tracks(&self) -> u64 {
         self.active_tracks.load(Ordering::Relaxed)
+    }
+
+    /// One decode batch finished. Called by the daemon wiring layer from
+    /// `manta_engine::listen_with_track_count`'s per-batch observer -- see
+    /// `pipeline_batches`.
+    pub fn record_pipeline_batch(&self) {
+        self.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pipeline_batches(&self) -> u64 {
+        self.pipeline_batches.load(Ordering::Relaxed)
     }
 
     pub fn telnet_clients(&self) -> i64 {
@@ -574,5 +595,18 @@ mod tests {
             (m.telnet_clients(), m.json_clients(), m.ws_clients()),
             (1, 1, 0)
         );
+    }
+
+    // MAN-122 review round 2: the status line's stall detection compares
+    // this counter against its own previous sample, so the only property
+    // that matters is that it advances once per recorded batch and never
+    // goes backwards.
+    #[test]
+    fn the_pipeline_batch_counter_advances_once_per_batch() {
+        let m = Metrics::new();
+        assert_eq!(m.pipeline_batches(), 0);
+        m.record_pipeline_batch();
+        m.record_pipeline_batch();
+        assert_eq!(m.pipeline_batches(), 2);
     }
 }

@@ -840,11 +840,19 @@ fn start_spot_server(
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
 
         // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
-        // failure never produces a "ready" line) but BEFORE any listener task is
+        // failure never produces a banner at all) but BEFORE any listener task is
         // spawned -- on a multi-thread runtime a spawned accept loop can admit a
         // client immediately, and its per-connection line would otherwise be able
         // to land ahead of the banner. `local_addr()`, not the configured port,
         // so a `*_port = 0` (ephemeral) config still names the real address.
+        //
+        // Review round 2: this line says `listening:`, not `ready:`. Three
+        // bound sockets are not evidence that anything will ever be decoded --
+        // a replay shorter than `manta_engine`'s two-second calibration window,
+        // or a live source that fails its first reads, exits here with the
+        // pipeline never having started. The readiness event proper is emitted
+        // from the decode loop's first batch (see `format_pipeline_ready`'s
+        // call site).
         tracing::info!(
             "{}",
             manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
@@ -1218,6 +1226,10 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            // Captured before `src` is moved into the pipeline, for the
+            // readiness event below.
+            let source_sample_rate_hz = src.sample_rate();
+            let mut pipeline_ready_logged = false;
             let listen_result = manta_engine::listen_with_track_count(
                 src,
                 &cfg,
@@ -1273,12 +1285,36 @@ fn main() -> Result<()> {
                 // demodulator has not latched emits nothing for up to the
                 // ~30 s silent-GC window, so an event-derived count reports
                 // `tracks=0` on a node that is genuinely decoding weak
-                // signals. `listen_with_track_count` already suppresses
-                // repeats, so this is one relaxed atomic store per real
-                // change.
+                // signals.
+                //
+                // Review round 2: this observer fires once per processed
+                // batch (repeats included), so it is also the daemon's
+                // decode-progress heartbeat. Two relaxed atomics per
+                // ~43 ms chunk, immediately after that chunk's channelizer
+                // + TrackManager work -- unmeasurable against it, and the
+                // only thing that lets the status line say "stalled"
+                // instead of republishing a frozen `tracks=N` forever.
                 |n_tracks| {
                     if let Some(server) = &spot_server {
                         server.metrics.set_active_tracks(n_tracks as u64);
+                        server.metrics.record_pipeline_batch();
+                        // The first batch is the earliest moment the daemon
+                        // can honestly claim to be decoding: `listen`'s
+                        // calibration read has returned, the channelizer is
+                        // built and the TrackManager has processed real
+                        // hops. The startup banner above only ever claimed
+                        // bound sockets (review round 2).
+                        if !pipeline_ready_logged {
+                            pipeline_ready_logged = true;
+                            tracing::info!(
+                                "{}",
+                                manta_server::status::format_pipeline_ready(
+                                    env!("CARGO_PKG_VERSION"),
+                                    source_name,
+                                    source_sample_rate_hz,
+                                )
+                            );
+                        }
                     }
                 },
             );

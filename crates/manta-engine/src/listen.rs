@@ -34,10 +34,19 @@ pub fn listen(
     listen_with_track_count(src, cfg, stop, on_event, on_spot, |_n| {})
 }
 
-/// `listen()` plus a live track-count observer: `on_tracks` is called with
+/// `listen()` plus a live per-batch observer: `on_tracks` is called with
 /// `TrackManager::decoding_track_count()` after every batch the pipeline
-/// processes (including the final `finish()`, which reports 0), and only
-/// when the count actually changes.
+/// processes, including the final `finish()`, which reports 0.
+///
+/// MAN-122 review round 2: it fires on EVERY batch, not only when the
+/// count changes. The call is the daemon's only per-batch signal that the
+/// synchronous decode loop is still turning over -- a status line derived
+/// from change-only notifications cannot tell "quiet band, count steady at
+/// 2" from "`IqSource::read` wedged, count frozen at 2 since an hour ago",
+/// which is exactly the question the line exists to answer. Suppressing
+/// repeats is the caller's business now (`manta-cli` keeps the gauge store
+/// unconditional -- one relaxed atomic per ~43 ms chunk is nothing against
+/// the per-batch DSP work it follows).
 ///
 /// MAN-122 review round 1: the daemon's `manta_active_tracks` gauge and its
 /// status line's `tracks=` field must come from the manager's own lifecycle
@@ -88,11 +97,6 @@ pub fn listen_with_track_count(
         cfg.detector,
         cfg.decode.clone(),
     );
-    // Deduplicated so a steady band doesn't restore the same value to the
-    // gauge ~24 times a second (one chunk == 2048 samples == ~43 ms at
-    // 48 kS/s); `Some(0)` is never the initial value, so the first batch
-    // always publishes, even when it is genuinely zero.
-    let mut last_tracks: Option<usize> = None;
     let mut validator = Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -111,14 +115,14 @@ pub fn listen_with_track_count(
             on_spot(&spot);
         }
     }
-    report_track_count(&tm, &mut last_tracks, &mut on_tracks);
+    on_tracks(tm.decoding_track_count());
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
-    report_track_count(&tm, &mut last_tracks, &mut on_tracks);
+    on_tracks(tm.decoding_track_count());
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -137,7 +141,7 @@ pub fn listen_with_track_count(
                 on_spot(&spot);
             }
         }
-        report_track_count(&tm, &mut last_tracks, &mut on_tracks);
+        on_tracks(tm.decoding_track_count());
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
@@ -148,24 +152,8 @@ pub fn listen_with_track_count(
     // `finish()` flushes and drops every decoder: nothing is being decoded
     // once the stream has ended, so the gauge must not be left holding the
     // last live value after a source disconnects or a replay hits EOF.
-    if last_tracks != Some(0) {
-        on_tracks(0);
-    }
+    on_tracks(0);
     Ok(())
-}
-
-/// Publish `tm`'s promoted-track count through `on_tracks`, but only when
-/// it differs from the last value published.
-fn report_track_count(
-    tm: &crate::track::TrackManager,
-    last: &mut Option<usize>,
-    on_tracks: &mut impl FnMut(usize),
-) {
-    let n = tm.decoding_track_count();
-    if *last != Some(n) {
-        *last = Some(n);
-        on_tracks(n);
-    }
 }
 
 #[cfg(test)]
@@ -241,7 +229,10 @@ mod tests {
     /// `TrackManager`'s promoted-track count, rises above zero while a real
     /// signal is being decoded, and is driven back to zero by `finish()` so
     /// the daemon's gauge doesn't stay stuck at the last live value after
-    /// EOF or an SDR disconnect.
+    /// EOF or an SDR disconnect. Review round 2: it also fires once per
+    /// processed batch, repeats included -- that per-batch edge is what the
+    /// daemon's status line uses to tell a wedged decode loop from a quiet
+    /// band.
     #[test]
     fn listen_reports_the_managers_track_count_and_clears_it_at_end_of_stream() {
         let spec = manta_testkit::vectors::v1();
@@ -274,9 +265,17 @@ mod tests {
             Some(0),
             "finish() drops every decoder, so the final reported count must be 0, got {counts:?}"
         );
+        // One call per batch: the padding batch, the calibration batch, one
+        // per CHUNK_SAMPLES-sized read, and one final zero from finish().
+        // Far more calls than there are distinct values -- the point being
+        // that a steady count still produces a steady stream of calls.
         assert!(
-            counts.windows(2).all(|w| w[0] != w[1]),
-            "repeats must be suppressed -- the observer should only fire on a real change, got {counts:?}"
+            counts.len()
+                > counts
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+            "the observer must fire per batch, repeats included, got {counts:?}"
         );
     }
 

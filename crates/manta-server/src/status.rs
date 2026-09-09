@@ -27,9 +27,17 @@ pub struct StartupInfo<'a> {
     pub metrics_addr: SocketAddr,
 }
 
+/// Scenario 1's one-line banner. The verb is `listening:`, not `ready:`
+/// (MAN-122 review round 2): at the point every field here is known the
+/// daemon has bound its three sockets and nothing more -- the decode
+/// pipeline has not initialized, and a replay shorter than
+/// `manta_engine`'s two-second calibration window (or a live source that
+/// fails its first reads) still exits without ever decoding a sample.
+/// Readiness to decode is a separate, later event; see
+/// `format_pipeline_ready`.
 pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
     format!(
-        "manta {} ready: source={} sample_rate_hz={:.0} dial_freq_hz={:.0} station={} \
+        "manta {} listening: source={} sample_rate_hz={:.0} dial_freq_hz={:.0} station={} \
          telnet={} json={} metrics={}",
         info.version,
         info.source,
@@ -40,6 +48,16 @@ pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
         info.json_addr,
         info.metrics_addr,
     )
+}
+
+/// The readiness event proper: emitted once, by the daemon wiring layer,
+/// when the decode pipeline has actually initialized (channelizer built,
+/// calibration window read, first batch processed) -- the point after
+/// which a bound socket is backed by a running decoder. Split from
+/// `format_startup_banner` in MAN-122 review round 2, because binding
+/// sockets is not evidence that anything will ever be decoded.
+pub fn format_pipeline_ready(version: &str, source: &str, sample_rate_hz: f64) -> String {
+    format!("manta {version} ready: decoding source={source} sample_rate_hz={sample_rate_hz:.0}")
 }
 
 /// What the status line's `uplink=` field reports. `NotConfigured` is
@@ -62,6 +80,46 @@ impl UplinkState {
     }
 }
 
+/// What the status line's `pipeline=` field reports, derived from
+/// `Metrics::pipeline_batches()` moving (or not) between two consecutive
+/// status samples (MAN-122 review round 2). Without this the status line
+/// happily republishes a stale `tracks=N` forever after the synchronous
+/// decode loop stops progressing -- exactly the "is it still decoding?"
+/// question the line exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineState {
+    /// No batch has been processed yet. Expected for the first interval or
+    /// two of a live source, whose `manta_engine` calibration window is
+    /// two real seconds of samples; NOT reported as a stall, which would
+    /// be a false alarm on every cold start.
+    Starting,
+    Decoding,
+    /// Batches were being processed, and then stopped, without the daemon
+    /// shutting down.
+    Stalled,
+}
+
+impl PipelineState {
+    fn as_str(self) -> &'static str {
+        match self {
+            PipelineState::Starting => "starting",
+            PipelineState::Decoding => "decoding",
+            PipelineState::Stalled => "stalled",
+        }
+    }
+
+    /// Classify from two consecutive samples of `Metrics::pipeline_batches()`.
+    pub fn from_progress(previous: u64, current: u64) -> Self {
+        if current == 0 {
+            PipelineState::Starting
+        } else if current == previous {
+            PipelineState::Stalled
+        } else {
+            PipelineState::Decoding
+        }
+    }
+}
+
 pub struct StatusSnapshot {
     pub uptime_s: u64,
     pub active_tracks: u64,
@@ -71,13 +129,15 @@ pub struct StatusSnapshot {
     pub json_clients: i64,
     pub ws_clients: i64,
     pub uplink: UplinkState,
+    pub pipeline: PipelineState,
 }
 
 pub fn format_status_line(s: &StatusSnapshot) -> String {
     format!(
-        "manta status: uptime_s={} tracks={} spots_per_min={:.1} spots_total={} \
+        "manta status: uptime_s={} pipeline={} tracks={} spots_per_min={:.1} spots_total={} \
          clients={} (telnet={} json={} ws={}) uplink={}",
         s.uptime_s,
+        s.pipeline.as_str(),
         s.active_tracks,
         s.spots_per_min,
         s.spots_total,
@@ -119,9 +179,15 @@ pub fn spawn_status_line(
         let started = Instant::now();
         let mut last_sample = started;
         let mut last_spots = metrics.spots_total();
+        let mut last_batches = metrics.pipeline_batches();
         loop {
+            // `biased`: without it `select!` picks a ready branch at random,
+            // so on the poll where the sleep and the shutdown notification
+            // both come ready the sleep can win and this task emits one more
+            // status line into the shutdown drain (MAN-122 review round 2).
+            // Shutdown first makes that unrepresentable.
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                biased;
                 changed = shutdown.changed() => {
                     // `Err` means every `watch::Sender` has dropped -- there is no
                     // shutdown signal left to observe, ever. Reading the stale
@@ -134,9 +200,19 @@ pub fn spawn_status_line(
                     }
                     continue;
                 }
+                _ = tokio::time::sleep(interval) => {}
+            }
+            // Second guard, for a shutdown that lands between the sleep
+            // completing and this line: `biased` orders the two futures
+            // within one poll, it does not order them against the wall
+            // clock. Cheap (one `watch` borrow) and it closes the window
+            // completely.
+            if *shutdown.borrow() {
+                return;
             }
             let now = Instant::now();
             let spots_total = metrics.spots_total();
+            let batches = metrics.pipeline_batches();
             let snapshot = StatusSnapshot {
                 uptime_s: now.duration_since(started).as_secs(),
                 active_tracks: metrics.active_tracks(),
@@ -155,9 +231,11 @@ pub fn spawn_status_line(
                 } else {
                     UplinkState::Disconnected
                 },
+                pipeline: PipelineState::from_progress(last_batches, batches),
             };
             last_sample = now;
             last_spots = spots_total;
+            last_batches = batches;
             tracing::info!("{}", format_status_line(&snapshot));
         }
     }))
@@ -203,8 +281,10 @@ mod tests {
             json_clients: 2,
             ws_clients: 0,
             uplink: UplinkState::Connected,
+            pipeline: PipelineState::Decoding,
         });
         for needle in [
+            "pipeline=decoding",
             "tracks=3",
             "spots_per_min=12.0",
             "clients=3",
@@ -226,5 +306,66 @@ mod tests {
     async fn a_zero_interval_disables_the_status_task() {
         let (_tx, rx) = watch::channel(false);
         assert!(spawn_status_line(Arc::new(Metrics::new()), Duration::ZERO, 0, rx).is_none());
+    }
+
+    /// MAN-122 review round 2: a wedged decode loop (a blocked
+    /// `IqSource::read`, say) leaves every other field in the snapshot
+    /// frozen at its last live value, so `pipeline=` is the only thing that
+    /// can tell an operator the difference between "quiet band" and "not
+    /// running".
+    #[test]
+    fn the_pipeline_field_separates_a_stalled_loop_from_a_running_one() {
+        assert_eq!(PipelineState::from_progress(0, 0), PipelineState::Starting);
+        assert_eq!(PipelineState::from_progress(0, 7), PipelineState::Decoding);
+        assert_eq!(PipelineState::from_progress(7, 12), PipelineState::Decoding);
+        // Batches were flowing, and then stopped: the gauge below still says
+        // `tracks=N`, but nothing is being decoded.
+        assert_eq!(PipelineState::from_progress(12, 12), PipelineState::Stalled);
+    }
+
+    /// The two events are distinct on purpose (MAN-122 review round 2): the
+    /// banner names bound sockets, which is not evidence the pipeline will
+    /// ever start.
+    #[test]
+    fn the_banner_claims_only_that_the_listeners_are_bound() {
+        let banner = format_startup_banner(&StartupInfo {
+            version: "0.1.0",
+            source: "file",
+            sample_rate_hz: 48_000.0,
+            dial_freq_hz: 14_060_000.0,
+            station_callsign: "W5AU",
+            telnet_addr: "127.0.0.1:7300".parse().unwrap(),
+            json_addr: "127.0.0.1:7301".parse().unwrap(),
+            metrics_addr: "127.0.0.1:7302".parse().unwrap(),
+        });
+        assert!(banner.contains("listening:"), "{banner:?}");
+        assert!(!banner.contains("ready:"), "{banner:?}");
+        let ready = format_pipeline_ready("0.1.0", "file", 48_000.0);
+        assert!(ready.contains("ready: decoding"), "{ready:?}");
+        assert!(ready.contains("source=file"), "{ready:?}");
+    }
+
+    /// A status line must never land after shutdown has been signalled --
+    /// it would interleave into the shutdown drain and claim liveness the
+    /// daemon no longer has. The one-poll tie between the sleep and the
+    /// notification is not constructible from a test (the sender wakes the
+    /// task before the paused clock advances), so it is closed structurally
+    /// instead, by `biased` plus the post-sleep `shutdown.borrow()` guard;
+    /// what this test pins is the observable half -- the task returns on
+    /// shutdown, promptly, of its own accord, rather than surviving to the
+    /// next tick.
+    #[tokio::test(start_paused = true)]
+    async fn the_status_task_returns_on_shutdown_instead_of_ticking_again() {
+        let (tx, rx) = watch::channel(false);
+        let metrics = Arc::new(Metrics::new());
+        let handle = spawn_status_line(metrics, Duration::from_secs(1), 0, rx)
+            .expect("a non-zero interval must spawn the task");
+        tokio::time::sleep(Duration::from_millis(999)).await;
+        tx.send(true).unwrap();
+        // The task must return of its own accord rather than being aborted.
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the status task must exit on shutdown, not outlive it")
+            .expect("the status task must not panic");
     }
 }

@@ -321,8 +321,18 @@ validation (MAN-28). Dedupe (step 5) still applies.
   bind succeeds and before any listener task is spawned, plus a
   rate-limited periodic status line (`manta_server::status`,
   `status_interval_secs` in `[server]`, default 60 s, `0` disables) naming
-  active track count, spots/min, connected client count, and uplink
-  connection state. Still aspirational: `manta-input`'s and
+  pipeline state, active track count, spots/min, connected client count,
+  and uplink connection state. The banner says `listening:`, not `ready:`
+  (review round 2): bound sockets are not evidence anything will decode,
+  since a replay shorter than the two-second calibration window or a live
+  source that fails its first reads exits with the pipeline never having
+  started. Readiness is a second, strictly later line
+  (`manta <ver> ready: decoding source=...`) emitted from the decode
+  loop's first processed batch. The status line's `pipeline=` field
+  (`starting`/`decoding`/`stalled`) is derived from a per-batch progress
+  counter, so a wedged decode loop — a blocked `IqSource::read`, say —
+  reads as `stalled` instead of republishing a frozen `tracks=N`
+  indefinitely. Still aspirational: `manta-input`'s and
   `manta-engine`'s own internals carry no logging of their own yet
   (decode-pipeline internals, not the network-facing surface MAN-59
   scoped to, nor the daemon-lifecycle surface MAN-122 scoped to), and
@@ -343,8 +353,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   the decode event stream. `TrackManager::decoding_track_count()` reports
   how many tracks are currently promoted and holding a leased decoder
   (`Active` or `Hang`); `manta_engine::listen_with_track_count()` hands
-  that number to `main.rs` after every processed batch (suppressing
-  repeats), which publishes it via `set_active_tracks`. So
+  that number to `main.rs` after every processed batch — repeats
+  included, since that call is also the daemon's decode-progress
+  heartbeat (review round 2) — which publishes it via
+  `set_active_tracks`. So
   `manta_active_tracks` and the status line's `tracks=` field both report
   a real, moving count instead of the previous permanent `0`. An
   event-derived count was tried first and rejected in review: a track

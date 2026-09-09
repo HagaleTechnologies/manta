@@ -1,10 +1,11 @@
 //! MAN-122 scenario 1 + 2 acceptance.
 use std::io::Write as _;
 
-/// `seconds` of 48 kHz mono silence -- enough for the daemon to bind, log,
-/// and (for the longer fixture) run past a short status interval. The
-/// banner is emitted before the decode loop starts, so the fixture's
-/// content is irrelevant here and silence keeps it small/fast.
+/// `seconds` of 48 kHz mono silence. The banner is emitted before the decode
+/// loop starts, so the fixture's content is irrelevant here and silence keeps
+/// it small/fast; its LENGTH is load-bearing only in one direction -- shorter
+/// than `manta_engine`'s two-second calibration window means the pipeline
+/// never starts, which is exactly what the second test wants.
 fn silent_48k_wav(dir: &std::path::Path, seconds: u32) -> std::path::PathBuf {
     let path = dir.join("silence.wav");
     let spec = hound::WavSpec {
@@ -73,7 +74,7 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let banner = stderr
         .lines()
-        .find(|l| l.contains("manta ") && l.contains("ready:"))
+        .find(|l| l.contains("manta ") && l.contains("listening:"))
         .unwrap_or_else(|| panic!("no startup banner in stderr: {stderr}"));
 
     for needle in [
@@ -101,20 +102,49 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
         !banner.contains(":0 "),
         "the banner must name the real bound port, not the configured 0: {banner:?}"
     );
+    // Review round 2: the banner claims bound sockets; readiness to decode is
+    // a separate, strictly later event. This fixture is longer than the
+    // calibration window, so the pipeline does start and both lines appear,
+    // in that order.
+    let ready_at = stderr
+        .lines()
+        .position(|l| l.contains("ready: decoding"))
+        .unwrap_or_else(|| panic!("no pipeline-ready line in stderr: {stderr}"));
+    let banner_at = stderr
+        .lines()
+        .position(|l| l == banner)
+        .expect("the banner was just found in this same stderr");
+    assert!(
+        banner_at < ready_at,
+        "the listeners-bound banner must precede the readiness event: {stderr}"
+    );
 }
 
+/// MAN-122 review round 2. The predecessor of this test asserted that a
+/// periodic status line appears during an unpaced 240-second file replay --
+/// which is only true while the replay takes longer in real time than the
+/// status interval. That is a property of the runner, not of the daemon: a
+/// fast enough machine decodes the fixture inside one interval, shutdown
+/// cancels the status task before its first tick, and the test goes red on
+/// correct production behaviour. Nothing in the CLI's surface can pace a
+/// file replay (`AudioIqSource` loads the whole WAV eagerly and reads from
+/// memory), so the timing half of scenario 2 is pinned where time IS
+/// controllable -- `manta-server`'s `status_line_acceptance.rs`, against
+/// the real `spawn_status_line` task, plus the interval/shutdown unit tests
+/// in `manta-server::status`.
+///
+/// What is left here is the half that needs the real binary and cannot
+/// race: readiness is not claimed for a daemon whose pipeline never
+/// started, and a daemon that never decodes never emits a status line
+/// either.
 #[test]
-fn the_daemon_logs_a_periodic_status_line_while_it_runs() {
-    // File replay is unpaced -- there is no way to hold a file-backed daemon
-    // open for a fixed wall time, so fixture length IS the timing margin:
-    // decode must take longer in real time than status_interval_secs, or
-    // shutdown races the status task's sleep and no line ever fires
-    // (confirmed live -- a 30 s fixture decodes in ~0.45s, well under the
-    // 1 s interval below, and the test fails). 240 s of 48 kHz silence
-    // gives ample margin for at least one status line to fire even on a
-    // slow machine.
+fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
     let dir = tempfile::tempdir().unwrap();
-    let wav = silent_48k_wav(dir.path(), 240);
+    // 1 s < CALIBRATION_SECONDS (2.0): the source runs out inside the
+    // calibration read, so `listen` fails before a single batch is
+    // processed. Deterministic on any machine at any speed -- it is a
+    // property of the fixture, not of how fast the fixture is consumed.
+    let wav = silent_48k_wav(dir.path(), 1);
     let cfg_path = write_server_config(dir.path(), 1);
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
@@ -130,12 +160,23 @@ fn the_daemon_logs_a_periodic_status_line_while_it_runs() {
         .env("RUST_LOG", "info")
         .output()
         .unwrap();
-    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert!(
+        !out.status.success(),
+        "a replay shorter than the calibration window must fail, not succeed"
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let status_lines = stderr
-        .lines()
-        .filter(|l| l.contains("manta status:"))
-        .count();
-    assert!(status_lines >= 1, "no status line in {stderr}");
+    assert!(
+        stderr.lines().any(|l| l.contains("listening:")),
+        "the listeners really were bound, so the banner must still be there: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ready: decoding"),
+        "the daemon exited during calibration without decoding anything -- it must \
+         never have claimed readiness: {stderr}"
+    );
+    assert!(
+        !stderr.contains("manta status:"),
+        "no status line can be emitted by a daemon that never got past calibration: {stderr}"
+    );
 }

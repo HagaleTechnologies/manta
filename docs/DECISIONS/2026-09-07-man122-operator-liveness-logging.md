@@ -20,10 +20,28 @@ subscriber is only initialized inside `start_spot_server`), matching the
 ticket's own "Given manta starts as a daemon" precondition.
 
 **Banner placement: after every bind succeeds, before any listener task is
-spawned.** A bind failure must never produce a "ready" line. On a
+spawned.** A bind failure must never produce a banner at all. On a
 multi-thread Tokio runtime a spawned accept loop can admit a client
 immediately, so emitting the banner before any `tokio::spawn` call
 guarantees no per-connection log line can land ahead of it.
+
+**The banner says `listening:`; readiness is a separate, later line**
+(review round 2). Binding three sockets is not evidence that anything will
+ever be decoded: a replay shorter than `manta_engine`'s two-second
+`CALIBRATION_SECONDS` window, or a live source that fails its initial
+reads, makes `listen_with_track_count` bail during calibration and the
+process exits without decoding a sample — after a banner that had already
+declared the daemon ready. So the banner claims exactly what it knows
+(`manta <ver> listening: source=... telnet=... json=... metrics=...`,
+still one line, still every field scenario 1 names), and a second line,
+`manta <ver> ready: decoding source=... sample_rate_hz=...`, is emitted
+once from the decode loop's first processed batch — the earliest moment
+the channelizer is built, the calibration window has been read and real
+hops have gone through `TrackManager`. Pinned by
+`startup_banner.rs::the_daemon_logs_a_startup_banner_before_any_client_connects`
+(both lines, in order) and
+`::a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready`
+(sub-calibration fixture: banner yes, readiness no).
 
 **Banner reports `local_addr()`, not the configured port.** Existing unit
 tests and the ticket's own multi-agent-hygiene convention use `*_port = 0`
@@ -33,6 +51,31 @@ tests and the ticket's own multi-agent-hygiene convention use `*_port = 0`
 line whose absence is meaningful ("the daemon stopped logging") is more
 useful than one that goes quiet when nothing changes; suppress-if-unchanged
 would make a wedged daemon and an idle band look identical.
+
+**`pipeline=` ties the line to real decode progress** (review round 2).
+The status task is scheduled independently of the synchronous decode loop,
+so on its own it will happily republish the last `tracks=N` every interval
+forever after that loop stops progressing — `AudioIqSource::read` blocking
+because an audio device stopped delivering callbacks is the concrete case,
+and it defeats the one thing the line exists to establish. `Metrics` now
+carries a monotonic `pipeline_batches` counter, bumped once per processed
+batch from the same `main.rs` observer that publishes the track gauge; the
+status task compares it against its own previous sample and reports
+`pipeline=decoding` (it moved), `pipeline=stalled` (it did not) or
+`pipeline=starting` (no batch yet — the expected reading for the first
+interval or two of a live source, whose calibration window is two real
+seconds, and not a stall). The counter is deliberately not exported in the
+Prometheus text: it is a liveness edge, not a figure worth graphing. This
+is why `listen_with_track_count`'s observer now fires on every batch
+rather than only on a change — see below.
+
+**Shutdown beats the interval tick** (review round 2). The status task's
+`select!` is `biased` with the shutdown arm first, and re-checks
+`shutdown.borrow()` after the sleep arm wins. Unbiased, `select!` picks at
+random among ready branches, so a sleep and a shutdown notification that
+come ready in the same poll could emit one more status line into the
+middle of the shutdown drain — the exact thing the shutdown arm was added
+to prevent.
 
 **Status interval: default 60 s, configurable via `status_interval_secs`,
 `0` disables.** 60 s is a quiet default for a process expected to run for
@@ -67,10 +110,16 @@ node reads as a fault" failure this field exists to avoid, just with a
 narrower trigger. `crates/manta-engine/src/track.rs`'s
 `decoding_track_count()` counts tracks holding a leased decoder (`Active`
 or `Hang`) and `listen_with_track_count()` reports it to `main.rs` after
-every processed batch, suppressing repeats so a steady band is one relaxed
-atomic store per real change rather than ~24 a second. End of stream
-reports `0`, so the gauge doesn't stay stuck at the last live value after
-EOF or an SDR disconnect.
+every processed batch. Repeats were suppressed in the engine at first; as
+of review round 2 they are not, because that call is also the daemon's
+only per-batch decode-progress signal (see `pipeline=` above) and a
+change-only notification cannot distinguish "quiet band, count steady at
+2" from "read wedged, count frozen at 2 since an hour ago". The cost is
+two relaxed atomic ops per ~43 ms chunk, immediately after that chunk's
+channelizer and `TrackManager` work — unmeasurable against it, including
+against the Pi 4 single-core budget. End of stream reports `0`, so the
+gauge doesn't stay stuck at the last live value after EOF or an SDR
+disconnect.
 
 Deliberately *not* `TrackManager::active_track_count()`, which counts every
 entry in `tracks` including unconfirmed CANDIDATEs -- rise crossings that
@@ -87,7 +136,7 @@ untouched. The regression is pinned by
 which drives a steady unmodulated carrier through `process_hops`, asserts
 the event stream is *empty*, and asserts the count is nevertheless 1, plus
 `listen::tests::listen_reports_the_managers_track_count_and_clears_it_at_end_of_stream`
-for the observer's rise/clear/dedup behaviour.
+for the observer's rise/clear/per-batch behaviour.
 
 **Formatting lives in `manta-server::status`, not `manta-cli`.**
 `manta-server` is a lib crate, so the two line-format functions and the
@@ -109,3 +158,23 @@ sites (banner emission point, status-task spawn point).
 - **No git SHA / build info in `--version`** — broad review R-13.
 - **No `manta_engine::listen()` signature change** to expose `TrackManager`
   directly.
+
+## Scenario 2's timing is pinned in `manta-server`, not through the binary
+
+Review round 2 removed `startup_banner.rs`'s "a status line appears during
+a 240-second replay" test. It was only ever true while the unpaced replay
+took longer in real time than the status interval — a property of the
+runner, not of the daemon. Nothing in the CLI's surface can pace a file
+replay (`AudioIqSource` eager-loads the whole WAV and then reads from
+memory), so on a fast enough machine the fixture decodes inside one
+interval, shutdown cancels the status task before its first tick, and the
+test goes red on correct production behaviour — on a repo that requires
+both platform test jobs green. The timing half of scenario 2 is pinned
+where time is controllable instead:
+`manta-server/tests/status_line_acceptance.rs` (the real
+`spawn_status_line` task, a 50 ms interval, emission + rate limit) and
+`manta-server::status`'s unit tests (zero-interval disable, shutdown
+return, `pipeline=` classification). What stays end-to-end through the
+real binary is the part that cannot race: the banner, its field content,
+its being line 1, and readiness never being claimed by a daemon whose
+pipeline never started.
