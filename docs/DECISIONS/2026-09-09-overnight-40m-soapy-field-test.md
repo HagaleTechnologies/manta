@@ -47,17 +47,19 @@ Across 10 completed 30-minute `listen --json` windows plus one partial
 same signature:
 
 - confidence pinned to 0.118-0.172 (the low end of the scale)
-- `snr_db` (the SPEC §2.3 2500 Hz-reference conversion,
-  `(S-F) - 14.3 dB`) pinned to -8.28 to -7.29 dB. That is *not* the same
-  as "no signal": a reported -8.28 dB here means the narrow 93.75 Hz
-  channel SNR `(S-F)` was still around +6 dB, i.e. consistently ~6-7 dB
-  above the local per-channel noise-floor estimate -- a real, structured
-  narrowband excess, just one this analysis can't yet distinguish from a
-  persistent artifact/spur vs. an actual off-air carrier. What *is*
-  suspicious is that the value is pinned nearly constant (-8.28 to
-  -7.29 dB) across 29 independent detections rather than varying the way
-  real fading/QRM would -- consistent with a deterministic mechanism, not
-  proof by itself that it's not a real signal.
+- `snr_db` pinned to -8.28 to -7.29 dB. This is emitted spot-side from
+  `TrackMeta.snr_2500_db`, which is `Demod::snr_2500_db()`
+  (`crates/manta-decode/src/envelope.rs`): `20*log10(e_hi/e_lo) - 14.3 dB`,
+  where `e_hi`/`e_lo` are the 90th/10th-percentile envelope amplitude
+  *within the track's own decode window* (the decoder's keying-rail
+  contrast). It is **not** the detector's `(S-F)` signal-vs-local-floor
+  SNR -- an earlier revision of this finding wrongly attributed it to
+  that quantity and derived a "+6 dB above the noise floor" claim from
+  it that doesn't follow from what's actually computed. What the pinned
+  value *does* establish: this track's keying-rail contrast is nearly
+  identical across all 29 independent detections rather than varying the
+  way real fading/QRM would -- consistent with a deterministic mechanism,
+  not proof by itself of anything about signal-vs-floor.
 - WPM scattered widely and often implausible for real CW traffic/beacons
   (30.8-60.0 wpm)
 - callsigns frequently malformed (`3EMEEEE`, `ER1EEAE`, `4AEEEEE` --
@@ -68,9 +70,19 @@ More telling: spot frequencies cluster tightly at a handful of near-
 identical values across *separate, non-overlapping* windows (6931.2-
 6931.9, 6936.0, 6944.0, 6968.0, 7064.0 kHz) rather than being randomly
 distributed -- a signature of a fixed decode artifact, not noise
-variance. Isolated with a dial-shift test: retuning from 7025 kHz to
-7075 kHz (passband ~6979-7171 kHz) moved the artifact to the *new*
-passband's edge (7168.2 kHz) instead of leaving it at 6931 kHz.
+variance. **But only the 6931.x cluster is dial-shift-confirmed as a
+passband-edge effect**: retuning from 7025 kHz to 7075 kHz (passband
+~6979-7171 kHz) moved *that* cluster to the *new* passband's lower/upper
+edge (7168.2 kHz) instead of leaving it at 6931 kHz. The 6936.0, 6944.0,
+and 7064.0 kHz clusters sit well inside the 6930-7120 kHz passband, not
+at either edge -- the dial-shift test was never repeated against them,
+so grouping them under the same "passband-edge artifact" label is not
+established. They could be a different fixed-bin spur (e.g. an
+individual 93.75 Hz channelizer boundary landing at a different absolute
+frequency each session, which would actually be closer to MAN-7/103's
+per-channel mechanism than the confirmed passband-edge cluster is) or a
+distinct decoder false-positive path entirely -- unresolved pending a
+retune test repeated against each interior cluster specifically.
 
 **Not the same bug as MAN-7/103 without more evidence, despite the
 "edge" coincidence.** MAN-7/103 (`crates/manta-cli/tests/
@@ -97,17 +109,29 @@ about a dB of this session's own recurring floor value and whose
 confidence sits at the low end of the scale is suspect -- especially
 near a passband or channelizer boundary -- but confirming it's actually
 noise (rather than a real weak/repeating signal) needs more than the
-`snr_db` value alone, per the reference-bandwidth conversion above.
+`snr_db` value alone.
+
+**`manta doctor` specifically is fully blind to this.**
+`DoctorReport::verdict()` (`crates/manta-engine/src/doctor.rs:143-146`)
+returns `Verdict::Decoding` the instant `spots_confirmed > 0`, before
+looking at SNR at all -- an affected run driven entirely by this artifact
+still reports `"DECODING -- at least one confirmed spot. End to end,
+working."` with no hint anything is wrong. This is a real, currently
+unresolved consequence of the false-positive defect above, not just a
+caution for a human reading raw `listen --json` output: `doctor`'s whole
+purpose is to be the quick automated health check, and right now it can
+be quick, automated, and wrong at the same time.
 
 ## Finding 3 (extends 2026-09-08's Finding 3, still open): no confirmed real off-air CW copy on 40m tonight
 
 None of the 29 confirmed spots are backed by a validated callsign at a
-clearly-above-population SNR -- by the signature in Finding 2 (pinned
-near-identical `snr_db`, low confidence, malformed text, edge-clustered
-frequencies) every one is far more consistent with the passband-edge
-artifact than with real copy, though Finding 2's caveat about the
-reference-bandwidth conversion means this is "no *evidence* of real
-copy," not a from-first-principles proof each one is noise. Max
+clearly-varying, above-population SNR -- by the signature in Finding 2
+(pinned near-identical `snr_db`, low confidence, malformed text,
+fixed-frequency clustering) every one is far more consistent with a
+deterministic artifact (confirmed passband-edge for the 6931.x cluster,
+unconfirmed mechanism for the rest) than with real copy, though this is
+"no *evidence* of real copy," not a from-first-principles proof each one
+is noise. Max
 instantaneous `TrackMeta.snr_2500_db` touched positive values in
 several windows (best full-window case +5.6 dB; one anomalous +18.3 dB
 track, `track_id` 5700 at 7076576 Hz, appeared in the final partial
@@ -129,8 +153,11 @@ SWR check before the next unattended run.
 The overflow fix is a genuine reliability improvement, confirmed in the
 field, independent of whether 40m ever produces a real decode. This run
 also surfaced a second, separate, currently-untracked false-positive
-defect near the input passband edge -- plausibly but not confirmedly
-related to MAN-7/103 -- worth its own investigation rather than folding
-into that existing bug by assumption. Off-air real-signal confirmation is
-still the one open item neither this run nor 2026-09-08's closed -- next
-attempted on 20m same night, see follow-up session notes.
+defect at the input passband edge -- plausibly but not confirmedly
+related to MAN-7/103 -- plus at least one more fixed-frequency cluster
+with an unconfirmed, possibly-distinct mechanism, both worth their own
+investigation rather than folding into an existing bug by assumption.
+`manta doctor`'s verdict currently can't tell either of these apart from
+a real decode. Off-air real-signal confirmation is still the one open
+item neither this run nor 2026-09-08's closed -- next attempted on 20m
+same night, see follow-up session notes.
