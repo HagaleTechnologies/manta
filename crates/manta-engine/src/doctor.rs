@@ -185,6 +185,17 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
 /// floor, not a tight fit to it. Kept local to doctor rather than plumbed
 /// into `listen()` itself, since ordinary `manta listen` has no duration
 /// bound to enforce in the first place.
+///
+/// This margin assumes the pipeline processes that 2s calibration buffer
+/// in at most its own wall-clock duration (real-time or faster) -- the
+/// project's own CPU-budget requirement (CLAUDE.md: full 192 kS/s passband
+/// within one Raspberry Pi 4 core), tracked and benched separately
+/// (ROADMAP M2's CPU-budget bench). A machine running meaningfully slower
+/// than that (round-5 review: roughly below 0.5x real-time) could still
+/// overrun this bound during calibration itself, since that read loop
+/// isn't stop-aware either -- the same underlying gap as `listen()`'s
+/// blocking-read interruptibility already noted as a deferred, shared,
+/// cross-cutting limitation (not something to fix inside doctor alone).
 pub const MIN_DURATION: Duration = Duration::from_secs(3);
 
 /// Maximum accepted `--duration`. `doctor()` accumulates every `TrackMeta`

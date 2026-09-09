@@ -1438,6 +1438,21 @@ fn main() -> Result<()> {
             hpsdr_rate,
             json,
         } => {
+            // Checked before any source is opened -- otherwise an invalid
+            // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
+            // connect/activate already spent real time (or hung/failed for
+            // an unrelated hardware reason), and the user never sees the
+            // actual duration error at all (round-5 review finding).
+            let duration_secs = duration;
+            if !(manta_engine::MIN_DURATION.as_secs()..=manta_engine::MAX_DURATION.as_secs())
+                .contains(&duration_secs)
+            {
+                bail!(
+                    "--duration must be between {} and {} seconds, got {duration_secs}",
+                    manta_engine::MIN_DURATION.as_secs(),
+                    manta_engine::MAX_DURATION.as_secs()
+                );
+            }
             let kiwi = KiwiOpts {
                 host: kiwi_host,
                 port: kiwi_port,
