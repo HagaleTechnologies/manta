@@ -374,6 +374,14 @@ impl Validator {
                     self.try_spot(*track_id, sample_ts)
                 }
             }
+            // Ground-truth "detector found a candidate" signal for
+            // `manta_engine::doctor()` (its NoSignal check), with nothing
+            // for the Validator itself to do -- deliberately never touches
+            // `self.tracks`, so a track promoted and merged/evicted away
+            // before producing any other event (the exact case this event
+            // exists to surface) creates no per-track_id state here to
+            // leak.
+            DecoderEvent::TrackPromoted { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id } => {
                 // MAN-19: without this, `self.tracks` and `self.gate`'s
                 // per-track_id state both grow forever -- `TrackManager`
