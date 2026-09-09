@@ -29,6 +29,16 @@ pub(crate) fn is_valid_portable(p: &str) -> bool {
         || (p.len() == 1 && p.chars().next().unwrap().is_ascii_digit())
 }
 
+/// A blanket per-character repeat-count limit was tried here (2026-09-09)
+/// to reject noise-decoded garble like `4AEEEEE`/`ER1EEAE`, but Codex
+/// review on PR #154 found it also rejects real, allocated `master.scp`
+/// callsigns that legitimately repeat a character 3+ times, non-
+/// consecutively -- `9A5SSS`, `AA6AA`, `BG8GGG`, `DD5DD`, `DL0LOL` -- with
+/// no way to allowlist around it since this runs before the SCP boost.
+/// Structural repeat-counting can't distinguish those from garble; the
+/// actual fix lives in `validator.rs`'s WPM-plausibility gate, scoped to
+/// the `SpotType::Beacon` path those overnight false positives actually
+/// came through.
 fn is_valid_base(base: &str) -> bool {
     let chars: Vec<char> = base.chars().collect();
     if chars.len() < 3 || chars.len() > 7 {
@@ -49,6 +59,18 @@ mod tests {
     #[test]
     fn accepts_real_shaped_callsigns() {
         for call in ["K5ARH", "W1AW", "4X1AA", "VE3ABC", "JA1ABC", "ZL2XYZ"] {
+            assert!(is_plausible(call), "{call} should be plausible");
+        }
+    }
+
+    /// Real, allocated `master.scp` callsigns that repeat a character
+    /// 2-4 times, several non-consecutively -- Codex review on PR #154
+    /// found the earlier repeat-count check rejected all of these.
+    #[test]
+    fn accepts_real_callsigns_with_repeated_characters() {
+        for call in [
+            "K2ZZ", "W3SS", "N5FPP", "9A5SSS", "AA6AA", "BG8GGG", "DD5DD", "DL0LOL",
+        ] {
             assert!(is_plausible(call), "{call} should be plausible");
         }
     }
