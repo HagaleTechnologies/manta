@@ -11,11 +11,8 @@
 - [What does manta reuse from coppa, and what is deliberately new code?](pages/coppa-reuse.md) — manta consumes DSP building blocks from the sibling coppa repo rather than reimplementing them ...
 - [What spot-output contracts does manta expose (telnet RBN + JSON)?](pages/spot-output-contract.md) — manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting s...
 - [Why is the weekly Cargo Dependabot run red with `unknown_error` / `null`?](pages/dependabot-cargo-unlock.md) — Diagnose Cargo updates that Dependabot cannot reach through its single-package unlock scope.
-<<<<<<< HEAD
-- [Why does manta commit a .serena/ directory, and what breaks if it changes?](pages/serena-project-config.md) — Missing config silently auto-generates instead of erroring; `.catalyst-cache` needs an explicit ignored_paths entry; every ProjectConfig field must be spelled out with current key names.
-=======
 - [How do I run manta against real RF and trust what it tells me?](pages/live-hardware-field-testing.md) — `doctor` vs `listen` tradeoffs, the bounded-duration `listen` wrapper, `scripts/summarize-listen-jsonl.sh`, and why a confirmed `Spot` alone isn't proof of a real signal.
->>>>>>> ea0b305d98310f0d3c611c2516e18c7388ce3a60
+- [Why does manta commit a .serena/ directory, and what breaks if it changes?](pages/serena-project-config.md) — Missing config silently auto-generates instead of erroring; `.catalyst-cache` needs an explicit ignored_paths entry; every ProjectConfig field must be spelled out with current key names.
 - [What's the PR review convergence policy?](../docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md) — P1 findings get fixed every review round; P2-and-lower findings raised after round one are tracked in a follow-up ticket instead of chased inline, so PRs converge instead of oscillating.
 - [What changed in the 2026-09-06 broad review?](../docs/DECISIONS/2026-09-06-broad-review-decisions.md) — RBN admission strategy, the wire SNR convention, multi-band identity, pausing the Pi4 CPU-budget story, and several other decisions that revise or supersede AGENTS.md, SPEC-decode-core.md, the legacy capability matrix, and the MAN-23 threat model on specific points.
 - [Which decoder investigations should come next?](../docs/DECISIONS/2026-09-09-decoder-recall-research.md) — Twenty ranked research proposals with measured baseline failures, implementation seams, evaluation gates, authorized Dit reuse, and third-party clean-room boundaries; proposals, not adopted spec changes.

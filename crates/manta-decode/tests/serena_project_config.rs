@@ -72,8 +72,38 @@ fn read(path: &Path) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Drops a valid YAML inline comment (` # ...` to end of line) that starts
+/// *outside* any quoted scalar, so documenting an entry — `read_only: true #
+/// navigation only`, `- rust # language server` — does not turn into a CI
+/// failure. A `#` inside quotes, or one not preceded by whitespace (`a#b`), is
+/// part of the value and is kept.
+fn strip_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == b'"' || c == b'\'' {
+                    quote = Some(c);
+                } else if c == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+                    return &value[..i];
+                }
+            }
+        }
+    }
+    value
+}
+
 fn unquote(value: &str) -> String {
-    value.trim().trim_matches(['\'', '"']).to_string()
+    strip_inline_comment(value.trim())
+        .trim()
+        .trim_matches(['\'', '"'])
+        .to_string()
 }
 
 #[derive(Default)]
@@ -101,6 +131,7 @@ fn parse_flat_yaml(src: &str) -> FlatYaml {
         if line.is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
+        let line = strip_inline_comment(line).trim_end();
         if let Some(item) = line.trim_start().strip_prefix("- ") {
             if let Some(key) = current_key.as_ref() {
                 out.lists
@@ -272,6 +303,26 @@ fn project_yml_ignores_the_noise_that_would_dominate_an_index_pass() {
     }
 }
 
+/// Every `.rs` file beneath `dir`, as repo-root-relative slash-separated paths.
+/// Directory ancestors alone are not enough to guard the index: a file-selecting
+/// pattern (`*.rs`, `crates/**/*.rs`) shadows no directory at all, yet would
+/// still take the whole workspace source out of Serena's symbol index.
+fn rust_files_under(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("readable directory entry").path();
+        if path.is_dir() {
+            rust_files_under(root, &path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let rel = path
+                .strip_prefix(root)
+                .expect("path is under the repo root");
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
 #[test]
 fn no_ignored_path_shadows_a_workspace_member_source_root() {
     let cfg = parse_flat_yaml(&read(&serena_dir().join("project.yml")));
@@ -287,12 +338,29 @@ fn no_ignored_path_shadows_a_workspace_member_source_root() {
     );
     for member in &members {
         let src = format!("{member}/src");
-        assert!(repo_root().join(&src).is_dir(), "{src} should exist");
+        let src_dir = repo_root().join(&src);
+        assert!(src_dir.is_dir(), "{src} should exist");
         for pattern in ignored {
             assert!(
                 !pattern_shadows(pattern, &src),
                 "ignored_paths entry {pattern:?} shadows workspace source root {src}"
             );
+        }
+        // The directory checks above miss file-selecting patterns (`*.rs`,
+        // `crates/**/*.rs`) — those shadow no directory yet still empty the
+        // symbol index, so every source file is checked too, not just its
+        // ancestors.
+        let mut sources = Vec::new();
+        rust_files_under(&repo_root(), &src_dir, &mut sources);
+        sources.sort();
+        assert!(!sources.is_empty(), "{src} contains no .rs files");
+        for source in &sources {
+            for pattern in ignored {
+                assert!(
+                    !pattern_shadows(pattern, source),
+                    "ignored_paths entry {pattern:?} shadows workspace source file {source}"
+                );
+            }
         }
     }
 }
@@ -322,4 +390,38 @@ fn serena_ships_the_codebase_map_memory_the_analyzer_reads_first() {
             "codebase_map.md does not mention {crate_name}"
         );
     }
+}
+
+#[test]
+fn inline_comments_are_stripped_outside_quoted_scalars() {
+    // Documenting an entry the way YAML allows must not fail the assertions
+    // above; a `#` inside a quoted scalar is data, not a comment.
+    let cfg = parse_flat_yaml(concat!(
+        "read_only: true # navigation only\n",
+        "language_servers:\n",
+        "- rust # language server\n",
+        "project_name: \"man # ta\"\n",
+    ));
+    assert_eq!(
+        cfg.scalars.get("read_only").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        cfg.lists.get("language_servers").map(Vec::as_slice),
+        Some(["rust".to_string()].as_slice())
+    );
+    assert_eq!(
+        cfg.scalars.get("project_name").map(String::as_str),
+        Some("man # ta")
+    );
+}
+
+#[test]
+fn pattern_shadows_catches_file_selecting_globs() {
+    let source = "crates/manta-decode/src/lib.rs";
+    assert!(pattern_shadows("*.rs", source));
+    assert!(pattern_shadows("crates/**/*.rs", source));
+    // ...without flagging patterns that leave the source visible.
+    assert!(!pattern_shadows("*.rs", "crates/manta-decode/src"));
+    assert!(!pattern_shadows("/target", source));
 }

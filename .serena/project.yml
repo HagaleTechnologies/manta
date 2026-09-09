@@ -63,13 +63,15 @@ initial_prompt: |
   coppa-dsp crate); manta-spot, manta-input and manta-testkit build on those;
   manta-engine (pipeline orchestration) and manta-server (telnet + JSON/WebSocket
   output) build on that layer; manta-cli (the `manta` binary) and
-  manta-soak-harness (long-duration soak binary, MAN-19) sit on top. Read
-  CLAUDE.md first (status, key constraints), then ARCHITECTURE.md (data flow,
-  crate graph) and docs/SPEC-decode-core.md (normative algorithm spec -- implement
-  from this); wiki/INDEX.md maps accumulated gotchas and decisions (descriptive
-  only -- code and docs/ win any conflict). manta reuses DSP building blocks (FFT,
-  channel-impairment models, audio I/O) from the sibling coppa repo via git
-  dependency -- see wiki/pages/coppa-reuse.md before assuming a DSP primitive is
+  manta-soak-harness (long-duration soak binary, MAN-19) sit on top. Read the
+  four canonical documents in the order CLAUDE.md/AGENTS.md mandates: README.md
+  (goals and non-goals), ARCHITECTURE.md (data flow, crate graph),
+  docs/SPEC-decode-core.md (normative algorithm spec -- implement from this),
+  then ROADMAP.md (milestones M0-M4 and their acceptance criteria); CLAUDE.md
+  itself carries current status and key constraints, and wiki/INDEX.md maps
+  accumulated gotchas and decisions (descriptive only -- code and docs/ win any
+  conflict). manta reuses DSP building blocks (FFT, channel-impairment models,
+  audio I/O) from the sibling coppa repo via git dependency -- see wiki/pages/coppa-reuse.md before assuming a DSP primitive is
   new code here. Prefer get_symbols_overview / find_symbol /
   find_referencing_symbols over raw grep for symbol-level questions; call
   read_memory("codebase_map") for the directory map.
