@@ -916,14 +916,14 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
-<<<<<<< HEAD
 /// What the MAN-122 startup banner names about the live source; carried as
 /// one struct so `start_spot_server`'s argument list stays at four.
 struct SourceInfo<'a> {
     name: &'a str,
     sample_rate_hz: f64,
     dial_freq_hz: f64,
-=======
+}
+
 /// How often the daemon samples an input source's `InputHealthCounters`
 /// into `Metrics` (MAN-56). An order of magnitude below any realistic
 /// Prometheus scrape interval, so a scrape never sees more than ~1 s of
@@ -946,7 +946,6 @@ fn input_health_of(
         gaps_detected: counters.gaps_detected(),
         malformed_packets: counters.malformed_packets(),
     }
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 }
 
 fn start_spot_server(
@@ -1398,8 +1397,8 @@ fn main() -> Result<()> {
                     // Sources with no wire-packet loss model return None
                     // and publish no series at all, which is deliberate:
                     // a permanently-zero counter reads as "no loss" rather
-                    // than "not measured" (cf. ARCHITECTURE §8's
-                    // manta_active_tracks caveat).
+                    // than "not measured" (ARCHITECTURE §8, "absent means
+                    // not measured").
                     if let Some(counters) = src.health_counters() {
                         let metrics = server.metrics.clone();
                         // Published once eagerly so the series exists (at

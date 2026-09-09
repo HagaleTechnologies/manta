@@ -334,7 +334,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `bounded_io` read rejections, malformed-WS-frame disconnects, and
   rejected metrics-endpoint requests are all logged (plain `fmt` output,
   `RUST_LOG`-controlled, default `info`) to give an operator a durable
-<<<<<<< HEAD
   record to reconstruct an abuse incident after the fact. **The daemon
   also logs its own liveness** — landed 2026-09-07 (MAN-122,
   `docs/DECISIONS/2026-09-07-man122-operator-liveness-logging.md`): one
@@ -360,18 +359,38 @@ validation (MAN-28). Dedupe (step 5) still applies.
   scoped to, nor the daemon-lifecycle surface MAN-122 scoped to), and
   `manta --status` hitting a local control socket for live stats is
   similarly not yet implemented (MAN-44). Prometheus text
-  endpoint (feature `metrics`): input overruns, active tracks, evictions,
-  decode rate, spots/min, per-stage queue depths, spot confidence
-  histogram — also aspirational for several of these fields; the
-  currently-implemented subset is `manta_spots_total`,
-  `manta_spots_dropped_lagged_total`,
+  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
+  doc was stale — no Cargo `metrics` feature has ever existed; the
+  endpoint is unconditionally compiled and served whenever
+  `--config` is set — `--server-config` is MAN-77's deprecated alias of
+  that flag): input overruns, active tracks, evictions, decode rate,
+  spots/min, per-stage queue depths, spot confidence histogram — still
+  aspirational for several of these fields; the currently-implemented
+  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
+  `manta_spots_dropped_write_failed_total`,
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
+  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
+  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
+  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
+  gauges, `manta_source_health`, `manta_active_tracks` (MAN-122, below),
+  the uplink counters, and (MAN-56,
+  landed 2026-09-04) `manta_input_dropped_packets_total`/
+  `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
+  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
+  per-stage queue depths, decode rate, spots/min, spot-confidence
+  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  deviation, a different gap from MAN-56's wire-level packet counters).
+  The three `manta_input_*` series are published only for sources that
+  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
+  report none) and are **absent**, not a frozen zero, for every other
+  source — "absent means not measured", so an operator never reads a
+  placeholder as live data.
   **`manta_active_tracks` is now populated** (corrected 2026-09-07,
-  MAN-122): the count comes from `TrackManager`'s own lifecycle, not from
+  MAN-122; it had been served-but-frozen at a constant `0` since
+  2026-09-03 because `manta_engine::listen()` exposed no hook for it):
+  the count comes from `TrackManager`'s own lifecycle, not from
   the decode event stream. `TrackManager::decoding_track_count()` reports
   how many tracks are currently promoted and holding a leased decoder
   (`Active` or `Hang`); `manta_engine::listen_with_track_count()` hands
@@ -392,47 +411,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   deliberately *not* `TrackManager::active_track_count()`, which also
   counts unconfirmed CANDIDATEs (noise-blip rise crossings that lease no
   decoder) and keeps its own meaning for `soak_metrics`.
-=======
-  record to reconstruct an abuse incident after the fact. Still
-  aspirational: `manta-input`/`manta-engine` carry no logging of their
-  own yet (decode-pipeline internals, not the network-facing surface
-  MAN-59 scoped to), and `manta --status` hitting a local control socket
-  for live stats is similarly not yet implemented. Prometheus text
-  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
-  doc was stale — no Cargo `metrics` feature has ever existed; the
-  endpoint is unconditionally compiled and served whenever
-  `--config` is set — `--server-config` is MAN-77's deprecated alias of
-  that flag): active tracks, evictions, decode rate,
-  spots/min, per-stage queue depths, spot confidence histogram — still
-  aspirational for several of these fields; the currently-implemented
-  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
-  `manta_spots_suppressed_by_filter_total`,
-  `manta_spots_dropped_write_failed_total`,
-  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
-  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
-  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
-  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
-  gauges, `manta_source_health`, the uplink counters, and (MAN-56,
-  landed 2026-09-04) `manta_input_dropped_packets_total`/
-  `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
-  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
-  per-stage queue depths, decode rate, spots/min, spot-confidence
-  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
-  a `coppa-audio` API addition, `manta-engine::soak`'s documented
-  deviation, a different gap from MAN-56's wire-level packet counters).
-  The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
-  report none) and are **absent**, not a frozen zero, for every other
-  source — same "absent means not measured" distinction as
-  `manta_active_tracks` below.
-  **`manta_active_tracks` is served but not populated** (corrected
-  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
-  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
-  own comment says the engine exposes no hook for it yet — so every
-  production daemon run reports a constant `0`, not a real track count.
-  Listed separately from the "currently-implemented" set above so an
-  operator doesn't read a served-but-frozen placeholder as live data.
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`

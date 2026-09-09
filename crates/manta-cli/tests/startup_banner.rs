@@ -58,12 +58,16 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
         .args([
-            "listen",
+            // MAN-77 made `run --config` the canonical daemon verb;
+            // the `listen`/`--server-config` aliases still work but print
+            // a deprecation warning to stderr, which would sit AHEAD of
+            // the banner and defeat the first-line assertion below.
+            "run",
             "--source",
             wav.to_str().unwrap(),
             "--dial-freq-hz",
             "14060000",
-            "--server-config",
+            "--config",
             cfg_path.to_str().unwrap(),
         ])
         .env("RUST_LOG", "info")
@@ -149,12 +153,14 @@ fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
         .args([
-            "listen",
+            // Canonical verb, as above: the deprecated `listen` alias
+            // would prepend a warning line to stderr.
+            "run",
             "--source",
             wav.to_str().unwrap(),
             "--dial-freq-hz",
             "14060000",
-            "--server-config",
+            "--config",
             cfg_path.to_str().unwrap(),
         ])
         .env("RUST_LOG", "info")

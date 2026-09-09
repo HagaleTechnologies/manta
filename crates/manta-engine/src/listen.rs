@@ -129,7 +129,22 @@ pub fn listen_with_track_count(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let n = src.read(&mut chunk)?;
+        // A read error must not escape via `?` before the gauge is
+        // zeroed. The end-of-stream `on_tracks(0)` below is only reached
+        // on a clean EOF or a `stop` request, so a mid-stream failure --
+        // an SDR disconnecting, say -- would otherwise leave
+        // `manta_active_tracks` (and the status line's `tracks=`) frozen
+        // at its last nonzero value for the whole shutdown drain, up to
+        // `SHUTDOWN_DRAIN_DEADLINE` (25 s), while the metrics listener is
+        // still answering scrapes with decoders that no longer exist.
+        // Publish 0 first, then propagate the original error unchanged.
+        let n = match src.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                on_tracks(0);
+                return Err(e);
+            }
+        };
         if n == 0 {
             break;
         }
@@ -276,6 +291,77 @@ mod tests {
                     .collect::<std::collections::HashSet<_>>()
                     .len(),
             "the observer must fire per batch, repeats included, got {counts:?}"
+        );
+    }
+
+    /// A source that replays `samples` and then FAILS instead of reporting
+    /// EOF -- an SDR disconnecting mid-stream, not a file running out.
+    struct FailsAtEndSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+    }
+
+    impl manta_input::IqSource for FailsAtEndSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if self.cursor >= self.samples.len() {
+                anyhow::bail!("source disconnected");
+            }
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+    }
+
+    /// MAN-122 review round 3: a mid-stream `IqSource::read` failure exits
+    /// `listen_with_track_count` before the end-of-stream `on_tracks(0)`,
+    /// so without an explicit zero on the error path the daemon's
+    /// `manta_active_tracks` gauge (and the status line's `tracks=`) would
+    /// stay frozen at its last nonzero value for the whole shutdown drain
+    /// while the metrics listener still answers scrapes.
+    #[test]
+    fn listen_zeroes_the_track_count_when_a_read_fails_mid_stream() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FailsAtEndSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut counts: Vec<usize> = Vec::new();
+        let err = listen_with_track_count(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        )
+        .expect_err("the source fails instead of reaching EOF, so listen must propagate the error");
+        assert!(
+            err.to_string().contains("source disconnected"),
+            "the original read error must be propagated unchanged, got {err}"
+        );
+
+        assert!(
+            counts.iter().any(|&n| n > 0),
+            "V1 is a clean +20 dB tone -- a track must have been promoted before the failure, got {counts:?}"
+        );
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "a failed read must publish 0 before propagating, or the gauge stays frozen through shutdown drain, got {counts:?}"
         );
     }
 
