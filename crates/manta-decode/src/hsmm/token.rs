@@ -245,6 +245,69 @@ mod tests {
         assert_eq!(w.hist[1].glyph, None);
     }
 
+    /// [Task 7 fix, round 2]: the round-1 correction of
+    /// `speed_updates_only_on_short_segments` fixed a factually-wrong
+    /// "glyphless node" premise, but its replacement exercises the same
+    /// glyph-bearing node-T case the adjacent assertion already covers --
+    /// leaving `Token::successor`'s `tree.glyph(self.node)?` early-return
+    /// (the branch that actually rejects a gap from a glyphless node)
+    /// untested. `"-.-.-"` (Dah, Dit, Dah, Dit, Dah) is a genuine glyphless
+    /// interior node: it is the shared prefix of `;` (`"-.-.-."`) and `!`
+    /// (`"-.-.--"`), so it has two children but, per `tree::TABLE`, no glyph
+    /// entry of its own (verified: `TABLE` has no `"-.-.-"` entry). Reaching
+    /// it and attempting a gap while still `AfterMark` (so the phase
+    /// precondition is satisfied and the duration prior is in-range) isolates
+    /// the glyph check specifically.
+    #[test]
+    fn gap_segment_from_glyphless_interior_node_is_invalid() {
+        let tree = MorseTree::shared();
+        let cfg = HsmmConfig::default();
+        // Walk "-.-.-" one element at a time (Dah, Dit, Dah, Dit, Dah), an
+        // EGap of nominal length after each of the first four marks to
+        // return to AfterSpace before the next mark; the final Dah is left
+        // un-gapped so the token stays AfterMark on the glyphless node.
+        let mut t = root_token(13.0);
+        let mut hop = 0u64;
+        for seg in [SegType::Dah, SegType::Dit, SegType::Dah, SegType::Dit] {
+            let d = if seg == SegType::Dah { 39 } else { 13 }; // nominal at u=13
+            hop += d as u64;
+            t = t.successor(seg, d, 50.0, tree, &cfg, hop, 0).unwrap();
+            hop += 13; // nominal EGap
+            t = t
+                .successor(SegType::EGap, 13, 50.0, tree, &cfg, hop, 0)
+                .unwrap();
+        }
+        hop += 39;
+        let t = t
+            .successor(SegType::Dah, 39, 50.0, tree, &cfg, hop, 0)
+            .unwrap();
+        assert_eq!(t.phase, Phase::AfterMark);
+        assert!(
+            tree.glyph(t.node).is_none(),
+            "\"-.-.-\" must be glyphless (shared prefix of ';' and '!')"
+        );
+        assert!(
+            tree.child(t.node, Element::Dit).is_some()
+                && tree.child(t.node, Element::Dah).is_some(),
+            "\"-.-.-\" must have both children (';' and '!')"
+        );
+        // Phase precondition and duration prior both pass; only the glyph
+        // check should reject each of CGap/WGap/Silence here.
+        for seg in [SegType::CGap, SegType::WGap, SegType::Silence] {
+            let d = match seg {
+                SegType::CGap => 39,     // nominal 3*13
+                SegType::WGap => 91,     // nominal 7*13
+                SegType::Silence => 200, // within [10u, 80u]
+                _ => unreachable!(),
+            };
+            assert!(
+                t.successor(seg, d, 50.0, tree, &cfg, hop + d as u64, 0)
+                    .is_none(),
+                "{seg:?} from a glyphless node must be invalid"
+            );
+        }
+    }
+
     #[test]
     fn ordering_is_total_and_matches_spec() {
         let mut a = root_token(13.0);

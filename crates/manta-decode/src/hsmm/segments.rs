@@ -91,14 +91,18 @@ mod tests {
     fn duration_prior_peaks_at_nominal_and_is_bounded() {
         let cfg = HsmmConfig::default();
         assert_eq!(SegType::Dah.log_dur_prior(39, 13.0, &cfg), Some(0.0));
-        // [Task 7 fix]: brief's assertion (`< -1.0`) is unsatisfiable given the
-        // spec-correct formula (SPEC v2 §4.3: `-(ln(d/(k*u)))^2 / (2*sigma^2)`,
-        // sigma = dur_sigma = 0.22 default). At d=30, nom=3*13=39:
-        // ln(30/39) = -0.262364, squared / (2*0.22^2) = 0.711105, so the value
-        // is -0.7111053 (verified by direct computation) -- well short of
-        // -1.0. Relaxed to a bound the correct formula actually satisfies
-        // while still asserting a meaningful penalty away from the peak.
-        assert!(SegType::Dah.log_dur_prior(30, 13.0, &cfg).unwrap() < -0.5);
+        // [Task 7 fix, round 2]: brief's assertion (`< -1.0`) is unsatisfiable
+        // given the spec-correct formula (SPEC v2 §4.3:
+        // `-(ln(d/(k*u)))^2 / (2*sigma^2)`, sigma = dur_sigma = 0.22 default).
+        // At d=30, nom=3*13=39: ln(30/39) = -0.262364, squared / (2*0.22^2)
+        // = 0.711105, so the value is -0.7111054 (independently re-derived by
+        // both the implementer and a task reviewer). A loose `< -0.5` bound
+        // (round-1 fix) doesn't pin `dur_sigma` itself -- a regression to
+        // dur_sigma=0.25 would still satisfy it (value becomes ~-0.5507) and
+        // ship silently. Pinned to the exact formula value instead.
+        assert!(
+            (SegType::Dah.log_dur_prior(30, 13.0, &cfg).unwrap() - (-0.7111054f32)).abs() < 1e-5
+        );
         assert_eq!(SegType::Dah.log_dur_prior(20, 13.0, &cfg), None); // < 0.6 * 39
         assert_eq!(SegType::Dah.log_dur_prior(60, 13.0, &cfg), None); // > 1.5 * 39
         assert_eq!(SegType::Silence.log_dur_prior(200, 13.0, &cfg), Some(0.0));
