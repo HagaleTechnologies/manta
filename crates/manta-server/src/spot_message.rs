@@ -175,29 +175,6 @@ impl SpotMessage {
         unix_ts_secs: i64,
         session_nonce: u128,
     ) -> Self {
-<<<<<<< HEAD
-        // Falls back to empty-string/zero when `dx_call` isn't
-        // cty-allocated. Reachable in practice, not just a defensive
-        // fallback: MAN-28's Watch List lets an operator allowlist a call
-        // that bypasses `cty.is_allocated()` entirely (e.g. a deliberately
-        // unallocated or malformed test callsign), so `Validator` can emit
-        // a spot for a callsign `cty.lookup` genuinely can't resolve.
-        // dxContinent/dxCqZone (and their de* counterparts) are REQUIRED,
-        // non-nullable fields on dispensa's spots.v1 wire contract, unlike
-        // dxDxcc/deDxcc (declared nullable there) -- there is currently no
-        // contract-defined "unknown" representation for these two fields,
-        // so this fallback stays a real (if honestly imperfect) value
-        // rather than null, which the contract would reject outright. See
-        // the follow-up ticket linked from this PR's round-6 review thread
-        // for the cross-repo contract question this raises.
-        let dx = cty.lookup(&spot.callsign);
-        // MAN-89: `station_call` may carry an RBN `-N` per-band SSID, which is a
-        // manta node index with no geographic meaning -- and which `cty.dat`'s
-        // exact-call alias rows would refuse to match (cty.rs:143-169 strips
-        // `/`-portable suffixes only). Look up the operator's actual callsign;
-        // `de_call` and `id` below keep the full identity.
-        let de = cty.lookup(crate::config::strip_ssid(station_call));
-=======
         // Falls back to the UNKNOWN_* sentinels above when the callsign
         // isn't cty-allocated. Reachable in practice, not defensive: MAN-28's
         // Watch List lets an operator allowlist a call that bypasses
@@ -219,8 +196,14 @@ impl SpotMessage {
         // which cty.dat DOES answer (through the base call's prefix) but the
         // answer is wrong by definition -- see its doc comment.
         let dx = Geography::resolve(&spot.callsign, cty);
-        let de = Geography::resolve(station_call, cty);
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
+        // MAN-89: `station_call` may carry an RBN `-N` per-band SSID, which is a
+        // manta node index with no geographic meaning -- and which `cty.dat`'s
+        // exact-call alias rows would refuse to match (cty.rs:143-169 strips
+        // `/`-portable suffixes only). Resolve the operator's actual callsign;
+        // `de_call` and `id` below keep the full identity. Stripping before
+        // `Geography::resolve` also keeps `is_outside_any_dxcc_entity`'s
+        // `/MM`//`AM` check reading the same string the lookup does.
+        let de = Geography::resolve(crate::config::strip_ssid(station_call), cty);
         // `band` must be derived from the SAME rounded value reported as
         // `frequency` -- computing it from the unrounded `spot.freq_hz`
         // separately (round-5 review finding) could disagree with
@@ -302,6 +285,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let bare = SpotMessage::from_spot(&sample_spot(), "4U1UN", &cty, "v", 0, 1);
         let ssid = SpotMessage::from_spot(&sample_spot(), "4U1UN-1", &cty, "v", 0, 1);
 
+        assert_eq!(ssid.de_dxcc, bare.de_dxcc);
         assert_eq!(ssid.de_continent, bare.de_continent);
         assert_eq!(ssid.de_lat, bare.de_lat);
         assert_eq!(ssid.de_lon, bare.de_lon);
@@ -317,6 +301,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let cty = cty::Table::parse(manta_spot::CTY_DAT);
         let bare = SpotMessage::from_spot(&sample_spot(), "W5AU", &cty, "v", 0, 1);
         let ssid = SpotMessage::from_spot(&sample_spot(), "W5AU-1", &cty, "v", 0, 1);
+        assert_eq!(ssid.de_dxcc, bare.de_dxcc);
         assert_eq!(ssid.de_continent, bare.de_continent);
         assert_eq!(ssid.de_lat, bare.de_lat);
     }

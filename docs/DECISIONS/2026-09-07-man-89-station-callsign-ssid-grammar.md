@@ -83,6 +83,16 @@ technical notes asked to fix together.
    the digit, so no segment is a complete call and the operator's typo becomes the station
    identity on every telnet and JSON spot.
 
+   Finally, the qualifying segment is tested for that STRUCTURE directly, not for a length plus
+   one of each character class (PR #131 review, round 4). Length-plus-classes still accepted
+   `W12` -- and therefore `W12-1` and `W12/P`, whose only other segment is a portable
+   designator -- because it never required the letter SUFFIX that follows a call's separating
+   digit. `config::is_complete_callsign` now requires some digit with at least one letter before
+   it AND at least one letter after it, which is exactly prefix + digit + suffix and subsumes the
+   round-3 length bound (letter-digit-letter is already 3 characters). Verified to keep every
+   real form the earlier rounds accepted: `W1A`, `W5AU`, `4U1UN`, `3DA0RS`, `GB3LER/B`,
+   `JW/LB2PG`, `VP2E/K5ARH/M`, and multi-digit special-event calls such as `LZ130LO`.
+
 ## Non-goals
 
 - Auto-generating the `N` band index. `manta-cli` still hardcodes a single DDC; a real per-band
