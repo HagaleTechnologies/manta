@@ -50,9 +50,12 @@ same signature:
 - `snr_db` pinned to -8.28 to -7.29 dB. This is emitted spot-side from
   `TrackMeta.snr_2500_db`, which is `Demod::snr_2500_db()`
   (`crates/manta-decode/src/envelope.rs`): `20*log10(e_hi/e_lo) - 14.3 dB`,
-  where `e_hi`/`e_lo` are the 90th/10th-percentile envelope amplitude
-  *within the track's own decode window* (the decoder's keying-rail
-  contrast). It is **not** the detector's `(S-F)` signal-vs-local-floor
+  where `e_hi`/`e_lo` are adaptive keying rails *within the track's own
+  decode window* -- seeded from the 90th/10th-percentile envelope
+  amplitude at initialization (`envelope.rs:193-199`), then EMA-updated
+  per sample and occasionally rescaled (`envelope.rs:244-266`), not a
+  literal running percentile at every `TrackMeta` (the decoder's keying-
+  rail contrast). It is **not** the detector's `(S-F)` signal-vs-local-floor
   SNR -- an earlier revision of this finding wrongly attributed it to
   that quantity and derived a "+6 dB above the noise floor" claim from
   it that doesn't follow from what's actually computed. **Also not
@@ -154,6 +157,31 @@ silent for 5.5 continuous hours in practice, antenna/feedline is now the
 more likely suspect than band conditions alone; worth a manual continuity/
 SWR check before the next unattended run.
 
+## Finding 4 (brief, inconclusive): 20m looks livelier than 40m, still no confirmed copy
+
+Three 30-minute `listen --json` windows on 20m the same night
+(`--soapy-freq 14025000`, passband ~13929-14121 kHz, same RSP1B/gain),
+before the session was cut short by operator instruction (not a
+technical stop) to hand the RSP1B to a separate configuration
+investigation:
+
+- Max instantaneous `snr_2500_db` per window: +13.9, +8.8, +12.9 dB --
+  consistently higher than any full 40m window (best case there was
+  +5.6 dB). Track turnover was also markedly higher (~1400 promoted/
+  ~1250 closed per window vs. ~1400/~500 on 40m).
+- 10 confirmed spots total. Most repeat the same low-confidence
+  (0.12-0.17), floor-pinned (`snr_db` at/near -8.28 dB) signature as the
+  40m artifact. A few did not: `SE7CW` (-4.77 dB), `VE3NN` (-5.86 dB,
+  27.3 wpm -- within plausible CW range), `W4PM` (-6.97 dB, 32.6 wpm) sit
+  measurably above the clamp floor and have structurally valid US/
+  Canadian-format callsigns, unlike the malformed-text pattern typical of
+  the 40m artifact.
+- None of this is asserted as confirmed real copy -- confidence stayed
+  low (0.12-0.17) even for these, and three plausible-looking hits out of
+  ten in one band switch isn't enough to rule out coincidence. Flagged
+  here as a genuine open lead worth a longer, focused 20m session, not a
+  conclusion.
+
 ## Takeaway
 
 The overflow fix is a genuine reliability improvement, confirmed in the
@@ -165,5 +193,6 @@ with an unconfirmed, possibly-distinct mechanism, both worth their own
 investigation rather than folding into an existing bug by assumption.
 `manta doctor`'s verdict currently can't tell either of these apart from
 a real decode. Off-air real-signal confirmation is still the one open
-item neither this run nor 2026-09-08's closed -- next attempted on 20m
-same night, see follow-up session notes.
+item neither this run nor 2026-09-08's closed. Finding 4 above has the
+same-night 20m data -- inconclusive, but the first hint worth chasing
+further.
