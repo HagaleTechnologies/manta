@@ -84,17 +84,27 @@ struct Word {
     /// non-exempt callsign spot after a type change alone inflated its
     /// rep count to 2 (MAN-28 round 9 review).
     last_reps: u32,
-    /// Set when this word's most recent evaluation was rejected solely by
-    /// the Beacon-WPM plausibility check (see `evaluate_candidate`) --
-    /// distinct from an ordinary `attempted` rejection (grammar/cty/
-    /// blocklist/notch), which is permanent. A WPM rejection is transient:
-    /// the track's speed estimate can still settle to a plausible value,
-    /// and this flag is what lets that later retry bypass the normal
-    /// same-type `attempted` guard without also bypassing it for a
-    /// genuinely permanent rejection (Codex review on PR #154, round 2).
-    /// Cleared at the start of every re-evaluation and re-set only if the
-    /// WPM check rejects again.
-    held_back_by_wpm: bool,
+}
+
+/// A non-allowlisted Beacon-type candidate that has passed every
+/// permanent, timing-independent check (blocklist/notch/grammar/cty) but
+/// not yet the WPM-plausibility check -- captured once, at the moment its
+/// pattern completes, and judged exactly once at the track's true close
+/// (`Validator::resolve_pending_beacons`). Round 7 redesign: a live WPM
+/// reading is inherently unreliable as a gate for a decision that must
+/// reflect the track's FINAL state (Codex review on PR #154, rounds 2-7
+/// each found a new way a reactive, opportunistic check could fire on a
+/// transient value in either direction). Deliberately independent of
+/// `TrackState::words`/`Word`: a long transmission can evict the
+/// originating word from the bounded `WORD_WINDOW` before the track
+/// closes (round 7), and later unrelated words must not corrupt this
+/// candidate's own decode-time timestamp/frequency/SNR (round 7).
+struct PendingBeacon {
+    candidate: String,
+    sample_ts: u64,
+    freq_hz: f64,
+    snr_db: f32,
+    char_confidences: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -119,6 +129,9 @@ struct TrackState {
     /// Source of `Word::seq`; incremented each time a word is pushed to
     /// `words` (MAN-28 round 12 review).
     next_word_seq: u64,
+    /// Captured non-allowlisted Beacon candidates awaiting the track's
+    /// true close -- see `PendingBeacon`'s doc comment.
+    pending_beacons: Vec<PendingBeacon>,
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -327,20 +340,18 @@ impl Validator {
                     }
                 }
                 track.last_sample_ts = *sample_ts;
-                self.try_spot(*track_id, *sample_ts, false)
+                self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
                 self.tracks.entry(*track_id).or_default().wpm = *wpm;
-                // No retry here -- see `TrackClosed`'s handler below.
-                // Round 2 of this same review tried retrying on every
-                // live SpeedUpdate, which round 5 then found reopens the
-                // exact false-positive risk this whole check exists to
-                // close: a noise track's speed estimate can oscillate
-                // across the cutoff (e.g. 46 -> 44 -> 47 WPM), and a
-                // Beacon-type spot emitted on the transient 44 WPM dip
-                // can't be retracted once the estimate rises again. A
-                // single decision at the track's true close has no such
-                // window.
+                // No retry here, and no Beacon-WPM decision here either
+                // (round 7 redesign) -- a non-allowlisted Beacon
+                // candidate is only ever judged once, at `TrackClosed`,
+                // against whatever `pending_beacons` has accumulated.
+                // Rounds 2-7 each found a new way a reactive check tied
+                // to a live, evolving WPM reading could fire on a
+                // transient value in either direction; a live SpeedUpdate
+                // now only ever records the value, nothing more.
                 Vec::new()
             }
             DecoderEvent::TrackMeta {
@@ -362,7 +373,7 @@ impl Validator {
                 if had_meta {
                     Vec::new()
                 } else {
-                    self.try_spot(*track_id, sample_ts, false)
+                    self.try_spot(*track_id, sample_ts)
                 }
             }
             // Ground-truth "detector found a candidate" signal for
@@ -374,23 +385,19 @@ impl Validator {
             // leak.
             DecoderEvent::TrackPromoted { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id } => {
-                // Codex review on PR #154, round 5: a Beacon candidate
-                // held back by evaluate_candidate's WPM-plausibility
-                // check gets exactly one last try here, using the
-                // track's TRUE FINAL speed -- manta-engine now guarantees
-                // an unthrottled final SpeedUpdate (TrackDecoder::
-                // finish()) is ordered immediately before this
+                // Round 7 redesign: the ONE point where every captured
+                // non-allowlisted Beacon candidate for this track is
+                // judged, using its TRUE FINAL speed -- manta-engine
+                // guarantees a final speed flush (TrackDecoder::finish()/
+                // finish_speed_only()) is ordered immediately before this
                 // TrackClosed for the same track on every closure path
-                // (stream EOF, hang, silent, merge, evict alike -- not
-                // just overall EOF), so `track.wpm` already reflects the
-                // settled value by the time this handler runs. Replaces
-                // round 2's retry-on-every-live-SpeedUpdate design (see
-                // that arm's comment for why it was reactive-unsound).
-                let sample_ts = self.tracks.get(track_id).map(|t| t.last_sample_ts);
-                let spots = match sample_ts {
-                    Some(ts) => self.try_spot(*track_id, ts, true),
-                    None => Vec::new(),
-                };
+                // (stream EOF, hang, silent, merge, evict alike), so
+                // `track.wpm` already reflects the settled value by the
+                // time this handler runs. See `resolve_pending_beacons`
+                // and `PendingBeacon`'s doc comments for why this
+                // replaced rounds 2-6's reactive, opportunistic-
+                // evaluation-plus-retry design.
+                let spots = self.resolve_pending_beacons(*track_id);
                 // MAN-19: without this, `self.tracks` and `self.gate`'s
                 // per-track_id state both grow forever -- `TrackManager`
                 // never reuses a `track_id`, and until `TrackClosed`
@@ -600,10 +607,7 @@ impl Validator {
         word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
     }
 
-    /// `is_final_retry` is `true` only for the one call `TrackClosed`'s
-    /// handler makes -- see `evaluate_candidate`'s use of it on the
-    /// `held_back_by_wpm` carve-out (Codex review on PR #154, round 6).
-    fn try_spot(&mut self, track_id: u32, sample_ts: u64, is_final_retry: bool) -> Vec<Spot> {
+    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
         // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
         // defaults. Bail without marking anything attempted, so pending
         // candidates are simply re-evaluated once metadata does arrive.
@@ -629,7 +633,6 @@ impl Validator {
                     spot_type,
                     involved_max_seq,
                     exact_seq,
-                    is_final_retry,
                 )
             })
             .collect();
@@ -640,11 +643,6 @@ impl Validator {
         spots
     }
 
-    // `candidates()`'s own tuple shape (candidate/spot_type/involved_max_seq/
-    // exact_seq) plus track_id/sample_ts/is_final_retry -- a private,
-    // single-call-site helper, not a public API; splitting these into a
-    // struct wouldn't reduce real complexity here, just relocate it.
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_candidate(
         &mut self,
         track_id: u32,
@@ -653,8 +651,27 @@ impl Validator {
         spot_type: SpotType,
         involved_max_seq: u64,
         exact_seq: Option<u64>,
-        is_final_retry: bool,
     ) -> Option<Spot> {
+        // Round 7 redesign: a non-allowlisted Beacon candidate is NEVER
+        // evaluated/emitted opportunistically here -- only captured (once
+        // blocklist/notch/grammar/cty confirm it isn't a permanent
+        // reject), then judged exactly once at the track's true close.
+        // See `capture_pending_beacon`/`resolve_pending_beacons` and
+        // `PendingBeacon`'s doc comment for why: rounds 2-6 each found a
+        // new way a reactive check tied to a live, evolving WPM reading
+        // could misfire on a transient value, in either direction.
+        // Allowlisted Beacon candidates are unaffected -- they fall
+        // through to the unchanged logic below, exactly as before.
+        if spot_type == SpotType::Beacon && !self.allowlist.contains(&candidate) {
+            return self.capture_pending_beacon(
+                track_id,
+                sample_ts,
+                candidate,
+                involved_max_seq,
+                exact_seq,
+            );
+        }
+
         let (freq_hz, snr_db, wpm) = {
             let track = self.tracks.get(&track_id)?;
             (
@@ -704,50 +721,26 @@ impl Validator {
                 // context types (round 12), both merely because an older
                 // framing word (DE, CQ) fell out of the 16-word window,
                 // not because anything new arrived.
-                //
-                // `held_back_by_wpm` is a second, narrower carve-out: a
-                // Beacon candidate rejected only by the WPM-plausibility
-                // check below never got a genuine attempt at spotting, so
-                // it must retry once the track's speed estimate settles
-                // (Codex review on PR #154, round 2) even though its type
-                // and involved_max_seq haven't changed. Gated on
-                // `is_final_retry` too (round 6): without that, an
-                // ordinary WordBoundary arriving while `track.wpm`
-                // happens to be transiently low would ALSO bypass this
-                // guard and spot the held-back candidate early -- the
-                // exact oscillation risk round 5's redesign meant to
-                // close, just triggered by a different event. Only the
-                // one explicit retry `TrackClosed`'s handler makes may
-                // use this bypass.
-                if (word.last_spot_type == Some(spot_type)
-                    || involved_max_seq <= word.classified_max_seq)
-                    && !(word.held_back_by_wpm && is_final_retry)
+                if word.last_spot_type == Some(spot_type)
+                    || involved_max_seq <= word.classified_max_seq
                 {
                     return None;
                 }
             }
-            let held_back_by_wpm = word.held_back_by_wpm;
-            let reclassifying = word.attempted && !held_back_by_wpm;
+            let reclassifying = word.attempted;
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
             word.classified_max_seq = involved_max_seq;
-            // Tentatively cleared; re-set below if the WPM check rejects
-            // this same attempt again.
-            word.held_back_by_wpm = false;
             (word.confidences.clone(), reclassifying)
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
-        // checked ahead of, both the automatic validation pipeline (the
-        // WPM heuristic below included) and the MAN-28 allowlist further
-        // down: an explicit blocklist/notch entry is the operator's more
-        // specific, deliberate override and must not be silently defeated
-        // by a broader allowlist entry, nor left uncounted by an earlier
-        // automatic rejection (ARCHITECTURE §8 -- Codex review on PR #154,
-        // round 3, found an earlier revision's WPM check bypassing this
-        // and leaving `suppression_counts` at zero for a candidate that
-        // was, in fact, operator-suppressed). Each hit is counted so it
-        // reads as a deliberate suppression, not silent coverage loss.
+        // checked ahead of, both the automatic validation pipeline and the
+        // MAN-28 allowlist below: an explicit blocklist/notch entry is the
+        // operator's more specific, deliberate override and must not be
+        // silently defeated by a broader allowlist entry. Each hit is
+        // counted (ARCHITECTURE §8) so it reads as a deliberate
+        // suppression, not silent coverage loss.
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
             return None;
@@ -766,40 +759,6 @@ impl Validator {
                 return None;
             }
             if !self.cty.is_allocated(&candidate) {
-                return None;
-            }
-            // Real-hardware finding (2026-09-09, docs/DECISIONS): every
-            // overnight noise-floor false positive from a real RSP1B/40m
-            // session read implausibly fast -- avg 51.5 WPM, several
-            // pinned at the tracker's own 60 WPM ceiling (SPEC-decode-
-            // core.md's tracked range is 8..60 WPM) -- and every one of
-            // them reached a spot via the `SpotType::Beacon` repetition-
-            // gate exemption (ARCHITECTURE §6.4): that's the only path
-            // where a single low-evidence decode can reach public output
-            // with no independent second confirmation. Scoped to that
-            // path only -- an earlier, unscoped version of this check
-            // rejected legitimate fast (45+ WPM) contest/computer-keyed
-            // CW reaching a spot through the ordinary two-repetition-
-            // confirmed path, which the decoder's own 8..60 WPM tracked
-            // range explicitly supports and needs no extra scrutiny here.
-            // Real NCDXF/IARU beacons ID at a fixed ~20-22 WPM, well
-            // under this threshold.
-            //
-            // A rejection here marks `held_back_by_wpm` (not a permanent
-            // `attempted`-guard block) so a later retry -- another
-            // WordBoundary, or the SpeedUpdate-triggered try_spot in
-            // `ingest` -- can still succeed once the estimate settles.
-            if spot_type == SpotType::Beacon && wpm > MAX_PLAUSIBLE_WPM {
-                if let Some(track) = self.tracks.get_mut(&track_id) {
-                    let word = if let Some(seq) = exact_seq {
-                        track.words.iter_mut().find(|w| w.seq == seq)
-                    } else {
-                        track.words.iter_mut().rev().find(|w| w.text == candidate)
-                    };
-                    if let Some(word) = word {
-                        word.held_back_by_wpm = true;
-                    }
-                }
                 return None;
             }
         }
@@ -834,7 +793,10 @@ impl Validator {
         }
         // ARCHITECTURE §6.4 exempts BEACON-tagged messages from the
         // repetition requirement: NCDXF-style beacons ID once per cycle,
-        // so a single decode must still spot (MAN-28).
+        // so a single decode must still spot (MAN-28). Only reachable
+        // here for an ALLOWLISTED Beacon candidate -- non-allowlisted
+        // ones never reach this function body at all (see the early
+        // dispatch above).
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
             return None;
         }
@@ -855,6 +817,140 @@ impl Validator {
             track_id,
             sample_ts,
         })
+    }
+
+    /// Captures a non-allowlisted Beacon candidate once every permanent,
+    /// timing-independent check passes -- never evaluates WPM or emits a
+    /// spot here. See `PendingBeacon`'s doc comment for why this is
+    /// deferred, and `resolve_pending_beacons` for where it's finally
+    /// judged.
+    fn capture_pending_beacon(
+        &mut self,
+        track_id: u32,
+        sample_ts: u64,
+        candidate: String,
+        involved_max_seq: u64,
+        exact_seq: Option<u64>,
+    ) -> Option<Spot> {
+        let (freq_hz, snr_db) = {
+            let track = self.tracks.get(&track_id)?;
+            (track.freq_hz * self.freq_calibration, track.snr_db)
+        };
+
+        // Word-attempted bookkeeping FIRST, same ordering as the
+        // non-Beacon path and for the same reason (Codex review on
+        // PR #154, round 3): checking blocklist/notch before this guard
+        // would re-count a permanently-suppressed candidate every time an
+        // unrelated later word re-triggers a scan that finds it again.
+        let char_confidences = {
+            let track = self.tracks.get_mut(&track_id)?;
+            let word = if let Some(seq) = exact_seq {
+                track.words.iter_mut().find(|w| w.seq == seq)?
+            } else {
+                track.words.iter_mut().rev().find(|w| w.text == candidate)?
+            };
+            let involved_max_seq = involved_max_seq.max(word.seq);
+            // Same reclassification guard as the non-Beacon path (MAN-28
+            // round 12/13) -- a word already captured as this exact
+            // candidate, with no genuinely new supporting evidence since,
+            // is not captured (or re-suppressed) again.
+            if word.attempted
+                && (word.last_spot_type == Some(SpotType::Beacon)
+                    || involved_max_seq <= word.classified_max_seq)
+            {
+                return None;
+            }
+            word.attempted = true;
+            word.last_spot_type = Some(SpotType::Beacon);
+            word.classified_max_seq = involved_max_seq;
+            word.confidences.clone()
+        };
+
+        // Operator suppression overrides (MAN-31), same boundary as the
+        // non-Beacon path (ARCHITECTURE §8).
+        if self.blocklist.contains(&candidate) {
+            self.suppression_counts.blocklist += 1;
+            return None;
+        }
+        if self.notch.contains(freq_hz) {
+            self.suppression_counts.notch += 1;
+            return None;
+        }
+        if !grammar::is_plausible(&candidate) {
+            return None;
+        }
+        if !self.cty.is_allocated(&candidate) {
+            return None;
+        }
+
+        self.tracks
+            .get_mut(&track_id)?
+            .pending_beacons
+            .push(PendingBeacon {
+                candidate,
+                sample_ts,
+                freq_hz,
+                snr_db,
+                char_confidences,
+            });
+        None
+    }
+
+    /// The one point where every `PendingBeacon` captured for `track_id`
+    /// is judged, using the track's speed at the moment of its true close
+    /// (`TrackClosed`'s handler calls this before removing track state).
+    /// Real-hardware finding (2026-09-09, docs/DECISIONS): every overnight
+    /// noise-floor false positive from a real RSP1B/40m session read
+    /// implausibly fast -- avg 51.5 WPM, several pinned at the tracker's
+    /// own 60 WPM ceiling (SPEC-decode-core.md's tracked range is
+    /// 8..60 WPM) -- while every confirmed-real spot from the same
+    /// session topped out at 42.8 WPM. Real NCDXF/IARU beacons ID at a
+    /// fixed ~20-22 WPM, well under `MAX_PLAUSIBLE_WPM`. A single WPM
+    /// value covers every pending candidate on this track -- it's a
+    /// track-level property, not a per-candidate one.
+    fn resolve_pending_beacons(&mut self, track_id: u32) -> Vec<Spot> {
+        let (wpm, pending) = {
+            let Some(track) = self.tracks.get_mut(&track_id) else {
+                return Vec::new();
+            };
+            (track.wpm, std::mem::take(&mut track.pending_beacons))
+        };
+        if pending.is_empty() || wpm > MAX_PLAUSIBLE_WPM {
+            return Vec::new();
+        }
+        pending
+            .into_iter()
+            .filter_map(|pb| {
+                let reps = self.gate.record(track_id, &pb.candidate, pb.sample_ts) as u32;
+                let mut confidence = confidence::c_call(&pb.char_confidences, reps);
+                if let Some(scp) = &self.scp {
+                    confidence =
+                        confidence::apply_scp_boost(confidence, scp.contains(&pb.candidate));
+                }
+                // ARCHITECTURE §6.4 exempts BEACON-tagged messages from
+                // the repetition requirement -- no `reps < 2` gate here,
+                // by design.
+                if !self.dedupe.should_emit(
+                    &pb.candidate,
+                    pb.freq_hz,
+                    pb.snr_db,
+                    SpotType::Beacon,
+                    pb.sample_ts,
+                ) {
+                    return None;
+                }
+                Some(Spot {
+                    callsign: pb.candidate,
+                    freq_hz: pb.freq_hz,
+                    snr_db: pb.snr_db,
+                    wpm,
+                    spot_type: SpotType::Beacon,
+                    confidence,
+                    track_id,
+                    sample_ts: pb.sample_ts,
+                })
+            })
+            .collect()
     }
 }
 
@@ -931,13 +1027,12 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     /// noise-floor false positive from a real RSP1B/40m session read
     /// implausibly fast (avg 51.5 WPM) and reached a spot through the
     /// `SpotType::Beacon` repetition-gate exemption -- the only path
-    /// where one low-evidence decode can reach public output. The WPM
-    /// gate is scoped to that path (Codex review on PR #154 found an
-    /// earlier, unscoped version rejected legitimate fast CW reaching a
-    /// spot through the ordinary repetition-confirmed path instead; see
-    /// `plausibly_fast_track_still_spots` below for that case).
+    /// where one low-evidence decode can reach public output. Round 7
+    /// redesign: a non-allowlisted Beacon candidate is captured
+    /// regardless of the WPM seen while it's decoding, and rejected at
+    /// `TrackClosed` if the track's TRUE FINAL speed is still implausible.
     #[test]
-    fn implausibly_fast_beacon_track_never_spots() {
+    fn beacon_never_spots_when_the_true_final_wpm_is_implausible() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
         v.ingest(&DecoderEvent::SpeedUpdate {
@@ -950,60 +1045,29 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots.is_empty(),
-            "a Beacon-type track reporting 60 WPM must never spot, got {spots:?}"
-        );
-    }
-
-    /// Codex review on PR #154, round 2: a Beacon candidate held back by
-    /// an early, transiently-inflated WPM estimate must still spot once
-    /// `SpeedUpdate` corrects it -- even with no further `WordBoundary`
-    /// (the short-track case the reviewer specifically flagged).
-    #[test]
-    fn beacon_held_back_by_wpm_spots_once_speed_update_settles() {
-        let mut v = Validator::new(FS, CTY_FIXTURE, None);
-        seed_meta(&mut v, 1);
-        v.ingest(&DecoderEvent::SpeedUpdate {
-            track_id: 1,
-            wpm: 60.0,
-        });
-        let words = ["K5ARH", "T"];
-        let spots = run(&transmission_events(1, &words, 0), &mut v);
-        assert!(
-            spots.is_empty(),
-            "should be held back at 60 WPM, got {spots:?}"
-        );
-
-        // A live SpeedUpdate alone must NOT retry (round 5: reacting to
-        // every transient update reopens the oscillation false-positive
-        // this whole check exists to close) -- only TrackClosed does,
-        // once manta-engine's guaranteed final flush has updated
-        // track.wpm.
-        let spots = v.ingest(&DecoderEvent::SpeedUpdate {
-            track_id: 1,
-            wpm: 22.0,
-        });
-        assert!(
-            spots.is_empty(),
-            "a live SpeedUpdate alone must not retry a held-back candidate, got {spots:?}"
+            "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
         );
 
         let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
-        assert_eq!(
-            spots.len(),
-            1,
-            "TrackClosed must give the held-back beacon exactly one final try using the settled WPM"
+        assert!(
+            spots.is_empty(),
+            "a track whose true final speed is implausible must never spot, got {spots:?}"
         );
-        assert_eq!(spots[0].callsign, "K5ARH");
-        assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
-    /// Codex review on PR #154, round 5: the core false-positive scenario
-    /// the retry-on-every-SpeedUpdate design reopened -- a noise track's
-    /// speed oscillates across the cutoff (46 -> 44 -> 47 WPM). The
-    /// intermediate dip below `MAX_PLAUSIBLE_WPM` must never itself spot;
-    /// only the track's eventual, true close decides.
+    /// Codex review on PR #154, rounds 2-6: a reactive check tied to a
+    /// live, evolving WPM reading kept finding new ways to misfire on a
+    /// transient value, in either direction (round 2: an early-inflated
+    /// reading permanently lost a real beacon; round 5: a noise track
+    /// oscillating across the cutoff, e.g. 46 -> 44 -> 47 WPM, could spot
+    /// on the dip; round 6: an unrelated later word could reopen that
+    /// same dip-driven spot). The round 7 redesign closes all three
+    /// structurally: nothing is EVER evaluated against WPM until
+    /// `TrackClosed`, so no interim reading -- high, low, or from an
+    /// unrelated word -- can matter at all. Only the track's true final
+    /// speed decides.
     #[test]
-    fn oscillating_wpm_never_spots_on_a_transient_dip_below_the_cutoff() {
+    fn only_the_true_final_wpm_at_track_close_decides() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
         v.ingest(&DecoderEvent::SpeedUpdate {
@@ -1014,76 +1078,41 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
 
-        let spots = v.ingest(&DecoderEvent::SpeedUpdate {
-            track_id: 1,
-            wpm: 44.0,
-        });
-        assert!(
-            spots.is_empty(),
-            "a transient dip below the cutoff must never itself spot, got {spots:?}"
-        );
-
-        let spots = v.ingest(&DecoderEvent::SpeedUpdate {
-            track_id: 1,
-            wpm: 47.0,
-        });
-        assert!(spots.is_empty());
-
-        // If the track's true final speed is genuinely implausible, the
-        // close must still reject it -- oscillation-proofing must not
-        // turn into an unconditional pass at close.
-        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
-        assert!(
-            spots.is_empty(),
-            "a track truly closing above the cutoff must still be rejected, got {spots:?}"
-        );
-    }
-
-    /// Codex review on PR #154, round 6: the `held_back_by_wpm` bypass
-    /// must fire ONLY for the explicit `TrackClosed` retry -- an ordinary
-    /// WordBoundary arriving while the track's speed is transiently low
-    /// must not ALSO be able to release a held-back candidate (the same
-    /// oscillation risk round 5 closed for SpeedUpdate, reopened via a
-    /// different event).
-    #[test]
-    fn an_unrelated_word_boundary_during_a_transient_dip_does_not_release_a_held_back_beacon() {
-        let mut v = Validator::new(FS, CTY_FIXTURE, None);
-        seed_meta(&mut v, 1);
-        v.ingest(&DecoderEvent::SpeedUpdate {
-            track_id: 1,
-            wpm: 60.0,
-        });
-        let words = ["K5ARH", "T"];
-        let spots = run(&transmission_events(1, &words, 0), &mut v);
-        assert!(spots.is_empty(), "should be held back at 60 WPM");
-
-        // Speed dips below the cutoff, but the track has not closed.
         v.ingest(&DecoderEvent::SpeedUpdate {
             track_id: 1,
             wpm: 44.0,
         });
-
         // An unrelated later word on the SAME track produces its own
-        // WordBoundary -- it must not reactivate the held-back candidate.
-        // ("5NN" specifically, not e.g. "DE": a bare CQ/DE anywhere in the
-        // window suppresses the power-step beacon fallback entirely --
-        // see context.rs -- which would make this candidate vanish for
-        // an unrelated reason instead of exercising the guard this test
-        // targets.)
+        // WordBoundary -- it must not cause an early spot or a duplicate
+        // capture. ("5NN" specifically, not e.g. "DE": a bare CQ/DE
+        // anywhere in the window suppresses the power-step beacon
+        // fallback entirely -- see context.rs -- which would make this
+        // candidate vanish for an unrelated reason instead of exercising
+        // the property this test targets.)
         let more = run(&transmission_events(1, &["5NN"], 200_000), &mut v);
         assert!(
             more.is_empty(),
-            "an unrelated WordBoundary must not bypass the held-back guard, got {more:?}"
+            "an unrelated WordBoundary must never itself spot, got {more:?}"
         );
 
-        // The true close still resolves it correctly.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 47.0,
+        });
+        // Settles to a plausible value before the track actually closes.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+
         let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
         assert_eq!(
             spots.len(),
             1,
-            "TrackClosed must still give the held-back beacon its one final try"
+            "the track's true final (plausible) speed must decide, got {spots:?}"
         );
         assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
     /// Codex review on PR #154, round 3: a blocklisted callsign that
@@ -1126,8 +1155,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     /// Sanity check: a plausible-speed Beacon-type candidate still spots
-    /// normally -- proves the WPM gate isn't rejecting Beacon spots
-    /// indiscriminately.
+    /// once its track truly closes -- proves the WPM gate isn't rejecting
+    /// Beacon spots indiscriminately. Round 7 redesign: a non-allowlisted
+    /// Beacon candidate is never emitted before `TrackClosed`, by design
+    /// (see `PendingBeacon`'s doc comment), so unlike the pre-redesign
+    /// version of this test, a spot only appears after that event.
     #[test]
     fn plausibly_fast_beacon_track_still_spots() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
@@ -1138,6 +1170,12 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         let words = ["K5ARH", "T"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
+        );
+
+        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);

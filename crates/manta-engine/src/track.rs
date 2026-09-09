@@ -320,14 +320,17 @@ impl Track {
     }
 
     /// Drain this track's queued `pending` samples through its decoder,
-    /// then call `finish()` -- used whenever a track closes mid-batch
-    /// (HangExpired/Silent/Merged/Evicted), before its `pending` queue
-    /// would otherwise be silently discarded along with the rest of the
-    /// removed `Track`. Without this, `finish()`'s "true final speed"
-    /// could be stale by up to a full batch's worth of already-queued
-    /// samples (Codex review on PR #154, round 6) -- exactly the state a
-    /// held-back `manta-spot` Beacon-WPM candidate needs at `TrackClosed`
-    /// time. No-op (empty `Vec`) if this track never had a decoder.
+    /// then call `finish()` -- used for a genuine end-of-signal closure
+    /// (HangExpired/Silent: a sustained real gap has already been
+    /// observed), before its `pending` queue would otherwise be silently
+    /// discarded along with the rest of the removed `Track`. Without the
+    /// drain, `finish()`'s "true final speed" could be stale by up to a
+    /// full batch's worth of already-queued samples (Codex review on
+    /// PR #154, round 6) -- exactly the state a held-back `manta-spot`
+    /// Beacon-WPM candidate needs at `TrackClosed` time. No-op (empty
+    /// `Vec`) if this track never had a decoder. See `finish_decoder_speed_only`
+    /// for Merged/Evicted, where forcing finalization would fabricate
+    /// content instead (round 7).
     fn finish_decoder(&mut self) -> Vec<DecoderEvent> {
         let Some(decoder) = self.decoder.as_mut() else {
             return Vec::new();
@@ -338,6 +341,30 @@ impl Track {
             .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
             .collect();
         events.extend(decoder.finish());
+        events
+    }
+
+    /// Same pending-drain as `finish_decoder`, but calls
+    /// `TrackDecoder::finish_speed_only` instead of `finish` -- for
+    /// Merged/Evicted closures, which are pure track bookkeeping (another
+    /// track claimed the channel, or the track cap was exceeded), not
+    /// evidence the RF signal itself ended. The track could be genuinely
+    /// mid-character at this instant; forcing that to resolve into a
+    /// character (as `finish_decoder` legitimately does for a real
+    /// trailing gap) would fabricate content that was never actually
+    /// confirmed -- Codex review on PR #154, round 7 found this could
+    /// synthesize a "T" character, forming the exact `<call> T` Beacon
+    /// pattern out of noise.
+    fn finish_decoder_speed_only(&mut self) -> Vec<DecoderEvent> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Vec::new();
+        };
+        let pending = std::mem::take(&mut self.pending);
+        let mut events: Vec<DecoderEvent> = pending
+            .into_iter()
+            .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+            .collect();
+        events.extend(decoder.finish_speed_only());
         events
     }
 
@@ -739,7 +766,7 @@ impl TrackManager {
                 if !track.has_emitted {
                     return false;
                 }
-                flush_events.extend(track.finish_decoder());
+                flush_events.extend(track.finish_decoder_speed_only());
                 true
             })
             .collect();
@@ -768,7 +795,7 @@ impl TrackManager {
             // emitted a real event -- see `step_hop`'s matching comment.
             if let Some(mut track) = self.tracks.remove(&loser) {
                 if track.has_emitted {
-                    flush_events.extend(track.finish_decoder());
+                    flush_events.extend(track.finish_decoder_speed_only());
                     evicted.push(loser);
                 }
             }
@@ -1404,6 +1431,15 @@ mod tests {
     /// test helper of the same shape, duplicated here since it isn't
     /// exported across the crate boundary. Just enough to get a
     /// `TrackDecoder`'s speed tracker ready (needs 5 marks).
+    /// Real inter-character gaps included (unlike a single-character
+    /// helper), so earlier characters can decode live via ordinary
+    /// `push_envelope` calls -- but deliberately no final trailing gap,
+    /// so the LAST character's last mark element stays genuinely "open"
+    /// (matches a real mid-transmission truncation, e.g. a merge/eviction
+    /// landing mid-character). Round 7: this distinction between "real
+    /// gaps already observed" and "still open, no gap yet" is exactly
+    /// what `finish_speed_only` must respect and `finish` legitimately
+    /// may not.
     fn rect_envelope_hops(text: &str, dit_hops: u32) -> Vec<f32> {
         let mut env = Vec::new();
         let mut push = |level: f32, hops: u32| {
@@ -1411,14 +1447,18 @@ mod tests {
                 env.push(level);
             }
         };
-        for c in text.chars() {
-            let pat = manta_decode::tree::pattern_for(c).unwrap();
+        let chars: Vec<char> = text.chars().collect();
+        for (ci, c) in chars.iter().enumerate() {
+            let pat = manta_decode::tree::pattern_for(*c).unwrap();
             let els: Vec<char> = pat.chars().collect();
             for (ei, e) in els.iter().enumerate() {
                 push(1.0, if *e == '.' { dit_hops } else { 3 * dit_hops });
                 if ei < els.len() - 1 {
                     push(0.0, dit_hops);
                 }
+            }
+            if ci < chars.len() - 1 {
+                push(0.0, 3 * dit_hops);
             }
         }
         env
@@ -1431,7 +1471,11 @@ mod tests {
     /// against once the track legitimately closes (not just at overall
     /// stream EOF, which `TrackManager::finish` already handled).
     #[test]
-    fn merge_converged_flushes_the_losers_decoder() {
+    fn merge_converged_never_fabricates_a_character_from_a_dangling_mark() {
+        // "PARIS" with real inter-character gaps but no final trailing
+        // gap: P/A/R/I decode live during setup; "S" is genuinely still
+        // open (mid-mark) when merge happens -- exactly the round-7
+        // scenario (a merge/eviction landing mid-character).
         let mut tm = TrackManager::new(
             64,
             96_000.0,
@@ -1464,12 +1508,15 @@ mod tests {
 
         let (closed, flush_events) = tm.merge_converged();
         assert_eq!(closed, vec![weak_id]);
-        // Before this fix, `merge_converged` dropped the loser's
-        // `TrackDecoder` without ever calling `finish()`, so this would
-        // always be empty regardless of what the decoder had buffered.
+        // Before this fix, merge_converged called the full (forcing)
+        // `finish()`, which would resolve "S"'s dangling mark into a
+        // fabricated character/word that was never actually confirmed by
+        // a real on-air gap.
         assert!(
-            !flush_events.is_empty(),
-            "merge_converged must call finish() on the closed loser's decoder, got nothing"
+            !flush_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. })),
+            "merge_converged must never fabricate a character/word from an in-progress mark, got {flush_events:?}"
         );
         assert!(
             flush_events.iter().all(|e| event_track_id(e) == weak_id),

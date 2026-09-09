@@ -73,6 +73,10 @@ fn v11_context_parse_sets_spot_type() {
         seed_meta(&mut v, 1);
         let mut spots = run(&transmission_events(1, words, 0), &mut v);
         spots.extend(run(&transmission_events(1, words, 100_000), &mut v));
+        // A non-allowlisted Beacon candidate is never emitted before
+        // TrackClosed (round 7 redesign) -- harmless no-op for the other
+        // cases here, which already spotted via the repetition gate.
+        spots.extend(v.ingest(&DecoderEvent::TrackClosed { track_id: 1 }));
         let hit = spots
             .iter()
             .find(|s| s.callsign == "K5ARH")
@@ -185,10 +189,17 @@ fn v18_beacon_pattern_exempt_from_repetition_gate() {
     seed_meta(&mut v, 1);
     let words = ["V", "V", "V", "K5ARH"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "a non-allowlisted Beacon candidate must never spot before TrackClosed \
+         (round 7 redesign), got {spots:?}"
+    );
+    let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
     assert_eq!(
         spots.len(),
         1,
-        "a BEACON-tagged spot must emit on the first decode"
+        "a BEACON-tagged spot must emit on the first decode -- no repetition needed, \
+         just the track's true close"
     );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
@@ -515,10 +526,17 @@ fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
     seed_meta(&mut v, 1);
     let words = ["K5ARH", "T"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
+    assert!(
+        spots.is_empty(),
+        "a non-allowlisted Beacon candidate must never spot before TrackClosed \
+         (round 7 redesign), got {spots:?}"
+    );
+    let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
     assert_eq!(
         spots.len(),
         1,
-        "a power-step BEACON-tagged spot must emit on the first decode"
+        "a power-step BEACON-tagged spot must emit on the first decode -- no \
+         repetition needed, just the track's true close"
     );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
@@ -630,11 +648,21 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
     });
+    // Round 7 redesign: a non-allowlisted Beacon candidate is only ever
+    // captured here (has_meta's retry lets it be captured at all, having
+    // never been attempted before), not emitted -- both occurrences only
+    // spot once the track truly closes.
+    assert!(
+        spots.is_empty(),
+        "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
+    );
+
+    let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
     assert!(
         spots
             .iter()
             .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
-        "W1AW must spot as Beacon once metadata arrives, got {spots:?}"
+        "W1AW must spot as Beacon once the track closes, got {spots:?}"
     );
     assert!(
         spots
