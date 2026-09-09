@@ -25,11 +25,40 @@ const CALIBRATION_SECONDS: f64 = 2.0;
 /// file replay) or `stop` is set (Ctrl-C, live audio). Each decoded event is
 /// passed to `on_event` as it's produced. Design doc §4.
 pub fn listen(
+    src: Box<dyn IqSource>,
+    cfg: &PipelineConfig,
+    stop: Arc<AtomicBool>,
+    on_event: impl FnMut(&DecoderEvent),
+    on_spot: impl FnMut(&crate::Spot),
+) -> Result<()> {
+    listen_with_track_count(src, cfg, stop, on_event, on_spot, |_n| {})
+}
+
+/// `listen()` plus a live track-count observer: `on_tracks` is called with
+/// `TrackManager::decoding_track_count()` after every batch the pipeline
+/// processes (including the final `finish()`, which reports 0), and only
+/// when the count actually changes.
+///
+/// MAN-122 review round 1: the daemon's `manta_active_tracks` gauge and its
+/// status line's `tracks=` field must come from the manager's own lifecycle
+/// state, not from the `DecoderEvent` stream `on_event` already sees. A
+/// track that `TrackManager` has promoted but whose demodulator has not
+/// latched emits no events at all -- `TrackDecoder` withholds `TrackMeta`
+/// until `snr_2500_db()` is `Some`, and a silent ACTIVE track survives to
+/// the ~30 s `gc_hops` GC -- so an event-derived count reports zero while
+/// real decoders are running on weak or unmodulated signals. This is the
+/// count that cannot lie about that.
+///
+/// Kept as a separate entry point rather than a sixth parameter on
+/// `listen()` so the existing callers and tests are untouched; `listen()`
+/// is now a no-op-observer wrapper over this.
+pub fn listen_with_track_count(
     mut src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
     stop: Arc<AtomicBool>,
     mut on_event: impl FnMut(&DecoderEvent),
     mut on_spot: impl FnMut(&crate::Spot),
+    mut on_tracks: impl FnMut(usize),
 ) -> Result<()> {
     // Validated up front so a bad config value fails fast, before spending
     // CALIBRATION_SECONDS reading from a live device (MAN-29).
@@ -59,6 +88,11 @@ pub fn listen(
         cfg.detector,
         cfg.decode.clone(),
     );
+    // Deduplicated so a steady band doesn't restore the same value to the
+    // gauge ~24 times a second (one chunk == 2048 samples == ~43 ms at
+    // 48 kS/s); `Some(0)` is never the initial value, so the first batch
+    // always publishes, even when it is genuinely zero.
+    let mut last_tracks: Option<usize> = None;
     let mut validator = Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -77,12 +111,14 @@ pub fn listen(
             on_spot(&spot);
         }
     }
+    report_track_count(&tm, &mut last_tracks, &mut on_tracks);
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
+    report_track_count(&tm, &mut last_tracks, &mut on_tracks);
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -101,6 +137,7 @@ pub fn listen(
                 on_spot(&spot);
             }
         }
+        report_track_count(&tm, &mut last_tracks, &mut on_tracks);
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
@@ -108,7 +145,27 @@ pub fn listen(
             on_spot(&spot);
         }
     }
+    // `finish()` flushes and drops every decoder: nothing is being decoded
+    // once the stream has ended, so the gauge must not be left holding the
+    // last live value after a source disconnects or a replay hits EOF.
+    if last_tracks != Some(0) {
+        on_tracks(0);
+    }
     Ok(())
+}
+
+/// Publish `tm`'s promoted-track count through `on_tracks`, but only when
+/// it differs from the last value published.
+fn report_track_count(
+    tm: &crate::track::TrackManager,
+    last: &mut Option<usize>,
+    on_tracks: &mut impl FnMut(usize),
+) {
+    let n = tm.decoding_track_count();
+    if *last != Some(n) {
+        *last = Some(n);
+        on_tracks(n);
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +234,49 @@ mod tests {
             "freq_hz {freq_hz} should be near {} (center_freq_hz + V1's known offset), not near 12340 \
              (which is what a hardcoded center_freq_hz=0.0 would produce)",
             spec.center_freq_hz + 12_340.0
+        );
+    }
+
+    /// MAN-122 review round 1: the track-count observer reports
+    /// `TrackManager`'s promoted-track count, rises above zero while a real
+    /// signal is being decoded, and is driven back to zero by `finish()` so
+    /// the daemon's gauge doesn't stay stuck at the last live value after
+    /// EOF or an SDR disconnect.
+    #[test]
+    fn listen_reports_the_managers_track_count_and_clears_it_at_end_of_stream() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut counts: Vec<usize> = Vec::new();
+        listen_with_track_count(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        )
+        .unwrap();
+
+        assert!(
+            counts.iter().any(|&n| n > 0),
+            "V1 is a clean +20 dB tone -- the observer must see a promoted track at some point, got {counts:?}"
+        );
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "finish() drops every decoder, so the final reported count must be 0, got {counts:?}"
+        );
+        assert!(
+            counts.windows(2).all(|w| w[0] != w[1]),
+            "repeats must be suppressed -- the observer should only fire on a real change, got {counts:?}"
         );
     }
 

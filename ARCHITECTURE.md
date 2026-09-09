@@ -339,14 +339,25 @@ validation (MAN-28). Dedupe (step 5) still applies.
   (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
   per-stage queue depths, which MAN-56 tracks as a separate gap.
   **`manta_active_tracks` is now populated** (corrected 2026-09-07,
-  MAN-122): `main.rs`'s `on_event` closure derives a live count from the
-  `DecoderEvent` stream it already observes — inserting a `track_id` on
-  any track-scoped event (`CharDecoded`/`WordBoundary`/`SpeedUpdate`/
-  `TrackMeta`), removing it on `TrackClosed` (mirroring `manta-spot`'s
-  `Validator`, MAN-19, which keys the same way rather than on `TrackMeta`
-  alone) — and publishes it via `set_active_tracks` on every change, so
+  MAN-122): the count comes from `TrackManager`'s own lifecycle, not from
+  the decode event stream. `TrackManager::decoding_track_count()` reports
+  how many tracks are currently promoted and holding a leased decoder
+  (`Active` or `Hang`); `manta_engine::listen_with_track_count()` hands
+  that number to `main.rs` after every processed batch (suppressing
+  repeats), which publishes it via `set_active_tracks`. So
   `manta_active_tracks` and the status line's `tracks=` field both report
-  a real, moving count instead of the previous permanent `0`.
+  a real, moving count instead of the previous permanent `0`. An
+  event-derived count was tried first and rejected in review: a track
+  `TrackManager` has promoted but whose demodulator has not latched emits
+  no events at all — `TrackDecoder` withholds `TrackMeta` until
+  `snr_2500_db()` is `Some` — and such a track can stay ACTIVE until the
+  ~30 s `gc_hops` silent GC, so a weak or unmodulated signal that real
+  decoders are working on would have reported `tracks=0`. The gauge is
+  driven back to `0` at end of stream, so it doesn't stay stuck at the
+  last live value after EOF or an SDR disconnect. Note this is
+  deliberately *not* `TrackManager::active_track_count()`, which also
+  counts unconfirmed CANDIDATEs (noise-blip rise crossings that lease no
+  decoder) and keeps its own meaning for `soak_metrics`.
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`

@@ -52,24 +52,42 @@ The ticket's own title is "tell manta is alive **and decoding**" — shipping
 the status line with a permanently-frozen `tracks=0` (ARCHITECTURE.md §8's
 pre-existing, documented gap) would read as a fault on a healthy,
 actively-decoding node, which is worse than not shipping the field at all.
-`main.rs`'s `on_event` closure already observes every `DecoderEvent`
-in-process; it now maintains a `HashSet<u32>` of currently-open `track_id`s
-(insert on any track-scoped event -- `CharDecoded`/`WordBoundary`/
-`SpeedUpdate`/`TrackMeta` -- remove on `TrackClosed`) and republishes
-`set_active_tracks` on every change. This mirrors `manta-spot::Validator`'s
-existing per-track bookkeeping (MAN-19), which keys the same way rather
-than on `TrackMeta` alone: `TrackMeta` only arrives at a 375-hop/~1 s
-cadence and only once the envelope demod is `running()`, so inserting on
-`TrackMeta` alone would leave short-lived or weak-demod tracks undercounted
-even while they decode and eventually close. Needs no `manta-engine` API
-change — `TrackManager::active_track_count()` exists but stays
-unreachable from outside `listen()`; deriving the count from the event
-stream `main.rs` already receives was the smaller change. Measured against
-a 60 s/22 wpm/48 kHz replay (2522 events): 179 `TrackMeta`/`TrackClosed`
-pairs, zero unpaired ids in either direction, zero left open at EOF. A long
-live soak (unavailable in this environment) is the real bound on whether
-this invariant holds indefinitely; see ARCHITECTURE.md's Performance
-Considerations note in the implementation plan.
+**The count is `TrackManager`'s lifecycle state, not the decode event
+stream** (review round 1). The first cut derived it in `main.rs`'s
+`on_event` closure -- a `HashSet<u32>` of open `track_id`s, inserted on any
+track-scoped event and freed on `TrackClosed`. That is wrong in the one
+direction that matters for a liveness line: `TrackDecoder` emits no
+`TrackMeta` until its demodulator latches (`snr_2500_db()` returns `Some`),
+and emits nothing else at all until it decodes a character, while
+`TrackManager` will legitimately hold such a track ACTIVE with a leased
+decoder until the ~30 s `gc_hops` silent GC. A weak, drifting, or
+unmodulated signal that real decoders are grinding on would therefore have
+reported `tracks=0` and `manta_active_tracks 0` -- exactly the "healthy
+node reads as a fault" failure this field exists to avoid, just with a
+narrower trigger. `crates/manta-engine/src/track.rs`'s
+`decoding_track_count()` counts tracks holding a leased decoder (`Active`
+or `Hang`) and `listen_with_track_count()` reports it to `main.rs` after
+every processed batch, suppressing repeats so a steady band is one relaxed
+atomic store per real change rather than ~24 a second. End of stream
+reports `0`, so the gauge doesn't stay stuck at the last live value after
+EOF or an SDR disconnect.
+
+Deliberately *not* `TrackManager::active_track_count()`, which counts every
+entry in `tracks` including unconfirmed CANDIDATEs -- rise crossings that
+mostly close `Unconfirmed` within `confirm_hops` (~50 ms) without ever
+leasing a decoder. Counting those would inflate an operator-facing "is it
+decoding?" line with signals nothing is decoding; `active_track_count`
+keeps its existing meaning for `soak_metrics`' peak/eviction accounting.
+
+This does cost a new `manta-engine` entry point, which the plan had hoped
+to avoid. `listen_with_track_count` is additive: `listen()` is now a
+no-op-observer wrapper over it, so every existing caller and test is
+untouched. The regression is pinned by
+`track::tests::decoding_track_count_sees_a_promoted_track_that_has_emitted_nothing`,
+which drives a steady unmodulated carrier through `process_hops`, asserts
+the event stream is *empty*, and asserts the count is nevertheless 1, plus
+`listen::tests::listen_reports_the_managers_track_count_and_clears_it_at_end_of_stream`
+for the observer's rise/clear/dedup behaviour.
 
 **Formatting lives in `manta-server::status`, not `manta-cli`.**
 `manta-server` is a lib crate, so the two line-format functions and the

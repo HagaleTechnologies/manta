@@ -781,32 +781,6 @@ struct SourceInfo<'a> {
     dial_freq_hz: f64,
 }
 
-/// MAN-122: the daemon's live track count, derived from the event stream
-/// `on_event` already sees. Mirrors manta-spot's `Validator`, which keys
-/// per-track state on *any* track-scoped event (`CharDecoded`,
-/// `WordBoundary`, `SpeedUpdate`, `TrackMeta` -- MAN-19's `Validator::
-/// ingest`), not `TrackMeta` alone: a track that decodes characters or
-/// crosses a word boundary inside its first second, or whose envelope
-/// demod never reaches `running()` at a 375-hop `TrackMeta` boundary,
-/// still gets counted. Frees on `TrackClosed`, and relies on the same
-/// invariant `Validator` does: every track that emits anything gets
-/// exactly one `TrackClosed`, including at end-of-stream via
-/// `TrackManager::finish()`.
-/// Returns true when the count changed and should be republished.
-fn note_track_event(
-    open: &mut std::collections::HashSet<u32>,
-    ev: &manta_decode::events::DecoderEvent,
-) -> bool {
-    use manta_decode::events::DecoderEvent;
-    match ev {
-        DecoderEvent::CharDecoded { track_id, .. }
-        | DecoderEvent::WordBoundary { track_id, .. }
-        | DecoderEvent::SpeedUpdate { track_id, .. }
-        | DecoderEvent::TrackMeta { track_id, .. } => open.insert(*track_id),
-        DecoderEvent::TrackClosed { track_id } => open.remove(track_id),
-    }
-}
-
 fn start_spot_server(
     config_path: &std::path::Path,
     source: SourceInfo<'_>,
@@ -1207,10 +1181,9 @@ fn main() -> Result<()> {
                     )?;
                     // Real, if coarse, health signal: this source opened
                     // and is running. `active_tracks` is populated below,
-                    // via `note_track_event` deriving a live count from the
-                    // `DecoderEvent` stream `on_event` already observes
-                    // (MAN-122) -- not through a `manta-engine` API, which
-                    // still exposes no live track-count surface of its own.
+                    // from `manta_engine::listen_with_track_count`'s
+                    // observer, which reports `TrackManager`'s own
+                    // promoted-track count (MAN-122).
                     //
                     // MAN-55: for a source where `open()` succeeding
                     // doesn't confirm a live device (HPSDR's UDP
@@ -1240,23 +1213,17 @@ fn main() -> Result<()> {
                 None => (None, None),
             };
 
-            let mut open_tracks: std::collections::HashSet<u32> = std::collections::HashSet::new();
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            let listen_result = manta_engine::listen(
+            let listen_result = manta_engine::listen_with_track_count(
                 src,
                 &cfg,
                 stop,
                 |ev| {
                     use manta_decode::events::DecoderEvent;
-                    if let Some(server) = &spot_server {
-                        if note_track_event(&mut open_tracks, ev) {
-                            server.metrics.set_active_tracks(open_tracks.len() as u64);
-                        }
-                    }
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
@@ -1298,6 +1265,21 @@ fn main() -> Result<()> {
                         spot.wpm,
                         spot.confidence
                     );
+                },
+                // MAN-122 review round 1: the live track gauge comes from
+                // `TrackManager`'s own lifecycle -- how many tracks are
+                // promoted and holding a decoder right now -- not from the
+                // `DecoderEvent` stream above. A promoted track whose
+                // demodulator has not latched emits nothing for up to the
+                // ~30 s silent-GC window, so an event-derived count reports
+                // `tracks=0` on a node that is genuinely decoding weak
+                // signals. `listen_with_track_count` already suppresses
+                // repeats, so this is one relaxed atomic store per real
+                // change.
+                |n_tracks| {
+                    if let Some(server) = &spot_server {
+                        server.metrics.set_active_tracks(n_tracks as u64);
+                    }
                 },
             );
 
@@ -1409,39 +1391,6 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
-    }
-
-    #[test]
-    fn open_tracks_follows_any_track_scoped_event_and_track_closed() {
-        use manta_decode::events::DecoderEvent;
-        let mut open = std::collections::HashSet::new();
-        let meta = |id| DecoderEvent::TrackMeta {
-            track_id: id,
-            snr_2500_db: 10.0,
-            freq_hz: 14_000_000.0,
-        };
-        note_track_event(&mut open, &meta(1));
-        note_track_event(&mut open, &meta(2));
-        note_track_event(&mut open, &meta(1)); // repeated TrackMeta must not double-count
-        assert_eq!(open.len(), 2);
-        // CR-1: a track that never reaches TrackMeta's 375-hop/~1s cadence
-        // (or whose demod never latches) must still be counted the moment
-        // it emits any other track-scoped event.
-        note_track_event(
-            &mut open,
-            &DecoderEvent::WordBoundary {
-                track_id: 3,
-                sample_ts: 0,
-            },
-        );
-        assert_eq!(open.len(), 3);
-        note_track_event(&mut open, &DecoderEvent::TrackClosed { track_id: 1 });
-        assert_eq!(open.len(), 2);
-        // A close for a track we never saw is a no-op, not a panic or an underflow.
-        note_track_event(&mut open, &DecoderEvent::TrackClosed { track_id: 99 });
-        assert_eq!(open.len(), 2);
-        note_track_event(&mut open, &DecoderEvent::TrackClosed { track_id: 3 });
-        assert_eq!(open.len(), 1);
     }
 
     #[test]

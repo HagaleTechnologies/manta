@@ -463,6 +463,30 @@ impl TrackManager {
         self.tracks.len()
     }
 
+    /// Count of tracks the manager has actually *promoted* -- every track
+    /// holding a leased decoder, i.e. in `LifecycleState::Active` or
+    /// `Hang` (the decoder is leased on CANDIDATE -> ACTIVE and kept
+    /// across HANG, `step_hop`). This is the daemon's live
+    /// `manta_active_tracks` gauge (MAN-122), and it is deliberately a
+    /// *lifecycle* count rather than one derived from the decoder event
+    /// stream: a promoted track whose demodulator has not latched yet
+    /// emits no `TrackMeta`/`CharDecoded` at all, and `TrackManager` can
+    /// legitimately hold it ACTIVE until the ~30 s `gc_hops` silent GC --
+    /// so a weak or unmodulated signal that a decoder is genuinely
+    /// working on would report zero if the count were derived from
+    /// emitted events (MAN-122 review round 1).
+    ///
+    /// Distinct from `active_track_count()`, which counts *every* entry in
+    /// `self.tracks` including unconfirmed CANDIDATEs. Candidates are
+    /// noise-blip rise crossings that mostly close `Unconfirmed` within
+    /// `confirm_hops` (~50 ms) without ever leasing a decoder; counting
+    /// them in an operator-facing "is it decoding?" line would inflate it
+    /// with signals nothing is decoding. `active_track_count` keeps its
+    /// existing meaning for `soak_metrics`' peak/eviction accounting.
+    pub fn decoding_track_count(&self) -> usize {
+        self.tracks.values().filter(|t| t.decoder.is_some()).count()
+    }
+
     /// Rebuild `owner_of` from scratch against the current `tracks` map.
     /// SPEC §2.5.
     fn recompute_ownership(&mut self) {
@@ -1037,6 +1061,69 @@ mod tests {
             "a strong channel should spawn and promote a track"
         );
         assert_eq!(tm.tracks.len(), 1);
+    }
+
+    /// MAN-122 review round 1, the exact failure the reviewer described: a
+    /// steady unmodulated carrier promotes a real track and leases it a
+    /// real decoder, but the demodulator never latches, so the decoder
+    /// emits *nothing* -- no `TrackMeta` (withheld until `snr_2500_db()` is
+    /// `Some`), no `CharDecoded`, nothing. `TrackManager` legitimately
+    /// holds that track ACTIVE until the ~30 s `gc_hops` GC. Any count
+    /// derived from the `DecoderEvent` stream therefore reports 0 while a
+    /// decoder is genuinely running; `decoding_track_count()` reports 1.
+    #[test]
+    fn decoding_track_count_sees_a_promoted_track_that_has_emitted_nothing() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let start = 250 * 15;
+        let hops: Vec<HopOutput> = (start..start + 120)
+            .map(|m| hop(m, power.clone()))
+            .collect();
+        let events = tm.process_hops(&hops, |m| m);
+
+        assert!(
+            events.is_empty(),
+            "an unmodulated carrier must not decode anything -- got {events:?}"
+        );
+        assert_eq!(
+            tm.decoding_track_count(),
+            1,
+            "the promoted track holds a leased decoder and must be counted \
+             even though it has emitted no event"
+        );
+        // The distinction this method exists for: `active_track_count()`
+        // is a different question (every entry, CANDIDATEs included) and
+        // keeps its own meaning for soak_metrics.
+        assert!(tm.active_track_count() >= tm.decoding_track_count());
+    }
+
+    #[test]
+    fn decoding_track_count_excludes_unpromoted_candidates() {
+        let cfg = DetectorConfig {
+            confirm_hops: 10_000, // nothing promotes within this test
+            ..DetectorConfig::default()
+        };
+        let mut tm = TrackManager::new(64, 96_000.0, 14_000_000.0, cfg, DecodeConfig::default());
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        for m in (250 * 15)..(250 * 15 + 60) {
+            tm.step_hop(&hop(m, power.clone()), m);
+        }
+        assert_eq!(tm.active_track_count(), 1, "a CANDIDATE exists");
+        assert_eq!(
+            tm.decoding_track_count(),
+            0,
+            "a CANDIDATE has leased no decoder and nothing is decoding it"
+        );
     }
 
     #[test]
