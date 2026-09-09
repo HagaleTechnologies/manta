@@ -25,6 +25,21 @@ pub enum DecoderEvent {
         snr_2500_db: f32,
         freq_hz: f64,
     },
+    /// A track has been promoted from CANDIDATE to ACTIVE (SPEC §2.1) --
+    /// the detector decided this looks like a real signal worth
+    /// demodulating, at the exact hop it made that decision. Unlike every
+    /// other variant, this doesn't depend on the decoder producing
+    /// anything downstream (a full decode, a periodic TrackMeta update, or
+    /// even a real event surviving to `TrackClosed`'s `has_emitted`
+    /// filter) -- it's the detector's own ground truth for "found a
+    /// candidate," which `manta_engine::doctor()`'s `NoSignal` check needs
+    /// directly rather than inferring it from decode-timing side effects
+    /// (see docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md).
+    TrackPromoted {
+        track_id: u32,
+        sample_ts: u64,
+        freq_hz: f64,
+    },
     /// A track has closed (any `CloseReason`: Unconfirmed/HangExpired/
     /// Silent/Merged/Evicted) and will never emit another event under
     /// this `track_id` -- `TrackManager::next_id` never reuses one.
