@@ -1538,7 +1538,10 @@ fn print_doctor_report(report: &manta_engine::DoctorReport) {
         _ if report.tracks_promoted == 0 => {
             println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
         }
-        _ => println!("snr_2500_db: no TrackMeta events landed before the last track closed"),
+        _ => println!(
+            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
+             run ended"
+        ),
     }
     println!(
         "decode: {} chars ({} distinct), {} confirmed spots",

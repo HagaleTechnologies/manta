@@ -67,9 +67,10 @@ impl Verdict {
                  expect signal."
             }
             Verdict::ActivityNoSnr => {
-                "ACTIVITY_NO_SNR -- decoder activity happened (a track closed and/or characters \
-                 decoded) but no SNR was ever measured before it closed, and nothing confirmed \
-                 a spot. Can't yet say noise vs. real signal -- try a longer --duration."
+                "ACTIVITY_NO_SNR -- the detector promoted a candidate (possibly closing, possibly \
+                 decoding characters too) but no SNR was ever measured before this run ended, and \
+                 nothing confirmed a spot. Can't yet say noise vs. real signal -- try a longer \
+                 --duration."
             }
             Verdict::NoisyNoDecode => {
                 "NOISY_NO_DECODE -- tracks opened but every one reads at or below the noise \
@@ -209,6 +210,40 @@ pub const MIN_DURATION: Duration = Duration::from_secs(3);
 /// meant to run for hours in the first place.
 pub const MAX_DURATION: Duration = Duration::from_secs(3600);
 
+/// Wraps a source, forcing EOF (`read()` returns `Ok(0)`) once
+/// `max_samples` samples have been delivered -- see the doc comment where
+/// it's constructed in `doctor()` for why this is needed.
+struct SampleBoundedSource {
+    inner: Box<dyn IqSource>,
+    max_samples: u64,
+    samples_read: u64,
+}
+
+impl IqSource for SampleBoundedSource {
+    fn sample_rate(&self) -> f64 {
+        self.inner.sample_rate()
+    }
+
+    fn center_freq_hz(&self) -> f64 {
+        self.inner.center_freq_hz()
+    }
+
+    fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
+        if self.samples_read >= self.max_samples {
+            return Ok(0);
+        }
+        let remaining = (self.max_samples - self.samples_read) as usize;
+        let cap = remaining.min(buf.len());
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.samples_read += n as u64;
+        Ok(n)
+    }
+
+    fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.inner.confirmed_live_handle()
+    }
+}
+
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot
 /// stream into a `DoctorReport` instead of printing or serving it. Reuses
 /// the real pipeline verbatim (same channelizer, same `TrackManager`, same
@@ -239,6 +274,23 @@ pub fn doctor(
 
     let sample_rate_hz = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
+    // A file-replay source (`--source`) delivers samples as fast as
+    // processing allows, not paced to real time -- unlike a live source,
+    // which naturally can't outrun its own sample clock. Left unbounded,
+    // doctor's watchdog only caps WALL-CLOCK time, so a fast machine could
+    // analyze the entire file regardless of --duration and report a
+    // verdict from content far outside the requested window while still
+    // claiming only a few seconds were "observed" (round-6 review
+    // finding). Bounding samples read, not just elapsed time, fixes this
+    // for every source type -- a live source is unaffected (it can never
+    // exceed real-time delivery in the first place), so this is a no-op
+    // safety net there and the actual fix for file replay.
+    let max_samples = (sample_rate_hz * duration.as_secs_f64()).round() as u64;
+    let src: Box<dyn IqSource> = Box::new(SampleBoundedSource {
+        inner: src,
+        max_samples,
+        samples_read: 0,
+    });
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
@@ -363,12 +415,48 @@ mod tests {
         })
     }
 
+    /// Regression (round-6 review): a file-replay source delivers samples
+    /// as fast as processing allows, not paced to real time -- unbounded,
+    /// doctor could analyze an entire long file regardless of --duration.
+    /// `SampleBoundedSource` must force EOF at exactly `max_samples`, even
+    /// though the wrapped source has far more available.
+    #[test]
+    fn sample_bounded_source_forces_eof_at_max_samples() {
+        let inner_samples = vec![Complex32::new(1.0, 0.0); 1000];
+        let mut src = SampleBoundedSource {
+            inner: Box::new(RawIqSource {
+                samples: inner_samples,
+                cursor: 0,
+                fs: 48_000.0,
+                center_freq_hz: 0.0,
+            }),
+            max_samples: 100,
+            samples_read: 0,
+        };
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1000];
+        let n = src.read(&mut buf).unwrap();
+        assert_eq!(n, 100, "must cap the read to max_samples in one call");
+        let n2 = src.read(&mut buf).unwrap();
+        assert_eq!(
+            n2, 0,
+            "must report EOF once max_samples have been delivered, even though the wrapped \
+             source has 900 more samples available"
+        );
+    }
+
     #[test]
     fn doctor_reports_decoding_on_a_clean_golden_signal() {
+        // 60s, not 5s: V1's looped "CQ CQ DE W1AW W1AW K" at 20 WPM needs
+        // real audio-time for the repetition gate to confirm a spot, and
+        // SampleBoundedSource (round-6 review fix) now genuinely bounds
+        // v1_source() (a 120s vector) to --duration worth of SOURCE TIME,
+        // not just wall-clock time -- 5s was never really enough here; it
+        // only looked sufficient before that fix, when doctor silently
+        // analyzed the entire 120s file regardless of --duration.
         let report = doctor(
             v1_source(),
             &PipelineConfig::default(),
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         )
         .unwrap();
         assert_eq!(report.verdict(), Verdict::Decoding);
@@ -582,9 +670,16 @@ mod tests {
     #[test]
     fn doctor_returns_promptly_when_the_source_ends_well_before_duration() {
         let start = Instant::now();
-        // v1_source() is a few seconds of audio at most; --duration asks
-        // for far longer than that, so a fixed-duration watchdog with no
-        // early-exit signal would block this call for the full 30s.
+        // v1_source() is actually 120s of audio (vectors::v1()'s own
+        // duration_s) -- delivered unpaced (as fast as processing allows,
+        // not paced to real time), so even a --duration far shorter than
+        // 120s finishes near-instantly in wall-clock terms. That's a
+        // different mechanism than "the source ran out of samples early"
+        // (this test's original framing was wrong about that), but the
+        // same assertion still proves the watchdog isn't the thing making
+        // this slow: a fixed-duration watchdog with no early-exit signal
+        // would still block for the full 30s regardless of how fast the
+        // source itself returns.
         let report = doctor(
             v1_source(),
             &PipelineConfig::default(),

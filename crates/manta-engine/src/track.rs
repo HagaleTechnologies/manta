@@ -736,7 +736,7 @@ impl TrackManager {
             closed_ids.extend(closed);
             promoted_events.extend(promoted);
         }
-        let mut events = self.drain_pool();
+        let pool_events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
         // actually decoded a character this batch. `step_hop` advances it
         // every hop with `char_emitted = false` (the pool has not run yet),
@@ -761,7 +761,7 @@ impl TrackManager {
         // for a *different* consumer (`doctor()`'s NoSignal check) with no
         // per-track_id state to leak (manta-spot's `Validator` treats it as
         // a pure no-op, never touching `self.tracks`).
-        for e in &events {
+        for e in &pool_events {
             if let Some(t) = self.tracks.get_mut(&event_track_id(e)) {
                 t.has_emitted = true;
             }
@@ -771,7 +771,19 @@ impl TrackManager {
                 }
             }
         }
-        events.extend(promoted_events);
+        // `promoted_events` goes first, `pool_events` after -- both land in
+        // `event_sample_ts`'s ties-at-0 tier (below), so `sort_by_key`'s
+        // stability preserves this relative order for the same track_id:
+        // a promotion always precedes any SpeedUpdate/TrackMeta this same
+        // batch's queued decoder output produced for that track. With
+        // shipped defaults this batch-collision can't happen (promotion
+        // needs ~2.05s worst case, TrackMeta/SpeedUpdate need ~1s more on
+        // top of that -- see docs/DECISIONS/2026-09-09-doctor-track-
+        // promoted-event.md), but a caller supplying much shorter warmup_hops/
+        // confirm_hops could reach it within one two-second calibration
+        // batch (round-6 review finding).
+        let mut events = promoted_events;
+        events.extend(pool_events);
         // MAN-19: emit one `TrackClosed` per track closed this batch (any
         // CloseReason) so downstream per-track_id state (`manta-spot`'s
         // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
@@ -894,9 +906,21 @@ impl TrackManager {
 fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
-        | DecoderEvent::WordBoundary { sample_ts, .. }
-        | DecoderEvent::TrackPromoted { sample_ts, .. } => *sample_ts,
-        DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackMeta { .. } => 0,
+        | DecoderEvent::WordBoundary { sample_ts, .. } => *sample_ts,
+        // `TrackPromoted` carries a real `sample_ts` field (accurate,
+        // useful to external JSON consumers), but for THIS resequencing
+        // key it's treated like SpeedUpdate/TrackMeta -- ties at 0, no
+        // cross-batch ordering claim -- specifically so `process_hops`'s
+        // stable sort can use vec order (promoted_events placed before
+        // pool_events) to guarantee a promotion always precedes any
+        // same-batch decoder update for its own track_id (round-6 review
+        // finding). Giving it its own real positive timestamp here would
+        // put it in the wrong tier entirely: 0 < any real sample_ts, so
+        // SpeedUpdate/TrackMeta (always 0) would otherwise always sort
+        // before a same-track promotion that logically preceded them.
+        DecoderEvent::SpeedUpdate { .. }
+        | DecoderEvent::TrackMeta { .. }
+        | DecoderEvent::TrackPromoted { .. } => 0,
         DecoderEvent::TrackClosed { .. } => u64::MAX,
     }
 }
@@ -1315,6 +1339,58 @@ mod tests {
             "expected CER < 0.02 (2 s warmup floor ~0.0155), got {cer:.4}\nexpected {:?}\ngot      {:?}",
             rendered.keyed_texts[0],
             text
+        );
+    }
+
+    /// Regression (round-6 review): a single `process_hops` call spanning
+    /// enough hops to include both a track's promotion and its first
+    /// decoder-output event (a long unchunked batch -- e.g. `listen()`'s
+    /// single startup-calibration `process_hops` call, or a caller feeding
+    /// large chunks) must never sort that later decoder update before the
+    /// `TrackPromoted` that logically preceded it.
+    #[test]
+    fn process_hops_orders_track_promoted_before_same_batch_decoder_updates() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        // The whole file as ONE process_hops call (not chunked the way
+        // listen()'s real-time main loop feeds it) -- guarantees this
+        // track's promotion and its first decoder-output event land in
+        // the same returned batch.
+        let hops = ch.process(&rendered.samples);
+        let events = tm.process_hops(&hops, |m| m * hop_samples);
+        let promoted_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackPromoted { .. }));
+        let first_decoder_update_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                DecoderEvent::TrackMeta { .. }
+                    | DecoderEvent::SpeedUpdate { .. }
+                    | DecoderEvent::CharDecoded { .. }
+                    | DecoderEvent::WordBoundary { .. }
+            )
+        });
+        let (Some(promoted_idx), Some(decoder_idx)) = (promoted_idx, first_decoder_update_idx)
+        else {
+            panic!(
+                "expected both a TrackPromoted and at least one decoder-output event in this \
+                 batch -- got {events:?}"
+            );
+        };
+        assert!(
+            promoted_idx < decoder_idx,
+            "TrackPromoted (index {promoted_idx}) must sort before the first decoder-output \
+             event (index {decoder_idx})"
         );
     }
 
