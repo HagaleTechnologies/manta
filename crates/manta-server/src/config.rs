@@ -59,6 +59,74 @@ where
     Ok(call)
 }
 
+/// Operator free-text (name, QTH) is interpolated verbatim into the
+/// greeting banner every client sees (MAN-86), so it carries exactly the
+/// line-injection concern `ServerConfig::station_callsign` documents: an
+/// embedded CR/LF would forge additional cluster lines, and other control
+/// characters could manipulate a terminal client's output. Rejected at
+/// deserialize time rather than escaped at render time so an operator finds
+/// out at daemon start, not silently on the wire.
+fn check_operator_text(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
+}
+
+/// Maidenhead locator: two letters A-R, two digits, optionally two letters
+/// A-X. A malformed grid is worse than an absent one -- Aggregator would
+/// record garbage as this node's location.
+fn check_grid(value: &str) -> Result<(), String> {
+    let c: Vec<char> = value.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let ok = matches!(c.len(), 4 | 6)
+        && ('A'..='R').contains(&c[0])
+        && ('A'..='R').contains(&c[1])
+        && c[2].is_ascii_digit()
+        && c[3].is_ascii_digit()
+        // Short-circuits before indexing c[4]/c[5] on a 4-char locator.
+        && (c.len() == 4 || (('A'..='X').contains(&c[4]) && ('A'..='X').contains(&c[5])));
+    if !ok {
+        return Err(format!("{value:?} is not a Maidenhead grid square"));
+    }
+    Ok(())
+}
+
+fn deserialize_optional_operator_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        check_operator_text("operator_name", value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_operator_qth<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        check_operator_text("operator_qth", value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_grid<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        check_grid(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -145,6 +213,44 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
+    // The three `operator_*` keys below feed the telnet greeting banner
+    // (MAN-86). They are ALSO listed, with these same defaults and
+    // validation rules, in `docs/SPEC-decode-core.md` §9's `[server]`
+    // block -- the repository's canonical config-key table, and the only
+    // place an operator who has not read this source file will look for
+    // them. Renaming a key, changing a default, or changing a validation
+    // rule here means changing it there too; each field's own doc comment
+    // below restates the rule so the two can be diffed by eye.
+    /// Operator's given name, e.g. `"Art"`. **Optional; default: absent**
+    /// (the field is omitted from the greeting line rather than rendered
+    /// as an empty placeholder). Appears in the telnet greeting banner CW
+    /// Skimmer clients and RBN Aggregator read on connect (MAN-86) --
+    /// Aggregator's Combined Skimmers tab (manual v6.0 §9.2) exists
+    /// precisely to hand-enter this same information for sources that
+    /// can't supply it. **Validated at deserialize time** by
+    /// `check_operator_text`: must be non-empty after trimming and must
+    /// contain no control characters, because it is interpolated verbatim
+    /// into every connecting client's banner (an embedded CR/LF would
+    /// forge cluster lines). A bad value fails daemon start.
+    #[serde(default, deserialize_with = "deserialize_optional_operator_name")]
+    pub operator_name: Option<String>,
+    /// Operator's QTH as free text, e.g. `"Richmond Hill, ON"`.
+    /// **Optional; default: absent**, dropped from the greeting line when
+    /// unset. **Validated at deserialize time** by the same
+    /// `check_operator_text` rule as `operator_name` above -- non-empty
+    /// after trimming, no control characters -- and for the same
+    /// line-injection reason.
+    #[serde(default, deserialize_with = "deserialize_optional_operator_qth")]
+    pub operator_qth: Option<String>,
+    /// Maidenhead grid square, e.g. `"FN03GW"`. **Optional; default:
+    /// absent**, dropped from the greeting line when unset. **Validated
+    /// at deserialize time** by `check_grid`: exactly 4 or 6 characters,
+    /// field letters `A`-`R`, square digits `0`-`9`, and (when 6)
+    /// subsquare letters `A`-`X`; case-insensitive. A malformed grid is
+    /// worse than an absent one -- Aggregator would record garbage as
+    /// this node's location.
+    #[serde(default, deserialize_with = "deserialize_optional_grid")]
+    pub operator_grid: Option<String>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -304,6 +410,73 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.telnet_max_commands_per_ip, None);
         assert_eq!(cfg.json_max_pings_per_ip, Some(0));
+    }
+
+    #[test]
+    fn operator_identity_keys_are_optional_and_default_to_none() {
+        let cfg: ServerConfig = toml::from_str(r#"station_callsign = "W3XYZ""#).unwrap();
+        assert_eq!(cfg.operator_name, None);
+        assert_eq!(cfg.operator_qth, None);
+        assert_eq!(cfg.operator_grid, None);
+    }
+
+    #[test]
+    fn operator_identity_keys_parse_when_present() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "HB9H"
+            operator_name = "Art"
+            operator_qth = "Switzerland"
+            operator_grid = "JN46la"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.operator_name.as_deref(), Some("Art"));
+        assert_eq!(cfg.operator_qth.as_deref(), Some("Switzerland"));
+        assert_eq!(cfg.operator_grid.as_deref(), Some("JN46la"));
+    }
+
+    #[test]
+    fn operator_name_and_qth_reject_line_injection_and_control_characters() {
+        // Same concern station_callsign already documents: these are
+        // interpolated verbatim into the greeting banner, so an embedded
+        // CRLF could forge additional cluster lines to every connecting
+        // client.
+        for bad in [
+            "operator_name = \"Art\\r\\nDX de EVIL-#:  14000.0  N0CALL\"",
+            "operator_qth = \"Bern\\nEVIL\"",
+            "operator_name = \"Art\\u0007\"",
+            "operator_qth = \"\"",
+            "operator_name = \"   \"",
+        ] {
+            let src = format!("station_callsign = \"HB9H\"\n{bad}");
+            assert!(
+                toml::from_str::<ServerConfig>(&src).is_err(),
+                "{bad} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_grid_rejects_non_maidenhead_values() {
+        for bad in ["ZZ99xx", "JN4", "JN46lax", "1N46la", "JN46l", ""] {
+            let src = format!("station_callsign = \"HB9H\"\noperator_grid = {bad:?}");
+            assert!(
+                toml::from_str::<ServerConfig>(&src).is_err(),
+                "{bad:?} should have been rejected as a grid square"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_grid_accepts_four_and_six_character_locators_in_either_case() {
+        for good in ["FN03", "FN03GW", "fn03gw", "JN46la"] {
+            let src = format!("station_callsign = \"HB9H\"\noperator_grid = {good:?}");
+            assert!(
+                toml::from_str::<ServerConfig>(&src).is_ok(),
+                "{good:?} should have been accepted"
+            );
+        }
     }
 
     #[test]

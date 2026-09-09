@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod metrics_http;
 pub mod rate_limit;
 pub mod rbn;
+pub mod sett;
 pub mod spot_message;
 pub mod tasks;
 pub mod telnet;

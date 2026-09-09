@@ -50,6 +50,15 @@ use tungstenite::{Message, WebSocket};
 /// rate nearest KiwiSDR's native ~12 kHz.
 const TARGET_RATE_HZ: usize = 96_000;
 
+/// The IQ passband manta asks a KiwiSDR receiver for, as the `low_cut`/
+/// `high_cut` (Hz, relative to the tuned centre) of the `SET mod=iq`
+/// command. Named constants rather than literals in the format string
+/// because `rf_passband_hz()` below derives the advertised RF coverage
+/// from them -- MAN-86 review: the two drifting apart is exactly how
+/// `SKIMMER/SETT` starts lying to Aggregator about what manta can hear.
+const IQ_LOW_CUT_HZ: i32 = -5_000;
+const IQ_HIGH_CUT_HZ: i32 = 5_000;
+
 /// Resampler chunk size (in complex sample-pairs) fed to `rubato::Fft` per
 /// `process_into_buffer` call.
 ///
@@ -213,10 +222,7 @@ impl KiwiIqSource {
         // them was never verified safe against real nodes.
         for cmd in [
             "SET ident_user=manta".to_string(),
-            format!(
-                "SET mod=iq low_cut=-5000 high_cut=5000 freq={:.3}",
-                center_freq_hz / 1000.0
-            ),
+            iq_mode_command(center_freq_hz),
             "SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50".to_string(),
             "SET squelch=0 max=0".to_string(),
             "SET genattn=0".to_string(),
@@ -313,6 +319,18 @@ fn ack_audio_rate_if_present(socket: &mut WebSocket<TcpStream>, text: &str) -> R
     Ok(())
 }
 
+/// The `SET mod=iq` command manta sends to tune the receiver and pin its
+/// IQ passband. Split out of `connect`'s command list so the passband it
+/// requests can be asserted against `rf_passband_hz()` in a unit test
+/// (MAN-86 review) -- a live receiver is otherwise the only way to observe
+/// this string.
+fn iq_mode_command(center_freq_hz: f64) -> String {
+    format!(
+        "SET mod=iq low_cut={IQ_LOW_CUT_HZ} high_cut={IQ_HIGH_CUT_HZ} freq={:.3}",
+        center_freq_hz / 1000.0
+    )
+}
+
 /// Parse `key=value` (whitespace-separated `MSG` parameter text) for `key`,
 /// returning its value as `f64`. Used for both `sample_rate` (float) and
 /// `audio_rate` (integer, but read as float for a single code path).
@@ -360,6 +378,18 @@ impl IqSource for KiwiIqSource {
 
     fn center_freq_hz(&self) -> f64 {
         self.center_freq_hz
+    }
+
+    /// The receiver's own IQ passband (`IQ_LOW_CUT_HZ`..`IQ_HIGH_CUT_HZ`),
+    /// NOT `+/- self.fs / 2` -- `fs` is `TARGET_RATE_HZ`, the rate this
+    /// source *upsamples to* from KiwiSDR's ~12 kS/s native stream, and
+    /// carries no signal beyond the 10 kHz the receiver was asked for.
+    /// MAN-86 review: passing `fs` on to `segments_for_passband` had SETT
+    /// claiming centre +/-48 kHz of coverage to Aggregator. The bounds are
+    /// the requested cuts verbatim rather than a symmetric width, so an
+    /// asymmetric `low_cut`/`high_cut` would stay honest here too.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        (f64::from(IQ_LOW_CUT_HZ), f64::from(IQ_HIGH_CUT_HZ))
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -441,6 +471,36 @@ mod tests {
         // "connection refused" path, no real network dependency.
         let result = KiwiIqSource::connect("127.0.0.1", 1, 14_025_000.0, "");
         assert!(result.is_err(), "expected a clean Err, not a panic");
+    }
+
+    #[test]
+    fn the_advertised_rf_bandwidth_matches_the_passband_actually_requested() {
+        // MAN-86 review: `sample_rate()` is TARGET_RATE_HZ (96 kS/s), the
+        // rate this source upsamples TO -- the receiver only ever sends
+        // the 10 kHz between low_cut and high_cut, and SETT must advertise
+        // that, not the processing rate. Parses the numbers back out of
+        // the command string that actually goes on the wire so the two
+        // cannot drift apart silently.
+        let cmd = iq_mode_command(14_040_000.0);
+        assert_eq!(
+            cmd, "SET mod=iq low_cut=-5000 high_cut=5000 freq=14040.000",
+            "the wire format of SET mod=iq changed"
+        );
+        let low = parse_kv_f64(&cmd, "low_cut").expect("low_cut in the command");
+        let high = parse_kv_f64(&cmd, "high_cut").expect("high_cut in the command");
+        assert_eq!(high - low, 10_000.0);
+        // The same bounds the trait method reports, derived from the same
+        // constants -- asserted through the wire string so a change to the
+        // requested passband that forgets the advertised one fails here.
+        assert_eq!(
+            (f64::from(IQ_LOW_CUT_HZ), f64::from(IQ_HIGH_CUT_HZ)),
+            (low, high)
+        );
+        assert_ne!(
+            high - low,
+            TARGET_RATE_HZ as f64,
+            "if these ever coincide this test proves nothing"
+        );
     }
 
     #[test]

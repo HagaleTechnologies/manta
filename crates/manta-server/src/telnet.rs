@@ -5,7 +5,7 @@
 //! plain line-oriented text, and skipping IAC keeps this a small,
 //! auditable text protocol (MAN-22/23 harden it further).
 
-use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
+use crate::bounded_io::{read_telnet_line_bounded, read_telnet_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::command::{self, Command};
 use crate::metrics::Metrics;
@@ -159,6 +159,89 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+/// Everything a connected client is told about this station: the identity
+/// that appears in the greeting banner and every spot line, plus the
+/// settings `SKIMMER/SETT` reports. One struct rather than five positional
+/// `serve()` parameters, following `json_stream::JsonStreamConfig`'s
+/// precedent. MAN-88 threads a `line_format` field through this same call
+/// chain -- whichever of MAN-86/MAN-88 lands second adds its field HERE
+/// rather than as a parallel positional parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StationProfile {
+    pub call: String,
+    pub operator_name: Option<String>,
+    pub operator_qth: Option<String>,
+    pub operator_grid: Option<String>,
+    pub sett: crate::sett::SettSettings,
+}
+
+/// Greeting line 2. Shape taken from the CW Skimmer manual's own banner --
+/// "CW Skimmer 1.3 is operated by Alex, VE3NEA in Richmond Hill, ON
+/// (FN03GW)" -- which is where Aggregator learns this node's operator and
+/// location (Aggregator manual v6.0 §3.1/§9.2; the SETT reply itself
+/// carries neither). Every optional part is dropped cleanly when absent
+/// rather than rendering an empty placeholder.
+fn operator_line(
+    version: &str,
+    name: Option<&str>,
+    call: &str,
+    qth: Option<&str>,
+    grid: Option<&str>,
+) -> String {
+    let mut s = format!("manta {version} is operated by ");
+    match name {
+        Some(n) => s.push_str(&format!("{n}, {call}")),
+        None => s.push_str(call),
+    }
+    if let Some(q) = qth {
+        s.push_str(&format!(" in {q}"));
+    }
+    if let Some(g) = grid {
+        s.push_str(&format!(" ({g})"));
+    }
+    s
+}
+
+/// Trims a raw login line to a plausible callsign, or `None`.
+///
+/// Deliberately WIDER than `manta_spot::grammar::is_plausible`, which the
+/// MAN-45 research documents as rejecting the real callsigns `JW/LB2PG` and
+/// `GB3LER/B`, and which would also reject SSID forms like `W3XYZ-2`. This
+/// listener has no authentication by design (ARCHITECTURE §7 exposure
+/// policy) -- this is a SHAPE check whose job is to keep garbage and
+/// control bytes out of the audit log and off the wire, so rejecting a real
+/// operator's callsign is the worse failure.
+///
+/// Trailing CR/NUL is STRIPPED, not rejected: RFC 854 encodes Enter as
+/// CR NUL and real telnet clients send it (MAN-86's ticket records this
+/// from macOS telnet). An EMBEDDED control character is still a rejection.
+/// PR #128 review: stripping it here is only reachable because the read
+/// path that feeds this function now COMPLETES a line on `CR NUL` as well
+/// as on `LF` (`bounded_io::read_telnet_line_bounded`) -- an NVT client
+/// sending `N0CALL\r\0` and nothing more previously never got its login
+/// line delivered here at all, and was dropped by the idle-read timeout
+/// 30 s later. `trim_matches` takes the CR and the NUL in either order and
+/// in any number, so both `\r\0` and a `\r\n`-terminated line arrive here
+/// as the bare callsign.
+fn sanitize_login(raw: &str) -> Option<String> {
+    let call = raw
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{0}')
+        .to_string();
+    if !(3..=16).contains(&call.chars().count()) {
+        return None;
+    }
+    if !call
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-')
+    {
+        return None;
+    }
+    if !call.chars().any(|c| c.is_ascii_digit()) || !call.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(call)
+}
+
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
 #[allow(clippy::too_many_arguments)]
@@ -166,7 +249,7 @@ pub async fn serve(
     listener: TcpListener,
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    station_call: String,
+    profile: Arc<StationProfile>,
     shutdown: watch::Receiver<bool>,
     tasks: ClientTasks,
     limiter: ConnectionLimiter,
@@ -221,7 +304,7 @@ pub async fn serve(
         let rx = bus.subscribe();
         let bus = bus.clone();
         let metrics = metrics.clone();
-        let station_call = station_call.clone();
+        let profile = profile.clone();
         let shutdown = shutdown.clone();
         let peer_ip = peer.ip();
         let ip_command_limiter = ip_command_limiter.clone();
@@ -242,7 +325,7 @@ pub async fn serve(
                 bus,
                 rx,
                 metrics.clone(),
-                station_call,
+                profile,
                 shutdown,
                 peer,
                 peer_ip,
@@ -278,7 +361,7 @@ pub async fn serve(
         bus,
         rx,
         metrics,
-        station_call,
+        profile,
         shutdown,
         peer_ip,
         ip_command_limiter,
@@ -292,7 +375,7 @@ async fn handle_client(
     bus: Arc<SpotBus>,
     mut rx: broadcast::Receiver<crate::bus::BusSpot>,
     metrics: Arc<Metrics>,
-    station_call: String,
+    profile: Arc<StationProfile>,
     mut shutdown: watch::Receiver<bool>,
     peer: std::net::SocketAddr,
     peer_ip: IpAddr,
@@ -306,9 +389,24 @@ async fn handle_client(
     let (rd, mut wr) = socket.into_split();
     let mut reader = BufReader::new(rd);
 
-    write_with_timeout(&mut wr, b"login: \r\n").await?;
+    let banner = format!(
+        "Welcome to the manta Telnet cluster port!\r\n{}\r\nPlease enter your callsign: \r\n",
+        operator_line(
+            env!("CARGO_PKG_VERSION"),
+            profile.operator_name.as_deref(),
+            &profile.call,
+            profile.operator_qth.as_deref(),
+            profile.operator_grid.as_deref(),
+        )
+    );
+    write_with_timeout(&mut wr, banner.as_bytes()).await?;
     let mut login_line = String::new();
-    match read_line_bounded_with_timeout(&mut reader, &mut login_line).await {
+    // The Telnet-specific variant (MAN-86/PR #128 review): a client that
+    // terminates with RFC 854's `CR NUL` instead of `CR LF` -- macOS
+    // `telnet` does -- otherwise never completes this line at all and is
+    // dropped by `IDLE_READ_TIMEOUT` 30 s later, having sent a perfectly
+    // valid callsign. `sanitize_login` below strips either terminator.
+    match read_telnet_line_bounded_with_timeout(&mut reader, &mut login_line).await {
         Ok(0) => {
             if log_enabled {
                 tracing::info!("telnet: client disconnected before completing login");
@@ -323,22 +421,36 @@ async fn handle_client(
             return Err(ClientError::Logged);
         }
     }
+    let Some(login) = sanitize_login(&login_line) else {
+        if log_enabled {
+            // Debug (`?`), never Display -- the whole point is that this
+            // value is untrusted and may carry CR/ANSI escapes.
+            tracing::info!(login = ?login_line, "telnet: implausible login callsign, disconnecting");
+        }
+        // One attempt, then close: this listener is unauthenticated by
+        // design, and a retry loop is free budget for a scanner.
+        write_with_timeout(&mut wr, b"Sorry, that is not a valid callsign.\r\n").await?;
+        return Ok(());
+    };
     // MAN-59 review: the login line is client-supplied and unvalidated --
     // Display (`%`) writes it into the log verbatim, letting an
     // unauthenticated client embed CRs/ANSI escapes to forge additional
     // bogus log lines or manipulate terminal output. Debug (`?`) escapes
-    // control characters instead.
+    // control characters instead -- still Debug-escaped even though
+    // `sanitize_login` already excluded control characters (defence in
+    // depth, and it keeps this call site correct if the check is ever
+    // loosened).
     if log_enabled {
-        tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
+        tracing::info!(login = ?login, "telnet: client logged in");
     }
 
-    write_with_timeout(&mut wr, format!("de {station_call}-# >\r\n").as_bytes()).await?;
+    write_with_timeout(&mut wr, format!("de {}-# >\r\n", profile.call).as_bytes()).await?;
 
     // `sh/dx` default when the client didn't specify a count.
     const DEFAULT_SHOW_DX_COUNT: usize = 10;
     let mut min_unique: Option<u32> = None;
     // Not cleared at the top of the loop, deliberately: `tokio::select!`
-    // can cancel `read_line_bounded_with_timeout` mid-line (a spot arrived
+    // can cancel `read_telnet_line_bounded_with_timeout` mid-line (a spot arrived
     // first), and the bytes it already consumed from `reader` were
     // already appended into `cmd_line` as a side effect before that
     // cancellation point -- clearing here would discard them, silently
@@ -358,7 +470,7 @@ async fn handle_client(
                                 continue; // below threshold: filtered out
                             }
                         }
-                        if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                        if write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot)
                             .await
                             .is_err()
                         {
@@ -404,7 +516,7 @@ async fn handle_client(
             // must never be disconnected just for staying quiet. (Round-5
             // review finding: this branch used to reuse the timed variant
             // here too, which cut off exactly that client after 30s.)
-            n = read_line_bounded(&mut reader, &mut cmd_line) => {
+            n = read_telnet_line_bounded(&mut reader, &mut cmd_line) => {
                 let n = match n {
                     Ok(n) => n,
                     Err(e) => {
@@ -474,7 +586,7 @@ async fn handle_client(
                                     continue;
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                            if write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot)
                                 .await
                                 .is_err()
                             {
@@ -524,6 +636,39 @@ async fn handle_client(
                             return Ok(());
                         }
                     }
+                    Command::Sett => {
+                        // Aggregator manual v6.0 §9.2: no SETT reply means
+                        // no spots forwarded. Uses the same write-failure
+                        // accounting every other write site in this loop
+                        // uses.
+                        if write_with_timeout(
+                            &mut wr,
+                            format!("{}\r\n", profile.sett).as_bytes(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if log_enabled {
+                                tracing::warn!("telnet: SETT reply write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
+                    }
+                    Command::Bye => {
+                        // Best-effort farewell, then close regardless: the
+                        // client asked to leave, so a failed write here is
+                        // not an error worth reporting separately. Whatever
+                        // is still queued on `rx` is abandoned by the
+                        // client's own request, not by a fault -- counted
+                        // the same way every other disconnect path counts
+                        // it.
+                        let _ = write_with_timeout(&mut wr, b"CU AGN!\r\n").await;
+                        if log_enabled {
+                            tracing::info!("telnet: client sent BYE, closing");
+                        }
+                        return Ok(());
+                    }
                     // Read-mostly protocol: any other line (unrecognized
                     // commands the client sent) is accepted without
                     // choking the connection.
@@ -552,7 +697,7 @@ async fn handle_client(
                                     continue;
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                            if write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot)
                                 .await
                                 .is_err()
                             {
@@ -603,4 +748,87 @@ async fn write_with_timeout(
     tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn banner_line_carries_name_call_qth_and_grid() {
+        // Shape from the CW Skimmer manual's own greeting:
+        //   "CW Skimmer 1.3 is operated by Alex, VE3NEA in Richmond Hill, ON (FN03GW)"
+        assert_eq!(
+            operator_line(
+                "0.1.0",
+                Some("Art"),
+                "HB9H",
+                Some("Switzerland"),
+                Some("JN46la")
+            ),
+            "manta 0.1.0 is operated by Art, HB9H in Switzerland (JN46la)"
+        );
+    }
+
+    #[test]
+    fn banner_line_degrades_gracefully_when_optional_fields_are_absent() {
+        assert_eq!(
+            operator_line("0.1.0", None, "HB9H", Some("Switzerland"), Some("JN46la")),
+            "manta 0.1.0 is operated by HB9H in Switzerland (JN46la)"
+        );
+        assert_eq!(
+            operator_line("0.1.0", Some("Art"), "HB9H", None, Some("JN46la")),
+            "manta 0.1.0 is operated by Art, HB9H (JN46la)"
+        );
+        assert_eq!(
+            operator_line("0.1.0", None, "HB9H", None, None),
+            "manta 0.1.0 is operated by HB9H"
+        );
+    }
+
+    #[test]
+    fn login_check_accepts_real_world_callsign_shapes() {
+        // Deliberately wider than manta_spot::grammar::is_plausible, which
+        // MAN-45 finding 2 records as rejecting JW/LB2PG and GB3LER/B --
+        // both real. An SSID suffix is also legitimate from a cluster
+        // client.
+        for good in [
+            "N0CALL", "W1AW", "JW/LB2PG", "GB3LER/B", "W3XYZ-2", "VE3NEA", "4X1AA",
+        ] {
+            assert_eq!(
+                sanitize_login(&format!("{good}\r\n")).as_deref(),
+                Some(good)
+            );
+        }
+    }
+
+    #[test]
+    fn login_check_strips_the_trailing_cr_nul_a_real_telnet_client_sends() {
+        // RFC 854 encodes Enter as CR NUL; the ticket records these
+        // arriving from macOS telnet, and the prior research observed them
+        // reaching the audit log verbatim as login="N0CALL\r\0".
+        assert_eq!(sanitize_login("N0CALL\r\u{0}\n").as_deref(), Some("N0CALL"));
+        assert_eq!(sanitize_login("N0CALL\r\u{0}").as_deref(), Some("N0CALL"));
+        assert_eq!(sanitize_login("  N0CALL  \r\n").as_deref(), Some("N0CALL"));
+    }
+
+    #[test]
+    fn login_check_rejects_implausible_values() {
+        for bad in [
+            "NOT A CALLSIGN AT ALL",    // spaces
+            "",                         // empty
+            "\r\n",                     // bare terminator
+            "ABCDEF",                   // no digit
+            "12345",                    // no letter
+            "N0\u{0}CALL",              // EMBEDDED control byte, not trailing
+            "N0CALL\u{1b}[31m",         // ANSI escape
+            "AAAAAAAAAAAAAAAAAAAAAAAA", // over length
+        ] {
+            assert_eq!(
+                sanitize_login(bad),
+                None,
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
 }

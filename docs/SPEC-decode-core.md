@@ -585,7 +585,31 @@ freq_correction_ppm = 0.0
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 allowlist = []
+
+[server]
+# Station identity and the operator details RBN Aggregator reads out of
+# the telnet greeting banner on connect (MAN-86, Aggregator manual v6.0
+# §3.1/§9.2; wire format in
+# `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md`).
+# `station_callsign` is REQUIRED and has no default; the three operator
+# keys are optional, and each one is dropped from the banner when absent
+# rather than rendered as an empty placeholder. All four are validated at
+# deserialize time (a bad value fails daemon start, it is never written to
+# the wire): `station_callsign` against `manta_spot::grammar::is_plausible`,
+# `operator_name`/`operator_qth` as non-empty free text with no control
+# characters (they are interpolated verbatim into every client's banner,
+# so an embedded CR/LF would forge cluster lines), `operator_grid` as a 4-
+# or 6-character Maidenhead locator.
+station_callsign = "W3XYZ"    # required, no default
+operator_name = "Art"         # optional, default: absent
+operator_qth = "Switzerland"  # optional, default: absent
+operator_grid = "JN46la"      # optional, default: absent
 ```
+
+`[server]`'s remaining keys are operational limits, not decode-core
+constants: listener ports and the per-listener connection/rate quotas
+(MAN-57/MAN-61) are documented on `manta_server::config::ServerConfig`'s
+own fields, with the exposure policy in ARCHITECTURE §7.
 
 ## 10. Deviations from ARCHITECTURE.md
 

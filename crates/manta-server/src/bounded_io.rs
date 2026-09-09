@@ -59,15 +59,83 @@ pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut String,
 ) -> std::io::Result<usize> {
+    read_line_inner(reader, buf, false).await
+}
+
+/// `read_line_bounded`, but ALSO treating the Telnet NVT `CR NUL`
+/// sequence as a complete line terminator (MAN-86/PR #128 review).
+///
+/// RFC 854 encodes an "Enter" keypress on an NVT as `CR NUL`, and real
+/// clients send exactly that with no `LF` following it -- macOS `telnet`
+/// is the one recorded on MAN-86's own ticket. Waiting for `\n` there
+/// means the login line never completes (the client is disconnected by
+/// `IDLE_READ_TIMEOUT` 30 s later, having sent a perfectly well-formed
+/// callsign) and a post-login `SKIMMER/SETT` or `BYE` sits in the buffer
+/// forever -- i.e. exactly the "Aggregator never gets its SETT reply"
+/// failure this ticket exists to fix, for any client that terminates
+/// with `CR NUL`.
+///
+/// The terminator bytes stay in `buf` like `\r\n` does; callers strip
+/// them (`telnet::sanitize_login`, `command::parse`) rather than this
+/// function editing the line it returns.
+///
+/// Only the Telnet listener uses this: the metrics HTTP request path
+/// (RFC 9112 is `CRLF`-terminated, and a bare `NUL` there is malformed)
+/// and the outbound RBN uplink (line-oriented `LF`) both keep the plain
+/// `read_line_bounded` behavior.
+pub async fn read_telnet_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+) -> std::io::Result<usize> {
+    read_line_inner(reader, buf, true).await
+}
+
+async fn read_line_inner<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    cr_nul_terminates: bool,
+) -> std::io::Result<usize> {
     let mut total = buf.len();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
             return Ok(total); // EOF
         }
-        let (chunk_len, found_newline) = match available.iter().position(|&b| b == b'\n') {
-            Some(nl) => (nl + 1, true),
-            None => (available.len(), false),
+        // `CR NUL` split across two `fill_buf` chunks: the `CR` is
+        // already in `buf` (appended by a previous iteration, or by a
+        // previous cancelled-and-resumed call), so it can only be
+        // recognized from there. Handled before the in-chunk scan below
+        // because a two-byte terminator is the one thing that scan
+        // cannot see across a chunk boundary.
+        if cr_nul_terminates && buf.ends_with('\r') && available[0] == 0 {
+            total += 1;
+            if total > MAX_LINE_BYTES {
+                reader.consume(1);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "line exceeds maximum length",
+                ));
+            }
+            buf.push('\0');
+            reader.consume(1);
+            return Ok(total);
+        }
+        let newline_end = available.iter().position(|&b| b == b'\n').map(|i| i + 1);
+        let cr_nul_end = if cr_nul_terminates {
+            available
+                .windows(2)
+                .position(|w| w == [b'\r', 0])
+                .map(|i| i + 2)
+        } else {
+            None
+        };
+        // Whichever terminator comes FIRST ends the line -- a `CR NUL`
+        // later in the chunk must not swallow an earlier `LF`.
+        let (chunk_len, found_newline) = match (newline_end, cr_nul_end) {
+            (Some(a), Some(b)) => (a.min(b), true),
+            (Some(a), None) => (a, true),
+            (None, Some(b)) => (b, true),
+            (None, None) => (available.len(), false),
         };
         total += chunk_len;
         if total > MAX_LINE_BYTES {
@@ -97,6 +165,17 @@ pub async fn read_line_bounded_with_timeout<R: AsyncBufRead + Unpin>(
     buf: &mut String,
 ) -> std::io::Result<usize> {
     tokio::time::timeout(IDLE_READ_TIMEOUT, read_line_bounded(reader, buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// `read_telnet_line_bounded`, plus the same idle-read deadline
+/// `read_line_bounded_with_timeout` applies.
+pub async fn read_telnet_line_bounded_with_timeout<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+) -> std::io::Result<usize> {
+    tokio::time::timeout(IDLE_READ_TIMEOUT, read_telnet_line_bounded(reader, buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
 }
@@ -202,6 +281,95 @@ mod tests {
         let n = read_line_bounded(&mut reader, &mut buf).await.unwrap();
         assert_eq!(buf, "sh/dx\r\n");
         assert_eq!(n, 7);
+    }
+
+    /// MAN-86/PR #128 review: RFC 854 encodes Enter as `CR NUL`, and
+    /// macOS `telnet` sends it with no trailing `LF` -- the Telnet read
+    /// path must complete the line on that sequence alone.
+    #[tokio::test]
+    async fn telnet_variant_treats_cr_nul_as_a_terminator() {
+        let mut reader = BufReader::new(&b"N0CALL\r\0SETT\r\0"[..]);
+        let mut buf = String::new();
+        let n = read_telnet_line_bounded(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, "N0CALL\r\0");
+        assert_eq!(n, 8);
+        // The next command on the same connection is not swallowed with it.
+        buf.clear();
+        read_telnet_line_bounded(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, "SETT\r\0");
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_still_terminates_on_a_plain_newline_first() {
+        // An `LF` earlier in the chunk wins over a later `CR NUL`.
+        let mut reader = BufReader::new(&b"BYE\r\nSETT\r\0"[..]);
+        let mut buf = String::new();
+        read_telnet_line_bounded(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, "BYE\r\n");
+    }
+
+    #[tokio::test]
+    async fn plain_variant_does_not_treat_cr_nul_as_a_terminator() {
+        // The HTTP/uplink callers keep the strict `LF`-only behavior:
+        // `CR NUL` is not a terminator there, so this line stays
+        // incomplete and the read blocks past what was written.
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        write_half.write_all(b"GET / HTTP/1.1\r\0").await.unwrap();
+        tokio::task::yield_now().await;
+
+        let fut = read_line_bounded(&mut reader, &mut buf);
+        tokio::pin!(fut);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Pending),
+            "CR NUL must not terminate a non-Telnet line"
+        );
+    }
+
+    /// The two terminator bytes can arrive in separate TCP segments --
+    /// the `CR` is already in `buf` when the `NUL` chunk shows up, which
+    /// is the only place it can be recognized from.
+    #[tokio::test]
+    async fn telnet_variant_recognizes_cr_nul_split_across_chunks() {
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+
+        write_half.write_all(b"N0CALL\r").await.unwrap();
+        tokio::task::yield_now().await;
+        {
+            let fut = read_telnet_line_bounded(&mut reader, &mut buf);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Pending => {} // no terminator yet
+                std::task::Poll::Ready(r) => panic!("must not complete yet, got {r:?}"),
+            }
+        }
+        assert_eq!(buf, "N0CALL\r");
+
+        write_half.write_all(&[0]).await.unwrap();
+        let n = read_telnet_line_bounded(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, "N0CALL\r\0");
+        assert_eq!(n, 8);
     }
 
     #[tokio::test]
