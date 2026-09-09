@@ -61,16 +61,43 @@ and conversion tooling notes, not the bytes.
 
 ## Ground truth
 
-No verified ground truth (capture UTC, band/frequency, or a time-aligned
-transcript) is available for any of these recordings beyond what's stated
-above — `vp8geo_cw.mp3`'s filename implies the pileup was calling VP8GEO,
-and `B2_20251129_000000_7080kHz.wav`'s embedded metadata gives a capture
-timestamp and center frequency, but neither is confirmed against a
-transcript or RBN spots. Until a transcript or enough capture metadata is
-supplied to recover one (per `ARCHITECTURE.md:318-321`'s recorded-corpus
-strategy), treat these as real-conditions robustness fixtures only —
-decoder output against them cannot yet be scored for recall/precision or
-turned into regression assertions.
+`B2_20251129_000000_7080kHz.wav` has real ground truth: `ground-truth/
+B2_20251129_000000_7080kHz.rbn.csv` is the Reverse Beacon Network's own raw
+spot dump (`data.reversebeacon.net/rbn_history/20251129.zip`, RBN's public
+daily archive) pre-filtered to this recording's exact window --
+2025-11-29 00:00:00-00:14:59 UTC, 6984-7176 kHz (the file's embedded
+center freq ± half its 192 kHz capture bandwidth) -- 26,801 raw skimmer
+spot lines covering 957 unique DX callsigns / 1,451 unique call+kHz bins,
+straight from real skimmers copying the real air during CQ WW CW 2025.
+Score a `manta decode --json` report against it with
+`scripts/score-against-rbn.py` (repo root); see that script's docstring
+for usage. This is the ARCHITECTURE.md §9 "Golden IQ corpus" benchmark
+(recorded band segment + RBN's own spots as reference labels ->
+recall/precision) for real M3-grade validation, not just synthetic
+fixtures.
+
+First baseline run (2026-09-08, this recording, unmodified pipeline):
+**197 manta spots vs. 1,451 RBN truth bins -> 31.0% precision, 4.2%
+recall**, alongside 41,174 distinct tracks opened over the 15 minutes
+(613k characters decoded) for those 197 spots -- the detector is opening
+far more tracks than the real simultaneous-signal count implies, and most
+never survive to a validated spot. See MAN ticket for the tracking issue
+this baseline was filed against.
+
+`vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` have no verified ground truth
+(no confirmed capture UTC/band/frequency, no time-aligned transcript) --
+`vp8geo_cw.mp3`'s filename implies the pileup was calling VP8GEO, and
+`wpx_cw_iq_96khz.wav`'s filename implies a WPX CW contest capture, but
+neither is confirmed against a transcript or RBN spots, and WPX's own WAV
+header carries no embedded metadata to anchor a date (checked directly --
+`fmt ` chunk runs straight into `data`, no LIST/INFO/bext chunk; the
+zip's internal timestamp, 2008-06-08, doesn't land on a CQ WPX CW contest
+weekend, so it's presumed to be a save/copy date, not a capture date).
+Both still decode to plausible real callsigns (WPX: 45 spots / 41 unique
+calls; vp8geo: 2,060 tracks / 12k characters decoded, no crashes) --
+useful as real-audio robustness/regression baselines (crash/hang/throughput,
+"still decodes something plausible"), just not scoreable for
+recall/precision until a transcript or capture metadata turns up.
 
 ## Provenance and licensing
 
