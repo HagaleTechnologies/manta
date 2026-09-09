@@ -319,6 +319,28 @@ impl Track {
         }
     }
 
+    /// Drain this track's queued `pending` samples through its decoder,
+    /// then call `finish()` -- used whenever a track closes mid-batch
+    /// (HangExpired/Silent/Merged/Evicted), before its `pending` queue
+    /// would otherwise be silently discarded along with the rest of the
+    /// removed `Track`. Without this, `finish()`'s "true final speed"
+    /// could be stale by up to a full batch's worth of already-queued
+    /// samples (Codex review on PR #154, round 6) -- exactly the state a
+    /// held-back `manta-spot` Beacon-WPM candidate needs at `TrackClosed`
+    /// time. No-op (empty `Vec`) if this track never had a decoder.
+    fn finish_decoder(&mut self) -> Vec<DecoderEvent> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Vec::new();
+        };
+        let pending = std::mem::take(&mut self.pending);
+        let mut events: Vec<DecoderEvent> = pending
+            .into_iter()
+            .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+            .collect();
+        events.extend(decoder.finish());
+        events
+    }
+
     /// Query the current lifecycle state. SPEC §2.4.
     // Temporary: no non-test caller yet until a later task filters/reports
     // tracks by lifecycle state (e.g. spot output limited to ACTIVE tracks).
@@ -605,7 +627,10 @@ impl TrackManager {
         // only honored at overall stream end, in `TrackManager::finish`
         // below). Draining it here and threading the events out gives
         // every closure path the same guarantee `TrackManager::finish`
-        // already had.
+        // already had. `Track::finish_decoder` (round 6) also drains any
+        // samples still queued in `pending` THIS batch first -- without
+        // that, `finish()` alone would reflect only whatever the decoder
+        // processed as of the end of the PREVIOUS `process_hops` batch.
         let mut closure_flush_events: Vec<DecoderEvent> = Vec::new();
         closed.retain(|id| {
             let Some(mut track) = self.tracks.remove(id) else {
@@ -614,9 +639,7 @@ impl TrackManager {
             if !track.has_emitted {
                 return false;
             }
-            if let Some(decoder) = track.decoder.as_mut() {
-                closure_flush_events.extend(decoder.finish());
-            }
+            closure_flush_events.extend(track.finish_decoder());
             true
         });
         self.recompute_ownership();
@@ -716,9 +739,7 @@ impl TrackManager {
                 if !track.has_emitted {
                     return false;
                 }
-                if let Some(decoder) = track.decoder.as_mut() {
-                    flush_events.extend(decoder.finish());
-                }
+                flush_events.extend(track.finish_decoder());
                 true
             })
             .collect();
@@ -747,9 +768,7 @@ impl TrackManager {
             // emitted a real event -- see `step_hop`'s matching comment.
             if let Some(mut track) = self.tracks.remove(&loser) {
                 if track.has_emitted {
-                    if let Some(decoder) = track.decoder.as_mut() {
-                        flush_events.extend(decoder.finish());
-                    }
+                    flush_events.extend(track.finish_decoder());
                     evicted.push(loser);
                 }
             }
@@ -1455,6 +1474,59 @@ mod tests {
         assert!(
             flush_events.iter().all(|e| event_track_id(e) == weak_id),
             "flush events must belong to the closed track, got {flush_events:?}"
+        );
+    }
+
+    /// Codex review on PR #154, round 6: `step_hop` queues each hop's
+    /// sample into `track.pending`, drained through the decoder only once
+    /// per `process_hops` batch via `drain_pool` -- which never runs for a
+    /// track closed mid-batch (it removes the track first). Simulates
+    /// that exact scenario: samples queued in `pending`, never yet fed to
+    /// the decoder, at the moment of merge closure.
+    #[test]
+    fn merge_converged_drains_queued_pending_samples_before_finishing() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.center = 20.4;
+            weak.current_snr_db = 8.0;
+            weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
+            // Queued exactly as `step_hop` would (magnitude, sample_ts)
+            // pairs in `pending` -- NOT fed through push_envelope yet.
+            weak.pending = rect_envelope_hops("PARIS", 18)
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| (a, i as u64))
+                .collect();
+            weak.has_emitted = true;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.center = 21.1;
+            strong.current_snr_db = 18.0;
+        }
+
+        let (closed, flush_events) = tm.merge_converged();
+        assert_eq!(closed, vec![weak_id]);
+        // Before this fix, the queued `pending` samples were discarded
+        // along with the rest of the removed `Track` -- `finish()` alone
+        // (on a decoder that never saw a single push_envelope call) would
+        // produce nothing.
+        assert!(
+            !flush_events.is_empty(),
+            "merge_converged must drain queued pending samples through the decoder before finishing, got nothing"
         );
     }
 

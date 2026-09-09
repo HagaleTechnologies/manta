@@ -327,7 +327,7 @@ impl Validator {
                     }
                 }
                 track.last_sample_ts = *sample_ts;
-                self.try_spot(*track_id, *sample_ts)
+                self.try_spot(*track_id, *sample_ts, false)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
                 self.tracks.entry(*track_id).or_default().wpm = *wpm;
@@ -362,7 +362,7 @@ impl Validator {
                 if had_meta {
                     Vec::new()
                 } else {
-                    self.try_spot(*track_id, sample_ts)
+                    self.try_spot(*track_id, sample_ts, false)
                 }
             }
             // Ground-truth "detector found a candidate" signal for
@@ -388,7 +388,7 @@ impl Validator {
                 // that arm's comment for why it was reactive-unsound).
                 let sample_ts = self.tracks.get(track_id).map(|t| t.last_sample_ts);
                 let spots = match sample_ts {
-                    Some(ts) => self.try_spot(*track_id, ts),
+                    Some(ts) => self.try_spot(*track_id, ts, true),
                     None => Vec::new(),
                 };
                 // MAN-19: without this, `self.tracks` and `self.gate`'s
@@ -600,7 +600,10 @@ impl Validator {
         word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
     }
 
-    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
+    /// `is_final_retry` is `true` only for the one call `TrackClosed`'s
+    /// handler makes -- see `evaluate_candidate`'s use of it on the
+    /// `held_back_by_wpm` carve-out (Codex review on PR #154, round 6).
+    fn try_spot(&mut self, track_id: u32, sample_ts: u64, is_final_retry: bool) -> Vec<Spot> {
         // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
         // defaults. Bail without marking anything attempted, so pending
         // candidates are simply re-evaluated once metadata does arrive.
@@ -626,6 +629,7 @@ impl Validator {
                     spot_type,
                     involved_max_seq,
                     exact_seq,
+                    is_final_retry,
                 )
             })
             .collect();
@@ -636,6 +640,11 @@ impl Validator {
         spots
     }
 
+    // `candidates()`'s own tuple shape (candidate/spot_type/involved_max_seq/
+    // exact_seq) plus track_id/sample_ts/is_final_retry -- a private,
+    // single-call-site helper, not a public API; splitting these into a
+    // struct wouldn't reduce real complexity here, just relocate it.
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_candidate(
         &mut self,
         track_id: u32,
@@ -644,6 +653,7 @@ impl Validator {
         spot_type: SpotType,
         involved_max_seq: u64,
         exact_seq: Option<u64>,
+        is_final_retry: bool,
     ) -> Option<Spot> {
         let (freq_hz, snr_db, wpm) = {
             let track = self.tracks.get(&track_id)?;
@@ -700,10 +710,18 @@ impl Validator {
                 // check below never got a genuine attempt at spotting, so
                 // it must retry once the track's speed estimate settles
                 // (Codex review on PR #154, round 2) even though its type
-                // and involved_max_seq haven't changed.
+                // and involved_max_seq haven't changed. Gated on
+                // `is_final_retry` too (round 6): without that, an
+                // ordinary WordBoundary arriving while `track.wpm`
+                // happens to be transiently low would ALSO bypass this
+                // guard and spot the held-back candidate early -- the
+                // exact oscillation risk round 5's redesign meant to
+                // close, just triggered by a different event. Only the
+                // one explicit retry `TrackClosed`'s handler makes may
+                // use this bypass.
                 if (word.last_spot_type == Some(spot_type)
                     || involved_max_seq <= word.classified_max_seq)
-                    && !word.held_back_by_wpm
+                    && !(word.held_back_by_wpm && is_final_retry)
                 {
                     return None;
                 }
@@ -1019,6 +1037,53 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             spots.is_empty(),
             "a track truly closing above the cutoff must still be rejected, got {spots:?}"
         );
+    }
+
+    /// Codex review on PR #154, round 6: the `held_back_by_wpm` bypass
+    /// must fire ONLY for the explicit `TrackClosed` retry -- an ordinary
+    /// WordBoundary arriving while the track's speed is transiently low
+    /// must not ALSO be able to release a held-back candidate (the same
+    /// oscillation risk round 5 closed for SpeedUpdate, reopened via a
+    /// different event).
+    #[test]
+    fn an_unrelated_word_boundary_during_a_transient_dip_does_not_release_a_held_back_beacon() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 60.0,
+        });
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be held back at 60 WPM");
+
+        // Speed dips below the cutoff, but the track has not closed.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 44.0,
+        });
+
+        // An unrelated later word on the SAME track produces its own
+        // WordBoundary -- it must not reactivate the held-back candidate.
+        // ("5NN" specifically, not e.g. "DE": a bare CQ/DE anywhere in the
+        // window suppresses the power-step beacon fallback entirely --
+        // see context.rs -- which would make this candidate vanish for
+        // an unrelated reason instead of exercising the guard this test
+        // targets.)
+        let more = run(&transmission_events(1, &["5NN"], 200_000), &mut v);
+        assert!(
+            more.is_empty(),
+            "an unrelated WordBoundary must not bypass the held-back guard, got {more:?}"
+        );
+
+        // The true close still resolves it correctly.
+        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        assert_eq!(
+            spots.len(),
+            1,
+            "TrackClosed must still give the held-back beacon its one final try"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
     }
 
     /// Codex review on PR #154, round 3: a blocklisted callsign that
