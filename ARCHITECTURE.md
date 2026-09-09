@@ -333,7 +333,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   endpoint (the "(feature `metrics`)" phrasing in older revisions of this
   doc was stale — no Cargo `metrics` feature has ever existed; the
   endpoint is unconditionally compiled and served whenever
-  `--server-config` is set): active tracks, evictions, decode rate,
+  `--config` is set — `--server-config` is MAN-77's deprecated alias of
+  that flag): active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,

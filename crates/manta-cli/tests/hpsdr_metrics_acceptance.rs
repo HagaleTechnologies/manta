@@ -5,7 +5,7 @@
 //!     without needing to attach a debugger or read gap_stats() from code
 //!
 //! No hardware is used: a fake HPSDR device on a loopback UDP socket drips
-//! malformed datagrams at a real `manta listen` child process, and this
+//! malformed datagrams at a real `manta run` child process, and this
 //! test scrapes the real `/metrics` HTTP endpoint. Feasible without a
 //! valid Metis packet (which would mean duplicating `manta-input`'s
 //! private protocol-framing test helpers): `MAX_CONSECUTIVE_MALFORMED` is
@@ -157,7 +157,7 @@ fn malformed_hpsdr_datagrams_are_visible_on_the_metrics_endpoint() {
 
     // 3. Spawn the daemon as a real child process against the fake device.
     let child = Command::new(env!("CARGO_BIN_EXE_manta"))
-        .arg("listen")
+        .arg("run")
         .arg("--hpsdr-host")
         .arg("127.0.0.1")
         .arg("--hpsdr-port")
@@ -166,12 +166,12 @@ fn malformed_hpsdr_datagrams_are_visible_on_the_metrics_endpoint() {
         .arg("14025000")
         .arg("--hpsdr-rate")
         .arg("192000")
-        .arg("--server-config")
+        .arg("--config")
         .arg(cfg_file.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn manta listen child process");
+        .expect("spawn manta run child process");
     let _child_guard = ChildGuard(child);
 
     // 4. Poll /metrics for up to 20 s, succeeding as soon as the
