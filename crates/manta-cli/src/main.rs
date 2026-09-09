@@ -2178,7 +2178,6 @@ mod tests {
         assert!(accepted2, "second configured target must be connected to");
     }
 
-<<<<<<< HEAD
     // MAN-56: input-layer health counters wiring.
 
     /// A wrapper `IqSource` that forgets to forward `health_counters`
@@ -2271,7 +2270,8 @@ mod tests {
         assert!(!m
             .render_prometheus_text()
             .contains("manta_input_malformed_packets_total{"));
-=======
+    }
+
     // MAN-136 round-1 validate code-review finding 1: the increment
     // condition for `manta_spots_unresolved_geography_total` must match the
     // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
@@ -2335,6 +2335,5 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             geography_is_unresolved(&cty, "W1AW"),
             "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
         );
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
     }
 }

@@ -348,8 +348,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-<<<<<<< HEAD
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
+  `manta_spots_dropped_write_failed_total`,
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
+  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
+  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
+  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
   gauges, `manta_source_health`, the uplink counters, and (MAN-56,
   landed 2026-09-04) `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
@@ -363,16 +366,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   report none) and are **absent**, not a frozen zero, for every other
   source — same "absent means not measured" distinction as
   `manta_active_tracks` below.
-=======
-  `manta_spots_dropped_write_failed_total`,
-  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
-  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
-  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
-  has no row in the vendored `dxcc.tsv`), per-protocol
-  client-connected gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
   **`manta_active_tracks` is served but not populated** (corrected
   2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
   `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
