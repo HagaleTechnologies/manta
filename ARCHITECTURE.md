@@ -304,14 +304,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
   clients not to choke. This is the RBN/aggregator compatibility surface.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
-<<<<<<< HEAD
   (adds confidence, track id, decoder text context — including the `rst` and
   `qrlQuery` message-content annotations from §6 step 1a, MAN-33, each omitted
   from the wire when empty because they are not yet ratified in the dispensa
-  contract). This is the cqdx ingest surface; schema published in `dispensa` as a JSON Schema contract
-  alongside the existing ecosystem contracts.
-=======
-  (adds confidence, track id, decoder text context). This is the cqdx ingest
+  contract). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
   existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
   `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
@@ -319,7 +315,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline.
 - **Exposure policy (normative, not just observed behavior):** both servers are

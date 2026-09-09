@@ -174,17 +174,14 @@ struct TrackState {
     /// Source of `Word::seq`; incremented each time a word is pushed to
     /// `words` (MAN-28 round 12 review).
     next_word_seq: u64,
-<<<<<<< HEAD
     /// MAN-33: see `Spot::rst`. Updated on every completed word.
     rst: Option<String>,
     /// MAN-33: see `Spot::qrl_query`. Set once, never cleared while the
     /// track lives.
     qrl_query: bool,
-=======
     /// Captured non-allowlisted Beacon candidates awaiting the track's
     /// true close -- see `PendingBeacon`'s doc comment.
     pending_beacons: Vec<PendingBeacon>,
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
 }
 
 /// A `freq_correction_ppm` value that doesn't yield a finite, positive
@@ -801,9 +798,6 @@ impl Validator {
         involved_max_seq: u64,
         exact_seq: Option<u64>,
     ) -> Option<Spot> {
-<<<<<<< HEAD
-        let (freq_hz, snr_db, wpm, rst, qrl_query) = {
-=======
         // Round 7 redesign: a non-allowlisted Beacon candidate is NEVER
         // evaluated/emitted opportunistically here -- only captured (once
         // blocklist/notch/grammar/cty confirm it isn't a permanent
@@ -824,8 +818,7 @@ impl Validator {
             );
         }
 
-        let (freq_hz, snr_db, wpm) = {
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
+        let (freq_hz, snr_db, wpm, rst, qrl_query) = {
             let track = self.tracks.get(&track_id)?;
             (
                 track.freq_hz * self.freq_calibration,
@@ -1107,13 +1100,19 @@ impl Validator {
     /// value covers every pending candidate on this track -- it's a
     /// track-level property, not a per-candidate one.
     fn resolve_pending_beacons(&mut self, track_id: u32) -> Vec<Spot> {
-        let (wpm, wpm_confirmed, pending) = {
+        // MAN-33's `rst`/`qrl_query` are read here for the same reason
+        // `wpm` is: both are track-level facts, not per-candidate ones, so
+        // a deferred beacon reports the track's state at its true close
+        // rather than a snapshot frozen at capture time.
+        let (wpm, wpm_confirmed, rst, qrl_query, pending) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
                 return Vec::new();
             };
             (
                 track.wpm,
                 track.wpm_confirmed,
+                track.rst.clone(),
+                track.qrl_query,
                 std::mem::take(&mut track.pending_beacons),
             )
         };
@@ -1170,6 +1169,8 @@ impl Validator {
                     confidence,
                     track_id,
                     sample_ts: pb.sample_ts,
+                    rst: rst.clone(),
+                    qrl_query,
                 })
             })
             .collect()

@@ -560,13 +560,9 @@ step 1a) in `crates/manta-spot/tests/golden_v31_v32.rs`.
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
-<<<<<<< HEAD
-| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37) | `BEACON`-tagged spot emits on the first decode, gate not applied -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern |
+| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
 | V31 | rst-extraction | A track decodes `TU 5NN` before its callsign spots; then a later `339` replaces it; then 17 filler words age the RST out of the 16-word window | The spot carries `rst = "599"`; the later report replaces it (`"339"`); an aged-out report is still reported (per-track, not per-window) |
 | V32 | qrl-query-flag | A track sends `QRL?` before calling CQ, vs. a bare `QRL` response, vs. an ordinary CQ with no QRL | `qrl_query` true only in the first case (the interrogative form is required); false for the bare response and the ordinary CQ; `TrackClosed` clears it |
-=======
-| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
 
 ---
 

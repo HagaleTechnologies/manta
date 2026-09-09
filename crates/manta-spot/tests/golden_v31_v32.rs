@@ -2,7 +2,7 @@
 //! validation pipeline (ARCHITECTURE §6 steps 1-5) -- these ride on an
 //! already-valid spot and gate nothing.
 
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::Glyph;
 use manta_spot::{Spot, Validator};
 
@@ -148,7 +148,10 @@ fn track_closed_clears_both_annotations() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     run(&transmission_events(1, &["QRL?", "5NN"], 0), &mut v);
-    v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::SignalEnded,
+    });
     seed_meta(&mut v, 1);
     let spots = run(
         &transmission_events(1, &["CQ", "K5ARH", "CQ", "K5ARH"], 200_000),

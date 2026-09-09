@@ -7,7 +7,14 @@
 //! number table (MAN-136); `dxContinent`/`dxCqZone`/`dxLat`/`dxLon` (and the
 //! `de*` counterparts) are resolved from the same vendored `cty.dat` the
 //! validator already trusts for the plausibility gate (`manta_spot::cty`).
-<<<<<<< HEAD
+//! When a callsign isn't cty-resolvable, each required field gets a named
+//! out-of-domain `UNKNOWN_*` sentinel below rather than a fabricated-looking
+//! real value or (where the contract forbids it) `null`. A maritime-mobile
+//! (`/MM`) or aeronautical-mobile (`/AM`) call is the separate, KNOWN case:
+//! `cty.lookup` resolves it through its base prefix, but the station is by
+//! definition outside every DXCC entity, so it gets ADIF's own
+//! `NO_DXCC_ENTITY` (0) plus unknown continent/zone/lat/lon instead of its
+//! home entity's geography.
 //!
 //! `rst`/`qrlQuery` (MAN-33) are manta proposals ahead of the dispensa
 //! contract, not yet in `spots.v1.schema.json` -- see
@@ -18,16 +25,6 @@
 //! byte-identically to the pre-MAN-33 wire, so an unratified key can never
 //! make the whole stream unparseable -- only the spots that genuinely carry
 //! the new information present it (PR #159 review finding).
-=======
-//! When a callsign isn't cty-resolvable, each required field gets a named
-//! out-of-domain `UNKNOWN_*` sentinel below rather than a fabricated-looking
-//! real value or (where the contract forbids it) `null`. A maritime-mobile
-//! (`/MM`) or aeronautical-mobile (`/AM`) call is the separate, KNOWN case:
-//! `cty.lookup` resolves it through its base prefix, but the station is by
-//! definition outside every DXCC entity, so it gets ADIF's own
-//! `NO_DXCC_ENTITY` (0) plus unknown continent/zone/lat/lon instead of its
-//! home entity's geography.
->>>>>>> 455e1afe126a9ee7d81a7cb640e88aeb272f15ec
 
 use manta_spot::cty;
 use manta_spot::Spot;
