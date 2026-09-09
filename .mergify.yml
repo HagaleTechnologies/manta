@@ -36,18 +36,22 @@
 # already gates them before they can reach this rule at all -- so
 # accepting their skip unconditionally is safe.
 #
-# Trusted-author gate (`author = thagale` OR the dependabot branch below):
-# this repo is public, its ruleset has `required_approving_review_count: 0`,
-# and the native auto-merge workflow this queue replaces had NO
-# author-association check of its own to carry forward -- without this
-# condition, any outside contributor's PR that goes green on all required
-# checks would auto-queue and merge with zero human in the loop. Mergify has
-# no direct equivalent of GitHub's `author_association` (no built-in
-# role/collaborator lookup), only an exact-login match, so `author =
-# thagale` is the closest available primitive. This diverges the moment a
-# second trusted collaborator is added -- their PRs won't auto-queue under
-# a single-login condition and will need either a manual `@Mergifyio queue`
-# comment or this file updated with their login.
+# Trusted-author gate (`author = thagale` OR `catalyst-cloud-connector[bot]`
+# OR the dependabot branch below): this repo is public, its ruleset has
+# `required_approving_review_count: 0`, and the native auto-merge workflow
+# this queue replaces had NO author-association check of its own to carry
+# forward -- without this condition, any outside contributor's PR that goes
+# green on all required checks would auto-queue and merge with zero human
+# in the loop. Mergify has no direct equivalent of GitHub's
+# `author_association` (no built-in role/collaborator lookup), only an
+# exact-login match, so an explicit login list is the closest available
+# primitive. `catalyst-cloud-connector[bot]` (Catalyst Cloud's own PR
+# author identity) is trusted equally to `thagale` here -- CI/Codex review
+# passing is the actual gate either way, the same as it always was; a human
+# author was never itself a stronger guarantee than green required checks.
+# This diverges the moment a second trusted collaborator is added -- their
+# PRs won't auto-queue under a fixed login list and will need either a
+# manual `@Mergifyio queue` comment or this file updated with their login.
 #
 # The dependabot branch requires a POSITIVE classification signal
 # (`approved-reviews-by = github-actions[bot]`), not just the ABSENCE of
@@ -98,6 +102,7 @@ pull_request_rules:
       - -label = needs-review
       - or:
           - author = thagale
+          - author = catalyst-cloud-connector[bot]
           - and:
               - author = dependabot[bot]
               - approved-reviews-by = github-actions[bot]
