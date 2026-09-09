@@ -7,8 +7,8 @@ maintainer: agent
 sources:
   - ARCHITECTURE.md
 verified:
-  commit: e68b106
-  date: 2026-07-07
+  commit: a1aad7da9e8cb98de7c2c68881b81d95c2bc98e6
+  date: 2026-09-09
 links:
   - decode-chain
   - spot-output-contract
@@ -28,4 +28,6 @@ Decoded CW text is noisy, so validation — not decoding — is what makes a spo
 
 The asymmetry is deliberate: false spots (bogus callsigns) are the failure mode that discredits the whole network, so the repetition gate and cty.dat rejection are tuned to make bogus spots rare — a V8/V8w pass criterion is *0 bogus callsigns*. Validated spots flow to [[spot-output-contract]].
 
-The repetition gate assumes a bogus decode is random noise that won't repeat identically. A deterministic front-end artifact breaks that assumption — it produces the *same* garbled decode at a fixed frequency every time, so it repeats and passes the gate. Field-confirmed against real hardware (mechanism still under investigation, not yet tied to a specific tracked bug): [[live-hardware-field-testing]].
+The repetition gate assumes a bogus decode is random noise that won't repeat identically. A deterministic front-end artifact breaks that assumption — it produces the *same* garbled decode at a fixed frequency every time, so it repeats and passes the gate. Field-confirmed against real hardware: [[live-hardware-field-testing]].
+
+**The BEACON exemption (step 4) doesn't need that assumption to break at all — it needs zero repeats.** A candidate the CQ/DE context parse tags `BEACON` (ARCHITECTURE §6.1/MAN-37: any plausible 3-15 char word followed by a lone trailing `T`, the shape an NCDXF/IARU beacon's unmodulated power-step dashes decode to) skips the repetition gate entirely by design — real beacons only ID once per cycle. That same pattern also matches noise-decoded garble that happens to end in a solo "T" word, and once tagged BEACON, one glimpse of that garble is a "confirmed" public spot with no second decode ever required. A 2026-09-09 overnight 40m capture ([[live-hardware-field-testing]]) produced 29 confirmed spots that were entirely this: implausibly fast WPM (avg ~51.5, several pinned at the tracker's own 60 WPM ceiling) and malformed text (`4AEEEEE`, `ER1EEAE`, ...), all as one-shot BEACON-exempt spots — not evidence of a deterministic front-end artifact needing to repeat identically, as an earlier reading of that data assumed. (A fixed-bin channelizer artifact could still explain why the *same* garbled decode recurs at the *same* frequency across separate sessions — but each occurrence only needed to survive one BEACON classification, not the repetition gate, to become a spot.) PR #154 (`crates/manta-spot/src/validator.rs`, `grammar.rs` — open as of this writing, not yet merged) adds a WPM-implausibility check scoped specifically to `SpotType::Beacon` candidates to close this; a residual few (structurally plausible, not implausibly fast) aren't caught by it and remain a known gap.
