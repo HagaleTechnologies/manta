@@ -137,6 +137,17 @@ impl TrackDecoder {
     /// `push_envelope` calls -- no forced closure of anything still open.
     pub fn finish_speed_only(&mut self) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
+        // `held` has already passed its own debounce confirmation --
+        // genuinely observed data, unlike `open` (still accumulating,
+        // could yet be an unconfirmed short blip). Safe to process
+        // through the ordinary (not forcing) run pipeline once nothing
+        // more will ever arrive for this decoder (round 8: without this,
+        // a mark/space fully confirmed just before a merge/eviction could
+        // sit unprocessed, leaving the "final" WPM stale on the wrong
+        // side of a consumer's cutoff even after `pending` was drained).
+        if let Some(run) = self.demod.take_held() {
+            self.on_run(run, &mut events);
+        }
         self.flush_final_speed(&mut events);
         events
     }

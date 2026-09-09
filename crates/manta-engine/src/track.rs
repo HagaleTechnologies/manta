@@ -556,6 +556,16 @@ impl TrackManager {
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
         let mut closed: Vec<u32> = Vec::new();
+        // Codex review on PR #154, round 8: `Silent` (no character
+        // decoded for `gc_hops`) does NOT imply an observed RF gap the
+        // way `HangExpired` (sustained `drop` for `hang_hops`) does -- it
+        // can fire on a track that's still ACTIVE with a real, continuous
+        // signal, just not producing decoded characters. Only
+        // `HangExpired` may use the forcing `finish_decoder`; `Silent`
+        // must go through `finish_decoder_speed_only` below, same as
+        // Merged/Evicted.
+        let mut close_reasons: std::collections::HashMap<u32, CloseReason> =
+            std::collections::HashMap::new();
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         for id in ids {
             let n = self.n_channels();
@@ -569,6 +579,7 @@ impl TrackManager {
             match event {
                 LifecycleEvent::Closed(reason) => {
                     self.close_counts.record(reason);
+                    close_reasons.insert(id, reason);
                     closed.push(id);
                 }
                 LifecycleEvent::Promoted => {
@@ -666,7 +677,16 @@ impl TrackManager {
             if !track.has_emitted {
                 return false;
             }
-            closure_flush_events.extend(track.finish_decoder());
+            // Only a genuine, sustained observed RF gap (HangExpired) may
+            // force an in-progress mark to resolve; Silent's own trigger
+            // (no character decoded) says nothing about whether the
+            // signal is still there (round 8).
+            let events = if close_reasons.get(id) == Some(&CloseReason::HangExpired) {
+                track.finish_decoder()
+            } else {
+                track.finish_decoder_speed_only()
+            };
+            closure_flush_events.extend(events);
             true
         });
         self.recompute_ownership();

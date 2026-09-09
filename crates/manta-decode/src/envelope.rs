@@ -217,6 +217,21 @@ impl Demod {
         out
     }
 
+    /// Takes the currently-`held` run (if any) without touching `open`.
+    /// `held` has already passed its own `debounce_hops` confirmation the
+    /// moment it was created (see `step`'s polarity-flip handling) --
+    /// genuinely confirmed data, unlike `open` (still accumulating,
+    /// could yet turn out to be a short blip absorbed by the next flip).
+    /// `held` can, in principle, still be un-done by a LATER short
+    /// reversal merging it back into a new `open` -- but only if more
+    /// samples arrive. Once nothing more ever will (a track's true
+    /// close), that can't happen, so treating `held` as final at that
+    /// point is safe (Codex review on PR #154, round 8 -- see
+    /// `TrackDecoder::finish_speed_only`, the only caller).
+    pub(crate) fn take_held(&mut self) -> Option<Run> {
+        self.held.take()
+    }
+
     /// EOF flush: closes the open run and emits everything held. SPEC §3.4.
     pub fn finish(&mut self) -> Vec<Run> {
         let mut out = Vec::new();
@@ -408,6 +423,49 @@ mod tests {
         let runs = run_segments(&segs);
         let big = runs.iter().filter(|r| r.mark && r.hops >= 55).count();
         assert_eq!(big, 1, "dropout must merge into one long mark: {runs:?}");
+    }
+
+    /// Codex review on PR #154, round 8: a confirmed run (past its own
+    /// debounce check) sits in `held` for one further polarity flip
+    /// before it reaches `on_run` live. `take_held` must surface it
+    /// directly, without disturbing whatever's still accumulating in
+    /// `open`.
+    #[test]
+    fn take_held_returns_a_confirmed_mark_without_touching_open() {
+        let mut d = Demod::new(DemodConfig::default());
+        let mut ts = 0u64;
+        // Warm up clean alternating cycles first (same pattern as
+        // clean_keying_yields_alternating_runs) so thresholds are
+        // established.
+        for _ in 0..10 {
+            for _ in 0..30 {
+                d.push(1.0, ts);
+                ts += 256;
+            }
+            for _ in 0..30 {
+                d.push(0.01, ts);
+                ts += 256;
+            }
+        }
+        // A fresh, long mark -- confirmed once it flips.
+        for _ in 0..30 {
+            d.push(1.0, ts);
+            ts += 256;
+        }
+        // One flip: the mark above moves into `held`; a fresh space
+        // becomes `open`.
+        d.push(0.01, ts);
+
+        let held = d.take_held();
+        assert!(
+            matches!(held, Some(r) if r.mark && r.hops >= 25),
+            "held should hold the just-confirmed MARK run, got {held:?}"
+        );
+        assert_eq!(
+            d.open_space_hops(),
+            Some(1),
+            "open (the fresh space just begun) must be untouched"
+        );
     }
 
     #[test]

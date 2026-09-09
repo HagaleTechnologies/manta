@@ -32,6 +32,16 @@ const WORD_WINDOW: usize = 16;
 /// operator.
 const MAX_PLAUSIBLE_WPM: f32 = 45.0;
 
+/// Bounds `TrackState::pending_beacons` per track. A regularly-transmitting
+/// carrier resets the silent-GC timer on every decoded character, so an
+/// unbounded track (in principle alive for the daemon's lifetime) could
+/// otherwise accumulate one entry per distinct Beacon-shaped decode
+/// forever, all the way until an eventual `TrackClosed` (Codex review on
+/// PR #154, round 8). Small: realistically only one or two genuinely
+/// distinct beacon identities are ever plausible on a single track: this
+/// exists to cap pathological growth, not to hold a meaningful backlog.
+const MAX_PENDING_BEACONS: usize = 8;
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -883,16 +893,19 @@ impl Validator {
             return None;
         }
 
-        self.tracks
-            .get_mut(&track_id)?
-            .pending_beacons
-            .push(PendingBeacon {
-                candidate,
-                sample_ts,
-                freq_hz,
-                snr_db,
-                char_confidences,
-            });
+        let pending = &mut self.tracks.get_mut(&track_id)?.pending_beacons;
+        if pending.len() >= MAX_PENDING_BEACONS {
+            // Drop the oldest to bound growth on a track that stays alive
+            // indefinitely (round 8) -- see MAX_PENDING_BEACONS's doc.
+            pending.remove(0);
+        }
+        pending.push(PendingBeacon {
+            candidate,
+            sample_ts,
+            freq_hz,
+            snr_db,
+            char_confidences,
+        });
         None
     }
 
@@ -930,6 +943,22 @@ impl Validator {
                 // ARCHITECTURE §6.4 exempts BEACON-tagged messages from
                 // the repetition requirement -- no `reps < 2` gate here,
                 // by design.
+                //
+                // A deferred candidate can resolve well after capture --
+                // if a NEWER spot for the same (callsign, freq) identity
+                // already recorded dedupe state in the meantime (via the
+                // ordinary, non-deferred path), this older sample_ts must
+                // never be handed to `should_emit`: a spot_type/SNR jump
+                // there would still record it, silently rewinding the
+                // watermark backward and letting a later real spot escape
+                // the suppression window early (Codex review on PR #154,
+                // round 8). Simplest safe rule: an already-superseded
+                // observation is not worth emitting at all.
+                if let Some(last_ts) = self.dedupe.last_sample_ts(&pb.candidate, pb.freq_hz) {
+                    if pb.sample_ts <= last_ts {
+                        return None;
+                    }
+                }
                 if !self.dedupe.should_emit(
                     &pb.candidate,
                     pb.freq_hz,
@@ -1132,6 +1161,89 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
         assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    /// Codex review on PR #154, round 8: a regularly-transmitting carrier
+    /// resets the silent-GC timer on every decoded character and can stay
+    /// ACTIVE (never closing) for the daemon's lifetime, so
+    /// `pending_beacons` must not grow without bound while it waits.
+    #[test]
+    fn pending_beacons_bounded_on_a_track_that_stays_active() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+
+        let n = MAX_PENDING_BEACONS + 5;
+        let mut ts = 0u64;
+        for i in 0..n {
+            // 26 distinct, grammar/cty-valid callsigns (K-prefixed, ending
+            // in a letter): K5AAA, K5AAB, K5AAC, ...
+            let call = format!("K5AA{}", (b'A' + (i % 26) as u8) as char);
+            let words = [call.as_str(), "T"];
+            let spots = run(&transmission_events(1, &words, ts), &mut v);
+            assert!(spots.is_empty(), "must only ever capture, not spot yet");
+            ts += 1_000_000;
+        }
+
+        let spots = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        assert!(
+            spots.len() <= MAX_PENDING_BEACONS,
+            "pending_beacons must stay bounded at {MAX_PENDING_BEACONS}, got {} spots",
+            spots.len()
+        );
+    }
+
+    /// Codex review on PR #154, round 8: a deferred Beacon candidate can
+    /// resolve well after capture. If a NEWER spot for the same
+    /// (callsign, freq) identity already recorded fresher dedupe state in
+    /// the meantime, resolving the older candidate must never call
+    /// `Dedupe::should_emit` with its own older timestamp -- doing so
+    /// (given a spot_type change, which alone satisfies `should_emit`'s
+    /// own criteria) would silently roll the recorded watermark backward.
+    #[test]
+    fn resolved_beacon_never_rewinds_dedupe_state_backward() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+
+        // Track 1 captures a Beacon candidate for K5ARH at an early
+        // timestamp, on 14_000_000.0 Hz (seed_meta's fixture value), but
+        // does not close yet.
+        seed_meta(&mut v, 1);
+        let words = ["K5ARH", "T"];
+        let spots = run(&transmission_events(1, &words, 1_000), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // A newer, ordinary (repetition-confirmed) spot for the SAME
+        // callsign/frequency arrives on a different track, well after.
+        seed_meta(&mut v, 2);
+        let words2 = ["DE", "K5ARH", "K"];
+        let mut spots2 = run(&transmission_events(2, &words2, 5_000_000), &mut v);
+        spots2.extend(run(&transmission_events(2, &words2, 5_100_000), &mut v));
+        assert_eq!(spots2.len(), 1, "the ordinary path must spot normally");
+        let newer_ts = spots2[0].sample_ts;
+
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0),
+            Some(newer_ts),
+            "dedupe must have recorded the newer, ordinary spot's timestamp"
+        );
+
+        // Track 1 finally closes -- its captured (OLDER) Beacon candidate
+        // must not emit now, and must not roll dedupe's watermark back to
+        // its own stale timestamp.
+        let spots3 = v.ingest(&DecoderEvent::TrackClosed { track_id: 1 });
+        assert!(
+            spots3.is_empty(),
+            "an already-superseded deferred candidate must not emit, got {spots3:?}"
+        );
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0),
+            Some(newer_ts),
+            "resolving the stale deferred candidate must not roll the \
+             dedupe watermark backward"
+        );
     }
 
     /// A non-Beacon (De-type) candidate at an implausible 60 WPM still
