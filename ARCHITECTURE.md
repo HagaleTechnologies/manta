@@ -227,11 +227,14 @@ transmission may never produce again).
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
    single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`DE`
-<<<<<<< HEAD
-   token appears anywhere in the window at all, a deliberately coarse
-   guard against mistagging an ordinary, unrecognized CQ/DE call as
-   Beacon). Context determines spot type (CQ / DE / BEACON) — RBN spots
-   carry this flag.
+   token appears anywhere in the window at all (the token must be a
+   complete decoded word, not a substring glued to punctuation inside
+   one), a deliberately coarse guard against mistagging an ordinary,
+   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+   is counted once, as `SuppressionCounts::power_step_guard` (§8); an
+   occurrence already evaluated as a Beacon before the guard appeared is
+   not a loss and is not counted). Context
+   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 
    **1a. Message-content annotations (MAN-33)**: alongside the context parse,
    each completed word is scanned for an RST signal report (including the
@@ -243,16 +246,6 @@ transmission may never produce again).
    only; the RBN telnet line is a fixed compatibility format with no field
    slot for them, matching CW Skimmer, which shows its own 599/QRL? labels
    in the band map rather than in what it uploads.
-=======
-   token appears anywhere in the window at all (the token must be a
-   complete decoded word, not a substring glued to punctuation inside
-   one), a deliberately coarse guard against mistagging an ordinary,
-   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
-   is counted once, as `SuppressionCounts::power_step_guard` (§8); an
-   occurrence already evaluated as a Beacon before the guard appeared is
-   not a loss and is not counted). Context
-   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
->>>>>>> 96348932a6a0b7d0997a6317ba2bbe19a9aaba39
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
    refreshable) — a call with an unallocated prefix is rejected.
