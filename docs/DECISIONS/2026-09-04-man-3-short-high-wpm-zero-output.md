@@ -164,8 +164,16 @@ Two things, together, are the mechanism:
    `track_ids: [6, 16]`-shaped partial success part 1 targets.
 
 **Fix:** `merge_converged`'s comparison changed from `<=` to strict `<`
-(`crates/manta-engine/src/track.rs`, one operator). On an exact tie the
-*incumbent* now survives -- there is no evidence a bit-identical reading
+(`crates/manta-engine/src/track.rs`, one operator), with the exact tie then
+ranked by `merge_keep_rank` -- `(promoted, has_emitted)`, higher survives --
+before falling back to the lower id. The rank matters because ids are *spawn*
+order, not promotion order: a slowly-confirming low-id CANDIDATE must not
+evict a higher-id ACTIVE track that already holds decoder history, since that
+CANDIDATE may then simply expire `Unconfirmed` and recreate this ticket's
+zero-output failure from the other direction (review round 1; pinned in
+SPEC §2.5). When the rank ties too -- both tracks at the same lifecycle
+stage, which is the case this deviation was measured on -- the
+*incumbent* survives -- there is no evidence a bit-identical reading
 means the older track is actually weaker, and the older track is by
 definition closer to accumulating the ~375-hop continuity `Demod`'s init
 window and `SpeedTracker`'s 5-mark quorum need. A track only loses a merge

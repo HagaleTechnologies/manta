@@ -210,8 +210,18 @@ window-size derivation and the measured false-track/CPU-budget impact.
   stands). **[DEVIATION — tie-break added per MAN-3]** On an exact
   `current_snr_db` tie (the common case for two tracks whose owned windows
   overlap and so read the same max-power channel, not an edge case) the
-  *incumbent* (older) track survives; a track only loses a merge when it
-  reads a **strictly** lower SNR than its competitor. See
+  survivor is chosen by **lifecycle rank, then by lower id**; a track only
+  loses a merge on SNR alone when it reads a **strictly** lower SNR than its
+  competitor. Lifecycle rank is the tuple `(promoted, has_emitted)`, higher
+  wins: a promoted (ACTIVE/HANG) track outranks a still-unconfirmed
+  CANDIDATE, and among promoted tracks one that has already put events on
+  the wire outranks one that has not. Track ids are **spawn** order, not
+  promotion order, so id alone would let a slowly-confirming low-id
+  CANDIDATE evict a higher-id ACTIVE track that already holds decoder
+  history — and that CANDIDATE may then simply expire `Unconfirmed`. Only
+  when the lifecycle rank also ties does the *incumbent* (lower-id, older)
+  track survive; that last case is the one this deviation was measured for,
+  so both tracks are at the same lifecycle stage whenever it applies. See
   docs/DECISIONS/2026-09-04-man-3-short-high-wpm-zero-output.md.
 
 ---

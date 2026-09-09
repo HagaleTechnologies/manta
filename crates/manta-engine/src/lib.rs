@@ -102,6 +102,36 @@ pub struct DecodeReport {
     pub spots: Vec<Spot>,
 }
 
+/// The frequency `DecodeReport` should carry for `select_report_track`'s
+/// chosen track: its own most recent `TrackMeta` centroid, else the most
+/// recent one from *any* track, else the receiver center.
+///
+/// Review round 2: the middle fallback is the point. `select_report_track`
+/// picks the track with the most decoded characters, and a late, short-lived
+/// replacement track can emit `CharDecoded` before it ever reaches the
+/// 375-hop (1 Hz) `TrackMeta` cadence -- so the selected track may carry no
+/// metadata at all. Dropping straight through to `center_freq_hz` then
+/// reports an offset signal at the receiver center even though an earlier
+/// track on the same carrier already measured its centroid, which for the
+/// MAN-3 multi-track shape (one physical signal, several successive tracks)
+/// is the common case, not an edge case. `center_freq_hz` stays the
+/// last-resort default for a stream with no `TrackMeta` anywhere.
+fn report_freq_hz(
+    this_track: &[DecoderEvent],
+    all_events: &[DecoderEvent],
+    center_freq_hz: f64,
+) -> f64 {
+    fn last_meta_freq(evs: &[DecoderEvent]) -> Option<f64> {
+        evs.iter().rev().find_map(|e| match e {
+            DecoderEvent::TrackMeta { freq_hz, .. } => Some(*freq_hz),
+            _ => None,
+        })
+    }
+    last_meta_freq(this_track)
+        .or_else(|| last_meta_freq(all_events))
+        .unwrap_or(center_freq_hz)
+}
+
 /// Deterministically pick the single `track_id` whose event slice becomes
 /// `DecodeReport`'s headline `.text`/`.wpm`/`.freq_hz`.
 ///
@@ -222,15 +252,33 @@ pub fn decode_samples(
 
     // MAN-3: distinct from the length bail above -- the channelizer ran fine
     // and produced hops, but no track ever promoted *and* emitted. That is a
-    // detection outcome (signal below `detector.on_snr_db`, or entirely
-    // inside SPEC §2.1's warmup+confirm floor), not an input-length problem,
-    // and reporting it as one sent this ticket's investigation down the
-    // wrong path once already.
+    // detection outcome, not an input-length problem, and reporting it as one
+    // sent this ticket's investigation down the wrong path once already.
+    //
+    // Review round 2: the two ways to reach zero events have *different*
+    // causes and must not share one message. `promoted_count()` separates
+    // them: zero promotions really is a detector outcome (below
+    // `detector.on_snr_db`, or inside SPEC §2.1's warmup+confirm floor), but
+    // a track that promoted and still emitted nothing was above threshold and
+    // longer than that floor -- it just closed before clearing the decoder's
+    // own output latency (the 1 Hz `TrackMeta` cadence, or §5's mark quorum
+    // for a first character). Pointing an operator at detector thresholds for
+    // that second case is actively misleading.
     if events.is_empty() {
+        let promoted = tm.promoted_count();
+        if promoted == 0 {
+            bail!(
+                "no signal found: {total_hops} hops processed, but no track was ever \
+                 promoted (SPEC §2.4) -- signal below detector.on_snr_db, or shorter \
+                 than the ~2.05 s warmup+confirm floor"
+            );
+        }
         bail!(
-            "no signal found: {total_hops} hops processed, but no track was ever \
-             promoted and emitted (SPEC §2.4) -- signal below detector.on_snr_db, \
-             or shorter than the ~2.05 s warmup+confirm floor"
+            "no signal found: {total_hops} hops processed and {promoted} track(s) \
+             promoted above detector.on_snr_db, but none emitted before closing -- a \
+             promoted track needs a further ~1 s of decoding to reach its first 1 Hz \
+             TrackMeta, or enough marks for a first character (SPEC §2.4/§5); this is \
+             decoder-output latency, not a detector-threshold problem"
         );
     }
     let report_track_id = select_report_track(&events);
@@ -239,15 +287,10 @@ pub fn decode_samples(
         .filter(|e| track::event_track_id(e) == report_track_id)
         .cloned()
         .collect();
-    let freq_hz = this_track
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            DecoderEvent::TrackMeta { freq_hz, .. } => Some(*freq_hz),
-            _ => None,
-        })
-        .unwrap_or(center_freq_hz)
-        * calibration_factor;
+    // `events` is still uncalibrated here (the `calibration_factor` pass over
+    // it runs below), so `report_freq_hz` sees raw centroids and the single
+    // multiply below applies the correction once.
+    let freq_hz = report_freq_hz(&this_track, &events, center_freq_hz) * calibration_factor;
     let wpm = this_track.iter().rev().find_map(|e| match e {
         DecoderEvent::SpeedUpdate { wpm, .. } => Some(*wpm),
         _ => None,
@@ -362,6 +405,42 @@ mod tests {
         ];
         assert_eq!(select_report_track(&events), 7);
         assert_eq!(events_to_text(&events), "A");
+    }
+
+    /// MAN-3 review round 2: the reported track can be a late, short-lived
+    /// replacement that decoded characters but never reached its own 1 Hz
+    /// `TrackMeta` cadence. Its frequency must still come from whatever
+    /// metadata the stream does carry for the same carrier, not silently
+    /// collapse to the receiver center.
+    #[test]
+    fn report_freq_falls_back_to_another_tracks_metadata_before_the_center() {
+        let events = vec![meta(6), ch(16, 100), ch(16, 200)];
+        let selected = select_report_track(&events);
+        assert_eq!(selected, 16);
+        let this_track: Vec<DecoderEvent> = events
+            .iter()
+            .filter(|e| track::event_track_id(e) == selected)
+            .cloned()
+            .collect();
+        assert!(this_track
+            .iter()
+            .all(|e| !matches!(e, DecoderEvent::TrackMeta { .. })));
+        assert_eq!(report_freq_hz(&this_track, &events, 7_000.0), 14_000.0);
+    }
+
+    /// The selected track's own metadata still wins when it has any, and a
+    /// stream with no `TrackMeta` at all still falls back to the center.
+    #[test]
+    fn report_freq_prefers_the_selected_tracks_own_metadata() {
+        let other = DecoderEvent::TrackMeta {
+            track_id: 6,
+            snr_2500_db: 20.0,
+            freq_hz: 1_000.0,
+        };
+        let events = vec![other, meta(16), ch(16, 100)];
+        let this_track = vec![meta(16), ch(16, 100)];
+        assert_eq!(report_freq_hz(&this_track, &events, 7_000.0), 14_000.0);
+        assert_eq!(report_freq_hz(&[], &[], 7_000.0), 7_000.0);
     }
 
     /// SPEC §8: selection must be a pure function of the event stream, with
