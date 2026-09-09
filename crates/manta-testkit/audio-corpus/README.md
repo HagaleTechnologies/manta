@@ -57,32 +57,76 @@ and conversion tooling notes, not the bytes.
   absent — so decoding the converted file needs a
   `B2_20251129_000000_7080kHz.json` sidecar with
   `{"center_freq_hz": 7080000}` alongside it, or spots/events will carry
-  baseband-relative rather than correct RF frequencies.
+  baseband-relative rather than correct RF frequencies. **Exact
+  conversion command** (Codex review, PR #144 -- without a pinned command
+  and checksums, "this recording, unmodified pipeline" doesn't actually
+  identify the benchmark input; bit-depth/normalization choices in the
+  conversion can shift weak-signal samples and so the reported spot
+  count):
+  `ffmpeg -i B2_20251129_000000_7080kHz.source.wav -c:a pcm_s16le B2_20251129_000000_7080kHz.wav`
+  (distinct input/output paths -- ffmpeg refuses to edit a file in place;
+  rename the as-received source to the `.source.wav` stem above, or point
+  `-i` at wherever it actually lives, before running this)
+  (source, as received from George K5TR, unmodified: SHA-256
+  `74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2`;
+  converted, this repo's benchmark input: SHA-256
+  `d2ea524744fd9d551bd4e5f09103a1771588eb11d37054c4334078edd4d4a621`).
 
 ## Ground truth
 
-RBN spots from `B2_20251129_000000_7080kHz.wav` capture time (2025-11-29
-00:00:00 UTC) on 40m (7.0–7.3 MHz band) are available from the Reverse
-Beacon Network. Ground truth can be scored via `scripts/score-against-rbn.py`:
+`B2_20251129_000000_7080kHz.wav` has real ground truth: `ground-truth/
+B2_20251129_000000_7080kHz.rbn.csv` is the Reverse Beacon Network's own raw
+spot dump (`data.reversebeacon.net/rbn_history/20251129.zip`, RBN's public
+daily archive) pre-filtered to this recording's exact window --
+2025-11-29 00:00:00-00:14:59 UTC, 6984-7176 kHz (the file's embedded
+center freq ± half its 192 kHz capture bandwidth) -- 26,801 raw skimmer
+spot lines covering 957 unique DX callsigns / 1,451 unique call+kHz bins,
+straight from real skimmers copying the real air during CQ WW CW 2025.
+Score a `manta decode --json` report against it with
+`scripts/score-against-rbn.py` (repo root); see that script's docstring
+for usage, including `--spotter`/`--min-spotters` filtering -- spotter
+filtering is useful for co-located reference validation (K5TR's signal
+path is nearly identical to manta's hardware); consensus filtering
+(multi-spotter agreement) is useful for rejecting receiver artifacts that
+don't appear on multiple independent systems. This is the ARCHITECTURE.md
+§9 "Golden IQ corpus" benchmark (recorded band segment + RBN's own spots
+as reference labels -> recall/precision) for real M3-grade validation, not
+just synthetic fixtures.
 
-```bash
-python3 scripts/score-against-rbn.py <decode_report.json> <rbn-daily-dump.csv> \
-    --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000                    # all spotters
-python3 scripts/score-against-rbn.py <decode_report.json> <rbn-daily-dump.csv> \
-    --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000 --spotter K5TR     # K5TR only
-python3 scripts/score-against-rbn.py <decode_report.json> <rbn-daily-dump.csv> \
-    --capture-start 2025-11-29T00:00:00Z --sample-rate-hz 192000 --min-spotters 2   # consensus
-```
+First baseline run (2026-09-08, this recording, unmodified pipeline):
+**197 manta spots vs. 1,441 scoreable RBN truth bins -> 29.9% precision,
+4.1% recall** (revised after a Codex review on PR #144 caught two real
+scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
+grammar can structurally never accept counted as misses; both fixed in
+`scripts/score-against-rbn.py`, see that script's docstring), alongside
+41,174 distinct tracks opened over the 15 minutes (613k characters
+decoded) for those 197 spots -- the detector is opening far more tracks
+than the real simultaneous-signal count implies, and most never survive
+to a validated spot. Filed as MAN-166.
 
-**Baseline numbers**: see `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for
-the current, canonical legacy-vs-hsmm recall/precision measurement against this recording
-(both K5TR-only and all-RBN). Do not duplicate those numbers here — this file previously
-carried an independent, now-stale copy that drifted out of sync with the real scorer after
-`scripts/score-against-rbn.py` was reconciled with `origin/main`'s richer implementation
-(MAN-166 Task 12a); avoid re-introducing that drift.
+**Legacy-vs-hsmm and K5TR-only comparison**: see
+`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for the
+canonical follow-up measurement against this same recording (MAN-166's
+decode-core-v2 stage-2 gate) -- both engines, both K5TR-only and all-RBN
+recall/precision. Its all-RBN legacy figures (59/1441 = 4.09% recall,
+197 spots -> 29.95% precision) are the same measurement as the baseline
+above, to within rounding; don't duplicate a second, independently-drifting
+copy of these numbers here -- point to that doc instead.
 
-Spotter filtering is useful for co-located reference validation (K5TR's signal
-path is nearly identical to manta's hardware); consensus filtering (multi-spotter agreement) is useful for rejecting receiver artifacts that don't appear on multiple independent systems.
+`vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` have no verified ground truth
+(no confirmed capture UTC/band/frequency, no time-aligned transcript) --
+`vp8geo_cw.mp3`'s filename implies the pileup was calling VP8GEO, and
+`wpx_cw_iq_96khz.wav`'s filename implies a WPX CW contest capture, but
+neither is confirmed against a transcript or RBN spots, and WPX's own WAV
+header carries no embedded metadata to anchor a date (checked directly --
+`fmt ` chunk runs straight into `data`, no LIST/INFO/bext chunk; the
+zip's internal timestamp, 2008-06-08, doesn't land on a CQ WPX CW contest
+weekend, so it's presumed to be a save/copy date, not a capture date).
+Both still decode to plausible real callsigns (WPX: 45 spots / 41 unique
+calls; vp8geo: 2,060 tracks / 12k characters decoded, no crashes) --
+useful as real-audio robustness/regression baselines (crash/hang/throughput,
+"still decodes something plausible"), just not scoreable for
+recall/precision until a transcript or capture metadata turns up.
 
 ## Provenance and licensing
 

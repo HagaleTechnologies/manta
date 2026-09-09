@@ -18,6 +18,10 @@ secrets*
 .idea/
 .vscode/
 
+# Python cache from scripts/ tooling (e.g. score-against-rbn.py).
+__pycache__/
+*.pyc
+
 # Local worktree scratch space (superpowers:using-git-worktrees).
 .worktrees/
 
@@ -45,3 +49,5 @@ crates/manta-testkit/audio-corpus/vp8geo_cw.mp3
 crates/manta-testkit/audio-corpus/vp8geo_cw_48khz.wav
 crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.wav
 crates/manta-testkit/audio-corpus/ground-truth/
+crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.json
+crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.source.wav

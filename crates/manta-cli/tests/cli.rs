@@ -108,6 +108,172 @@ fn decode_engine_hsmm_runs_end_to_end() {
 }
 
 #[test]
+fn run_is_the_canonical_daemon_verb() {
+    // MAN-77 scenario 1. Repro on e398d46: `manta run --help` exited 2 with
+    // "error: unrecognized subcommand 'run'".
+    let out = manta().args(["run", "--help"]).output().unwrap();
+    assert!(out.status.success(), "manta run --help should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Usage: manta run"), "stdout: {stdout}");
+
+    let top = manta().arg("--help").output().unwrap();
+    let top = String::from_utf8_lossy(&top.stdout);
+    // `run` is listed as a command; `listen` appears only as its alias.
+    assert!(top.contains("  run "), "top-level help: {top}");
+    assert!(top.contains("[alias: listen]"), "top-level help: {top}");
+}
+
+#[test]
+fn listen_is_still_accepted_as_an_alias_of_run() {
+    // The ticket's "existing scripts don't break silently" requirement.
+    let out = manta().args(["listen", "--help"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "manta listen --help should still succeed"
+    );
+}
+
+#[test]
+fn decode_and_gen_are_unaffected_by_the_verb_promotion() {
+    // MAN-77 scenario 2, asserted explicitly rather than left implicit.
+    for sub in ["decode", "gen"] {
+        let out = manta().args([sub, "--help"]).output().unwrap();
+        assert!(out.status.success(), "manta {sub} --help should succeed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("Usage: manta {sub}")),
+            "{sub}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn config_is_the_canonical_daemon_config_flag() {
+    // Repro on e398d46: "error: unexpected argument '--config' found".
+    // Validated before any file I/O, so nonexistent paths provoke the
+    // --dial-freq-hz error, which proves --config was accepted and routed
+    // to the same field --server-config used to reach.
+    let out = manta()
+        .args([
+            "run",
+            "--source",
+            "/nonexistent.wav",
+            "--config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    // The error text must name the new flag, not the old one.
+    assert!(stderr.contains("--config"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("--server-config"),
+        "stale flag name: {stderr}"
+    );
+}
+
+#[test]
+fn server_config_is_still_accepted_as_a_hidden_alias_of_config() {
+    let out = manta()
+        .args([
+            "run",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--dial-freq-hz"));
+
+    // Hidden: help advertises the canonical name only.
+    let help = manta().args(["run", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--config <CONFIG>"), "help: {help}");
+    assert!(
+        !help.contains("--server-config"),
+        "deprecated flag advertised: {help}"
+    );
+}
+
+#[test]
+fn deprecated_daemon_spelling_warns_on_stderr_and_names_the_replacement() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`manta run --config`"), "stderr: {stderr}");
+    assert!(stderr.contains("`--config`"), "stderr: {stderr}");
+}
+
+#[test]
+fn the_ad_hoc_listen_path_is_not_nagged() {
+    // The ticket title keeps `listen` for audio/dev testing, and
+    // docs/RUNBOOKS/m1-w1aw-live-copy.md still instructs `listen --device`.
+    let out = manta()
+        .args(["listen", "--kiwi-host", "example.com"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("deprecated"), "unexpected nag: {stderr}");
+}
+
+#[test]
+fn deprecation_notices_never_touch_stdout() {
+    // AGENTS.md: file input -> byte-identical spot logs. stdout carries the
+    // JSON Lines stream; a warning there would corrupt it. Uses the same
+    // argv as `deprecated_daemon_spelling_warns_on_stderr_and_names_the_replacement`
+    // (which does emit both notices) -- `listen --help` emits no notice at
+    // all, so it can't catch an eprintln!->println! regression.
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("deprecated"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("deprecated"),
+        "test is vacuous unless a notice actually fires; stderr: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn non_utf8_argv_does_not_panic() {
+    // Regression: warn_deprecations() used to scan std::env::args(), which
+    // panics on non-UTF-8 argv. It runs as main()'s first statement, before
+    // Cli::parse() (which uses args_os() via clap and tolerates non-UTF-8
+    // paths) ever sees the argv -- so this must not panic for ANY
+    // subcommand, not only the deprecated spellings. Filenames are byte
+    // strings on Linux/macOS and need not be UTF-8.
+    use std::os::unix::ffi::OsStrExt as _;
+    let bad_path = std::ffi::OsStr::from_bytes(b"/tmp/man77-non-utf8-\xff.wav");
+    let out = manta().arg("decode").arg(bad_path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    // The nonexistent (and non-UTF-8-named) file should fail like any other
+    // missing file, not crash the argv scan before Cli::parse() runs.
+    assert!(!out.status.success());
+}
+
+#[test]
 fn kiwi_host_without_freq_is_a_clean_error() {
     let out = manta()
         .args(["listen", "--kiwi-host", "example.com"])

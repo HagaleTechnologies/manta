@@ -5,8 +5,8 @@
 //! `[decode]` (nor `[detector]`/`[input]`/`[spot]`) -- `manta-server` has no
 //! dependency on `manta-decode` and isn't going to grow one just to parse a
 //! table it never acts on. Consumers that DO care about `[decode]` (today:
-//! `manta-cli`'s `Command::Listen`, when `--server-config` is given) parse
-//! the same TOML text a SECOND time into `DecodeConfigFile`, independent of
+//! `manta-cli`'s `Command::Run`/`Decode`/`Oracle`, when `--config` is given)
+//! parse the same TOML text a SECOND time into `DecodeConfigFile`, independent of
 //! `DaemonConfigFile` -- the same pattern that file's own doc comment
 //! already establishes for keeping `[server]`/`[[rbn_uplink]]` parsing
 //! self-contained.
