@@ -31,6 +31,13 @@ stdout carries the command's product; stderr carries everything else
 | `listen` | spot lines (`--json`: JSON Lines of spots/events) | live per-character monitor (text mode only) |
 | `soak` | the report (text or `--json`) | nothing on success |
 
+A live monitor writes stderr without a trailing newline, so whoever owns it
+must terminate that line before anything else writes to stderr — otherwise
+the next write is glued to it (`CQ DE W1AWerror: ...`). `listen` closes the
+character monitor's line as soon as `manta_engine::listen` returns, on the
+error path and on a clean EOF alike, so the `error:` line below always
+starts in column zero.
+
 ## Errors and hints
 
 Every propagated error renders as one `error: <what failed>: <cause>` line

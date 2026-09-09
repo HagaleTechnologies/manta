@@ -339,6 +339,39 @@ fn listen_text_mode_puts_only_spot_lines_on_stdout() {
     assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
 }
 
+/// MAN-130 remediation: the live character monitor grows stderr one
+/// character at a time and never terminates its own line, so whatever
+/// stderr printed next used to be glued to it -- `CQ DE W1AWerror: ...`
+/// when the source failed mid-run (a KiwiSDR disconnect, say). The listen
+/// path now closes that line as soon as `manta_engine::listen` returns, so
+/// the promised standalone `error:` line always starts in column zero. This
+/// exercises the clean-EOF half of that (a mid-stream source failure is not
+/// reproducible from a file source: `WavIqSource` loads eagerly and so
+/// fails at open, before any glyph is decoded); both halves are the same
+/// write site.
+#[test]
+fn listen_text_mode_terminates_the_character_monitor_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("cw48k.wav");
+    write_48k_cw_wav(&wav, "CQ CQ DE W1AW W1AW K", 20.0, 40.0);
+    let out = manta()
+        .arg("listen")
+        .arg("--source")
+        .arg(&wav)
+        .args(["--dial-freq-hz", "14000000"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.is_empty(),
+        "expected character-monitor output on stderr"
+    );
+    assert!(
+        stderr.ends_with('\n'),
+        "monitor left stderr mid-line, so the next stderr write lands on it: {stderr:?}"
+    );
+}
+
 #[test]
 fn listen_json_mode_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();

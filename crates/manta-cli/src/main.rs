@@ -1209,6 +1209,14 @@ fn run() -> Result<std::process::ExitCode> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+            // The character monitor writes to stderr WITHOUT a trailing
+            // newline (it grows a character at a time, live), so whatever
+            // stderr prints next would otherwise be appended to it --
+            // `CQ DE W1AWerror: ...` when the source fails mid-run, e.g. a
+            // KiwiSDR disconnect. Track whether the monitor put anything on
+            // the line so the listen path can terminate it before returning,
+            // on the error path and on a clean EOF alike (MAN-130).
+            let monitor_dirty = std::cell::Cell::new(false);
             let listen_result = manta_engine::listen(
                 src,
                 &cfg,
@@ -1227,11 +1235,13 @@ fn run() -> Result<std::process::ExitCode> {
                         DecoderEvent::CharDecoded { glyph, .. } => {
                             if let Some(c) = glyph.text_char() {
                                 eprint!("{c}");
+                                monitor_dirty.set(true);
                                 let _ = std::io::stderr().flush();
                             }
                         }
                         DecoderEvent::WordBoundary { .. } => {
                             eprint!(" ");
+                            monitor_dirty.set(true);
                             let _ = std::io::stderr().flush();
                         }
                         _ => {}
@@ -1254,6 +1264,16 @@ fn run() -> Result<std::process::ExitCode> {
                     println!("{}", fmt::spot_line(spot));
                 },
             );
+
+            // Close the monitor's unterminated line the moment `listen`
+            // returns, before anything else can write to stderr: the
+            // `error:` line `main` renders from `listen_result?` below --
+            // and any shutdown-time log line from the block that follows --
+            // must start in column zero, not glued to the last decoded
+            // character (MAN-130).
+            if monitor_dirty.get() {
+                eprintln!();
+            }
 
             // Run the same server-shutdown sequence on BOTH the success and
             // error paths -- an SDR disconnect or WAV read failure from
