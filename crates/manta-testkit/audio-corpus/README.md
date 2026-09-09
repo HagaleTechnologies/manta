@@ -61,16 +61,23 @@ and conversion tooling notes, not the bytes.
 
 ## Ground truth
 
-No verified ground truth (capture UTC, band/frequency, or a time-aligned
-transcript) is available for any of these recordings beyond what's stated
-above — `vp8geo_cw.mp3`'s filename implies the pileup was calling VP8GEO,
-and `B2_20251129_000000_7080kHz.wav`'s embedded metadata gives a capture
-timestamp and center frequency, but neither is confirmed against a
-transcript or RBN spots. Until a transcript or enough capture metadata is
-supplied to recover one (per `ARCHITECTURE.md:318-321`'s recorded-corpus
-strategy), treat these as real-conditions robustness fixtures only —
-decoder output against them cannot yet be scored for recall/precision or
-turned into regression assertions.
+RBN spots from `B2_20251129_000000_7080kHz.wav` capture time (2025-11-29
+00:00:00 UTC) on 40m (7.0–7.3 MHz band) are available from the Reverse
+Beacon Network. Ground truth can be scored via `scripts/score-against-rbn.py`:
+
+```bash
+python3 scripts/score-against-rbn.py <rbn-daily-dump.csv>                        # all spotters
+python3 scripts/score-against-rbn.py <rbn-daily-dump.csv> --spotter K5TR         # K5TR only (co-located reference)
+python3 scripts/score-against-rbn.py <rbn-daily-dump.csv> --min-spotters 2       # consensus (≥2 spotters)
+```
+
+**2026-09-09 baseline** (`B2_20251129_000000_7080kHz.wav`, first 15 min, vs
+manta on 2026-09-09 implementation):
+- **K5TR-only** (`--spotter K5TR`): 55/210 = 26.2% recall, 24.3% precision
+- **All spotters** (no filter): 68/1451 = 4.7% recall, 30.1% precision
+
+Spotter filtering is useful for co-located reference validation (K5TR's signal
+path is nearly identical to manta's hardware); consensus filtering (multi-spotter agreement) is useful for rejecting receiver artifacts that don't appear on multiple independent systems.
 
 ## Provenance and licensing
 
