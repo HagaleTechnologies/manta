@@ -1,2 +1,24 @@
+# `git-fetch-with-cli` makes cargo shell out to the system `git` binary to
+# fetch this workspace's git dependencies (coppa-{dsp,audio,channel}, pinned
+# by rev in Cargo.toml) instead of using its built-in libgit2 transport,
+# whose fetch of a bare pinned rev intermittently fails against GitHub with
+# `revision <rev> not found` on a cold cache. cargo's own CLI transport is
+# the documented workaround and is what this repo relies on.
+#
+# CONSEQUENCE, and the reason this is spelled out rather than left implicit:
+# building manta FROM SOURCE therefore requires a `git` executable on PATH in
+# addition to Rust 1.85+ (README's Quickstart states both). A machine with
+# rustup but no git -- a minimal Windows install, say, or a slim container --
+# fails at the fetch step before compiling anything, with `could not execute
+# process 'git fetch ...' (never executed)`. End users are unaffected: the
+# released binaries and the published Docker image need neither Rust nor git.
+#
+# Provisioned in every environment this repo builds source in:
+#   - CI / release runners: git ships on all GitHub-hosted images, and
+#     actions/checkout needs it (.github/workflows/ci.yml, release*.yml).
+#   - Docker image build: installed explicitly in the builder stage, since
+#     `rust:1-slim-*` ships no git (see Dockerfile's comment).
+#   - `cross` release targets: installed by Cross.toml's pre-build hook,
+#     because the fetch happens inside the cross-rs container.
 [net]
 git-fetch-with-cli = true

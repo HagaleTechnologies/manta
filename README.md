@@ -82,7 +82,15 @@ as before, and is what the rest of this Quickstart assumes:
 
 ## Quickstart
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.85 or newer, and a `git` executable on `PATH`. Git is a
+build-time requirement, not just a way to clone this repo: manta depends on
+[`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git
+dependency, and `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`
+so cargo fetches it through the `git` binary rather than its built-in
+libgit2 transport (which intermittently fails to resolve a bare pinned rev
+on a cold cache). Without git on `PATH` the build fails at the fetch step,
+before compiling anything. Neither Rust nor git is needed to *run* the
+released binaries or the Docker image above.
 
 ```sh
 # Build
