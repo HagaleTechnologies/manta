@@ -7,13 +7,8 @@ maintainer: agent
 sources:
   - ARCHITECTURE.md
 verified:
-<<<<<<< HEAD
-  commit: 01d1ea1
-  date: 2026-09-07
-=======
   commit: a1aad7da9e8cb98de7c2c68881b81d95c2bc98e6
   date: 2026-09-09
->>>>>>> fefb469186bfa83fd546cfe8843d88e1978ad91c
 links:
   - decode-chain
   - spot-output-contract
