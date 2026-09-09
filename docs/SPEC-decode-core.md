@@ -581,6 +581,11 @@ cluster_alpha = 0.15
 # (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29.
 freq_correction_ppm = 0.0
 
+# Operator-supplied RF dial frequency for a source that has no RF
+# reference of its own (rig-audio passband). §1.3; CLI --dial-freq-hz;
+# MAN-34. Omit for sources that report their own tuned frequency.
+center_freq_hz = 0.0
+
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.

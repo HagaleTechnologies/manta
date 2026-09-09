@@ -127,6 +127,146 @@ fn dial_freq_hz_rejects_non_finite_and_non_positive_values() {
     }
 }
 
+/// MAN-34, the ticket's Gherkin end-to-end through the compiled binary:
+/// `listen --source <48 kHz rig-audio WAV> --dial-freq-hz F --json` reports
+/// F + baseband offset, not the bare offset.
+///
+/// Asserts on `TrackMeta.freq_hz` rather than on an emitted spot: spot
+/// emission additionally requires callsign/grammar/repetition validation
+/// that a synthetic tone fixture cannot guarantee deterministically, and
+/// `Spot.freq_hz` is populated verbatim from `TrackMeta.freq_hz` (times the
+/// ppm factor, 1.0 by default) at manta-spot/src/validator.rs:592-599,
+/// 723-725. The TrackMeta -> Spot leg is already covered elsewhere
+/// (manta-engine's `listen_uses_the_sources_center_freq_hz_not_a_hardcoded_zero`).
+///
+/// `DecoderEvent` is internally tagged (`#[serde(tag = "event")]`,
+/// crates/manta-decode/src/events.rs), so each JSON line looks like
+/// `{"event":"TrackMeta","track_id":..,"freq_hz":..}` -- not serde's
+/// default externally-tagged `{"TrackMeta": {...}}` shape.
+#[test]
+fn listen_with_dial_freq_hz_reports_absolute_frequency_for_an_audio_source() {
+    const CENTER_HZ: f64 = 14_030_000.0;
+    const TONE_HZ: f64 = 750.0;
+    let fs = 48_000u32;
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("rig-audio.wav");
+
+    let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
+    let (env, _keyed) =
+        manta_testkit::keyer::key_text_loop("CQ CQ DE W1AW W1AW K", &spec, fs as f64, 15.0)
+            .unwrap();
+    let mut w = hound::WavWriter::create(
+        &wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: fs,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    let dphi = std::f64::consts::TAU * TONE_HZ / fs as f64;
+    let mut phi = 0.0f64;
+    for e in env.iter() {
+        w.write_sample(e * phi.cos() as f32).unwrap();
+        phi += dphi;
+    }
+    w.finalize().unwrap();
+
+    let out = manta()
+        .args(["listen", "--json", "--dial-freq-hz", "14030000", "--source"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let freqs: Vec<f64> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("TrackMeta"))
+        .filter_map(|v| v.get("freq_hz").and_then(|f| f.as_f64()))
+        .collect();
+    assert!(
+        !freqs.is_empty(),
+        "expected TrackMeta events, got: {stdout}"
+    );
+    for f in &freqs {
+        assert!(
+            (f - CENTER_HZ).abs() < fs as f64 / 2.0,
+            "TrackMeta.freq_hz {f} is not an absolute frequency around {CENTER_HZ}"
+        );
+    }
+}
+
+#[test]
+fn listen_warns_when_an_audio_source_has_no_dial_freq_hz() {
+    // The warning is emitted before any source is opened, so a nonexistent
+    // path still provokes it (same technique as the --server-config test).
+    let out = manta()
+        .args(["listen", "--source", "/nonexistent.wav"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    assert!(stderr.contains("baseband"), "stderr: {stderr}");
+}
+
+#[test]
+fn listen_does_not_warn_when_dial_freq_hz_is_supplied() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--dial-freq-hz",
+            "14030000",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("baseband"),
+        "no baseband warning expected with --dial-freq-hz: {stderr}"
+    );
+}
+
+#[test]
+fn soak_dial_freq_hz_rejects_non_finite_and_non_positive_values() {
+    for bad in ["nan", "inf", "-inf", "0", "-14027000"] {
+        let out = manta()
+            .args([
+                "soak",
+                "--duration",
+                "1",
+                "--source",
+                "/nonexistent.wav",
+                "--dial-freq-hz",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "soak --dial-freq-hz {bad} should have been rejected"
+        );
+    }
+}
+
+#[test]
+fn soak_warns_when_an_audio_source_has_no_dial_freq_hz() {
+    let out = manta()
+        .args(["soak", "--duration", "1", "--source", "/nonexistent.wav"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+}
+
 #[test]
 fn json_output_is_valid_and_deterministic_across_three_runs() {
     // SPEC §6 CI rule: same binary + same file, 3 runs -> identical output.

@@ -158,13 +158,27 @@ enum Command {
         /// (ARCHITECTURE §7-§8) alongside the decode loop.
         #[arg(long)]
         server_config: Option<PathBuf>,
-        /// RF dial frequency in Hz, overriding the source's own
-        /// `center_freq_hz()`. Required with --server-config when the
-        /// source is a plain audio device or --source WAV file, since
-        /// neither reports a real RF frequency (KiwiSDR/SoapySDR already
-        /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
-        /// would publish an audio-tone offset (e.g. 700 Hz) as if it were
-        /// the actual DX frequency.
+        /// RF dial frequency in Hz. For a plain audio device or --source
+        /// WAV file, this becomes the source's own `center_freq_hz()`
+        /// (AudioIqSource::with_center_freq_hz, MAN-34); for an already
+        /// RF-aware source (KiwiSDR/SoapySDR/HPSDR) it overrides the
+        /// tuned frequency the source already reports. Required with
+        /// --server-config when the source is a plain audio device or
+        /// --source WAV file, since neither reports a real RF frequency
+        /// on its own (KiwiSDR/SoapySDR already know theirs from
+        /// --kiwi-freq/--soapy-freq) -- without it, spots would publish
+        /// an audio-tone offset (e.g. 700 Hz) as if it were the actual DX
+        /// frequency. Outside --server-config it's still optional, but
+        /// omitting it on an audio source prints a one-line stderr
+        /// warning and reported frequencies stay baseband offsets.
+        ///
+        /// Sideband convention: enter the suppressed-carrier/USB dial
+        /// reading, since manta adds the decoded audio-tone offset to this
+        /// value as-is. On a rig in CW mode the displayed dial frequency
+        /// is usually already offset by your sidetone pitch -- subtract
+        /// your CW pitch (e.g. 700-800 Hz) from that display before
+        /// passing it here, or spots will read high by the pitch amount
+        /// (CW-R inverts the sign and doubles the error).
         #[arg(long, value_parser = parse_dial_freq_hz)]
         dial_freq_hz: Option<f64>,
         /// Fixed replay epoch, Unix seconds -- overrides the replayed
@@ -268,6 +282,11 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
+        /// RF dial frequency in Hz, overriding the source's own
+        /// `center_freq_hz()` -- see `listen --dial-freq-hz`. Without it,
+        /// an audio source's reported frequencies are baseband offsets.
+        #[arg(long, value_parser = parse_dial_freq_hz)]
+        dial_freq_hz: Option<f64>,
     },
     /// Bounded-duration health check: is this source hearing anything real?
     /// Runs the real decode pipeline for --duration, then reports track/SNR/
@@ -427,6 +446,7 @@ fn open_source(
     source: Option<PathBuf>,
     kiwi: KiwiOpts,
     soapy: SoapyOpts,
+    dial_freq_hz: Option<f64>,
 ) -> Result<Box<dyn IqSource>> {
     if let Some(host) = kiwi.host {
         let freq = kiwi
@@ -450,7 +470,7 @@ fn open_source(
             &driver, rate, freq, soapy.gain,
         )?));
     }
-    open_audio_source(device, source)
+    open_audio_source(device, source, dial_freq_hz)
 }
 
 #[cfg(not(feature = "soapy"))]
@@ -458,6 +478,7 @@ fn open_source(
     device: Option<String>,
     source: Option<PathBuf>,
     kiwi: KiwiOpts,
+    dial_freq_hz: Option<f64>,
 ) -> Result<Box<dyn IqSource>> {
     if let Some(host) = kiwi.host {
         let freq = kiwi
@@ -470,21 +491,30 @@ fn open_source(
             &kiwi.password,
         )?));
     }
-    open_audio_source(device, source)
+    open_audio_source(device, source, dial_freq_hz)
 }
 
-fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
-    Ok(match source {
-        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
-        None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
-    })
+fn open_audio_source(
+    device: Option<String>,
+    source: Option<PathBuf>,
+    dial_freq_hz: Option<f64>,
+) -> Result<Box<dyn IqSource>> {
+    let src = match source {
+        Some(path) => manta_input::AudioIqSource::from_wav_file(&path)?,
+        None => manta_input::AudioIqSource::from_device(device.as_deref())?,
+    };
+    Ok(Box::new(match dial_freq_hz {
+        Some(hz) => src.with_center_freq_hz(hz)?,
+        None => src,
+    }))
 }
 
-/// Overrides an inner source's `center_freq_hz()` with a fixed value --
-/// `AudioIqSource` always reports `0.0` (audio-passband mode has no real
-/// RF dial frequency of its own), so without this a spot's `freq_hz` would
-/// publish a bare audio-tone offset (e.g. 700 Hz) as if it were the actual
-/// DX frequency. See `--dial-freq-hz`.
+/// Overrides an inner source's `center_freq_hz()` with a fixed value.
+/// Audio and file-replay sources now carry the operator's dial frequency
+/// natively (`open_audio_source` -> `AudioIqSource::with_center_freq_hz`,
+/// MAN-34); this decorator remains for the RF-aware sources (KiwiSDR/
+/// SoapySDR/HPSDR), which already report a tuned frequency of their own
+/// that `--dial-freq-hz` is allowed to supersede. See `--dial-freq-hz`.
 struct FixedCenterFreqSource {
     inner: Box<dyn IqSource>,
     freq_hz: f64,
@@ -505,6 +535,47 @@ impl IqSource for FixedCenterFreqSource {
 
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
+    }
+}
+
+/// Warn on stderr when the opened source is audio-derived (not RF-aware)
+/// and no `--dial-freq-hz` was given -- MAN-34. A missing dial frequency in
+/// this case means every downstream frequency is a bare baseband offset,
+/// not an absolute RF frequency. This is a warning, not a `bail!`: a bare
+/// `manta listen --device` watching decoded text locally, with no interest
+/// in frequency, is a legitimate and documented use (README.md, the M1
+/// manual-acceptance runbook). The harm this ticket names -- a wrong
+/// frequency reaching the network -- is already a hard error via
+/// `--server-config`'s own check; this covers the local case without
+/// regressing it.
+fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq_hz: Option<f64>) {
+    if !has_rf_aware_source && dial_freq_hz.is_none() {
+        eprintln!(
+            "warning: no --dial-freq-hz given for an audio source -- \
+             reported frequencies are baseband offsets within the \
+             audio passband, not absolute RF frequencies. Pass the \
+             rig's dial frequency, e.g. --dial-freq-hz 14030000."
+        );
+    }
+}
+
+/// Applies `--dial-freq-hz` as an override on top of an already-RF-aware
+/// source (KiwiSDR/SoapySDR/HPSDR), which reports a tuned frequency of its
+/// own that the operator is allowed to supersede. Audio and file-replay
+/// sources carry the operator's dial frequency natively instead
+/// (`open_audio_source` -> `AudioIqSource::with_center_freq_hz`, MAN-34),
+/// so this is a no-op for them even when `dial_freq_hz` is `Some`.
+fn apply_rf_aware_override(
+    src: Box<dyn IqSource>,
+    has_rf_aware_source: bool,
+    dial_freq_hz: Option<f64>,
+) -> Box<dyn IqSource> {
+    match dial_freq_hz {
+        Some(freq_hz) if has_rf_aware_source => Box::new(FixedCenterFreqSource {
+            inner: src,
+            freq_hz,
+        }),
+        _ => src,
     }
 }
 
@@ -1132,6 +1203,7 @@ fn main() -> Result<()> {
                      --kiwi-freq/--soapy-freq)"
                 );
             }
+            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
 
             let kiwi = KiwiOpts {
                 host: kiwi_host,
@@ -1164,21 +1236,22 @@ fn main() -> Result<()> {
                                 rate: soapy_rate,
                                 gain: soapy_gain,
                             },
+                            dial_freq_hz,
                         )?
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, kiwi)?
+                        open_source(device, source, kiwi, dial_freq_hz)?
                     }
                 }
             };
-            let src: Box<dyn IqSource> = match dial_freq_hz {
-                Some(freq_hz) => Box::new(FixedCenterFreqSource {
-                    inner: src,
-                    freq_hz,
-                }),
-                None => src,
-            };
+            // Audio and file-replay sources now carry the operator's dial
+            // frequency natively (open_audio_source -> AudioIqSource::
+            // with_center_freq_hz, MAN-34). This override remains for the
+            // RF-aware sources, which report a tuned frequency of their own
+            // that --dial-freq-hz is allowed to supersede.
+            let src: Box<dyn IqSource> =
+                apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --server-config wasn't
@@ -1362,7 +1435,19 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
+            dial_freq_hz,
         } => {
+            #[cfg(feature = "soapy")]
+            let has_soapy_source = soapy_driver.is_some();
+            #[cfg(not(feature = "soapy"))]
+            let has_soapy_source = false;
+            #[cfg(feature = "hpsdr")]
+            let has_hpsdr_source = hpsdr_host.is_some();
+            #[cfg(not(feature = "hpsdr"))]
+            let has_hpsdr_source = false;
+            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
+            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
+
             let kiwi = KiwiOpts {
                 host: kiwi_host,
                 port: kiwi_port,
@@ -1394,14 +1479,16 @@ fn main() -> Result<()> {
                                 rate: soapy_rate,
                                 gain: soapy_gain,
                             },
+                            dial_freq_hz,
                         )?
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, kiwi)?
+                        open_source(device, source, kiwi, dial_freq_hz)?
                     }
                 }
             };
+            let src = apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {

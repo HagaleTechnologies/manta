@@ -37,6 +37,12 @@ the post-resample rate; `center_freq_hz()` returns 0.0 (audio has no RF
 reference — SPEC's `freq_hz` reporting for audio-sourced tracks is
 offset-only, center 0).
 
+**Superseded 2026-09-05 (MAN-34):** `center_freq_hz()` returns 0.0 only
+when no RF reference was supplied. `AudioIqSource::with_center_freq_hz`
+accepts an operator-supplied dial frequency (`manta listen
+--dial-freq-hz`), and reported frequencies are then absolute. See
+`docs/DECISIONS/2026-09-05-man-34-audio-rf-reference.md`.
+
 ## 3. `manta-dsp::hilbert` — analytic-signal FIR
 
 New component: an odd-length windowed-sinc Hilbert transformer

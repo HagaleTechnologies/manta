@@ -25,3 +25,7 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 ## Status caveat
 
 The JSON schema is **not yet frozen in dispensa** — treat the field set as design-phase until the ADR lands. Do not restate fields here; the contract, once written, is authoritative. Validated spots reaching these surfaces come from [[spot-validation]].
+
+## Audio-sourced spot frequencies (MAN-34)
+
+A spot's `freq_hz` on either surface is only absolute (real RF) when its source has an RF reference. The rig-audio input mode (`listen`/`listen --device`, `AudioIqSource`) has none of its own — pass `--dial-freq-hz` (or call `AudioIqSource::with_center_freq_hz` from library code) or its reported frequencies are bare baseband offsets, not RBN-compatible. `--dial-freq-hz` is added to the decoded audio-tone offset as-is, so it must be the suppressed-carrier/USB dial reading — on a CW-mode dial display, subtract your sidetone pitch first, or spots read high by the pitch amount. See `docs/DECISIONS/2026-09-05-man-34-audio-rf-reference.md`.
