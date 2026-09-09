@@ -134,13 +134,25 @@ Currently, the RBN recommends a value of "1".
    passband overlapping no allocation at all (a receiver test tone, a nonsense `--dial-freq-hz`)
    falls back to the raw passband rather than an empty list, since an empty list reads to
    Aggregator as "decoding nothing" — worse than an honest (if unlabeled) range.
-   **Amended (PR #128 review):** the passband width is the source's *RF bandwidth*
-   (`IqSource::rf_bandwidth_hz`), not its processing sample rate. The two are the same number for
-   every non-resampling source, but `KiwiIqSource` upsamples a ~12 kS/s receiver stream to
-   96 kS/s while asking the receiver for `low_cut=-5000 high_cut=5000` — advertising the sample
-   rate there claimed centre ±48 kHz of coverage Aggregator would then expect spots from, against
-   a real 10 kHz. `sample_rate()` remains the value `SpotBus` uses for sample-index-to-wall-clock
-   conversion; only coverage claims use the bandwidth.
+   **Amended (PR #128 review):** the passband is the source's own *RF passband*
+   (`IqSource::rf_passband_hz`, `(lo, hi)` offsets in Hz from the centre frequency), not a width
+   derived from its processing sample rate, and not assumed symmetric. Three findings drove this:
+   - `KiwiIqSource` upsamples a ~12 kS/s receiver stream to 96 kS/s while asking the receiver for
+     `low_cut=-5000 high_cut=5000` — advertising the sample rate there claimed centre ±48 kHz of
+     coverage Aggregator would then expect spots from, against a real 10 kHz.
+   - `AudioIqSource` Hilbert-transforms a rig's AF output, so its decodable energy is at *positive*
+     offsets from `--dial-freq-hz` over the rig's ~3 kHz passband (ARCHITECTURE §3) — half of a
+     symmetric ±24 kHz claim is on the wrong side of the dial entirely. Its bounds are the named
+     constants `manta_input::AUDIO_PASSBAND_LO_HZ`/`..._HI_HZ` (300/3000 Hz, the nominal widest
+     rig AF passband); a rig running a narrow CW filter passes less, and making the claim exact
+     needs a config key for the rig's own filter, which is out of MAN-86's scope.
+   - The advertised bounds are scaled by the same `input.freq_correction_ppm` calibration factor
+     the validator applies to every emitted spot frequency. At the supported ±1000 ppm limit that
+     is ~14 kHz on 20 m, enough for manta to advertise bounds that exclude frequencies in its own
+     spot stream.
+
+   `sample_rate()` remains the value `SpotBus` uses for sample-index-to-wall-clock conversion;
+   only coverage claims use the passband.
 6. **Login validation is a permissive shape check, not authentication.** `ARCHITECTURE.md` §7
    already commits normatively to no client authentication on this listener. `manta_spot::grammar::
    is_plausible` was considered and rejected for this purpose: MAN-45 research finding 2 records it

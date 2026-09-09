@@ -3,7 +3,7 @@
 //! Center frequency comes from a JSON sidecar `<stem>.json`.
 
 pub mod audio;
-pub use audio::{AudioIqSource, TARGET_RATE_HZ};
+pub use audio::{AudioIqSource, AUDIO_PASSBAND_HI_HZ, AUDIO_PASSBAND_LO_HZ, TARGET_RATE_HZ};
 
 pub mod kiwi;
 pub use kiwi::KiwiIqSource;
@@ -29,25 +29,33 @@ pub trait IqSource {
     /// The source's RF center frequency, Hz (0.0 if unknown).
     fn center_freq_hz(&self) -> f64;
 
-    /// The width of RF spectrum this source actually delivers, Hz --
-    /// which is NOT always `sample_rate()`.
+    /// The RF passband this source actually delivers, as `(lo, hi)`
+    /// offsets in Hz from `center_freq_hz()` -- which is NOT always
+    /// `-sample_rate()/2 .. +sample_rate()/2`, and is NOT always
+    /// symmetric about the centre.
     ///
     /// MAN-86 review: a source that resamples reports a *processing* rate
-    /// wider than the spectrum it carries. `KiwiIqSource` upsamples a
-    /// ~12 kS/s receiver stream to 96 kS/s while the receiver itself is
-    /// configured for a 10 kHz IQ passband, so reading `sample_rate()` as
-    /// the decodable width would make `SKIMMER/SETT` advertise centre
-    /// +/-48 kHz of coverage to Aggregator that no signal ever occupies.
-    /// Anything a consumer publishes as *coverage* (SETT segments) must
-    /// use this; anything that is a per-sample timing quantity (the
-    /// channelizer, `SpotBus`'s sample-index-to-wall-clock conversion)
-    /// must keep using `sample_rate()`.
+    /// wider than the spectrum it carries, and a source fed from a rig's
+    /// audio output carries spectrum only on ONE side of its dial
+    /// frequency. `KiwiIqSource` upsamples a ~12 kS/s receiver stream to
+    /// 96 kS/s while the receiver itself is configured for a 10 kHz IQ
+    /// passband; `AudioIqSource` Hilbert-transforms a rig's ~3 kHz audio
+    /// output, whose tones are positive offsets above `--dial-freq-hz`.
+    /// Reading half the sample rate as the decodable half-width would
+    /// make `SKIMMER/SETT` advertise centre +/-48 kHz / dial +/-24 kHz of
+    /// coverage to Aggregator that no signal ever occupies. Anything a
+    /// consumer publishes as *coverage* (SETT segments) must use this;
+    /// anything that is a per-sample timing quantity (the channelizer,
+    /// `SpotBus`'s sample-index-to-wall-clock conversion) must keep using
+    /// `sample_rate()`.
     ///
-    /// Defaults to `sample_rate()`, correct for every non-resampling
-    /// source (file, audio, SoapySDR, HPSDR), where the delivered
-    /// spectrum IS the Nyquist span of the stream.
-    fn rf_bandwidth_hz(&self) -> f64 {
-        self.sample_rate()
+    /// Defaults to the full Nyquist span, correct for every source that
+    /// neither resamples nor works from real audio (file, SoapySDR,
+    /// HPSDR), where the delivered spectrum IS the Nyquist span of the
+    /// stream.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        let half = self.sample_rate() / 2.0;
+        (-half, half)
     }
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;

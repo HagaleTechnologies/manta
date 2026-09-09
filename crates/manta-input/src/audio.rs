@@ -18,6 +18,28 @@ use std::path::Path;
 /// power of two), the constraint SingleChannelExtractor::new requires.
 pub const TARGET_RATE_HZ: u32 = 48_000;
 
+/// The rig-audio passband this source actually delivers, as offsets in Hz
+/// ABOVE the dial frequency (`--dial-freq-hz`).
+///
+/// MAN-86 review: these are what `SKIMMER/SETT` advertises to Aggregator as
+/// decodable coverage, and they are deliberately NOT derived from
+/// `TARGET_RATE_HZ`. Two independent reasons: `read` Hilbert-transforms
+/// real audio into an analytic signal, so all of its energy sits at
+/// POSITIVE offsets from the dial -- the negative half of a
+/// `+/- TARGET_RATE_HZ / 2` claim is on the wrong side of the dial
+/// entirely; and a receiver's AF output is the ~3 kHz passband its IF
+/// filter passes (ARCHITECTURE §3, "Degenerate ~3 kHz wideband mode"), not
+/// the 24 kHz its sound card happens to sample.
+///
+/// The values are the nominal SSB/CW-wide AF passband a rig in its widest
+/// setting delivers. A rig running a narrow CW filter passes less than
+/// this, so the claim is a superset for that operator; making it exact
+/// needs a config key for the rig's actual filter, which is out of MAN-86's
+/// scope and is why these are named constants rather than literals.
+pub const AUDIO_PASSBAND_LO_HZ: f64 = 300.0;
+/// Upper edge of the rig-audio passband -- see `AUDIO_PASSBAND_LO_HZ`.
+pub const AUDIO_PASSBAND_HI_HZ: f64 = 3_000.0;
+
 /// A real audio source (device or file) converted to analytic Complex32,
 /// implementing IqSource. ARCHITECTURE §3 "Audio passband" input.
 pub struct AudioIqSource {
@@ -78,6 +100,12 @@ impl IqSource for AudioIqSource {
         0.0 // audio has no RF reference; offset-only reporting (design doc §2)
     }
 
+    /// The rig's AF passband, ABOVE the dial frequency only -- never
+    /// `+/- TARGET_RATE_HZ / 2`. See `AUDIO_PASSBAND_LO_HZ`.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        (AUDIO_PASSBAND_LO_HZ, AUDIO_PASSBAND_HI_HZ)
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let mut real = vec![0.0f32; buf.len()];
         let got = self.src.read(&mut real)?;
@@ -105,6 +133,17 @@ mod tests {
         let mut aiq = AudioIqSource::new(src).unwrap();
         assert_eq!(aiq.sample_rate(), fs as f64);
         assert_eq!(aiq.center_freq_hz(), 0.0);
+        // MAN-86 review: coverage is the rig's AF passband above the dial,
+        // NOT the analytic stream's +/- 24 kHz Nyquist span.
+        assert_eq!(
+            aiq.rf_passband_hz(),
+            (AUDIO_PASSBAND_LO_HZ, AUDIO_PASSBAND_HI_HZ)
+        );
+        assert!(
+            aiq.rf_passband_hz().0 > 0.0,
+            "analytic audio carries no spectrum below the dial frequency"
+        );
+        assert!(aiq.rf_passband_hz().1 < aiq.sample_rate() / 2.0);
         let mut buf = vec![Complex32::new(0.0, 0.0); 4000];
         let n = aiq.read(&mut buf).unwrap();
         assert!(n > 0);

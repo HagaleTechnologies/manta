@@ -52,7 +52,11 @@ async fn spawn_server() -> (
         sett: manta_server::sett::SettSettings {
             validation_level: manta_server::sett::ValidationLevel::Normal,
             cq_only: false,
-            segments: manta_server::sett::segments_for_passband(14_040_000.0, SAMPLE_RATE_HZ),
+            segments: manta_server::sett::segments_for_passband(
+                14_040_000.0,
+                (-SAMPLE_RATE_HZ / 2.0, SAMPLE_RATE_HZ / 2.0),
+                1.0,
+            ),
         },
     });
     tokio::spawn(async move {
