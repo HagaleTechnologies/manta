@@ -97,7 +97,12 @@ pub struct DoctorReport {
     pub sample_rate_hz: f64,
     /// `IqSource::center_freq_hz()`, as actually negotiated.
     pub center_freq_hz: f64,
-    /// How long the run actually observed the source for.
+    /// How much SOURCE TIME the run actually analyzed -- derived from
+    /// samples consumed (`SampleBoundedSource`), not wall-clock elapsed
+    /// time. An unpaced file source (`--source`) can process audio far
+    /// faster (or, under load, slower) than 1:1, so wall-clock time and
+    /// source time can differ substantially; a live source is naturally
+    /// paced to real time, so the two coincide there.
     pub duration: Duration,
     /// Number of `TrackPromoted` events seen -- the detector's own ground
     /// truth for "found a candidate signal," independent of whether the
@@ -212,11 +217,18 @@ pub const MAX_DURATION: Duration = Duration::from_secs(3600);
 
 /// Wraps a source, forcing EOF (`read()` returns `Ok(0)`) once
 /// `max_samples` samples have been delivered -- see the doc comment where
-/// it's constructed in `doctor()` for why this is needed.
+/// it's constructed in `doctor()` for why this is needed. `samples_read`
+/// is shared (not owned) so `doctor()` can read the final count after
+/// `listen()` consumes and eventually drops the source -- needed to
+/// report actual SOURCE TIME consumed (round-8 review finding: the
+/// report's `duration` still reflected wall-clock elapsed time even
+/// after this wrapper started correctly bounding what gets analyzed, so
+/// an unpaced file source could analyze 30s of audio in 2s of wall time
+/// and the report would claim only 2.0s was observed).
 struct SampleBoundedSource {
     inner: Box<dyn IqSource>,
     max_samples: u64,
-    samples_read: u64,
+    samples_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl IqSource for SampleBoundedSource {
@@ -229,7 +241,9 @@ impl IqSource for SampleBoundedSource {
     }
 
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
-        if self.samples_read >= self.max_samples {
+        use std::sync::atomic::Ordering;
+        let already_read = self.samples_read.load(Ordering::Relaxed);
+        if already_read >= self.max_samples {
             return Ok(0);
         }
         // Saturate, don't truncate: on a 32-bit target a long, high-rate
@@ -240,10 +254,10 @@ impl IqSource for SampleBoundedSource {
         // -- `listen()` reads that as EOF, ending the whole run early.
         // Saturating first means `cap` is only ever bounded by `buf.len()`
         // itself (already a real usize), never spuriously zero.
-        let remaining = usize::try_from(self.max_samples - self.samples_read).unwrap_or(usize::MAX);
+        let remaining = usize::try_from(self.max_samples - already_read).unwrap_or(usize::MAX);
         let cap = remaining.min(buf.len());
         let n = self.inner.read(&mut buf[..cap])?;
-        self.samples_read += n as u64;
+        self.samples_read.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 
@@ -294,10 +308,11 @@ pub fn doctor(
     // exceed real-time delivery in the first place), so this is a no-op
     // safety net there and the actual fix for file replay.
     let max_samples = (sample_rate_hz * duration.as_secs_f64()).round() as u64;
+    let samples_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let src: Box<dyn IqSource> = Box::new(SampleBoundedSource {
         inner: src,
         max_samples,
-        samples_read: 0,
+        samples_read: samples_read.clone(),
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -350,10 +365,19 @@ pub fn doctor(
         },
         |_spot| spots_confirmed += 1,
     );
-    let observed_duration = start.elapsed();
     listen_done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
     result?;
+
+    // SOURCE time consumed, not wall-clock elapsed: an unpaced file
+    // source (`--source`) can process far more (or less) audio per
+    // wall-clock second than 1:1, so `start.elapsed()` doesn't describe
+    // what was actually analyzed (round-8 review finding). A live source
+    // is naturally paced to real time, so this is equivalent to
+    // wall-clock there anyway.
+    let observed_duration = Duration::from_secs_f64(
+        (samples_read.load(std::sync::atomic::Ordering::Relaxed) as f64 / sample_rate_hz).max(0.0),
+    );
 
     let snr_db_min = snrs.iter().copied().fold(None, |acc: Option<f32>, v| {
         Some(acc.map_or(v, |a| a.min(v)))
@@ -439,7 +463,7 @@ mod tests {
                 center_freq_hz: 0.0,
             }),
             max_samples: 100,
-            samples_read: 0,
+            samples_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let mut buf = vec![Complex32::new(0.0, 0.0); 1000];
         let n = src.read(&mut buf).unwrap();
@@ -449,6 +473,12 @@ mod tests {
             n2, 0,
             "must report EOF once max_samples have been delivered, even though the wrapped \
              source has 900 more samples available"
+        );
+        assert_eq!(
+            src.samples_read.load(std::sync::atomic::Ordering::Relaxed),
+            100,
+            "the shared counter doctor() reads after listen() returns must reflect exactly what \
+             was delivered"
         );
     }
 
@@ -681,13 +711,13 @@ mod tests {
         // v1_source() is actually 120s of audio (vectors::v1()'s own
         // duration_s) -- delivered unpaced (as fast as processing allows,
         // not paced to real time), so even a --duration far shorter than
-        // 120s finishes near-instantly in wall-clock terms. That's a
-        // different mechanism than "the source ran out of samples early"
-        // (this test's original framing was wrong about that), but the
-        // same assertion still proves the watchdog isn't the thing making
-        // this slow: a fixed-duration watchdog with no early-exit signal
-        // would still block for the full 30s regardless of how fast the
-        // source itself returns.
+        // 120s finishes near-instantly in WALL-CLOCK terms. SampleBoundedSource
+        // still caps the SOURCE time consumed at the requested 30s (round-6
+        // fix), and report.duration now reflects that source time, not wall
+        // time (round-8 fix) -- so the two assertions below check two
+        // different things on purpose: this call must be fast (wall clock),
+        // but must still faithfully report having analyzed close to the
+        // full requested 30s of audio content.
         let report = doctor(
             v1_source(),
             &PipelineConfig::default(),
@@ -700,7 +730,14 @@ mod tests {
              the watchdog must exit as soon as listen() returns, not sleep out the full duration",
             start.elapsed()
         );
-        assert!(report.duration < Duration::from_secs(10));
+        assert!(
+            report.duration >= Duration::from_secs(29)
+                && report.duration <= Duration::from_secs(30),
+            "report.duration should reflect ~30s of SOURCE time consumed (SampleBoundedSource's \
+             own bound), not the near-instant wall-clock time this unpaced replay actually took, \
+             got {:?}",
+            report.duration
+        );
     }
 
     /// Regression: an even-length input must average the two middle
