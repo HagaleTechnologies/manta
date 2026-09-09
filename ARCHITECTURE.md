@@ -21,7 +21,7 @@ marked **(research-dependent)** are the only intentionally open questions.
  IQ/WAV file ──▶│       │ config                    ┌──────────▼────────────┐  │
  rig audio ────▶│       │                           │  decoder pool         │  │
  (cpal)         │       │                           │  (per-signal CW       │  │
-                │       │                           │   decoders, N ≤ 500)  │  │
+                │       │                           │   decoders, N ≤ 1200) │  │
                 │       │                           └──────────┬────────────┘  │
                 │       │                                      │ decoded text  │
                 │  ┌────┴─────┐   ┌─────────────┐   ┌──────────▼────────────┐  │
@@ -157,8 +157,12 @@ keying doesn't inflate its own floor). A channel goes *active* when smoothed pow
 exceeds floor + threshold (default 6 dB) with hysteresis (3 dB drop + 5 s hang to
 survive QSB and inter-word gaps). Active channel ⇒ a **track** (center channel ±1
 neighbor, combined by max-power selection) ⇒ a decoder is leased from the pool.
-Track cap (default 500) with lowest-SNR eviction; evictions are counted and
-reported (no silent coverage loss).
+Track cap (default 1200, MAN-166: raised from 500, which was never
+stress-tested against real contest-band signal density and was pinned at
+its ceiling for the entire duration of a real 15-minute recording,
+`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`) with
+lowest-SNR eviction; evictions are counted and reported (no silent
+coverage loss).
 
 **CPU budget** (the reason this whole design is viable):
 

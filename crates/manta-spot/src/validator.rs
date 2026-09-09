@@ -782,7 +782,7 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate.record(freq_hz, &candidate, sample_ts) as u32
+            self.gate.record(track_id, freq_hz, &candidate, sample_ts) as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;

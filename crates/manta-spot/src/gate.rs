@@ -13,19 +13,26 @@ const WINDOW_SECONDS: f64 = 90.0;
 /// bucket alone isn't sufficient identity.
 const FREQ_BUCKET_HZ: f64 = 100.0;
 
-/// Minimum gap, in seconds, between two decodes for the later one to
-/// count as a genuinely distinct occurrence rather than a near-duplicate
-/// (Codex review, PR #152). Neighbor-bucket matching (see `record`'s doc)
-/// widens the frequency net two real, simultaneous tracks decoding the
-/// SAME over-the-air transmission can fall into -- a known real
+/// Minimum gap, in seconds, between two *different tracks'* decodes for
+/// the later one to count as a genuinely distinct occurrence rather than
+/// a near-duplicate (Codex review, PR #152). Bucketing by frequency alone
+/// (see `record`'s doc) can't tell a duplicate-spawn track decoding the
+/// SAME over-the-air transmission as another track -- a known real
 /// phenomenon (spectral splatter spawning more than one candidate for one
 /// signal) that `merge_converged` doesn't always catch before both reach
-/// a full decode. Two such tracks' `WordBoundary`s land within roughly
-/// one word's keying duration of each other; a genuine re-transmission
-/// (the operator re-keying) is a real pause later. 1.0s sits below any
-/// realistic contest CQ repeat cadence while comfortably exceeding a
-/// single word's decode duration -- a reasoned choice, not yet measured
-/// against real data the way `on_snr_db`/`CHAR_GAP_DITS` were.
+/// a full decode -- from a genuine, later re-transmission. Two duplicate
+/// tracks' `WordBoundary`s land within roughly one word's keying duration
+/// of each other; a real re-transmission (the operator re-keying) is a
+/// real pause later. 1.0s sits below any realistic contest CQ repeat
+/// cadence while comfortably exceeding a single word's decode duration --
+/// a reasoned choice, not yet measured against real data the way
+/// `on_snr_db`/`CHAR_GAP_DITS` were. Only applies across *different*
+/// track_ids: the same track decoding two words close together (a real
+/// pattern -- a CQing station double-calling its own callsign
+/// back-to-back within one transmission, e.g. "CQ K5ARH K5ARH K",
+/// specifically so the transmission carries its own two confirmations)
+/// is always genuine, since one continuous decode stream can't decode the
+/// same instant twice.
 const MIN_OCCURRENCE_GAP_SECONDS: f64 = 1.0;
 
 fn bucket(freq_hz: f64) -> i64 {
@@ -42,7 +49,7 @@ pub struct RepetitionGate {
     /// 90s window the instant a track churned, regardless of whether the
     /// same callsign was still genuinely repeating. A frequency bucket
     /// survives that churn.
-    seen: BTreeMap<(i64, String), Vec<u64>>,
+    seen: BTreeMap<(i64, String), Vec<(u64, u32)>>,
     /// Cumulative count of `record()` calls, for life. MAN-19 round 3:
     /// the only direct evidence that this gate's state was ever touched
     /// at all -- a soak whose decoding regressed to metadata-only output
@@ -63,9 +70,9 @@ impl RepetitionGate {
         }
     }
 
-    /// Records one decode of `callsign` at `freq_hz` at `sample_ts`.
-    /// Returns the number of distinct decodes within the trailing window
-    /// (including this one).
+    /// Records one decode of `callsign` by `track_id` at `freq_hz` at
+    /// `sample_ts`. Returns the number of distinct decodes within the
+    /// trailing window (including this one).
     ///
     /// A single `bucket(freq_hz)` lookup isn't sufficient identity on its
     /// own: two decodes of the same real signal can round to *different*
@@ -77,53 +84,38 @@ impl RepetitionGate {
     /// that one if found, rather than always keying strictly by its own
     /// freshly-computed bucket.
     ///
-    /// That neighbor search cuts the other way too (same review): it
-    /// widens the frequency net enough that two genuinely different,
-    /// simultaneous tracks decoding the same real transmission (a known
-    /// duplicate-candidate phenomenon) could both land in the same entry
-    /// within milliseconds of each other, turning one real transmission
-    /// into a false second confirmation. So the minimum-gap check below
-    /// applies *only* when the match came from a neighbor bucket, not the
-    /// decode's own exact bucket: a legitimate real pattern -- a CQing
+    /// That widened net cuts the other way too (same review): two
+    /// genuinely different, simultaneous tracks decoding the same real
+    /// transmission (a known duplicate-candidate phenomenon
+    /// `merge_converged` doesn't always catch in time) could land in the
+    /// same bucket -- the exact one, not just a neighbor -- and both
+    /// credit the same entry within milliseconds of each other. `track_id`
+    /// is what actually distinguishes that from a real pattern (a CQing
     /// station double-calling its own callsign back-to-back within one
-    /// transmission ("CQ K5ARH K5ARH K") specifically so the transmission
-    /// carries its own two confirmations -- decodes both instances at the
-    /// *same* frequency (the exact bucket), and must not be penalized by
-    /// a check that exists to catch a *different* signal's track a
-    /// neighbor bucket away, not a genuine same-signal repeat. `entry`'s
+    /// transmission): see `MIN_OCCURRENCE_GAP_SECONDS`'s doc. `entry`'s
     /// timestamps are assumed non-decreasing (the pipeline resequences
     /// events by `sample_ts` before they reach here, SPEC §6 rule 6), so
     /// comparing against just the last one is sufficient.
-    pub fn record(&mut self, freq_hz: f64, callsign: &str, sample_ts: u64) -> usize {
+    pub fn record(&mut self, track_id: u32, freq_hz: f64, callsign: &str, sample_ts: u64) -> usize {
         self.records_total += 1;
         let b = bucket(freq_hz);
-        let home = (b, callsign.to_string());
-        let (key, from_neighbor) = if self.seen.contains_key(&home) {
-            (home, false)
-        } else {
-            match [b - 1, b + 1]
-                .into_iter()
-                .map(|candidate| (candidate, callsign.to_string()))
-                .find(|k| self.seen.contains_key(k))
-            {
-                Some(k) => (k, true),
-                None => (home, false),
-            }
-        };
+        let key = (b - 1..=b + 1)
+            .map(|candidate| (candidate, callsign.to_string()))
+            .find(|k| self.seen.contains_key(k))
+            .unwrap_or((b, callsign.to_string()));
         let entry = self.seen.entry(key).or_default();
-        let is_distinct_occurrence = if from_neighbor {
-            match entry.last() {
-                Some(&last) => sample_ts.saturating_sub(last) >= self.min_occurrence_gap_samples,
-                None => true,
+        let is_distinct_occurrence = match entry.last() {
+            Some(&(last_ts, last_track)) => {
+                track_id == last_track
+                    || sample_ts.saturating_sub(last_ts) >= self.min_occurrence_gap_samples
             }
-        } else {
-            true
+            None => true,
         };
         if is_distinct_occurrence {
-            entry.push(sample_ts);
+            entry.push((sample_ts, track_id));
         }
         let cutoff = sample_ts.saturating_sub(self.window_samples);
-        entry.retain(|&ts| ts >= cutoff);
+        entry.retain(|&(ts, _)| ts >= cutoff);
         entry.len()
     }
 
@@ -162,9 +154,9 @@ impl RepetitionGate {
     /// keep `seen` bounded without needing a dedicated timer.
     pub fn sweep(&mut self, now_ts: u64) {
         let cutoff = now_ts.saturating_sub(self.window_samples);
-        self.seen.retain(|_, timestamps| {
-            timestamps.retain(|&ts| ts >= cutoff);
-            !timestamps.is_empty()
+        self.seen.retain(|_, occurrences| {
+            occurrences.retain(|&(ts, _)| ts >= cutoff);
+            !occurrences.is_empty()
         });
     }
 }
@@ -178,45 +170,46 @@ mod tests {
     #[test]
     fn first_decode_counts_as_one() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(7_080_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0), 1);
     }
 
     #[test]
     fn second_decode_within_window_counts_as_two() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(7_080_000.0, "K5ARH", 0);
-        assert_eq!(gate.record(7_080_000.0, "K5ARH", 300_000), 2);
+        gate.record(1, 7_080_000.0, "K5ARH", 0);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 300_000), 2);
     }
 
     #[test]
     fn decode_outside_window_resets_the_count() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(7_080_000.0, "K5ARH", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
-        assert_eq!(gate.record(7_080_000.0, "K5ARH", window_samples + 1), 1);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", window_samples + 1), 1);
     }
 
     #[test]
     fn different_frequencies_and_callsigns_are_independent() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(7_080_000.0, "K5ARH", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0);
         // Far enough apart (>1 bucket width) to land outside neighbor matching.
-        assert_eq!(gate.record(7_081_000.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(7_080_000.0, "W1AW", 0), 1);
+        assert_eq!(gate.record(1, 7_081_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 7_080_000.0, "W1AW", 0), 1);
     }
 
     /// A real signal's track closing and reopening under a new `track_id`
     /// (e.g. `CloseReason::HangExpired`) must not reset its repetition
     /// count -- that's the whole point of keying by frequency bucket
     /// instead of `track_id` (MAN-166). Two `record` calls for the same
-    /// bucket+callsign, with a `sweep` between them (as `Validator::ingest`
+    /// bucket+callsign under *different* track_ids (simulating the close
+    /// + reopen), with a `sweep` between them (as `Validator::ingest`
     /// does on every `TrackClosed`), still accumulate to 2.
     #[test]
     fn sweep_between_two_records_does_not_reset_the_count() {
         let mut gate = RepetitionGate::new(FS);
-        gate.record(7_080_000.0, "K5ARH", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0);
         gate.sweep(0);
-        assert_eq!(gate.record(7_080_000.0, "K5ARH", 300_000), 2);
+        assert_eq!(gate.record(2, 7_080_000.0, "K5ARH", 300_000), 2);
     }
 
     /// `sweep` prunes only entries whose timestamps have fully aged out of
@@ -227,12 +220,12 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
 
-        gate.record(7_080_000.0, "K5ARH", 0); // will age out, never refreshed
-        gate.record(7_090_000.0, "W1AW", 0);
+        gate.record(1, 7_080_000.0, "K5ARH", 0); // will age out, never refreshed
+        gate.record(2, 7_090_000.0, "W1AW", 0);
         // A genuine later occurrence (comfortably past both the
         // minimum-occurrence gap and, eventually, `now`'s cutoff) keeps
         // W1AW's entry alive.
-        gate.record(7_090_000.0, "W1AW", window_samples + 1);
+        gate.record(2, 7_090_000.0, "W1AW", window_samples + 1);
 
         gate.sweep(window_samples * 2);
 
@@ -248,49 +241,48 @@ mod tests {
     /// 100 Hz buckets (140000 vs 140001) despite being the same signal --
     /// the exact centroid-drift-across-a-boundary case this bucketing
     /// exists to tolerate. Both must still count toward the same
-    /// repetition total.
+    /// repetition total (different track_ids, simulating the track that
+    /// drifted closing and reopening).
     #[test]
     fn a_decode_just_across_a_bucket_boundary_still_counts_toward_the_same_signal() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(14_000_049.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(14_000_051.0, "K5ARH", 300_000), 2);
+        assert_eq!(gate.record(1, 14_000_049.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(2, 14_000_051.0, "K5ARH", 300_000), 2);
     }
 
-    /// Codex review, PR #152: neighbor-bucket matching (added for the
-    /// boundary-crossing test above) creates a new risk -- two genuinely
-    /// *different*, simultaneous tracks decoding the same real
-    /// over-the-air transmission at nearby frequencies (a known real
-    /// phenomenon `merge_converged` doesn't always catch in time) would
-    /// otherwise both credit the same (bucket, callsign) entry within
-    /// milliseconds of each other, inflating one real transmission into a
-    /// false `reps == 2` "second confirmation". A decode within
-    /// `MIN_OCCURRENCE_GAP_SECONDS` of the entry's most recent timestamp
-    /// must not count as a distinct occurrence.
+    /// Codex review, PR #152 (both rounds): two genuinely *different*,
+    /// simultaneous tracks decoding the same real over-the-air
+    /// transmission (a known real phenomenon `merge_converged` doesn't
+    /// always catch in time) must not both credit the same entry --
+    /// whether they land in the exact same bucket or a neighbor one. A
+    /// different track_id within `MIN_OCCURRENCE_GAP_SECONDS` of the
+    /// entry's latest timestamp must not count as a distinct occurrence;
+    /// a genuine later re-transmission still does.
     #[test]
-    fn near_simultaneous_decodes_at_nearby_frequencies_do_not_double_count() {
+    fn near_simultaneous_decodes_from_a_different_track_do_not_double_count() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(14_000_000.0, "K5ARH", 0), 1); // bucket 140000
-                                                              // Same instant, a different (duplicate-spawn) track in the
-                                                              // *neighbor* bucket (140001) -- too close in time to be a genuine
-                                                              // second occurrence.
-        assert_eq!(gate.record(14_000_060.0, "K5ARH", 1_000), 1);
+        // Same exact bucket, different (duplicate-spawn) track, same instant.
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 1_000), 1);
+        // Neighbor bucket, yet another track, still the same instant.
+        assert_eq!(gate.record(3, 14_000_060.0, "K5ARH", 1_500), 1);
         // A real, later re-transmission (comfortably past the minimum
-        // gap) still counts.
-        assert_eq!(gate.record(14_000_000.0, "K5ARH", 300_000), 2);
+        // gap; track_id doesn't matter here) still counts.
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 300_000), 2);
     }
 
-    /// The minimum-gap check above must apply only to a *neighbor*-bucket
-    /// match, never to a decode's own exact bucket: a real CQing station
-    /// double-calling its own callsign back-to-back within one
-    /// transmission ("CQ K5ARH K5ARH K", a deliberate real practice so
-    /// the transmission carries its own two confirmations) decodes both
-    /// instances at the *same* frequency, often well under a second
-    /// apart, and must still count as two.
+    /// The minimum-gap check above must never apply *within* a single
+    /// track: a real CQing station double-calling its own callsign
+    /// back-to-back within one transmission ("CQ K5ARH K5ARH K", a
+    /// deliberate real practice so the transmission carries its own two
+    /// confirmations) decodes both instances on the same track, often
+    /// well under a second apart, and must still count as two -- one
+    /// continuous decode stream can't decode the same instant twice.
     #[test]
-    fn rapid_same_frequency_repeats_are_never_rejected_as_near_simultaneous() {
+    fn rapid_same_track_repeats_are_never_rejected_as_near_simultaneous() {
         let mut gate = RepetitionGate::new(FS);
-        assert_eq!(gate.record(14_000_000.0, "K5ARH", 0), 1);
-        assert_eq!(gate.record(14_000_000.0, "K5ARH", 500), 2);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 0), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 500), 2);
     }
 
     /// MAN-19's original concern (unbounded growth under sustained track
@@ -304,7 +296,7 @@ mod tests {
         // 1 kHz apart: far outside neighbor-bucket matching range, so each
         // gets its own entry.
         for i in 0..10_000i64 {
-            gate.record(i as f64 * 1000.0, "K5ARH", 0);
+            gate.record(i as u32, i as f64 * 1000.0, "K5ARH", 0);
         }
         gate.sweep(window_samples + 1);
         assert_eq!(
