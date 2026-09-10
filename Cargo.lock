@@ -884,6 +884,7 @@ dependencies = [
  "coppa-audio",
  "ctrlc",
  "manta-decode",
+ "manta-dsp",
  "manta-engine",
  "manta-input",
  "manta-server",

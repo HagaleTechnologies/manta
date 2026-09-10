@@ -35,5 +35,6 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 coppa-audio = { workspace = true }
 serde_json = { workspace = true }
+manta-dsp = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
