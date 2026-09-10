@@ -93,11 +93,27 @@ pub fn listen(
     on_event: impl FnMut(&DecoderEvent),
     on_spot: impl FnMut(&crate::Spot),
 ) -> Result<()> {
-<<<<<<< HEAD
-    listen_with_track_count(src, cfg, stop, on_event, on_spot, |_n| {})
+    listen_with_observers(
+        src,
+        cfg,
+        stop,
+        ListenObservers::default(),
+        on_event,
+        on_spot,
+        |_n| {},
+    )
 }
 
-/// `listen()` plus a live per-batch observer: `on_tracks` is called with
+/// Like `listen`, but additionally publishes engine-owned live state (the
+/// active-track count) to the caller two ways: into `observers`, a shared
+/// atomic a consumer on another thread can poll on its own schedule
+/// (MAN-45), and to `on_tracks`, a synchronous per-batch callback (MAN-122).
+/// Both carry the same number; they exist side by side because they answer
+/// different questions -- see `ListenObservers`'s doc comment for why the
+/// gauge is an atomic, and the `on_tracks` paragraphs below for why the
+/// daemon additionally needs the per-batch *edge*.
+///
+/// `on_tracks` is called with
 /// `TrackManager::decoding_track_count()` after every batch the pipeline
 /// processes, including the final `finish()`, which reports 0.
 ///
@@ -121,27 +137,10 @@ pub fn listen(
 /// real decoders are running on weak or unmodulated signals. This is the
 /// count that cannot lie about that.
 ///
-/// Kept as a separate entry point rather than a sixth parameter on
+/// Kept as a separate entry point rather than extra parameters on
 /// `listen()` so the existing callers and tests are untouched; `listen()`
 /// is now a no-op-observer wrapper over this.
-pub fn listen_with_track_count(
-=======
-    listen_with_observers(
-        src,
-        cfg,
-        stop,
-        ListenObservers::default(),
-        on_event,
-        on_spot,
-    )
-}
-
-/// Like `listen`, but additionally publishes engine-owned live state
-/// (currently just the active-track count) into `observers` as the decode
-/// loop runs. See `ListenObservers`'s doc comment for why this is a shared
-/// atomic rather than a third callback.
 pub fn listen_with_observers(
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
     mut src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
     stop: Arc<AtomicBool>,
@@ -191,12 +190,23 @@ pub fn listen_with_observers(
         validator.allowlist(call);
     }
 
-    // O(1) (`TrackManager::active_track_count` is `tracks.len()`), once per
-    // processed chunk and skipped entirely when no observer is registered
-    // -- immaterial against the Pi4 CPU budget.
-    let report_active_tracks = |tm: &crate::track::TrackManager| {
+    // One relaxed store over a count that is a single filtered pass across
+    // the (cap-bounded) track map, once per processed chunk and skipped
+    // entirely when no observer is registered -- immaterial against the Pi4
+    // CPU budget and against the channelizer + TrackManager work it follows.
+    //
+    // MAN-122: the published number is `decoding_track_count()`, NOT
+    // `active_track_count()`. MAN-45 introduced this gauge against the
+    // latter (every entry in `tracks`, unconfirmed CANDIDATEs included);
+    // candidates are mostly noise-blip rise crossings that close within
+    // `confirm_hops` without ever leasing a decoder, so counting them
+    // inflates an operator-facing "is it decoding?" reading with signals
+    // nothing is decoding. See `TrackManager::decoding_track_count`'s doc
+    // comment for the full argument. `active_track_count` keeps its
+    // existing meaning for `soak_metrics`' peak/eviction accounting.
+    let report_active_tracks = |n_tracks: usize| {
         if let Some(gauge) = &observers.active_tracks {
-            gauge.store(tm.active_track_count() as u64, Ordering::Relaxed);
+            gauge.store(n_tracks as u64, Ordering::Relaxed);
         }
     };
 
@@ -209,22 +219,18 @@ pub fn listen_with_observers(
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
-    on_tracks(tm.decoding_track_count());
-=======
-    report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    let n_tracks = tm.decoding_track_count();
+    report_active_tracks(n_tracks);
+    on_tracks(n_tracks);
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
-    on_tracks(tm.decoding_track_count());
-=======
-    report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    let n_tracks = tm.decoding_track_count();
+    report_active_tracks(n_tracks);
+    on_tracks(n_tracks);
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -243,6 +249,7 @@ pub fn listen_with_observers(
         let n = match src.read(&mut chunk) {
             Ok(n) => n,
             Err(e) => {
+                report_active_tracks(0);
                 on_tracks(0);
                 return Err(e);
             }
@@ -258,11 +265,9 @@ pub fn listen_with_observers(
                 on_spot(&spot);
             }
         }
-<<<<<<< HEAD
-        on_tracks(tm.decoding_track_count());
-=======
-        report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+        let n_tracks = tm.decoding_track_count();
+        report_active_tracks(n_tracks);
+        on_tracks(n_tracks);
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
@@ -270,17 +275,12 @@ pub fn listen_with_observers(
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
-    // `finish()` flushes and drops every decoder: nothing is being decoded
-    // once the stream has ended, so the gauge must not be left holding the
-    // last live value after a source disconnects or a replay hits EOF.
+    // `finish()` flushes and drops every decoder and closes every remaining
+    // track: nothing is being decoded once the stream has ended, so both
+    // observers must settle back to 0 rather than be left holding the last
+    // live value after a source disconnects or a replay hits EOF.
+    report_active_tracks(0);
     on_tracks(0);
-=======
-    // `finish()` closes every remaining track, so the gauge must settle
-    // back to 0 here rather than being left at whatever the last processed
-    // chunk reported.
-    report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
     Ok(())
 }
 
@@ -316,10 +316,12 @@ mod tests {
 
     /// MAN-45 (PR #63 round-9 finding): `manta_active_tracks` reported a
     /// constant 0 on every production run because `listen()` exposed no
-    /// live track count to its caller -- `TrackManager::active_track_count()`
-    /// existed but was reachable only from inside the engine. This proves
-    /// the observer handle tracks the real count during the run and settles
-    /// at 0 afterward (`TrackManager::finish()` closes every track).
+    /// live track count to its caller -- the manager's own count existed but
+    /// was reachable only from inside the engine. This proves the observer
+    /// handle tracks the real count during the run and settles at 0
+    /// afterward (`TrackManager::finish()` closes every track). MAN-122: the
+    /// number published here is `decoding_track_count()`, so an unconfirmed
+    /// noise candidate can never lift it off 0.
     #[test]
     fn listen_with_observers_publishes_a_live_active_track_count() {
         use std::sync::atomic::AtomicU64;
@@ -345,6 +347,7 @@ mod tests {
             },
             |_ev| peak = peak.max(observed.load(Ordering::Relaxed)),
             |_spot| {},
+            |_n| {},
         )
         .unwrap();
 
@@ -412,6 +415,7 @@ mod tests {
             },
             |_ev| {},
             |_spot| {},
+            |_n| {},
         )
         .unwrap_err();
         assert!(
@@ -514,10 +518,11 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut counts: Vec<usize> = Vec::new();
-        listen_with_track_count(
+        listen_with_observers(
             src,
             &PipelineConfig::default(),
             stop,
+            ListenObservers::default(),
             |_ev| {},
             |_spot| {},
             |n| counts.push(n),
@@ -575,7 +580,7 @@ mod tests {
     }
 
     /// MAN-122 review round 3: a mid-stream `IqSource::read` failure exits
-    /// `listen_with_track_count` before the end-of-stream `on_tracks(0)`,
+    /// `listen_with_observers` before the end-of-stream `on_tracks(0)`,
     /// so without an explicit zero on the error path the daemon's
     /// `manta_active_tracks` gauge (and the status line's `tracks=`) would
     /// stay frozen at its last nonzero value for the whole shutdown drain
@@ -593,10 +598,11 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut counts: Vec<usize> = Vec::new();
-        let err = listen_with_track_count(
+        let err = listen_with_observers(
             src,
             &PipelineConfig::default(),
             stop,
+            ListenObservers::default(),
             |_ev| {},
             |_spot| {},
             |n| counts.push(n),

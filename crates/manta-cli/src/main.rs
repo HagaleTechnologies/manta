@@ -826,6 +826,21 @@ struct SpotServer {
     /// life of the process, so re-running the same binary search on every
     /// spot only re-derives a constant.
     station_geography_unresolved: bool,
+    /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
+    /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
+    /// task's actual exit right after `shutdown_tx.send(true)` and before
+    /// the client drain begins. The task's own two shutdown guards (a
+    /// `biased` select and a re-borrow after the sleep) still leave a
+    /// check-to-log window: shutdown can be signalled between the second
+    /// borrow returning `false` and the `tracing::info!` that follows, so a
+    /// status line could still land in the middle of the drain. Awaiting
+    /// the handle here is what makes shutdown and emission mutually
+    /// ordered -- once the join returns, the task is gone and no further
+    /// line can be emitted. `None` when the status line is disabled
+    /// (`status_interval_secs = 0`), in which case there is nothing to
+    /// await. `Mutex<Option<..>>` because shutdown only ever holds
+    /// `&SpotServer` and must `take()` the handle to join it.
+    status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
@@ -1117,7 +1132,7 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let status_line = rt.block_on(async {
         let telnet_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
         let json_listener =
@@ -1243,8 +1258,10 @@ fn start_spot_server(
             ));
         }
 
-        // MAN-122 scenario 2.
-        manta_server::status::spawn_status_line(
+        // MAN-122 scenario 2. The handle travels out of this block and
+        // into `SpotServer::status_line` so shutdown can join the task --
+        // see that field's doc comment.
+        let status_line = manta_server::status::spawn_status_line(
             metrics.clone(),
             cfg.status_interval_secs
                 .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
@@ -1254,7 +1271,7 @@ fn start_spot_server(
             shutdown_rx.clone(),
         );
 
-        anyhow::Ok(())
+        anyhow::Ok(status_line)
     })?;
 
     Ok((
@@ -1266,6 +1283,7 @@ fn start_spot_server(
             tasks,
             station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
             cty,
+            status_line: std::sync::Mutex::new(status_line),
         },
     ))
 }
@@ -1469,46 +1487,31 @@ fn main() -> Result<()> {
                                 .as_nanos(),
                         };
 
-<<<<<<< HEAD
-                    let (rt, server) = start_spot_server(
-                        &path,
-                        SourceInfo {
-                            name: source_name,
-                            sample_rate_hz: src.sample_rate(),
-                            dial_freq_hz: src.center_freq_hz(),
-                        },
-                        epoch,
-                        session_nonce,
-                    )?;
-                    // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` is populated below,
-                    // from `manta_engine::listen_with_track_count`'s
-                    // observer, which reports `TrackManager`'s own
-                    // promoted-track count (MAN-122).
-                    //
-                    // MAN-55: for a source where `open()` succeeding
-                    // doesn't confirm a live device (HPSDR's UDP
-                    // connect/send need no peer response at all),
-                    // `confirmed_live_handle()` returns Some, and health
-                    // starts false, flipping true only once the source's
-                    // own read loop has actually processed a valid
-                    // packet. Every other source type (Kiwi/Soapy/audio/
-                    // file) returns None from the trait's default and
-                    // keeps the original immediate-true behavior, since
-                    // opening those already implies liveness.
-                    match src.confirmed_live_handle() {
-                        Some(live) => {
-                            server.metrics.set_source_health(source_name, false);
-                            let metrics = server.metrics.clone();
-=======
-                        let (rt, server) =
-                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                        // MAN-122: the banner `start_spot_server` logs names
+                        // the source, its sample rate and its dial frequency,
+                        // so all three are read HERE, before `src` is moved
+                        // into the pipeline below.
+                        let (rt, server) = start_spot_server(
+                            &path,
+                            SourceInfo {
+                                name: source_name,
+                                sample_rate_hz: src.sample_rate(),
+                                dial_freq_hz: src.center_freq_hz(),
+                            },
+                            epoch,
+                            session_nonce,
+                        )?;
                         // MAN-45 (round-9 finding): the daemon's own copy of the
                         // gauge `manta_engine::listen_with_observers` updates as
                         // it runs (on the MAIN thread, outside this tokio
                         // runtime) -- polled into `Metrics` below, the same
                         // bridge shape MAN-55's `confirmed_live_handle` watcher
-                        // uses for source liveness.
+                        // uses for source liveness. MAN-122 additionally takes
+                        // the same count synchronously off `listen`'s per-batch
+                        // `on_tracks` callback, for the status line's
+                        // decode-progress heartbeat, which a polled gauge value
+                        // cannot express (a steady count and a wedged decode
+                        // loop look identical through the atomic alone).
                         let active_tracks =
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                         // MAN-45 remediate (code-review finding 1): the
@@ -1521,7 +1524,6 @@ fn main() -> Result<()> {
                         let active_tracks_poller = {
                             let gauge = active_tracks.clone();
                             let track_metrics = server.metrics.clone();
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                             rt.spawn(async move {
                                 loop {
                                     track_metrics.set_active_tracks(
@@ -1583,39 +1585,12 @@ fn main() -> Result<()> {
                             });
                         }
 
-<<<<<<< HEAD
-                    // MAN-56: HPSDR's packet loss/malformed counters are
-                    // input-layer state manta-server cannot compute itself
-                    // (it has no manta-input dependency). Sample them into
-                    // Metrics on a timer, the same wiring-layer-injection
-                    // shape `set_source_health` uses above -- and read the
-                    // handle HERE, before `listen(src, ..)` below takes
-                    // ownership of the source for the rest of the run.
-                    // Sources with no wire-packet loss model return None
-                    // and publish no series at all, which is deliberate:
-                    // a permanently-zero counter reads as "no loss" rather
-                    // than "not measured" (ARCHITECTURE §8, "absent means
-                    // not measured").
-                    if let Some(counters) = src.health_counters() {
-                        let metrics = server.metrics.clone();
-                        // Published once eagerly so the series exists (at
-                        // 0) from the very first scrape rather than only
-                        // after one poll interval.
-                        metrics.set_input_health(source_name, input_health_of(&counters));
-                        rt.spawn(async move {
-                            loop {
-                                tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
-                                metrics.set_input_health(source_name, input_health_of(&counters));
-                            }
-                        });
-=======
                         (
                             Some(rt),
                             Some(server),
                             Some(active_tracks),
                             Some(active_tracks_poller),
                         )
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                     }
                     None => (None, None, None, None),
                 };
@@ -1625,15 +1600,11 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-<<<<<<< HEAD
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
             let mut pipeline_ready_logged = false;
-            let listen_result = manta_engine::listen_with_track_count(
-=======
             let listen_result = manta_engine::listen_with_observers(
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                 src,
                 &cfg,
                 stop,
@@ -1775,6 +1746,27 @@ fn main() -> Result<()> {
                 }
                 server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
+                // MAN-122 review round 4 (P2): shutdown is signalled ABOVE
+                // and the periodic status task is joined HERE, before the
+                // client drain below starts -- the task's own guards order
+                // shutdown against its two `select!` poll points, but not
+                // against the wall clock between its last `shutdown.borrow()`
+                // and the `tracing::info!` that follows, so a line could
+                // otherwise still be emitted into the middle of the drain.
+                // Joining makes the two mutually ordered: `spawn_status_line`
+                // returns from its `shutdown.changed()` arm as soon as the
+                // send above is observed, so this wait is bounded by one
+                // scheduler poll, not by `status_interval_secs`.
+                if let Some(status_line) = server
+                    .status_line
+                    .lock()
+                    .expect("status-line handle mutex poisoned")
+                    .take()
+                {
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(status_line);
+                    }
+                }
             }
             // `server_runtime`/`spot_server` are always constructed as a
             // matched pair (both `Some` or both `None`, see their
@@ -2104,6 +2096,65 @@ mod tests {
              a handler can already be running when shutdown fires, plus \
              CLIENT_DRAIN_DEADLINE = {:?} for its own drain loop once it gets there)",
             manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
+    }
+
+    /// MAN-122 review round 4 (P2): `spawn_status_line`'s in-task guards
+    /// cannot close the window between its post-sleep `shutdown.borrow()`
+    /// and its `tracing::info!`, so the daemon must order the two from the
+    /// outside -- retain the task's `JoinHandle` and AWAIT it right after
+    /// signalling shutdown, before the client drain starts. This pins both
+    /// halves of that: the handle really is retained on `SpotServer` for a
+    /// config that enables the status line (a discarded handle is
+    /// unjoinable and the ordering is unenforceable), and joining it after
+    /// `shutdown_tx.send(true)` completes promptly rather than blocking for
+    /// a whole `status_interval_secs`.
+    #[test]
+    fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
+        let cfg_file = write_temp_file(
+            br#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                status_interval_secs = 3600
+                "#,
+        );
+
+        let (rt, server) = start_spot_server(
+            cfg_file.path(),
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        let handle =
+            server.status_line.lock().unwrap().take().expect(
+                "a non-zero status_interval_secs must leave a joinable handle on SpotServer",
+            );
+
+        let _ = server.shutdown_tx.send(true);
+        // One hour of configured interval against a one-second budget: this
+        // can only pass because the task's `shutdown.changed()` arm is
+        // `biased`-first and returns without waiting for the next tick.
+        let joined = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle).await
+        });
+        assert!(
+            joined.is_ok(),
+            "the status task must be joinable within a scheduler poll of shutdown, \
+             not at the next status_interval_secs tick"
+        );
+        assert!(
+            joined.unwrap().is_ok(),
+            "the status task must exit cleanly, not panic"
         );
     }
 

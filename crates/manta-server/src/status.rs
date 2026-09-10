@@ -192,6 +192,21 @@ pub fn spots_per_min(delta_spots: u64, elapsed: Duration) -> f64 {
 /// interval` (unused anywhere in this workspace), but additionally raced
 /// against the shutdown watch so the task cannot emit a status line into
 /// the middle of the shutdown drain.
+///
+/// **The returned `JoinHandle` is part of the contract, not a convenience:
+/// a caller that signals shutdown MUST await it before it starts draining
+/// clients** (MAN-122 review round 4, P2). The two in-task guards below
+/// order shutdown against this task's own `select!` poll points, but
+/// nothing orders it against the wall clock between the post-sleep
+/// `shutdown.borrow()` returning `false` and the `tracing::info!` that
+/// follows -- a shutdown landing inside that window still yields one
+/// status line printed into the middle of the drain, claiming a liveness
+/// the daemon no longer has. Joining the handle is what makes shutdown and
+/// emission mutually ordered from the outside, and it is cheap: the
+/// `shutdown.changed()` arm is `biased`-first, so the task returns within
+/// one scheduler poll of the signal rather than at the next `interval`
+/// tick. `manta-cli`'s `main` does exactly this, via
+/// `SpotServer::status_line`.
 pub fn spawn_status_line(
     metrics: Arc<Metrics>,
     interval: Duration,
@@ -231,8 +246,20 @@ pub fn spawn_status_line(
             // Second guard, for a shutdown that lands between the sleep
             // completing and this line: `biased` orders the two futures
             // within one poll, it does not order them against the wall
-            // clock. Cheap (one `watch` borrow) and it closes the window
-            // completely.
+            // clock. Cheap (one `watch` borrow).
+            //
+            // MAN-122 review round 4 (P2): this guard narrows the window,
+            // it does NOT close it -- a shutdown signalled after this
+            // borrow reads `false` but before the `tracing::info!` at the
+            // bottom of the loop still produces one line inside the drain,
+            // and no in-task check can close that (the check and the log
+            // cannot be made atomic against an external signal). The
+            // ordering is established from the OUTSIDE instead, by the
+            // caller joining this task's `JoinHandle` immediately after
+            // sending shutdown and before starting the client drain -- see
+            // this function's doc comment and `SpotServer::status_line` in
+            // `manta-cli`. Once that join returns, this task is gone and no
+            // further line is possible.
             if *shutdown.borrow() {
                 return;
             }

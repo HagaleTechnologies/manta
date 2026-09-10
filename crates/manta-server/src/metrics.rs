@@ -279,7 +279,7 @@ impl Metrics {
     }
 
     /// One decode batch finished. Called by the daemon wiring layer from
-    /// `manta_engine::listen_with_track_count`'s per-batch observer -- see
+    /// `manta_engine::listen_with_observers`'s per-batch `on_tracks` observer -- see
     /// `pipeline_batches`.
     pub fn record_pipeline_batch(&self) {
         self.pipeline_batches.fetch_add(1, Ordering::Relaxed);

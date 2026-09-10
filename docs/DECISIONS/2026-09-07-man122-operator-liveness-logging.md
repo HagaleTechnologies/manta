@@ -29,7 +29,7 @@ guarantees no per-connection log line can land ahead of it.
 (review round 2). Binding three sockets is not evidence that anything will
 ever be decoded: a replay shorter than `manta_engine`'s two-second
 `CALIBRATION_SECONDS` window, or a live source that fails its initial
-reads, makes `listen_with_track_count` bail during calibration and the
+reads, makes `listen_with_observers` bail during calibration and the
 process exits without decoding a sample — after a banner that had already
 declared the daemon ready. So the banner claims exactly what it knows
 (`manta <ver> listening: source=... telnet=... json=... metrics=...`,
@@ -66,7 +66,7 @@ status task compares it against its own previous sample and reports
 interval or two of a live source, whose calibration window is two real
 seconds, and not a stall). The counter is deliberately not exported in the
 Prometheus text: it is a liveness edge, not a figure worth graphing. This
-is why `listen_with_track_count`'s observer now fires on every batch
+is why `listen_with_observers`'s observer now fires on every batch
 rather than only on a change — see below.
 
 **`starting` is bounded by a grace period** (review round 3). "No batch
@@ -121,7 +121,7 @@ reported `tracks=0` and `manta_active_tracks 0` -- exactly the "healthy
 node reads as a fault" failure this field exists to avoid, just with a
 narrower trigger. `crates/manta-engine/src/track.rs`'s
 `decoding_track_count()` counts tracks holding a leased decoder (`Active`
-or `Hang`) and `listen_with_track_count()` reports it to `main.rs` after
+or `Hang`) and `listen_with_observers()` reports it to `main.rs` after
 every processed batch. Repeats were suppressed in the engine at first; as
 of review round 2 they are not, because that call is also the daemon's
 only per-batch decode-progress signal (see `pipeline=` above) and a
@@ -140,10 +140,19 @@ leasing a decoder. Counting those would inflate an operator-facing "is it
 decoding?" line with signals nothing is decoding; `active_track_count`
 keeps its existing meaning for `soak_metrics`' peak/eviction accounting.
 
-This does cost a new `manta-engine` entry point, which the plan had hoped
-to avoid. `listen_with_track_count` is additive: `listen()` is now a
-no-op-observer wrapper over it, so every existing caller and test is
-untouched. The regression is pinned by
+This costs no new `manta-engine` entry point. MAN-45 landed
+`listen_with_observers` on main in parallel with this ticket, publishing
+`active_track_count()` into a shared `AtomicU64` (`ListenObservers`) that
+the daemon polls into `Metrics` every 250 ms; merging main into this branch
+folded MAN-122's per-batch observer into that same function as an
+additional `on_tracks` callback rather than adding a second entry point,
+and corrected the published number from `active_track_count()` to
+`decoding_track_count()` for the reasons just above. Both observers carry
+the same count and both are wanted: the atomic is what a consumer on
+another thread can poll on its own schedule, and the callback is the
+per-batch *edge* -- a polled gauge value cannot distinguish a steady count
+from a wedged decode loop. `listen()` is a no-op-observer wrapper over the
+merged function, so every existing caller and test is untouched. The regression is pinned by
 `track::tests::decoding_track_count_sees_a_promoted_track_that_has_emitted_nothing`,
 which drives a steady unmodulated carrier through `process_hops`, asserts
 the event stream is *empty*, and asserts the count is nevertheless 1, plus
@@ -190,3 +199,22 @@ return, `pipeline=` classification). What stays end-to-end through the
 real binary is the part that cannot race: the banner, its field content,
 its being line 1, and readiness never being claimed by a daemon whose
 pipeline never started.
+
+## Review round 4 (P2): shutdown and status emission are ordered by a join
+
+`spawn_status_line`'s two in-task guards -- the `biased` `select!` and the
+post-sleep `shutdown.borrow()` -- narrow the window in which a status line
+can land inside the shutdown drain, but they cannot close it: a shutdown
+signalled after that borrow reads `false` and before the loop's
+`tracing::info!` still produces one line, and no in-task check can be made
+atomic against an external signal.
+
+The ordering is therefore established from the outside. `spawn_status_line`
+already returned a `JoinHandle`; the daemon now RETAINS it
+(`SpotServer::status_line`) and awaits it immediately after
+`shutdown_tx.send(true)` and before the client drain starts. Once that join
+returns the task is gone, so no further line is possible. The wait is
+bounded by one scheduler poll rather than by `status_interval_secs`,
+because the task's `shutdown.changed()` arm is `biased`-first -- pinned by
+`main.rs`'s `the_status_line_task_is_retained_and_joins_promptly_on_shutdown`,
+which configures a one-hour interval and joins inside a one-second budget.

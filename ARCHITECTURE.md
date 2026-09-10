@@ -400,15 +400,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
-<<<<<<< HEAD
-  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
-  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
-  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
-  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
-  gauges, `manta_source_health`, `manta_active_tracks` (MAN-122, below),
-  the uplink counters, and (MAN-56,
-  landed 2026-09-04) `manta_input_dropped_packets_total`/
-=======
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the
   daemon shut down while a client was still in its PRE-LOGIN/handshake
   phase — telnet's login prompt/read/banner and the JSON stream's
@@ -434,10 +425,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   de callsign didn't resolve against `cty.dat`, *or* it resolved but its
   entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
   or `/AM` designator that places it outside any DXCC entity),
-  `manta_active_tracks`, per-protocol client-connected gauges,
-  `manta_source_health`, the uplink counters, and (MAN-56, landed
-  2026-09-04) `manta_input_dropped_packets_total`/
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+  `manta_active_tracks` (MAN-45/MAN-122, below), per-protocol
+  client-connected gauges, `manta_source_health`, the uplink counters, and
+  (MAN-56, landed 2026-09-04) `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
   (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
   per-stage queue depths, decode rate, spots/min, spot-confidence
@@ -447,44 +437,41 @@ validation (MAN-28). Dedupe (step 5) still applies.
   The three `manta_input_*` series are published only for sources that
   actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
   report none) and are **absent**, not a frozen zero, for every other
-<<<<<<< HEAD
   source — "absent means not measured", so an operator never reads a
-  placeholder as live data.
-  **`manta_active_tracks` is now populated** (corrected 2026-09-07,
-  MAN-122; it had been served-but-frozen at a constant `0` since
-  2026-09-03 because `manta_engine::listen()` exposed no hook for it):
-  the count comes from `TrackManager`'s own lifecycle, not from
-  the decode event stream. `TrackManager::decoding_track_count()` reports
-  how many tracks are currently promoted and holding a leased decoder
-  (`Active` or `Hang`); `manta_engine::listen_with_track_count()` hands
-  that number to `main.rs` after every processed batch — repeats
-  included, since that call is also the daemon's decode-progress
-  heartbeat (review round 2) — which publishes it via
-  `set_active_tracks`. So
-  `manta_active_tracks` and the status line's `tracks=` field both report
-  a real, moving count instead of the previous permanent `0`. An
-  event-derived count was tried first and rejected in review: a track
-  `TrackManager` has promoted but whose demodulator has not latched emits
-  no events at all — `TrackDecoder` withholds `TrackMeta` until
-  `snr_2500_db()` is `Some` — and such a track can stay ACTIVE until the
-  ~30 s `gc_hops` silent GC, so a weak or unmodulated signal that real
-  decoders are working on would have reported `tracks=0`. The gauge is
-  driven back to `0` at end of stream, so it doesn't stay stuck at the
-  last live value after EOF or an SDR disconnect. Note this is
-  deliberately *not* `TrackManager::active_track_count()`, which also
-  counts unconfirmed CANDIDATEs (noise-blip rise crossings that lease no
-  decoder) and keeps its own meaning for `soak_metrics`.
-=======
-  source — the same "absent means not measured" distinction that motivated
-  the `manta_active_tracks` caveat before it was populated.
+  placeholder as live data; the same distinction that motivated the
+  `manta_active_tracks` caveat before it was populated.
   **`manta_active_tracks` is now populated** (MAN-45, corrected
-  2026-09-04): `manta_engine::listen_with_observers` publishes
-  `TrackManager::active_track_count()` into a shared handle as the decode
-  loop runs (`ListenObservers`); the daemon's server runtime polls it into
-  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
-  (every other caller — `soak()`, the CPU-budget bench, both integration
-  tests) is unchanged and pays nothing for this.
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+  2026-09-04; its *source* corrected again 2026-09-07 by MAN-122). It had
+  been served-but-frozen at a constant `0` since 2026-09-03 because
+  `manta_engine::listen()` exposed no hook for it. Two observers now carry
+  the count out of the decode loop, both fed from the same number:
+  `manta_engine::listen_with_observers` stores it into a shared handle
+  (`ListenObservers`), which the daemon's server runtime polls into
+  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250 ms); and the same
+  function hands it synchronously to an `on_tracks` callback after every
+  processed batch — repeats included, since that call is also the daemon's
+  decode-progress heartbeat (MAN-122 review round 2), which a polled gauge
+  value alone cannot express. Plain `listen()` (every other caller —
+  `soak()`, the CPU-budget bench, both integration tests) registers
+  neither and pays nothing for this.
+  The number itself comes from `TrackManager`'s own lifecycle, not from
+  the decode event stream: `TrackManager::decoding_track_count()` reports
+  how many tracks are currently promoted and holding a leased decoder
+  (`Active` or `Hang`). So `manta_active_tracks` and the status line's
+  `tracks=` field both report a real, moving count instead of the previous
+  permanent `0`. An event-derived count was tried first and rejected in
+  review: a track `TrackManager` has promoted but whose demodulator has
+  not latched emits no events at all — `TrackDecoder` withholds
+  `TrackMeta` until `snr_2500_db()` is `Some` — and such a track can stay
+  ACTIVE until the ~30 s `gc_hops` silent GC, so a weak or unmodulated
+  signal that real decoders are working on would have reported `tracks=0`.
+  The gauge is driven back to `0` at end of stream and on a mid-stream
+  read failure, so it doesn't stay stuck at the last live value after EOF
+  or an SDR disconnect. Note this is deliberately *not*
+  `TrackManager::active_track_count()` (what MAN-45 first published here),
+  which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
+  that lease no decoder and would inflate an operator-facing "is it
+  decoding?" reading — and which keeps its own meaning for `soak_metrics`.
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
