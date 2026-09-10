@@ -421,10 +421,17 @@ async fn omitted_dry_run_key_logs_in_but_does_not_transmit() {
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let bus2 = bus.clone();
-    let metrics2 = metrics.clone();
+    // MAN-44: `serve()` writes to a registered per-target handle, and the
+    // aggregate `uplink_*_total()` figures asserted below are DERIVED by
+    // summing the registry -- so the target has to be registered here for
+    // this scenario's counters to be visible at all.
+    let spec = manta_server::uplink::target_specs(std::slice::from_ref(&cfg))
+        .into_iter()
+        .next()
+        .unwrap();
+    let target = metrics.register_uplink_target(spec);
     tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, metrics2, shutdown_rx)
-            .await;
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx).await;
     });
 
     // The login handshake still completes -- dry-run gates the spot write

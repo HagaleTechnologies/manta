@@ -403,6 +403,8 @@ impl Metrics {
             spots_dropped_lagged_total: AtomicU64::new(0),
             spots_suppressed_by_filter_total: AtomicU64::new(0),
             spots_dropped_write_failed_total: AtomicU64::new(0),
+            spots_dropped_shutdown_total: AtomicU64::new(0),
+            spots_replay_abandoned_total: AtomicU64::new(0),
             spots_unresolved_geography_total: AtomicU64::new(0),
             telnet_clients: AtomicI64::new(0),
             json_clients: AtomicI64::new(0),
@@ -986,7 +988,6 @@ impl Metrics {
 mod tests {
     use super::*;
 
-<<<<<<< HEAD
     fn spec(label: &str) -> UplinkTargetSpec {
         let (host, port) = label.rsplit_once(':').unwrap();
         UplinkTargetSpec {
@@ -1003,7 +1004,8 @@ mod tests {
             enabled: false,
             ..spec(label)
         }
-=======
+    }
+
     /// MAN-45 (PR #63 round-16 finding, revised round-18 remediate finding
     /// 1): the shapes every write-failure/clean-shutdown site in
     /// `telnet`/`json_stream` needs, in one place: a failed LIVE-SPOT write
@@ -1028,7 +1030,6 @@ mod tests {
         // history iterator are replays, not newly-lost live spots, so only
         // the live `rx` backlog counts.
         assert_eq!(abandoned_spot_count(false, 7), 7);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
     }
 
     #[test]

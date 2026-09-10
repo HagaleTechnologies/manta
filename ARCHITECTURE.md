@@ -394,15 +394,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
-<<<<<<< HEAD
-  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
-  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
-  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
-  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
-  gauges, `manta_source_health`, the uplink counters, (MAN-44) per-target
-  `manta_uplink_target_*` series, and (MAN-56, landed 2026-09-04)
-  `manta_input_dropped_packets_total`/
-=======
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the
   daemon shut down while a client was still in its PRE-LOGIN/handshake
   phase — telnet's login prompt/read/banner and the JSON stream's
@@ -429,9 +420,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
   or `/AM` designator that places it outside any DXCC entity),
   `manta_active_tracks`, per-protocol client-connected gauges,
-  `manta_source_health`, the uplink counters, and (MAN-56, landed
-  2026-09-04) `manta_input_dropped_packets_total`/
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+  `manta_source_health`, the uplink counters, (MAN-44) per-target
+  `manta_uplink_target_*` series, and (MAN-56, landed 2026-09-04)
+  `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
   (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
   per-stage queue depths, decode rate, spots/min, spot-confidence
