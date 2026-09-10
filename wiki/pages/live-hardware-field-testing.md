@@ -11,6 +11,7 @@ sources:
   - docs/DECISIONS/2026-09-10-synchronized-rbn-capture-proves-detection-gap-is-manta-side.md
   - docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md
   - docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md
+  - docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md
 verified:
   commit: 0495f37
   date: 2026-09-10
@@ -195,6 +196,16 @@ weak-but-present is a real, different failure mode from absent, and
 common-mode noise on the feedline is a real, different fix from
 reconnecting a cable.
 
+**Confirmed at scale, same day**: a 90-minute unattended 4-cycle soak
+post-fix produced 22 confirmed spots, 13 (59%) matching the real-catch
+signature (`Cq`/`De` type, confidence 0.22-0.43) and 9 (41%) matching the
+known Beacon-exemption residual gap above. Several real-looking calls
+repeated across independent cycles (`W3RJ` 4x, `KC4X` 4x); cross-checked
+against simultaneously-captured RBN logs, 4 of 7 checked callsigns
+matched almost exactly in frequency (within 40 Hz), confirming the single
+-capture result generalizes rather than being a lucky one-off. See
+`docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md`.
+
 **A genuine hardware artifact can still look exactly like a manta bug.**
 The same session found a real, absolute-RF-frequency-locked comb of
 "birdies" every exact 8 kHz (confirmed on two different bands/dial
@@ -216,3 +227,18 @@ outright). Also: a single `ErrorCode::Overflow` on a live USB stream used
 to kill the whole session outright — fixed in `crates/manta-input/src/
 soapy.rs` (#146, 2026-09-09) with its own bounded retry, so this is no
 longer something you need to work around.
+
+**The SDRplay API service itself is unreliable under sustained ~192 kS/s
+streaming** — confirmed three separate times in one session
+(`sdrplay_api_ServiceNotResponding` / `sdrplay_api_Fail`), sometimes
+requiring a privileged restart (`sudo launchctl kickstart -k
+system/com.sdrplay.service`) plus a physical USB replug, sometimes
+self-recovering within a minute or two with no intervention at all — both
+behaviors observed, so treat it as genuinely intermittent, not "wedged
+until a human fixes it." **For any unattended/long-duration capture, run
+short independent cycles (e.g. ~20-25 min) rather than one long capture**
+— a single long run has no resilience against a mid-run crash and can
+lose the whole session; cycling means one crash only costs that cycle.
+Check device enumeration (`SoapySDRUtil --find`) before each cycle starts
+so a skipped cycle is detected rather than silently producing an empty
+result.
