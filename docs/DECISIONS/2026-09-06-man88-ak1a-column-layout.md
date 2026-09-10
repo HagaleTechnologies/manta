@@ -135,6 +135,24 @@ capture with a longer spotter identity was available to check against.
 What it protects is the property the ticket asked for: a fixed-column
 parser never reads a later field one character late.
 
+The **SNR and WPM fields are minimum widths on the same rule** (raised by
+the PR #114 review as the case the identity/callsign reasoning above did
+not cover). `{:>2}` pads but never truncates, and neither
+`manta_spot::validator` nor the renderer clamps the value it is given:
+`Demod::snr_2500_db` reaches roughly -14 dB when a track's keying rails
+converge, which renders three characters. So the SNR, WPM, type and time
+anchors are expressed as offsets from the column the **mode field
+actually ended on** (`SNR_END_OFFSET` 2, `WPM_END_OFFSET` 9,
+`TYPE_START_OFFSET` 16, `TIME_START_OFFSET` 24 in `rbn.rs`) rather than as
+absolute columns: a wide SNR or a three-digit WPM widens its own field and
+gives up only its own anchor, while the type field stays at 63 and the
+time field at 71. Expressing them as offsets is also what lets one set of
+constants describe both layouts — `LineFormat::Skimmer`'s 2-wide mode
+field ends 4 columns earlier, so its tail follows at 59 and 67. Pinned by
+`a_wide_snr_widens_its_own_field_but_moves_no_later_column`,
+`a_wide_wpm_widens_its_own_field_but_moves_no_later_column`, and
+`the_skimmer_layout_keeps_its_time_column_under_a_wide_snr`.
+
 **MAN-89** (`CALL-N-#` SSIDs) pushes many spotter identities past the
 16-column budget (`DX de ` + 7-char base call + `-#:`) for base callsigns
 of 5+ characters — its plan should re-measure against a fresh capture

@@ -82,6 +82,29 @@ const CALL_START_COL: usize = 27;
 /// than moving the SNR, WPM, type and time fields.
 const MODE_START_COL: usize = 42;
 
+/// The remaining four anchors are expressed as offsets from the column the
+/// mode field ends on, not as absolute columns, because the mode field is
+/// the one whose width the layout selects: it is 6 wide in the RBN relay
+/// layout (ending at column 47) and 2 wide in the CW-Skimmer layout
+/// (ending at 43), and everything after it therefore sits 4 columns
+/// further left in `LineFormat::Skimmer`. Anchoring on the mode field's
+/// actual end keeps both layouts described by one set of constants, and
+/// keeps an over-long callsign shifting the whole tail as a block rather
+/// than tearing it apart.
+///
+/// SNR is right-justified so its last char lands 2 columns past the mode
+/// field (RBN column 49), then a literal ` dB`.
+const SNR_END_OFFSET: usize = 2;
+/// WPM is right-justified so its last char lands 9 columns past the mode
+/// field (RBN column 56), then a literal ` WPM`.
+const WPM_END_OFFSET: usize = 9;
+/// The 6-wide, left-justified spot-type field starts 16 columns past the
+/// mode field (RBN columns 63-68).
+const TYPE_START_OFFSET: usize = 16;
+/// The `HHMMZ` time field starts 24 columns past the mode field -- RBN
+/// column 71, the column MAN-88 exists to restore.
+const TIME_START_OFFSET: usize = 24;
+
 /// Renders one spot as a fixed-column AK1A `DX de` cluster line, e.g.
 /// `DX de W3XYZ-#:  14027.10  JA1ABC         CW    23 dB  28 WPM  CQ      0312Z`.
 ///
@@ -144,17 +167,54 @@ pub fn format_line(
         LineFormat::Rbn => "CW    ",
         LineFormat::Skimmer => "  ",
     };
+    let mode_end_col = call_end_col + mode_gap + mode.chars().count();
+
+    // MAN-88 review finding: the SNR and WPM fields are MINIMUM widths too.
+    // `Demod::snr_2500_db` is passed through unclamped by the validator, so
+    // a track whose keying rails converge can reach roughly -14 dB, and
+    // `{:>2}` then renders three characters. Anchor each following field on
+    // the column its predecessor actually ended on -- exactly as the
+    // frequency and callsign fields above do -- so a wide SNR (or a wide
+    // WPM) widens only its own field instead of walking the type and time
+    // fields off the columns a fixed-column parser reads.
+    let snr = format!("{}", spot.snr_db.round() as i32);
+    let snr_gap = SNR_END_OFFSET.saturating_sub(snr.chars().count());
+    let snr_end_col = mode_end_col + snr_gap + snr.chars().count();
+    // ` dB` is part of the SNR field, not a separator.
+    let db_end_col = snr_end_col + " dB".len();
+
+    let wpm = format!("{}", spot.wpm.round() as i32);
+    let wpm_gap = (mode_end_col + WPM_END_OFFSET)
+        .saturating_sub(db_end_col + wpm.chars().count())
+        .max(1);
+    let wpm_end_col = db_end_col + wpm_gap + wpm.chars().count();
+    // ` WPM` is part of the WPM field, not a separator.
+    let wpm_unit_end_col = wpm_end_col + " WPM".len();
+
+    // The type field is left-justified in 6 columns; `BEACON` fills it
+    // exactly, so nothing in `spot_type_label` overruns it today, but the
+    // time anchor below is computed from its rendered width regardless.
+    let ctx = format!("{:<6}", spot_type_label(spot.spot_type));
+    let type_gap = (mode_end_col + TYPE_START_OFFSET)
+        .saturating_sub(wpm_unit_end_col + 1)
+        .max(1);
+    let type_end_col = wpm_unit_end_col + type_gap + ctx.chars().count();
+    let time_gap = (mode_end_col + TIME_START_OFFSET)
+        .saturating_sub(type_end_col + 1)
+        .max(1);
 
     format!(
         "{identity}{:freq_gap$}{freq}{:call_gap$}{call}{:mode_gap$}{mode}\
-         {snr:>2} dB  {wpm:>2} WPM  {ctx:<6}  {hour:02}{minute:02}Z",
+         {:snr_gap$}{snr} dB{:wpm_gap$}{wpm} WPM{:type_gap$}{ctx}\
+         {:time_gap$}{hour:02}{minute:02}Z",
+        "",
+        "",
+        "",
+        "",
         "",
         "",
         "",
         call = spot.callsign,
-        snr = spot.snr_db.round() as i32,
-        wpm = spot.wpm.round() as i32,
-        ctx = spot_type_label(spot.spot_type),
     )
 }
 
@@ -375,6 +435,64 @@ mod tests {
             line.contains("DX de K5ARH/QRP-#: 14011.90"),
             "line was: {line}"
         );
+    }
+
+    /// MAN-88 review finding: `{snr:>2}` is a minimum width, and
+    /// `Demod::snr_2500_db` reaches roughly -14 dB when a track's keying
+    /// rails converge -- neither the validator nor this renderer clamps it.
+    /// A three-character SNR must widen its own field only; the WPM, type
+    /// and time columns a fixed-column parser reads stay put.
+    #[test]
+    fn a_wide_snr_widens_its_own_field_but_moves_no_later_column() {
+        for snr_db in [-14.0, -9.5, 105.0, 100.0] {
+            let mut spot = capture_spot();
+            spot.snr_db = snr_db;
+            let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
+            let ctx = format!("snr {snr_db}: {line}");
+            let snr_text = format!("{} dB", snr_db.round() as i32);
+            // The SNR field itself still starts on its own column 48.
+            assert_eq!(col_of(&line, &snr_text), 48, "{ctx}");
+            assert_eq!(col_of(&line, "25 WPM"), 55, "{ctx}");
+            assert_eq!(&line[62..68], "CQ    ", "{ctx}");
+            assert_eq!(col_of(&line, "0236Z"), 71, "{ctx}");
+            // Never abuts the field before it.
+            assert!(line.contains(&format!(" {snr_text}")), "{ctx}");
+        }
+    }
+
+    /// The same rule one field further along: WPM is a minimum width too,
+    /// so a three-digit WPM (or a wide SNR *and* a wide WPM together) may
+    /// not move the type or time columns.
+    #[test]
+    fn a_wide_wpm_widens_its_own_field_but_moves_no_later_column() {
+        for (snr_db, wpm) in [(21.0, 100.0), (-14.0, 100.0), (-14.0, 8.0)] {
+            let mut spot = capture_spot();
+            spot.snr_db = snr_db;
+            spot.wpm = wpm;
+            let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
+            let ctx = format!("snr {snr_db}, wpm {wpm}: {line}");
+            assert_eq!(&line[62..68], "CQ    ", "{ctx}");
+            assert_eq!(col_of(&line, "0236Z"), 71, "{ctx}");
+            // Both variable-width fields keep their mandatory separator.
+            assert!(
+                line.contains(&format!("dB  {} WPM", wpm.round() as i32))
+                    || line.contains(&format!("dB {} WPM", wpm.round() as i32)),
+                "{ctx}"
+            );
+        }
+    }
+
+    /// The skimmer layout's tail re-anchors on the same rule, 4 columns
+    /// left of the RBN one -- a wide SNR must not walk its time field off
+    /// column 67 either.
+    #[test]
+    fn the_skimmer_layout_keeps_its_time_column_under_a_wide_snr() {
+        for snr_db in [21.0, -14.0, 105.0] {
+            let mut spot = capture_spot();
+            spot.snr_db = snr_db;
+            let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Skimmer);
+            assert_eq!(col_of(&line, "0236Z"), 67, "snr {snr_db}: {line}");
+        }
     }
 
     #[test]
