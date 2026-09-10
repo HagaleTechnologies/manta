@@ -158,7 +158,42 @@ impl HsmmDecoder {
         self.last_ts = ev.sample_ts;
         let mut out = Vec::new();
         if ev.present && !self.present {
-            // Keying just appeared: (re)seed at this hop.
+            // Codex review, PR #161 round 5: `self.anchors` is deliberately
+            // NOT cleared on reseed (SPEC v2 §4.6's `reach_sil` retention
+            // exists precisely so a short intervening blip doesn't wrongly
+            // read as silence) -- so an old anchor's tokens, carrying a
+            // cumulative log-likelihood score that can have grown by
+            // hundreds to thousands of points over a real decode, remain
+            // in the beam right alongside the fresh seeds this branch is
+            // about to create at a literal `score: 0.0`. The very next
+            // merge/prune step (`token_order`, raw score desc) then keeps
+            // whichever token has the highest absolute score regardless of
+            // fit -- an old, merely-still-viable hypothesis can dominate a
+            // brand new, better-fitting reseed purely on accumulated
+            // magnitude, defeating the whole point of reseeding on a real
+            // speed change or post-fade restart.
+            //
+            // Shift every already-live score DOWN by the current best
+            // score before adding the zero-baseline seeds, rather than
+            // raising the seeds up to meet it: this keeps every existing
+            // token's RELATIVE ordering (and every already-computed
+            // HistEntry) exactly unchanged -- successor()'s cumulative sum
+            // and `margin()`'s score DIFFERENCES are invariant under a
+            // constant shift applied uniformly -- while putting the best
+            // surviving old hypothesis on the SAME footing (score 0.0) as
+            // the fresh seeds it must now compete against fairly. Left
+            // `self.live`'s own scores untouched here since `self.live` is
+            // overwritten with `seeds` two lines below regardless; only
+            // `self.anchors` (what the NEXT anchor step's candidate
+            // generation actually reads) needs the shift.
+            let offset = self.live.first().map(|t| t.score).unwrap_or(0.0);
+            if offset != 0.0 {
+                for a in self.anchors.iter_mut() {
+                    for t in a.tokens.iter_mut() {
+                        t.score -= offset;
+                    }
+                }
+            }
             let seeds = self.seed(ev.hop);
             self.anchors.push_back(Anchor {
                 hop: ev.hop,
@@ -380,6 +415,52 @@ mod tests {
         assert!(
             dec.best_u().is_some(),
             "a token with real, scored evidence must be reported"
+        );
+    }
+
+    #[test]
+    fn reseed_normalizes_retained_scores_to_the_current_best() {
+        // Codex review, PR #161 round 5: `self.anchors` isn't cleared on
+        // reseed (SPEC v2 §4.6 retention), so an old anchor's tokens keep
+        // whatever cumulative score they'd accumulated before the gap
+        // while a fresh reseed starts at a literal 0.0 -- comparing those
+        // directly in the next merge/prune step let the old hypothesis's
+        // sheer magnitude win regardless of fit, defeating reseeding
+        // entirely. Build up a real positive score via an anchor step,
+        // force a reseed, then verify every retained old token was
+        // shifted down by exactly that amount: the best surviving old
+        // token must now read exactly 0.0, the same baseline as the
+        // fresh seeds it competes against.
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        dec.push(&ev(100, true, false)); // reseed: raw seeds
+        dec.push(&ev(113, true, true)); // real evidence: scores become nonzero
+
+        let pre_reseed_best = dec
+            .anchors
+            .iter()
+            .flat_map(|a| a.tokens.iter())
+            .map(|t| t.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            pre_reseed_best > 0.0,
+            "sanity check: real evidence must produce a positive score, got {pre_reseed_best}"
+        );
+
+        dec.push(&ev(114, false, false)); // silence
+        dec.push(&ev(115, true, false)); // present rises again: reseed
+
+        let anchors_before_the_fresh_one = dec.anchors.len() - 1;
+        let post_reseed_best_retained = dec
+            .anchors
+            .iter()
+            .take(anchors_before_the_fresh_one)
+            .flat_map(|a| a.tokens.iter())
+            .map(|t| t.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (post_reseed_best_retained - 0.0).abs() < 1e-4,
+            "the best retained old token must be shifted down to exactly 0.0 (the fresh seeds' \
+             own baseline), got {post_reseed_best_retained}"
         );
     }
 }

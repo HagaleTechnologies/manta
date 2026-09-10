@@ -1003,7 +1003,7 @@ fn load_decode_config_file(
             path.display()
         );
     }
-    // Codex review, PR #161 round 5: `sigma_u = 0` puts a hop exactly on
+    // Codex review, PR #161 round 4: `sigma_u = 0` puts a hop exactly on
     // the normalized half-amplitude decision surface at `0 / 0`, making
     // the LLR (and every downstream accumulated prefix) permanently NaN;
     // a non-finite value corrupts every present hop the same way. Both
@@ -1017,7 +1017,7 @@ fn load_decode_config_file(
             cfg.evidence.sigma_u
         );
     }
-    // Codex review, PR #161 round 5: an empty `seed_units_hops` list
+    // Codex review, PR #161 round 4: an empty `seed_units_hops` list
     // deserializes and passes every check above, but every keying onset
     // then seeds zero tokens -- candidate generation stays empty forever
     // and the command silently emits no decoded text or spots. Require at
@@ -1042,7 +1042,7 @@ fn load_decode_config_file(
             path.display()
         );
     }
-    // Codex review, PR #161 round 5: `conf_kappa = 0` makes the common
+    // Codex review, PR #161 round 4: `conf_kappa = 0` makes the common
     // no-competing-hypothesis path (s_alt == best.score) compute `0 / 0`
     // in `margin`'s confidence sigmoid, emitting a NaN character/word-
     // boundary confidence that then contaminates every downstream spot-
@@ -1053,6 +1053,19 @@ fn load_decode_config_file(
              no-competing-hypothesis confidence path compute 0/0)",
             path.display(),
             cfg.hsmm.conf_kappa
+        );
+    }
+    // Codex review, PR #161 round 5: `dur_sigma = 0` reaches
+    // `log_dur_prior`'s `2 * dur_sigma * dur_sigma` denominator -- an
+    // exactly-nominal-duration segment computes 0/0, and every other
+    // segment computes an infinite (non-nominal) score, corrupting
+    // pruning and every downstream confidence.
+    if !cfg.hsmm.dur_sigma.is_finite() || cfg.hsmm.dur_sigma <= 0.0 {
+        bail!(
+            "[decode] dur_sigma must be finite and strictly positive in {} (got {}; 0 makes an \
+             exactly-nominal segment's duration prior compute 0/0)",
+            path.display(),
+            cfg.hsmm.dur_sigma
         );
     }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
@@ -2300,6 +2313,12 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_zero_conf_kappa() {
         let f = write_temp_file(b"[decode]\nconf_kappa = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_dur_sigma() {
+        let f = write_temp_file(b"[decode]\ndur_sigma = 0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
