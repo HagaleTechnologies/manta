@@ -4,6 +4,12 @@ Parent decision: `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D4 — "M
 blocking callsign-grammar fix; MAN-13/14 carry the design decision itself." This record covers
 only the validator-level decisions D4 left to MAN-89's implementation.
 
+Discoverable from the knowledge map (AGENTS.md "Knowledge wiki"): `wiki/INDEX.md` lists this
+record as "How may an operator spell their own `station_callsign`?", and
+`wiki/pages/spot-output-contract.md` — the page a contributor working on either spot surface
+lands on — points here for the identity grammar. Both point; neither restates, so this record
+stays the only authoritative statement of the grammar.
+
 ## Problem
 
 `[server].station_callsign` was validated with `manta_spot::grammar::is_plausible`, a prefilter
