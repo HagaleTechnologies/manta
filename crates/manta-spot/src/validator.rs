@@ -129,6 +129,16 @@ struct PendingBeacon {
     freq_hz: f64,
     snr_db: f32,
     char_confidences: Vec<f32>,
+    /// The track_id that originally captured this candidate -- NOT
+    /// necessarily the track_id it's eventually resolved under (Codex
+    /// review, PR #152, round 14): `migrate_or_discard_pending_beacons`
+    /// moves a `PendingBeacon` into a merge survivor's own list, and
+    /// resolving it there under the survivor's track_id would wrongly
+    /// grant it `RepetitionGate`'s rapid-same-track exemption even though
+    /// it's a genuinely different track's (duplicate-spawn) candidate --
+    /// letting one real over-the-air occurrence, captured by two
+    /// overlapping tracks, reach `reps >= 2` on its own.
+    origin_track_id: u32,
 }
 
 #[derive(Default)]
@@ -289,7 +299,38 @@ pub struct Validator {
     blocklist: Blocklist,
     notch: NotchList,
     suppression_counts: SuppressionCounts,
+    /// The latest `sample_ts` seen across every track (not per-track --
+    /// see `TrackState::last_sample_ts` for that), used to `sweep` the
+    /// repetition gate on `TrackClosed` (MAN-166, Codex review PR #152).
+    /// A closing track's *own* `last_sample_ts` is not a safe stand-in:
+    /// it can be stale or still 0 (a track that emitted metadata but no
+    /// `WordBoundary`), which would make that sweep a no-op and leave
+    /// other, genuinely-expired gate entries growing unbounded forever --
+    /// this field is the only thing that's actually monotonic across the
+    /// whole `Validator`, matching SPEC-decode-core.md §6 rule 2
+    /// (sample_ts-based, never wall clock).
+    now_ts: u64,
+    /// `now_ts` as of the last `gate.sweep()` call (Codex review, PR
+    /// #152). `TrackClosed` alone isn't a sufficient sweep trigger: a
+    /// persistently-active track that never closes (e.g. real noise/QRM
+    /// continually feeding it new plausible-but-wrong callsigns, each
+    /// resetting its own silent-GC timer) would otherwise let the gate
+    /// grow unbounded for as long as it stays open, even though
+    /// `now_ts` itself keeps advancing correctly. `maybe_sweep` also
+    /// runs off every `now_ts`-bearing event, throttled by
+    /// `sweep_interval_samples` so a busy pipeline doesn't pay for an
+    /// O(gate size) scan on every single character.
+    last_swept_ts: u64,
+    sweep_interval_samples: u64,
 }
+
+/// How often (in seconds of `sample_ts`) the repetition gate is swept
+/// independent of any `TrackClosed` event (MAN-166, Codex review PR
+/// #152). Small relative to the gate's own 90s window (`gate::
+/// WINDOW_SECONDS`) so a persistently-open, never-closing track can't
+/// let it grow far past its steady-state size before the next sweep --
+/// a reasoned choice, not yet measured against real long-run data.
+const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
 
 impl Validator {
     pub fn new(fs: f64, cty_dat: &str, master_scp: Option<&str>) -> Self {
@@ -304,6 +345,32 @@ impl Validator {
             blocklist: Blocklist::default(),
             notch: NotchList::default(),
             suppression_counts: SuppressionCounts::default(),
+            now_ts: 0,
+            last_swept_ts: 0,
+            sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
+        }
+    }
+
+    /// Advances `now_ts` to `sample_ts` (if later), then `maybe_sweep`s.
+    /// Called from every event carrying a real `sample_ts` -- see
+    /// `now_ts`'s doc for why `TrackClosed` alone isn't a sufficient
+    /// sweep trigger on its own.
+    fn advance_clock(&mut self, sample_ts: u64) {
+        self.now_ts = self.now_ts.max(sample_ts);
+        self.maybe_sweep();
+    }
+
+    /// Sweeps the repetition gate if `sweep_interval_samples` has elapsed
+    /// since the last sweep -- throttled the same way regardless of
+    /// caller, `TrackClosed` included: under real sustained track churn
+    /// (tens of thousands of closes in a 15-minute recording, MAN-166) an
+    /// *unthrottled* per-close sweep would mean an O(gate size) scan on
+    /// every single close, reintroducing the cost problem periodic
+    /// sweeping exists to bound.
+    fn maybe_sweep(&mut self) {
+        if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
+            self.gate.sweep(self.now_ts);
+            self.last_swept_ts = self.now_ts;
         }
     }
 
@@ -377,8 +444,10 @@ impl Validator {
                 track_id,
                 glyph,
                 confidence,
+                sample_ts,
                 ..
             } => {
+                self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
                 match glyph {
                     Glyph::Char(c) => {
@@ -400,6 +469,7 @@ impl Validator {
                 sample_ts,
                 ..
             } => {
+                self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
@@ -456,9 +526,12 @@ impl Validator {
             // before producing any other event (the exact case this event
             // exists to surface) creates no per-track_id state here to
             // leak.
-            DecoderEvent::TrackPromoted { .. } => Vec::new(),
+            DecoderEvent::TrackPromoted { sample_ts, .. } => {
+                self.advance_clock(*sample_ts);
+                Vec::new()
+            }
             DecoderEvent::TrackClosed { track_id, closure } => {
-                // Round 7 redesign: `SignalEnded` is the ONE point where
+                // Round 7 redesign (PR #154): `SignalEnded` is the ONE point where
                 // every captured non-allowlisted Beacon candidate for
                 // this track is judged, using its TRUE FINAL speed --
                 // manta-engine guarantees a final speed flush
@@ -484,15 +557,32 @@ impl Validator {
                         Vec::new()
                     }
                 };
-                // MAN-19: without this, `self.tracks` and `self.gate`'s
-                // per-track_id state both grow forever -- `TrackManager`
-                // never reuses a `track_id`, and until `TrackClosed`
-                // existed neither structure had any signal that one would
-                // never be seen again. Confirmed as the soak's actual
-                // unbounded-RSS-growth root cause under sustained track
-                // churn.
+                // MAN-19: without removing `self.tracks`' entry,
+                // per-track_id word/grammar-context state grows forever --
+                // `TrackManager` never reuses a `track_id`, and until
+                // `TrackClosed` existed nothing had any signal that one
+                // would never be seen again. Confirmed as the soak's
+                // actual unbounded-RSS-growth root cause under sustained
+                // track churn.
+                //
+                // `self.gate` is swept, not forgotten by `track_id`
+                // (MAN-166): the repetition gate is keyed by frequency
+                // bucket, which a closing-and-reopening real signal keeps
+                // across the churn this event represents -- forgetting it
+                // here, the way `self.tracks` correctly is, would defeat
+                // the gate's whole 90s window the instant a track closed.
+                // `maybe_sweep` still bounds `gate`'s memory the way
+                // MAN-19 needed, just on elapsed time instead of track
+                // lifetime -- and unlike this event alone (Codex review,
+                // PR #152), it also runs off every other `sample_ts`-
+                // bearing event via `advance_clock`, so a persistently-
+                // active track that never closes at all still gets swept.
+                // See `now_ts`'s and `maybe_sweep`'s own docs for why a
+                // closing track's own (possibly stale/zero)
+                // `last_sample_ts` was never a safe sweep reference on its
+                // own.
                 self.tracks.remove(track_id);
-                self.gate.forget_track(*track_id);
+                self.maybe_sweep();
                 spots
             }
         }
@@ -901,7 +991,7 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate.record(track_id, &candidate, sample_ts) as u32
+            self.gate.record(track_id, freq_hz, &candidate, sample_ts) as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -1021,6 +1111,7 @@ impl Validator {
             freq_hz,
             snr_db,
             char_confidences,
+            origin_track_id: track_id,
         });
         None
     }
@@ -1092,7 +1183,18 @@ impl Validator {
         pending
             .into_iter()
             .filter_map(|pb| {
-                let reps = self.gate.record(track_id, &pb.candidate, pb.sample_ts) as u32;
+                // pb.origin_track_id, not the resolving `track_id`
+                // (Codex review, PR #152, round 14): a migrated
+                // PendingBeacon must keep the identity that ACTUALLY
+                // captured it, or a merge survivor resolving a different
+                // track's candidate here would wrongly grant it the
+                // rapid-same-track exemption -- letting one real
+                // over-the-air occurrence, captured by two overlapping
+                // duplicate-spawn tracks, reach reps >= 2 on its own.
+                let reps =
+                    self.gate
+                        .record(pb.origin_track_id, pb.freq_hz, &pb.candidate, pb.sample_ts)
+                        as u32;
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {
                     confidence =
@@ -1468,6 +1570,89 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
     }
 
+    /// Codex review, PR #152, round 14: two duplicate-spawn tracks (a
+    /// known real phenomenon -- spectral splatter spawning more than one
+    /// candidate for one signal) each independently capture the SAME real
+    /// transmission as a Beacon candidate, then both merge into the same
+    /// survivor. Resolving both under the survivor's own track_id would
+    /// wrongly grant the second one the rapid-same-track exemption (it
+    /// looks like the survivor's own back-to-back repeat), letting one
+    /// real over-the-air occurrence self-confirm to `reps == 2` --
+    /// contaminating the SHARED RepetitionGate entry enough that an
+    /// unrelated, later ORDINARY (non-Beacon) decode of the same callsign
+    /// would see the repetition gate already satisfied despite only one
+    /// real transmission ever having happened. Preserving each
+    /// candidate's true origin_track_id keeps the cross-track minimum-gap
+    /// rule effective across the merge.
+    #[test]
+    fn duplicate_tracks_capturing_the_same_beacon_do_not_self_confirm_through_a_shared_survivor() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let words = ["K5ARH", "T"];
+
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        seed_meta(&mut v, 3);
+        let spots = run(&transmission_events(3, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // Both duplicate-spawn tracks merge into the same survivor, as
+        // pure bookkeeping -- neither closure is proof either signal
+        // ended.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 3,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+
+        // The survivor closes for real, at a plausible speed -- resolving
+        // BOTH migrated candidates. Beacon candidates always spot
+        // regardless of reps (ARCHITECTURE §6.4), so both resolve
+        // normally either way; the bug is only observable downstream.
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 2,
+            wpm: 25.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::SignalEnded,
+        });
+        // Both migrated candidates are identical in every dedupe-relevant
+        // way (same callsign/freq/sample_ts, since both duplicate tracks
+        // decoded the exact same synthetic transmission) -- spot-level
+        // dedupe correctly collapses that to a single emitted spot. The
+        // real point of this test is the ordinary decode below, not the
+        // count here.
+        assert!(
+            !spots.is_empty(),
+            "at least one candidate resolves, got {spots:?}"
+        );
+
+        // A near-simultaneous ORDINARY (non-Beacon) decode of the same
+        // callsign, on a genuinely different track. Only one real
+        // over-the-air occurrence has ever happened here -- the two
+        // Beacon candidates were duplicate spawns of that SAME
+        // transmission, and (with origin_track_id preserved) correctly
+        // rejected as near-duplicates of each other. The ordinary
+        // repetition gate must NOT already see reps >= 2 from that alone.
+        seed_meta(&mut v, 6);
+        let spots = run(&transmission_events(6, &["DE", "K5ARH", "K"], 700), &mut v);
+        assert!(
+            spots.is_empty(),
+            "the merged duplicate Beacon candidates must not have already satisfied the \
+             ordinary repetition gate -- only one real occurrence ever happened, got {spots:?}"
+        );
+    }
+
     /// Codex review on PR #154, round 9: an Evicted closure has no
     /// survivor to migrate a captured Beacon candidate to -- it must be
     /// discarded (never resolved), and counted per ARCHITECTURE §8.
@@ -1614,6 +1799,67 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::De);
+    }
+
+    /// MAN-166: a real signal's track closing and reopening under a new
+    /// `track_id` (e.g. `CloseReason::HangExpired`'s 5s silence timer, or
+    /// `Merged`/`Evicted`) must not reset its repetition confirmation --
+    /// the callsign is still genuinely repeating within the gate's 90s
+    /// window, just under a different `track_id` at roughly the same
+    /// frequency.
+    #[test]
+    fn repetition_survives_a_track_closing_and_reopening_at_the_same_frequency() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH", "K"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        run(
+            &[DecoderEvent::TrackClosed {
+                track_id: 1,
+                closure: ClosureKind::SignalEnded,
+            }],
+            &mut v,
+        );
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 2,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket
+        });
+        let spots = run(&transmission_events(2, &words, 100_000), &mut v);
+
+        assert_eq!(
+            spots.len(),
+            1,
+            "second confirmation, on a new track_id but the same frequency, must spot"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].track_id, 2);
+    }
+
+    /// Two distinct real signals, far enough apart to land in different
+    /// frequency buckets, must never share repetition credit even if they
+    /// happen to decode the same text.
+    #[test]
+    fn different_frequency_buckets_never_share_repetition_credit() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 2,
+            snr_2500_db: 20.0,
+            freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 100_000), &mut v));
+        assert!(
+            spots.is_empty(),
+            "one decode each, at different frequencies, must not share repetition credit"
+        );
     }
 
     /// MAN-29: a configured per-source frequency-calibration correction
@@ -1783,7 +2029,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     /// MAN-19: reproduces the soak's actual failure mode at unit-test
     /// scale -- many distinct, never-reused track_ids, each getting real
     /// activity (TrackMeta) then closing. Without `TrackClosed` wired
-    /// through to `self.tracks.remove`/`self.gate.forget_track`, `tracks`
+    /// through to `self.tracks.remove`/`self.gate.sweep`, `tracks`
     /// would have 10,000 entries here instead of 0.
     #[test]
     fn sustained_track_churn_stays_bounded() {
@@ -1799,6 +2045,91 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             v.tracks.len(),
             0,
             "Validator.tracks must not accumulate one entry per historical track_id"
+        );
+    }
+
+    /// Codex review, PR #152: `TrackClosed`'s sweep must use a
+    /// validator-wide monotonic clock, not the closing track's own
+    /// `last_sample_ts` -- a track that closes having emitted metadata
+    /// but no `WordBoundary` still has `last_sample_ts == 0`, so sweeping
+    /// with that stale value is a no-op (`sweep`'s own cutoff saturates to
+    /// 0) and leaves the gate's `seen` map growing without bound under
+    /// exactly this kind of churn, reintroducing the MAN-19 leak this
+    /// mechanism exists to prevent.
+    #[test]
+    fn gate_stays_bounded_under_churn_even_when_closing_tracks_have_a_stale_own_timestamp() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let window_samples = (90.0 * FS) as u64;
+        let words = ["DE", "K5ARH", "K"];
+
+        // Many distinct real signals (different frequencies, one gate
+        // entry each), each confirmed once early (small sample_ts) then
+        // closed -- every one of these tracks' own `last_sample_ts` stays
+        // small/stale relative to the far-future check below.
+        for track_id in 0..2_000u32 {
+            v.ingest(&DecoderEvent::TrackMeta {
+                track_id,
+                snr_2500_db: 20.0,
+                freq_hz: 14_000_000.0 + (track_id as f64) * 1000.0,
+            });
+            run(&transmission_events(track_id, &words, 0), &mut v);
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::SignalEnded,
+            });
+        }
+        assert!(
+            !v.gate.is_empty(),
+            "sanity check: the loop above must actually have populated the gate"
+        );
+
+        // A real WordBoundary, far past the 90s window, advances the
+        // validator's own clock -- this is the only source of "now" a
+        // correct implementation has, since every closing track above was
+        // stuck at an early, stale `last_sample_ts`.
+        // Comfortably past window_samples relative to the small
+        // (hundreds-of-samples) timestamps every track above used, so the
+        // 2,000 old entries are genuinely expired, not just past a cutoff
+        // that's still behind their own real timestamps.
+        seed_meta(&mut v, 99_999);
+        v.ingest(&DecoderEvent::word_boundary(99_999, window_samples * 2));
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 99_999,
+            closure: ClosureKind::SignalEnded,
+        });
+
+        assert_eq!(
+            v.gate.len(),
+            0,
+            "gate must not accumulate one entry per historical frequency once genuinely swept past the window"
+        );
+    }
+
+    /// Codex review, PR #152: a persistently-active track that never
+    /// closes (e.g. real noise/QRM continually feeding it new plausible-
+    /// but-wrong callsigns, each resetting its own silent-GC timer so it
+    /// never emits `TrackClosed`) must not let the gate grow unbounded
+    /// just because sweep was only ever wired to that one event -- it
+    /// must also run periodically off the same monotonic clock.
+    #[test]
+    fn gate_sweeps_periodically_even_when_no_track_ever_closes() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // one persistent track_id, never closed below
+
+        // 500 distinct plausible callsigns on the same never-closing
+        // track, spaced ~1.04s apart -- comfortably past both the
+        // repetition gate's own window and any reasonable sweep interval
+        // by the end of the loop, all without a single TrackClosed.
+        for i in 0..500u32 {
+            let call = format!("K{i}Y");
+            let words = ["DE", &call, "K"];
+            run(&transmission_events(1, &words, i as u64 * 100_000), &mut v);
+        }
+
+        assert!(
+            v.gate.len() < 100,
+            "gate must be swept periodically even with no TrackClosed at all, not just accumulate one entry per historical callsign (got {})",
+            v.gate.len()
         );
     }
 }

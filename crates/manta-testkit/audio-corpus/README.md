@@ -100,9 +100,29 @@ scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
 grammar can structurally never accept counted as misses; both fixed in
 `scripts/score-against-rbn.py`, see that script's docstring), alongside
 41,174 distinct tracks opened over the 15 minutes (613k characters
-decoded) for those 197 spots -- the detector is opening far more tracks
-than the real simultaneous-signal count implies, and most never survive
-to a validated spot. Filed as MAN-166.
+
+Follow-up (2026-09-09, `docs/DECISIONS/
+2026-09-09-man166-confirm-hops-and-track-cap.md`): root-caused the
+41,174-tracks figure to two structural closure reasons
+(`TrackManager::close_counts()`, `crates/manta-engine/examples/
+close_counts.rs`) -- `unconfirmed` (Candidate never sustains
+`confirm_hops`, 68.8% of all churn) and `evicted`/`merged`
+(`track_cap=500` pinned at its ceiling the entire recording, 29.7%). Fixed
+a real repetition-gate bug (was keyed by the ephemeral `track_id`, so a
+track closing and reopening under real fragmentation reset its
+confirmation count every time) and raised `track_cap` to 1200 (measured
+real organic peak demand: 886). Result: **198 spots, 31.8% precision, 4.4%
+recall** -- a small but genuine improvement on both metrics, zero
+regressions across the full workspace test suite. `confirm_hops` itself
+was investigated and left unchanged: the dit-timing mismatch that causes
+the `unconfirmed` storm is real, but lowering the constant breaks a
+different golden vector (V10, Farnsworth timing) via an unrelated
+decoder-side coupling -- see the decision doc. Two deeper, unfixed
+findings from this pass: `merge_converged`'s SPEC §2.5 "one signal one
+track within 1.0 channel" assumption doesn't hold in dense real contest
+packing, and most surviving real spots still reflect only one clean
+decode ever captured (not a repetition/tracking problem) -- pointing at
+raw decode-core accuracy under genuine HF noise as the dominant remaining
 
 **Legacy-vs-hsmm and K5TR-only comparison**: see
 `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for the
