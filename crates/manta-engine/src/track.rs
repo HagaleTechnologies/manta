@@ -22,6 +22,30 @@ pub struct DetectorConfig {
     pub warmup_hops: u64,
     /// ARCHITECTURE §4 (not SPEC §9): max concurrent ACTIVE tracks.
     pub track_cap: usize,
+    /// Not in SPEC §9. MAN-171: a channel whose track just closed
+    /// `CloseReason::Silent` (ACTIVE/HANG for `gc_hops` with zero characters
+    /// decoded) is barred from spawning a new CANDIDATE for this many hops.
+    /// SPEC §2.2's neighborhood-floor clamp (`Track::effective_floor_db`)
+    /// deliberately never lets a channel's own quantile raise its
+    /// detection threshold by more than 3 dB relative to its neighbors --
+    /// correct for a real parked carrier, but it also means a genuinely
+    /// stationary, unmodulated interferer (an SDR/USB clock-harmonic
+    /// "birdie": confirmed on real RSP1B hardware during MAN-171's
+    /// investigation, an fs-independent comb at every exact 8 kHz RF
+    /// multiple) keeps satisfying `rise` forever -- `gate.rise[k]` never
+    /// clears just because a track already tried and failed to decode it.
+    /// Without this cooldown, such a channel spawns, promotes, runs
+    /// `gc_hops` with no `CharDecoded`, closes `Silent`, and immediately
+    /// re-spawns on the very next hop -- forever, for the life of the
+    /// process (measured live: 53% of all `TrackPromoted` events over a
+    /// real 90 s RSP1B capture landed within 100 Hz of an exact-8kHz-
+    /// multiple channel, each grid point promoting 2-3 times). Silent is
+    /// the only `CloseReason` this applies to: `Unconfirmed` never
+    /// allocated a decoder at all, `HangExpired`/`Merged`/`Evicted` all
+    /// have other, more direct explanations (a real observed RF gap, or
+    /// track-manager bookkeeping) that don't imply "this channel is a
+    /// standing artifact."
+    pub silent_respawn_cooldown_hops: u64,
 }
 
 impl Default for DetectorConfig {
@@ -118,6 +142,15 @@ impl Default for DetectorConfig {
             gc_hops: 11250,
             warmup_hops: 750,
             track_cap: 1200,
+            // MAN-171: same order as `gc_hops` itself -- a channel that
+            // stayed silent for the whole GC window earns an equally long
+            // rest before it's trusted to spawn a fresh CANDIDATE. This
+            // roughly halves a persistent artifact's promotion rate
+            // (spawn -> gc_hops ACTIVE -> Silent -> cooldown -> repeat)
+            // rather than eliminating it -- a channel could, in principle,
+            // host a real signal again later, so this is a rate limit, not
+            // a permanent denylist.
+            silent_respawn_cooldown_hops: 11250,
         }
     }
 }
@@ -669,6 +702,11 @@ pub struct TrackManager {
     channel_spacing_hz: f64,
     /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
     close_counts: CloseCounts,
+    /// MAN-171: channel -> hop_counter before which a new CANDIDATE may not
+    /// spawn on that channel, set on a `CloseReason::Silent` closure (see
+    /// `DetectorConfig::silent_respawn_cooldown_hops`). `0` (the default,
+    /// always `<= hop_counter`) means no active cooldown.
+    channel_cooldown_until: Vec<u64>,
 }
 
 impl TrackManager {
@@ -694,6 +732,7 @@ impl TrackManager {
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
+            channel_cooldown_until: vec![0; n_channels],
         }
     }
 
@@ -791,6 +830,22 @@ impl TrackManager {
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
         self.floor.update(&power_db_vals);
         let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
+        // MAN-171 (Codex review, PR #174 round 4, correct): clear a
+        // channel's respawn cooldown the moment its own `rise` genuinely
+        // drops. `CloseReason::Silent` does NOT prove the RF signal ended
+        // -- only `HangExpired` does (see this file's other comments on
+        // that exact distinction) -- so a track that closes Silent while a
+        // real, weak/marginal signal just wasn't producing decoded
+        // characters, and *then* that signal actually ends, must not keep
+        // blocking a genuinely different station that shows up on the same
+        // channel during the remaining cooldown window. A true stationary
+        // artifact's `rise` never drops on its own, so this never touches
+        // its cooldown.
+        for (k, &r) in rise.iter().enumerate() {
+            if !r && self.channel_cooldown_until[k] > 0 {
+                self.channel_cooldown_until[k] = 0;
+            }
+        }
         self.recompute_ownership();
 
         let past_warmup = self.hop_counter >= self.cfg.warmup_hops;
@@ -941,6 +996,24 @@ impl TrackManager {
             let Some(mut track) = self.tracks.remove(id) else {
                 return false;
             };
+            // MAN-171: a track that ran the full GC window with zero
+            // decoded characters is very likely a stationary artifact
+            // (birdie/spur), not real CW -- bar its channels from
+            // immediately re-spawning a fresh CANDIDATE (see
+            // `DetectorConfig::silent_respawn_cooldown_hops`'s doc for why
+            // `rise` alone can never clear on its own for a channel like
+            // this). Checked ahead of the `has_emitted` gate below since
+            // that gate is about whether a `TrackClosed` *event* is worth
+            // surfacing downstream, not about whether this channel just
+            // proved itself not real CW -- unrelated questions. Computed
+            // from `track.owned` before `track` drops.
+            if close_reasons.get(id) == Some(&CloseReason::Silent) {
+                let until = self.hop_counter + self.cfg.silent_respawn_cooldown_hops;
+                let n = self.channel_cooldown_until.len();
+                for ch in track.owned(n) {
+                    self.channel_cooldown_until[ch] = until;
+                }
+            }
             if !track.has_emitted {
                 return false;
             }
@@ -966,9 +1039,13 @@ impl TrackManager {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
-                if rise[k] && self.owner_of[k].is_none() {
+                if rise[k] && self.owner_of[k].is_none() && !self.channel_cooling_down(k) {
                     let mut winner = k;
-                    if k + 1 < n && rise[k + 1] && self.owner_of[k + 1].is_none() {
+                    if k + 1 < n
+                        && rise[k + 1]
+                        && self.owner_of[k + 1].is_none()
+                        && !self.channel_cooling_down(k + 1)
+                    {
                         if hop.power[k + 1] > hop.power[winner] {
                             winner = k + 1;
                         }
@@ -1016,6 +1093,12 @@ impl TrackManager {
         closed_with_kind.extend(evicted_ids);
         closure_flush_events.extend(evicted_flush);
         (closed_with_kind, promoted_events, closure_flush_events)
+    }
+
+    /// MAN-171: is `k` still serving out a post-`Silent`-closure spawn
+    /// cooldown (`DetectorConfig::silent_respawn_cooldown_hops`)?
+    fn channel_cooling_down(&self, k: usize) -> bool {
+        self.channel_cooldown_until[k] > self.hop_counter
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -1844,6 +1927,174 @@ mod tests {
         );
     }
 
+    /// Regression, MAN-171: a channel that stays `rise`-true forever (a
+    /// stationary, never-decoding interferer -- confirmed live as a real
+    /// ~8kHz-spaced SDR/USB clock-harmonic comb on RSP1B hardware) must not
+    /// spawn a fresh CANDIDATE the instant its previous track closes
+    /// `Silent`. Without `silent_respawn_cooldown_hops`, `rise[k]` never
+    /// clearing is exactly what let such a channel spawn/promote/run
+    /// `gc_hops` with zero decoded characters/close `Silent`/immediately
+    /// re-spawn, forever, for the life of the process (measured live: 53%
+    /// of all `TrackPromoted` events over a real 90 s capture landed on
+    /// this exact grid, most points promoting 2-3 times).
+    #[test]
+    fn silent_close_starts_a_respawn_cooldown_on_that_channel() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above floor, never decoded (no process_hops/drain_pool call)
+
+        let mut m = 250u64 * 15;
+        let mut promotions = 0u32;
+        let mut saw_close = false;
+        // Run well past a full promote -> gc_hops(11250) Silent-close cycle,
+        // driving step_hop directly (bypassing process_hops/drain_pool, so
+        // no char is ever decoded -- the same "never produces real content"
+        // signature a stationary artifact has). A never-decoding track's
+        // `has_emitted` stays false forever, so `step_hop`'s own `closed`
+        // return value (MAN-19-filtered on `has_emitted`) never surfaces
+        // this closure -- `tracks.len()` dropping back to 0 is the only
+        // reliable signal here.
+        for _ in 0..12_000 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted
+                .iter()
+                .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+                .count() as u32;
+            m += 1;
+            if promotions > 0 && tm.tracks.is_empty() {
+                saw_close = true;
+                break;
+            }
+        }
+        assert_eq!(
+            promotions, 1,
+            "expected exactly one promotion before the Silent close"
+        );
+        assert!(
+            saw_close,
+            "expected the track to close (Silent) within the run window"
+        );
+        assert_eq!(tm.tracks.len(), 0, "the closed track must be gone");
+
+        // Immediately after the close, the channel is STILL rise-true --
+        // without the cooldown fix this respawns and promotes again inside
+        // a handful of hops (confirm_hops=19). It must not.
+        for _ in 0..30 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            assert!(
+                promoted.is_empty(),
+                "channel 10 re-promoted at hop {m}, only {} hops after its Silent close -- \
+                 the post-Silent respawn cooldown did not hold",
+                m - (250 * 15)
+            );
+            m += 1;
+        }
+
+        // Once the cooldown (silent_respawn_cooldown_hops = gc_hops =
+        // 11250) has fully elapsed, the channel must be allowed to spawn
+        // again -- this is a rate limit, not a permanent denylist.
+        let mut repromoted = false;
+        for _ in 0..(11_250 + 150) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                repromoted = true;
+                break;
+            }
+            m += 1;
+        }
+        assert!(
+            repromoted,
+            "channel 10 never re-promoted even after the full cooldown window elapsed"
+        );
+    }
+
+    /// Regression, MAN-171 (Codex review, PR #174 round 4): `CloseReason::
+    /// Silent` does not prove the RF signal actually ended -- a real, weak/
+    /// marginal signal can close Silent (30s with no decoded character)
+    /// while still genuinely present, or shortly before it actually ends.
+    /// The respawn cooldown must not keep blocking a genuinely *different*
+    /// station that shows up on the same channel once the old signal's own
+    /// `rise` has dropped -- that drop is the real observed RF gap the
+    /// cooldown's persistent-artifact rationale depends on. Only a channel
+    /// whose `rise` never drops (a true stationary artifact) should still
+    /// be blocked for the full cooldown window (covered by the sibling
+    /// test above).
+    #[test]
+    fn respawn_cooldown_clears_once_the_channel_actually_goes_quiet() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above floor, never decoded
+
+        let mut m = 250u64 * 15;
+        let mut promotions = 0u32;
+        for _ in 0..12_000 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted
+                .iter()
+                .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+                .count() as u32;
+            m += 1;
+            if promotions > 0 && tm.tracks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            promotions, 1,
+            "expected exactly one promotion before the Silent close"
+        );
+        assert_eq!(tm.tracks.len(), 0, "the closed track must be gone");
+
+        // The old signal genuinely ends -- channel 10 goes quiet, `rise`
+        // drops. A few hops is enough for the gate's EMA to settle below
+        // threshold given the +20 dB jump.
+        let quiet = quiet_power(n);
+        for _ in 0..40 {
+            tm.step_hop(&hop(m, quiet.clone()), m);
+            m += 1;
+        }
+
+        // A genuinely different station now starts on the same channel,
+        // well within what would still be the flat cooldown window (30s =
+        // 11250 hops) -- it must be allowed to promote normally, not be
+        // silently suppressed by a cooldown that no longer applies.
+        let mut repromoted = false;
+        for _ in 0..60 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                repromoted = true;
+                break;
+            }
+            m += 1;
+        }
+        assert!(
+            repromoted,
+            "a new signal on channel 10 was suppressed by a stale cooldown after the old \
+             signal's rise genuinely dropped -- the cooldown must clear on a real RF gap"
+        );
+    }
+
     #[test]
     fn step_hop_populates_spectral_ref_power_instead_of_hard_coded_none() {
         // Codex review, PR #178: `pending`'s spectral_ref_power was
@@ -2566,25 +2817,62 @@ mod tests {
     /// single startup-calibration `process_hops` call, or a caller feeding
     /// large chunks) must never sort that later decoder update before the
     /// `TrackPromoted` that logically preceded it.
+    ///
+    /// MAN-171 (Codex review, PR #174 round 1): originally rendered the
+    /// full 120 s V1 vector as one unchunked batch. Since `note_char_
+    /// decoded()` (the GC/silent-timer reset) only ever runs *after*
+    /// `drain_pool()`, which a single-call batch defers to the very end,
+    /// EVERY track promoted inside that one call was structurally doomed
+    /// to close `Silent` at exactly `gc_hops` (30 s) regardless of real
+    /// decode progress -- V1's real signal cycled through 4 promote/
+    /// Silent-close births (at 2.06 s, 32.16 s, 62.29 s, 92.34 s) before
+    /// the *file* ran out, an artifact of this test's own oversized batch
+    /// with nothing to do with real decode convergence (confirmed:
+    /// `manta-cli/tests/golden_v1.rs`'s `v1_passes_end_to_end_from_wav`
+    /// decodes the same V1 vector through production's real 4096-sample
+    /// chunking as a single, continuous track_id 1). A short (10 s, well
+    /// under `gc_hops`) render still spans plenty of hops past warmup
+    /// (2 s) + confirm (~50 ms) for a promotion and its own real decoder
+    /// output to land in the one batch this test's actual point requires
+    /// -- without ever needing a track to survive `gc_hops` unassisted.
     #[test]
     fn process_hops_orders_track_promoted_before_same_batch_decoder_updates() {
         use manta_dsp::channelizer::Channelizer;
-        let spec = manta_testkit::vectors::v1();
-        let rendered = manta_testkit::vectors::render(&spec).unwrap();
-        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        use manta_testkit::scene::{render_scene, SignalSpec};
+        let fs = 96_000.0;
+        let center_freq_hz = 14_000_000.0;
+        let sig = SignalSpec {
+            text: "CQ CQ DE W1AW W1AW K".into(),
+            loop_text: true,
+            wpm: 20.0,
+            offset_hz: 12_340.0,
+            snr_2500_db: 20.0,
+            jitter: None,
+            qsb: None,
+            watterson: None,
+            char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
+        };
+        let (samples, _texts) =
+            render_scene(std::slice::from_ref(&sig), fs, 10.0, Some(0x534B_494D_5631)).unwrap();
+        let mut ch = Channelizer::new(fs, center_freq_hz).unwrap();
         let hop_samples = ch.hop() as u64;
         let mut tm = TrackManager::new(
             ch.n_channels(),
-            spec.fs,
-            spec.center_freq_hz,
+            fs,
+            center_freq_hz,
             DetectorConfig::default(),
             DecodeConfig::default(),
         );
-        // The whole file as ONE process_hops call (not chunked the way
-        // listen()'s real-time main loop feeds it) -- guarantees this
-        // track's promotion and its first decoder-output event land in
-        // the same returned batch.
-        let hops = ch.process(&rendered.samples);
+        // The whole (short) render as ONE process_hops call (not chunked
+        // the way listen()'s real-time main loop feeds it) -- guarantees
+        // this track's promotion and its first decoder-output event land
+        // in the same returned batch, without needing a track to survive
+        // a full `gc_hops` unassisted (see the doc comment above).
+        let hops = ch.process(&samples);
         let events = tm.process_hops(&hops, |m| m * hop_samples);
         let promoted_idx = events
             .iter()
