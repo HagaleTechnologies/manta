@@ -1600,12 +1600,6 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-<<<<<<< HEAD
-            // Captured before `src` is moved into the pipeline, for the
-            // readiness event below.
-            let source_sample_rate_hz = src.sample_rate();
-            let mut pipeline_ready_logged = false;
-=======
             // Printed AFTER the handler is installed, and via `eprintln!`
             // rather than `tracing::info!` because the subscriber is only
             // initialized inside `start_spot_server` -- a plain `listen`
@@ -1620,7 +1614,21 @@ fn main() -> Result<()> {
             // `READY_MARKER` updated to match. stdout stays pure JSON
             // under `--json` (MAN-59 round 6); this goes to stderr.
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
->>>>>>> 8ed910326650742ef7c499942c65075efa7b4004
+            // Captured before `src` is moved into the pipeline, for the
+            // readiness event below.
+            let source_sample_rate_hz = src.sample_rate();
+            let mut pipeline_ready_logged = false;
+            // MAN-122 review round 5 (P2): `stop` is moved into
+            // `listen_with_observers` below, so the readiness observer needs
+            // its own handle to read the cancellation flag. The engine runs
+            // the padding and calibration `on_tracks` callbacks BEFORE its
+            // loop first examines `stop` (manta-engine/src/listen.rs: the
+            // two `on_tracks(n_tracks)` calls above `loop { if
+            // stop.load(..) { break } }`), so a SIGINT arriving during the
+            // two-second startup calibration would otherwise publish
+            // `ready: decoding` for a run that shuts down without ever
+            // decoding a chunk.
+            let stop_ready = stop.clone();
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -1712,7 +1720,17 @@ fn main() -> Result<()> {
                         // built and the TrackManager has processed real
                         // hops. The startup banner above only ever claimed
                         // bound sockets (review round 2).
-                        if !pipeline_ready_logged {
+                        // Checked here rather than only at first-batch
+                        // time so a cancelled startup cannot publish a
+                        // false readiness event: `stop` is already `true`
+                        // by the time the calibration callbacks run, and
+                        // the decode loop breaks out immediately after
+                        // them. Not latching `pipeline_ready_logged` on
+                        // this path is deliberate -- the flag means "we
+                        // have claimed readiness", and no claim was made.
+                        if !pipeline_ready_logged
+                            && !stop_ready.load(std::sync::atomic::Ordering::Relaxed)
+                        {
                             pipeline_ready_logged = true;
                             tracing::info!(
                                 "{}",
