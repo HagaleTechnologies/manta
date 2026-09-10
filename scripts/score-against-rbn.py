@@ -228,7 +228,13 @@ def main():
     n_manta = len(manta_spots)
     n_truth = len(truth_by_key)
     precision = len(tp) / n_manta if n_manta else 0.0
-    recall = len(tp) / n_truth if n_truth else 0.0
+    # Codex review, PR #161: `len(tp)` counts manta SPOTS, not unique matched
+    # truth bins -- a re-spot of the same call+kHz (e.g. after the 10-minute
+    # dedupe window) appends a second entry to `tp` for the same truth item,
+    # which would double-count that one truth item and can inflate recall
+    # past 100%. `n_truth - len(fn_keys)` is the count of truth bins that
+    # matched at least one manta spot, which is what recall means.
+    recall = (n_truth - len(fn_keys)) / n_truth if n_truth else 0.0
 
     print(f"manta spots: {n_manta}")
     print(f"RBN truth rows excluded (callsign shape manta's grammar can never accept): {excluded}")

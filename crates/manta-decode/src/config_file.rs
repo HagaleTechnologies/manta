@@ -19,10 +19,20 @@
 //! drift from them. It also keeps the mapping reusable by any other
 //! `manta-decode` consumer without a new `manta-cli` dependency, and avoids
 //! adding `Deserialize` (and reconciling `#[serde(deny_unknown_fields)]`
-//! with the several fields SPEC v2 §7 does NOT expose, e.g. `DecodeConfig::
-//! demod`/`beam: BeamConfig`/`flush_gap_dits`, `EvidenceConfig::tau_a_ms`/
-//! `u_init_hops`, `NoiseConfig::tau_ms`, `HsmmConfig::u_min`/`u_max`) to
-//! those runtime structs themselves.
+//! with the several fields neither spec's `[decode]` table exposes, e.g.
+//! `EvidenceConfig::tau_a_ms`/`u_init_hops`, `NoiseConfig::tau_ms`,
+//! `HsmmConfig::u_min`/`u_max`, `DemodConfig::tau_hi_init_ms`) to those
+//! runtime structs themselves. `demod`/`beam: BeamConfig`/
+//! `DecodeConfig::flush_gap_dits` ARE exposed, carrying SPEC v1 §9's
+//! pre-existing `timing_sigma`/`beam_width`/`debounce_ms`/`hyst_up`/
+//! `hyst_down`/`tau_lo_ms`/`tau_hi_bounds_ms`/`flush_gap_dits` keys (Codex
+//! review, PR #161, two rounds -- `deny_unknown_fields` had silently
+//! rejected any config file still using them, contradicting v2 §7's
+//! "additive over v1" claim. Round 1 only caught 5 of v1 §9's 12 keys;
+//! round 2 caught 3 more that have a real, simple backing field.
+//! `char_gap_dits`/`word_gap_dits`/`mu_ratio_bounds`/`cluster_alpha` are
+//! still not exposed -- see `DecodeConfigToml`'s own doc comment on why
+//! those four are a real fast-follow, not a config-plumbing fix).
 //!
 //! `engine = "hsmm"` parses here without complaint. As of Task 11,
 //! `manta-cli`'s `parse_engine` no longer gates `--engine hsmm` either --
@@ -32,7 +42,9 @@
 //! `--engine` overrides whatever this table's `engine` key says, hsmm or
 //! not.
 
+use crate::beam::BeamConfig;
 use crate::decoder::{DecodeConfig, Engine};
+use crate::envelope::DemodConfig;
 use crate::evidence::EvidenceConfig;
 use crate::hsmm::HsmmConfig;
 use crate::noise::NoiseConfig;
@@ -96,6 +108,35 @@ fn default_seed_units_hops() -> Vec<f32> {
 fn default_conf_kappa() -> f32 {
     HsmmConfig::default().conf_kappa
 }
+// SPEC v1 §9's pre-existing `[decode]` keys (Codex review, PR #161): this
+// table's `#[serde(deny_unknown_fields)]` otherwise silently rejects any
+// config file still using these -- v2 §7 says its keys are additive over
+// v1, not a replacement for it.
+fn default_timing_sigma() -> f32 {
+    BeamConfig::default().sigma
+}
+fn default_beam_width() -> usize {
+    BeamConfig::default().width
+}
+fn default_debounce_ms() -> f64 {
+    DemodConfig::default().debounce_ms
+}
+fn default_hyst_up() -> f32 {
+    DemodConfig::default().hyst_up
+}
+fn default_hyst_down() -> f32 {
+    DemodConfig::default().hyst_down
+}
+fn default_tau_lo_ms() -> f64 {
+    DemodConfig::default().tau_lo_ms
+}
+fn default_tau_hi_bounds_ms() -> [f64; 2] {
+    let (lo, hi) = DemodConfig::default().tau_hi_bounds_ms;
+    [lo, hi]
+}
+fn default_flush_gap_dits() -> f32 {
+    DecodeConfig::default().flush_gap_dits
+}
 
 /// The `[decode]` TOML table, exactly SPEC v2 §7's key list. Every key
 /// defaults to its real `Default` impl's value (or, for `refine_bw_hz`,
@@ -145,6 +186,35 @@ pub struct DecodeConfigToml {
     pub seed_units_hops: Vec<f32>,
     #[serde(default = "default_conf_kappa")]
     pub conf_kappa: f32,
+    // SPEC v1 §9 (preserved additively over v2 -- see the default_* fns above)
+    #[serde(default = "default_timing_sigma")]
+    pub timing_sigma: f32,
+    #[serde(default = "default_beam_width")]
+    pub beam_width: usize,
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: f64,
+    #[serde(default = "default_hyst_up")]
+    pub hyst_up: f32,
+    #[serde(default = "default_hyst_down")]
+    pub hyst_down: f32,
+    #[serde(default = "default_tau_lo_ms")]
+    pub tau_lo_ms: f64,
+    #[serde(default = "default_tau_hi_bounds_ms")]
+    pub tau_hi_bounds_ms: [f64; 2],
+    #[serde(default = "default_flush_gap_dits")]
+    pub flush_gap_dits: f32,
+    // NOT exposed here despite being in SPEC v1 §9's table --
+    // `char_gap_dits`, `word_gap_dits`, `mu_ratio_bounds`, `cluster_alpha`
+    // are hardcoded constants in `crates/manta-decode/src/timing.rs`
+    // (`CHAR_GAP_DITS`/`WORD_GAP_DITS`/`RATIO_MIN`+`RATIO_MAX`/
+    // `CLUSTER_ALPHA`), not fields on any `DecodeConfig`-reachable struct.
+    // `char_gap_dits` additionally has deliberate per-engine deviation
+    // logic (see `timing.rs`'s own doc comment on `CHAR_GAP_DITS` vs
+    // `CHAR_GAP_DITS_NOMINAL`) that a naive TOML passthrough could break.
+    // Making these four genuinely configurable is real engineering in
+    // `manta-decode`'s core timing/gap-classification logic, not a config-
+    // plumbing fix -- tracked as a fast-follow rather than attempted here
+    // (Codex review, PR #161).
 }
 
 impl Default for DecodeConfigToml {
@@ -167,18 +237,41 @@ impl Default for DecodeConfigToml {
             speed_alpha: default_speed_alpha(),
             seed_units_hops: default_seed_units_hops(),
             conf_kappa: default_conf_kappa(),
+            timing_sigma: default_timing_sigma(),
+            beam_width: default_beam_width(),
+            debounce_ms: default_debounce_ms(),
+            hyst_up: default_hyst_up(),
+            hyst_down: default_hyst_down(),
+            tau_lo_ms: default_tau_lo_ms(),
+            tau_hi_bounds_ms: default_tau_hi_bounds_ms(),
+            flush_gap_dits: default_flush_gap_dits(),
         }
     }
 }
 
 impl DecodeConfigToml {
-    /// Builds a real `DecodeConfig` from this table. Every field SPEC v2
-    /// §7 does not expose (`demod`, `beam: BeamConfig`, `flush_gap_dits`,
-    /// `evidence.tau_a_ms`/`u_init_hops`, `noise.tau_ms`, `hsmm.u_min`/
-    /// `u_max`) is left at `DecodeConfig::default()`'s value.
+    /// Builds a real `DecodeConfig` from this table. `demod`/`beam`/
+    /// `flush_gap_dits` carry SPEC v1 §9's pre-existing keys (Codex review,
+    /// PR #161 -- v2 §7's keys are additive over v1, not a replacement).
+    /// Every field neither spec exposes (`evidence.tau_a_ms`/`u_init_hops`,
+    /// `noise.tau_ms`, `hsmm.u_min`/`u_max`, `demod.tau_hi_init_ms`) is
+    /// left at `DecodeConfig::default()`'s value.
     pub fn into_decode_config(self) -> DecodeConfig {
         DecodeConfig {
             engine: self.engine,
+            demod: DemodConfig {
+                hyst_up: self.hyst_up,
+                hyst_down: self.hyst_down,
+                debounce_ms: self.debounce_ms,
+                tau_lo_ms: self.tau_lo_ms,
+                tau_hi_bounds_ms: (self.tau_hi_bounds_ms[0], self.tau_hi_bounds_ms[1]),
+                ..DemodConfig::default()
+            },
+            beam: BeamConfig {
+                width: self.beam_width,
+                sigma: self.timing_sigma,
+            },
+            flush_gap_dits: self.flush_gap_dits,
             evidence: EvidenceConfig {
                 sigma_u: self.sigma_u,
                 llr_clip: self.llr_clip,
@@ -204,7 +297,6 @@ impl DecodeConfigToml {
                 ..HsmmConfig::default()
             },
             refine_bw_hz: self.refine_bw_hz,
-            ..DecodeConfig::default()
         }
     }
 }
@@ -296,8 +388,57 @@ mod tests {
                 speed_alpha: 0.25,
                 seed_units_hops: vec![8.0, 12.0, 17.0, 25.0, 37.0],
                 conf_kappa: 5.5,
+                ..DecodeConfigToml::default()
             }
         );
+    }
+
+    #[test]
+    fn spec_v1_section9_keys_still_parse_and_are_not_rejected_as_unknown() {
+        // Codex review, PR #161 (two rounds): `deny_unknown_fields` had
+        // silently rejected any config file still using SPEC v1 §9's
+        // pre-existing keys, even though v2 §7 documents its own keys as
+        // additive over v1, not a replacement. Round 1 covered 5 keys;
+        // round 2 added the 3 more that have a real, simple backing field
+        // (`char_gap_dits`/`word_gap_dits`/`mu_ratio_bounds`/
+        // `cluster_alpha` remain unexposed -- see `DecodeConfigToml`'s doc
+        // comment).
+        let file: DecodeConfigFile = toml::from_str(
+            r#"
+            [decode]
+            timing_sigma = 0.30
+            beam_width = 6
+            debounce_ms = 15.0
+            hyst_up = 1.3
+            hyst_down = 0.75
+            tau_lo_ms = 450.0
+            tau_hi_bounds_ms = [120.0, 380.0]
+            flush_gap_dits = 9.0
+            "#,
+        )
+        .unwrap();
+        let expected = DecodeConfigToml {
+            timing_sigma: 0.30,
+            beam_width: 6,
+            debounce_ms: 15.0,
+            hyst_up: 1.3,
+            hyst_down: 0.75,
+            tau_lo_ms: 450.0,
+            tau_hi_bounds_ms: [120.0, 380.0],
+            flush_gap_dits: 9.0,
+            ..DecodeConfigToml::default()
+        };
+        assert_eq!(file.decode, expected);
+
+        let cfg = file.decode.into_decode_config();
+        assert_eq!(cfg.beam.sigma, 0.30);
+        assert_eq!(cfg.beam.width, 6);
+        assert_eq!(cfg.demod.debounce_ms, 15.0);
+        assert_eq!(cfg.demod.hyst_up, 1.3);
+        assert_eq!(cfg.demod.hyst_down, 0.75);
+        assert_eq!(cfg.demod.tau_lo_ms, 450.0);
+        assert_eq!(cfg.demod.tau_hi_bounds_ms, (120.0, 380.0));
+        assert_eq!(cfg.flush_gap_dits, 9.0);
     }
 
     #[test]
@@ -345,6 +486,9 @@ mod tests {
         assert_eq!(cfg.noise.tau_ms, default.noise.tau_ms);
         assert_eq!(cfg.hsmm.u_min, default.hsmm.u_min);
         assert_eq!(cfg.hsmm.u_max, default.hsmm.u_max);
+        assert_eq!(cfg.demod.tau_hi_init_ms, default.demod.tau_hi_init_ms);
+        // flush_gap_dits/beam.width are exposed now (Codex review, PR #161)
+        // but weren't overridden in this instance -- still equal defaults.
         assert_eq!(cfg.flush_gap_dits, default.flush_gap_dits);
         assert_eq!(cfg.beam.width, default.beam.width);
     }

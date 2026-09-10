@@ -3,7 +3,7 @@
 //! straight into `TrackDecoder`, and score callsign recovery. Isolates
 //! the decode core from the tracker. SPEC v2 §8.3.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
 use manta_decode::events::DecoderEvent;
 use manta_dsp::channelizer::Channelizer;
@@ -40,8 +40,153 @@ pub struct OracleSummary {
     pub by_snr: Vec<(String, usize, usize, usize)>,
 }
 
-/// First spot per (call, kHz) from an RBN daily-dump CSV, restricted to `spotter`.
-pub fn parse_rbn_spots(csv_path: &Path, spotter: &str) -> Result<Vec<OracleSpot>> {
+/// Parses an RBN CSV `date` column value ("YYYY-MM-DD HH:MM:SS", UTC) or an
+/// ISO-8601 timestamp ("YYYY-MM-DDTHH:MM:SSZ") into Unix epoch seconds.
+/// Hand-rolled (no chrono/time dependency in this workspace) via Howard
+/// Hinnant's days-from-civil algorithm; UTC, proleptic Gregorian, no leap
+/// seconds -- matches `scripts/score-against-rbn.py`'s own handling of both
+/// timestamp shapes. Validates every component's range (local review gate,
+/// PR #161: the original version parsed numeric fields but never checked
+/// them, so e.g. "2025-13-01T00:00:00Z" or "2025-02-29T00:00:00Z" [2025 is
+/// not a leap year] silently normalized into a wrong epoch via
+/// `days_from_civil`'s unchecked arithmetic instead of erroring) and that
+/// no trailing garbage follows the expected component count.
+pub fn parse_utc_timestamp(s: &str) -> Result<i64> {
+    let sep = s
+        .find(['T', ' '])
+        .with_context(|| format!("no date/time separator in {s:?}"))?;
+    let (date, time) = (&s[..sep], &s[sep + 1..]);
+    let time = time.trim_end_matches('Z');
+    // Accept an explicit +00:00/-00:00 (or +0000/-0000) UTC offset -- the
+    // form `scripts/score-against-rbn.py`'s own `parse_iso` produces after
+    // normalizing "Z" to "+00:00", and a form CLI users may reasonably
+    // type directly -- as equivalent to "Z". Reject any NON-zero offset
+    // explicitly rather than silently misparsing it as UTC (local review
+    // gate, PR #161 round 2): this parser does no offset arithmetic, so a
+    // real non-zero offset must be a hard error, not a wrong answer.
+    let time = match time.rfind(['+', '-']) {
+        Some(off_pos) => {
+            let (clock, offset) = time.split_at(off_pos);
+            let normalized = offset.replace(':', "");
+            if normalized == "+0000" || normalized == "-0000" {
+                clock
+            } else {
+                bail!(
+                    "unsupported non-UTC offset {offset:?} in {s:?} -- only Z or a zero UTC \
+                     offset (+00:00/-00:00) is supported, since this parser does no offset \
+                     arithmetic"
+                );
+            }
+        }
+        None => time,
+    };
+    let mut d = date.split('-');
+    let y: i64 = d
+        .next()
+        .context("year")?
+        .parse()
+        .with_context(|| format!("year in {s:?}"))?;
+    let mo: i64 = d
+        .next()
+        .context("month")?
+        .parse()
+        .with_context(|| format!("month in {s:?}"))?;
+    let da: i64 = d
+        .next()
+        .context("day")?
+        .parse()
+        .with_context(|| format!("day in {s:?}"))?;
+    if d.next().is_some() {
+        bail!("unexpected extra date component in {s:?}");
+    }
+    let mut t = time.split(':');
+    let h: i64 = t
+        .next()
+        .context("hour")?
+        .parse()
+        .with_context(|| format!("hour in {s:?}"))?;
+    let mi: i64 = t
+        .next()
+        .context("minute")?
+        .parse()
+        .with_context(|| format!("minute in {s:?}"))?;
+    let se: i64 = t
+        .next()
+        .context("second")?
+        .parse()
+        .with_context(|| format!("second in {s:?}"))?;
+    if t.next().is_some() {
+        bail!("unexpected extra time component in {s:?}");
+    }
+    // Codex review, PR #161 round 2: an extreme but syntactically valid
+    // year (e.g. i64::MAX) reaches `days_from_civil`'s unchecked arithmetic
+    // and panics with an overflow instead of returning the intended parse
+    // error. No real capture date needs a year outside this range.
+    if !(1..=9999).contains(&y) {
+        bail!("year out of range 1-9999 in {s:?}: {y}");
+    }
+    if !(1..=12).contains(&mo) {
+        bail!("month out of range 1-12 in {s:?}: {mo}");
+    }
+    let dim = days_in_month(y, mo);
+    if da < 1 || da > dim {
+        bail!("day out of range 1-{dim} for {y:04}-{mo:02} in {s:?}: {da}");
+    }
+    if !(0..=23).contains(&h) {
+        bail!("hour out of range 0-23 in {s:?}: {h}");
+    }
+    if !(0..=59).contains(&mi) {
+        bail!("minute out of range 0-59 in {s:?}: {mi}");
+    }
+    if !(0..=59).contains(&se) {
+        bail!("second out of range 0-59 in {s:?}: {se}");
+    }
+    Ok(days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se)
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// `m` must already be validated as 1-12 (checked in `parse_utc_timestamp`
+/// before this is called).
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => unreachable!("month {m} must already be validated as 1-12"),
+    }
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// First spot per (call, kHz) from an RBN daily-dump CSV, restricted to
+/// `spotter`. `capture_start_epoch_s` (Unix epoch seconds, UTC -- see
+/// `parse_utc_timestamp`) anchors `OracleSpot::t_sec` to the actual
+/// recording start (Codex review, PR #161: extracting only `MM:SS` from
+/// the RBN row and treating it as an offset from the file start silently
+/// assumes the capture starts exactly on the hour and never crosses an
+/// hour boundary -- wrong for any other capture).
+pub fn parse_rbn_spots(
+    csv_path: &Path,
+    spotter: &str,
+    capture_start_epoch_s: i64,
+) -> Result<Vec<OracleSpot>> {
     let text = std::fs::read_to_string(csv_path)
         .with_context(|| format!("read {}", csv_path.display()))?;
     let mut lines = text.lines();
@@ -67,8 +212,7 @@ pub fn parse_rbn_spots(csv_path: &Path, spotter: &str) -> Result<Vec<OracleSpot>
             continue;
         }
         let khz: f64 = f[c_freq].parse()?;
-        let hms = &f[c_date][11..19];
-        let t_sec = hms[3..5].parse::<f64>()? * 60.0 + hms[6..8].parse::<f64>()?;
+        let t_sec = (parse_utc_timestamp(f[c_date])? - capture_start_epoch_s) as f64;
         let spot = OracleSpot {
             call: f[c_dx].to_uppercase(),
             khz,
@@ -201,5 +345,113 @@ fn summarize(spots: &[OracleSpot], results: &[OracleResult]) -> OracleSummary {
             .into_iter()
             .map(|(k, (n, a, f))| (k.to_string(), n, a, f))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn parses_rbn_space_separated_and_iso8601_z_forms() {
+        // Same instant, two shapes this function must accept (RBN's own
+        // "date" column, and an ISO-8601 --capture-start).
+        assert_eq!(
+            parse_utc_timestamp("2025-11-29 00:00:00").unwrap(),
+            parse_utc_timestamp("2025-11-29T00:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn epoch_zero_round_trips() {
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:00:00Z").unwrap(), 0);
+    }
+
+    #[test]
+    fn known_epoch_value_matches() {
+        // 2025-11-29T00:00:00Z, cross-checked against `date -u -d@<epoch>`.
+        assert_eq!(
+            parse_utc_timestamp("2025-11-29T00:00:00Z").unwrap(),
+            1_764_374_400
+        );
+    }
+
+    #[test]
+    fn capture_start_anchoring_survives_an_hour_boundary() {
+        // Codex review, PR #161: the old `MM:SS`-only parser treated wall-clock
+        // time as an offset from the top of an hour. A spot at 00:59:50 seen
+        // shortly after a 00:59:30 capture start must land ~20s in, not wrap
+        // toward the start of the *next* hour's MM:SS reading (only 20s either
+        // way here, but the old bug would have silently produced a huge wrong
+        // offset for a spot just past the hour, e.g. 01:00:05).
+        let capture_start = parse_utc_timestamp("2025-11-29T00:59:30Z").unwrap();
+        let spot_row_epoch = parse_utc_timestamp("2025-11-29T01:00:05Z").unwrap();
+        assert_eq!(spot_row_epoch - capture_start, 35);
+    }
+
+    #[test]
+    fn rejects_out_of_range_month() {
+        assert!(parse_utc_timestamp("2025-13-01T00:00:00Z").is_err());
+        assert!(parse_utc_timestamp("2025-00-01T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn rejects_extreme_years_instead_of_overflowing() {
+        // Codex review, PR #161 round 2: this exact input panicked with
+        // "attempt to multiply with overflow" in days_from_civil before the
+        // year-range check was added.
+        assert!(parse_utc_timestamp("9223372036854775807-01-01T00:00:00Z").is_err());
+        assert!(parse_utc_timestamp("0-01-01T00:00:00Z").is_err());
+        assert!(parse_utc_timestamp("10000-01-01T00:00:00Z").is_err());
+        assert!(parse_utc_timestamp("1-01-01T00:00:00Z").is_ok());
+        assert!(parse_utc_timestamp("9999-01-01T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn rejects_feb_29_in_a_non_leap_year() {
+        assert!(parse_utc_timestamp("2025-02-29T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn accepts_feb_29_in_a_leap_year() {
+        assert!(parse_utc_timestamp("2024-02-29T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn rejects_out_of_range_hour_minute_second() {
+        assert!(parse_utc_timestamp("2025-11-29T99:00:00Z").is_err());
+        assert!(parse_utc_timestamp("2025-11-29T00:60:00Z").is_err());
+        assert!(parse_utc_timestamp("2025-11-29T00:00:60Z").is_err());
+    }
+
+    #[test]
+    fn rejects_day_out_of_range_for_its_month() {
+        assert!(parse_utc_timestamp("2025-04-31T00:00:00Z").is_err()); // April has 30 days
+        assert!(parse_utc_timestamp("2025-11-29T00:00:00Z").is_ok()); // sanity: valid date still parses
+    }
+
+    #[test]
+    fn rejects_trailing_garbage_components() {
+        assert!(parse_utc_timestamp("2025-11-29-01T00:00:00Z").is_err());
+        assert!(parse_utc_timestamp("2025-11-29T00:00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn accepts_explicit_zero_utc_offset_forms() {
+        // Local review gate, PR #161 round 2: "+00:00" is a valid ISO-8601
+        // UTC timestamp (it's what score-against-rbn.py's own parse_iso
+        // produces after normalizing "Z"), and must parse identically to "Z".
+        let z = parse_utc_timestamp("2025-11-29T00:00:00Z").unwrap();
+        assert_eq!(parse_utc_timestamp("2025-11-29T00:00:00+00:00").unwrap(), z);
+        assert_eq!(parse_utc_timestamp("2025-11-29T00:00:00-00:00").unwrap(), z);
+        assert_eq!(parse_utc_timestamp("2025-11-29T00:00:00+0000").unwrap(), z);
+    }
+
+    #[test]
+    fn rejects_non_zero_utc_offsets_rather_than_silently_misparsing() {
+        // This parser does no offset arithmetic -- a real non-zero offset
+        // must be a hard error, never silently treated as UTC.
+        assert!(parse_utc_timestamp("2025-11-29T00:00:00+05:00").is_err());
+        assert!(parse_utc_timestamp("2025-11-29T00:00:00-08:00").is_err());
     }
 }

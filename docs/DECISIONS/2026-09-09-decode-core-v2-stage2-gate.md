@@ -28,8 +28,11 @@ against `ground-truth/B2_20251129_000000_7080kHz.rbn.csv` (26,803 lines
 including a header row -- RBN's raw daily-dump format for this
 recording's window).
 
-`cargo run --release -p manta-cli -- oracle <B2 wav> <B2 rbn csv> --engine
-<engine> --jsonl <out>`. `n` = 221 both engines (unchanged fixture set).
+`cargo run --release -p manta-cli -- oracle <B2 wav> <B2 rbn csv>
+--capture-start 2025-11-29T00:00:00Z --engine <engine> --jsonl <out>`. `n` =
+221 both engines (unchanged fixture set). (`--capture-start` became
+required after this measurement, PR #161 -- add it when re-running this
+command.)
 
 | metric | gate (§8.4 stage 2) | legacy | hsmm | hsmm meets gate? |
 |---|---|---|---|---|
@@ -99,6 +102,16 @@ call+kHz bins, vs 1,441 all-RBN bins after 126 grammar-excluded).
 | **K5TR-only precision (lower bound)** | 28/197 = **14.21 %** | 52/501 = **10.38 %** |
 | **all-RBN recall** | 59/1441 = **4.09 %** | 125/1441 = **8.68 %** |
 | **all-RBN precision** | 59/197 = **29.95 %** | 125/501 = **24.95 %** |
+
+**Caveat added post-measurement (Codex review, PR #161):** these recall figures were
+computed as `len(tp) / n_truth` at measurement time, which counts manta SPOTS matched,
+not unique truth bins matched -- a re-spot of the same call+kHz within this run (e.g.
+after the 10-minute dedupe window) would count that one truth bin twice, inflating
+recall. The scorer has since been fixed to use `(n_truth - len(fn_keys)) / n_truth`
+instead. Precision is unaffected (it's a per-manta-spot ratio, not per-truth-bin). None
+of the four recall figures above have been re-verified against the corrected formula --
+the real B2/K5TR corpus isn't available in every environment that might read this doc --
+so treat them as an upper bound on the true recall until re-measured.
 
 "K5TR-only precision" is a **lower bound, not true precision**: it
 divides K5TR-attributed true positives by the *total* spot count (197 /

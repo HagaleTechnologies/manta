@@ -268,7 +268,7 @@ impl TrackDecoder {
             None => events.push(DecoderEvent::WordBoundary {
                 track_id: self.track_id,
                 sample_ts: c.sample_ts,
-                confidence: c.confidence,
+                confidence: c.confidence * q,
             }),
         }
     }
