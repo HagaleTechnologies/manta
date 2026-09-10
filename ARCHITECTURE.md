@@ -134,10 +134,8 @@ cascade of Kaiser-windowed halfband FIR decimate-by-2 stages narrows it
 down before the channelizer ever sees it. Only exact power-of-two
 factors are supported (no general resampling), and the resulting rate
 must itself satisfy the channelizer's `fs/93.75` table constraint.
-Motivated by field evidence (docs/DECISIONS/2026-09-09-soapy-gain-is-
-inverted-attenuation-scale.md, docs/DECISIONS/2026-09-09-20m-dial-shift-
-edge-artifact-confirmed.md) that a narrower capture bandwidth can
-improve real-signal detection on some hardware.
+Motivated by live-hardware field evidence (2026-09-09) that a narrower
+capture bandwidth can improve real-signal detection on some hardware.
 
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
