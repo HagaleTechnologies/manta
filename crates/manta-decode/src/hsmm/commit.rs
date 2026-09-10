@@ -1,5 +1,5 @@
 //! Partial-traceback commit and posterior margins. SPEC v2 §4.8–4.9.
-use super::token::{glyph_rank, Token};
+use super::token::{glyph_rank, token_order, Token};
 use super::{Committed, HsmmConfig};
 use crate::tree::Glyph;
 
@@ -148,6 +148,19 @@ pub fn commit(
                 t.hist.remove(0);
             }
         }
+        // Codex review, PR #161 round 15: stripping sealed entries
+        // removes a DIFFERENT number of leading entries per token
+        // (unlike the uniform consensus-glyph removal near the end of
+        // this loop, which strips the same shared leading entry from
+        // every survivor and so can never change their relative lexical
+        // order) -- two equal-score tokens whose sealed leading glyphs
+        // differ can have their SPEC v2 §6.2 tie-break order silently
+        // invalidated once stripped, e.g. `[A(sealed), Z]` and
+        // `[B(sealed), A]` are ordered first-then-second before
+        // stripping but should reverse after (`[Z]` vs `[A]`). Re-sort
+        // so `tokens[0]` below, the forced-commit check, and `margin`
+        // all see the correct deterministic best token.
+        tokens.sort_by(token_order);
         if tokens.is_empty() || tokens[0].hist.is_empty() {
             break;
         }
@@ -178,4 +191,73 @@ pub fn commit(
         sealed.push((head.sample_ts, head.glyph.is_some()));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::token::Phase;
+    use super::*;
+
+    #[test]
+    fn commit_resorts_after_stripping_sealed_prefixes_of_differing_length() {
+        // Codex review, PR #161 round 15: stripping sealed entries removes
+        // a DIFFERENT number of leading entries per token, which can
+        // invalidate the SPEC v2 §6.2 deterministic tie-break order among
+        // equal-score tokens. Before stripping, [A(sealed), Z] correctly
+        // sorts ahead of [B(sealed), A] (glyph_rank('A') < glyph_rank('B')).
+        // After both leading (sealed) entries are stripped, the survivors
+        // are [Z] vs [A] -- the order must REVERSE (glyph_rank('A') <
+        // glyph_rank('Z')), which only happens if commit() re-sorts.
+        let cfg = HsmmConfig::default();
+        let token1 = Token {
+            node: 0,
+            phase: Phase::AfterSpace,
+            u: 13.0,
+            score: 5.0,
+            hist: vec![
+                super::super::token::HistEntry {
+                    glyph: Some(Glyph::Char('A')),
+                    sample_ts: 100,
+                    born_hop: 1,
+                },
+                super::super::token::HistEntry {
+                    glyph: Some(Glyph::Char('Z')),
+                    sample_ts: 200,
+                    born_hop: 2,
+                },
+            ],
+            anchor_hop: 2,
+        };
+        let token2 = Token {
+            node: 0,
+            phase: Phase::AfterSpace,
+            u: 13.0,
+            score: 5.0, // tied with token1
+            hist: vec![
+                super::super::token::HistEntry {
+                    glyph: Some(Glyph::Char('B')),
+                    sample_ts: 100,
+                    born_hop: 1,
+                },
+                super::super::token::HistEntry {
+                    glyph: Some(Glyph::Char('A')),
+                    sample_ts: 250,
+                    born_hop: 2,
+                },
+            ],
+            anchor_hop: 2,
+        };
+        // Pre-strip order is already correct per token_order (token1's
+        // [A, Z] sorts ahead of token2's [B, A]) -- exactly what a real
+        // caller's `cands.sort_by(token_order)` would have produced.
+        let mut tokens = vec![token1, token2];
+        let mut sealed = vec![(100, true)]; // both leading entries already sealed
+        let now_hop = 1000; // forces a commit regardless of consensus
+        let out = commit(&mut tokens, now_hop, &cfg, &mut sealed);
+        assert_eq!(
+            out.first().map(|c| (c.glyph, c.sample_ts)),
+            Some((Some(Glyph::Char('A')), 250)),
+            "after stripping, token2's [A] must sort ahead of token1's [Z] -- got {out:?}"
+        );
+    }
 }
