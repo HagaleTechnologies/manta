@@ -1068,6 +1068,36 @@ fn load_decode_config_file(
             cfg.hsmm.dur_sigma
         );
     }
+    // Codex review, PR #161 round 6: a large but individually-plausible
+    // `hold_dits` (e.g. 300) pushes `Evidence`'s hold-window width `h`
+    // (`hold_dits * u_max`) past `MAX_RETAIN` -- a debug build panics on
+    // the internal `debug_assert!`, a release build silently caps the
+    // delay line and discards centers with no error, decoding only the
+    // retained tail at EOF. `cfg.hsmm.u_max` is the largest `u_ref` the
+    // live speed-feedback loop can ever request (`Token::successor`
+    // clamps every speed update to `[u_min, u_max]`), so that's the
+    // correct worst case to bound against -- not just the config's
+    // initial `u_init_hops`.
+    let max_h = cfg.evidence.hold_dits as f64 * cfg.hsmm.u_max as f64;
+    if !cfg.evidence.hold_dits.is_finite() || cfg.evidence.hold_dits <= 0.0 || !max_h.is_finite() {
+        bail!(
+            "[decode] hold_dits must be finite and positive in {} (got {})",
+            path.display(),
+            cfg.evidence.hold_dits
+        );
+    }
+    if max_h >= manta_decode::evidence::MAX_RETAIN as f64 {
+        bail!(
+            "[decode] hold_dits={} is too large in {}: at the configured u_max={}, the hold \
+             window (hold_dits * u_max = {max_h}) would reach or exceed Evidence's internal \
+             retention cap ({}), silently truncating the delay line and discarding evidence \
+             centers",
+            cfg.evidence.hold_dits,
+            path.display(),
+            cfg.hsmm.u_max,
+            manta_decode::evidence::MAX_RETAIN,
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2320,6 +2350,27 @@ mod tests {
     fn load_decode_config_file_rejects_zero_dur_sigma() {
         let f = write_temp_file(b"[decode]\ndur_sigma = 0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_hold_dits() {
+        let f = write_temp_file(b"[decode]\nhold_dits = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_hold_dits_that_overflows_max_retain() {
+        // Codex review, PR #161 round 6: a large but individually-plausible
+        // hold_dits (300) at the default u_max (56.0) computes h = 16800,
+        // far past Evidence's MAX_RETAIN (4096).
+        let f = write_temp_file(b"[decode]\nhold_dits = 300\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_the_default_hold_dits() {
+        let f = write_temp_file(b"[decode]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
     }
 
     #[test]

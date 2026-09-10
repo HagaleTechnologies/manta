@@ -67,7 +67,14 @@ pub struct Evidence {
 /// default 56 hops, hold_dits default 4 -> h ~= 224 at the extreme; retaining
 /// several multiples of that bounds memory without ever needing to trim in
 /// a way that's coupled to a changing `h`).
-const MAX_RETAIN: usize = 4096;
+///
+/// Public (Codex review, PR #161 round 6) so a config loader can validate
+/// a user-supplied `hold_dits` against it BEFORE constructing `Evidence` --
+/// a config with a large but individually-plausible `hold_dits` (e.g. 300)
+/// pushes `h` past this cap, tripping the `debug_assert!`s below in a debug
+/// build or, in release, silently capping the delay line and discarding
+/// centers no downstream code is ever told about.
+pub const MAX_RETAIN: usize = 4096;
 
 impl Evidence {
     pub fn new(cfg: EvidenceConfig) -> Self {

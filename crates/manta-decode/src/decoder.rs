@@ -446,8 +446,21 @@ impl TrackDecoder {
                     for c in self.hsmm.push(&ev) {
                         self.emit_committed(c, &mut events);
                     }
+                    // Codex review, PR #161 round 6: this branch updated
+                    // the evidence window's speed feedback but never
+                    // called `report_wpm`, unlike `push_hop_hsmm`'s live
+                    // path -- `hsmm.finish()` below clears `self.live`
+                    // (so nothing downstream can recover the speed from
+                    // it) and `flush_final_speed` only ever reads the
+                    // Legacy-only `SpeedTracker`, so a short recording's
+                    // first usable Hsmm speed estimate (or a late change)
+                    // could emit no `SpeedUpdate` at all -- oracle's
+                    // `wpm_ratio` and any downstream WPM gate would then
+                    // see missing or stale data. Apply the exact same
+                    // reporting step `push_hop_hsmm` does.
                     if let Some(u) = self.hsmm.best_u() {
                         self.evidence.set_u_ref(u);
+                        self.report_wpm(450.0 / u, &mut events);
                     }
                 }
                 for c in self.hsmm.finish() {
