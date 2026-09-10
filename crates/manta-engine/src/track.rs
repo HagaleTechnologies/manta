@@ -297,7 +297,7 @@ impl Lifecycle {
     }
 }
 
-use manta_decode::decoder::{DecodeConfig, TrackDecoder};
+use manta_decode::decoder::{DecodeConfig, Engine, TrackDecoder};
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_dsp::channelizer::{
     interpolate_offset, odd_channel_sign_correction, power_db, HopOutput,
@@ -701,6 +701,38 @@ impl TrackManager {
         self.owner_of.len()
     }
 
+    /// SPEC v2 §2.2's min-of-six-neighbors spectral reference for a
+    /// track's centroid channel, converted from dB to linear power (the
+    /// unit `NoiseTracker::push`'s `spectral_ref_power` expects). Always
+    /// `Some` since `FloorBank::spectral_reference_db` has a real value
+    /// for every channel from construction onward. A free function (not
+    /// a `TrackManager` method) taking `&FloorBank` directly, so call
+    /// sites that already hold a mutable borrow of one `self.tracks`
+    /// entry (via `self.tracks.get_mut`) can still call this with
+    /// `&self.floor` -- a method call would instead borrow all of `self`,
+    /// conflicting with that live `self.tracks` borrow.
+    ///
+    /// Centered on the rounded CENTROID channel (matching
+    /// `decoder_input`'s own `c = round(c_f)`), NOT `k` (Codex review,
+    /// PR #178 round 4): `k` is the instantaneous max-power channel and
+    /// can flicker on noise/QRM even while the true centroid stays put --
+    /// the guard band this reference defines must stay centered on where
+    /// the track actually is, not wherever `k` momentarily points. A
+    /// populated-neighbor probe measured -50 dB at `k` vs the correct
+    /// -90 dB at the centroid when the two differed.
+    ///
+    /// Callers must only invoke this where the result will actually be
+    /// consumed (a decoder-present, non-`Legacy`-engine push) -- Codex
+    /// review, PR #178 round 4: computing this unconditionally for every
+    /// open track on every hop (including `Legacy`, which never reads
+    /// `spectral_ref_power`, and CANDIDATE tracks with no decoder to feed
+    /// it to) wasted ~225k-900k transcendental evaluations/sec at
+    /// 300-1200 tracks.
+    fn spectral_ref_power(floor: &FloorBank, center: f64) -> Option<f32> {
+        let c = center.round() as usize;
+        Some(10f64.powf(floor.spectral_reference_db(c) / 10.0) as f32)
+    }
+
     /// Issue #26: per-`CloseReason` counts of every track closed so far
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
@@ -768,6 +800,16 @@ impl TrackManager {
         // without also needing a borrow of `self.decode_cfg` alongside
         // `self.tracks.get_mut(&id)`.
         let refine_bw_hz = self.decode_cfg.refine_bw_hz;
+        // Codex review, PR #178 round 4: `Engine::Legacy` (the default)
+        // ignores `spectral_ref_power` entirely (`push_envelope_legacy`
+        // never reads it), and a CANDIDATE track (no decoder yet) never
+        // queues it either -- computing `FloorBank::spectral_reference_db`
+        // (a six-neighbor scan plus `log10`/`powf`) unconditionally for
+        // every open track on every hop wasted ~225k-900k transcendental
+        // evaluations/sec at 300-1200 tracks for callers that can never
+        // consume the result. Gated at each push site below (Promoted /
+        // decoder-present) instead of computed here for every track.
+        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy);
 
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
@@ -790,28 +832,6 @@ impl TrackManager {
             track.update_centroid(k, &hop.power, n);
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
-            // SPEC v2 §2.2's min-of-six-neighbors spectral reference,
-            // converted from dB to linear power (the unit
-            // `NoiseTracker::push`'s `spectral_ref_power` expects) --
-            // `FloorBank::spectral_reference_db` always has a real value
-            // for every channel from construction onward, so this is
-            // unconditionally `Some` (Codex review, PR #178: previously
-            // hard-coded `None` at both `decoder_input` push sites below,
-            // so `NoiseTracker`'s spectral-discounting branch never
-            // activated for the v2 engines).
-            //
-            // Centered on the rounded CENTROID channel (matching
-            // `decoder_input`'s own `c = round(c_f)`), NOT `k` (Codex
-            // review, PR #178 round 4): `k` is the instantaneous
-            // max-power channel and can flicker on noise/QRM even while
-            // the true centroid stays put -- the guard band this
-            // reference defines must stay centered on where the track
-            // actually is, not wherever `k` momentarily points. A
-            // populated-neighbor probe measured -50 dB at `k` vs the
-            // correct -90 dB at the centroid when the two differed.
-            let c = track.center.round() as usize;
-            let spectral_ref_power =
-                Some(10f64.powf(self.floor.spectral_reference_db(c) / 10.0) as f32);
             let char_emitted = false; // GC timer input; refined below once a decoder exists.
             let event = track.lifecycle.on_hop(rise[k], drop[k], char_emitted);
             match event {
@@ -835,6 +855,9 @@ impl TrackManager {
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
                     let (amp, raw_power, ts) = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                    let spectral_ref_power = compute_spectral_ref_power
+                        .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                        .flatten();
                     track.pending.push((amp, raw_power, spectral_ref_power, ts));
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
@@ -877,6 +900,9 @@ impl TrackManager {
                         }
                         let (amp, raw_power, ts) =
                             track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                        let spectral_ref_power = compute_spectral_ref_power
+                            .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                            .flatten();
                         track.pending.push((amp, raw_power, spectral_ref_power, ts));
                     }
                 }
@@ -1825,13 +1851,19 @@ mod tests {
         // `step_hop`, so `NoiseTracker`'s SPEC v2 §2.2 spectral-
         // discounting branch (`max(N_temp, β·N_spec)`) never activated
         // for the edge-legacy/hsmm engines -- QRM/clicks weren't
-        // discounted as the spec requires.
+        // discounted as the spec requires. `Engine::Hsmm` here (not
+        // `DecodeConfig::default()`'s `Legacy`) is required for this
+        // assertion to be meaningful post round-4's perf fix, which
+        // correctly stops computing spectral_ref_power for Legacy.
         let mut tm = TrackManager::new(
             64,
             96_000.0,
             14_000_000.0,
             DetectorConfig::default(),
-            DecodeConfig::default(),
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                ..DecodeConfig::default()
+            },
         );
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
@@ -1873,13 +1905,18 @@ mod tests {
         // the -90 dB floor, c=10's neighbor set {6,7,8,12,13,14} still
         // has two quiet escapes (6, 12) and correctly reads -90 dB;
         // k=11's neighbor set {7,8,9,13,14,15} is entirely loud and would
-        // (incorrectly) read -50 dB if used instead.
+        // (incorrectly) read -50 dB if used instead. `Engine::Hsmm` (not
+        // `DecodeConfig::default()`'s `Legacy`) so round 4's perf fix
+        // doesn't skip computing spectral_ref_power entirely.
         let mut tm = TrackManager::new(
             64,
             96_000.0,
             14_000_000.0,
             DetectorConfig::default(),
-            DecodeConfig::default(),
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                ..DecodeConfig::default()
+            },
         );
         feed_warmup(&mut tm, 64);
         let mut power = quiet_power(64);
@@ -1925,6 +1962,48 @@ mod tests {
             ref_db < -80.0,
             "spectral reference must stay centered on the centroid c=10 (correct: ~-90 dB), not \
              the flickering owned channel k=11 (buggy: ~-50 dB); got {ref_db} dB"
+        );
+    }
+
+    #[test]
+    fn step_hop_skips_spectral_ref_power_for_the_legacy_engine() {
+        // Codex review, PR #178 round 4: `Engine::Legacy` never reads
+        // `spectral_ref_power` (`push_envelope_legacy` doesn't accept
+        // it), so computing `FloorBank::spectral_reference_db` (a
+        // six-neighbor scan plus `log10`/`powf`) for every open Legacy
+        // track on every hop was pure waste -- measured at ~225k-900k
+        // unnecessary transcendental evaluations/sec at 300-1200 tracks.
+        // `DecodeConfig::default()`'s engine is `Legacy`.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _) = *track
+            .pending
+            .last()
+            .expect("the promotion hop itself must have queued a pending entry");
+        assert!(
+            spectral_ref_power.is_none(),
+            "the Legacy engine must never pay for computing spectral_ref_power"
         );
     }
 
