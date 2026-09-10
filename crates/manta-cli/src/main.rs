@@ -544,7 +544,10 @@ impl IqSource for FixedCenterFreqSource {
 /// behavior). Applied uniformly regardless of source type (kiwi/soapy/
 /// hpsdr/audio/file replay), mirroring how `dial_freq_hz`'s
 /// `FixedCenterFreqSource` wrap is already applied uniformly below.
-fn maybe_decimate(src: Box<dyn IqSource>, capture_rate_hz: Option<f64>) -> Result<Box<dyn IqSource>> {
+fn maybe_decimate(
+    src: Box<dyn IqSource>,
+    capture_rate_hz: Option<f64>,
+) -> Result<Box<dyn IqSource>> {
     match capture_rate_hz {
         Some(target) if (target - src.sample_rate()).abs() > 1e-6 => {
             Ok(Box::new(manta_input::DecimatingSource::new(src, target)?))

@@ -124,7 +124,9 @@ impl Decimator {
         }
         let n_stages = factor.trailing_zeros() as usize;
         let taps = design_halfband(HALFBAND_TAPS);
-        let stages = (0..n_stages).map(|_| HalfbandStage::new(taps.clone())).collect();
+        let stages = (0..n_stages)
+            .map(|_| HalfbandStage::new(taps.clone()))
+            .collect();
         Ok(Decimator { stages, fs_out })
     }
 
@@ -179,8 +181,16 @@ mod tests {
         let h = design_halfband(HALFBAND_TAPS);
         let center = (h.len() - 1) / 2;
         for k in (2..center).step_by(2) {
-            assert!(h[center + k].abs() < 1e-6, "tap at +{k} not ~0: {}", h[center + k]);
-            assert!(h[center - k].abs() < 1e-6, "tap at -{k} not ~0: {}", h[center - k]);
+            assert!(
+                h[center + k].abs() < 1e-6,
+                "tap at +{k} not ~0: {}",
+                h[center + k]
+            );
+            assert!(
+                h[center - k].abs() < 1e-6,
+                "tap at -{k} not ~0: {}",
+                h[center - k]
+            );
         }
     }
 
@@ -196,7 +206,10 @@ mod tests {
             worst = worst.max(response_db(&h, f, fs));
             f += 500.0;
         }
-        assert!(worst <= -78.0, "worst stopband {worst} dB (raise HALFBAND_TAPS if this fails)");
+        assert!(
+            worst <= -78.0,
+            "worst stopband {worst} dB (raise HALFBAND_TAPS if this fails)"
+        );
     }
 
     #[test]

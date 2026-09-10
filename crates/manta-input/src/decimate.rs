@@ -161,7 +161,10 @@ mod tests {
         });
         let src = DecimatingSource::new(inner, 48_000.0).unwrap();
         assert_eq!(src.center_freq_hz(), 14_035_000.0);
-        assert!(src.confirmed_live_handle().unwrap().load(std::sync::atomic::Ordering::Relaxed));
+        assert!(src
+            .confirmed_live_handle()
+            .unwrap()
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -284,9 +287,6 @@ mod tests {
         // Record a packet drop in the original counters
         counters.record_dropped(5);
         // Verify the forwarded reference sees the same update
-        assert_eq!(
-            forwarded_counters.dropped_packets(),
-            5
-        );
+        assert_eq!(forwarded_counters.dropped_packets(), 5);
     }
 }
