@@ -85,8 +85,23 @@ const MAX_CLOSED_SURVIVORS: usize = 512;
 /// simply age out under this cap. Sized like `MAX_CLOSED_SURVIVORS`,
 /// above `PipelineConfig::track_cap`'s default 500, and dropped in the
 /// same INSERTION order for the same reasons; dropping one only ever
-/// degrades a migration to "annotations lost", never to leaked state.
+/// degrades a migration to "annotations lost"/"pending beacons lost",
+/// never to leaked state.
 const MAX_DEFERRED_ANNOTATIONS: usize = 512;
+
+/// Everything a merge can hand to a survivor that has no `TrackState`
+/// yet, parked instead of materializing one -- see
+/// `MAX_DEFERRED_ANNOTATIONS` for why materializing one leaks. Both
+/// migrations that a `ClosureKind::Bookkeeping` closure performs park
+/// here: MAN-33's message annotations AND the `PendingBeacon`s
+/// `migrate_or_discard_pending_beacons` carries (Codex review on PR
+/// #159, round 12 -- the beacon path had the identical
+/// `entry(..).or_default()` shape and so the identical leak).
+#[derive(Default)]
+struct DeferredState {
+    annotations: MessageAnnotations,
+    pending_beacons: Vec<PendingBeacon>,
+}
 
 /// MAN-33's per-track message annotations, named apart from `TrackState`
 /// so a merge can carry them without a `TrackState` to put them in --
@@ -417,12 +432,12 @@ pub struct Validator {
     /// (the MAN-19 leak) -- and it is only reachable at all in the
     /// pathological regime where an eviction happens.
     dropped_survivor_watermark: u32,
-    /// MAN-33 annotations carried by a merge whose survivor has no
-    /// `TrackState` yet, held here instead of materializing one for it --
-    /// see `MAX_DEFERRED_ANNOTATIONS`. Adopted by `track_mut` on that
-    /// survivor's first event; never read for a track that already has a
-    /// `TrackState`.
-    deferred_annotations: BTreeMap<u32, MessageAnnotations>,
+    /// MAN-33 annotations and `PendingBeacon`s carried by a merge whose
+    /// survivor has no `TrackState` yet, held here instead of
+    /// materializing one for it -- see `MAX_DEFERRED_ANNOTATIONS`.
+    /// Adopted by `track_mut` on that survivor's first event; never read
+    /// for a track that already has a `TrackState`.
+    deferred_annotations: BTreeMap<u32, DeferredState>,
     /// The `deferred_annotations` keys in the order they were parked, so
     /// the oldest is dropped first at the cap -- the same insertion-order
     /// policy (and the same reasons) as `closed_survivor_order`. An id
@@ -589,12 +604,8 @@ impl Validator {
                 confidence,
                 sample_ts,
             } => {
-<<<<<<< HEAD
-                let track = self.track_mut(*track_id);
-=======
                 self.advance_clock(*sample_ts);
-                let track = self.tracks.entry(*track_id).or_default();
->>>>>>> bbfa2398ca2738031f4db14093c35d7798453109
+                let track = self.track_mut(*track_id);
                 match glyph {
                     Glyph::Char(c) => {
                         track.current.text.push(c.to_ascii_uppercase());
@@ -614,12 +625,8 @@ impl Validator {
                 track_id,
                 sample_ts,
             } => {
-<<<<<<< HEAD
-                let track = self.track_mut(*track_id);
-=======
                 self.advance_clock(*sample_ts);
-                let track = self.tracks.entry(*track_id).or_default();
->>>>>>> bbfa2398ca2738031f4db14093c35d7798453109
+                let track = self.track_mut(*track_id);
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
                     // MAN-33: scan the word that just completed, not the
@@ -775,8 +782,7 @@ impl Validator {
                 // `last_sample_ts` was never a safe sweep reference on its
                 // own.
                 self.tracks.remove(track_id);
-<<<<<<< HEAD
-                self.gate.forget_track(*track_id);
+                self.maybe_sweep();
                 // Record where this identity went (`None` = nowhere) so a
                 // LATER-delivered closure naming this now-removed track_id
                 // as its survivor can be forwarded on rather than
@@ -784,9 +790,6 @@ impl Validator {
                 // value stored is the already-resolved survivor, so chains
                 // stay flat instead of deepening one hop per merge.
                 self.note_closed(*track_id, survivor);
-=======
-                self.maybe_sweep();
->>>>>>> bbfa2398ca2738031f4db14093c35d7798453109
                 spots
             }
         }
@@ -1415,14 +1418,29 @@ impl Validator {
             return;
         }
         match survivor_track_id {
+            // `get_mut`, NOT `entry(..).or_default()` (Codex review on PR
+            // #159: "avoid orphaning state on eventless merge
+            // survivors"). Materializing a `TrackState` for a survivor
+            // that has never emitted a decoder event is the MAN-19 leak:
+            // `merge_converged` requires only the LOSER to have emitted,
+            // so an eventless survivor merged or evicted before it ever
+            // decodes anything is filtered out of `TrackClosed` and
+            // nothing would ever free that state. Park the beacons
+            // exactly as `migrate_message_annotations` parks the
+            // annotations -- `track_mut` adopts them if the survivor
+            // does eventually speak, which is the same event that earns
+            // it its own eventual `TrackClosed`.
             Some(survivor) => {
-                let survivor_track = self.tracks.entry(survivor).or_default();
-                for pb in pending {
-                    if survivor_track.pending_beacons.len() >= MAX_PENDING_BEACONS {
-                        survivor_track.pending_beacons.remove(0);
-                        self.suppression_counts.pending_beacon_overflow += 1;
+                if let Some(survivor_track) = self.tracks.get_mut(&survivor) {
+                    for pb in pending {
+                        if survivor_track.pending_beacons.len() >= MAX_PENDING_BEACONS {
+                            survivor_track.pending_beacons.remove(0);
+                            self.suppression_counts.pending_beacon_overflow += 1;
+                        }
+                        survivor_track.pending_beacons.push(pb);
                     }
-                    survivor_track.pending_beacons.push(pb);
+                } else {
+                    self.defer_pending_beacons(survivor, pending);
                 }
             }
             None => {
@@ -1485,7 +1503,7 @@ impl Validator {
 
     /// `self.tracks`' entry for `track_id`, created on first use. THE one
     /// place a `TrackState` is materialized, so a survivor that had
-    /// annotations parked for it by `migrate_message_annotations` picks
+    /// annotations (or pending beacons) parked for it by a merge picks
     /// them up the moment it produces its own first decoder event -- the
     /// same event that sets `manta-engine`'s `has_emitted` and so
     /// guarantees this state an eventual `TrackClosed` to free it (Codex
@@ -1496,37 +1514,83 @@ impl Validator {
         } else {
             self.deferred_annotations.remove(&track_id)
         };
-        let track = self.tracks.entry(track_id).or_default();
         if let Some(carried) = carried {
-            fold_annotations(
-                &mut track.rst,
-                &mut track.rst_ts,
-                &mut track.qrl_query,
-                carried,
-            );
+            let mut overflow = 0u64;
+            {
+                let track = self.tracks.entry(track_id).or_default();
+                fold_annotations(
+                    &mut track.rst,
+                    &mut track.rst_ts,
+                    &mut track.qrl_query,
+                    carried.annotations,
+                );
+                // Same bound and same drop-oldest policy the live path in
+                // `migrate_or_discard_pending_beacons` uses -- adoption
+                // must not be a way around `MAX_PENDING_BEACONS`.
+                for pb in carried.pending_beacons {
+                    if track.pending_beacons.len() >= MAX_PENDING_BEACONS {
+                        track.pending_beacons.remove(0);
+                        overflow += 1;
+                    }
+                    track.pending_beacons.push(pb);
+                }
+            }
+            self.suppression_counts.pending_beacon_overflow += overflow;
         }
-        track
+        self.tracks.entry(track_id).or_default()
     }
 
     /// Parks `carried` for a survivor that has no `TrackState`, folding
     /// into whatever an earlier merge already parked for the same id (a
     /// chain of merges can reach the same eventless survivor more than
-    /// once). Bounded by `MAX_DEFERRED_ANNOTATIONS`, dropping the entry
-    /// parked LONGEST AGO first -- the same insertion-order policy
-    /// `note_closed` uses for `closed_survivors`. The cap is enforced
-    /// against `deferred_annotation_order`, not the map, because
-    /// `track_mut` removes adopted ids from the map without touching the
-    /// deque: bounding the deque bounds both, whereas bounding only the
-    /// map would let the deque grow one stale id per adoption forever.
+    /// once). Capping/eviction lives in `deferred_entry`.
     fn defer_annotations(&mut self, survivor_track_id: u32, carried: MessageAnnotations) {
-        if let Some(existing) = self.deferred_annotations.get_mut(&survivor_track_id) {
-            fold_annotations(
-                &mut existing.rst,
-                &mut existing.rst_ts,
-                &mut existing.qrl_query,
-                carried,
-            );
-            return;
+        let existing = self.deferred_entry(survivor_track_id);
+        fold_annotations(
+            &mut existing.annotations.rst,
+            &mut existing.annotations.rst_ts,
+            &mut existing.annotations.qrl_query,
+            carried,
+        );
+    }
+
+    /// Parks `pending` for a survivor that has no `TrackState`, the
+    /// beacon-side counterpart of `defer_annotations` (Codex review on PR
+    /// #159, round 12). Bounded by the same `MAX_PENDING_BEACONS` the
+    /// live migration path enforces, counted the same way, so parking can
+    /// never become a way to hold more deferred beacons per identity than
+    /// a live `TrackState` would.
+    fn defer_pending_beacons(&mut self, survivor_track_id: u32, pending: Vec<PendingBeacon>) {
+        let mut overflow = 0u64;
+        {
+            let existing = self.deferred_entry(survivor_track_id);
+            for pb in pending {
+                if existing.pending_beacons.len() >= MAX_PENDING_BEACONS {
+                    existing.pending_beacons.remove(0);
+                    overflow += 1;
+                }
+                existing.pending_beacons.push(pb);
+            }
+        }
+        self.suppression_counts.pending_beacon_overflow += overflow;
+    }
+
+    /// The parked `DeferredState` for `survivor_track_id`, created on
+    /// first use -- THE one place a deferred entry is materialized, so
+    /// both parkers share one cap and one eviction policy. Bounded by
+    /// `MAX_DEFERRED_ANNOTATIONS`, dropping the entry parked LONGEST AGO
+    /// first -- the same insertion-order policy `note_closed` uses for
+    /// `closed_survivors`. The cap is enforced against
+    /// `deferred_annotation_order`, not the map, because `track_mut`
+    /// removes adopted ids from the map without touching the deque:
+    /// bounding the deque bounds both, whereas bounding only the map
+    /// would let the deque grow one stale id per adoption forever.
+    fn deferred_entry(&mut self, survivor_track_id: u32) -> &mut DeferredState {
+        if self.deferred_annotations.contains_key(&survivor_track_id) {
+            return self
+                .deferred_annotations
+                .get_mut(&survivor_track_id)
+                .expect("checked present");
         }
         while self.deferred_annotation_order.len() >= MAX_DEFERRED_ANNOTATIONS {
             let Some(dropped) = self.deferred_annotation_order.pop_front() else {
@@ -1534,10 +1598,22 @@ impl Validator {
                 // is at the cap. Break rather than spin.
                 break;
             };
-            self.deferred_annotations.remove(&dropped);
+            if let Some(dropped) = self.deferred_annotations.remove(&dropped) {
+                // Aging a parked entry out loses whatever it held. The
+                // annotations were only ever decoration on a spot, but the
+                // beacons were candidates that could have become one --
+                // counted per ARCHITECTURE §8, exactly as an eviction with
+                // no survivor is.
+                self.suppression_counts.pending_beacon_lost_to_eviction +=
+                    dropped.pending_beacons.len() as u64;
+            }
         }
-        self.deferred_annotations.insert(survivor_track_id, carried);
+        self.deferred_annotations
+            .insert(survivor_track_id, DeferredState::default());
         self.deferred_annotation_order.push_back(survivor_track_id);
+        self.deferred_annotations
+            .get_mut(&survivor_track_id)
+            .expect("just inserted")
     }
 
     /// The one point where every `PendingBeacon` captured for `track_id`
@@ -1966,6 +2042,78 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             1,
             "the migrated candidate must resolve at the survivor's true \
              close, using the survivor's own final speed, got {spots:?}"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review on PR #159, round 12 ("avoid orphaning state on
+    /// eventless merge survivors"): the beacon migration had the same
+    /// `entry(..).or_default()` shape the annotation migration was fixed
+    /// for in round 11, and so the same MAN-19 leak -- a survivor that
+    /// has emitted nothing gets no `TrackClosed` of its own, so a
+    /// `TrackState` materialized for it here is never freed. The
+    /// candidates must be parked instead, and adopted only if the
+    /// survivor does eventually speak.
+    #[test]
+    fn merge_into_an_eventless_survivor_parks_pending_beacons() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // Track 2 has produced no decoder event at all, so it has no
+        // `TrackState` -- and `merge_converged` would filter its own
+        // eventual closure out entirely.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        assert!(
+            v.tracks.is_empty(),
+            "no `TrackState` may exist for a survivor that has emitted \
+             nothing -- no `TrackClosed` would ever free it, got {:?}",
+            v.tracks.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            v.deferred_annotations
+                .get(&2)
+                .map(|d| d.pending_beacons.len()),
+            Some(1),
+            "the loser's captured candidate must be parked for the survivor"
+        );
+        assert_eq!(
+            v.suppression_counts().pending_beacon_lost_to_eviction,
+            0,
+            "parking is not losing -- nothing may be counted lost here"
+        );
+
+        // The survivor speaks: it now has a `TrackState` (and so an
+        // eventual `TrackClosed`), and adopts what was parked.
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 2,
+            wpm: 25.0,
+        });
+        assert!(
+            !v.deferred_annotations.contains_key(&2),
+            "an adopted parking slot must be released"
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(
+            spots.len(),
+            1,
+            "the parked candidate must resolve at the survivor's true \
+             close, got {spots:?}"
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);

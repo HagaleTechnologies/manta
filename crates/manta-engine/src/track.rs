@@ -301,7 +301,7 @@ use manta_decode::decoder::{DecodeConfig, TrackDecoder};
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
 use manta_dsp::floor::{FloorBank, Gate};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
 /// round(center)+1}` per SPEC §2.5; `center` is a live, per-hop EMA of the
@@ -596,6 +596,7 @@ impl TrackManager {
         Vec<(u32, ClosureKind)>,
         Vec<DecoderEvent>,
         Vec<DecoderEvent>,
+        Vec<(u32, u64)>,
     ) {
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         assert_eq!(
@@ -803,12 +804,29 @@ impl TrackManager {
             })
             .collect();
         let (merged_ids, merged_flush) = self.merge_converged();
+        // MAN-33 round 12 (Codex review on PR #159): a merge redirect is
+        // an event that happened at THIS hop, not at end-of-batch. Record
+        // the hop timestamp for every merge-loser closed here so
+        // `effective_sort_ts` can place its `TrackClosed` chronologically
+        // instead of at `event_sample_ts`'s end-of-everything `u64::MAX` --
+        // see that function's own comment for why the old placement
+        // silently dropped a loser's annotations from a same-batch
+        // survivor spot.
+        let merge_redirect_ts: Vec<(u32, u64)> = merged_ids
+            .iter()
+            .map(|(loser, _)| (*loser, sample_ts))
+            .collect();
         closed_with_kind.extend(merged_ids);
         closure_flush_events.extend(merged_flush);
         let (evicted_ids, evicted_flush) = self.evict_over_cap();
         closed_with_kind.extend(evicted_ids);
         closure_flush_events.extend(evicted_flush);
-        (closed_with_kind, promoted_events, closure_flush_events)
+        (
+            closed_with_kind,
+            promoted_events,
+            closure_flush_events,
+            merge_redirect_ts,
+        )
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -859,13 +877,42 @@ impl TrackManager {
                 }
             }
         }
+        // MAN-33 round 12 (Codex review on PR #159): a single batch can
+        // form a CHAIN -- the guard above only refuses to make the same
+        // track a loser twice, so `A -> B` and `B -> C` can both be
+        // decided here. Naming `B` as `A`'s survivor would be naming a
+        // track this method is about to remove: `B` is itself a loser, so
+        // it stops existing before this batch's events are even emitted,
+        // and worse, an eventless `B` is filtered out below and so gets
+        // no `TrackClosed` of its own -- the consumer never learns about
+        // the `B -> C` redirect and silently strands whatever it parked
+        // for `B` (a merge loser's message annotations, its pending
+        // beacons). Collapse every chain to its FINAL survivor here,
+        // where the whole batch's decisions are in hand, rather than
+        // asking a downstream consumer to reconstruct a redirect it was
+        // never told about.
+        let redirects: HashMap<u32, u32> = to_close.iter().copied().collect();
+        // Acyclic by construction (a track is a loser at most once, and
+        // the first link's loser can never reappear as a later link's
+        // survivor), so this terminates; the bound is belt-and-braces
+        // against a future change to the pairing guard above.
+        let resolve_final = |mut survivor: u32| -> u32 {
+            for _ in 0..redirects.len() {
+                match redirects.get(&survivor) {
+                    Some(&next) => survivor = next,
+                    None => break,
+                }
+            }
+            survivor
+        };
         // MAN-19: only report a merge-loser as `TrackClosed`-worthy if it
         // actually emitted a real event -- see the matching comment in
         // `step_hop` (a track promoted this same batch can be merged away
         // before ever getting a `drain_pool` pass).
         let mut flush_events: Vec<DecoderEvent> = Vec::new();
         let ever_emitted_closed = to_close
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(|(loser, survivor)| {
                 self.close_counts.record(CloseReason::Merged);
                 let mut track = self.tracks.remove(&loser)?;
@@ -876,7 +923,7 @@ impl TrackManager {
                 Some((
                     loser,
                     ClosureKind::Bookkeeping {
-                        survivor_track_id: Some(survivor),
+                        survivor_track_id: Some(resolve_final(survivor)),
                     },
                 ))
             })
@@ -939,11 +986,16 @@ impl TrackManager {
         let mut closed_ids: Vec<(u32, ClosureKind)> = Vec::new();
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         let mut closure_flush_events: Vec<DecoderEvent> = Vec::new();
+        // Per-merge-loser hop timestamp, for `effective_sort_ts` (MAN-33
+        // round 12) -- the same shape as `promoted_ts_by_track` below.
+        let mut merge_ts_by_track: HashMap<u32, u64> = HashMap::new();
         for h in hops {
-            let (closed, promoted, closure_flush) = self.step_hop(h, hop_to_sample_ts(h.m));
+            let (closed, promoted, closure_flush, merge_ts) =
+                self.step_hop(h, hop_to_sample_ts(h.m));
             closed_ids.extend(closed);
             promoted_events.extend(promoted);
             closure_flush_events.extend(closure_flush);
+            merge_ts_by_track.extend(merge_ts);
         }
         let pool_events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
@@ -1015,7 +1067,7 @@ impl TrackManager {
         );
         events.sort_by_key(|e| {
             (
-                effective_sort_ts(e, &promoted_ts_by_track),
+                effective_sort_ts(e, &promoted_ts_by_track, &merge_ts_by_track),
                 event_track_id(e),
                 event_kind_tier(e),
             )
@@ -1166,11 +1218,43 @@ fn event_sample_ts(e: &DecoderEvent) -> u64 {
 fn effective_sort_ts(
     e: &DecoderEvent,
     promoted_ts_by_track: &std::collections::HashMap<u32, u64>,
+    merge_ts_by_track: &std::collections::HashMap<u32, u64>,
 ) -> u64 {
     match e {
         DecoderEvent::SpeedUpdate { track_id, .. } | DecoderEvent::TrackMeta { track_id, .. } => {
             promoted_ts_by_track.get(track_id).copied().unwrap_or(0)
         }
+        // MAN-33 round 12 (Codex review on PR #159): a merge-loser's
+        // `TrackClosed` is the ONLY signal the consumer gets that this
+        // identity continues on the survivor, and `manta-spot`'s
+        // `Validator` migrates the loser's message annotations (RST,
+        // `QRL?`) and pending beacons onto the survivor when it arrives.
+        // Left at `event_sample_ts`'s `u64::MAX` it sorts after EVERY
+        // ordinary event in the batch -- including the survivor's own
+        // spot-producing `WordBoundary`s, which then emit without the
+        // context the loser had already decoded (and, since an annotation
+        // change deliberately does not bypass dedupe, may not get it back
+        // until a natural re-spot). A merge is not an end-of-batch fact:
+        // it happened at a specific hop, and everything the loser ever
+        // decoded has a timestamp at or before that hop (`step_hop`
+        // queues this hop's sample into `pending` before
+        // `merge_converged` drains it through
+        // `finish_decoder_speed_only`). So sort it at the merge hop --
+        // strictly after the loser's own final decoder events, strictly
+        // before any survivor event that genuinely follows the merge.
+        // `Bookkeeping { survivor_track_id: None }` (Silent/Evicted) has
+        // nothing to migrate and keeps the end-of-batch placement, as does
+        // `SignalEnded`, whose beacon resolution must see the whole batch.
+        DecoderEvent::TrackClosed {
+            track_id,
+            closure:
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(_),
+                },
+        } => merge_ts_by_track
+            .get(track_id)
+            .copied()
+            .unwrap_or_else(|| event_sample_ts(e)),
         other => event_sample_ts(other),
     }
 }
@@ -1184,6 +1268,20 @@ fn effective_sort_ts(
 fn event_kind_tier(e: &DecoderEvent) -> u8 {
     match e {
         DecoderEvent::TrackPromoted { .. } => 0,
+        // A merge redirect borrows its hop timestamp above, which is also
+        // the newest timestamp its own loser's final flush events can
+        // carry. Tier 2 breaks that tie the only way that is correct: the
+        // loser's last decoded character/word is processed BEFORE the
+        // closure that tears its state down and migrates it (Codex review
+        // on PR #159 -- "while still processing the loser's final decoder
+        // events first").
+        DecoderEvent::TrackClosed {
+            closure:
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(_),
+                },
+            ..
+        } => 2,
         _ => 1,
     }
 }
@@ -1375,7 +1473,7 @@ mod tests {
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         let mut saw_promotion = false;
         for m in (250 * 15)..(250 * 15 + 60) {
-            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            let (_, promoted, _, _) = tm.step_hop(&hop(m, power.clone()), m);
             if promoted
                 .iter()
                 .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
@@ -1464,6 +1562,176 @@ mod tests {
             "issue #26: eviction must be counted, got {:?}",
             tm.close_counts()
         );
+    }
+
+    /// Codex review on PR #159, round 12: one batch can decide `A -> B`
+    /// AND `B -> C` (the pairing guard only refuses to make a track a
+    /// loser twice), and an eventless intermediate `B` is filtered out of
+    /// `TrackClosed` by the MAN-19 `has_emitted` rule. Naming `B` as
+    /// `A`'s survivor therefore hands the consumer a redirect to a track
+    /// it will never hear about again -- `manta-spot` parks `A`'s RST/
+    /// `QRL?` annotations and pending beacons under `B` and `C` never
+    /// sees them. `merge_converged` must collapse the chain here, where
+    /// the whole batch's decisions are in hand.
+    #[test]
+    fn merge_converged_names_the_final_survivor_of_a_chain() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(30);
+        tm.spawn(50);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        // All three centers converge pairwise, with a strict SNR ladder:
+        // `a` loses to `b`, then `b` loses to `c`.
+        for (id, center, snr) in [(a, 20.4, 8.0), (b, 20.9, 12.0), (c, 21.1, 18.0)] {
+            let t = tm.tracks.get_mut(&id).unwrap();
+            t.center = center;
+            t.current_snr_db = snr;
+        }
+        // Only `a` has ever emitted; `b` is the eventless intermediate
+        // whose own closure the MAN-19 filter suppresses.
+        tm.tracks.get_mut(&a).unwrap().has_emitted = true;
+
+        let (closed, _flush) = tm.merge_converged();
+        assert_eq!(
+            closed,
+            vec![(
+                a,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(c)
+                }
+            )],
+            "the chain a -> b -> c must be reported as a -> c: b is closed \
+             in this same batch and is filtered out of TrackClosed, so a \
+             consumer told \"survivor = b\" would strand a's evidence"
+        );
+        assert!(
+            !tm.tracks.contains_key(&a) && !tm.tracks.contains_key(&b),
+            "both losers must be gone, leaving only the final survivor"
+        );
+        assert!(tm.tracks.contains_key(&c));
+    }
+
+    /// Codex review on PR #159, round 12: a merge redirect is a fact
+    /// about a specific hop, not about end-of-batch. Left at
+    /// `event_sample_ts`'s `u64::MAX` it sorted after every ordinary
+    /// event in the batch, so a survivor `WordBoundary` that produced a
+    /// spot did so before the loser's annotations had been migrated onto
+    /// it. It must land after the loser's OWN final decoder events and
+    /// before any survivor event that genuinely follows the merge.
+    #[test]
+    fn merge_redirect_sorts_at_its_hop_not_at_end_of_batch() {
+        let loser = 1u32;
+        let survivor = 2u32;
+        let merge_ts = 500u64;
+        let mut events = vec![
+            // A survivor word that genuinely precedes the merge.
+            DecoderEvent::WordBoundary {
+                track_id: survivor,
+                sample_ts: 300,
+            },
+            // The loser's final flushed character, at the merge hop.
+            DecoderEvent::CharDecoded {
+                track_id: loser,
+                sample_ts: merge_ts,
+                glyph: manta_decode::tree::Glyph::Char('N'),
+                confidence: 1.0,
+            },
+            DecoderEvent::TrackClosed {
+                track_id: loser,
+                closure: ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(survivor),
+                },
+            },
+            // The survivor word that would emit the spot.
+            DecoderEvent::WordBoundary {
+                track_id: survivor,
+                sample_ts: 700,
+            },
+        ];
+        let promoted_ts_by_track: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::new();
+        let merge_ts_by_track: std::collections::HashMap<u32, u64> =
+            [(loser, merge_ts)].into_iter().collect();
+        events.sort_by_key(|e| {
+            (
+                effective_sort_ts(e, &promoted_ts_by_track, &merge_ts_by_track),
+                event_track_id(e),
+                event_kind_tier(e),
+            )
+        });
+
+        let closed_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::TrackClosed { .. }))
+            .unwrap();
+        let final_char_idx = events
+            .iter()
+            .position(|e| matches!(e, DecoderEvent::CharDecoded { .. }))
+            .unwrap();
+        let late_word_idx = events
+            .iter()
+            .position(
+                |e| matches!(e, DecoderEvent::WordBoundary { sample_ts, .. } if *sample_ts == 700),
+            )
+            .unwrap();
+        let early_word_idx = events
+            .iter()
+            .position(
+                |e| matches!(e, DecoderEvent::WordBoundary { sample_ts, .. } if *sample_ts == 300),
+            )
+            .unwrap();
+        assert!(
+            final_char_idx < closed_idx,
+            "the loser's own final decoder events must be processed first, got {events:?}"
+        );
+        assert!(
+            closed_idx < late_word_idx,
+            "the redirect must be visible before the survivor's post-merge \
+             spot-producing word, got {events:?}"
+        );
+        assert!(
+            early_word_idx < final_char_idx,
+            "a survivor word that genuinely precedes the merge keeps its \
+             chronological place, got {events:?}"
+        );
+    }
+
+    /// A closure with nothing to migrate keeps the end-of-batch
+    /// placement: `SignalEnded` resolves deferred beacons and must see the
+    /// whole batch, and `Bookkeeping { survivor_track_id: None }`
+    /// (Silent/Evicted) has no survivor to migrate to.
+    #[test]
+    fn survivorless_closures_keep_their_end_of_batch_placement() {
+        let promoted_ts_by_track: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::new();
+        let merge_ts_by_track: std::collections::HashMap<u32, u64> =
+            [(1u32, 500u64)].into_iter().collect();
+        for closure in [
+            ClosureKind::SignalEnded,
+            ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            },
+        ] {
+            let e = DecoderEvent::TrackClosed {
+                track_id: 1,
+                closure,
+            };
+            assert_eq!(
+                effective_sort_ts(&e, &promoted_ts_by_track, &merge_ts_by_track),
+                u64::MAX,
+                "only a merge redirect borrows its hop timestamp"
+            );
+            assert_eq!(event_kind_tier(&e), 1);
+        }
     }
 
     #[test]
@@ -1792,9 +2060,11 @@ mod tests {
             .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
             .map(|e| (event_track_id(e), event_sample_ts(e)))
             .collect();
+        let merge_ts_by_track: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::new();
         events.sort_by_key(|e| {
             (
-                effective_sort_ts(e, &promoted_ts_by_track),
+                effective_sort_ts(e, &promoted_ts_by_track, &merge_ts_by_track),
                 event_track_id(e),
                 event_kind_tier(e),
             )

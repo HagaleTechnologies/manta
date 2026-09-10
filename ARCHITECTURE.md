@@ -258,7 +258,15 @@ transmission may never produce again).
    track id: when two converged tracks merge, the losing track's QRL flag
    and its RST (if it is the chronologically later of the two) migrate to
    the survivor, exactly as pending Beacon candidates do, since the
-   survivor continues the same station's transmission. **Neither gates any
+   survivor continues the same station's transmission. Two ordering
+   guarantees make that migration observable rather than merely intended:
+   `TrackManager::merge_converged` collapses a same-batch merge *chain*
+   (`A → B → C`) to its final survivor before reporting it, so the
+   redirect never names a track that is itself closing; and the
+   merge-loser's `TrackClosed` sorts at the hop the merge happened on
+   rather than at end-of-batch, so it lands after the loser's own final
+   decoder events and before any survivor word that follows the merge and
+   could emit a spot. **Neither gates any
    step below**: a callsign that fails grammar/cty/repetition is
    not rescued by carrying an RST. They reach the JSON Lines stream (§7)
    only; the RBN telnet line is a fixed compatibility format with no field

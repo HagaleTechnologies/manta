@@ -267,6 +267,43 @@ invent operator-facing variability the feature doesn't have.
   committed). The false-positive/negative rates above are reasoned from the
   regexes and the validation table, not measured on air (FU-3).
 
+## Decision 8 (round 12): the engine resolves the merge redirect, the consumer does not
+
+Carrying annotations across a merge is only correct if the redirect the
+consumer receives is (a) about a track that will still exist, and (b)
+delivered before the survivor emits a spot. Neither held, and neither is
+fixable in `manta-spot` alone — the validator sees one `DecoderEvent` at a
+time and cannot see a merge the engine chose not to report.
+
+- **Chain collapse.** `merge_converged`'s pairing guard only refuses to make
+  the same track a *loser* twice, so one batch can decide `A → B` and
+  `B → C`. An eventless `B` is filtered out of `TrackClosed` by MAN-19's
+  `has_emitted` rule, so a consumer told "A's survivor is B" is holding a
+  redirect to a track it will never hear about again — it parks A's
+  annotations and pending beacons under B, and C never sees them.
+  `merge_converged` now resolves every chain to its FINAL survivor before
+  reporting it, where the whole batch's decisions are in hand.
+- **Chronological placement.** `event_sample_ts` gives `TrackClosed` a
+  synthetic `u64::MAX`, which put a merge redirect after *every* ordinary
+  event in the batch — including the survivor's own spot-producing
+  `WordBoundary`. Since Decision 6 deliberately does not let an annotation
+  change bypass dedupe, that spot could stay context-free until a natural
+  re-spot. A merge is not an end-of-batch fact: it happened at a specific
+  hop, and everything the loser ever decoded carries a timestamp at or
+  before that hop. `effective_sort_ts` now sorts a
+  `Bookkeeping { survivor_track_id: Some(_) }` closure at its merge hop,
+  with a tertiary tier that keeps it strictly after the loser's own final
+  flush events. `SignalEnded` (whose beacon resolution must see the whole
+  batch) and `Bookkeeping { survivor_track_id: None }` (nothing to migrate)
+  keep the end-of-batch placement.
+- **No orphaned survivor state.** Both migrations a `Bookkeeping` closure
+  performs now park into `Validator::deferred_annotations` when the survivor
+  has no `TrackState` yet, rather than materializing one with
+  `entry(..).or_default()`. Round 11 fixed the annotation path; the pending-
+  beacon path had the identical shape and the identical MAN-19 leak, and is
+  fixed the same way here. `track_mut` adopts both on the survivor's first
+  real event — the same event that earns it an eventual `TrackClosed`.
+
 ## Follow-up register
 
 No Linear credential exists in this environment, so these are recorded here
