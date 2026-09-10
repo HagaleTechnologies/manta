@@ -988,6 +988,21 @@ fn load_decode_config_file(
             path.display()
         );
     }
+    // Codex review, PR #161 round 3: `[decode] beam = 0` (the hsmm
+    // engine's own beam size, SPEC v2 §4 -- distinct from the legacy
+    // `beam_width` checked above) deserializes and passes every check
+    // above, but `HsmmDecoder::push`'s `merged.truncate(0)` then
+    // permanently empties the live hypothesis set on the very first
+    // anchor step -- the command silently emits no decoded text or
+    // spots, no error. Same class of gap as `beam_width`, just the other
+    // engine's beam.
+    if cfg.hsmm.beam == 0 {
+        bail!(
+            "[decode] hsmm beam must be nonzero in {} (0 empties the live hypothesis set on the \
+             first anchor step, silently emitting no decoded text)",
+            path.display()
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2197,6 +2212,12 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_zero_beam_width() {
         let f = write_temp_file(b"[decode]\nbeam_width = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_hsmm_beam() {
+        let f = write_temp_file(b"[decode]\nbeam = 0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
