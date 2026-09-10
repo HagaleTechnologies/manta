@@ -3,9 +3,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -53,6 +54,60 @@ enum Command {
         /// range per line (MAN-31).
         #[arg(long)]
         notch: Option<PathBuf>,
+        /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
+        /// given, its values are the baseline; an explicit --engine overrides
+        /// just the `engine` key (merge_cli_engine). `--server-config` is a
+        /// deprecated alias, matching `run`/`listen`'s D11/MAN-77 rename.
+        #[arg(long, alias = "server-config")]
+        config: Option<PathBuf>,
+        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
+        /// `hsmm` (fully implemented and reviewed since Task 8; still
+        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
+        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
+        /// an explicit flag can be told apart from an absent one: when
+        /// --config's `[decode]` table also sets `engine`, this flag
+        /// takes precedence over it when given, and the file's value is the
+        /// baseline otherwise (SPEC v2 §7).
+        #[arg(long, value_parser = parse_engine)]
+        engine: Option<Engine>,
+    },
+    /// Real-signal decode oracle: decode each RBN-spotted station's channel
+    /// directly (tracker bypassed) and report callsign recovery (SPEC v2 §8.3).
+    Oracle {
+        /// Stereo IQ WAV with <stem>.json sidecar.
+        path: PathBuf,
+        /// RBN daily-dump CSV pre-filtered to the recording's window.
+        rbn_csv: PathBuf,
+        /// Spotter whose spots define the reference set (the co-located skimmer).
+        #[arg(long, default_value = "K5TR")]
+        spotter: String,
+        /// Recording's capture start, ISO-8601 UTC (e.g.
+        /// 2025-11-29T00:00:00Z). Anchors RBN spot times to the actual
+        /// recording, rather than assuming the capture starts exactly on
+        /// the hour (Codex review, PR #161).
+        #[arg(long, value_parser = parse_capture_start)]
+        capture_start: i64,
+        #[arg(long, default_value_t = 40.0, value_parser = parse_window_s)]
+        window_s: f64,
+        /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
+        /// given, its values are the baseline; an explicit --engine overrides
+        /// just the `engine` key (merge_cli_engine). `--server-config` is a
+        /// deprecated alias, matching `run`/`listen`'s D11/MAN-77 rename.
+        #[arg(long, alias = "server-config")]
+        config: Option<PathBuf>,
+        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
+        /// `hsmm` (fully implemented and reviewed since Task 8; still
+        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
+        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
+        /// an explicit flag can be told apart from an absent one: when
+        /// --config's `[decode]` table also sets `engine`, this flag
+        /// takes precedence over it when given, and the file's value is the
+        /// baseline otherwise (SPEC v2 §7).
+        #[arg(long, value_parser = parse_engine)]
+        engine: Option<Engine>,
+        /// Write per-spot results as JSON Lines here (summary always goes to stdout).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Generate a golden test vector fixture set (SPEC §7).
     Gen {
@@ -191,6 +246,16 @@ enum Command {
         /// this machine's copy of the file happens to say."
         #[arg(long, value_parser = parse_replay_epoch)]
         replay_epoch: Option<i64>,
+        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
+        /// `hsmm` (fully implemented and reviewed since Task 8; still
+        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
+        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
+        /// an explicit flag can be told apart from an absent one: when
+        /// `--config`'s `[decode]` table also sets `engine`, this
+        /// flag takes precedence over it when given, and the file's value
+        /// is the baseline otherwise (SPEC v2 §7).
+        #[arg(long, value_parser = parse_engine)]
+        engine: Option<Engine>,
     },
     /// Run the listen pipeline for a fixed duration, checking for panics
     /// and unbounded memory growth (ROADMAP M1 accept criterion).
@@ -601,6 +666,16 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     Ok(ppm)
 }
 
+/// `Engine::Hsmm` (Task 8: `TrackDecoder::push_hop_hsmm`) is a real, fully
+/// implemented and reviewed engine as of Task 11 -- it parses through like
+/// `legacy`/`edge-legacy`. It remains experimental/unmeasured for
+/// production use (SPEC v2 §8.4, Tasks 11-12 measure it), but that's a
+/// deployment/support-posture question for operators choosing `--engine
+/// hsmm` explicitly, not a reason to reject it at the CLI.
+fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
+    s.parse()
+}
+
 /// Derives the replay session's wall-clock epoch (fed to `SpotBus`, and
 /// from there into every JSON `timestamp`/RBN Zulu field a client
 /// observes) from the replayed file's own filesystem modification time.
@@ -731,6 +806,33 @@ fn session_nonce_for_replay_path(path: &std::path::Path) -> Result<u128> {
 /// `FixedCenterFreqSource` and silently propagate into malformed RBN/JSON
 /// frequency fields (e.g. a literal `NaN`, or a "0"/`band: "unknown"` from
 /// a zero or negative dial frequency).
+/// `--capture-start` for `Command::Oracle`: ISO-8601 UTC (e.g.
+/// "2025-11-29T00:00:00Z"), parsed to Unix epoch seconds via
+/// `manta_testkit::oracle::parse_utc_timestamp` -- anchors RBN spot times
+/// to the actual recording start (Codex review, PR #161).
+fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
+    manta_testkit::oracle::parse_utc_timestamp(s)
+        .map_err(|e| format!("invalid --capture-start {s:?}: {e}"))
+}
+
+// Codex review, PR #161 round 2: a negative --window-s makes run_oracle's
+// s1 < s0, panicking on the iq[s0..s1] slice; zero/NaN silently produces an
+// empty window; infinity decodes the whole capture per spot. Reject at the
+// CLI boundary too (run_oracle itself now also validates -- see that
+// function's doc comment -- but a CLI-level rejection gives a clap usage
+// error instead of a bail! from inside the command's execution path).
+fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
+    let window_s: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --window-s {s:?}: {e}"))?;
+    if !window_s.is_finite() || window_s <= 0.0 {
+        return Err(format!(
+            "--window-s must be finite and positive, got {window_s}"
+        ));
+    }
+    Ok(window_s)
+}
+
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
@@ -851,12 +953,14 @@ fn build_pipeline_config(
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    engine: Engine,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist,
         ..Default::default()
     };
+    cfg.decode.engine = engine;
     if let Some(path) = blocklist {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading blocklist file {}", path.display()))?;
@@ -868,6 +972,450 @@ fn build_pipeline_config(
         cfg.notch = manta_engine::NotchList::parse(strip_bom(&text));
     }
     Ok(cfg)
+}
+
+/// Loads the `[decode]` TOML table (SPEC v2 §7) from `--server-config`, if
+/// given, into a full `manta_decode::decoder::DecodeConfig`. Parses the
+/// same file's raw text a SECOND time, independent of
+/// `manta_server::config::DaemonConfigFile` -- that struct deliberately
+/// does not model `[decode]` (see its own doc comment), and re-parsing the
+/// same text into a separately-modeled top-level table is the existing
+/// pattern for this unified daemon config (`ServerConfig`/`RbnUplinkConfig`
+/// already work this way). `Ok(DecodeConfig::default())` when no
+/// `--server-config` path is given, matching `PipelineConfig::default()`'s
+/// own decode baseline.
+fn load_decode_config_file(
+    server_config: Option<&Path>,
+) -> Result<manta_decode::decoder::DecodeConfig> {
+    let Some(path) = server_config else {
+        return Ok(manta_decode::decoder::DecodeConfig::default());
+    };
+    let cfg_text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading --server-config {}", path.display()))?;
+    let file: manta_decode::config_file::DecodeConfigFile = toml::from_str(&cfg_text)
+        .with_context(|| format!("parsing [decode] table in {}", path.display()))?;
+    let cfg = file.decode.into_decode_config();
+    // Codex review, PR #161: `fallback_hops = 0` deserializes successfully (it's a
+    // plain u32 with no serde-level range check) but Evidence::push's anchor
+    // computation divides by it (`self.hop_out % self.cfg.fallback_hops as u64`),
+    // panicking on the first hop for both edge-legacy and hsmm. Reject it here,
+    // at the one place a `[decode]` table from disk enters the process, rather
+    // than scattering a zero-guard into the hot per-hop path.
+    if cfg.evidence.fallback_hops == 0 {
+        bail!(
+            "[decode] fallback_hops must be nonzero in {} (0 would divide by zero on the \
+             first evidence hop)",
+            path.display()
+        );
+    }
+    // Codex review, PR #161 round 2: `tau_hi_bounds_ms = [400, 100]` (or any
+    // non-finite/inverted pair) deserializes successfully, but
+    // `Demod::set_dit_ms` later passes it straight to `f64::clamp`, which
+    // panics on `min > max` and takes down the whole decode/listen/run
+    // process on its first speed update. Reject an invalid bound here,
+    // same reasoning as the fallback_hops check above.
+    let (tau_hi_lo, tau_hi_hi) = cfg.demod.tau_hi_bounds_ms;
+    if !tau_hi_lo.is_finite() || !tau_hi_hi.is_finite() || tau_hi_lo > tau_hi_hi || tau_hi_lo <= 0.0
+    {
+        bail!(
+            "[decode] tau_hi_bounds_ms must be a finite [low, high] pair with 0 < low <= high \
+             in {} (got [{tau_hi_lo}, {tau_hi_hi}], which would panic in f64::clamp on the \
+             first speed update)",
+            path.display()
+        );
+    }
+    if !cfg.demod.tau_lo_ms.is_finite() || cfg.demod.tau_lo_ms <= 0.0 {
+        bail!(
+            "[decode] tau_lo_ms must be a finite, positive number of milliseconds in {} \
+             (got {})",
+            path.display(),
+            cfg.demod.tau_lo_ms
+        );
+    }
+    // Codex review, PR #161 rounds 3 and 5: `timing_sigma = 0` (or NaN)
+    // reaches beam::log_likelihood's `2 * sigma * sigma` denominator,
+    // producing infinite/NaN confidence scores instead of a load-time
+    // error. Round 3's `> 0.0` check alone isn't a strong enough floor: an
+    // f32-representable but tiny value (e.g. 1e-30) still passes it, yet
+    // `2.0 * sigma * sigma` underflows to exactly 0.0 in f32 (f32's
+    // smallest positive normal is ~1.18e-38, so anything with
+    // sigma^2 below ~5.9e-39 flushes to zero), giving 0.0/0.0 = NaN for
+    // any candidate with a perfectly-matched duration. 1e-3 (0.1% relative
+    // timing tolerance) is nowhere near that underflow threshold and is
+    // already far stricter than any real keying signal's timing jitter --
+    // SPEC v2's own default is 0.25 -- so it rejects only configs that
+    // could never usefully decode real audio, not legitimate tuning.
+    const MIN_TIMING_SIGMA: f32 = 1e-3;
+    if !cfg.beam.sigma.is_finite() || cfg.beam.sigma < MIN_TIMING_SIGMA {
+        bail!(
+            "[decode] timing_sigma must be finite and >= {MIN_TIMING_SIGMA} in {} (got {}; \
+             smaller values can underflow log_likelihood's denominator to a NaN score)",
+            path.display(),
+            cfg.beam.sigma
+        );
+    }
+    if cfg.beam.width == 0 {
+        bail!(
+            "[decode] beam_width must be nonzero in {} (0 disables the beam decoder entirely)",
+            path.display()
+        );
+    }
+    // Codex review, PR #161 round 3: `[decode] beam = 0` (the hsmm
+    // engine's own beam size, SPEC v2 §4 -- distinct from the legacy
+    // `beam_width` checked above) deserializes and passes every check
+    // above, but `HsmmDecoder::push`'s `merged.truncate(0)` then
+    // permanently empties the live hypothesis set on the very first
+    // anchor step -- the command silently emits no decoded text or
+    // spots, no error. Same class of gap as `beam_width`, just the other
+    // engine's beam.
+    if cfg.hsmm.beam == 0 {
+        bail!(
+            "[decode] hsmm beam must be nonzero in {} (0 empties the live hypothesis set on the \
+             first anchor step, silently emitting no decoded text)",
+            path.display()
+        );
+    }
+    // Codex review, PR #161 round 4: `sigma_u = 0` puts a hop exactly on
+    // the normalized half-amplitude decision surface at `0 / 0`, making
+    // the LLR (and every downstream accumulated prefix) permanently NaN;
+    // a non-finite value corrupts every present hop the same way. Both
+    // edge-legacy and hsmm then silently stop decoding or propagate NaN
+    // scores.
+    // Codex review, PR #161 round 20: fresh evidence beyond the zero-value
+    // case above -- a finite-but-tiny sigma_u (e.g. 1e-30) still passes
+    // `> 0.0`, yet `sigma_u * sigma_u` underflows to exactly 0.0 in f32,
+    // permanently poisoning the evidence prefix with NaN. Same underflow
+    // class as dur_sigma's MIN_DUR_SIGMA floor.
+    const MIN_SIGMA_U: f32 = 1e-3;
+    if !cfg.evidence.sigma_u.is_finite() || cfg.evidence.sigma_u < MIN_SIGMA_U {
+        bail!(
+            "[decode] sigma_u must be finite and >= {MIN_SIGMA_U} in {} (got {}; smaller values \
+             can underflow the LLR denominator to 0/0)",
+            path.display(),
+            cfg.evidence.sigma_u
+        );
+    }
+    // Codex review, PR #161 round 4: an empty `seed_units_hops` list
+    // deserializes and passes every check above, but every keying onset
+    // then seeds zero tokens -- candidate generation stays empty forever
+    // and the command silently emits no decoded text or spots. Require at
+    // least one seed unit, and that every seed is itself finite and
+    // positive (a bad seed is exactly as silently broken as an empty
+    // list, just one hypothesis worth instead of all of them).
+    if cfg.hsmm.seed_units_hops.is_empty() {
+        bail!(
+            "[decode] seed_units_hops must have at least one entry in {} (an empty list seeds \
+             zero tokens at every keying onset, silently emitting no decoded text)",
+            path.display()
+        );
+    }
+    if let Some(bad) = cfg
+        .hsmm
+        .seed_units_hops
+        .iter()
+        .find(|u| !u.is_finite() || **u <= 0.0)
+    {
+        bail!(
+            "[decode] every seed_units_hops entry must be finite and positive in {} (got {bad})",
+            path.display()
+        );
+    }
+    // Codex review, PR #161 round 18: a seed outside the decoder's
+    // supported [u_min, u_max] speed range (7.5..=56 hops/dit) is finite
+    // and positive and so passed the check above, but can't produce a
+    // valid initial mark transition for any real 8-60 WPM signal -- a
+    // seed list containing only such values silently emits no decoded
+    // text.
+    if let Some(bad) = cfg
+        .hsmm
+        .seed_units_hops
+        .iter()
+        .find(|u| **u < cfg.hsmm.u_min || **u > cfg.hsmm.u_max)
+    {
+        bail!(
+            "[decode] every seed_units_hops entry must be within the supported speed range \
+             [{}, {}] hops/dit in {} (got {bad}; outside that range, the seed can't produce a \
+             valid initial mark transition for any real signal)",
+            cfg.hsmm.u_min,
+            cfg.hsmm.u_max,
+            path.display()
+        );
+    }
+    // Codex review, PR #161 round 4: `conf_kappa = 0` makes the common
+    // no-competing-hypothesis path (s_alt == best.score) compute `0 / 0`
+    // in `margin`'s confidence sigmoid, emitting a NaN character/word-
+    // boundary confidence that then contaminates every downstream spot-
+    // confidence calculation and JSON report.
+    if !cfg.hsmm.conf_kappa.is_finite() || cfg.hsmm.conf_kappa <= 0.0 {
+        bail!(
+            "[decode] conf_kappa must be finite and strictly positive in {} (got {}; 0 makes the \
+             no-competing-hypothesis confidence path compute 0/0)",
+            path.display(),
+            cfg.hsmm.conf_kappa
+        );
+    }
+    // Codex review, PR #161 rounds 5 and 16: `dur_sigma = 0` reaches
+    // `log_dur_prior`'s `2 * dur_sigma * dur_sigma` denominator -- an
+    // exactly-nominal-duration segment computes 0/0, and every other
+    // segment computes an infinite (non-nominal) score, corrupting
+    // pruning and every downstream confidence. Round 5's `> 0.0` check
+    // alone isn't a strong enough floor: a finite-but-tiny value (e.g.
+    // 1e-30) still passes it, yet `2.0 * dur_sigma * dur_sigma`
+    // underflows to exactly 0.0 in f32 -- same underflow class as
+    // timing_sigma's `MIN_TIMING_SIGMA` floor below.
+    const MIN_DUR_SIGMA: f32 = 1e-3;
+    if !cfg.hsmm.dur_sigma.is_finite() || cfg.hsmm.dur_sigma < MIN_DUR_SIGMA {
+        bail!(
+            "[decode] dur_sigma must be finite and >= {MIN_DUR_SIGMA} in {} (got {}; smaller \
+             values can underflow log_dur_prior's denominator to 0/0)",
+            path.display(),
+            cfg.hsmm.dur_sigma
+        );
+    }
+    // Codex review, PR #161 round 6: a large but individually-plausible
+    // `hold_dits` (e.g. 300) pushes `Evidence`'s hold-window width `h`
+    // (`hold_dits * u_max`) past `MAX_RETAIN` -- a debug build panics on
+    // the internal `debug_assert!`, a release build silently caps the
+    // delay line and discards centers with no error, decoding only the
+    // retained tail at EOF. `cfg.hsmm.u_max` is the largest `u_ref` the
+    // live speed-feedback loop can ever request (`Token::successor`
+    // clamps every speed update to `[u_min, u_max]`), so that's the
+    // correct worst case to bound against -- not just the config's
+    // initial `u_init_hops`.
+    let max_h = cfg.evidence.hold_dits as f64 * cfg.hsmm.u_max as f64;
+    if !cfg.evidence.hold_dits.is_finite() || cfg.evidence.hold_dits <= 0.0 || !max_h.is_finite() {
+        bail!(
+            "[decode] hold_dits must be finite and positive in {} (got {})",
+            path.display(),
+            cfg.evidence.hold_dits
+        );
+    }
+    // Codex review, PR #161 round 20: fresh evidence beyond the earlier
+    // retention-bound fix -- `Evidence::set_u_ref` rounds `hold_dits *
+    // u_ref` before enforcing `h < MAX_RETAIN` (`.round().max(1.0)`), so
+    // comparing the unrounded product here can accept a value that
+    // rounds UP into the cap once actually used (e.g. hold_dits=73.14 at
+    // u_max=56 gives 4095.84, accepted here, but rounds to 4096).
+    // Compare the same rounded value Evidence itself uses.
+    let max_h_rounded = max_h.round().max(1.0);
+    if max_h_rounded >= manta_decode::evidence::MAX_RETAIN as f64 {
+        bail!(
+            "[decode] hold_dits={} is too large in {}: at the configured u_max={}, the rounded \
+             hold window (round(hold_dits * u_max) = {max_h_rounded}) would reach or exceed \
+             Evidence's internal retention cap ({}), silently truncating the delay line and \
+             discarding evidence centers",
+            cfg.evidence.hold_dits,
+            path.display(),
+            cfg.hsmm.u_max,
+            manta_decode::evidence::MAX_RETAIN,
+        );
+    }
+    // Codex review, PR #161 round 8: `speed_alpha = nan` deserializes and
+    // passes every check above; the first duration update
+    // (`u += speed_alpha * (target - u)`) then makes `u` NaN, and every
+    // subsequent duration prior/score derived from it goes NaN too --
+    // beam ordering can then retain those hypotheses independently of
+    // real evidence, silently corrupting or emptying the output.
+    if !cfg.hsmm.speed_alpha.is_finite() {
+        bail!(
+            "[decode] speed_alpha must be finite in {} (got {}; a non-finite value poisons \
+             every subsequent speed update and duration prior with NaN)",
+            path.display(),
+            cfg.hsmm.speed_alpha
+        );
+    }
+    // Codex review, PR #161 round 17: a finite but NEGATIVE speed_alpha
+    // moves `u += speed_alpha * (target - u)` away from the observed
+    // segment duration instead of toward it -- repeated short segments
+    // then drive `u` toward a clamp boundary, producing incorrect WPM
+    // reports and killing otherwise-valid duration hypotheses.
+    if cfg.hsmm.speed_alpha < 0.0 {
+        bail!(
+            "[decode] speed_alpha must be nonnegative in {} (got {}; a negative gain moves the \
+             speed estimate away from observed durations instead of toward them)",
+            path.display(),
+            cfg.hsmm.speed_alpha
+        );
+    }
+    // Codex review, PR #161 round 10: `mark_insert_penalty = nan` reaches
+    // `SegType::log_type_prior`; the first Dit/Dah transition then gives
+    // every candidate a NaN score, so beam ordering no longer reflects
+    // the evidence and emitted confidence can also become NaN.
+    if !cfg.hsmm.mark_insert_penalty.is_finite() {
+        bail!(
+            "[decode] mark_insert_penalty must be finite in {} (got {}; a non-finite value \
+             poisons every Dit/Dah transition's score with NaN)",
+            path.display(),
+            cfg.hsmm.mark_insert_penalty
+        );
+    }
+    // Codex review, PR #161 round 12: `noise_min_bias_db = inf` (used by
+    // both edge-legacy and hsmm) makes `NoiseTracker::new`'s `b_min`
+    // infinite; every temporal noise estimate then becomes infinite and
+    // the evidence gate stays closed forever, silently emitting nothing.
+    if !cfg.noise.noise_min_bias_db.is_finite() {
+        bail!(
+            "[decode] noise_min_bias_db must be finite in {} (got {}; a non-finite value makes \
+             every temporal noise estimate infinite, silently closing the evidence gate)",
+            path.display(),
+            cfg.noise.noise_min_bias_db
+        );
+    }
+    // Codex review, PR #178: MAN-168's engine wiring is what gives
+    // `NoiseTracker::push`'s spectral-reference branch its first real
+    // (non-`None`) input, so `spectral_beta`/`spectral_min_bias_db =
+    // inf` -- previously harmless dead config, since the branch never
+    // activated -- now makes `spectral_beta * b_spec * r` infinite the
+    // same way `noise_min_bias_db = inf` does above, permanently closing
+    // the keying-present gate.
+    if !cfg.noise.spectral_min_bias_db.is_finite() {
+        bail!(
+            "[decode] spectral_min_bias_db must be finite in {} (got {}; a non-finite value \
+             makes every spectral noise estimate infinite, silently closing the evidence gate)",
+            path.display(),
+            cfg.noise.spectral_min_bias_db
+        );
+    }
+    if !cfg.noise.spectral_beta.is_finite() {
+        bail!(
+            "[decode] spectral_beta must be finite in {} (got {}; a non-finite value makes \
+             every spectral noise estimate infinite, silently closing the evidence gate)",
+            path.display(),
+            cfg.noise.spectral_beta
+        );
+    }
+    // Codex review, PR #178 round 4: a finite NEGATIVE spectral_beta
+    // (e.g. a `-0.5` sign typo) makes NoiseTracker::push's spectral term
+    // (`beta * b_spec * r`) negative, so `max(n_temp, ...)` always
+    // discards it -- silently disabling the QRM/click discount just
+    // wired in, the same way `speed_alpha < 0.0` silently broke the
+    // speed estimate elsewhere in this file. 0.0 stays legal: it's a
+    // valid, explicit "no spectral discount" value, not a sign error.
+    if cfg.noise.spectral_beta < 0.0 {
+        bail!(
+            "[decode] spectral_beta must be nonnegative in {} (got {}; a negative value makes \
+             the spectral term always lose to max(), silently disabling the spectral \
+             noise discount)",
+            path.display(),
+            cfg.noise.spectral_beta
+        );
+    }
+    // Codex review, PR #161 round 13: a negative `lookahead_dits` makes
+    // every non-consensus history entry's nonnegative age always exceed
+    // the (negative) forced-commit threshold, reducing the HSMM to
+    // greedy commits and producing misleading confidence/decoded text; a
+    // NaN or infinite value disables forced commits entirely.
+    if !cfg.hsmm.lookahead_dits.is_finite() || cfg.hsmm.lookahead_dits < 0.0 {
+        bail!(
+            "[decode] lookahead_dits must be finite and nonnegative in {} (got {}; a negative \
+             value forces every non-consensus entry immediately, and a non-finite value \
+             disables forced commits entirely)",
+            path.display(),
+            cfg.hsmm.lookahead_dits
+        );
+    }
+    // Codex review, PR #161 round 14: `noise_window_ms` <= 0 or NaN casts
+    // to zero in `ms_to_hops`, silently reducing the minimum-statistics
+    // window to one hop (keyed power itself becomes the noise floor,
+    // suppressing EdgeLegacy/HSMM output); infinity becomes `u32::MAX`,
+    // letting each track's deque grow for effectively the process
+    // lifetime.
+    if !cfg.noise.noise_window_ms.is_finite() || cfg.noise.noise_window_ms <= 0.0 {
+        bail!(
+            "[decode] noise_window_ms must be finite and positive in {} (got {})",
+            path.display(),
+            cfg.noise.noise_window_ms
+        );
+    }
+    // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
+    // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
+    // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
+    // with NaN makes every comparison false (Legacy silently emits nothing
+    // at all, no error, no panic); a non-positive or inverted hysteresis
+    // band (hyst_up <= hyst_down) breaks the open/close asymmetry
+    // hysteresis exists for; `flush_gap_dits <= 0` forces an instant/
+    // premature word flush on every hop. Validate all of them here too,
+    // for the same reason as every check above: this is the one place a
+    // `[decode]` table from disk enters the process.
+    if !cfg.demod.hyst_up.is_finite() || !cfg.demod.hyst_down.is_finite() {
+        bail!(
+            "[decode] hyst_up/hyst_down must be finite in {} (got hyst_up={}, hyst_down={})",
+            path.display(),
+            cfg.demod.hyst_up,
+            cfg.demod.hyst_down
+        );
+    }
+    if cfg.demod.hyst_down <= 0.0 || cfg.demod.hyst_up <= cfg.demod.hyst_down {
+        bail!(
+            "[decode] hyst_up must be > hyst_down > 0 in {} (got hyst_up={}, hyst_down={})",
+            path.display(),
+            cfg.demod.hyst_up,
+            cfg.demod.hyst_down
+        );
+    }
+    if !cfg.demod.debounce_ms.is_finite() || cfg.demod.debounce_ms <= 0.0 {
+        bail!(
+            "[decode] debounce_ms must be finite and positive in {} (got {})",
+            path.display(),
+            cfg.demod.debounce_ms
+        );
+    }
+    if !cfg.flush_gap_dits.is_finite() || cfg.flush_gap_dits <= 0.0 {
+        bail!(
+            "[decode] flush_gap_dits must be finite and positive in {} (got {})",
+            path.display(),
+            cfg.flush_gap_dits
+        );
+    }
+    // Codex review, PR #161 round 2: a negative or non-finite `llr_clip`
+    // reaches `f32::clamp(-llr_clip, llr_clip)` on the first keying-present
+    // evidence hop in both edge-legacy and hsmm, panicking on inverted or
+    // NaN bounds exactly like the tau_hi_bounds_ms case above.
+    if !cfg.evidence.llr_clip.is_finite() || cfg.evidence.llr_clip <= 0.0 {
+        bail!(
+            "[decode] llr_clip must be finite and positive in {} (got {}; f32::clamp panics on \
+             a negative or non-finite bound)",
+            path.display(),
+            cfg.evidence.llr_clip
+        );
+    }
+    // Codex review, MAN-168: `refine_bw_hz` is a newly-activated (default
+    // 0.0/disabled) setting -- a NaN or infinite value is neither `<=
+    // 0.0` (so refinement isn't bypassed) nor a usable bandwidth,
+    // reaching `Refiner::new`'s own `debug_assert!(bw_hz > 0.0)` (a debug
+    // panic; a release build instead designs an all-NaN/degenerate FIR
+    // that then poisons every refined amplitude). 0.0 itself must stay
+    // legal -- it's the documented "disabled" sentinel, not an error.
+    //
+    // Codex review, PR #178: a NEGATIVE value (e.g. a `-30` sign typo)
+    // also isn't `> 0.0`, so `decoder_input`'s own `refine_bw_hz <= 0.0`
+    // check silently treats it as the disabled bypass instead of
+    // reporting the operator's config error -- the documented disabled
+    // sentinel is specifically `0.0`, not "anything non-positive".
+    if !cfg.refine_bw_hz.is_finite() || cfg.refine_bw_hz < 0.0 {
+        bail!(
+            "[decode] refine_bw_hz must be finite and nonnegative in {} (got {}; use 0.0 to \
+             disable refinement, not a negative value)",
+            path.display(),
+            cfg.refine_bw_hz
+        );
+    }
+    Ok(cfg)
+}
+
+/// SPEC v2 §7: an explicit `--engine` flag overrides the `[decode]` table's
+/// `engine` key; the file's value (or `Engine::Legacy` if there's no
+/// `--server-config`/no `[decode]` table) is the baseline otherwise. Every
+/// other `DecodeConfig` field always comes from `file_decode` (i.e. from
+/// the file, or its defaults) -- there is no CLI flag for them.
+fn merge_cli_engine(
+    cli_engine: Option<Engine>,
+    mut file_decode: manta_decode::decoder::DecodeConfig,
+) -> manta_decode::decoder::DecodeConfig {
+    if let Some(engine) = cli_engine {
+        file_decode.engine = engine;
+    }
+    file_decode
 }
 
 /// Handles what the `Run` on-spot closure needs to feed a running spot server.
@@ -959,7 +1507,126 @@ fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool
 /// one spot. The previous 2s value was shorter than even a single one of
 /// those 10s writes, so a genuinely slow-but-completing client was
 /// routinely cut off mid-drain for no reason (round-15 review finding).
-const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+///
+/// MAN-45 (round-16 finding): as of this change, the value that actually
+/// bounds ONE client's drain is `manta_server::tasks::CLIENT_DRAIN_DEADLINE`
+/// -- each of the three per-client drain loops (telnet's, json_stream's TCP
+/// and WS) now enforces its own inner deadline and counts whatever it
+/// abandons when that fires, so a healthy handler always returns from
+/// `await_all` well within its own budget. This constant is now a
+/// registry-wide *scheduling backstop* above that per-client bound (see the
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// test below) -- it no longer needs sizing against any particular spot
+/// count, only against `CLIENT_DRAIN_DEADLINE` plus scheduling margin.
+///
+/// MAN-45 remediate (round-16 P1, finding 2): "scheduling margin" above
+/// CLIENT_DRAIN_DEADLINE isn't the whole story -- `CLIENT_DRAIN_DEADLINE`
+/// only bounds a handler's OWN `_ = shutdown.changed() =>` branch body.
+/// `tokio::select!` doesn't poll that branch again until whichever OTHER
+/// branch is currently running resolves, so a handler already mid-write
+/// when shutdown fires can burn up to its own current branch's full
+/// worst-case time BEFORE it even reaches the drain branch and starts
+/// that 20s clock. The largest such branch across all three handlers is
+/// telnet's live-spot write (`manta_server::telnet::WRITE_TIMEOUT`, TWO
+/// separately-timed writes per spot) -- json_stream's TCP/WS write and
+/// Pong-reply arms are each a single `WRITE_TIMEOUT`, strictly smaller.
+/// So the true worst case this deadline must outlive is `2 *
+/// telnet::WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE`, not
+/// `CLIENT_DRAIN_DEADLINE` alone (asserted directly by
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// below). telnet's `sh/dx` replay loop is bounded to the SAME worst case
+/// as the live-write arm rather than its own unbounded backlog depth: it
+/// re-checks `shutdown.has_changed()` before every history entry and, the
+/// moment it's observed, `break`s back to the `select!` loop's own drain
+/// branch to deliver the live `rx` backlog with that branch's full unused
+/// budget, rather than abandoning it (validation round 17, CR-2/CR-3 --
+/// the remaining history replay itself is simply not re-attempted, since
+/// those entries were already published and counted once).
+///
+/// Validation round 17 (CR-1): this model above only accounts for
+/// branches INSIDE the `select!` loop -- it does NOT need to also budget
+/// for `telnet::handle_client`'s pre-loop login handshake (prompt write,
+/// login-line read, banner write; up to `WRITE_TIMEOUT +
+/// bounded_io::IDLE_READ_TIMEOUT + WRITE_TIMEOUT` = 50s) because that
+/// handshake itself now races `shutdown.changed()` at every step and
+/// bails out (counting its subscribed `rx` backlog) the moment shutdown
+/// fires, instead of running any of those three waits to completion
+/// first. A stalled pre-login client therefore contributes close to zero
+/// to shutdown latency, not up to 50s -- if a future change ever makes
+/// that handshake NOT shutdown-aware again, this deadline's true worst
+/// case would need to grow to include it.
+///
+/// MAN-45 remediate (code-review round 18, finding 3): the same was true,
+/// but NOT yet fixed, of `json_stream::serve`'s pre-loop phase --
+/// `looks_like_websocket_handshake`'s classifying peek (up to
+/// `PEEK_TIMEOUT`, or `HANDSHAKE_TIMEOUT` once any byte had arrived) and
+/// `handle_ws_client`'s own `accept_async_with_config` step (up to another
+/// `HANDSHAKE_TIMEOUT`) previously never observed `shutdown` either. Both
+/// now race `shutdown.changed()` the same way telnet's handshake does, so
+/// this deadline's safety margin no longer rests on the coincidence that
+/// json_stream's *unraced* worst case (20s) happened to be smaller than
+/// telnet's live-write branch (`2 * telnet::WRITE_TIMEOUT` = 20s) already
+/// budgeted for above -- it now holds because BOTH pre-loop phases are
+/// shutdown-aware by design, matching this deadline's own model.
+///
+/// MAN-45 remediate (code-review round 19, P1): the "at most ONE in-flight
+/// branch body precedes the drain" step of that model is now ENFORCED, not
+/// assumed. `tokio::select!` picks a random ready arm, so a client with a
+/// backlog could previously win the live-spot arm repeatedly after shutdown
+/// was signalled -- an unbounded number of `2 * WRITE_TIMEOUT` writes
+/// before its own `CLIENT_DRAIN_DEADLINE` clock ever started, which this
+/// deadline cannot cover at any constant value. Every client-write-capable
+/// arm in all three handler loops (`telnet::handle_client`'s live-spot and
+/// command-read arms, `json_stream`'s TCP live-spot and socket-read arms,
+/// and its WS live-spot and frame arms) now carries an
+/// `if !shutdown.has_changed()` precondition, so once shutdown is pending
+/// the drain arm is the only arm those loops can still select. The worst
+/// case therefore really is one already-selected branch body plus
+/// `CLIENT_DRAIN_DEADLINE`, which is what the value below is sized for.
+///
+/// MAN-45 remediate (round-19 P1, re-raised against an earlier head): the
+/// "one branch body" half of that budget is now also asserted END-TO-END,
+/// not only arithmetically here --
+/// `telnet_acceptance::shutdown_bounds_live_writes_to_at_most_one_before_the_drain`
+/// queues a backlog, signals shutdown before the client task can wake, and
+/// asserts across repeated trials that at most ONE live spot write precedes
+/// the drain and that every queued spot is then delivered or counted. "At
+/// most one", not zero, is deliberate: a handler already parked in
+/// `select!` when shutdown fires evaluated its preconditions before the
+/// flag was set, so it can still take the live-spot arm once -- which is
+/// precisely the single branch body this deadline budgets for, above. See
+/// that test's own doc comment for what it does and does not prove (with
+/// fast localhost writes the unguarded build stays inside the bound too;
+/// exceeding it needs a client that has stopped reading, so each write runs
+/// the full `WRITE_TIMEOUT`).
+/// MAN-45 remediate (code-review round 19, P1): **changing this value is
+/// not self-contained** -- it is the floor for the CALLER-side stop grace
+/// period an operator must configure, and two documents state that period
+/// as a literal number: `README.md`'s Docker install section (`docker stop
+/// -t 60`) and `Dockerfile`'s STOPSIGNAL comment block. Both said 30s,
+/// sized against the pre-MAN-45 25s value; against 50s here, a 30s
+/// container timeout SIGKILLs the daemon partway through the very drain
+/// this constant exists to allow, before it can record the abandoned
+/// backlog on `manta_spots_dropped_write_failed_total` (the counter each
+/// handler's drain loop charges when its own `CLIENT_DRAIN_DEADLINE`
+/// expires -- `manta_spots_dropped_shutdown_total` covers only a client
+/// still in pre-login/handshake, whose backlog had not been offered for
+/// delivery yet; that is not the same as the connection having written
+/// nothing, since the telnet banner and WS-accept branches are reached
+/// after the login prompt / part of the 101 response is already on the
+/// wire) --
+/// recreating the silent truncation the drain work removed. Both are now
+/// 60s, leaving margin over this deadline. If this constant grows again,
+/// raise them with it.
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// How often the server runtime copies the engine's live track count into
+/// the `manta_active_tracks` gauge. The decode loop runs on the MAIN
+/// thread, outside the tokio runtime that owns `Metrics`, so a poller is
+/// the bridge -- the same shape MAN-55's `confirmed_live_handle` watcher
+/// already uses. 4 Hz is far finer than any Prometheus scrape interval and
+/// costs one relaxed atomic load per tick.
+const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
@@ -1091,6 +1758,7 @@ fn start_spot_server(
                 cfg.telnet_max_connections_per_ip,
             ),
             telnet_ip_command_limiter,
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
         ));
         let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::json_stream::MAX_INBOUND_PINGS,
@@ -1110,6 +1778,7 @@ fn start_spot_server(
                 // need shutdown_rx -- can't let this be the moving consumer
                 // anymore now that there are more consumers.
                 shutdown: shutdown_rx.clone(),
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks.clone(),
             manta_server::tasks::new_connection_limiter(
@@ -1183,8 +1852,19 @@ fn main() -> Result<()> {
             allowlist,
             blocklist,
             notch,
+            config,
+            engine,
         } => {
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            let decode_from_file = load_decode_config_file(config.as_deref())?;
+            let decode_cfg = merge_cli_engine(engine, decode_from_file);
+            let mut cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                decode_cfg.engine,
+            )?;
+            cfg.decode = decode_cfg;
             let report = decode_wav(&path, &cfg)?;
             if json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -1194,6 +1874,33 @@ fn main() -> Result<()> {
                 eprintln!("spots: {}", report.spots.len());
             }
         }
+        Command::Oracle {
+            path,
+            rbn_csv,
+            spotter,
+            capture_start,
+            window_s,
+            config,
+            engine,
+            jsonl,
+        } => {
+            let mut src = manta_input::WavIqSource::open(&path)?;
+            let (fs, center) = (src.sample_rate(), src.center_freq_hz());
+            let iq = manta_input::read_all(&mut src)?;
+            let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
+            let decode_from_file = load_decode_config_file(config.as_deref())?;
+            let cfg = merge_cli_engine(engine, decode_from_file);
+            let (results, summary) =
+                manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
+            if let Some(p) = jsonl {
+                let mut w = std::io::BufWriter::new(std::fs::File::create(p)?);
+                for r in &results {
+                    use std::io::Write;
+                    writeln!(w, "{}", serde_json::to_string(r)?)?;
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
                 "v1" => manta_testkit::vectors::v1(),
@@ -1202,7 +1909,18 @@ fn main() -> Result<()> {
                 "v4" => manta_testkit::vectors::v4(),
                 "v5" => manta_testkit::vectors::v5(),
                 "v6" => manta_testkit::vectors::v6(),
-                other => bail!("unknown vector {other:?} (available: v1-v6)"),
+                "vr1" => manta_testkit::vectors::vr1(),
+                "vr2" => manta_testkit::vectors::vr2(),
+                "vr3" => manta_testkit::vectors::vr3(),
+                "vr4" => manta_testkit::vectors::vr4(),
+                "vr5" => manta_testkit::vectors::vr5(),
+                "vr6a" => manta_testkit::vectors::vr6a(),
+                "vr6b" => manta_testkit::vectors::vr6b(),
+                "vr7" => manta_testkit::vectors::vr7(),
+                "vr8" => manta_testkit::vectors::vr8(),
+                other => bail!(
+                    "unknown vector {other:?} (available: v1-v6, vr1-vr5, vr6a, vr6b, vr7-vr8)"
+                ),
             };
             std::fs::create_dir_all(&out)?;
             let manifest = manta_testkit::vectors::write_fixture_set(&spec, &out)?;
@@ -1247,6 +1965,7 @@ fn main() -> Result<()> {
             config,
             dial_freq_hz,
             replay_epoch,
+            engine,
         } => {
             let is_file_replay = source.is_some();
             // Captured before `open_source` consumes `source` below --
@@ -1288,7 +2007,21 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            // SPEC v2 §7: `[decode]` (from --config, if given) is
+            // the baseline; an explicit --engine overrides just its
+            // `engine` key (merge_cli_engine). `engine = "hsmm"` is a fully
+            // implemented and reviewed engine (Task 8) and needs no gate
+            // here as of Task 11.
+            let decode_from_file = load_decode_config_file(config.as_deref())?;
+            let decode_cfg = merge_cli_engine(engine, decode_from_file);
+            let mut cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                decode_cfg.engine,
+            )?;
+            cfg.decode = decode_cfg;
             #[cfg(feature = "hpsdr")]
             let hpsdr_source = open_hpsdr_source(HpsdrOpts {
                 host: hpsdr_host,
@@ -1339,112 +2072,158 @@ fn main() -> Result<()> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match config {
-                Some(path) => {
-                    // `epoch` feeds SpotBus's wall-clock conversion (every
-                    // JSON `timestamp`/RBN Zulu field a client observes) --
-                    // a live session's epoch is this process's real start
-                    // time; a replay session's defaults to the replayed
-                    // file's own mtime, a genuine timestamp that's stable
-                    // across reruns of the SAME untouched file, but changes
-                    // across a copy/download/restore that doesn't preserve
-                    // filesystem metadata even though the recording's
-                    // content is identical -- pass --replay-epoch to pin an
-                    // exact value when that matters more than "whatever
-                    // this machine's copy says" (round-7 review finding;
-                    // see the flag's own doc comment for the full
-                    // rationale, and `epoch_for_replay_path`'s for why
-                    // neither "always now()" nor a content-hash alone was
-                    // right before this flag existed). `session_nonce` is
-                    // the separate, spot-id-uniqueness-only value:
-                    // recording-content-derived for file replay (so
-                    // different recordings never collide on id even at the
-                    // same track/sample position), nanosecond-precision-now
-                    // for a live session (so two live sessions started
-                    // within the same wall-clock second don't collide
-                    // either).
-                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                    let session_nonce: u128 = match &replay_path {
-                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
-                        // Live session: `epoch` above is already SystemTime::now().
-                        None => epoch
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .expect("epoch predates the Unix epoch")
-                            .as_nanos(),
-                    };
+            let (server_runtime, spot_server, active_tracks, mut active_tracks_poller) =
+                match config {
+                    Some(path) => {
+                        // `epoch` feeds SpotBus's wall-clock conversion (every
+                        // JSON `timestamp`/RBN Zulu field a client observes) --
+                        // a live session's epoch is this process's real start
+                        // time; a replay session's defaults to the replayed
+                        // file's own mtime, a genuine timestamp that's stable
+                        // across reruns of the SAME untouched file, but changes
+                        // across a copy/download/restore that doesn't preserve
+                        // filesystem metadata even though the recording's
+                        // content is identical -- pass --replay-epoch to pin an
+                        // exact value when that matters more than "whatever
+                        // this machine's copy says" (round-7 review finding;
+                        // see the flag's own doc comment for the full
+                        // rationale, and `epoch_for_replay_path`'s for why
+                        // neither "always now()" nor a content-hash alone was
+                        // right before this flag existed). `session_nonce` is
+                        // the separate, spot-id-uniqueness-only value:
+                        // recording-content-derived for file replay (so
+                        // different recordings never collide on id even at the
+                        // same track/sample position), nanosecond-precision-now
+                        // for a live session (so two live sessions started
+                        // within the same wall-clock second don't collide
+                        // either).
+                        let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                        let session_nonce: u128 = match &replay_path {
+                            Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                            // Live session: `epoch` above is already SystemTime::now().
+                            None => epoch
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .expect("epoch predates the Unix epoch")
+                                .as_nanos(),
+                        };
 
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
-                    // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` has no equivalent
-                    // hook yet -- manta-engine exposes no live track-count
-                    // API for `listen()`'s callbacks to read, so it stays
-                    // at Metrics::default()'s 0 until that surface exists.
-                    //
-                    // MAN-55: for a source where `open()` succeeding
-                    // doesn't confirm a live device (HPSDR's UDP
-                    // connect/send need no peer response at all),
-                    // `confirmed_live_handle()` returns Some, and health
-                    // starts false, flipping true only once the source's
-                    // own read loop has actually processed a valid
-                    // packet. Every other source type (Kiwi/Soapy/audio/
-                    // file) returns None from the trait's default and
-                    // keeps the original immediate-true behavior, since
-                    // opening those already implies liveness.
-                    match src.confirmed_live_handle() {
-                        Some(live) => {
-                            server.metrics.set_source_health(source_name, false);
-                            let metrics = server.metrics.clone();
+                        let (rt, server) =
+                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                        // MAN-45 (round-9 finding): the daemon's own copy of the
+                        // gauge `manta_engine::listen_with_observers` updates as
+                        // it runs (on the MAIN thread, outside this tokio
+                        // runtime) -- polled into `Metrics` below, the same
+                        // bridge shape MAN-55's `confirmed_live_handle` watcher
+                        // uses for source liveness.
+                        let active_tracks =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        // MAN-45 remediate (code-review finding 1): the
+                        // `JoinHandle` is kept, not discarded, so the shutdown
+                        // sequence below can abort this poller and WAIT for it
+                        // to actually stop before writing the deterministic
+                        // zero -- otherwise a tick already in flight can read
+                        // the still-stale gauge and write it right back after
+                        // the zero, undoing it.
+                        let active_tracks_poller = {
+                            let gauge = active_tracks.clone();
+                            let track_metrics = server.metrics.clone();
                             rt.spawn(async move {
-                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                loop {
+                                    track_metrics.set_active_tracks(
+                                        gauge.load(std::sync::atomic::Ordering::Relaxed),
+                                    );
+                                    tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
                                 }
-                                metrics.set_source_health(source_name, true);
+                            })
+                        };
+                        // MAN-55: for a source where `open()` succeeding
+                        // doesn't confirm a live device (HPSDR's UDP
+                        // connect/send need no peer response at all),
+                        // `confirmed_live_handle()` returns Some, and health
+                        // starts false, flipping true only once the source's
+                        // own read loop has actually processed a valid
+                        // packet. Every other source type (Kiwi/Soapy/audio/
+                        // file) returns None from the trait's default and
+                        // keeps the original immediate-true behavior, since
+                        // opening those already implies liveness.
+                        match src.confirmed_live_handle() {
+                            Some(live) => {
+                                server.metrics.set_source_health(source_name, false);
+                                let metrics = server.metrics.clone();
+                                rt.spawn(async move {
+                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
+                                        tokio::time::sleep(std::time::Duration::from_millis(200))
+                                            .await;
+                                    }
+                                    metrics.set_source_health(source_name, true);
+                                });
+                            }
+                            None => server.metrics.set_source_health(source_name, true),
+                        }
+
+                        // MAN-56: HPSDR's packet loss/malformed counters are
+                        // input-layer state manta-server cannot compute itself
+                        // (it has no manta-input dependency). Sample them into
+                        // Metrics on a timer, the same wiring-layer-injection
+                        // shape `set_source_health` uses above -- and read the
+                        // handle HERE, before `listen(src, ..)` below takes
+                        // ownership of the source for the rest of the run.
+                        // Sources with no wire-packet loss model return None
+                        // and publish no series at all, which is deliberate:
+                        // a permanently-zero counter reads as "no loss" rather
+                        // than "not measured" (ARCHITECTURE §8's
+                        // "absent means not measured" distinction).
+                        if let Some(counters) = src.health_counters() {
+                            let metrics = server.metrics.clone();
+                            // Published once eagerly so the series exists (at
+                            // 0) from the very first scrape rather than only
+                            // after one poll interval.
+                            metrics.set_input_health(source_name, input_health_of(&counters));
+                            rt.spawn(async move {
+                                loop {
+                                    tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                                    metrics
+                                        .set_input_health(source_name, input_health_of(&counters));
+                                }
                             });
                         }
-                        None => server.metrics.set_source_health(source_name, true),
-                    }
 
-                    // MAN-56: HPSDR's packet loss/malformed counters are
-                    // input-layer state manta-server cannot compute itself
-                    // (it has no manta-input dependency). Sample them into
-                    // Metrics on a timer, the same wiring-layer-injection
-                    // shape `set_source_health` uses above -- and read the
-                    // handle HERE, before `listen(src, ..)` below takes
-                    // ownership of the source for the rest of the run.
-                    // Sources with no wire-packet loss model return None
-                    // and publish no series at all, which is deliberate:
-                    // a permanently-zero counter reads as "no loss" rather
-                    // than "not measured" (cf. ARCHITECTURE §8's
-                    // manta_active_tracks caveat).
-                    if let Some(counters) = src.health_counters() {
-                        let metrics = server.metrics.clone();
-                        // Published once eagerly so the series exists (at
-                        // 0) from the very first scrape rather than only
-                        // after one poll interval.
-                        metrics.set_input_health(source_name, input_health_of(&counters));
-                        rt.spawn(async move {
-                            loop {
-                                tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
-                                metrics.set_input_health(source_name, input_health_of(&counters));
-                            }
-                        });
+                        (
+                            Some(rt),
+                            Some(server),
+                            Some(active_tracks),
+                            Some(active_tracks_poller),
+                        )
                     }
-
-                    (Some(rt), Some(server))
-                }
-                None => (None, None),
-            };
+                    None => (None, None, None, None),
+                };
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            let listen_result = manta_engine::listen(
+            // Printed AFTER the handler is installed, and via `eprintln!`
+            // rather than `tracing::info!` because the subscriber is only
+            // initialized inside `start_spot_server` -- a plain `listen`
+            // (no --server-config) has no subscriber at all. Two jobs:
+            // `listen` otherwise prints nothing at startup (2026-09-05
+            // review, lens 1 #4/#7), and it is the readiness handshake
+            // `tests/signal_shutdown.rs` waits for -- signalling any
+            // earlier races `set_handler` and kills the child under the OS
+            // default disposition regardless of MAN-85's fix. If the
+            // fuller startup banner (lens 1 #7) ever replaces this line,
+            // it must still be emitted here, after `set_handler`, and
+            // `READY_MARKER` updated to match. stdout stays pure JSON
+            // under `--json` (MAN-59 round 6); this goes to stderr.
+            eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+            let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
                 stop,
+                manta_engine::ListenObservers {
+                    active_tracks: active_tracks.clone(),
+                },
                 |ev| {
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
@@ -1514,6 +2293,32 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
+                // MAN-45 remediate (code-review finding 1): the engine's
+                // own gauge is already 0 on the SUCCESS path
+                // (TrackManager::finish() closed every track before
+                // `listen_with_observers` returned), but NOT on the ERROR
+                // path -- `listen_result` above is deliberately captured
+                // rather than `?`-ed so an SDR disconnect or WAV read
+                // failure still runs this drain sequence (round-7 finding),
+                // and on that path `listen_with_observers` returns before
+                // reaching `tm.finish()`'s trailing zero, leaving the
+                // shared `AtomicU64` at the last processed chunk's nonzero
+                // count. The still-running poller reads that stale value
+                // every `ACTIVE_TRACKS_POLL_INTERVAL` and would overwrite
+                // the deterministic zero below within one tick if left
+                // running -- abort it and AWAIT its actual termination
+                // first (not just issue the abort and hope), so no
+                // in-flight tick can race the zero-write below. A metrics
+                // scrape landing anywhere in the `SHUTDOWN_DRAIN_DEADLINE`
+                // window that follows must never see a stale nonzero
+                // count for a daemon with no live tracks.
+                if let Some(poller) = active_tracks_poller.take() {
+                    poller.abort();
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(poller);
+                    }
+                }
+                server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -1561,7 +2366,13 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            let cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                Engine::Legacy,
+            )?;
             #[cfg(feature = "hpsdr")]
             let hpsdr_source = open_hpsdr_source(HpsdrOpts {
                 host: hpsdr_host,
@@ -1653,7 +2464,13 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            let cfg = build_pipeline_config(
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+                Engine::Legacy,
+            )?;
             #[cfg(feature = "hpsdr")]
             let hpsdr_source = open_hpsdr_source(HpsdrOpts {
                 host: hpsdr_host,
@@ -1817,6 +2634,466 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
+    /// must never fire before a handler's own drain deadline, or
+    /// `shutdown_timeout` aborts a drain that was still inside its budget
+    /// and the abandoned queue goes uncounted again -- the exact failure
+    /// rounds 15 and 16 both landed on from different directions. The
+    /// margin covers task scheduling, not another spot's write.
+    ///
+    /// MAN-45 remediate (round-16 P1, finding 2): `CLIENT_DRAIN_DEADLINE`
+    /// alone under-counts the true worst case -- a handler already mid-
+    /// write when shutdown fires doesn't even START its own drain
+    /// deadline until that in-progress `select!` branch resolves. Asserts
+    /// the FULL relationship (`2 * telnet::WRITE_TIMEOUT +
+    /// CLIENT_DRAIN_DEADLINE`, telnet's live-spot write being the largest
+    /// such in-progress branch across all three handlers), not just the
+    /// drain deadline in isolation -- see `SHUTDOWN_DRAIN_DEADLINE`'s own
+    /// doc comment for the full argument.
+    #[test]
+    fn the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline() {
+        let worst_case_before_drain_starts = 2 * manta_server::telnet::WRITE_TIMEOUT;
+        let true_worst_case =
+            worst_case_before_drain_starts + manta_server::tasks::CLIENT_DRAIN_DEADLINE;
+        assert!(
+            SHUTDOWN_DRAIN_DEADLINE > true_worst_case,
+            "SHUTDOWN_DRAIN_DEADLINE ({SHUTDOWN_DRAIN_DEADLINE:?}) must exceed the true \
+             worst case of {true_worst_case:?} (2 * telnet::WRITE_TIMEOUT = \
+             {worst_case_before_drain_starts:?}, the largest in-progress `select!` branch \
+             a handler can already be running when shutdown fires, plus \
+             CLIENT_DRAIN_DEADLINE = {:?} for its own drain loop once it gets there)",
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
+    }
+
+    #[test]
+    fn merge_cli_engine_prefers_the_explicit_cli_flag_over_the_file() {
+        // SPEC v2 §7: --engine overrides [decode]'s engine key when both
+        // are given -- this is the exact precedence rule Command::Run's
+        // (and, since MAN-166's final-review fix batch, Decode's/Oracle's)
+        // handler relies on `merge_cli_engine` for.
+        let file_decode = manta_decode::decoder::DecodeConfig {
+            engine: Engine::Legacy,
+            ..manta_decode::decoder::DecodeConfig::default()
+        };
+        let resolved = merge_cli_engine(Some(Engine::EdgeLegacy), file_decode);
+        assert_eq!(resolved.engine, Engine::EdgeLegacy);
+    }
+
+    #[test]
+    fn merge_cli_engine_falls_back_to_the_file_engine_when_the_flag_is_absent() {
+        let file_decode = manta_decode::decoder::DecodeConfig {
+            engine: Engine::EdgeLegacy,
+            ..manta_decode::decoder::DecodeConfig::default()
+        };
+        let resolved = merge_cli_engine(None, file_decode);
+        assert_eq!(resolved.engine, Engine::EdgeLegacy);
+    }
+
+    #[test]
+    fn merge_cli_engine_leaves_every_other_decode_field_from_the_file_untouched() {
+        // The CLI has no flag for sigma_u/beam/etc. -- only `engine` may be
+        // overridden; everything else must come through verbatim from the
+        // file-derived DecodeConfig.
+        let mut file_decode = manta_decode::decoder::DecodeConfig::default();
+        file_decode.evidence.sigma_u = 0.31;
+        file_decode.hsmm.beam = 10;
+        let resolved = merge_cli_engine(Some(Engine::EdgeLegacy), file_decode);
+        assert_eq!(resolved.evidence.sigma_u, 0.31);
+        assert_eq!(resolved.hsmm.beam, 10);
+    }
+
+    #[test]
+    fn load_decode_config_file_defaults_when_no_server_config_given() {
+        let cfg = load_decode_config_file(None).unwrap();
+        assert_eq!(cfg.engine, Engine::Legacy);
+        assert_eq!(
+            cfg.evidence.sigma_u,
+            manta_decode::evidence::EvidenceConfig::default().sigma_u
+        );
+    }
+
+    #[test]
+    fn load_decode_config_file_reads_the_decode_table_from_server_config() {
+        let f = write_temp_file(
+            br#"
+            [server]
+            station_callsign = "W3XYZ"
+            [decode]
+            engine = "edge-legacy"
+            sigma_u = 0.31
+            beam = 10
+            "#,
+        );
+        let cfg = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(cfg.engine, Engine::EdgeLegacy);
+        assert_eq!(cfg.evidence.sigma_u, 0.31);
+        assert_eq!(cfg.hsmm.beam, 10);
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_fallback_hops() {
+        let f = write_temp_file(b"[decode]\nfallback_hops = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_inverted_tau_hi_bounds() {
+        // Codex review, PR #161 round 2: this would otherwise panic in
+        // f64::clamp on the first speed update instead of failing to load.
+        let f = write_temp_file(b"[decode]\ntau_hi_bounds_ms = [400.0, 100.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_tau_lo_ms() {
+        let f = write_temp_file(b"[decode]\ntau_lo_ms = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+        let f = write_temp_file(b"[decode]\ntau_lo_ms = -5.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_valid_tau_bounds() {
+        let f =
+            write_temp_file(b"[decode]\ntau_lo_ms = 450.0\ntau_hi_bounds_ms = [120.0, 380.0]\n");
+        let cfg = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(cfg.demod.tau_lo_ms, 450.0);
+        assert_eq!(cfg.demod.tau_hi_bounds_ms, (120.0, 380.0));
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_timing_sigma() {
+        // Codex review, PR #161 round 3: this would otherwise produce
+        // infinite/NaN confidence scores instead of failing to load.
+        let f = write_temp_file(b"[decode]\ntiming_sigma = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+        let f = write_temp_file(b"[decode]\ntiming_sigma = -0.5\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_timing_sigma_too_small_to_avoid_underflow() {
+        // Codex review, PR #161 round 5: 1e-30 is finite and > 0.0 (so
+        // round 3's original check alone would accept it), but
+        // beam::log_likelihood's `2.0 * sigma * sigma` underflows to
+        // exactly 0.0 in f32, giving NaN confidence for a perfectly-timed
+        // candidate.
+        let f = write_temp_file(b"[decode]\ntiming_sigma = 1e-30\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_beam_width() {
+        let f = write_temp_file(b"[decode]\nbeam_width = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_hsmm_beam() {
+        let f = write_temp_file(b"[decode]\nbeam = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_sigma_u() {
+        let f = write_temp_file(b"[decode]\nsigma_u = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_sigma_u() {
+        let f = write_temp_file(b"[decode]\nsigma_u = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_sigma_u_too_small_to_avoid_underflow() {
+        // Codex review, PR #161 round 20: 1e-30 is finite and > 0.0 (so
+        // the original check alone passed it), but sigma_u * sigma_u
+        // underflows to exactly 0.0 in f32.
+        let f = write_temp_file(b"[decode]\nsigma_u = 1e-30\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_empty_seed_units_hops() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = []\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_nonpositive_seed_unit() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = [9.0, 0.0, 18.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_seed_unit_below_u_min() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = [1.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_seed_unit_above_u_max() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = [100.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_conf_kappa() {
+        let f = write_temp_file(b"[decode]\nconf_kappa = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_dur_sigma() {
+        let f = write_temp_file(b"[decode]\ndur_sigma = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_dur_sigma_too_small_to_avoid_underflow() {
+        // Codex review, PR #161 round 16: 1e-30 is finite and > 0.0 (so
+        // round 5's original check alone passed it), but 2*dur_sigma^2
+        // underflows to exactly 0.0 in f32.
+        let f = write_temp_file(b"[decode]\ndur_sigma = 1e-30\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_hold_dits() {
+        let f = write_temp_file(b"[decode]\nhold_dits = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_hold_dits_that_overflows_max_retain() {
+        // Codex review, PR #161 round 6: a large but individually-plausible
+        // hold_dits (300) at the default u_max (56.0) computes h = 16800,
+        // far past Evidence's MAX_RETAIN (4096).
+        let f = write_temp_file(b"[decode]\nhold_dits = 300\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_hold_dits_that_only_overflows_after_rounding() {
+        // Codex review, PR #161 round 20: hold_dits=73.14 at the default
+        // u_max (56.0) computes an UNROUNDED product of 4095.84 -- under
+        // MAX_RETAIN (4096) -- but Evidence::set_u_ref rounds before
+        // enforcing the cap, and round(4095.84) = 4096, which is not
+        // "well under" MAX_RETAIN.
+        let f = write_temp_file(b"[decode]\nhold_dits = 73.14\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_the_default_hold_dits() {
+        let f = write_temp_file(b"[decode]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_speed_alpha() {
+        let f = write_temp_file(b"[decode]\nspeed_alpha = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_speed_alpha() {
+        let f = write_temp_file(b"[decode]\nspeed_alpha = -0.1\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_mark_insert_penalty() {
+        let f = write_temp_file(b"[decode]\nmark_insert_penalty = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_noise_min_bias_db() {
+        let f = write_temp_file(b"[decode]\nnoise_min_bias_db = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_spectral_min_bias_db() {
+        let f = write_temp_file(b"[decode]\nspectral_min_bias_db = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_spectral_beta() {
+        let f = write_temp_file(b"[decode]\nspectral_beta = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_spectral_beta() {
+        // Codex review, PR #178 round 4: a negative value makes
+        // NoiseTracker's max() always discard the spectral term,
+        // silently disabling the discount instead of reporting the
+        // operator's sign-typo config error.
+        let f = write_temp_file(b"[decode]\nspectral_beta = -0.5\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_spectral_beta() {
+        // 0.0 is a valid, explicit "no spectral discount" value, not a
+        // sign error -- must stay legal.
+        let f = write_temp_file(b"[decode]\nspectral_beta = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_refine_bw_hz() {
+        // 0.0 is the documented "disabled" sentinel, not an error.
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_a_positive_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = 30.0\n");
+        let cfg = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(cfg.refine_bw_hz, 30.0);
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_refine_bw_hz() {
+        // Codex review, PR #178: a negative value (e.g. a `-30` sign
+        // typo) isn't `> 0.0`, so decoder_input's own bypass check would
+        // silently treat it as disabled instead of reporting the error --
+        // the documented disabled sentinel is specifically 0.0.
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = -30.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_lookahead_dits() {
+        let f = write_temp_file(b"[decode]\nlookahead_dits = -1.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_lookahead_dits() {
+        let f = write_temp_file(b"[decode]\nlookahead_dits = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_lookahead_dits() {
+        let f = write_temp_file(b"[decode]\nlookahead_dits = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_noise_window_ms() {
+        let f = write_temp_file(b"[decode]\nnoise_window_ms = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_noise_window_ms() {
+        let f = write_temp_file(b"[decode]\nnoise_window_ms = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_hysteresis() {
+        // Codex review, PR #161 round 4: NaN makes every `Demod::step`
+        // comparison false, silently disabling Legacy's decode entirely.
+        let f = write_temp_file(b"[decode]\nhyst_up = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_inverted_hysteresis() {
+        let f = write_temp_file(b"[decode]\nhyst_up = 0.5\nhyst_down = 0.8\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+        let f = write_temp_file(b"[decode]\nhyst_down = -1.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_debounce_ms() {
+        let f = write_temp_file(b"[decode]\ndebounce_ms = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_flush_gap_dits() {
+        // Codex review, PR #161 round 4: <= 0 forces an instant/premature
+        // word flush on every hop.
+        let f = write_temp_file(b"[decode]\nflush_gap_dits = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    /// Regression: an earlier version of this task rejected `engine =
+    /// "hsmm"` at TOML-deserialize time (inside `load_decode_config_file`,
+    /// i.e. BEFORE `merge_cli_engine` ever runs), which meant an explicit
+    /// `--engine legacy` could never override a config file staging
+    /// `engine = "hsmm"` -- the file's parse error fired first, and the
+    /// override never got a chance to apply. As of Task 11, `hsmm` is no
+    /// longer rejected anywhere in this path, but the precedence rule this
+    /// test protects (an explicit `--engine` beats the file's `engine` key)
+    /// still matters, so it's kept with `hsmm` as the file-staged value to
+    /// prove `merge_cli_engine` reads the CLI override, not the file, when
+    /// both are given.
+    #[test]
+    fn cli_engine_override_beats_a_hsmm_staged_file() {
+        let f = write_temp_file(
+            br#"
+            [server]
+            station_callsign = "W3XYZ"
+            [decode]
+            engine = "hsmm"
+            "#,
+        );
+        let file_decode = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(
+            file_decode.engine,
+            Engine::Hsmm,
+            "the file's own value must still be hsmm going into the merge"
+        );
+        let result = merge_cli_engine(Some(Engine::Legacy), file_decode);
+        assert_eq!(
+            result.engine,
+            Engine::Legacy,
+            "an explicit --engine must override a hsmm-staged file"
+        );
+    }
+
+    /// The other direction: with NO CLI override, a file staging `engine =
+    /// "hsmm"` is honored (not rejected) -- `hsmm` is a fully implemented,
+    /// reviewed engine (Task 8) with no CLI-level gate as of Task 11.
+    #[test]
+    fn hsmm_staged_file_is_honored_without_a_cli_override() {
+        let f = write_temp_file(
+            br#"
+            [decode]
+            engine = "hsmm"
+            "#,
+        );
+        let file_decode = load_decode_config_file(Some(f.path())).unwrap();
+        let result = merge_cli_engine(None, file_decode);
+        assert_eq!(result.engine, Engine::Hsmm);
     }
 
     #[test]

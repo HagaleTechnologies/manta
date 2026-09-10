@@ -164,3 +164,134 @@ fn v10_passes_end_to_end_from_wav() {
         manifest.keyed_texts[0]
     );
 }
+
+// --- SPEC v2 §8.4 Task 12: `--engine hsmm` copies of V7/V9/V10, at the
+// same SPEC §7 bars as their legacy counterparts above. Measured
+// 2026-09-09 -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v7_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v7();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tracks = per_track(&report);
+    assert_eq!(
+        tracks.len(),
+        2,
+        "V7/hsmm must produce exactly 2 tracks, got {}",
+        tracks.len()
+    );
+    for (i, expected_text) in manifest.keyed_texts.iter().enumerate() {
+        let expected_freq = manifest.expected_freqs_hz[i];
+        let (_, (decoded_text, freq)) = tracks
+            .iter()
+            .min_by(|(_, (_, fa)), (_, (_, fb))| {
+                let da = (fa.unwrap_or(f64::MAX) - expected_freq).abs();
+                let db = (fb.unwrap_or(f64::MAX) - expected_freq).abs();
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap();
+        let cer = manta_testkit::cer::cer(expected_text, decoded_text);
+        assert!(
+            cer <= 0.05,
+            "signal {i} ({expected_text:?}) char accuracy must be >= 95%, got CER {cer} (decoded {decoded_text:?})"
+        );
+        let freq = freq.expect("TrackMeta freq_hz must have fired at least once in a 120s scene");
+        assert!(
+            (freq - expected_freq).abs() <= 15.0,
+            "signal {i} freq {} expected {} (err {})",
+            freq,
+            expected_freq,
+            (freq - expected_freq).abs()
+        );
+    }
+}
+
+// Measured passing (2026-09-09, stage-2 gate) -- see
+// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+#[test]
+fn v9_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v9();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manta_testkit::vectors::write_v9_fixture_set(&spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join("v9.wav"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tracks = per_track(&report);
+    assert_eq!(
+        tracks.len(),
+        1,
+        "V9/hsmm must not split into multiple tracks under drift"
+    );
+    let (_, (decoded_text, freq)) = tracks.iter().next().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded_text);
+    assert!(
+        cer <= 0.10,
+        "V9/hsmm char accuracy must be >= 90%, got CER {cer}"
+    );
+    let freq = freq.expect("TrackMeta freq_hz must have fired at least once");
+    assert!(
+        (freq - manifest.expected_freq_hz).abs() <= 15.0,
+        "final freq {} expected {} (err {})",
+        freq,
+        manifest.expected_freq_hz,
+        (freq - manifest.expected_freq_hz).abs()
+    );
+}
+
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v10_passes_end_to_end_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v10();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let decoded = report["text"].as_str().unwrap();
+    let cer = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer <= 0.05,
+        "V10/hsmm char accuracy must be >= 95%, got CER {cer}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+    const FARNSWORTH_BOOTSTRAP_WORD_TOLERANCE: usize = 4;
+    let expected_words = manifest.keyed_texts[0].split(' ').count();
+    let decoded_words = decoded.split(' ').filter(|w| !w.is_empty()).count();
+    assert!(
+        decoded_words >= expected_words
+            && decoded_words <= expected_words + FARNSWORTH_BOOTSTRAP_WORD_TOLERANCE,
+        "word boundary count outside the documented Farnsworth-bootstrap tolerance: expected {expected_words} (+0..={FARNSWORTH_BOOTSTRAP_WORD_TOLERANCE}), decoded {decoded_words}\nexpected: {:?}\ndecoded:  {decoded:?}",
+        manifest.keyed_texts[0]
+    );
+}

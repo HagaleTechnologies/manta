@@ -1,9 +1,14 @@
 //! CW keying state machine, timing, and Morse decode (SPEC-decode-core §3–§5).
 
 pub mod beam;
+pub mod config_file;
 pub mod decoder;
+pub mod edge_demod;
 pub mod envelope;
 pub mod events;
+pub mod evidence;
+pub mod hsmm;
+pub mod noise;
 pub mod timing;
 pub mod tree;
 

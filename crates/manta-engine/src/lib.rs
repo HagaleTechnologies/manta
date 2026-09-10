@@ -2,7 +2,7 @@
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
 pub mod listen;
-pub use listen::listen;
+pub use listen::{listen, listen_with_observers, ListenObservers};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
@@ -315,6 +315,7 @@ mod tests {
                 sample_ts: 20,
                 glyph: manta_decode::tree::Glyph::Char('W'),
                 confidence: 1.0,
+                alternatives: Vec::new(),
             },
         ];
         assert_eq!(primary_track_id(&events), Some(2));
