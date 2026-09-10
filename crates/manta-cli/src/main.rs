@@ -820,7 +820,10 @@ struct SpotServer {
     /// de-side `UNKNOWN_*` sentinels. Resolved ONCE at `start_spot_server`
     /// time rather than per spot: `station_callsign` cannot change for the
     /// life of the process, so re-running the same binary search on every
-    /// spot only re-derives a constant.
+    /// spot only re-derives a constant. Computed with
+    /// `spot_message::station_geography_is_unresolved`, which strips a
+    /// MAN-89 `-N` SSID first, so it classifies the same string
+    /// `SpotMessage::from_spot` resolves the `de` geography from.
     station_geography_unresolved: bool,
 }
 
@@ -846,9 +849,14 @@ struct SpotServer {
 /// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
 /// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
 /// the whole test.
+///
+/// The rule itself now lives beside `Geography::resolve` in
+/// `manta_server::spot_message` (PR #131 review, round 6) -- a second copy
+/// here is exactly how the de side came to classify an unstripped SSID while
+/// `from_spot` classified a stripped one. This stays as the `dx`-side
+/// spelling with the argument order the call sites and tests below use.
 fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
-    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
-        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
+    manta_server::spot_message::geography_is_unresolved(callsign, cty)
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
@@ -1067,7 +1075,14 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
-            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            // MAN-89: the station identity may carry a `-N` per-band SSID, so
+            // this side goes through the SSID-stripping spelling -- the same
+            // one `SpotMessage::from_spot` resolves the `de` geography with.
+            station_geography_unresolved:
+                manta_server::spot_message::station_geography_is_unresolved(
+                    &cfg.station_callsign,
+                    &cty,
+                ),
             cty,
         },
     ))
@@ -2169,6 +2184,38 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(geography_is_unresolved(&cty, "W1AW/MM"));
         assert!(geography_is_unresolved(&cty, "W1AW/AM"));
         assert!(!geography_is_unresolved(&cty, "W1AW/P"));
+    }
+
+    /// PR #131 review, round 6: the `de`-side precomputation feeding
+    /// `SpotServer::station_geography_unresolved` classified the UNSTRIPPED
+    /// `station_callsign`. For an accepted mobile identity like `W1AW/MM-1`
+    /// the designator test then saw `MM-1` rather than `MM` while `cty.lookup`
+    /// still fell back to the allocated `W` prefix -- so `from_spot` emitted
+    /// `NO_DXCC_ENTITY` plus unknown geography on every spot while
+    /// `manta_spots_unresolved_geography_total` stayed at zero.
+    #[test]
+    fn a_station_callsign_with_an_ssid_is_classified_on_its_stripped_form() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        // Test premise: the unstripped value is exactly the false negative --
+        // neither the designator test nor the entity lookup flags it.
+        assert!(
+            !geography_is_unresolved(&cty, "W1AW/MM-1"),
+            "test premise: the unstripped form reads as resolved"
+        );
+        assert!(manta_server::spot_message::station_geography_is_unresolved(
+            "W1AW/MM-1",
+            &cty
+        ));
+        assert!(manta_server::spot_message::station_geography_is_unresolved(
+            "W1AW/AM-1",
+            &cty
+        ));
+        // An SSID on an ordinary call changes nothing either way.
+        assert!(!manta_server::spot_message::station_geography_is_unresolved("W1AW-1", &cty));
+        assert!(manta_server::spot_message::station_geography_is_unresolved(
+            "QQ1AAA-1", &cty
+        ));
     }
 
     #[test]

@@ -49,17 +49,17 @@ fn is_valid_ssid(ssid: &str) -> bool {
 
 /// The shortest thing that can be a callsign: an ITU call is at minimum a
 /// one-character prefix, a digit and a one-character suffix (`W1A`). Bounds
-/// the slash-composed base directly; the `/`-delimited segment that must be
-/// the call itself gets the stronger structural test instead, which implies
-/// this length -- see `is_complete_callsign` and `check_operator_callsign`.
+/// the slash-composed base directly, and is re-applied to the `/`-delimited
+/// segment that must be the call itself, alongside that segment's stronger
+/// structural test -- see `is_complete_callsign` and
+/// `check_operator_callsign`.
 const MIN_CALLSIGN_LEN: usize = 3;
 
 /// True when this ONE `/`-delimited segment has the structure of a complete
-/// ITU callsign: a prefix, a separating digit, and a letter suffix that runs
-/// to the END of the segment -- i.e. some digit with at least one letter
-/// BEFORE it, and the segment's LAST character a letter. `W1A`, `W5AU`,
-/// `4U1UN`, `3DA0RS`, `GB3LER` and multi-digit special-event forms like
-/// `LZ130LO` all satisfy it.
+/// ITU callsign: at least `MIN_CALLSIGN_LEN` characters, a digit somewhere
+/// before the end, and a letter suffix that runs to the END of the segment.
+/// `W1A`, `W5AU`, `4U1UN`, `3DA0RS`, `GB3LER`, multi-digit special-event
+/// forms like `LZ130LO` and digit-led ones like `4GRID` all satisfy it.
 ///
 /// Structure, not just character classes (PR #131 review, round 4): a
 /// predicate that only asks for `MIN_CALLSIGN_LEN` characters plus "some
@@ -73,31 +73,41 @@ const MIN_CALLSIGN_LEN: usize = 3;
 /// of the digit" still accepted `W1A2` (and `W1A2-1`, `W1A2/P`), where the
 /// trailing digit sits OUTSIDE the suffix. ITU RR 19.68A puts a letter last
 /// in every amateur callsign, so a segment ending in a digit is a typo at any
-/// length.
+/// length -- and that one rule is what rejects every round-4/5 fixture, so
+/// nothing else here has to re-derive it.
 ///
-/// The length bound is implied rather than restated: a letter, then a digit,
-/// then a letter is already `MIN_CALLSIGN_LEN` characters. Prefix (`JW/`) and
-/// portable/beacon suffix (`/P`, `/B`, `/3`) segments legitimately fail this
-/// and stay accepted -- `check_operator_callsign` only requires that ONE
-/// segment pass.
+/// The separating digit is NOT required to have a letter before it (PR #131
+/// review, round 6): demanding one rejected `4AFARU`, `4GRID` and `5NNHR` --
+/// the three digit-led calls the vendored `master.scp` carries whose only
+/// digit LEADS the call -- which `grammar::is_plausible` accepted, so the
+/// strict-superset property this validator is built on (see
+/// `check_operator_callsign`) did not actually hold, and an operator holding
+/// one of those special-event calls could not start the daemon at all. A
+/// false reject is the expensive failure for operator identity; `W12`-shaped
+/// typos stay rejected by the letter-suffix rule above, which is independent
+/// of where the digit sits.
+///
+/// The length bound IS restated rather than implied: once the digit may lead
+/// the segment, "digit then letter" only implies two characters, and the
+/// round-3 fixtures (`AB/1C`, `A1/B`) depend on a two-character segment not
+/// counting as a call. Prefix (`JW/`) and portable/beacon suffix (`/P`,
+/// `/B`, `/3`) segments legitimately fail this and stay accepted --
+/// `check_operator_callsign` only requires that ONE segment pass.
 fn is_complete_callsign(segment: &str) -> bool {
     let bytes = segment.as_bytes();
-    let Some(first_letter) = bytes.iter().position(u8::is_ascii_alphabetic) else {
+    if bytes.len() < MIN_CALLSIGN_LEN {
         return false;
-    };
-    // The suffix ENDS the segment: `rposition` alone only proves a letter
-    // exists somewhere after the digit, which `W1A2` also satisfies.
+    }
+    // The suffix ENDS the segment: a letter merely somewhere after the digit
+    // is also true of `W1A2`.
     let Some(&last) = bytes.last() else {
         return false;
     };
     if !last.is_ascii_alphabetic() {
         return false;
     }
-    let last_letter = bytes.len() - 1;
-    bytes
-        .iter()
-        .enumerate()
-        .any(|(i, b)| b.is_ascii_digit() && i > first_letter && i < last_letter)
+    // ... and a separating digit sits somewhere ahead of that suffix.
+    bytes[..bytes.len() - 1].iter().any(u8::is_ascii_digit)
 }
 
 /// Validates an operator-supplied station identity -- `[server].station_callsign`
@@ -504,13 +514,59 @@ mod tests {
             "3DA0RS",       // digit-leading prefix
             "4U1UN",        // exact cty.dat alias, digit-leading prefix
             "LZ130LO",      // special-event call: several separating digits
-            "W1A/P",        // the shortest real call, MIN_CALLSIGN_LEN exactly
-            "w3xyz",        // lowercase accepted ...
+            // PR #131 review round 6: the only digit LEADS the call. All
+            // three are in the vendored `master.scp`, and all three were
+            // accepted by `grammar::is_plausible` -- rejecting them broke
+            // this validator's strict-superset property and locked their
+            // holders out of starting the daemon.
+            "4AFARU",
+            "4GRID",
+            "5NNHR",
+            "4GRID-1", // ... and they take an SSID like any other call
+            "W1A/P",   // the shortest real call, MIN_CALLSIGN_LEN exactly
+            "w3xyz",   // lowercase accepted ...
         ] {
             let cfg: ServerConfig = toml::from_str(&format!(r#"station_callsign = {good:?}"#))
                 .unwrap_or_else(|e| panic!("{good:?} should be accepted: {e}"));
             assert_eq!(cfg.station_callsign, good.to_ascii_uppercase()); // ... and normalized
         }
+    }
+
+    /// The property `check_operator_callsign` is built on: it must be a strict
+    /// SUPERSET of `manta_spot::grammar::is_plausible`. Being NARROWER than the
+    /// decoder's own prefilter means an operator whose call the DECODER would
+    /// have spotted happily cannot start the daemon at all -- the expensive
+    /// failure direction for an identity field.
+    ///
+    /// Checked against every call in the vendored `master.scp` rather than a
+    /// hand-written fixture list (PR #131 review, round 6): rounds 4, 5 and 6
+    /// each found one more shape a fixture list had missed, and round 6's
+    /// (`4AFARU`, `4GRID`, `5NNHR` -- digit-led, no second numeral) was sitting
+    /// in this very file the whole time. A data-driven property closes the
+    /// class instead of the instance.
+    #[test]
+    fn accepts_every_master_scp_call_the_decoder_grammar_accepts() {
+        let mut checked = 0usize;
+        for call in manta_spot::MASTER_SCP
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+        {
+            if !manta_spot::grammar::is_plausible(call) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                check_operator_callsign(call).is_ok(),
+                "{call:?} is accepted by grammar::is_plausible but rejected by \
+                 check_operator_callsign: {:?}",
+                check_operator_callsign(call)
+            );
+        }
+        assert!(
+            checked > 40_000,
+            "test premise: master.scp should supply a large corpus, got {checked}"
+        );
     }
 
     /// The true positives the old grammar caught must STILL be rejected -- the

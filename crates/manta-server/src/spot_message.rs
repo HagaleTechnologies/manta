@@ -121,6 +121,54 @@ impl Geography {
     }
 }
 
+/// The station identity `Geography::resolve` must actually be handed for the
+/// `de` side: `station_call` with any RBN `-N` per-band SSID (MAN-89 / D4)
+/// stripped off. The SSID is a manta node index with no geographic meaning,
+/// `cty.dat`'s exact-call alias rows refuse to match through it
+/// (`cty.rs:143-169` strips `/`-portable suffixes only), and
+/// `is_outside_any_dxcc_entity` would read `MM-1` rather than `MM`.
+///
+/// Exported so every consumer of the de-side classification uses the same
+/// input string -- see `station_geography_is_unresolved`.
+pub fn station_geography_call(station_call: &str) -> &str {
+    crate::config::strip_ssid(station_call)
+}
+
+/// True when `from_spot` would emit the `UNKNOWN_DXCC`/`UNKNOWN_CONTINENT`/
+/// `UNKNOWN_CQ_ZONE` sentinels (or `NO_DXCC_ENTITY` with unknown geography)
+/// for `callsign` -- i.e. exactly the condition
+/// `manta_spots_unresolved_geography_total` counts.
+///
+/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
+/// whether `lookup` returned an entry: `Geography::resolve` emits
+/// `UNKNOWN_DXCC` on `entry.and_then(|e| e.dxcc).is_none()`, which is also
+/// true when `cty.dat` resolves the call but the vendored `dxcc.tsv` has no
+/// row for its primary prefix (the hand-refresh drift state, data/SOURCES.md).
+/// A `/MM` or `/AM` call counts too: `cty.lookup` answers for it through the
+/// base prefix, but `Geography::resolve` discards that answer.
+///
+/// Lives here, beside `Geography::resolve` itself, rather than in
+/// `manta-cli`: the metric's increment condition and the field values it is
+/// defined over are one rule, and holding them in two crates is what let them
+/// drift (PR #131 review, round 6).
+pub fn geography_is_unresolved(callsign: &str, cty: &cty::Table) -> bool {
+    is_outside_any_dxcc_entity(callsign) || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
+}
+
+/// `geography_is_unresolved` for the operator's OWN station identity, which
+/// -- unlike decoder output -- may carry an SSID.
+///
+/// PR #131 review, round 6: `manta-cli::start_spot_server` precomputed the
+/// `de`-side half of `manta_spots_unresolved_geography_total` from the
+/// UNSTRIPPED `station_callsign`, so for an accepted mobile identity like
+/// `K5ARH/MM-1` the designator test saw `MM-1` (not `MM`) while `cty.lookup`
+/// still fell back to the allocated `K` prefix. `from_spot` emitted
+/// `NO_DXCC_ENTITY` plus unknown geography on every such spot while the
+/// counter stayed at zero -- the exact signal the metric exists to give.
+pub fn station_geography_is_unresolved(station_call: &str, cty: &cty::Table) -> bool {
+    geography_is_unresolved(station_geography_call(station_call), cty)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotMessage {
@@ -197,13 +245,13 @@ impl SpotMessage {
         // answer is wrong by definition -- see its doc comment.
         let dx = Geography::resolve(&spot.callsign, cty);
         // MAN-89: `station_call` may carry an RBN `-N` per-band SSID, which is a
-        // manta node index with no geographic meaning -- and which `cty.dat`'s
-        // exact-call alias rows would refuse to match (cty.rs:143-169 strips
-        // `/`-portable suffixes only). Resolve the operator's actual callsign;
-        // `de_call` and `id` below keep the full identity. Stripping before
-        // `Geography::resolve` also keeps `is_outside_any_dxcc_entity`'s
-        // `/MM`//`AM` check reading the same string the lookup does.
-        let de = Geography::resolve(crate::config::strip_ssid(station_call), cty);
+        // manta node index with no geographic meaning -- see
+        // `station_geography_call`, which owns that stripping so this
+        // resolution and the `manta_spots_unresolved_geography_total`
+        // precomputation in `manta-cli::start_spot_server` classify the SAME
+        // string (PR #131 review, round 6). `de_call` and `id` below keep the
+        // full identity.
+        let de = Geography::resolve(station_geography_call(station_call), cty);
         // `band` must be derived from the SAME rounded value reported as
         // `frequency` -- computing it from the unrounded `spot.freq_hz`
         // separately (round-5 review finding) could disagree with
