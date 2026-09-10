@@ -29,3 +29,10 @@ pub const CTY_DAT: &str = include_str!("../data/cty.dat");
 /// `data/` -- see `data/SOURCES.md` for provenance and refresh
 /// instructions.
 pub const MASTER_SCP: &str = include_str!("../data/master.scp");
+
+/// Per-entity ADIF DXCC entity numbers keyed on `cty.dat`'s primary-prefix
+/// field, vendored under `data/` -- see `data/SOURCES.md` for provenance and
+/// `scripts/gen-dxcc-table.sh` for regeneration. Separate from `cty.dat`
+/// because AD1C's `cty.dat` carries no ADIF entity numbers at all (MAN-136,
+/// broad-review decision D10).
+pub const DXCC_TSV: &str = include_str!("../data/dxcc.tsv");

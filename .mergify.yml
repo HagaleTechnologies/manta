@@ -36,18 +36,22 @@
 # already gates them before they can reach this rule at all -- so
 # accepting their skip unconditionally is safe.
 #
-# Trusted-author gate (`author = thagale` OR the dependabot branch below):
-# this repo is public, its ruleset has `required_approving_review_count: 0`,
-# and the native auto-merge workflow this queue replaces had NO
-# author-association check of its own to carry forward -- without this
-# condition, any outside contributor's PR that goes green on all required
-# checks would auto-queue and merge with zero human in the loop. Mergify has
-# no direct equivalent of GitHub's `author_association` (no built-in
-# role/collaborator lookup), only an exact-login match, so `author =
-# thagale` is the closest available primitive. This diverges the moment a
-# second trusted collaborator is added -- their PRs won't auto-queue under
-# a single-login condition and will need either a manual `@Mergifyio queue`
-# comment or this file updated with their login.
+# Trusted-author gate (`author = thagale` OR `catalyst-cloud-connector[bot]`
+# OR the dependabot branch below): this repo is public, its ruleset has
+# `required_approving_review_count: 0`, and the native auto-merge workflow
+# this queue replaces had NO author-association check of its own to carry
+# forward -- without this condition, any outside contributor's PR that goes
+# green on all required checks would auto-queue and merge with zero human
+# in the loop. Mergify has no direct equivalent of GitHub's
+# `author_association` (no built-in role/collaborator lookup), only an
+# exact-login match, so an explicit login list is the closest available
+# primitive. `catalyst-cloud-connector[bot]` (Catalyst Cloud's own PR
+# author identity) is trusted equally to `thagale` here -- CI/Codex review
+# passing is the actual gate either way, the same as it always was; a human
+# author was never itself a stronger guarantee than green required checks.
+# This diverges the moment a second trusted collaborator is added -- their
+# PRs won't auto-queue under a fixed login list and will need either a
+# manual `@Mergifyio queue` comment or this file updated with their login.
 #
 # The dependabot branch requires a POSITIVE classification signal
 # (`approved-reviews-by = github-actions[bot]`), not just the ABSENCE of
@@ -87,7 +91,23 @@ queue_rules:
   - name: default
     merge_method: squash
     batch_size: 1
-    update_method: rebase
+    # merge, not rebase: this repo's ruleset also has
+    # strict_required_status_checks_policy: true ("Require branches to be
+    # up to date before merging"), and Mergify refuses to pair THAT with
+    # update_method: rebase unless a separate update_bot_account is
+    # configured (a rebase changes commit SHAs and needs an authorized
+    # account to attribute the push to) -- confirmed live: PR #90 sat with
+    # every real check green but the queue rule itself reporting
+    # action_required ("Configuration not compatible with
+    # required_status_checks ruleset rule") until this was caught, because
+    # no bot PR had ever gotten far enough to reach this step before
+    # catalyst-cloud-connector[bot] was trusted to auto-queue at all.
+    # update_method only affects the temporary in-place-checks update
+    # Mergify performs while validating a queued PR, never lands on main
+    # itself (squash discards that structure regardless) -- the PR
+    # branch's own linear history during that temporary window isn't
+    # worth the OAuth/bot-account setup update_bot_account would require.
+    update_method: merge
 
 pull_request_rules:
   - name: queue on green + threads resolved
@@ -98,6 +118,7 @@ pull_request_rules:
       - -label = needs-review
       - or:
           - author = thagale
+          - author = catalyst-cloud-connector[bot]
           - and:
               - author = dependabot[bot]
               - approved-reviews-by = github-actions[bot]
