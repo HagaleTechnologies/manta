@@ -7,8 +7,9 @@ maintainer: agent
 sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
+  - docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md
 verified:
-  commit: a1aad7da9e8cb98de7c2c68881b81d95c2bc98e6
+  commit: 455e1af
   date: 2026-09-09
 links:
   - spot-validation
@@ -74,10 +75,23 @@ no repeat needed. This doesn't rule out a fixed-bin channelizer artifact
 also being the reason the *same* garbled text recurs at the *same*
 frequency across sessions (below) — it just means that artifact didn't
 need to fool the repetition gate to produce a public spot. PR #154
-(`crates/manta-spot/src/validator.rs`, `grammar.rs` — open as of this
-writing) adds a WPM-implausibility check scoped to `SpotType::Beacon`
-candidates specifically; a small residual (structurally plausible,
-not-implausibly-fast garble) isn't caught and is a known, accepted gap.
+(`crates/manta-spot/src/validator.rs`, `grammar.rs` — merged 2026-09-09
+as `455e1af`) adds a WPM-implausibility check scoped to `SpotType::Beacon`
+candidates specifically, and defers non-allowlisted Beacon candidates
+until the track's true final close (a genuine observed RF gap), requiring
+a confirmed real `SpeedUpdate` before resolving one. A small residual
+(structurally plausible, not-implausibly-fast garble) isn't caught and is
+a known, accepted gap (tracked in issue #163, deprioritized).
+
+**Confirmed live, one session in** (`2026-09-09-post-pr154-20m-daytime-
+validation.md`): a 15-minute 20m daytime capture went from the overnight
+run's 29/29 false positives to 1 residual Beacon garble matching the
+documented gap above (low confidence, 3-char non-callsign text, WPM just
+under `MAX_PLAUSIBLE_WPM`) plus 1 plausible genuine `SpotType::Cq` catch
+(realistic WPM, above-artifact-band confidence, well-formed callsign) --
+the first non-Beacon confirmed spot across all live sessions to date. One
+session isn't a solid statistical answer yet, but the fix is behaving as
+designed so far.
 
 The frequency-clustering data point from the original finding is still
 worth knowing when you see the same defect: only one of the observed
