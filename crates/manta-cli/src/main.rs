@@ -219,6 +219,17 @@ enum Command {
         /// the source's native rate unchanged (today's behavior).
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
+        /// Declare `--source` as a raw complex-IQ WAV (any rate, routed
+        /// through `WavIqSource`) rather than the default mono real-audio
+        /// interpretation (`AudioIqSource`, Hilbert transform, 48000 Hz
+        /// only). Channel count alone can't reliably distinguish the two
+        /// formats -- a stereo real-audio recording and a 2-channel raw IQ
+        /// capture are indistinguishable by header alone -- so this must be
+        /// explicit (MAN-169 round-4 Codex finding: sniffing channel count
+        /// silently reinterpreted ordinary stereo audio recordings as IQ,
+        /// decoding them with an image at the negative-frequency mirror).
+        #[arg(long)]
+        source_iq: bool,
         /// TOML config with a `[server]`-shaped `ServerConfig` (station
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
@@ -352,6 +363,17 @@ enum Command {
         /// the source's native rate unchanged (today's behavior).
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
+        /// Declare `--source` as a raw complex-IQ WAV (any rate, routed
+        /// through `WavIqSource`) rather than the default mono real-audio
+        /// interpretation (`AudioIqSource`, Hilbert transform, 48000 Hz
+        /// only). Channel count alone can't reliably distinguish the two
+        /// formats -- a stereo real-audio recording and a 2-channel raw IQ
+        /// capture are indistinguishable by header alone -- so this must be
+        /// explicit (MAN-169 round-4 Codex finding: sniffing channel count
+        /// silently reinterpreted ordinary stereo audio recordings as IQ,
+        /// decoding them with an image at the negative-frequency mirror).
+        #[arg(long)]
+        source_iq: bool,
     },
     /// Bounded-duration health check: is this source hearing anything real?
     /// Runs the real decode pipeline for --duration, then reports track/SNR/
@@ -445,6 +467,17 @@ enum Command {
         /// the source's native rate unchanged (today's behavior).
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
+        /// Declare `--source` as a raw complex-IQ WAV (any rate, routed
+        /// through `WavIqSource`) rather than the default mono real-audio
+        /// interpretation (`AudioIqSource`, Hilbert transform, 48000 Hz
+        /// only). Channel count alone can't reliably distinguish the two
+        /// formats -- a stereo real-audio recording and a 2-channel raw IQ
+        /// capture are indistinguishable by header alone -- so this must be
+        /// explicit (MAN-169 round-4 Codex finding: sniffing channel count
+        /// silently reinterpreted ordinary stereo audio recordings as IQ,
+        /// decoding them with an image at the negative-frequency mirror).
+        #[arg(long)]
+        source_iq: bool,
         /// Emit the DoctorReport as one JSON object on stdout instead of a
         /// human-readable summary.
         #[arg(long)]
@@ -516,6 +549,7 @@ fn open_hpsdr_source(hpsdr: HpsdrOpts) -> Result<Option<Box<dyn IqSource>>> {
 fn open_source(
     device: Option<String>,
     source: Option<PathBuf>,
+    source_iq: bool,
     kiwi: KiwiOpts,
     soapy: SoapyOpts,
 ) -> Result<Box<dyn IqSource>> {
@@ -541,13 +575,14 @@ fn open_source(
             &driver, rate, freq, soapy.gain,
         )?));
     }
-    open_audio_source(device, source)
+    open_audio_source(device, source, source_iq)
 }
 
 #[cfg(not(feature = "soapy"))]
 fn open_source(
     device: Option<String>,
     source: Option<PathBuf>,
+    source_iq: bool,
     kiwi: KiwiOpts,
 ) -> Result<Box<dyn IqSource>> {
     if let Some(host) = kiwi.host {
@@ -561,7 +596,7 @@ fn open_source(
             &kiwi.password,
         )?));
     }
-    open_audio_source(device, source)
+    open_audio_source(device, source, source_iq)
 }
 
 /// `--source <path>.wav` covers two distinct file formats sharing the same
@@ -574,44 +609,23 @@ fn open_source(
 /// finding: routing every `--source` WAV through `AudioIqSource`
 /// unconditionally meant a 96/192 kS/s IQ replay could never reach here,
 /// since `AudioIqSource::from_wav_file` rejects every rate but 48000).
-/// Disambiguated by channel count, the one cheap, unambiguous signal
-/// available without decoding samples: 2 channels means IQ (I, Q), 1 means
-/// mono audio. Anything else falls through to `AudioIqSource::from_wav_file`
+/// Disambiguated by the explicit `--source-iq` flag, not channel count
+/// (MAN-169 round-4 Codex finding: a 2-channel WAV is ambiguous between a
+/// genuine IQ capture and an ordinary stereo real-audio recording -- header
+/// shape alone can't tell them apart, so guessing from it silently
+/// misinterpreted stereo audio as IQ). `--source-iq` set routes through
+/// `WavIqSource`; unset (the default, matching this flag's pre-round-2
+/// behavior exactly) always falls through to `AudioIqSource::from_wav_file`,
 /// so its own existing validation error (not a new one invented here) is
-/// what the operator sees, exactly as before this change.
-/// Peeks a WAV file's channel count without decoding samples -- 2 means
-/// raw complex IQ (`WavIqSource`), anything else falls through to
-/// `AudioIqSource`'s mono real-audio path. Returns `false` (not IQ) on any
-/// read failure, so a bad/missing file degrades to the pre-existing
-/// `AudioIqSource::from_wav_file` error path rather than a new one.
-fn is_2channel_iq_wav(path: &Path) -> bool {
-    hound::WavReader::open(path)
-        .map(|r| r.spec().channels == 2)
-        .unwrap_or(false)
-}
-
-/// Whether `source` names a 2-channel IQ WAV carrying a real RF center
-/// frequency via its `<stem>.json` sidecar (`WavIqSource`'s own
-/// convention, see `manta_input::Sidecar`) -- if so, the `--config`
-/// RF-awareness gate below should not require a redundant
-/// `--dial-freq-hz` (MAN-169 round-3 Codex finding: `has_rf_aware_source`
-/// previously only checked kiwi/soapy/hpsdr flags, so a daemon replay of
-/// an IQ file with real sidecar metadata was wrongly rejected). Checked
-/// cheaply (a header peek + file existence), without duplicating
-/// `WavIqSource::open`'s own sidecar-parsing/validation -- a missing or
-/// malformed sidecar just means "not RF-aware", handled identically to
-/// every other non-RF-aware source already.
-fn source_has_rf_center_freq_sidecar(source: &Option<PathBuf>) -> bool {
-    let Some(path) = source else {
-        return false;
-    };
-    is_2channel_iq_wav(path) && path.with_extension("json").exists()
-}
-
-fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
+/// what the operator sees for a rate/format mismatch.
+fn open_audio_source(
+    device: Option<String>,
+    source: Option<PathBuf>,
+    source_iq: bool,
+) -> Result<Box<dyn IqSource>> {
     Ok(match source {
         Some(path) => {
-            if is_2channel_iq_wav(&path) {
+            if source_iq {
                 Box::new(manta_input::WavIqSource::open(&path)?)
             } else {
                 Box::new(manta_input::AudioIqSource::from_wav_file(&path)?)
@@ -619,6 +633,25 @@ fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<
         }
         None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
+}
+
+/// Whether `source` (only meaningful when `source_iq` is set -- see
+/// `open_audio_source`) carries a real RF center frequency once actually
+/// opened and its sidecar parsed, not merely because a `<stem>.json` file
+/// happens to exist (MAN-169 round-4 Codex finding: a sidecar existing
+/// with `center_freq_hz: 0.0` -- IqSource's own "unknown center" sentinel
+/// -- is indistinguishable from "no sidecar" once parsed, so existence
+/// alone isn't enough to bypass the --dial-freq-hz guard below).
+fn source_iq_has_real_rf_center(source: &Option<PathBuf>, source_iq: bool) -> bool {
+    if !source_iq {
+        return false;
+    }
+    let Some(path) = source else {
+        return false;
+    };
+    manta_input::WavIqSource::open(path)
+        .map(|src| src.center_freq_hz() != 0.0)
+        .unwrap_or(false)
 }
 
 /// Overrides an inner source's `center_freq_hz()` with a fixed value --
@@ -2012,6 +2045,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
             capture_rate_hz,
+            source_iq,
             config,
             dial_freq_hz,
             replay_epoch,
@@ -2032,7 +2066,7 @@ fn main() -> Result<()> {
             let has_rf_aware_source = kiwi_host.is_some()
                 || has_soapy_source
                 || has_hpsdr_source
-                || source_has_rf_center_freq_sidecar(&source);
+                || source_iq_has_real_rf_center(&source, source_iq);
             let source_name = if kiwi_host.is_some() {
                 "kiwi"
             } else if has_soapy_source {
@@ -2092,6 +2126,7 @@ fn main() -> Result<()> {
                         open_source(
                             device,
                             source,
+                            source_iq,
                             kiwi,
                             SoapyOpts {
                                 driver: soapy_driver,
@@ -2103,7 +2138,7 @@ fn main() -> Result<()> {
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, kiwi)?
+                        open_source(device, source, source_iq, kiwi)?
                     }
                 }
             };
@@ -2412,6 +2447,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
             capture_rate_hz,
+            source_iq,
         } => {
             let kiwi = KiwiOpts {
                 host: kiwi_host,
@@ -2443,6 +2479,7 @@ fn main() -> Result<()> {
                         open_source(
                             device,
                             source,
+                            source_iq,
                             kiwi,
                             SoapyOpts {
                                 driver: soapy_driver,
@@ -2454,7 +2491,7 @@ fn main() -> Result<()> {
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, kiwi)?
+                        open_source(device, source, source_iq, kiwi)?
                     }
                 }
             };
@@ -2494,6 +2531,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
             capture_rate_hz,
+            source_iq,
             json,
         } => {
             // Checked before any source is opened -- otherwise an invalid
@@ -2541,6 +2579,7 @@ fn main() -> Result<()> {
                         open_source(
                             device,
                             source,
+                            source_iq,
                             kiwi,
                             SoapyOpts {
                                 driver: soapy_driver,
@@ -2552,7 +2591,7 @@ fn main() -> Result<()> {
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, kiwi)?
+                        open_source(device, source, source_iq, kiwi)?
                     }
                 }
             };

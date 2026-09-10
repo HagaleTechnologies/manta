@@ -282,13 +282,47 @@ fn capture_rate_hz_replays_a_2channel_iq_wav_through_wav_iq_source() {
     let out = manta()
         .args(["run", "--source"])
         .arg(dir.path().join("v1.wav"))
-        .args(["--capture-rate-hz", "48000"]) // 96000 -> 48000, factor 2
+        .args(["--source-iq", "--capture-rate-hz", "48000"]) // 96000 -> 48000, factor 2
         .output()
         .unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn without_source_iq_a_2channel_wav_is_still_treated_as_stereo_audio() {
+    // MAN-169 round-4 Codex finding (Finding A): channel count alone can't
+    // distinguish a genuine 2-channel raw-IQ capture from an ordinary
+    // stereo real-audio recording -- both `WavIqSource` and `AudioIqSource`
+    // accept 2-channel WAVs. Without `--source-iq`, `--source` must always
+    // go through `AudioIqSource::from_wav_file` (the pre-round-2, and
+    // pre-this-PR, default), never `WavIqSource`. Proven indirectly: v1()'s
+    // default fs is 96000 Hz, and `AudioIqSource::from_wav_file` hard-
+    // rejects every rate but 48000 -- so this must fail with that source's
+    // own "48000" error, not a `WavIqSource`-shaped success or a different
+    // error, proving the 2-channel WAV was never silently reinterpreted as
+    // IQ.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1(); // fs=96_000, 2-channel WAV, no --source-iq
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("48000"),
+        "expected AudioIqSource's rate-mismatch error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("IQ WAV must have"),
+        "must not go through WavIqSource without --source-iq: {stderr}"
     );
 }
 
@@ -305,6 +339,7 @@ fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
     // longer fires for that case -- the run still fails (the --config path
     // doesn't exist), but it must fail for THAT reason, not the
     // --dial-freq-hz one, proving the RF-awareness check itself now passes.
+    // Requires --source-iq (round-4: no more channel-count sniffing).
     let dir = tempfile::tempdir().unwrap();
     let spec = manta_testkit::vectors::v1(); // fs=96_000, center_freq_hz=14_000_000 (nonzero)
     manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
@@ -312,7 +347,7 @@ fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
     let out = manta()
         .args(["run", "--source"])
         .arg(dir.path().join("v1.wav"))
-        .args(["--config", "/nonexistent-daemon-config.toml"])
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -320,6 +355,37 @@ fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
     assert!(
         !stderr.contains("--dial-freq-hz"),
         "RF-awareness gate should not fire for an IQ WAV with a real sidecar: {stderr}"
+    );
+}
+
+#[test]
+fn config_requires_dial_freq_hz_for_an_iq_wav_with_a_zero_sidecar_center() {
+    // MAN-169 round-4 Codex finding (Finding B): a `<stem>.json` sidecar
+    // existing is not proof its `center_freq_hz` is meaningful --
+    // `center_freq_hz: 0.0` is `WavIqSource`'s own "unknown center"
+    // sentinel (the same value it reports when there's no sidecar at all),
+    // so existence-only checking wrongly bypassed the --dial-freq-hz guard
+    // for a source that doesn't actually report a real RF center. This
+    // proves the opposite of the sibling "real sidecar" test above: the
+    // guard must still fire when the sidecar's value is the zero sentinel.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        center_freq_hz: 0.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dial-freq-hz"),
+        "a sidecar with center_freq_hz: 0.0 must not bypass the --dial-freq-hz guard: {stderr}"
     );
 }
 
