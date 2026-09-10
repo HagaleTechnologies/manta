@@ -1,8 +1,12 @@
 //! Per-track narrowband refinement: an optional, per-hop channel derotator
 //! and lowpass that sharpens a track's amplitude estimate using its
 //! fractional centroid offset. SPEC v2 §3. Enabled when `decode.refine_bw_hz`
-//! is greater than zero (default 0, meaning off); the engine call site is
-//! out of scope for this module (deferred to MAN-168).
+//! is greater than zero (default 0, meaning off).
+//!
+//! The engine call site (MAN-168, `manta-engine::track`) needs
+//! [`GROUP_DELAY_HOPS`] to correctly pair a refined amplitude with the
+//! `sample_ts` it actually corresponds to -- the symmetric FIR delays its
+//! output by that many hops relative to the raw `sqrt(power)` it replaces.
 
 use num_complex::Complex32;
 
@@ -13,6 +17,12 @@ const HOP_RATE_HZ: f64 = 375.0;
 const CHANNEL_SPACING_HZ: f64 = 93.75;
 /// SPEC v2 §3: 11-tap FIR.
 const TAPS: usize = 11;
+/// Group delay of the symmetric `TAPS`-tap FIR, in hops: `Refiner::push`'s
+/// output at hop `t` corresponds to the input sample from `t -
+/// GROUP_DELAY_HOPS` hops ago, not the current hop. Public so a caller
+/// (MAN-168's `manta-engine` call site) can pair a refined amplitude with
+/// its true `sample_ts` instead of the current hop's.
+pub const GROUP_DELAY_HOPS: usize = (TAPS - 1) / 2;
 
 fn sinc(x: f64) -> f64 {
     if x.abs() < 1e-12 {

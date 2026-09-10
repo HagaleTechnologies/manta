@@ -1268,6 +1268,21 @@ fn load_decode_config_file(
             cfg.evidence.llr_clip
         );
     }
+    // Codex review, MAN-168: `refine_bw_hz` is a newly-activated (default
+    // 0.0/disabled) setting -- a NaN or infinite value is neither `<=
+    // 0.0` (so refinement isn't bypassed) nor a usable bandwidth,
+    // reaching `Refiner::new`'s own `debug_assert!(bw_hz > 0.0)` (a debug
+    // panic; a release build instead designs an all-NaN/degenerate FIR
+    // that then poisons every refined amplitude). 0.0 itself must stay
+    // legal -- it's the documented "disabled" sentinel, not an error.
+    if !cfg.refine_bw_hz.is_finite() {
+        bail!(
+            "[decode] refine_bw_hz must be finite in {} (got {}; use 0.0 to disable refinement, \
+             not NaN/inf)",
+            path.display(),
+            cfg.refine_bw_hz
+        );
+    }
     Ok(cfg)
 }
 
@@ -2779,6 +2794,32 @@ mod tests {
     fn load_decode_config_file_rejects_infinite_noise_min_bias_db() {
         let f = write_temp_file(b"[decode]\nnoise_min_bias_db = inf\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_refine_bw_hz() {
+        // 0.0 is the documented "disabled" sentinel, not an error.
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_a_positive_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = 30.0\n");
+        let cfg = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(cfg.refine_bw_hz, 30.0);
     }
 
     #[test]
