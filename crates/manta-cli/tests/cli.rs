@@ -909,16 +909,30 @@ fn status_with_an_invalid_addr_fails_with_exit_code_two_not_one() {
 /// MAN-44 CR-A regression: an unreadable `--server-config` must exit 2, not
 /// 1, for the same reason -- this used to `?`-propagate out of `main` and
 /// exit 1, colliding with the "unhealthy uplink" code.
+///
+/// Both spellings are exercised: `--server-config` is the deprecated
+/// alias operators already have in their runbooks and cron jobs, and
+/// `--config` is the canonical flag `warn_deprecations` tells them to
+/// switch to. Before the Codex review fix (PR #95) the second one did not
+/// exist on `status`, so the deprecation notice named a flag clap
+/// rejected -- and this test would have failed with clap's exit 2-shaped
+/// usage error for the wrong reason, hence the message assertion.
 #[test]
 fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
-    let out = manta()
-        .args(["status", "--server-config", "/nonexistent/manta.toml"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for spelling in ["--server-config", "--config"] {
+        let out = manta()
+            .args(["status", spelling, "/nonexistent/manta.toml"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`manta status {spelling}` stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("manta status:") && stderr.contains("/nonexistent/manta.toml"),
+            "`manta status {spelling}` must fail reading the config, not on clap usage: {stderr}"
+        );
+    }
 }

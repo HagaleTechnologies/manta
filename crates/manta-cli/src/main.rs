@@ -347,8 +347,16 @@ enum Command {
         /// Daemon config to read the metrics bind address/port from. A
         /// wildcard `bind_addr` (e.g. `0.0.0.0`) resolves to loopback for
         /// dialing purposes -- see `resolve_status_addr`.
-        #[arg(long, conflicts_with = "addr")]
-        server_config: Option<PathBuf>,
+        ///
+        /// `--server-config` is a deprecated alias, exactly as on
+        /// `run`/`listen`/`decode` (D11/MAN-77). It has to be spelled
+        /// this way round: `warn_deprecations` scans raw argv without
+        /// knowing the verb, so `manta status --server-config m.toml`
+        /// prints "use `--config` instead" -- and before this alias
+        /// existed, that advice named a flag clap then rejected
+        /// (Codex review, PR #95).
+        #[arg(long, alias = "server-config", conflicts_with = "addr")]
+        config: Option<PathBuf>,
         /// Explicit `host:port` of the daemon's metrics listener (default
         /// 127.0.0.1:7302, the documented default metrics port).
         #[arg(long)]
@@ -1853,10 +1861,10 @@ fn format_addrs(addrs: &[std::net::SocketAddr]) -> String {
 }
 
 /// The full pre-render `manta status` flow: read/parse an optional
-/// `--server-config`, resolve the dial address, and fetch+parse the
-/// daemon's `/status` document. Extracted so every failure along this path
-/// -- not just `fetch_status`'s -- goes through the same exit-2 handling
-/// (CR-A).
+/// `--config` (a.k.a. the deprecated `--server-config` alias), resolve
+/// the dial address, and fetch+parse the daemon's `/status` document.
+/// Extracted so every failure along this path -- not just
+/// `fetch_status`'s -- goes through the same exit-2 handling (CR-A).
 ///
 /// `resolve_status_addr` runs INSIDE the tokio runtime, on the blocking
 /// pool (MAN-44 code review CR-2): the previous version called it before
@@ -2069,7 +2077,43 @@ async fn fetch_status_inner(
         .await
         .context("reading the status body")?;
     let body = String::from_utf8(body).context("status body was not valid UTF-8")?;
-    serde_json::from_str(&body).context("status body was not a valid status document")
+    parse_status_doc(&body)
+}
+
+/// Parses a `/status` body AND enforces its `schema_version` (Codex
+/// review, PR #95).
+///
+/// `schema_version` only earns its place in the document if someone
+/// checks it: a newer daemon that removed or re-meaning'd a field can
+/// still deserialize structurally into this build's `StatusDoc` -- serde
+/// ignores unknown keys and every field this build requires may well
+/// still be present -- and `manta status` would then render it, and pick
+/// an exit code from it, under semantics that no longer hold. An operator
+/// running a monitoring one-liner would get a confident `0`/`1` computed
+/// from a document this build cannot actually interpret.
+///
+/// So a version this build does not understand is a hard error, which
+/// `Command::Status` turns into the documented exit 2 ("could not reach
+/// or parse the daemon's status at all", `docs/RUNBOOKS/uplink-health.md`)
+/// -- deliberately NOT exit 1, which means "asked, and the uplink is
+/// unhealthy". Version skew is a tooling problem, not an uplink problem.
+///
+/// Separated from `fetch_status_inner` so this is testable without a
+/// socket; `fetch_status_inner` has no other post-read logic to keep.
+fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
+    use manta_server::status::STATUS_SCHEMA_VERSION;
+
+    let doc: manta_server::status::StatusDoc =
+        serde_json::from_str(body).context("status body was not a valid status document")?;
+    if doc.schema_version != STATUS_SCHEMA_VERSION {
+        bail!(
+            "daemon reports status schema_version {} but this manta build understands only {} \
+             -- upgrade whichever of the daemon and the CLI is older",
+            doc.schema_version,
+            STATUS_SCHEMA_VERSION
+        );
+    }
+    Ok(doc)
 }
 
 fn main() -> Result<()> {
@@ -2639,13 +2683,13 @@ fn main() -> Result<()> {
             }
         }
         Command::Status {
-            server_config,
+            config,
             addr,
             json,
             timeout_secs,
         } => {
             // CR-A: EVERY failure short of a parsed StatusDoc -- an
-            // unreadable/unparseable --server-config, a bad --addr, or a
+            // unreadable/unparseable --config, a bad --addr, or a
             // daemon that couldn't be reached -- exits 2 ("couldn't ask"),
             // distinct from exit 1 ("asked, the uplink is unhealthy",
             // `status_exit_code`). Letting the first two `?`-propagate out
@@ -2654,7 +2698,7 @@ fn main() -> Result<()> {
             // (`docs/RUNBOOKS/uplink-health.md`'s exit-code table) -- a
             // typo'd config path was indistinguishable from a genuinely
             // degraded uplink.
-            let doc = match run_status(server_config.as_deref(), addr.as_deref(), timeout_secs) {
+            let doc = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
                 Ok(doc) => doc,
                 Err(e) => {
                     eprintln!("manta status: {e:#}");
@@ -3317,6 +3361,75 @@ mod tests {
         // Other subcommands are never implicated.
         assert_eq!(notices(&["manta", "decode", "/tmp/v1.wav"]), vec![]);
         assert_eq!(notices(&["manta", "soak", "--duration", "10"]), vec![]);
+        // `status` is scanned like any other verb -- which is only
+        // honest because `status` now ACCEPTS the flag the notice tells
+        // the operator to switch to (Codex review, PR #95); see
+        // `status_accepts_the_canonical_config_flag_the_deprecation_notice_names`.
+        assert_eq!(
+            notices(&["manta", "status", "--server-config", "m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        assert_eq!(notices(&["manta", "status", "--config", "m.toml"]), vec![]);
+    }
+
+    /// Codex review, PR #95: `warn_deprecations` scans raw argv without
+    /// knowing the verb, so `manta status --server-config m.toml` printed
+    /// "use `--config` instead" while `status` accepted no `--config` at
+    /// all -- the notice pointed operators at a spelling clap rejected.
+    /// Both spellings must now parse to the same field.
+    #[test]
+    fn status_accepts_the_canonical_config_flag_the_deprecation_notice_names() {
+        use clap::Parser;
+
+        for spelling in ["--config", "--server-config"] {
+            let cli = Cli::try_parse_from(["manta", "status", spelling, "m.toml"])
+                .unwrap_or_else(|e| panic!("`manta status {spelling}` must parse: {e}"));
+            match cli.command {
+                Command::Status { config, .. } => {
+                    assert_eq!(config.as_deref(), Some(std::path::Path::new("m.toml")));
+                }
+                _ => panic!("`manta status {spelling}` must parse as Command::Status"),
+            }
+        }
+    }
+
+    /// Codex review, PR #95: a newer daemon's document can stay
+    /// structurally deserializable while its fields mean something else,
+    /// so the version has to be checked rather than merely carried.
+    #[test]
+    fn a_status_document_with_an_unknown_schema_version_is_rejected() {
+        let doc =
+            manta_server::status::StatusDoc::from_metrics(&manta_server::metrics::Metrics::new());
+        let ok = serde_json::to_string(&doc).unwrap();
+        assert_eq!(
+            parse_status_doc(&ok).unwrap().schema_version,
+            manta_server::status::STATUS_SCHEMA_VERSION,
+            "the version this build emits must be the version it accepts"
+        );
+
+        let mut v: serde_json::Value = serde_json::from_str(&ok).unwrap();
+        v["schema_version"] = serde_json::json!(2);
+        let err = parse_status_doc(&v.to_string())
+            .expect_err("a schema_version this build does not understand must not be rendered")
+            .to_string();
+        assert!(
+            err.contains("schema_version 2") && err.contains("understands only 1"),
+            "the error must name both versions so an operator knows which side to upgrade: {err}"
+        );
+    }
+
+    /// The neighbouring failure mode: a body that is not a status
+    /// document at all (a wrong port answering `GET /status`) must still
+    /// fail on its own message, not on the new version check.
+    #[test]
+    fn a_body_that_is_not_a_status_document_fails_before_the_version_check() {
+        let err = parse_status_doc("{\"hello\":\"world\"}")
+            .expect_err("a non-status body must not parse")
+            .to_string();
+        assert!(
+            err.contains("not a valid status document"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

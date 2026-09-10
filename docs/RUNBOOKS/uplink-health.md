@@ -1,9 +1,9 @@
 # Reading RBN uplink health with `manta status`
 
-MAN-44. For a daemon started with `--server-config`, run:
+MAN-44. For a daemon started with `--config`, run:
 
 ```console
-$ manta status --server-config /etc/manta/manta.toml
+$ manta status --config /etc/manta/manta.toml
 manta status — daemon up 3h 12m
 
   spots published      18432
@@ -32,7 +32,11 @@ manta status --addr 10.0.0.5:7302
 manta status --addr 10.0.0.5:7302 --json | jq .uplink
 ```
 
-`--server-config`'s `bind_addr` is translated for you: a wildcard
+(`--server-config` still works everywhere `--config` does here — it is a
+deprecated alias, kept so existing runbooks and cron jobs don't break, and
+it prints a one-line deprecation notice on stderr.)
+
+`--config`'s `bind_addr` is translated for you: a wildcard
 (`0.0.0.0`/`::`) means "the daemon listens everywhere," which isn't itself
 something `manta status` can dial, so it falls back to loopback. If the
 daemon runs on a different host than the one you're checking from, use
@@ -86,10 +90,16 @@ daemon runs on a different host than the one you're checking from, use
 | `1` | Reached the daemon; the uplink is unhealthy (`DEGRADED`/`DOWN`). |
 | `2` | Could not reach or parse the daemon's status — check the daemon is running and the address/port. |
 
+Exit `2` also covers version skew: if the daemon serves a `schema_version`
+this `manta` build doesn't understand, `manta status` refuses to interpret
+the document rather than guessing at an exit code, and names both versions
+so you know which side to upgrade. A degraded uplink is never reported this
+way — that is always exit `1`.
+
 A cron/Nagios-style one-liner:
 
 ```sh
-manta status --server-config /etc/manta/manta.toml >/dev/null || echo "uplink check failed (exit $?)"
+manta status --config /etc/manta/manta.toml >/dev/null || echo "uplink check failed (exit $?)"
 ```
 
 ## Also available: `GET /status` and Prometheus

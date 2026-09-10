@@ -18,6 +18,18 @@ use crate::metrics::{
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+/// The one `schema_version` this build both emits and understands.
+///
+/// Public because it is half of a wire contract, not a private detail:
+/// `manta-cli`'s `parse_status_doc` rejects any other version outright
+/// rather than reading a newer daemon's document with this build's
+/// semantics (Codex review, PR #95). A bump here means an INCOMPATIBLE
+/// change -- a removed or re-meaning'd field. Purely additive fields do
+/// not bump it: `serde` ignores unknown keys, so an older CLI keeps
+/// reading a newer daemon correctly, which is the whole reason a version
+/// mismatch can be treated as fatal rather than best-effort.
+pub const STATUS_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusDoc {
     pub schema_version: u32,
@@ -88,7 +100,7 @@ impl StatusDoc {
         let reconnects_total = targets.iter().map(|t| t.reconnects).sum();
         let health = overall_uplink_health_of(&targets);
         StatusDoc {
-            schema_version: 1,
+            schema_version: STATUS_SCHEMA_VERSION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: metrics.uptime().as_secs(),
             spots_total: metrics.spots_total(),
