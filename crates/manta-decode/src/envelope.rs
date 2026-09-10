@@ -217,6 +217,38 @@ impl Demod {
         out
     }
 
+    /// Takes the currently-`held` run (if any), merging in `open`'s
+    /// duration first if `open` is itself a short, sub-`debounce_hops`
+    /// reversal -- ordinary debounce noise riding on `held`'s trailing
+    /// edge, exactly the case `step`'s live polarity-flip handling
+    /// already treats as noise-not-a-new-run. `finish()` performs the
+    /// same merge before emitting; matching it here keeps the reported
+    /// duration accurate instead of silently short by up to
+    /// `debounce_hops` (Codex review on PR #154, round 9). An `open` run
+    /// that has ALREADY reached its own `debounce_hops` confirmation is
+    /// untouched either way -- that one is a genuinely new, still
+    /// unconfirmed run, not noise, and must never be resolved here.
+    ///
+    /// `held` itself has already passed its own `debounce_hops`
+    /// confirmation the moment it was created (see `step`'s polarity-flip
+    /// handling) -- genuinely confirmed data. It can, in principle, still
+    /// be un-done by a LATER short reversal merging it back into a new
+    /// `open` -- but only if more samples arrive. Once nothing more ever
+    /// will (a track's true close), that can't happen, so treating `held`
+    /// as final at that point is safe (round 8 -- see
+    /// `TrackDecoder::finish_speed_only`, the only caller).
+    pub(crate) fn take_held(&mut self) -> Option<Run> {
+        match self.open {
+            Some(open) if open.hops < self.debounce_hops => {
+                let mut h = self.held.take()?;
+                self.open = None;
+                h.hops += open.hops;
+                Some(h)
+            }
+            _ => self.held.take(),
+        }
+    }
+
     /// EOF flush: closes the open run and emits everything held. SPEC §3.4.
     pub fn finish(&mut self) -> Vec<Run> {
         let mut out = Vec::new();
@@ -408,6 +440,93 @@ mod tests {
         let runs = run_segments(&segs);
         let big = runs.iter().filter(|r| r.mark && r.hops >= 55).count();
         assert_eq!(big, 1, "dropout must merge into one long mark: {runs:?}");
+    }
+
+    /// Codex review on PR #154, round 8: a confirmed run (past its own
+    /// debounce check) sits in `held` for one further polarity flip
+    /// before it reaches `on_run` live. `take_held` must surface it
+    /// directly, without disturbing whatever's still accumulating in
+    /// `open`.
+    #[test]
+    fn take_held_merges_a_short_sub_debounce_open_into_the_held_run() {
+        let mut d = Demod::new(DemodConfig::default());
+        let mut ts = 0u64;
+        // Warm up clean alternating cycles first (same pattern as
+        // clean_keying_yields_alternating_runs) so thresholds are
+        // established.
+        for _ in 0..10 {
+            for _ in 0..30 {
+                d.push(1.0, ts);
+                ts += 256;
+            }
+            for _ in 0..30 {
+                d.push(0.01, ts);
+                ts += 256;
+            }
+        }
+        // A fresh, long mark -- confirmed once it flips.
+        for _ in 0..30 {
+            d.push(1.0, ts);
+            ts += 256;
+        }
+        // One flip: the mark above moves into `held`; a fresh 1-hop space
+        // becomes `open` -- well under debounce_hops, ordinary debounce
+        // noise riding on the held mark's trailing edge (round 9).
+        d.push(0.01, ts);
+
+        let held = d.take_held();
+        assert!(
+            matches!(held, Some(r) if r.mark && r.hops >= 26),
+            "held should merge in the short open space's 1 hop on top of \
+             the confirmed ~30-hop mark, got {held:?}"
+        );
+        assert_eq!(
+            d.open_space_hops(),
+            None,
+            "the short open space's duration was consumed into the merge -- \
+             open must be cleared, not left dangling"
+        );
+    }
+
+    /// Codex review on PR #154, round 9: unlike a short sub-debounce
+    /// reversal (merged in above), an `open` run that has ALREADY reached
+    /// its own `debounce_hops` confirmation is a genuinely new, separate
+    /// run -- not noise -- and `take_held` must never resolve it.
+    #[test]
+    fn take_held_leaves_an_already_confirmed_open_run_untouched() {
+        let mut d = Demod::new(DemodConfig::default());
+        let mut ts = 0u64;
+        for _ in 0..10 {
+            for _ in 0..30 {
+                d.push(1.0, ts);
+                ts += 256;
+            }
+            for _ in 0..30 {
+                d.push(0.01, ts);
+                ts += 256;
+            }
+        }
+        for _ in 0..30 {
+            d.push(1.0, ts); // fresh mark, confirmed once it flips
+            ts += 256;
+        }
+        // Flip into a space, then keep feeding it well past debounce_hops
+        // -- this space is now itself a genuinely confirmed, separate run.
+        for _ in 0..30 {
+            d.push(0.01, ts);
+            ts += 256;
+        }
+
+        let held = d.take_held();
+        assert!(
+            matches!(held, Some(r) if r.mark && (25..=31).contains(&r.hops)),
+            "held must report the original mark's own duration, unmerged, got {held:?}"
+        );
+        assert_eq!(
+            d.open_space_hops(),
+            Some(30),
+            "an already-confirmed open run must be left untouched, not resolved"
+        );
     }
 
     #[test]
