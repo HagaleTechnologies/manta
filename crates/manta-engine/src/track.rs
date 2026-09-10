@@ -344,6 +344,28 @@ pub(crate) struct Track {
     /// (MAN-19 review round 1). `TrackClosed` emission checks this, not
     /// decoder presence.
     has_emitted: bool,
+    /// Set once this track has been NAMED as the survivor of a
+    /// `ClosureKind::Bookkeeping` closure that was actually emitted, i.e.
+    /// once a downstream consumer has been told "that identity continues
+    /// here" and may be holding per-identity evidence parked under this
+    /// id (`manta-spot`'s `Validator::deferred_annotations`: MAN-33's
+    /// RST/`QRL?` annotations and pending beacons).
+    ///
+    /// MAN-33 round 13 (Codex review on PR #159, "forward annotations
+    /// through silent merge intermediates"): `merge_converged`'s
+    /// `resolve_final` collapses a chain decided within ONE batch, but a
+    /// chain spread across batches cannot be collapsed that way -- `A ->
+    /// B` in batch 1 names a live, eventless `B`, and when `B` is merged
+    /// into `C` in batch 2 the MAN-19 `has_emitted` filter suppresses
+    /// `B`'s own `TrackClosed`, so the consumer never learns the `B -> C`
+    /// redirect and `A`'s evidence is stranded under `B` forever. This
+    /// flag is exactly the set of ids for which that filter must yield:
+    /// a track the consumer was told about gets its own eventual closure
+    /// even if it never decoded a thing. Nothing else changes -- an
+    /// eventless track still never has its decoder flushed (that would
+    /// introduce real decoder events for a track_id the stream never
+    /// showed), so the only new event is the bookkeeping closure itself.
+    holds_migrated_state: bool,
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -372,6 +394,7 @@ impl Track {
             decoder: None,
             pending: Vec::new(),
             has_emitted: false,
+            holds_migrated_state: false,
         }
     }
 
@@ -736,7 +759,13 @@ impl TrackManager {
                 return false;
             };
             if !track.has_emitted {
-                return false;
+                // MAN-33 round 13: unless a consumer was told this id is
+                // where some other identity continues, in which case it
+                // is owed the closure that frees what it parked there --
+                // see `Track::holds_migrated_state`. No decoder flush:
+                // this track produced nothing the stream ever saw, and
+                // the closure alone carries no decoder output.
+                return track.holds_migrated_state;
             }
             // Only a genuine, sustained observed RF gap (HangExpired) may
             // force an in-progress mark to resolve; Silent's own trigger
@@ -910,28 +939,48 @@ impl TrackManager {
         // `step_hop` (a track promoted this same batch can be merged away
         // before ever getting a `drain_pool` pass).
         let mut flush_events: Vec<DecoderEvent> = Vec::new();
-        let ever_emitted_closed = to_close
-            .iter()
-            .copied()
-            .filter_map(|(loser, survivor)| {
-                self.close_counts.record(CloseReason::Merged);
-                let mut track = self.tracks.remove(&loser)?;
-                if !track.has_emitted {
-                    return None;
-                }
+        let mut reported_closed: Vec<(u32, ClosureKind)> = Vec::new();
+        // Every final survivor this method actually NAMES downstream --
+        // marked below so a later batch cannot silently merge it away
+        // (MAN-33 round 13, see `Track::holds_migrated_state`). Collected
+        // rather than marked inline because `self.tracks` is being
+        // drained of losers in the same pass.
+        let mut named_survivors: Vec<u32> = Vec::new();
+        for (loser, survivor) in to_close.iter().copied() {
+            self.close_counts.record(CloseReason::Merged);
+            let Some(mut track) = self.tracks.remove(&loser) else {
+                continue;
+            };
+            // MAN-19's filter, with MAN-33 round 13's exception: an
+            // eventless loser is still owed its closure once a consumer
+            // has been told some other identity continues under its id,
+            // otherwise the redirect out of it is never delivered and
+            // whatever was parked there is stranded. Its decoder is still
+            // never flushed -- it emitted nothing the stream ever saw.
+            if !track.has_emitted && !track.holds_migrated_state {
+                continue;
+            }
+            if track.has_emitted {
                 flush_events.extend(track.finish_decoder_speed_only());
-                Some((
-                    loser,
-                    ClosureKind::Bookkeeping {
-                        survivor_track_id: Some(resolve_final(survivor)),
-                    },
-                ))
-            })
-            .collect();
+            }
+            let final_survivor = resolve_final(survivor);
+            named_survivors.push(final_survivor);
+            reported_closed.push((
+                loser,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(final_survivor),
+                },
+            ));
+        }
+        for survivor in named_survivors {
+            if let Some(t) = self.tracks.get_mut(&survivor) {
+                t.holds_migrated_state = true;
+            }
+        }
         if !ids.is_empty() {
             self.recompute_ownership();
         }
-        (ever_emitted_closed, flush_events)
+        (reported_closed, flush_events)
     }
 
     /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
@@ -954,6 +1003,14 @@ impl TrackManager {
             if let Some(mut track) = self.tracks.remove(&loser) {
                 if track.has_emitted {
                     flush_events.extend(track.finish_decoder_speed_only());
+                }
+                // MAN-19's filter, plus MAN-33 round 13's exception: an
+                // eventless track a consumer was told to migrate INTO is
+                // still owed its closure, so what it parked there is
+                // released rather than left to age out under a cap. No
+                // decoder flush for that case -- see
+                // `Track::holds_migrated_state`.
+                if track.has_emitted || track.holds_migrated_state {
                     // No survivor -- an eviction just stops tracking this
                     // identity, with no successor to migrate deferred
                     // evidence to (round 9).
@@ -1102,10 +1159,15 @@ impl TrackManager {
                 t.has_emitted = true;
             }
         }
+        // `holds_migrated_state` (MAN-33 round 13) joins `has_emitted`
+        // here for the same reason it does in the three `process_hops`
+        // closure paths: a track a consumer was told to migrate INTO is
+        // owed a closure that releases what it parked there, even at
+        // end-of-stream and even if it never decoded anything itself.
         let closed_ids: Vec<u32> = self
             .tracks
             .iter()
-            .filter(|(_, t)| t.has_emitted)
+            .filter(|(_, t)| t.has_emitted || t.holds_migrated_state)
             .map(|(&id, _)| id)
             .collect();
         // MAN-19 round 7: append, then apply ONE consistent global
@@ -1618,6 +1680,87 @@ mod tests {
             "both losers must be gone, leaving only the final survivor"
         );
         assert!(tm.tracks.contains_key(&c));
+    }
+
+    /// Codex review on PR #159, round 12 ("forward annotations through
+    /// silent merge intermediates"): `resolve_final` above collapses a
+    /// chain decided inside ONE batch, but a chain spread across batches
+    /// cannot be collapsed that way -- `A -> B` is delivered before
+    /// `B -> C` is even decided. So the consumer parks `A`'s evidence
+    /// under a live, eventless `B`, and MAN-19's `has_emitted` filter
+    /// then suppresses `B`'s own closure forever, stranding it. A track
+    /// the consumer was told to migrate INTO is owed its own closure even
+    /// if it never decoded a thing -- but still never a decoder flush,
+    /// which would put real decoder events for an unseen track_id into
+    /// the stream.
+    #[test]
+    fn an_eventless_survivor_holding_migrated_state_still_closes() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(30);
+        tm.spawn(50);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        // Batch 1: only `a` and `b` converge; `c` is far away. `a` is the
+        // only track that ever emitted anything.
+        for (id, center, snr) in [(a, 20.4, 8.0), (b, 20.9, 12.0), (c, 60.0, 18.0)] {
+            let t = tm.tracks.get_mut(&id).unwrap();
+            t.center = center;
+            t.current_snr_db = snr;
+        }
+        tm.tracks.get_mut(&a).unwrap().has_emitted = true;
+        let (closed, _flush) = tm.merge_converged();
+        assert_eq!(
+            closed,
+            vec![(
+                a,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(b)
+                }
+            )]
+        );
+        assert!(
+            tm.tracks.get(&b).unwrap().holds_migrated_state,
+            "a survivor named downstream must be marked, or its own \
+             closure is suppressed later"
+        );
+        assert!(
+            !tm.tracks.get(&c).unwrap().holds_migrated_state,
+            "a track no closure ever named must stay unmarked"
+        );
+
+        // Batch 2: `b` -- still eventless -- merges into `c`.
+        for (id, center, snr) in [(b, 40.0, 9.0), (c, 40.5, 18.0)] {
+            let t = tm.tracks.get_mut(&id).unwrap();
+            t.center = center;
+            t.current_snr_db = snr;
+        }
+        let (closed, flush) = tm.merge_converged();
+        assert_eq!(
+            closed,
+            vec![(
+                b,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(c)
+                }
+            )],
+            "the b -> c redirect must reach the consumer, or a's evidence \
+             parked under b is stranded there forever"
+        );
+        assert!(
+            flush.is_empty(),
+            "an eventless loser must never have its decoder flushed: it \
+             produced nothing the stream ever saw, got {flush:?}"
+        );
+        assert!(tm.tracks.get(&c).unwrap().holds_migrated_state);
     }
 
     /// Codex review on PR #159, round 12: a merge redirect is a fact

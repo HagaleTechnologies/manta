@@ -722,7 +722,17 @@ impl Validator {
                 // by ITS OWN eventual true close), or discards it if there
                 // is none.
                 let (spots, survivor) = match closure {
-                    ClosureKind::SignalEnded => (self.resolve_pending_beacons(*track_id), None),
+                    ClosureKind::SignalEnded => {
+                        let spots = self.resolve_pending_beacons(*track_id);
+                        // This identity ended. Anything an earlier merge
+                        // parked under this id (it had no `TrackState` at
+                        // the time) has nowhere left to go -- release it
+                        // and count the beacons, exactly as an eviction
+                        // with no survivor does. See
+                        // `migrate_or_discard_deferred`.
+                        self.migrate_or_discard_deferred(*track_id, None);
+                        (spots, None)
+                    }
                     ClosureKind::Bookkeeping { survivor_track_id } => {
                         // MAN-33 round 2 (Codex review on PR #159): the
                         // named survivor is NOT necessarily the identity
@@ -754,6 +764,21 @@ impl Validator {
                         if let Some(survivor) = survivor {
                             self.migrate_message_annotations(*track_id, survivor);
                         }
+                        // MAN-33 round 13 (Codex review on PR #159,
+                        // "forward annotations through silent merge
+                        // intermediates"): the two migrations above carry
+                        // this track's OWN state. It may also be holding
+                        // state a PREVIOUS batch's merge parked under its
+                        // id while it had no `TrackState` -- an eventless
+                        // intermediate B in an `A -> B` then `B -> C`
+                        // chain spread across batches, which
+                        // `merge_converged`'s within-batch `resolve_final`
+                        // cannot collapse. `manta-engine` now guarantees
+                        // this closure is delivered for such a B
+                        // (`Track::holds_migrated_state`); forwarding the
+                        // parked state here is the other half, and without
+                        // it A's RST/`QRL?` would still die under B.
+                        self.migrate_or_discard_deferred(*track_id, survivor);
                         (Vec::new(), survivor)
                     }
                 };
@@ -1499,6 +1524,88 @@ impl Validator {
         // free that state. Park the annotations instead; `track_mut`
         // adopts them if the survivor does eventually speak.
         self.defer_annotations(survivor_track_id, carried);
+    }
+
+    /// Forwards whatever an EARLIER merge parked under `track_id` (see
+    /// `defer_annotations`/`defer_pending_beacons`) on to `survivor`, or
+    /// releases it when the identity ended with no successor.
+    ///
+    /// MAN-33 round 13 (Codex review on PR #159, "forward annotations
+    /// through silent merge intermediates"). `migrate_message_annotations`
+    /// and `migrate_or_discard_pending_beacons` both read `self.tracks`,
+    /// so neither one can see state parked for a track that never
+    /// materialized a `TrackState` -- which is exactly the state an
+    /// eventless merge intermediate holds. Chains decided inside ONE
+    /// `process_hops` batch are collapsed upstream by
+    /// `merge_converged`'s `resolve_final`; a chain spread across batches
+    /// cannot be, because `A -> B` is already delivered before `B -> C`
+    /// is even decided. `manta-engine` closes that half by delivering the
+    /// closure for a still-eventless `B` (`Track::holds_migrated_state`),
+    /// and this closes the other half by moving what `B` was holding.
+    ///
+    /// Removes only from the map, not from `deferred_annotation_order` --
+    /// the same asymmetry `track_mut`'s adoption path has, and `deferred_entry`
+    /// enforces the cap against the deque precisely so a stale id left
+    /// there still counts toward it.
+    fn migrate_or_discard_deferred(&mut self, track_id: u32, survivor: Option<u32>) {
+        let Some(parked) = self.deferred_annotations.remove(&track_id) else {
+            return;
+        };
+        match survivor {
+            Some(survivor) => self.deposit_migrated_state(survivor, parked),
+            None => {
+                // Same accounting an eviction with no survivor gets: the
+                // annotations were only ever decoration on a spot, the
+                // beacons were candidates that could have become one
+                // (ARCHITECTURE §8).
+                self.suppression_counts.pending_beacon_lost_to_eviction +=
+                    parked.pending_beacons.len() as u64;
+            }
+        }
+    }
+
+    /// Deposits already-migrated state onto `survivor_track_id`, live if
+    /// it has a `TrackState` and parked if it does not -- the same
+    /// two-way choice (and the same "never materialize a `TrackState` for
+    /// an eventless survivor", see `MAX_DEFERRED_ANNOTATIONS`) that
+    /// `migrate_message_annotations` and
+    /// `migrate_or_discard_pending_beacons` each make for their own half,
+    /// applied here to a `DeferredState` carrying both.
+    fn deposit_migrated_state(&mut self, survivor_track_id: u32, carried: DeferredState) {
+        let DeferredState {
+            annotations,
+            pending_beacons,
+        } = carried;
+        if annotations.rst.is_some() || annotations.qrl_query {
+            if let Some(survivor) = self.tracks.get_mut(&survivor_track_id) {
+                fold_annotations(
+                    &mut survivor.rst,
+                    &mut survivor.rst_ts,
+                    &mut survivor.qrl_query,
+                    annotations,
+                );
+            } else {
+                self.defer_annotations(survivor_track_id, annotations);
+            }
+        }
+        if pending_beacons.is_empty() {
+            return;
+        }
+        if self.tracks.contains_key(&survivor_track_id) {
+            let mut overflow = 0u64;
+            if let Some(survivor) = self.tracks.get_mut(&survivor_track_id) {
+                for pb in pending_beacons {
+                    if survivor.pending_beacons.len() >= MAX_PENDING_BEACONS {
+                        survivor.pending_beacons.remove(0);
+                        overflow += 1;
+                    }
+                    survivor.pending_beacons.push(pb);
+                }
+            }
+            self.suppression_counts.pending_beacon_overflow += overflow;
+        } else {
+            self.defer_pending_beacons(survivor_track_id, pending_beacons);
+        }
     }
 
     /// `self.tracks`' entry for `track_id`, created on first use. THE one
@@ -2978,6 +3085,119 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(
             !v.deferred_annotations.contains_key(&2),
             "an adopted parking slot must be released"
+        );
+    }
+
+    /// Codex review on PR #159, round 12 ("forward annotations through
+    /// silent merge intermediates"): `merge_converged`'s `resolve_final`
+    /// only collapses a chain decided inside ONE batch. Spread across
+    /// batches it cannot -- `1 -> 2` is already delivered before `2 -> 3`
+    /// is even decided -- so an eventless intermediate 2 holds track 1's
+    /// parked annotations and, before round 13, was never heard from
+    /// again. `manta-engine` now delivers 2's own closure anyway
+    /// (`Track::holds_migrated_state`) and this must forward what was
+    /// parked there on to 3, still without materializing a `TrackState`
+    /// for any eventless id.
+    #[test]
+    fn parked_annotations_follow_an_eventless_intermediates_own_closure() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        run(&transmission_events(1, &["QRL?", "TU", "5NN"], 0), &mut v);
+
+        // Batch 1: 1 -> 2, with 2 still eventless, so the annotations park.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        assert!(v.deferred_annotations.contains_key(&2));
+
+        // Batch 2: 2 -> 3, and 2 still never spoke for itself.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(3),
+            },
+        });
+        assert!(
+            !v.deferred_annotations.contains_key(&2),
+            "the intermediate's parking slot must be released by its own closure"
+        );
+        assert!(
+            v.deferred_annotations.contains_key(&3),
+            "what was parked under the intermediate must follow the redirect"
+        );
+        assert!(
+            v.tracks.is_empty(),
+            "forwarding must not materialize a `TrackState` for either \
+             eventless id, got {:?}",
+            v.tracks.keys().collect::<Vec<_>>()
+        );
+
+        // The chain's final survivor finally speaks, and spots.
+        seed_meta(&mut v, 3);
+        let spots = run(
+            &transmission_events(3, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+            &mut v,
+        );
+        assert_eq!(spots.len(), 1, "spots were {spots:?}");
+        assert_eq!(
+            spots[0].rst.as_deref(),
+            Some("599"),
+            "the RST must survive an eventless intermediate"
+        );
+        assert!(
+            spots[0].qrl_query,
+            "the QRL? flag must survive an eventless intermediate"
+        );
+    }
+
+    /// The other outcome of round 13's new closure: the identity parked
+    /// under an eventless survivor ENDS there (an eviction, or an
+    /// end-of-signal). What was parked has nowhere left to go, so it must
+    /// be released immediately and its beacons counted exactly as an
+    /// eviction with no survivor is (ARCHITECTURE §8) -- not left to age
+    /// out silently against `MAX_DEFERRED_ANNOTATIONS`.
+    #[test]
+    fn a_parked_identity_that_ends_releases_what_was_parked_for_it() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        assert!(
+            v.deferred_annotations.contains_key(&2),
+            "the loser's pending beacon must be parked for the survivor"
+        );
+        assert_eq!(v.suppression_counts().pending_beacon_lost_to_eviction, 0);
+
+        // Track 2 is evicted without ever having spoken.
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            },
+        });
+        assert!(spots.is_empty(), "spots were {spots:?}");
+        assert!(
+            !v.deferred_annotations.contains_key(&2),
+            "the parking slot must be released the moment its identity ends"
+        );
+        assert_eq!(
+            v.suppression_counts().pending_beacon_lost_to_eviction,
+            1,
+            "a parked beacon whose identity ended is lost, and is counted"
         );
     }
 

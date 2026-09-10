@@ -66,13 +66,30 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
 /// early, low-track-id candidate that was promoted and then merged/
 /// evicted/reached EOF before producing any real decoder event never gets
 /// selected over a later track that actually decoded something (round-5
-/// review finding). `None` means every event in `events` was a
-/// `TrackPromoted` (or `events` was empty, already handled by the caller
+/// review finding).
+///
+/// `TrackClosed` is excluded for the same reason (MAN-33 round 13): it is
+/// pure teardown bookkeeping, never decoder output, and since round 13 it
+/// can be emitted for a track that decoded nothing at all -- an eventless
+/// merge survivor a consumer parked per-identity state under, which is
+/// owed the closure that releases it (`Track::holds_migrated_state`).
+/// Counting one here would let such a track win the `min` and silently
+/// change which track `decode_samples` reports. For every track that DID
+/// emit, its own real events already carry the same id, so excluding its
+/// closure never changes the result.
+///
+/// `None` means every event in `events` was a `TrackPromoted`/
+/// `TrackClosed` (or `events` was empty, already handled by the caller
 /// before this is reached).
 fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
     events
         .iter()
-        .filter(|e| !matches!(e, DecoderEvent::TrackPromoted { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                DecoderEvent::TrackPromoted { .. } | DecoderEvent::TrackClosed { .. }
+            )
+        })
         .map(track::event_track_id)
         .min()
 }
