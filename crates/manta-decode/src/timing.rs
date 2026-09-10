@@ -23,7 +23,50 @@ const DRIFT_OFF_FRAC: f64 = 0.40;
 // large majority of those (11 -> 4 failures, reproduced across two
 // independent random seeds) with zero cases regressing pass -> fail.
 const CHAR_GAP_DITS: f32 = 1.6;
-const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
+// SPEC §9 decode.word_gap_dits, unmodified. Used **only** by
+// `flush_threshold_dits` below, whose Farnsworth scaling ratio is defined
+// against the spec's nominal char/word boundary scale. Kept separate from
+// the (deviated) classification threshold below so decoder.rs's 7-dit
+// safety-net flush stays byte-identical across MAN-2 -- see that method's
+// doc comment.
+const SPEC_WORD_GAP_DITS: f32 = 5.0;
+// SPEC §9 decode.word_gap_dits. **[DEVIATION]** SPEC §4.2 pins 5.0; lowered
+// to 4.5 here -- see docs/DECISIONS/2026-09-04-word-gap-threshold-fix.md
+// (MAN-2, manta#11: "RN XJ0Z" decoded "RNXJ0Z" -- characters correct, the
+// space between the two words dropped). Live-instrumented (an earlier
+// session that proposed 3.5 could not build this workspace and used a
+// static estimate instead; this value replaces it with measurements from a
+// real trace): on the ticket's own `dztx_p2pkwz_at_37wpm` repro
+// (`crates/manta-engine/tests/regression_word_gap_high_wpm.rs`), a real
+// 7-dit inter-word gap measured `u = 4.7059` -- below the nominal 5.0,
+// confirming the reported compression mechanism is real in at least one
+// realization. On the ticket's headline `rn_xj0z_at_39wpm` case, by
+// contrast, real word gaps measured `u = 5.19-5.82` (never compressed
+// below 5.0) while real char gaps measured `u = 2.06-2.41` -- so the
+// mechanism is real but inconsistent across realizations, not the uniform
+// 30-40 WPM effect the original static estimate assumed. 4.5 is the
+// smallest deviation from the SPEC nominal that classifies the one
+// confirmed compressed gap (4.7) as InterWord, chosen over a larger drop
+// (e.g. the originally-shipped 3.5) because lower values measurably cost
+// more at the slow end of the band: a 360-case low-WPM (8/10/12 WPM) probe
+// with 25% keying jitter (`crates/manta-testkit/src/keyer.rs`'s `Jitter`)
+// found spurious over-splitting (decoded word count > keyed word count) in
+// 80/360 cases at the nominal 5.0, rising to 95/360 at 4.5, 130/360 at 4.0,
+// and 190/360 at the originally-shipped 3.5 -- 3.5 was nearly 2.4x
+// nominal's over-splitting rate for a threshold that, per the trace
+// evidence above, only needed to move as far as 4.7 to fix the one
+// confirmed case. This also clears the plan's margin rule (`candidate >=
+// 1.25 * p95(u_char)`): the char-gap `u` populations measured above top out
+// around 2.4, so `1.25 * 2.4 = 3.0`, well under 4.5. A full 500-case x
+// 2-seed sweep (the plan's Phase 2) was not run -- the probe above is a
+// smaller, targeted check of the code-review-flagged low-WPM risk, not a
+// replacement for it -- so this value should be revisited if that sweep is
+// later run.
+const WORD_GAP_DITS: f32 = 4.5;
+// The three gap classes must stay ordered, or `classify` silently loses a
+// bucket. Compile-time, zero cost.
+const _: () = assert!(CHAR_GAP_DITS < WORD_GAP_DITS);
+const _: () = assert!(WORD_GAP_DITS <= SPEC_WORD_GAP_DITS);
 const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
                                // SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
                                // which is the practical floor for this constant: `ClusterPair::observe`
@@ -371,12 +414,12 @@ impl GapClassifier {
     /// (`DecodeConfig::flush_gap_dits`, nominally applied as
     /// `nominal_flush_dits * mu_dit_ms`) to stay Farnsworth-aware. SPEC §4.2
     /// pins the flush trigger at `7*mu_dit`, sized to sit above the *fixed*
-    /// `WORD_GAP_DITS = 5.0` nominal word-gap threshold -- comfortable
+    /// `SPEC_WORD_GAP_DITS = 5.0` nominal word-gap threshold -- comfortable
     /// headroom when `mu_dit` also represents the character/word spacing
     /// scale (the non-Farnsworth case). Under Farnsworth, `mu_dit` tracks
     /// only the (fast) content dit while real gaps are stretched by a much
     /// slower, decoupled spacing unit (SPEC §4.2's Farnsworth decoupling),
-    /// so a flush multiple still anchored to the fixed `WORD_GAP_DITS`
+    /// so a flush multiple still anchored to the fixed `SPEC_WORD_GAP_DITS`
     /// scale sits *below* real Farnsworth character gaps -- decoder.rs's
     /// safety net was firing on essentially every inter-character gap
     /// (confirmed via instrumented trace on the V10 vector:
@@ -405,12 +448,18 @@ impl GapClassifier {
     /// makes the safety net slower to fire, never incorrect -- unlike
     /// `classify()`'s own word/char decision, which must stay conservative
     /// since it's what the golden vectors' character stream depends on.
+    ///
+    /// MAN-2: divides by `SPEC_WORD_GAP_DITS` (the unmodified SPEC nominal),
+    /// not `WORD_GAP_DITS` (the lowered classification threshold) -- the two
+    /// were split specifically so that tuning the word/char classification
+    /// boundary cannot silently rescale this unrelated safety-net flush
+    /// multiple. See `WORD_GAP_DITS`'s doc comment.
     pub fn flush_threshold_dits(&self, nominal_flush_dits: f32) -> f32 {
         let farnsworth_shaped = self.pair.ready()
             && self.pair.confirmed()
             && self.pair.hi / self.pair.lo >= FARNS_MIN_RATIO;
         if farnsworth_shaped {
-            let ratio = self.pair.boundary() / WORD_GAP_DITS;
+            let ratio = self.pair.boundary() / SPEC_WORD_GAP_DITS;
             (nominal_flush_dits * ratio).max(nominal_flush_dits)
         } else {
             nominal_flush_dits
@@ -525,15 +574,57 @@ mod tests {
     #[test]
     fn gap_classification_nominal() {
         // CHAR_GAP_DITS boundary is 1.6, not SPEC §4.2's nominal 2.0 --
-        // see docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md.
+        // see docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md. WORD_GAP_DITS
+        // boundary is 4.5, not SPEC §4.2's nominal 5.0 -- see
+        // docs/DECISIONS/2026-09-04-word-gap-threshold-fix.md (MAN-2).
         let mut g = GapClassifier::new();
         let mu = 60.0;
         assert_eq!(g.classify(60.0, mu), GapClass::InterElement); // 1 dit
         assert_eq!(g.classify(180.0, mu), GapClass::InterChar); // 3 dits
         assert_eq!(g.classify(420.0, mu), GapClass::InterWord); // 7 dits
         assert_eq!(g.classify(95.0, mu), GapClass::InterElement); // < 1.6
-        assert_eq!(g.classify(299.0, mu), GapClass::InterChar); // < 5.0
-        assert_eq!(g.classify(300.0, mu), GapClass::InterWord); // >= 5.0
+        assert_eq!(g.classify(269.0, mu), GapClass::InterChar); // < 4.5
+        assert_eq!(g.classify(270.0, mu), GapClass::InterWord); // >= 4.5
+    }
+
+    #[test]
+    fn compressed_word_gap_at_high_wpm_is_inter_word() {
+        // MAN-2 (manta#11): "RN XJ0Z" decoded "RNXJ0Z" -- characters
+        // correct, the inter-word space dropped. Live-instrumented (raw
+        // Demod -> GapClassifier trace) on the ticket's own
+        // dztx_p2pkwz_at_37wpm repro
+        // (crates/manta-engine/tests/regression_word_gap_high_wpm.rs): a
+        // real 7-dit inter-word gap measured u=4.7059, below the SPEC §4.2
+        // nominal 5.0 -- confirming Demod's hysteresis+debounce (SPEC §3.3)
+        // does compress gap_ms/mu_dit_ms enough, in at least this
+        // realization, to misclassify a real word boundary. Real char gaps
+        // in the same case family measured u=2.06-2.41. WORD_GAP_DITS=4.5
+        // sits between the two: the measured char-gap value stays
+        // InterChar, the measured word-gap value becomes InterWord.
+        let mut g = GapClassifier::new();
+        let mu = 50.0;
+        assert_eq!(g.classify(2.06 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(4.7059 * mu, mu), GapClass::InterWord);
+    }
+
+    #[test]
+    fn lowering_the_word_threshold_does_not_move_the_flush_threshold() {
+        // MAN-2 review guard: `flush_threshold_dits` used to also divide by
+        // WORD_GAP_DITS, so lowering the classification threshold would
+        // have silently scaled decoder.rs's 7-dit safety-net flush up by
+        // the same factor -- an unrelated timing change the ticket
+        // explicitly forbids bundling. The flush path is pinned to the
+        // SPEC §4.2 nominal 5.0 via the new SPEC_WORD_GAP_DITS constant,
+        // independent of WORD_GAP_DITS's value.
+        let mut g = GapClassifier::new();
+        let mu = 48.0;
+        for _ in 0..5 {
+            g.classify(6.0 * mu, mu);
+            g.classify(14.0 * mu, mu);
+        }
+        // boundary ~= sqrt(6*14) = 9.165 dits; 7.0 * 9.165/5.0 = 12.83
+        let got = g.flush_threshold_dits(7.0);
+        assert!((got - 12.83).abs() < 0.15, "flush threshold moved: {got}");
     }
 
     #[test]

@@ -567,4 +567,72 @@ mod tests {
         events.extend(dec.finish());
         assert_eq!(events_to_text(&events), "TTTTT");
     }
+
+    /// Band-limited variant of `rect_envelope`: a box-car moving average of
+    /// `ramp_hops` turns every ideal edge into a linear ramp of that width,
+    /// which is what the real channelizer's ~93.75 Hz channel bandwidth plus
+    /// the testkit keyer's 5 ms raised-cosine edges produce. `rect_envelope`'s
+    /// instantaneous edges give Demod's hysteresis (SPEC §3.3) nothing to lag
+    /// on, which is exactly why the existing 25 WPM tests above never saw
+    /// MAN-2 (manta#11).
+    fn ramped_envelope(text: &str, dit_hops: u32, ramp_hops: usize) -> Vec<f32> {
+        let raw = rect_envelope(text, dit_hops);
+        let mut out = Vec::with_capacity(raw.len());
+        for i in 0..raw.len() {
+            let lo = i.saturating_sub(ramp_hops - 1);
+            let win = &raw[lo..=i];
+            out.push(win.iter().sum::<f32>() / win.len() as f32);
+        }
+        out
+    }
+
+    fn decode_ramped(text: &str, dit_hops: u32, ramp_hops: usize) -> String {
+        let env = ramped_envelope(text, dit_hops, ramp_hops);
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        events_to_text(&events)
+    }
+
+    #[test]
+    fn word_gap_survives_at_high_wpm() {
+        // MAN-2 (manta#11): "RN XJ0Z" decoded "RNXJ0Z". dit_hops=13 => dit =
+        // 34.67 ms => ~34.6 WPM, inside the ticket's 30-40 WPM band. With
+        // ramp_hops=6 (16 ms, ~ the measured 15-20 ms Demod overshoot
+        // documented in docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md)
+        // marks measure long and gaps measure short, so a true 7-dit word
+        // gap compresses toward WORD_GAP_DITS while true 3-dit character
+        // gaps stay comfortably over CHAR_GAP_DITS=1.6 -- chars decode
+        // correctly and only the space is at risk, precisely the reported
+        // symptom.
+        //
+        // Calibration rule applied (per the plan): measured live at
+        // ramp_hops=6 on the pre-fix tree (WORD_GAP_DITS=5.0), this decodes
+        // to "CQCQDE TEST RN XJ0Z" -- the leading "CQ CQ DE" fuses, exactly
+        // the reported defect, though confined to the *leading* words
+        // rather than the trailing "RN XJ0Z" the original weak
+        // `ends_with("RN XJ0Z")` assertion checked (that assertion is
+        // vacuous: the tail is already correct pre-fix at ramp_hops 6, 7,
+        // and 8, so it never went red). Asserting full-string equality
+        // instead is red pre-fix and green post-fix at WORD_GAP_DITS=4.5,
+        // both measured live, so ramp_hops=6 is kept and the assertion is
+        // strengthened rather than raising ramp_hops or deleting the test.
+        let text = decode_ramped("CQ CQ DE TEST RN XJ0Z", 13, 6);
+        assert_eq!(
+            text, "CQ CQ DE TEST RN XJ0Z",
+            "inter-word space dropped at ~34.6 WPM (MAN-2), got {text:?}"
+        );
+    }
+
+    #[test]
+    fn word_gap_survives_at_moderate_wpm_control() {
+        // Control: the same text at 25 WPM (dit_hops=18) must stay green
+        // both before and after the fix -- it pins that the fix isn't just
+        // moving the failure to a different speed.
+        let text = decode_ramped("CQ CQ DE TEST RN XJ0Z", 18, 6);
+        assert!(text.ends_with("RN XJ0Z"), "got {text:?}");
+    }
 }
