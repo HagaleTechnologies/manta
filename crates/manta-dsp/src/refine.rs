@@ -1,8 +1,21 @@
 //! Per-track narrowband refinement: an optional, per-hop channel derotator
 //! and lowpass that sharpens a track's amplitude estimate using its
 //! fractional centroid offset. SPEC v2 §3. Enabled when `decode.refine_bw_hz`
-//! is greater than zero (default 0, meaning off); the engine call site is
-//! out of scope for this module (deferred to MAN-168).
+//! is greater than zero (default 0, meaning off).
+//!
+//! The engine call site (MAN-168, `manta-engine::track`) uses
+//! [`GROUP_DELAY_HOPS`] to size its convergence window: `TAPS` (equal to
+//! `2*GROUP_DELAY_HOPS + 1`) real hops are needed before the FIR's 11-tap
+//! window is no longer partly zero-padded from a reset. It does NOT use
+//! this constant to
+//! pair a refined amplitude with an earlier `sample_ts`, despite that
+//! being this constant's original purpose. A `GROUP_DELAY_HOPS`-delayed
+//! pairing on top of the convergence gate is provably impossible to do
+//! without either skipping hops or duplicating an observation, given an
+//! interface that must emit exactly one amplitude per input hop. See the
+//! call site's own doc comment, and MAN-194, for the full reasoning and
+//! the real fix. The engine currently reports each hop's own `sample_ts`
+//! with no delay compensation instead.
 
 use num_complex::Complex32;
 
@@ -13,6 +26,14 @@ const HOP_RATE_HZ: f64 = 375.0;
 const CHANNEL_SPACING_HZ: f64 = 93.75;
 /// SPEC v2 §3: 11-tap FIR.
 const TAPS: usize = 11;
+/// Group delay of the symmetric `TAPS`-tap FIR, in hops: `Refiner::push`'s
+/// output at hop `t` corresponds to the input sample from `t -
+/// GROUP_DELAY_HOPS` hops ago, not the current hop. Public so a caller
+/// (MAN-168's `manta-engine` call site) can derive its FIR-convergence
+/// window (`2*GROUP_DELAY_HOPS + 1 == TAPS`) -- see the module doc
+/// comment for why that caller does NOT use this for delayed `sample_ts`
+/// pairing, despite the name.
+pub const GROUP_DELAY_HOPS: usize = (TAPS - 1) / 2;
 
 fn sinc(x: f64) -> f64 {
     if x.abs() < 1e-12 {

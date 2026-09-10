@@ -297,10 +297,13 @@ impl Lifecycle {
     }
 }
 
-use manta_decode::decoder::{DecodeConfig, TrackDecoder};
+use manta_decode::decoder::{DecodeConfig, Engine, TrackDecoder};
 use manta_decode::events::{ClosureKind, DecoderEvent};
-use manta_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
+use manta_dsp::channelizer::{
+    interpolate_offset, odd_channel_sign_correction, power_db, HopOutput,
+};
 use manta_dsp::floor::{FloorBank, Gate};
+use manta_dsp::refine::{Refiner, GROUP_DELAY_HOPS};
 use std::collections::BTreeMap;
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
@@ -331,10 +334,21 @@ pub(crate) struct Track {
     /// The track's leased decoder, allocated on CANDIDATE -> ACTIVE
     /// promotion (SPEC §2.4/§5); `None` before promotion.
     decoder: Option<TrackDecoder>,
-    /// `(magnitude, sample_ts)` queued this hop-batch by `step_hop`,
-    /// drained once per `process_hops` call by `drain_pool` (ARCHITECTURE
-    /// §10's decoder pool).
-    pending: Vec<(f32, u64)>,
+    /// `(amplitude, raw_power, spectral_ref_power, sample_ts)` queued this
+    /// hop-batch by `step_hop`, drained once per `process_hops` call by
+    /// `drain_pool` (ARCHITECTURE §10's decoder pool). `raw_power` is kept
+    /// separate from `amplitude` (rather than derived as `amplitude *
+    /// amplitude`) so the noise tracker always sees the tracked channel's
+    /// real, full-bandwidth power even when `amplitude` is a narrowband-
+    /// refined value (Codex review, PR #178) -- see `decoder_input`'s doc
+    /// comment. `spectral_ref_power` (SPEC v2 §2.2's min-of-six-neighbors
+    /// reference, linear) is computed by `step_hop` from `FloorBank`, not
+    /// `decoder_input` (a `Track` method with no access to the floor bank,
+    /// a `TrackManager` field) -- always `Some` since `FloorBank` has a
+    /// real value for every channel from construction onward (Codex
+    /// review, PR #178: this was hard-coded `None` before, so
+    /// `NoiseTracker`'s spectral-discounting branch never activated).
+    pending: Vec<(f32, f32, Option<f32>, u64)>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -344,6 +358,29 @@ pub(crate) struct Track {
     /// (MAN-19 review round 1). `TrackClosed` emission checks this, not
     /// decoder presence.
     has_emitted: bool,
+    /// MAN-168 (SPEC v2 §3): this track's narrowband amplitude refiner,
+    /// lazily constructed the first time `decoder_input` runs with
+    /// `refine_bw_hz > 0.0`. `None` when refinement is disabled (the
+    /// default) or not yet constructed.
+    refiner: Option<Refiner>,
+    /// The integer owned channel `refiner` was last fed from. A change
+    /// here -- NOT a fractional `center` EMA nudge -- is what resets the
+    /// refiner's FIR history/phase accumulator (SPEC v2 §3: "a change of
+    /// c resets the FIR history"). Using the integer channel as the reset
+    /// trigger, rather than every `center` update, keeps the reset-caused
+    /// ramp-in transient (the FIR needs `GROUP_DELAY_HOPS * 2 + 1` hops to
+    /// refill) rare -- it only fires on a real max-power-channel switch,
+    /// not on continuous sub-channel drift.
+    refiner_channel: Option<usize>,
+    /// Real (non-zero-padded) hops fed to `refiner` since its last reset:
+    /// `decoder_input` reports the raw (unrefined) magnitude, not
+    /// `refiner`'s own output, until this reaches `TAPS` (the FIR's full
+    /// window is real) -- see `decoder_input`'s doc comment for why a
+    /// GROUP_DELAY_HOPS-delayed *pairing* on top of that convergence gate
+    /// was tried and reverted (Codex review, PR #178, three consecutive
+    /// rounds surfacing a new duplication/fabrication shape each time; see
+    /// MAN-194). Reset to 0 alongside `refiner.reset()`.
+    refiner_hops_since_reset: u64,
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -372,7 +409,117 @@ impl Track {
             decoder: None,
             pending: Vec::new(),
             has_emitted: false,
+            refiner: None,
+            refiner_channel: None,
+            refiner_hops_since_reset: 0,
         }
+    }
+
+    /// The amplitude to feed this hop's decoder push, the RAW (unrefined)
+    /// power of the detector's owned channel `k` for the noise tracker,
+    /// and the `sample_ts` the amplitude corresponds to (MAN-168, SPEC v2
+    /// §3). Falls back to `(raw_amp, raw_power, sample_ts)` from the same
+    /// channel when refinement is disabled (`refine_bw_hz <= 0.0`, the
+    /// default) -- so `raw_power` always matches SPEC v2 §2.1's "tracked
+    /// channel" regardless of whether refinement is active, which is the
+    /// point: `raw_power` must NOT come from the narrowband-filtered
+    /// amplitude. `TrackDecoder::push_hop`'s calibrated `NoiseTracker`
+    /// expects the full-bandwidth channel's power; the refiner's 30 Hz
+    /// (vs the channel's ~93.75 Hz) passband integrates substantially
+    /// less noise power by design (that's what makes the SIGNAL amplitude
+    /// more accurate) -- Codex review measured the refined amplitude's
+    /// squared power reading ~8.6 dB low relative to `hop.power[k]`, and
+    /// `push_envelope` (the old, amplitude-only call this replaced)
+    /// reconstructed power as `amp * amp`, silently feeding that skewed,
+    /// temporally-correlated series into noise calibration whenever
+    /// refinement was enabled.
+    ///
+    /// Reports each hop's OWN `sample_ts` -- NOT a `GROUP_DELAY_HOPS`
+    /// -delayed pairing with `refiner`'s output, despite `refine.rs`'s
+    /// original doc comment describing that as the intended design.
+    /// Three consecutive rounds of Codex review on PR #178 each found a
+    /// new bug in an attempted delayed-pairing scheme (a duplicate/
+    /// regressed timestamp; a duplicated single amplitude replayed across
+    /// several hops; then the SAME warm-up observations reported a SECOND
+    /// time once the delay ring filled) -- and it's provable, not just
+    /// hard to get right: with an interface that must emit exactly one
+    /// `(amp, raw_power, ts)` triple per input hop (this codebase has
+    /// already learned the hard way that silently skipping a hop shortens
+    /// the following space run and collapses character boundaries), a
+    /// stream that starts at zero delay can never transition to
+    /// `GROUP_DELAY_HOPS` hops of delay later without either skipping
+    /// `GROUP_DELAY_HOPS` hops (to let the delayed index fall behind) or
+    /// reporting some hop's observation twice. Neither is acceptable, so
+    /// this reports amplitude with NO delay compensation instead: a
+    /// constant, `GROUP_DELAY_HOPS`-hop (~13ms) systematic timestamp
+    /// offset from true wall-clock time, which does not affect the
+    /// RELATIVE durations (dit/dah/space ratios) `HsmmDecoder`/`Demod`
+    /// actually decode from, unlike either alternative. See MAN-194 for
+    /// the real fix: a burst-capable `decoder_input` (returning
+    /// `Vec<(f32, f32, u64)>`) can emit zero or several triples for one
+    /// input hop, which is what a correct drain/prime protocol actually
+    /// requires.
+    fn decoder_input(
+        &mut self,
+        k: usize,
+        hop: &HopOutput,
+        sample_ts: u64,
+        refine_bw_hz: f32,
+    ) -> (f32, f32, u64) {
+        let raw_power = hop.power[k];
+        if refine_bw_hz <= 0.0 {
+            return (raw_power.sqrt(), raw_power, sample_ts);
+        }
+        // SPEC v2 §3 requires `c = round(c_f)`: refine the CENTROID
+        // channel, not `k` (the instantaneous max-power channel used for
+        // detector ownership/gating elsewhere). `k` can flicker on noise
+        // or a competing near-edge channel even while the true centroid
+        // stays put; each flicker would otherwise reset the FIR and
+        // collapse its output to a single tap (Codex review, PR #161's
+        // MAN-168 wiring).
+        let c = self.center.round() as usize;
+        let delta = (self.center - c as f64) as f32;
+        let refiner = self
+            .refiner
+            .get_or_insert_with(|| Refiner::new(refine_bw_hz, delta));
+        if self.refiner_channel != Some(c) {
+            refiner.reset();
+            self.refiner_channel = Some(c);
+            self.refiner_hops_since_reset = 0;
+        }
+        refiner.set_delta(delta);
+        // The channelizer's rotation step leaves a checkerboard sign
+        // artifact on odd channels at odd hops (see
+        // `channelizer::odd_channel_sign_correction`'s doc comment); a
+        // phase-sensitive consumer like this derotating/filtering refiner
+        // must correct it before the sample reaches `Refiner::push`, or an
+        // odd-channel track's refined amplitude self-cancels (measured
+        // ~39 dB of spurious attenuation before this correction was
+        // applied here). Always feed the refiner, even during warm-up
+        // below -- its FIR history and phase accumulator need every hop
+        // to converge, regardless of whether THIS hop's output is used.
+        let corrected = hop.x[c] * odd_channel_sign_correction(hop.m, c);
+        let refined_amp = refiner.push(corrected);
+        self.refiner_hops_since_reset += 1;
+
+        // `TAPS == 2*GROUP_DELAY_HOPS + 1` for this odd-length symmetric
+        // FIR: right after a reset, its 11-tap window is still partly
+        // zero-padded, and `refiner.push`'s output is a ramp-in transient,
+        // not a real observation -- measured ~40% below steady-state
+        // amplitude on a constant tone partway through convergence, a dip
+        // that can flip a legacy/HSMM decision, and (before that) SPEC v2
+        // §3 requires reset loss to report neutral evidence rather than
+        // the transient's spurious negative-LLR swing. Report the raw
+        // (unrefined) magnitude -- exactly what a disabled refiner would
+        // report, already-trusted real evidence -- until the FULL window
+        // is real.
+        let full_history_hops = 2 * GROUP_DELAY_HOPS as u64 + 1; // == TAPS
+        let amp = if self.refiner_hops_since_reset >= full_history_hops {
+            refined_amp
+        } else {
+            hop.power[c].sqrt()
+        };
+        (amp, raw_power, sample_ts)
     }
 
     /// Drain this track's queued `pending` samples through its decoder,
@@ -394,7 +541,9 @@ impl Track {
         let pending = std::mem::take(&mut self.pending);
         let mut events: Vec<DecoderEvent> = pending
             .into_iter()
-            .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+            .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
+            })
             .collect();
         events.extend(decoder.finish());
         events
@@ -418,7 +567,9 @@ impl Track {
         let pending = std::mem::take(&mut self.pending);
         let mut events: Vec<DecoderEvent> = pending
             .into_iter()
-            .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+            .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
+            })
             .collect();
         events.extend(decoder.finish_speed_only());
         events
@@ -550,6 +701,38 @@ impl TrackManager {
         self.owner_of.len()
     }
 
+    /// SPEC v2 §2.2's min-of-six-neighbors spectral reference for a
+    /// track's centroid channel, converted from dB to linear power (the
+    /// unit `NoiseTracker::push`'s `spectral_ref_power` expects). Always
+    /// `Some` since `FloorBank::spectral_reference_db` has a real value
+    /// for every channel from construction onward. A free function (not
+    /// a `TrackManager` method) taking `&FloorBank` directly, so call
+    /// sites that already hold a mutable borrow of one `self.tracks`
+    /// entry (via `self.tracks.get_mut`) can still call this with
+    /// `&self.floor` -- a method call would instead borrow all of `self`,
+    /// conflicting with that live `self.tracks` borrow.
+    ///
+    /// Centered on the rounded CENTROID channel (matching
+    /// `decoder_input`'s own `c = round(c_f)`), NOT `k` (Codex review,
+    /// PR #178 round 4): `k` is the instantaneous max-power channel and
+    /// can flicker on noise/QRM even while the true centroid stays put --
+    /// the guard band this reference defines must stay centered on where
+    /// the track actually is, not wherever `k` momentarily points. A
+    /// populated-neighbor probe measured -50 dB at `k` vs the correct
+    /// -90 dB at the centroid when the two differed.
+    ///
+    /// Callers must only invoke this where the result will actually be
+    /// consumed (a decoder-present, non-`Legacy`-engine push) -- Codex
+    /// review, PR #178 round 4: computing this unconditionally for every
+    /// open track on every hop (including `Legacy`, which never reads
+    /// `spectral_ref_power`, and CANDIDATE tracks with no decoder to feed
+    /// it to) wasted ~225k-900k transcendental evaluations/sec at
+    /// 300-1200 tracks.
+    fn spectral_ref_power(floor: &FloorBank, center: f64) -> Option<f32> {
+        let c = center.round() as usize;
+        Some(10f64.powf(floor.spectral_reference_db(c) / 10.0) as f32)
+    }
+
     /// Issue #26: per-`CloseReason` counts of every track closed so far
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
@@ -612,6 +795,21 @@ impl TrackManager {
 
         let past_warmup = self.hop_counter >= self.cfg.warmup_hops;
         self.hop_counter += 1;
+        // MAN-168 (SPEC v2 §3): read once per hop-batch, not per track --
+        // it doesn't vary per track and `Track::decoder_input` needs it
+        // without also needing a borrow of `self.decode_cfg` alongside
+        // `self.tracks.get_mut(&id)`.
+        let refine_bw_hz = self.decode_cfg.refine_bw_hz;
+        // Codex review, PR #178 round 4: `Engine::Legacy` (the default)
+        // ignores `spectral_ref_power` entirely (`push_envelope_legacy`
+        // never reads it), and a CANDIDATE track (no decoder yet) never
+        // queues it either -- computing `FloorBank::spectral_reference_db`
+        // (a six-neighbor scan plus `log10`/`powf`) unconditionally for
+        // every open track on every hop wasted ~225k-900k transcendental
+        // evaluations/sec at 300-1200 tracks for callers that can never
+        // consume the result. Gated at each push site below (Promoted /
+        // decoder-present) instead of computed here for every track.
+        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy);
 
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
@@ -656,7 +854,11 @@ impl TrackManager {
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
-                    track.pending.push((hop.power[k].sqrt(), sample_ts));
+                    let (amp, raw_power, ts) = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                    let spectral_ref_power = compute_spectral_ref_power
+                        .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                        .flatten();
+                    track.pending.push((amp, raw_power, spectral_ref_power, ts));
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
@@ -696,7 +898,12 @@ impl TrackManager {
                         if let Some(decoder) = track.decoder.as_mut() {
                             decoder.set_freq_hz(freq_hz);
                         }
-                        track.pending.push((hop.power[k].sqrt(), sample_ts));
+                        let (amp, raw_power, ts) =
+                            track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                        let spectral_ref_power = compute_spectral_ref_power
+                            .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                            .flatten();
+                        track.pending.push((amp, raw_power, spectral_ref_power, ts));
                     }
                 }
             }
@@ -1105,7 +1312,9 @@ impl TrackManager {
             .flat_map_iter(|(decoder, pending)| {
                 pending
                     .into_iter()
-                    .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+                    .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                        decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1215,6 +1424,243 @@ mod tests {
     }
 
     #[test]
+    fn decoder_input_bypasses_the_refiner_when_disabled() {
+        // MAN-168: refine_bw_hz <= 0.0 (the default) must fall back to the
+        // raw owned-channel magnitude exactly as before, and never
+        // construct a Refiner at all.
+        let mut track = Track::new(1, 5, &cfg());
+        let h = hop_with_x(0, vec![num_complex::Complex32::new(3.0, 4.0); 8]); // |z|=5
+        let (amp, raw_power, ts) = track.decoder_input(5, &h, 1000, 0.0);
+        assert_eq!(amp, 5.0);
+        assert_eq!(raw_power, 25.0);
+        assert_eq!(ts, 1000);
+        assert!(track.refiner.is_none());
+    }
+
+    #[test]
+    fn decoder_input_does_not_reset_the_refiner_on_center_drift_alone() {
+        // MAN-168 (Codex review on PR #161's MAN-168 ticket design):
+        // resetting must be keyed on the INTEGER owned channel changing,
+        // not the continuous `center` EMA -- otherwise every hop's
+        // fractional drift would retrigger the FIR ramp-in transient.
+        let mut track = Track::new(1, 5, &cfg());
+        let h = hop_with_x(0, vec![num_complex::Complex32::new(1.0, 0.0); 8]);
+        track.decoder_input(5, &h, 0, 30.0);
+        assert_eq!(track.refiner_hops_since_reset, 1);
+        // Drift center within the same integer channel k=5 across several
+        // more hops -- the counter must keep GROWING (never cleared by a
+        // spurious reset) since `refiner_channel` stays `Some(5)`.
+        for i in 1..4u64 {
+            track.center += 0.1;
+            track.decoder_input(5, &h, i * 512, 30.0);
+        }
+        assert_eq!(
+            track.refiner_hops_since_reset, 4,
+            "center drift within the same channel must not reset the hop counter"
+        );
+        assert_eq!(track.refiner_channel, Some(5));
+    }
+
+    #[test]
+    fn decoder_input_resets_on_a_real_channel_change() {
+        // A genuine centroid-channel switch (round(center) changes) must
+        // reset the refiner's FIR/phase and hop counter, per SPEC v2 §3.
+        // `k` (the raw ownership channel) is passed but no longer drives
+        // refiner selection at all -- SPEC v2 §3 requires `c = round(c_f)`,
+        // so only `center` crossing a rounding boundary can trigger this.
+        let mut track = Track::new(1, 5, &cfg());
+        let h = hop_with_x(0, vec![num_complex::Complex32::new(1.0, 0.0); 8]);
+        track.decoder_input(5, &h, 0, 30.0);
+        track.decoder_input(5, &h, 512, 30.0);
+        assert_eq!(track.refiner_hops_since_reset, 2);
+        track.center = 6.0; // centroid crosses the rounding boundary 5 -> 6
+        track.decoder_input(5, &h, 1024, 30.0);
+        assert_eq!(
+            track.refiner_hops_since_reset, 1,
+            "a real centroid-channel change must reset the hop counter, not just increment it"
+        );
+        assert_eq!(track.refiner_channel, Some(6));
+    }
+
+    #[test]
+    fn decoder_input_reports_each_hops_own_sample_ts_with_no_delay_compensation() {
+        // Codex review, PR #178 (three consecutive rounds, each surfacing
+        // a new duplication/fabrication shape in an attempted
+        // GROUP_DELAY_HOPS-delayed pairing scheme -- see decoder_input's
+        // doc comment): decoder_input reports each hop's OWN sample_ts,
+        // never an earlier one, regardless of convergence state.
+        let mut track = Track::new(1, 5, &cfg());
+        let h = hop_with_x(0, vec![num_complex::Complex32::new(1.0, 0.0); 8]);
+        for i in 0..(GROUP_DELAY_HOPS as u64 + 2) {
+            let sample_ts = 1000 + i * 512;
+            let (_, _, ts) = track.decoder_input(5, &h, sample_ts, 30.0);
+            assert_eq!(
+                ts, sample_ts,
+                "hop {i} must report its OWN sample_ts, not an earlier hop's"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_input_reports_raw_magnitude_during_warm_up_not_the_fir_ramp_in() {
+        // Codex review: a freshly-reset FIR's ramp-in output is not a real
+        // observation -- feeding it as evidence produced five spurious
+        // negative-LLR hops on a genuinely steady tone, violating SPEC v2
+        // §3's requirement that reset loss report neutral (`llr = 0`)
+        // evidence. During warm-up decoder_input must report the RAW
+        // magnitude (matching the disabled-refiner fallback), not
+        // `Refiner::push`'s transient output.
+        let mut track = Track::new(1, 5, &cfg());
+        let raw = num_complex::Complex32::new(3.0, 4.0); // |raw| = 5
+        let h = hop_with_x(0, vec![raw; 8]);
+        for i in 0..GROUP_DELAY_HOPS as u64 {
+            let (amp, _, _) = track.decoder_input(5, &h, i * 512, 30.0);
+            assert_eq!(
+                amp, 5.0,
+                "warm-up hop {i} must report the raw magnitude, not a FIR ramp-in transient"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_input_warm_up_does_not_replay_the_first_observation_as_later_hops() {
+        // Codex review, PR #178: an earlier version of the warm-up fix
+        // reported the RING's stored (oldest/front) raw magnitude on
+        // every warm-up call, rather than each hop's OWN fresh
+        // raw_amp -- since the front entry never advances until the ring
+        // starts popping, that replayed hop 0's single observation
+        // unchanged across every warm-up hop. A loud sample right after a
+        // reset, followed by pure noise, would then fabricate a
+        // synthetic sustained mark the real signal never produced --
+        // `Demod`/HSMM evidence record every push's amplitude, not just
+        // distinct timestamps, so holding the timestamp flat (a
+        // deliberate, separate, and still-correct part of this fix) does
+        // NOT prevent that fabrication on its own. Drive a changing
+        // envelope (loud, then near-silent) through warm-up and confirm
+        // each hop's reported amplitude tracks its OWN input.
+        let mut track = Track::new(1, 5, &cfg());
+        let loud = num_complex::Complex32::new(3.0, 4.0); // |loud| = 5
+        let quiet = num_complex::Complex32::new(0.03, 0.04); // |quiet| = 0.05
+        let h_loud = hop_with_x(0, vec![loud; 8]);
+        let h_quiet = hop_with_x(0, vec![quiet; 8]);
+
+        let (amp0, _, _) = track.decoder_input(5, &h_loud, 0, 30.0);
+        assert_eq!(amp0, 5.0, "hop 0's own loud observation must be reported");
+
+        for i in 1..GROUP_DELAY_HOPS as u64 {
+            let (amp, _, _) = track.decoder_input(5, &h_quiet, i * 512, 30.0);
+            assert_eq!(
+                amp, 0.05,
+                "warm-up hop {i} must report ITS OWN (quiet) observation, not hop 0's loud one \
+                 replayed"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_input_withholds_refined_amp_until_the_fir_is_fully_converged() {
+        // Codex review, PR #178: forwarding refined_amp as soon as the
+        // delay-pairing ring fills (GROUP_DELAY_HOPS+1 real hops) still
+        // has GROUP_DELAY_HOPS zero-padded taps in the 11-tap window --
+        // measured ~40% below steady-state amplitude on a constant tone.
+        // Full convergence needs TAPS == 2*GROUP_DELAY_HOPS+1 real hops.
+        // Verify: every reported amp up through hop `full_history_hops`
+        // exactly matches the raw magnitude (never the FIR's own,
+        // different, ramp-in output), and by then the ring has been
+        // popping (delay-pairing already active) for several hops.
+        let mut track = Track::new(1, 5, &cfg());
+        let raw = num_complex::Complex32::new(3.0, 4.0); // |raw| = 5
+        let h = hop_with_x(0, vec![raw; 8]);
+        let full_history_hops = 2 * GROUP_DELAY_HOPS as u64 + 1;
+        for i in 0..full_history_hops {
+            let (amp, _, _) = track.decoder_input(5, &h, i * 512, 30.0);
+            assert_eq!(
+                amp, 5.0,
+                "hop {i} (before full convergence at hop {full_history_hops}) must still report \
+                 the raw magnitude, not a partially-converged FIR output"
+            );
+        }
+        // One hop past full convergence: refined_amp is now safe to
+        // forward. A constant real input at an even channel/hop (no odd
+        // sign-correction flips) converges to something close to the raw
+        // magnitude too, so assert the amplitude is finite and no longer
+        // artificially forced to exactly the raw value by warm-up logic
+        // -- i.e. confirm the code path actually switched, not just that
+        // the numbers happen to coincide.
+        let (converged_amp, _, _) = track.decoder_input(5, &h, full_history_hops * 512, 30.0);
+        assert!(
+            converged_amp.is_finite() && converged_amp > 0.0,
+            "post-convergence amplitude must be a real, finite, positive refined value"
+        );
+    }
+
+    #[test]
+    fn decoder_input_raw_power_uses_the_owned_channel_k_even_when_it_differs_from_the_centroid() {
+        // Codex review, PR #178: TrackDecoder's calibrated NoiseTracker
+        // needs the tracked channel's real, full-bandwidth power (SPEC v2
+        // §2.1), not `amp * amp` -- the refiner's narrowband output
+        // integrates substantially less noise power by design (measured
+        // ~8.6 dB low), so reconstructing power from it (what the old
+        // push_envelope-based call site did) silently skewed noise
+        // calibration whenever refinement was enabled. The detector's
+        // owned/gating channel `k` and the refiner's centroid-rounded
+        // channel `c` can also legitimately differ (the whole point of
+        // the centroid-selection fix earlier in this file's history), so
+        // this must come from `k` specifically, never from `c` or from
+        // any refined value, confirmed here with `k` and `c` set to
+        // channels with clearly different powers.
+        let mut track = Track::new(1, 5, &cfg()); // center stays 5.0 -> c=5
+        let mut samples = vec![num_complex::Complex32::new(1.0, 0.0); 8];
+        samples[5] = num_complex::Complex32::new(3.0, 4.0); // channel c=5: power 25
+        samples[6] = num_complex::Complex32::new(1.0, 0.0); // channel k=6: power 1
+        let h = hop_with_x(0, samples);
+        // k=6 passed explicitly, differing from center's rounded channel c=5.
+        let (_, raw_power, _) = track.decoder_input(6, &h, 0, 30.0);
+        assert_eq!(
+            raw_power, 1.0,
+            "raw_power must come from k=6 (power 1), not c=5 (power 25) or any refined value"
+        );
+    }
+
+    #[test]
+    fn decoder_input_applies_the_odd_channel_sign_correction() {
+        // The real channelizer's rotation step bakes the checkerboard sign
+        // artifact into `HopOutput::x[k]` itself (see
+        // `channelizer::odd_channel_sign_correction`'s doc comment); a
+        // synthetic `HopOutput` for a physically-constant tone must
+        // reproduce that same artifact to exercise decoder_input's fix, so
+        // pre-multiply by the same factor here. `decoder_input` must undo
+        // it (the two factors cancel, `(-1)^2 = 1`) before the refiner
+        // sees the sample -- without that, the refiner sees the raw
+        // alternating input and self-cancels it (the ~39 dB attenuation
+        // the Codex review measured against the real channelizer).
+        let raw = num_complex::Complex32::new(1.0, 0.0);
+        let mean_amp = |channel: usize| -> f32 {
+            let mut track = Track::new(1, channel, &cfg());
+            let mut sum = 0.0f32;
+            let mut count = 0u32;
+            for m in 0..200u64 {
+                let artifacted = raw * odd_channel_sign_correction(m, channel);
+                let h = hop_with_x(m, vec![artifacted; 8]);
+                let (amp, _, _) = track.decoder_input(channel, &h, m * 512, 30.0);
+                if m > 50 {
+                    sum += amp;
+                    count += 1;
+                }
+            }
+            sum / count as f32
+        };
+        let even = mean_amp(4);
+        let odd = mean_amp(5);
+        assert!(
+            (odd - even).abs() < 1e-3,
+            "odd-channel track must match even-channel amplitude once \
+             odd_channel_sign_correction is applied to decoder_input's \
+             refiner feed, got odd={odd} even={even}"
+        );
+    }
+
+    #[test]
     fn promotes_after_confirm_hops_of_sustained_rise() {
         let mut lc = Lifecycle::new(&cfg()); // hop 1 (birth) already counted
         for _ in 0..3 {
@@ -1310,6 +1756,14 @@ mod tests {
         }
     }
 
+    /// Like `hop`, but also populates the complex spectrum `x` -- needed
+    /// for MAN-168's `decoder_input` tests, which read `hop.x[k]` (every
+    /// other existing test only reads `hop.power`).
+    fn hop_with_x(m: u64, x: Vec<num_complex::Complex32>) -> HopOutput {
+        let power = x.iter().map(|c| c.norm_sqr()).collect();
+        HopOutput { m, x, power }
+    }
+
     fn quiet_power(n: usize) -> Vec<f32> {
         vec![1e-9; n] // ~ -90 dBFS
     }
@@ -1387,6 +1841,169 @@ mod tests {
         assert!(
             saw_promotion,
             "step_hop must return a TrackPromoted event at the hop it promotes a track"
+        );
+    }
+
+    #[test]
+    fn step_hop_populates_spectral_ref_power_instead_of_hard_coded_none() {
+        // Codex review, PR #178: `pending`'s spectral_ref_power was
+        // hard-coded `None` at both `decoder_input` push sites in
+        // `step_hop`, so `NoiseTracker`'s SPEC v2 §2.2 spectral-
+        // discounting branch (`max(N_temp, β·N_spec)`) never activated
+        // for the edge-legacy/hsmm engines -- QRM/clicks weren't
+        // discounted as the spec requires. `Engine::Hsmm` here (not
+        // `DecodeConfig::default()`'s `Legacy`) is required for this
+        // assertion to be meaningful post round-4's perf fix, which
+        // correctly stops computing spectral_ref_power for Legacy.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                ..DecodeConfig::default()
+            },
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _) = *track
+            .pending
+            .last()
+            .expect("the promotion hop itself must have queued a pending entry");
+        assert!(
+            spectral_ref_power.is_some(),
+            "spectral_ref_power must be populated from FloorBank, not hard-coded None"
+        );
+    }
+
+    #[test]
+    fn spectral_ref_power_centers_on_the_centroid_not_the_flickering_owned_channel() {
+        // Codex review, PR #178 round 4: `select_channel` only ever picks
+        // within the track's owned window {c-1, c, c+1} (`c =
+        // round(center)`), so `k` and `c` can differ by at most one
+        // channel -- but SPEC v2 §2.2's spectral reference must stay
+        // centered on `c`, not wherever `k` momentarily points, or a
+        // strong neighbor just inside `k`'s guard band (but outside
+        // `c`'s) spuriously elevates the reference and suppresses valid
+        // evidence. This reproduces Codex's own `FloorBank` probe: with
+        // channels [7,8,9,13,14,15] loud (-50 dB) and everything else at
+        // the -90 dB floor, c=10's neighbor set {6,7,8,12,13,14} still
+        // has two quiet escapes (6, 12) and correctly reads -90 dB;
+        // k=11's neighbor set {7,8,9,13,14,15} is entirely loud and would
+        // (incorrectly) read -50 dB if used instead. `Engine::Hsmm` (not
+        // `DecodeConfig::default()`'s `Legacy`) so round 4's perf fix
+        // doesn't skip computing spectral_ref_power entirely.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                ..DecodeConfig::default()
+            },
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        {
+            let track = tm.tracks.get_mut(&id).unwrap();
+            track.center = 10.0; // pin exactly at c=10, sidestepping interpolation drift
+        }
+
+        let floor = 1e-9f32; // -90 dB
+        let loud = 1e-9 * 10f32.powf(40.0 / 10.0); // -50 dB
+        let mid = 1e-9 * 10f32.powf(50.0 / 10.0); // -40 dB (channel 10)
+        let strong = 1e-9 * 10f32.powf(60.0 / 10.0); // -30 dB (channel 11, the k-winner)
+        let mut divergent_power = vec![floor; 64];
+        for &ch in &[7usize, 8, 9, 13, 14, 15] {
+            divergent_power[ch] = loud;
+        }
+        divergent_power[10] = mid;
+        divergent_power[11] = strong; // max in owned window {9,10,11} -> k=11
+
+        let m2 = 250 * 15 + 60;
+        tm.step_hop(&hop(m2, divergent_power), m2);
+
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _) = *track
+            .pending
+            .last()
+            .expect("this hop must have queued a pending entry");
+        let ref_db = 10.0 * spectral_ref_power.unwrap().log10();
+        assert!(
+            ref_db < -80.0,
+            "spectral reference must stay centered on the centroid c=10 (correct: ~-90 dB), not \
+             the flickering owned channel k=11 (buggy: ~-50 dB); got {ref_db} dB"
+        );
+    }
+
+    #[test]
+    fn step_hop_skips_spectral_ref_power_for_the_legacy_engine() {
+        // Codex review, PR #178 round 4: `Engine::Legacy` never reads
+        // `spectral_ref_power` (`push_envelope_legacy` doesn't accept
+        // it), so computing `FloorBank::spectral_reference_db` (a
+        // six-neighbor scan plus `log10`/`powf`) for every open Legacy
+        // track on every hop was pure waste -- measured at ~225k-900k
+        // unnecessary transcendental evaluations/sec at 300-1200 tracks.
+        // `DecodeConfig::default()`'s engine is `Legacy`.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _) = *track
+            .pending
+            .last()
+            .expect("the promotion hop itself must have queued a pending entry");
+        assert!(
+            spectral_ref_power.is_none(),
+            "the Legacy engine must never pay for computing spectral_ref_power"
         );
     }
 
@@ -1683,12 +2300,13 @@ mod tests {
             weak.center = 20.4;
             weak.current_snr_db = 8.0;
             weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
-            // Queued exactly as `step_hop` would (magnitude, sample_ts)
-            // pairs in `pending` -- NOT fed through push_envelope yet.
+            // Queued exactly as `step_hop` would (amplitude, raw_power,
+            // spectral_ref_power, sample_ts) tuples in `pending` -- NOT
+            // fed through push_hop yet.
             weak.pending = rect_envelope_hops("PARIS", 18)
                 .into_iter()
                 .enumerate()
-                .map(|(i, a)| (a, i as u64))
+                .map(|(i, a)| (a, a * a, None, i as u64))
                 .collect();
             weak.has_emitted = true;
         }

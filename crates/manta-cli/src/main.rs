@@ -1189,6 +1189,45 @@ fn load_decode_config_file(
             cfg.noise.noise_min_bias_db
         );
     }
+    // Codex review, PR #178: MAN-168's engine wiring is what gives
+    // `NoiseTracker::push`'s spectral-reference branch its first real
+    // (non-`None`) input, so `spectral_beta`/`spectral_min_bias_db =
+    // inf` -- previously harmless dead config, since the branch never
+    // activated -- now makes `spectral_beta * b_spec * r` infinite the
+    // same way `noise_min_bias_db = inf` does above, permanently closing
+    // the keying-present gate.
+    if !cfg.noise.spectral_min_bias_db.is_finite() {
+        bail!(
+            "[decode] spectral_min_bias_db must be finite in {} (got {}; a non-finite value \
+             makes every spectral noise estimate infinite, silently closing the evidence gate)",
+            path.display(),
+            cfg.noise.spectral_min_bias_db
+        );
+    }
+    if !cfg.noise.spectral_beta.is_finite() {
+        bail!(
+            "[decode] spectral_beta must be finite in {} (got {}; a non-finite value makes \
+             every spectral noise estimate infinite, silently closing the evidence gate)",
+            path.display(),
+            cfg.noise.spectral_beta
+        );
+    }
+    // Codex review, PR #178 round 4: a finite NEGATIVE spectral_beta
+    // (e.g. a `-0.5` sign typo) makes NoiseTracker::push's spectral term
+    // (`beta * b_spec * r`) negative, so `max(n_temp, ...)` always
+    // discards it -- silently disabling the QRM/click discount just
+    // wired in, the same way `speed_alpha < 0.0` silently broke the
+    // speed estimate elsewhere in this file. 0.0 stays legal: it's a
+    // valid, explicit "no spectral discount" value, not a sign error.
+    if cfg.noise.spectral_beta < 0.0 {
+        bail!(
+            "[decode] spectral_beta must be nonnegative in {} (got {}; a negative value makes \
+             the spectral term always lose to max(), silently disabling the spectral \
+             noise discount)",
+            path.display(),
+            cfg.noise.spectral_beta
+        );
+    }
     // Codex review, PR #161 round 13: a negative `lookahead_dits` makes
     // every non-consensus history entry's nonnegative age always exceed
     // the (negative) forced-commit threshold, reducing the HSMM to
@@ -1266,6 +1305,27 @@ fn load_decode_config_file(
              a negative or non-finite bound)",
             path.display(),
             cfg.evidence.llr_clip
+        );
+    }
+    // Codex review, MAN-168: `refine_bw_hz` is a newly-activated (default
+    // 0.0/disabled) setting -- a NaN or infinite value is neither `<=
+    // 0.0` (so refinement isn't bypassed) nor a usable bandwidth,
+    // reaching `Refiner::new`'s own `debug_assert!(bw_hz > 0.0)` (a debug
+    // panic; a release build instead designs an all-NaN/degenerate FIR
+    // that then poisons every refined amplitude). 0.0 itself must stay
+    // legal -- it's the documented "disabled" sentinel, not an error.
+    //
+    // Codex review, PR #178: a NEGATIVE value (e.g. a `-30` sign typo)
+    // also isn't `> 0.0`, so `decoder_input`'s own `refine_bw_hz <= 0.0`
+    // check silently treats it as the disabled bypass instead of
+    // reporting the operator's config error -- the documented disabled
+    // sentinel is specifically `0.0`, not "anything non-positive".
+    if !cfg.refine_bw_hz.is_finite() || cfg.refine_bw_hz < 0.0 {
+        bail!(
+            "[decode] refine_bw_hz must be finite and nonnegative in {} (got {}; use 0.0 to \
+             disable refinement, not a negative value)",
+            path.display(),
+            cfg.refine_bw_hz
         );
     }
     Ok(cfg)
@@ -2778,6 +2838,72 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_infinite_noise_min_bias_db() {
         let f = write_temp_file(b"[decode]\nnoise_min_bias_db = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_spectral_min_bias_db() {
+        let f = write_temp_file(b"[decode]\nspectral_min_bias_db = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_spectral_beta() {
+        let f = write_temp_file(b"[decode]\nspectral_beta = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_spectral_beta() {
+        // Codex review, PR #178 round 4: a negative value makes
+        // NoiseTracker's max() always discard the spectral term,
+        // silently disabling the discount instead of reporting the
+        // operator's sign-typo config error.
+        let f = write_temp_file(b"[decode]\nspectral_beta = -0.5\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_spectral_beta() {
+        // 0.0 is a valid, explicit "no spectral discount" value, not a
+        // sign error -- must stay legal.
+        let f = write_temp_file(b"[decode]\nspectral_beta = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_refine_bw_hz() {
+        // 0.0 is the documented "disabled" sentinel, not an error.
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_a_positive_refine_bw_hz() {
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = 30.0\n");
+        let cfg = load_decode_config_file(Some(f.path())).unwrap();
+        assert_eq!(cfg.refine_bw_hz, 30.0);
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_refine_bw_hz() {
+        // Codex review, PR #178: a negative value (e.g. a `-30` sign
+        // typo) isn't `> 0.0`, so decoder_input's own bypass check would
+        // silently treat it as disabled instead of reporting the error --
+        // the documented disabled sentinel is specifically 0.0.
+        let f = write_temp_file(b"[decode]\nrefine_bw_hz = -30.0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 

@@ -27,6 +27,36 @@ pub fn power_db(power: f32) -> f64 {
     10.0 * (power as f64 + POWER_DB_EPSILON).log10()
 }
 
+/// SPEC §1.3 step 2's circular rotation (`r = (m*hop) mod N`, `hop = N/4`)
+/// leaves a residual checkerboard sign artifact on `HopOutput::x[k]`: odd
+/// channels at odd hops come out negated relative to what a phase-
+/// continuous baseband signal would read, `(-1)^(m*k)`. Magnitude-only
+/// consumers (`power = |X[k]|^2`, everything before MAN-168) are
+/// invariant to this and never needed to correct it. A consumer working
+/// with the complex spectrum directly (MAN-168's narrowband refiner,
+/// which derotates and lowpass-filters `x[k]` and so needs a genuinely
+/// phase-continuous input) must multiply `x[k]` by this factor first.
+///
+/// Found by Codex review on PR #161's MAN-168 wiring (a probe using the
+/// real channelizer + refiner measured ~39 dB of spurious attenuation on
+/// one specific odd channel). The exact form here was verified
+/// empirically, not hand-derived from the rotation step's DFT shift
+/// theorem (an initial `exp(-j*2*pi*k*r/N)` derivation, mathematically
+/// plausible for an abstract circular shift, measured identical -- and
+/// still wrong -- results for both candidate signs; the real artifact
+/// turned out to be this much simpler period-2 real sign flip). Confirmed
+/// against both 96 kHz/1024-channel and 192 kHz/2048-channel
+/// configurations, multiple even/odd channel pairs, and both a centered
+/// and a fractionally-offset tone: after this correction, an odd
+/// channel's refined output exactly matches an even channel's.
+pub fn odd_channel_sign_correction(hop_m: u64, k: usize) -> f32 {
+    if hop_m % 2 == 1 && k % 2 == 1 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
 /// Per-hop fine-frequency interpolation (SPEC §1.4): quadratic
 /// interpolation on dB powers of the three bins around a candidate peak
 /// channel. Returns the sub-bin offset in `[-0.5, 0.5]`, or `None` if the
@@ -343,5 +373,50 @@ mod tests {
         // genuine valley is the unambiguous "no local max" case.
         // denom = db(0.5) - 2*db(0.1) + db(0.5) ~= 13.98 >= 0 -> unusable.
         assert_eq!(interpolate_offset(0.5, 0.1, 0.5), None);
+    }
+
+    #[test]
+    fn odd_channel_sign_correction_recovers_a_phase_continuous_odd_channel_tone() {
+        // Codex review, PR #161's MAN-168: a centered tone on an odd
+        // channel comes out of the channelizer with a spurious per-hop
+        // sign flip (`(-1)^(m*k)`) that a magnitude-only consumer never
+        // noticed; a consumer using the complex spectrum directly (the
+        // narrowband refiner) sees severe self-cancellation without this
+        // correction. Verify the corrected odd channel matches an even
+        // channel's amplitude exactly, using the real channelizer.
+        use crate::refine::Refiner;
+        let fs = 96_000.0;
+        let mean = |k: usize, corrected: bool| -> f32 {
+            let mut ch = Channelizer::new(fs, 0.0).unwrap();
+            let freq_hz = ch.channel_freq_hz(k);
+            let sig = tone(freq_hz, 60_000, 1.0, fs);
+            let hops = ch.process(&sig);
+            let mut r = Refiner::new(30.0, 0.0);
+            let mut sum = 0.0f32;
+            let mut count = 0u32;
+            for h in hops.iter().skip(20) {
+                let x = if corrected {
+                    h.x[k] * odd_channel_sign_correction(h.m, k)
+                } else {
+                    h.x[k]
+                };
+                sum += r.push(x);
+                count += 1;
+            }
+            sum / count as f32
+        };
+        let even_amp = mean(64, true);
+        let odd_uncorrected = mean(65, false);
+        let odd_corrected = mean(65, true);
+        assert!(
+            odd_uncorrected < even_amp * 0.5,
+            "sanity: an uncorrected odd channel must show real self-cancellation, got \
+             odd={odd_uncorrected} even={even_amp}"
+        );
+        assert!(
+            (odd_corrected - even_amp).abs() < 1e-3,
+            "corrected odd channel must match the even channel's amplitude exactly, got \
+             odd_corrected={odd_corrected} even={even_amp}"
+        );
     }
 }
