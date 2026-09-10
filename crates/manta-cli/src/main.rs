@@ -824,32 +824,16 @@ struct SpotServer {
     station_geography_unresolved: bool,
 }
 
-/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
-/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
-/// exactly the condition `manta_spots_unresolved_geography_total` counts.
-///
-/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
-/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
-/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
-/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
-/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
-/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
-/// alone would let those spots go out carrying `dxDxcc: -1` with the
-/// counter still at zero, silently withholding the one signal this metric
-/// exists to give (round-1 validate code-review finding 1).
-///
-/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
-/// (round-7 review finding 2): `cty.lookup` answers for it through the base
-/// call's prefix, but `from_spot` deliberately discards that answer and emits
-/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
-/// real position is unknown -- so the spot does carry the sentinels this
-/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
-/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
-/// the whole test.
-fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
-    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
-        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
-}
+// MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
+// `UNKNOWN_*` sentinels?" predicate that
+// `manta_spots_unresolved_geography_total` is defined over used to be
+// defined HERE, one crate away from the `SpotMessage::from_spot` it has to
+// agree with -- and it drifted: the station side was classified from the raw
+// configured `station_callsign` while `from_spot` resolved the SSID-stripped
+// one. It now lives beside that code in `manta-server::spot_message`, with
+// the station-side entry point doing the stripping itself so no call site
+// can forget it.
+use manta_server::spot_message::{geography_is_unresolved, station_geography_unresolved};
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
 /// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
@@ -1067,20 +1051,12 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
-            // MAN-89 (PR #131 review, round 6): stripped exactly as
-            // `SpotMessage::from_spot` strips it before `Geography::resolve`
-            // (spot_message.rs), because this flag has to answer the SAME
-            // question that path answers. Left unstripped, an SSID'd mobile
-            // identity like `K5ARH/MM-1` reaches
-            // `is_outside_any_dxcc_entity` as `MM-1` rather than `MM` (so the
-            // /MM test misses) while `cty.lookup` still resolves through the
-            // allocated `K` prefix -- and every spot from that node would go
-            // out carrying the de-side sentinels with the counter stuck at
-            // zero.
-            station_geography_unresolved: geography_is_unresolved(
-                &cty,
-                manta_server::config::strip_ssid(&cfg.station_callsign),
-            ),
+            // MAN-89: `station_geography_unresolved` strips the RBN `-N`
+            // per-band SSID itself, so this flag is classified through the
+            // SAME string `SpotMessage::from_spot` resolves the de side
+            // through -- see its doc comment for what an unstripped
+            // classification costs.
+            station_geography_unresolved: station_geography_unresolved(&cty, &cfg.station_callsign),
             cty,
         },
     ))
@@ -2201,12 +2177,14 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
-    // MAN-89 (PR #131 review, round 6): `station_geography_unresolved` is
-    // precomputed from the operator's configured `station_callsign`, which
+    // MAN-89 (PR #131 review, rounds 6 and 7): `station_geography_unresolved`
+    // is precomputed from the operator's configured `station_callsign`, which
     // may carry an RBN `-N` per-band SSID. It must be classified through the
     // SAME string `SpotMessage::from_spot` resolves -- the SSID-stripped one
     // -- or a mobile node's spots go out with the de-side sentinels while
-    // `manta_spots_unresolved_geography_total` stays at zero.
+    // `manta_spots_unresolved_geography_total` stays at zero. These drive the
+    // production entry point directly rather than stripping in the test, so
+    // the strip cannot silently move back out to the call sites.
 
     #[test]
     fn an_ssid_bearing_mobile_station_callsign_is_counted_as_unresolved() {
@@ -2218,7 +2196,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "test premise: unstripped, {call} reads as resolved -- this is the bug"
             );
             assert!(
-                geography_is_unresolved(&cty, manta_server::config::strip_ssid(call)),
+                station_geography_unresolved(&cty, call),
                 "{call} carries the de-side sentinels and must be counted"
             );
         }
@@ -2230,13 +2208,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // node identity into a counted one.
         let cty =
             manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
-        assert!(!geography_is_unresolved(
-            &cty,
-            manta_server::config::strip_ssid("W1AW-1")
-        ));
-        assert!(!geography_is_unresolved(
-            &cty,
-            manta_server::config::strip_ssid("W1AW/P-2")
-        ));
+        assert!(!station_geography_unresolved(&cty, "W1AW-1"));
+        assert!(!station_geography_unresolved(&cty, "W1AW/P-2"));
+        // An SSID-free identity is classified exactly as before.
+        assert!(!station_geography_unresolved(&cty, "W1AW"));
+        assert!(station_geography_unresolved(&cty, "W1AW/MM"));
     }
 }

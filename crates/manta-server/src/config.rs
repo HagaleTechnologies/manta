@@ -110,7 +110,14 @@ fn is_complete_callsign(segment: &str) -> bool {
     // ITU digit-led prefixes carry exactly one numeral (`4U`, `3D`, `5N`), so
     // `12A` is still a typo -- and the segment already ends in a letter, so
     // this cannot readmit a suffix-less `W12` either.
-    if bytes[0].is_ascii_digit() && first_letter == 1 {
+    //
+    // `1..=9`, not "any digit": no ITU prefix begins with `0` (and no entry in
+    // the vendored `master.scp` does either), so `0AB` is a mistyped identity
+    // rather than a digit-led special-event call. Restricting the leading
+    // numeral keeps this shortcut from being the hole the finding it answers
+    // warned against, without touching the separating-digit rule below --
+    // `0A1B` still passes there exactly as it did before.
+    if matches!(bytes[0], b'1'..=b'9') && first_letter == 1 {
         return true;
     }
     let last_letter = bytes.len() - 1;
@@ -617,6 +624,12 @@ mod tests {
             "4GRID2",
             "12A/P",
             "5NNHR9",
+            // ... and the leading numeral itself is 1-9: no ITU prefix, and no
+            // `master.scp` entry, begins with `0`, so this shape is a typo the
+            // digit-led shortcut must not wave through.
+            "0AB",
+            "0AB-1",
+            "0GRID",
         ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));
@@ -658,6 +671,51 @@ mod tests {
             ));
             assert_eq!(result.is_ok(), expect_ok, "login_callsign {call:?}");
         }
+    }
+
+    /// The strict-superset claim, measured against the WHOLE vendored
+    /// `master.scp` rather than a hand-picked fixture list.
+    ///
+    /// Rounds 4, 5 and 6 of the PR #131 review each narrowed
+    /// `is_complete_callsign`, and round 6 found by hand-reading `master.scp`
+    /// that the previous narrowing had locked real operators (`4AFARU`,
+    /// `4GRID`, `5NNHR`) out of starting the daemon -- while the fixture lists
+    /// above still reported the superset property as holding. Fixtures cannot
+    /// catch that class of regression; the snapshot can. Every one of the
+    /// ~50k real, allocated calls in it that the decoder-output grammar this
+    /// validator REPLACED accepted must remain configurable as a station
+    /// identity, with and without an RBN `-N` per-band SSID.
+    #[test]
+    fn accepts_every_master_scp_call_the_replaced_grammar_accepted() {
+        let mut rejected: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for call in manta_spot::MASTER_SCP
+            .lines()
+            .map(str::trim)
+            .filter(|c| !c.is_empty() && !c.starts_with('#'))
+        {
+            if !manta_spot::grammar::is_plausible(call) {
+                continue;
+            }
+            checked += 1;
+            for candidate in [call.to_string(), format!("{call}-1")] {
+                if check_operator_callsign(&candidate).is_err() {
+                    rejected.push(candidate);
+                }
+            }
+        }
+        assert!(
+            checked > 10_000,
+            "test premise: the vendored snapshot should carry tens of thousands \
+             of grammar-accepted calls, got {checked}"
+        );
+        assert!(
+            rejected.is_empty(),
+            "{} real master.scp callsign(s) accepted by grammar::is_plausible are \
+             rejected by check_operator_callsign, e.g. {:?}",
+            rejected.len(),
+            &rejected[..rejected.len().min(20)]
+        );
     }
 
     /// The SSID grammar has exactly one definition; `strip_ssid` must agree with

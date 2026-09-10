@@ -117,6 +117,19 @@ technical notes asked to fix together.
    whole vendored `master.scp`: 50,001 entries, and the only line the predicate rejects is the
    file's own `!!Order,1,1` header.
 
+   The leading numeral is `1`-`9`, not "any digit" (round 7). No ITU prefix begins with `0`, and
+   no `master.scp` entry does either, so `0AB` is a mistyped identity rather than a digit-led
+   special-event call; restricting the shortcut keeps it from becoming the hole round 6 was
+   guarding against. The separating-digit rule is untouched, so `0A1B` still qualifies through it
+   exactly as before.
+
+   That re-measurement is no longer a one-off: `config::tests::
+   accepts_every_master_scp_call_the_replaced_grammar_accepted` asserts the strict-superset
+   property over the whole vendored snapshot on every run, with and without an SSID. Rounds 4,
+   5 and 6 each narrowed this predicate and each time the hand-picked fixture lists still
+   reported the superset property as holding -- fixtures cannot catch that class of regression,
+   the snapshot can.
+
 8. **The unresolved-geography metric classifies the SSID-STRIPPED station callsign** (PR #131
    review, round 6). `SpotMessage::from_spot` resolves the de side through
    `config::strip_ssid(station_call)`, but `manta-cli::start_spot_server` precomputed
@@ -127,6 +140,14 @@ technical notes asked to fix together.
    `manta_spots_unresolved_geography_total` stays at zero for every spot the node emits. The
    precomputation now applies the same `strip_ssid` the emit path applies, so the counter's
    condition and the sentinel's condition are derived from one string.
+
+   The classification is CENTRALIZED rather than fixed at the call site (round 7). The predicate
+   used to live in `manta-cli` while the sentinel emission it has to agree with lives in
+   `manta-server::spot_message` -- one crate away, which is how the two drifted in the first
+   place. `geography_is_unresolved` now lives beside `SpotMessage::from_spot`, and the
+   station-side entry point `spot_message::station_geography_unresolved` applies `strip_ssid`
+   itself, so no caller can forget it; the dx-side entry point deliberately takes the callsign
+   verbatim, since decoder output never carries an SSID.
 
 ## Non-goals
 
