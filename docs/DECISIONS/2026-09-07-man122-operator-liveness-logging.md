@@ -65,7 +65,22 @@ status task compares it against its own previous sample and reports
 `pipeline=starting` (no batch yet — the expected reading for the first
 interval or two of a live source, whose calibration window is two real
 seconds, and not a stall). The counter is deliberately not exported in the
-Prometheus text: it is a liveness edge, not a figure worth graphing. This
+Prometheus text: it is a liveness edge, not a figure worth graphing.
+
+**`starting` is bounded by `STARTUP_GRACE` = 30 s** (review round 3).
+Classifying *any* zero-progress sample as `starting` made the state
+absorbing: a daemon whose very first `IqSource::read` blocks forever never
+bumps `pipeline_batches`, so every status line it ever emitted read
+`pipeline=starting` — the one classification an operator reads as "fine,
+give it a moment" — and the wedged-startup case, which is the case the
+liveness signal exists for, was the case it could not report. Zero progress
+is now `starting` only while uptime is under `STARTUP_GRACE`, and `stalled`
+after. 30 s is roughly 15x what a healthy cold start has to do at that
+point (the `IqSource` is already open before the status task is spawned, so
+only the two-second calibration read, the channelizer build and the
+filter-length padding batch remain), and it is deliberately under the 60 s
+`DEFAULT_STATUS_INTERVAL` so that at the default cadence a wedged startup
+is reported on the very first status line rather than never. This
 is why `listen_with_track_count`'s observer now fires on every batch
 rather than only on a change — see below.
 
@@ -178,3 +193,14 @@ return, `pipeline=` classification). What stays end-to-end through the
 real binary is the part that cannot race: the banner, its field content,
 its being line 1, and readiness never being claimed by a daemon whose
 pipeline never started.
+
+Review round 3 removed the last remnant of the same race: that
+readiness-only test still ran the subprocess with `status_interval_secs =
+1` and asserted no `manta status:` line appeared. A runner slow enough to
+take over a second to reach calibration EOF would see a legitimate status
+line and go red — `status.rs` is specified to emit while the pipeline has
+not started, so the absence of one was never an invariant. The test now
+sets `status_interval_secs = 0`, which disables the timer outright and
+turns that assertion into a real, deterministic one: the zero-interval kill
+switch works in the shipped binary, not only in `spawn_status_line`'s unit
+test.

@@ -88,16 +88,37 @@ impl UplinkState {
 /// question the line exists to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineState {
-    /// No batch has been processed yet. Expected for the first interval or
-    /// two of a live source, whose `manta_engine` calibration window is
-    /// two real seconds of samples; NOT reported as a stall, which would
-    /// be a false alarm on every cold start.
+    /// No batch has been processed yet, and the daemon is still inside
+    /// `STARTUP_GRACE`. Expected for the first interval or two of a live
+    /// source, whose `manta_engine` calibration window is two real seconds
+    /// of samples; NOT reported as a stall, which would be a false alarm on
+    /// every cold start.
     Starting,
     Decoding,
     /// Batches were being processed, and then stopped, without the daemon
-    /// shutting down.
+    /// shutting down -- or none was ever processed and `STARTUP_GRACE` has
+    /// since elapsed.
     Stalled,
 }
+
+/// How long zero pipeline progress is still reported as `starting` rather
+/// than `stalled` (MAN-122 review round 3).
+///
+/// Without a bound, a daemon whose very first `IqSource::read` blocks
+/// forever -- an SDR that accepts the connection and then never streams, a
+/// KiwiSDR whose audio channel is silently dropped -- leaves
+/// `pipeline_batches` at zero for the life of the process, so every status
+/// line it ever emits says `pipeline=starting`. The liveness signal would
+/// then report a wedged startup as a healthy cold start, indefinitely.
+///
+/// 30 s is ~15x the work a healthy cold start actually has to do here: the
+/// source is already open before the status task is spawned (`main.rs`
+/// constructs the `IqSource` before `start_spot_server`), so all that is
+/// left is `manta_engine`'s two-second calibration read, the channelizer
+/// build, and the filter-length padding batch. It is also under the 60 s
+/// `DEFAULT_STATUS_INTERVAL`, so at the default cadence a wedged startup is
+/// reported as `stalled` on the very first status line rather than never.
+pub const STARTUP_GRACE: Duration = Duration::from_secs(30);
 
 impl PipelineState {
     fn as_str(self) -> &'static str {
@@ -108,10 +129,19 @@ impl PipelineState {
         }
     }
 
-    /// Classify from two consecutive samples of `Metrics::pipeline_batches()`.
-    pub fn from_progress(previous: u64, current: u64) -> Self {
+    /// Classify from two consecutive samples of `Metrics::pipeline_batches()`
+    /// plus how long the daemon has been up.
+    ///
+    /// `since_start` is what stops "no batch yet" from being a permanent
+    /// excuse: past `STARTUP_GRACE` a pipeline that has still never
+    /// processed a batch is wedged, not starting, and says so.
+    pub fn from_progress(previous: u64, current: u64, since_start: Duration) -> Self {
         if current == 0 {
-            PipelineState::Starting
+            if since_start >= STARTUP_GRACE {
+                PipelineState::Stalled
+            } else {
+                PipelineState::Starting
+            }
         } else if current == previous {
             PipelineState::Stalled
         } else {
@@ -211,10 +241,11 @@ pub fn spawn_status_line(
                 return;
             }
             let now = Instant::now();
+            let uptime = now.duration_since(started);
             let spots_total = metrics.spots_total();
             let batches = metrics.pipeline_batches();
             let snapshot = StatusSnapshot {
-                uptime_s: now.duration_since(started).as_secs(),
+                uptime_s: uptime.as_secs(),
                 active_tracks: metrics.active_tracks(),
                 spots_per_min: spots_per_min(
                     spots_total.saturating_sub(last_spots),
@@ -231,7 +262,7 @@ pub fn spawn_status_line(
                 } else {
                     UplinkState::Disconnected
                 },
-                pipeline: PipelineState::from_progress(last_batches, batches),
+                pipeline: PipelineState::from_progress(last_batches, batches, uptime),
             };
             last_sample = now;
             last_spots = spots_total;
@@ -315,12 +346,57 @@ mod tests {
     /// running".
     #[test]
     fn the_pipeline_field_separates_a_stalled_loop_from_a_running_one() {
-        assert_eq!(PipelineState::from_progress(0, 0), PipelineState::Starting);
-        assert_eq!(PipelineState::from_progress(0, 7), PipelineState::Decoding);
-        assert_eq!(PipelineState::from_progress(7, 12), PipelineState::Decoding);
+        let young = Duration::ZERO;
+        assert_eq!(
+            PipelineState::from_progress(0, 0, young),
+            PipelineState::Starting
+        );
+        assert_eq!(
+            PipelineState::from_progress(0, 7, young),
+            PipelineState::Decoding
+        );
+        assert_eq!(
+            PipelineState::from_progress(7, 12, young),
+            PipelineState::Decoding
+        );
         // Batches were flowing, and then stopped: the gauge below still says
         // `tracks=N`, but nothing is being decoded.
-        assert_eq!(PipelineState::from_progress(12, 12), PipelineState::Stalled);
+        assert_eq!(
+            PipelineState::from_progress(12, 12, young),
+            PipelineState::Stalled
+        );
+    }
+
+    /// MAN-122 review round 3: zero progress is only `starting` for a
+    /// bounded grace period. A first `IqSource::read` that blocks forever
+    /// never bumps `pipeline_batches`, and before this the daemon reported
+    /// `pipeline=starting` for as long as it stayed wedged -- the one
+    /// classification an operator reads as "fine, give it a moment".
+    #[test]
+    fn a_startup_that_never_produces_a_batch_becomes_stalled_once_grace_elapses() {
+        // Inside the window: still a plausible cold start.
+        assert_eq!(
+            PipelineState::from_progress(0, 0, STARTUP_GRACE - Duration::from_secs(1)),
+            PipelineState::Starting
+        );
+        // At and past it: wedged, and the status line has to say so.
+        assert_eq!(
+            PipelineState::from_progress(0, 0, STARTUP_GRACE),
+            PipelineState::Stalled
+        );
+        assert_eq!(
+            PipelineState::from_progress(0, 0, Duration::from_secs(3600)),
+            PipelineState::Stalled
+        );
+        // Grace never *demotes* a pipeline that did start: a daemon up for
+        // an hour whose batches are still advancing is decoding.
+        assert_eq!(
+            PipelineState::from_progress(900, 1000, Duration::from_secs(3600)),
+            PipelineState::Decoding
+        );
+        // The grace period must be shorter than the default cadence, or the
+        // default deployment's first status line could never report it.
+        assert!(STARTUP_GRACE < DEFAULT_STATUS_INTERVAL);
     }
 
     /// The two events are distinct on purpose (MAN-122 review round 2): the

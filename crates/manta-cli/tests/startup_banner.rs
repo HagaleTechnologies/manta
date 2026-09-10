@@ -139,8 +139,18 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
 ///
 /// What is left here is the half that needs the real binary and cannot
 /// race: readiness is not claimed for a daemon whose pipeline never
-/// started, and a daemon that never decodes never emits a status line
-/// either.
+/// started.
+///
+/// Review round 3: the status timer is disabled outright here
+/// (`status_interval_secs = 0`) rather than set to 1 s. The predecessor
+/// asserted no `manta status:` line appeared, which raced the subprocess
+/// against its own status timer -- a runner slow enough to take more than
+/// one interval to reach calibration EOF would see a perfectly legitimate
+/// `pipeline=starting` (now `pipeline=stalled`, past `STARTUP_GRACE`) line
+/// and go red on correct behaviour. Emitting status lines while the
+/// pipeline has not started is exactly what `status.rs` is specified to do,
+/// so their absence was never an invariant. This test is readiness-only;
+/// the timer has nothing to contribute to it.
 #[test]
 fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
     let dir = tempfile::tempdir().unwrap();
@@ -149,7 +159,7 @@ fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
     // processed. Deterministic on any machine at any speed -- it is a
     // property of the fixture, not of how fast the fixture is consumed.
     let wav = silent_48k_wav(dir.path(), 1);
-    let cfg_path = write_server_config(dir.path(), 1);
+    let cfg_path = write_server_config(dir.path(), 0);
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
         .args([
@@ -181,8 +191,13 @@ fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
         "the daemon exited during calibration without decoding anything -- it must \
          never have claimed readiness: {stderr}"
     );
+    // Not a claim about what a never-started pipeline logs -- that would
+    // race the status timer (see this test's doc comment). This pins the
+    // one status-line property that IS deterministic here:
+    // `status_interval_secs = 0` really does disable the task in the real
+    // binary, not just in `spawn_status_line`'s unit test.
     assert!(
         !stderr.contains("manta status:"),
-        "no status line can be emitted by a daemon that never got past calibration: {stderr}"
+        "status_interval_secs = 0 must disable the status task entirely: {stderr}"
     );
 }
