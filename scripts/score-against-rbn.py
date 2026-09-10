@@ -236,6 +236,15 @@ def main():
     # matched at least one manta spot, which is what recall means.
     recall = (n_truth - len(fn_keys)) / n_truth if n_truth else 0.0
 
+    # Codex review, PR #161 round 19: the implementation plan
+    # (docs/superpowers/plans/2026-09-09-decode-core-v2.md lines 135-147)
+    # requires printing the resolved truth filter in the header --
+    # otherwise runs with different --spotter/--min-spotters values are
+    # indistinguishable except by their resulting counts, making the
+    # reported precision/recall impossible to reproduce reliably.
+    spotters_desc = ", ".join(sorted(spotters)) if spotters else "all"
+    print(f"spotters: {spotters_desc}")
+    print(f"min_spotters: {args.min_spotters}")
     print(f"manta spots: {n_manta}")
     print(f"RBN truth rows excluded (callsign shape manta's grammar can never accept): {excluded}")
     print(f"RBN truth unique call+kHz bins in window: {n_truth}")
