@@ -50,13 +50,22 @@ const MAX_PENDING_BEACONS: usize = 8;
 /// way a closure can name an already-closed track as its survivor), and
 /// this is sized above `PipelineConfig::track_cap`'s default 500
 /// (manta-engine/src/track.rs), so at the shipped default a still-needed
-/// redirect is never the one dropped. Entries are dropped
-/// lowest-track_id-first, which is oldest-first: `TrackManager` hands out
-/// strictly increasing ids and never reuses one. Even in the pathological
-/// case (a batch closing more tracks than this), dropping an entry only
-/// ever degrades a migration to "no survivor" -- annotations discarded,
-/// pending beacons counted lost -- and never to resurrecting removed
-/// per-track_id state, which is what `dropped_survivor_watermark` is for.
+/// redirect is never the one dropped. Entries are dropped in INSERTION
+/// (closure-processing) order, oldest closure first -- NOT by lowest
+/// track_id (Codex review on PR #159, round 3). Those two orders are not
+/// the same: `TrackManager` hands out strictly increasing ids, but it
+/// closes them in whatever order they die, so a long-lived low-id track
+/// closing today lands as the map's SMALLEST key while being its NEWEST
+/// entry. Evicting by key dropped exactly that redirect on the very next
+/// closure -- i.e. the redirects a chained merge needs are the ones the
+/// policy threw away first. Insertion order is what the consuming
+/// invariant actually needs: a redirect is only ever read by a closure in
+/// the same batch as the one that wrote it, so the newest entries are the
+/// live ones. Even in the pathological case (a batch closing more tracks
+/// than this), dropping an entry only ever degrades a migration to "no
+/// survivor" -- annotations discarded, pending beacons counted lost --
+/// and never to resurrecting removed per-track_id state, which is what
+/// `dropped_survivor_watermark` is for.
 const MAX_CLOSED_SURVIVORS: usize = 512;
 
 /// A validated spot, ready for `manta-server` to serialize and emit.
@@ -325,11 +334,23 @@ pub struct Validator {
     /// survivor can be forwarded to the final survivor -- see
     /// `resolve_migration_target` (Codex review on PR #159, round 2).
     closed_survivors: BTreeMap<u32, Option<u32>>,
+    /// The `closed_survivors` keys in the order they were inserted, so
+    /// `note_closed` can evict the OLDEST CLOSURE rather than the lowest
+    /// track_id -- see `MAX_CLOSED_SURVIVORS` for why those differ and why
+    /// evicting by key discarded exactly the freshest redirects.
+    closed_survivor_order: std::collections::VecDeque<u32>,
     /// One past the highest `track_id` whose `closed_survivors` entry has
     /// been dropped to stay under `MAX_CLOSED_SURVIVORS` (`0` while none
     /// has). Below it, "no entry" no longer means "never closed", so
     /// `resolve_migration_target` must not treat such a track_id as a live
-    /// survivor to migrate into.
+    /// survivor to migrate into. Under insertion-order eviction the
+    /// dropped ids are no longer a prefix of the key space, so this is a
+    /// conservative OVER-approximation: a live track_id below the
+    /// watermark that has not emitted any event yet also reads as "gone".
+    /// That errs the safe way -- it discards annotations rather than
+    /// resurrecting per-track_id state no `TrackClosed` would ever free
+    /// (the MAN-19 leak) -- and it is only reachable at all in the
+    /// pathological regime where an eviction happens.
     dropped_survivor_watermark: u32,
     gate: RepetitionGate,
     dedupe: Dedupe,
@@ -347,6 +368,7 @@ impl Validator {
             scp: master_scp.map(scp::Set::parse),
             tracks: BTreeMap::new(),
             closed_survivors: BTreeMap::new(),
+            closed_survivor_order: std::collections::VecDeque::new(),
             dropped_survivor_watermark: 0,
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
@@ -1177,16 +1199,30 @@ impl Validator {
 
     /// Records the (already-resolved) survivor of a track this validator
     /// just closed, for `resolve_migration_target`. Bounded per
-    /// `MAX_CLOSED_SURVIVORS`, dropping the lowest (oldest) track_id first.
+    /// `MAX_CLOSED_SURVIVORS`, dropping the entry inserted LONGEST AGO
+    /// first (Codex review on PR #159, round 3) -- `closed_survivor_order`
+    /// carries that order, because the map's own key order is track_id
+    /// order and a late-closing low-id track is the newest entry under the
+    /// smallest key. See `MAX_CLOSED_SURVIVORS`.
     fn note_closed(&mut self, track_id: u32, survivor: Option<u32>) {
         while self.closed_survivors.len() >= MAX_CLOSED_SURVIVORS {
-            if let Some((dropped, _)) = self.closed_survivors.pop_first() {
+            let Some(dropped) = self.closed_survivor_order.pop_front() else {
+                // Unreachable: the two structures are inserted into
+                // together. Break rather than spin if they ever diverge.
+                break;
+            };
+            if self.closed_survivors.remove(&dropped).is_some() {
                 self.dropped_survivor_watermark = self
                     .dropped_survivor_watermark
                     .max(dropped.saturating_add(1));
             }
         }
-        self.closed_survivors.insert(track_id, survivor);
+        // `TrackManager` never reuses a track_id, so this is always a
+        // fresh key; the guard keeps `closed_survivor_order` free of
+        // duplicate entries even if that ever stopped holding.
+        if self.closed_survivors.insert(track_id, survivor).is_none() {
+            self.closed_survivor_order.push_back(track_id);
+        }
     }
 
     /// A `ClosureKind::Bookkeeping` closure is not evidence this
@@ -2171,6 +2207,92 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             v.tracks.is_empty(),
             "no per-track_id state may survive this sequence, got {:?}",
             v.tracks.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Codex review on PR #159, round 3: `closed_survivors` must evict by
+    /// INSERTION age, not by track_id. A long-lived low-id track that
+    /// closes after a long run of higher-id churn is the map's NEWEST
+    /// entry under its SMALLEST key -- key-ordered eviction (`pop_first`)
+    /// therefore threw that fresh redirect away on the very next closure,
+    /// so only the FIRST merge loser naming it reached the final survivor
+    /// and every later one silently lost its RST/QRL annotations (and had
+    /// its pending beacons counted lost to an eviction that never
+    /// happened). Here track 5 -> 3 is recorded after a full cap's worth
+    /// of churn, loser 8 consumes it, and loser 9 -- the one carrying the
+    /// annotations -- must still find it.
+    #[test]
+    fn a_fresh_redirect_outlives_an_older_closure_with_a_higher_id() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 3);
+        seed_meta(&mut v, 5);
+        seed_meta(&mut v, 8);
+        seed_meta(&mut v, 9);
+        // Only the last loser in the batch decoded any message context.
+        run(&transmission_events(9, &["QRL?", "TU", "5NN"], 0), &mut v);
+
+        // Fill the map to capacity with older, higher-id closures.
+        for track_id in 1_000..1_000 + MAX_CLOSED_SURVIVORS as u32 {
+            seed_meta(&mut v, track_id);
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::SignalEnded,
+            });
+        }
+
+        // The chain's intermediate closes onto the final survivor: newest
+        // entry, smallest key.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 5,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(3),
+            },
+        });
+        // A first loser consumes the redirect -- and, under the old
+        // key-ordered policy, its own `note_closed` evicted it.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 8,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(5),
+            },
+        });
+        assert_eq!(
+            v.closed_survivors.get(&5),
+            Some(&Some(3)),
+            "an unrelated older closure must not evict the freshly recorded \
+             redirect for track 5"
+        );
+
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 9,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(5),
+            },
+        });
+        assert!(
+            !v.tracks.contains_key(&5),
+            "forwarding through the redirect must not recreate the closed \
+             intermediate's state"
+        );
+        assert!(
+            v.closed_survivors.len() <= MAX_CLOSED_SURVIVORS,
+            "closed_survivors must stay bounded at {MAX_CLOSED_SURVIVORS}, got {}",
+            v.closed_survivors.len()
+        );
+
+        let spots = run(
+            &transmission_events(3, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+            &mut v,
+        );
+        assert_eq!(spots.len(), 1, "spots were {spots:?}");
+        assert_eq!(
+            spots[0].rst.as_deref(),
+            Some("599"),
+            "the second loser's RST must still reach the final survivor"
+        );
+        assert!(
+            spots[0].qrl_query,
+            "the second loser's QRL? flag must still reach the final survivor"
         );
     }
 }
