@@ -50,9 +50,14 @@ const MAX_PENDING_BEACONS: usize = 8;
 /// way a closure can name an already-closed track as its survivor), and
 /// this is sized above `PipelineConfig::track_cap`'s default 500
 /// (manta-engine/src/track.rs), so at the shipped default a still-needed
-/// redirect is never the one dropped. Entries are dropped
-/// lowest-track_id-first, which is oldest-first: `TrackManager` hands out
-/// strictly increasing ids and never reuses one. Even in the pathological
+/// redirect is never the one dropped. Entries are dropped in INSERTION
+/// order (oldest closure first), tracked by `closed_survivor_order`.
+/// Dropping the lowest track_id instead would NOT be oldest-first, even
+/// though `TrackManager` hands out strictly increasing ids: a long-lived
+/// low-id track closes LATE, so its brand-new redirect is the smallest
+/// key in the map and the very next closure would evict it -- exactly
+/// the entry the same batch is about to consult (Codex review on PR
+/// #159, round 3). Even in the pathological
 /// case (a batch closing more tracks than this), dropping an entry only
 /// ever degrades a migration to "no survivor" -- annotations discarded,
 /// pending beacons counted lost -- and never to resurrecting removed
@@ -325,11 +330,20 @@ pub struct Validator {
     /// survivor can be forwarded to the final survivor -- see
     /// `resolve_migration_target` (Codex review on PR #159, round 2).
     closed_survivors: BTreeMap<u32, Option<u32>>,
+    /// The `closed_survivors` keys in the order they were first inserted,
+    /// so the capacity bound evicts the OLDEST redirect rather than the
+    /// lowest track_id -- see `MAX_CLOSED_SURVIVORS` for why those are not
+    /// the same thing. Always the same length as `closed_survivors`.
+    closed_survivor_order: VecDeque<u32>,
     /// One past the highest `track_id` whose `closed_survivors` entry has
     /// been dropped to stay under `MAX_CLOSED_SURVIVORS` (`0` while none
     /// has). Below it, "no entry" no longer means "never closed", so
     /// `resolve_migration_target` must not treat such a track_id as a live
-    /// survivor to migrate into.
+    /// survivor to migrate into. Insertion-order eviction means the
+    /// dropped ids are no longer a prefix of the id space, so this can
+    /// sit above track_ids whose entries are still present; that only
+    /// ever makes an unknown target degrade to "no survivor" (safe,
+    /// annotations discarded) and never resurrects removed state.
     dropped_survivor_watermark: u32,
     gate: RepetitionGate,
     dedupe: Dedupe,
@@ -347,6 +361,7 @@ impl Validator {
             scp: master_scp.map(scp::Set::parse),
             tracks: BTreeMap::new(),
             closed_survivors: BTreeMap::new(),
+            closed_survivor_order: VecDeque::new(),
             dropped_survivor_watermark: 0,
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
@@ -1177,16 +1192,29 @@ impl Validator {
 
     /// Records the (already-resolved) survivor of a track this validator
     /// just closed, for `resolve_migration_target`. Bounded per
-    /// `MAX_CLOSED_SURVIVORS`, dropping the lowest (oldest) track_id first.
+    /// `MAX_CLOSED_SURVIVORS`, dropping the OLDEST redirect -- the one
+    /// inserted longest ago, not the lowest track_id. A closure batch's
+    /// own fresh redirects are therefore the last things evicted, which
+    /// is the invariant `MAX_CLOSED_SURVIVORS` claims and the
+    /// lowest-key-first policy silently broke for a long-lived low-id
+    /// track (Codex review on PR #159, round 3).
     fn note_closed(&mut self, track_id: u32, survivor: Option<u32>) {
-        while self.closed_survivors.len() >= MAX_CLOSED_SURVIVORS {
-            if let Some((dropped, _)) = self.closed_survivors.pop_first() {
-                self.dropped_survivor_watermark = self
-                    .dropped_survivor_watermark
-                    .max(dropped.saturating_add(1));
-            }
+        // A repeated `TrackClosed` for the same track_id refreshes the
+        // stored survivor but keeps its original age -- it is the same
+        // identity, and re-queueing it would leave a stale duplicate in
+        // the order queue.
+        if self.closed_survivors.insert(track_id, survivor).is_none() {
+            self.closed_survivor_order.push_back(track_id);
         }
-        self.closed_survivors.insert(track_id, survivor);
+        while self.closed_survivor_order.len() > MAX_CLOSED_SURVIVORS {
+            let Some(dropped) = self.closed_survivor_order.pop_front() else {
+                break;
+            };
+            self.closed_survivors.remove(&dropped);
+            self.dropped_survivor_watermark = self
+                .dropped_survivor_watermark
+                .max(dropped.saturating_add(1));
+        }
     }
 
     /// A `ClosureKind::Bookkeeping` closure is not evidence this
@@ -2171,6 +2199,83 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             v.tracks.is_empty(),
             "no per-track_id state may survive this sequence, got {:?}",
             v.tracks.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Codex review on PR #159, round 3: the capacity bound must evict by
+    /// INSERTION age, not by track_id. A long-lived LOW-id track closes
+    /// late, so its redirect is simultaneously the newest entry and the
+    /// smallest key -- evicting the smallest key would throw it away on
+    /// the very next closure, exactly the entry the same batch is about
+    /// to walk, and the loser's annotations would be discarded instead of
+    /// reaching the final survivor.
+    #[test]
+    fn a_fresh_low_id_redirect_outlives_a_full_map() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        // Track 7 is the merge loser carrying the annotations, track 3
+        // the long-lived low-id intermediate it names, track 5000 the
+        // identity actually still being tracked.
+        seed_meta(&mut v, 7);
+        run(&transmission_events(7, &["QRL?", "TU", "5NN"], 0), &mut v);
+        seed_meta(&mut v, 5_000);
+
+        // Fill the redirect map to capacity with older, higher-id
+        // closures, so the next insertion must evict something.
+        for track_id in 1_000..1_000 + MAX_CLOSED_SURVIVORS as u32 {
+            seed_meta(&mut v, track_id);
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::SignalEnded,
+            });
+        }
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 3,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(5_000),
+            },
+        });
+        // An unrelated closure falls between the intermediate and its
+        // loser -- under lowest-key-first eviction this is what dropped
+        // track 3's brand-new redirect.
+        seed_meta(&mut v, 4_000);
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 4_000,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(
+            v.closed_survivors.contains_key(&3),
+            "the freshest redirect must never be the one evicted"
+        );
+        assert!(
+            v.closed_survivors.len() <= MAX_CLOSED_SURVIVORS,
+            "closed_survivors must stay bounded at {MAX_CLOSED_SURVIVORS}, got {}",
+            v.closed_survivors.len()
+        );
+
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 7,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(3),
+            },
+        });
+        assert!(
+            !v.tracks.contains_key(&3),
+            "following the redirect must not recreate the intermediate's state"
+        );
+
+        let spots = run(
+            &transmission_events(5_000, &["CQ", "K5ARH", "CQ", "K5ARH"], 200_000),
+            &mut v,
+        );
+        assert_eq!(spots.len(), 1, "spots were {spots:?}");
+        assert_eq!(
+            spots[0].rst.as_deref(),
+            Some("599"),
+            "the surviving redirect must still carry the loser's RST to the final survivor"
+        );
+        assert!(
+            spots[0].qrl_query,
+            "the surviving redirect must still carry the loser's QRL? flag"
         );
     }
 }

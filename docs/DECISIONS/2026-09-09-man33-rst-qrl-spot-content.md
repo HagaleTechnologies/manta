@@ -136,6 +136,33 @@ Covered by `chained_merge_forwards_annotations_to_the_final_survivor`,
 `a_dropped_redirect_degrades_to_no_survivor`, all three of which fail against
 the pre-fix migrate-as-named behaviour.
 
+**Revised again on round 3 (Codex, `crates/manta-spot/src/validator.rs:1183`):**
+that bounded map evicted the *lowest track_id* on overflow, justified as
+"oldest-first" because `TrackManager` hands out strictly increasing ids. It is
+not: ids are assigned at track *creation*, the map is keyed at track *closure*,
+and a long-lived low-id track closes late — so its brand-new redirect is
+simultaneously the newest entry and the smallest key, and the very next closure
+evicted it. Once the map is full (512 historical closures), a merge loser
+naming that track therefore lost the chain and its RST/QRL annotations were
+discarded, with pending beacons miscounted as lost to eviction — the exact
+failure the round-2 fix exists to prevent, and it contradicted the invariant
+`MAX_CLOSED_SURVIVORS` claims ("a redirect is only ever consulted by a closure
+in the same batch as the one that recorded it, so a still-needed redirect is
+never the one dropped").
+
+Resolution: `Validator::closed_survivor_order`, a `VecDeque<u32>` of the map's
+keys in first-insertion order; `note_closed` evicts from its front, so the
+oldest *closure* goes rather than the smallest id, and a batch's own fresh
+redirects are the last things dropped. A repeated `TrackClosed` for the same
+track_id refreshes the stored survivor without re-queueing the id, keeping the
+deque and the map exactly in step. `dropped_survivor_watermark` stays
+`max(dropped id) + 1`: dropped ids are no longer a prefix of the id space, so
+the watermark can now sit above ids still present in the map, which only ever
+makes an *unknown* target degrade to "no survivor" — still one-directional,
+still never resurrecting removed state. Covered by
+`a_fresh_low_id_redirect_outlives_a_full_map`, which fails against the
+lowest-key eviction policy.
+
 ## Decision 4: JSON Lines stream only — never the RBN telnet line
 
 `rbn::format_line` is the RBN/aggregator compatibility surface, shared with
