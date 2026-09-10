@@ -101,16 +101,74 @@ system/com.sdrplay.service` or equivalent) that this session cannot
 perform without an interactive password. **Live-hardware verification of
 a better gain value is blocked until the service is restarted.**
 
-## Next steps (not done here)
+## Follow-up, same session: service restarted, device replugged, gain fix confirmed real but does NOT close the detection gap
 
-1. Restart `com.sdrplay.service` (needs sudo -- human action).
-2. Re-run the dial-shift/RBN-cross-correlation test from
-   `2026-09-09-20m-dial-shift-edge-artifact-confirmed.md` at a
-   properly-tuned gain (start around 15-20, sweep narrower from there) to
-   see whether the passband-edge artifact and the "4/5 known-strong
-   frequencies produce zero tracks" gap persist at a sane gain, or
-   substantially resolve.
-3. Consider whether `manta`'s `--soapy-gain` CLI docs/help text should
+`sudo launchctl kickstart` alone did not clear the wedged service (new
+PID confirmed via `ps`, but `activateStream()` still failed identically)
+-- a physical USB unplug/replug of the RSP1B itself was required. After
+that, streaming activation worked cleanly again at every tested gain.
+
+A 6-minute `manta run --json` capture at `--soapy-gain 15` against a
+simultaneous fresh RBN capture (20m, nighttime this time -- different
+DX than the earlier daytime session, but the point is the same-window
+comparison) confirms the gain fix is real: `snr_2500_db` peaked at 18.65
+dB (vs. `gain=40`'s 3.81 dB, and the earlier short sweep's best of 6.52
+dB at `gain=20`) and total decoded-character volume was far higher.
+
+**But it does not close the detection gap from
+`2026-09-09-20m-dial-shift-edge-artifact-confirmed.md`.** Checked against
+6 specific real, multi-skimmer-confirmed RBN spots in the exact capture
+window (K9YII @ 14037.0, WB7DND @ 14041.5, RT5T @ 14034.0, UA9URS @
+14022.8, W6ME @ 14052.5, W5MP @ 14012.5 kHz) -- **zero `TrackMeta` events
+within +/-3 kHz of any of them.** The 18.65 dB peak SNR traced back to
+the ~14075/14045 kHz artifact clusters (the same suspected-RTTY/unknown-
+interference clusters from the dial-shift doc), not a real CW station --
+and there was no RBN-confirmed spot at all near 14045-14050 kHz in this
+window either, so that in-CW-segment cluster isn't confirmed real either.
+A wider frequency search (+/-3 kHz, ruling out simple LO/calibration
+drift) still found nothing. Also notable: the passband-edge artifact's
+*share* of total track activity got worse at the better gain (~55% of
+all `TrackMeta` events in this run vs. 28-35% at `gain=40`) -- less
+attenuation lets more energy through everywhere, including whatever's
+driving the edge-channel artifact.
+
+A same-session audit of every other RSP1B-specific setting manta doesn't
+explicitly touch came back clean: `biasT_ctrl=false`, `rfnotch_ctrl=
+false`, `dabnotch_ctrl=false` (all currently off; their target bands --
+MW broadcast, DAB -- don't touch 14 MHz regardless), `iqcorr_ctrl=true`
+and DC-offset correction on (both beneficial), and `bandwidth` auto-
+selected to 200 kHz (correctly matched to the 192 kHz sample rate, not
+suspiciously wide). None of these explain the gap.
+
+**Conclusion: the gain-scale bug was real and worth fixing, but it is not
+the (or not the whole) explanation for "almost no real CW heard."**
+Something else -- most plausibly the physical antenna/feedline path
+specifically feeding the RSP1B (distinct from whatever feeds the
+FTdx10), or a detector/DSP issue that only manifests on real narrowband
+CW under real noise and isn't caught by synthetic Watterson-channel test
+vectors -- is still preventing this receive chain from hearing signals
+that other stations clearly hear. Not resolvable from software
+alone tonight.
+
+## Next steps
+
+1. ~~Restart `com.sdrplay.service`~~ Done, but insufficient alone -- also
+   needed a physical USB replug of the RSP1B (both are human/privileged
+   actions; note for next time a stream won't activate despite the
+   service looking fresh).
+2. Physically verify the RSP1B's actual antenna connection: is it truly
+   tapped off the same feedline as the FTdx10 (splitter/multicoupler), is
+   that connection solid, and does swapping which receiver sits on which
+   tap change which one hears real CW? This is the most direct way to
+   tell "antenna path to the RSP1B specifically" from "manta's detector"
+   as the culprit.
+3. If the antenna path checks out, the detector/DSP side needs real
+   investigation -- e.g. capture a raw IQ file at a known-strong RBN
+   frequency and inspect it independently of manta's own track/detector
+   pipeline (a spectrum/waterfall view, or a minimal non-manta CW
+   demodulator) to see if the signal is present in the IQ stream at all
+   before blaming detection logic.
+4. Consider whether `manta`'s `--soapy-gain` CLI docs/help text should
    warn explicitly that higher values mean *more* attenuation on this
    driver, since that's the opposite of the ordinary-English reading of
    "gain" -- a real footgun for anyone operating this from the command
