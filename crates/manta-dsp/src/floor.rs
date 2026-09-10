@@ -104,11 +104,29 @@ pub struct FloorBank {
     floor_db: Vec<f64>,
     block_floor_db: Vec<f64>,
     hop_counter: u64,
-    /// Per-hop EMA (tau = 40 ms, same alpha as Gate) of each channel's dB
-    /// power, kept here so the decoder's spectral noise reference (SPEC v2
-    /// §2.2) needs no extra per-channel state.
-    smoothed_db: Vec<f64>,
+    /// Per-hop EMA (tau = 40 ms, same alpha as Gate) of each channel's
+    /// LINEAR power, kept here so the decoder's spectral noise reference
+    /// (SPEC v2 §2.2) needs no extra per-channel state.
+    ///
+    /// Codex review, PR #161 round 12: SPEC v2 §2.1-2.2 defines `P_s` as
+    /// an EMA of LINEAR channel power, not dB. Averaging dB values
+    /// directly understates exactly the transient this reference exists
+    /// to catch: a one-hop rise from -90 to -30 dB averages to about
+    /// -86 dB in dB-space (`GATE_EMA_ALPHA` is small, so the dB-space
+    /// mean barely moves) but about -42 dB in linear-power space -- the
+    /// correct answer, since a linear-power EMA is dominated by the
+    /// large new value the way real leakage power actually behaves.
+    /// Stored in linear units; `spectral_reference_db` converts the
+    /// selected minimum back to dB when read.
+    smoothed_lin: Vec<f64>,
     smoothed_init: bool,
+}
+
+/// `10^(db/10)`, the inverse of `manta_dsp::channelizer::power_db`'s
+/// `10*log10(power)` (minus that function's epsilon, negligible outside
+/// the extreme floor).
+fn db_to_linear(db: f64) -> f64 {
+    10f64.powf(db / 10.0)
 }
 
 impl FloorBank {
@@ -120,7 +138,7 @@ impl FloorBank {
             floor_db: vec![HIST_MIN_DB; n_channels],
             block_floor_db: vec![HIST_MIN_DB; n_blocks],
             hop_counter: 0,
-            smoothed_db: vec![HIST_MIN_DB; n_channels],
+            smoothed_lin: vec![db_to_linear(HIST_MIN_DB); n_channels],
             smoothed_init: false,
         }
     }
@@ -141,11 +159,14 @@ impl FloorBank {
             self.channels.len()
         );
         if self.smoothed_init {
-            for (s, &p) in self.smoothed_db.iter_mut().zip(power_db) {
-                *s += GATE_EMA_ALPHA * (p - *s);
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
+                let p_lin = db_to_linear(p);
+                *s += GATE_EMA_ALPHA * (p_lin - *s);
             }
         } else {
-            self.smoothed_db.copy_from_slice(power_db);
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
+                *s = db_to_linear(p);
+            }
             self.smoothed_init = true;
         }
         if self.hop_counter % DECIMATION_HOPS == 0 {
@@ -174,13 +195,13 @@ impl FloorBank {
     /// guard-banded neighbor channels c±2..c±4 (wrapping), in dB,
     /// uncorrected for the min-of-six bias (the decoder applies it).
     pub fn spectral_reference_db(&self, c: usize) -> f64 {
-        let n = self.smoothed_db.len() as isize;
+        let n = self.smoothed_lin.len() as isize;
         let mut m = f64::INFINITY;
         for d in [-4isize, -3, -2, 2, 3, 4] {
             let k = (c as isize + d).rem_euclid(n) as usize;
-            m = m.min(self.smoothed_db[k]);
+            m = m.min(self.smoothed_lin[k]);
         }
-        m
+        10.0 * m.log10()
     }
 }
 
@@ -460,5 +481,33 @@ mod tests {
             bank.update(&p);
         }
         assert!((bank.spectral_reference_db(0) - -99.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn spectral_reference_ema_averages_linear_power_not_db() {
+        // Codex review, PR #161 round 12: SPEC v2 §2.1-2.2 defines P_s as
+        // an EMA of LINEAR channel power. A dB-space EMA badly understates
+        // a transient rise: after settling at -90 dB, one hop at -30 dB
+        // averages to about -86 dB in dB-space but about -42 dB in
+        // linear-power space -- the correct answer, since real leakage
+        // power should actually raise the reference. Bump every guard-band
+        // neighbor of channel 10 identically so the min-of-six selection
+        // reflects the transient directly.
+        let mut bank = FloorBank::new(64);
+        let steady = vec![-90.0; 64];
+        for _ in 0..400 {
+            bank.update(&steady);
+        }
+        let mut bumped = steady.clone();
+        for &k in &[6usize, 7, 8, 12, 13, 14] {
+            bumped[k] = -30.0;
+        }
+        bank.update(&bumped);
+        let r = bank.spectral_reference_db(10);
+        assert!(
+            (r - -42.0).abs() < 1.0,
+            "expected the linear-power EMA answer (~-42 dB) after a one-hop transient across \
+             every guard-band neighbor, got {r}"
+        );
     }
 }

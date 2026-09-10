@@ -1124,6 +1124,18 @@ fn load_decode_config_file(
             cfg.hsmm.mark_insert_penalty
         );
     }
+    // Codex review, PR #161 round 12: `noise_min_bias_db = inf` (used by
+    // both edge-legacy and hsmm) makes `NoiseTracker::new`'s `b_min`
+    // infinite; every temporal noise estimate then becomes infinite and
+    // the evidence gate stays closed forever, silently emitting nothing.
+    if !cfg.noise.noise_min_bias_db.is_finite() {
+        bail!(
+            "[decode] noise_min_bias_db must be finite in {} (got {}; a non-finite value makes \
+             every temporal noise estimate infinite, silently closing the evidence gate)",
+            path.display(),
+            cfg.noise.noise_min_bias_db
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2619,6 +2631,12 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_nan_mark_insert_penalty() {
         let f = write_temp_file(b"[decode]\nmark_insert_penalty = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_noise_min_bias_db() {
+        let f = write_temp_file(b"[decode]\nnoise_min_bias_db = inf\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
