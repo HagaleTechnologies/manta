@@ -50,6 +50,8 @@ mod tests {
             confidence: 0.9,
             track_id: 1,
             sample_ts: 0,
+            rst: None,
+            qrl_query: false,
         }
     }
 
@@ -85,6 +87,20 @@ mod tests {
         assert!(
             line.contains("K5ARH/QRP CW"),
             "call and mode ran together: {line}"
+        );
+    }
+
+    #[test]
+    fn rst_and_qrl_never_reach_the_rbn_line() {
+        // MAN-33 decision D5: the DX de line is the aggregator/RBN compatibility
+        // surface (and feeds the outbound uplink), so spot-content annotations
+        // stay on the JSON stream. This test is the guard, not an oversight.
+        let mut spot = sample_spot();
+        spot.rst = Some("599".to_string());
+        spot.qrl_query = true;
+        assert_eq!(
+            format_line(&spot, "W3XYZ", 11_520),
+            "DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z"
         );
     }
 }

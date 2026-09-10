@@ -15,6 +15,16 @@
 //! definition outside every DXCC entity, so it gets ADIF's own
 //! `NO_DXCC_ENTITY` (0) plus unknown continent/zone/lat/lon instead of its
 //! home entity's geography.
+//!
+//! `rst`/`qrlQuery` (MAN-33) are manta proposals ahead of the dispensa
+//! contract, not yet in `spots.v1.schema.json` -- see
+//! `docs/DECISIONS/2026-09-09-man33-rst-qrl-spot-content.md`. Because they are
+//! not yet ratified there, and a consumer validating against `spots.v1` may
+//! set `additionalProperties: false`, both are `skip_serializing_if`: a spot
+//! that carries neither annotation (the overwhelming majority) serializes
+//! byte-identically to the pre-MAN-33 wire, so an unratified key can never
+//! make the whole stream unparseable -- only the spots that genuinely carry
+//! the new information present it (PR #159 review finding).
 
 use manta_spot::cty;
 use manta_spot::Spot;
@@ -146,9 +156,27 @@ pub struct SpotMessage {
     pub de_continent: String,
     pub snr: Option<i32>,
     pub wpm: Option<i32>,
+    /// MAN-33: the most recent RST decoded on this track, three digits.
+    /// Proposed addition to dispensa's spots.v1 contract -- see
+    /// docs/DECISIONS/2026-09-09-man33-rst-qrl-spot-content.md. Omitted from
+    /// the wire entirely when absent (see this module's doc comment), rather
+    /// than serialized as `null` the way the contract's own nullable-required
+    /// fields are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rst: Option<String>,
+    /// MAN-33: this station sent a QRL? frequency query. Omitted from the wire
+    /// when false, for the same unratified-contract reason as `rst`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub qrl_query: bool,
     pub decode_confidence: Option<f32>,
     pub decoder_version: Option<String>,
     pub channelizer_resolution_hz: Option<f64>,
+}
+
+/// `skip_serializing_if` predicate for `qrl_query` -- `bool` has no
+/// `is_none`-shaped inherent method taking `&self`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl SpotMessage {
@@ -232,6 +260,8 @@ impl SpotMessage {
             de_continent: de.continent,
             snr: Some(spot.snr_db.round() as i32),
             wpm: Some(spot.wpm.round() as i32),
+            rst: spot.rst.clone(),
+            qrl_query: spot.qrl_query,
             decode_confidence: Some(spot.confidence),
             decoder_version: Some(decoder_version.to_string()),
             channelizer_resolution_hz: None,
@@ -261,7 +291,42 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             confidence: 0.9,
             track_id: 7,
             sample_ts: 12_345,
+            rst: None,
+            qrl_query: false,
         }
+    }
+
+    #[test]
+    fn rst_and_qrl_reach_the_wire_under_their_contract_names() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let mut spot = sample_spot();
+        spot.rst = Some("599".to_string());
+        spot.qrl_query = true;
+        let m = SpotMessage::from_spot(&spot, "W5AU", &cty, "manta-0.1.0", 1_700_000_000, 7);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""rst":"599""#), "wire was {json}");
+        assert!(json.contains(r#""qrlQuery":true"#), "wire was {json}");
+    }
+
+    #[test]
+    fn a_spot_with_no_message_content_omits_both_keys_entirely() {
+        // PR #159 review finding: `rst`/`qrlQuery` are not in dispensa's
+        // published spots.v1 schema yet, so a consumer that rejects unknown
+        // properties would reject EVERY spot if these were always present.
+        // Skipping them when empty keeps the pre-MAN-33 wire byte-identical
+        // for any spot that carries no message content.
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let m = SpotMessage::from_spot(
+            &sample_spot(),
+            "W5AU",
+            &cty,
+            "manta-0.1.0",
+            1_700_000_000,
+            7,
+        );
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains(r#""rst""#), "wire was {json}");
+        assert!(!json.contains(r#""qrlQuery""#), "wire was {json}");
     }
 
     #[test]

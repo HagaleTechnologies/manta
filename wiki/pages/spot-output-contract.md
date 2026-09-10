@@ -9,8 +9,8 @@ sources:
   - README.md
   - CLAUDE.md
 verified:
-  commit: 01d1ea1
-  date: 2026-09-07
+  commit: 5b9e747
+  date: 2026-09-09
 links:
   - spot-validation
 ---
@@ -25,3 +25,5 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 ## Status caveat
 
 A schema now exists in dispensa and rejects malformed batches — this is no longer design-phase. `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are required and non-nullable on it; every spot carries real or named-sentinel values for all five (never `null`), per `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`, which is the authoritative record of what each field means when a callsign doesn't resolve — see that doc and ARCHITECTURE §7 rather than restating the field set here. Validated spots reaching these surfaces come from [[spot-validation]].
+
+manta now emits two fields (`rst`, `qrlQuery`) ahead of the dispensa contract — MAN-33's message-content annotations, JSON stream only, never the telnet line, and omitted from the wire when empty so an unratified key can never make the whole stream unparseable for a strict consumer. See `docs/DECISIONS/2026-09-09-man33-rst-qrl-spot-content.md` for the proposed schema fragment, the omit-when-empty rationale, and why telnet is excluded; do not restate the fields here.

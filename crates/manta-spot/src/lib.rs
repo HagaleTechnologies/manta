@@ -10,6 +10,7 @@ pub mod cty;
 pub mod dedupe;
 pub mod gate;
 pub mod grammar;
+pub mod message;
 pub mod notch;
 pub mod scp;
 pub mod validator;

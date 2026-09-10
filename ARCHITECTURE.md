@@ -247,6 +247,40 @@ transmission may never produce again).
    occurrence already evaluated as a Beacon before the guard appeared is
    not a loss and is not counted). Context
    determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+
+   **1a. Message-content annotations (MAN-33)**: alongside the context parse,
+   each completed word is scanned for an RST signal report (including the
+   `5NN` cut-number form, normalized to `599`) and a `QRL?` frequency query
+   (the interrogative form only — a bare `QRL` is the *response* "the
+   frequency is in use" and is not flagged). Both are carried on the spot as
+   annotations — the most recently decoded RST, and a QRL-query flag sticky
+   for the track's lifetime. Both follow the *signal identity*, not the
+   track id: when two converged tracks merge, the losing track's QRL flag
+   and its RST (if it is the chronologically later of the two) migrate to
+   the survivor, exactly as pending Beacon candidates do, since the
+   survivor continues the same station's transmission. Three ordering
+   guarantees make that migration observable rather than merely intended:
+   `TrackManager::merge_converged` collapses a same-batch merge *chain*
+   (`A → B → C`) to its final survivor before reporting it, so the
+   redirect never names a track that is itself closing; the
+   merge-loser's `TrackClosed` sorts at the hop the merge happened on
+   rather than at end-of-batch, so it lands after the loser's own final
+   decoder events and before any survivor word that follows the merge and
+   could emit a spot; and a survivor a redirect has already *named* is
+   guaranteed its own eventual `TrackClosed` even if it never decodes
+   anything itself, so a chain spread across *batches* (`A → B` reported
+   before `B → C` is decided, with `B` silent throughout) still forwards
+   `A`'s annotations on to `C` instead of stranding them under `B` — the
+   one case the same-batch collapse structurally cannot reach. That last
+   guarantee is the sole exception to the MAN-19 rule that only a track
+   which emitted a real event is reported closed; it adds the bookkeeping
+   closure only, never decoder output for a track the stream never
+   showed. **None of them gates any
+   step below**: a callsign that fails grammar/cty/repetition is
+   not rescued by carrying an RST. They reach the JSON Lines stream (§7)
+   only; the RBN telnet line is a fixed compatibility format with no field
+   slot for them, matching CW Skimmer, which shows its own 599/QRL? labels
+   in the band map rather than in what it uploads.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
    refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
@@ -310,7 +344,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
   clients not to choke. This is the RBN/aggregator compatibility surface.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
-  (adds confidence, track id, decoder text context). This is the cqdx ingest
+  (adds confidence, track id, decoder text context — including the `rst` and
+  `qrlQuery` message-content annotations from §6 step 1a, MAN-33, each omitted
+  from the wire when empty because they are not yet ratified in the dispensa
+  contract). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
   existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
   `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
