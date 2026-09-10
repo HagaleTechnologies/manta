@@ -7,6 +7,8 @@ maintainer: agent
 sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
+  - docs/DECISIONS/2026-09-09-20m-dial-shift-edge-artifact-confirmed.md
+  - docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md
 verified:
   commit: a1aad7da9e8cb98de7c2c68881b81d95c2bc98e6
   date: 2026-09-09
@@ -91,6 +93,22 @@ signal, not a detection/spot-generation bug) — see
 for the full original reasoning; treat the interior-passband clusters as
 a separate, still-untracked question until proven otherwise.
 
+**Update, confirmed on 20m** (`2026-09-09-20m-dial-shift-edge-artifact-
+confirmed.md`): a two-run dial-shift test (+30 kHz between runs) nails
+down both halves of this. **Both passband edges are a real detector/
+channelizer artifact** — `TrackPromoted` rate spikes ~3 kHz in from each
+true edge of the tuned passband in both runs, tracking the edge as it
+moves, and none of these edge tracks ever confirmed a spot. Together they
+were 28-35% of all promoted tracks in that session — a real cost even
+though they don't produce false spots. Separately, **an interior cluster
+around 14075 kHz did NOT move with the dial** — same absolute frequency
+both times — so it's not the same artifact; it's inside the US 20m RTTY/
+data segment (14070-14095 kHz) and is more likely a real continuous
+digital-mode signal whose keying trips the CW detector into promoting
+tracks that never validate (not confirmed against a live waterfall). Root
+cause of the edge artifact itself is still open (PFB edge-channel
+behavior is the leading suspect).
+
 **`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
 track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
 `envelope.rs`'s rail-collapse clamp (`e_hi >= 2*e_lo`, SPEC §3.2) — but
@@ -145,3 +163,30 @@ outright). Also: a single `ErrorCode::Overflow` on a live USB stream used
 to kill the whole session outright — fixed in `crates/manta-input/src/
 soapy.rs` (#146, 2026-09-09) with its own bounded retry, so this is no
 longer something you need to work around.
+
+**`--soapy-gain` is a gain-*reduction* (attenuation) scale on this
+driver, not a gain scale — bigger number means less sensitive, not
+more** (`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`). `0` is
+maximum sensitivity, `48` is minimum. Every field session through
+2026-09-09 used `--soapy-gain 40`, which pins the IF stage at its
+absolute maximum attenuation (`IFGR=59`, the top of its whole `[20,59]`
+range) — chosen only to avoid the top-of-range activation failure above,
+never checked against actual sensitivity. A live sweep found chars-
+decoded and peak SNR both markedly better at `gain=10-20` than at `40`
+(`gain=0` is worse than `40`, though — the front end likely overloads on
+this busy an antenna at max sensitivity, so it's not simply "always use
+the minimum"). **Start future sessions around `gain=15-20` and sweep
+narrower from there, not `40`.** This may substantially explain why prior
+sessions heard almost no real CW despite RBN showing abundant real
+activity on the same frequencies.
+
+**The `sdrplay_apiService` daemon can wedge mid-session** (root-owned
+LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
+enumeration (`SoapySDRUtil --find`/`--probe`) keeps working, but stream
+`activate()` starts failing (`sdrplay_api_Fail`/`sdrplay_api_
+ServiceNotResponding`) consistently across every gain value, not just
+one. No client-side fix resolves this (confirmed: no process was holding
+the device per `lsof`) — it needs `sudo launchctl kickstart -k
+system/com.sdrplay.service` (or a service restart), a privileged action.
+If a run that worked minutes ago suddenly can't `activateStream()` at
+all, check this before assuming it's gain- or code-related.
