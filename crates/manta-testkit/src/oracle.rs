@@ -325,8 +325,17 @@ pub fn run_oracle(
 fn summarize(spots: &[OracleSpot], results: &[OracleResult]) -> OracleSummary {
     let mut ratios: Vec<f32> = results.iter().filter_map(|r| r.wpm_ratio).collect();
     ratios.sort_by(f32::total_cmp);
+    // Codex review, PR #161 round 14: `ratios[len/2]` picks the UPPER
+    // middle value for an even-length set instead of averaging the two
+    // central values -- e.g. [0.9, 1.1] reported 1.1, not the
+    // conventional median 1.0. The stage-1 acceptance gate compares this
+    // against [0.95, 1.05], so an even-sized result set could incorrectly
+    // pass or fail purely from this rounding-direction bug.
     let median = if ratios.is_empty() {
         None
+    } else if ratios.len() % 2 == 0 {
+        let hi = ratios.len() / 2;
+        Some((ratios[hi - 1] + ratios[hi]) / 2.0)
     } else {
         Some(ratios[ratios.len() / 2])
     };
@@ -464,5 +473,72 @@ mod timestamp_tests {
         // must be a hard error, never silently treated as UTC.
         assert!(parse_utc_timestamp("2025-11-29T00:00:00+05:00").is_err());
         assert!(parse_utc_timestamp("2025-11-29T00:00:00-08:00").is_err());
+    }
+}
+
+#[cfg(test)]
+mod summarize_tests {
+    use super::*;
+
+    fn result_with_ratio(wpm_ratio: f32) -> OracleResult {
+        OracleResult {
+            call: "W5AU".to_string(),
+            khz: 14000.0,
+            as_word: false,
+            framed: false,
+            substring: false,
+            wpm_ratio: Some(wpm_ratio),
+            text: String::new(),
+        }
+    }
+
+    fn spot() -> OracleSpot {
+        OracleSpot {
+            call: "W5AU".to_string(),
+            khz: 14000.0,
+            t_sec: 0.0,
+            snr_db: 20,
+            wpm: 20,
+        }
+    }
+
+    #[test]
+    fn median_averages_the_two_central_values_for_an_even_sized_set() {
+        // Codex review, PR #161 round 14: ratios[len/2] picked the upper
+        // middle value for an even-length set (e.g. [0.9, 1.1] reported
+        // 1.1, not the conventional median 1.0), which could flip the
+        // stage-1 acceptance gate's [0.95, 1.05] pass/fail comparison.
+        let results = vec![result_with_ratio(0.9), result_with_ratio(1.1)];
+        let spots = vec![spot(), spot()];
+        let summary = summarize(&spots, &results);
+        assert_eq!(summary.wpm_ratio_median, Some(1.0));
+    }
+
+    #[test]
+    fn median_is_the_middle_value_for_an_odd_sized_set() {
+        let results = vec![
+            result_with_ratio(0.8),
+            result_with_ratio(1.0),
+            result_with_ratio(1.4),
+        ];
+        let spots = vec![spot(), spot(), spot()];
+        let summary = summarize(&spots, &results);
+        assert_eq!(summary.wpm_ratio_median, Some(1.0));
+    }
+
+    #[test]
+    fn median_is_none_when_no_result_has_a_wpm_ratio() {
+        let results = vec![OracleResult {
+            call: "W5AU".to_string(),
+            khz: 14000.0,
+            as_word: false,
+            framed: false,
+            substring: false,
+            wpm_ratio: None,
+            text: String::new(),
+        }];
+        let spots = vec![spot()];
+        let summary = summarize(&spots, &results);
+        assert_eq!(summary.wpm_ratio_median, None);
     }
 }

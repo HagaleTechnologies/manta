@@ -1150,6 +1150,19 @@ fn load_decode_config_file(
             cfg.hsmm.lookahead_dits
         );
     }
+    // Codex review, PR #161 round 14: `noise_window_ms` <= 0 or NaN casts
+    // to zero in `ms_to_hops`, silently reducing the minimum-statistics
+    // window to one hop (keyed power itself becomes the noise floor,
+    // suppressing EdgeLegacy/HSMM output); infinity becomes `u32::MAX`,
+    // letting each track's deque grow for effectively the process
+    // lifetime.
+    if !cfg.noise.noise_window_ms.is_finite() || cfg.noise.noise_window_ms <= 0.0 {
+        bail!(
+            "[decode] noise_window_ms must be finite and positive in {} (got {})",
+            path.display(),
+            cfg.noise.noise_window_ms
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2670,6 +2683,18 @@ mod tests {
     fn load_decode_config_file_accepts_zero_lookahead_dits() {
         let f = write_temp_file(b"[decode]\nlookahead_dits = 0.0\n");
         assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nonpositive_noise_window_ms() {
+        let f = write_temp_file(b"[decode]\nnoise_window_ms = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_infinite_noise_window_ms() {
+        let f = write_temp_file(b"[decode]\nnoise_window_ms = inf\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
     #[test]
