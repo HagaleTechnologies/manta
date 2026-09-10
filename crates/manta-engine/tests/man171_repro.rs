@@ -17,6 +17,10 @@ fn sig(offset_hz: f64, snr_2500_db: f32) -> SignalSpec {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     }
 }
 
