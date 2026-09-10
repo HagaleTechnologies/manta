@@ -80,6 +80,13 @@ const CALL_START_COL: usize = 27;
 /// callsign column (27-41). Also an absolute anchor, so an over-long
 /// callsign -- or an already-shifted frequency -- is absorbed here rather
 /// than moving the SNR, WPM, type and time fields.
+///
+/// A callsign that ends exactly on column 41 fills the column rather than
+/// overrunning it, so the gap before the mode field is zero and this
+/// anchor still holds (`a_callsign_that_fills_the_column_exactly_keeps_
+/// the_mode_column_at_42`). Only a call that runs past column 41 gives up
+/// the anchor, and then only down to one mandatory separating space
+/// (`a_callsign_one_column_past_the_field_keeps_its_mandatory_separator`).
 const MODE_START_COL: usize = 42;
 
 /// The remaining four anchors are expressed as offsets from the column the
@@ -114,11 +121,15 @@ const TIME_START_OFFSET: usize = 24;
 /// no wall-clock time).
 ///
 /// Every field after the spotter identity is anchored to an absolute
-/// column (MAN-88): the identity and callsign fields are MINIMUM widths
-/// with a guaranteed one-space separator, never truncated -- an oversized
-/// value (e.g. MAN-28's Watch List bypasses callsign-grammar validation)
-/// shifts the field that follows it right rather than corrupting a field
-/// or forging a shorter identity.
+/// column (MAN-88): the identity and callsign fields are MINIMUM widths,
+/// never truncated -- an oversized value (e.g. MAN-28's Watch List
+/// bypasses callsign-grammar validation) shifts the field that follows it
+/// right rather than corrupting a field or forging a shorter identity, and
+/// keeps one mandatory separating space so a whitespace-splitting parser
+/// still sees two tokens. A value that fills its column exactly is a fit,
+/// not an overflow: it keeps the next field on its own anchor and takes a
+/// zero-width gap, which is how the layout's fixed columns survive a
+/// 15-character callsign.
 ///
 /// Each anchor is computed from the column the *previous* field actually
 /// ended on, so an overrun is absorbed by the next separator instead of
@@ -157,10 +168,22 @@ pub fn format_line(
     // and everything after it one column right.
     let call_gap = CALL_START_COL.saturating_sub(freq_end_col + 1).max(1);
     let call_end_col = freq_end_col + call_gap + spot.callsign.chars().count();
-    // Same rule for the mode column: MAN-28's Watch List bypasses the
-    // callsign grammar, so an allowlisted entry can exceed the 15-wide
-    // callsign column and eat this gap down to its mandatory space.
-    let mode_gap = MODE_START_COL.saturating_sub(call_end_col + 1).max(1);
+    // Same rule for the mode column, with one refinement the review of PR
+    // #114 asked for: the callsign column is exactly 15 wide (27-41), so a
+    // call that *fills* it is a fit, not an overflow -- the gap before the
+    // mode field is then legitimately zero and the mode column keeps its
+    // own anchor at 42. Forcing a separator there would have inserted a
+    // 16th callsign column and walked the mode, SNR, WPM, type and time
+    // fields one column right, which is precisely what a fixed-column
+    // parser cannot survive. The mandatory one-space separator is reserved
+    // for an actual overrun: MAN-28's Watch List bypasses the callsign
+    // grammar, so an allowlisted entry longer than the column can reach
+    // the renderer, and that value must not abut the mode token.
+    let mode_gap = if call_end_col < MODE_START_COL {
+        MODE_START_COL - call_end_col - 1
+    } else {
+        1
+    };
     // The mode field's own trailing padding is the separator to the SNR
     // field -- there is no extra gap in the RBN layout (columns 42-47).
     let mode = match line_format {
@@ -418,6 +441,84 @@ mod tests {
             line.contains("SOMEVERYLONGWATCHLISTCALL CW"),
             "line was: {line}"
         );
+    }
+
+    /// MAN-88 PR #114 review finding: a callsign that fills the 15-wide
+    /// column exactly (columns 27-41) is a *fit*, not an overflow. The
+    /// mode column must still start on column 42 and every field after it
+    /// on its own RBN column; a mandatory separator here would have made
+    /// the callsign column 16 wide and pushed mode/SNR/WPM/type/time to
+    /// 43/49/56/64/72. Reachable because MAN-28's Watch List bypasses the
+    /// callsign grammar entirely, so an allowlisted 15-character entry
+    /// reaches the renderer. The cost is that this one exact fit abuts the
+    /// mode token -- the fixed columns are what the ticket asks for, and
+    /// this is the only length at which the two rules conflict.
+    #[test]
+    fn a_callsign_that_fills_the_column_exactly_keeps_the_mode_column_at_42() {
+        let mut spot = capture_spot();
+        spot.callsign = "VK9/W3XYZ/QRP12".to_string();
+        assert_eq!(
+            spot.callsign.chars().count(),
+            15,
+            "test vector must be an exact fit"
+        );
+        let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
+        let ctx = format!("line was: {line}");
+        assert_eq!(col_of(&line, "VK9/W3XYZ/QRP12"), 27, "{ctx}");
+        assert_eq!(col_of(&line, "CW"), 42, "{ctx}");
+        assert_eq!(col_of(&line, "21 dB"), 48, "{ctx}");
+        assert_eq!(col_of(&line, "25 WPM"), 55, "{ctx}");
+        assert_eq!(&line[62..68], "CQ    ", "{ctx}");
+        assert_eq!(col_of(&line, "0236Z"), 71, "{ctx}");
+    }
+
+    /// The exact-fit rule must not leak into a genuine overrun: one column
+    /// past the callsign field, the mode column gives up its anchor rather
+    /// than let the two tokens run together.
+    #[test]
+    fn a_callsign_one_column_past_the_field_keeps_its_mandatory_separator() {
+        let mut spot = capture_spot();
+        spot.callsign = "VK9/W3XYZ/QRP123".to_string();
+        assert_eq!(
+            spot.callsign.chars().count(),
+            16,
+            "test vector must overrun by one"
+        );
+        let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
+        assert!(line.contains("VK9/W3XYZ/QRP123 CW"), "line was: {line}");
+        // The whole tail moves as a block: one column for the extra
+        // character, one for the separator the overrun now needs.
+        assert_eq!(col_of(&line, "CW"), 44, "line was: {line}");
+        assert_eq!(col_of(&line, "0236Z"), 73, "line was: {line}");
+    }
+
+    /// The exact-fit rule crossed with the wide-SNR rule: a 15-character
+    /// Watch List entry and a three-character SNR together must still
+    /// leave the WPM, type and time columns where a fixed-column parser
+    /// reads them.
+    #[test]
+    fn an_exact_fit_callsign_and_a_wide_snr_still_keep_the_later_columns() {
+        let mut spot = capture_spot();
+        spot.callsign = "VK9/W3XYZ/QRP12".to_string();
+        spot.snr_db = -14.0;
+        let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Rbn);
+        let ctx = format!("line was: {line}");
+        assert_eq!(col_of(&line, "CW"), 42, "{ctx}");
+        assert_eq!(col_of(&line, "-14 dB"), 48, "{ctx}");
+        assert_eq!(col_of(&line, "25 WPM"), 55, "{ctx}");
+        assert_eq!(&line[62..68], "CQ    ", "{ctx}");
+        assert_eq!(col_of(&line, "0236Z"), 71, "{ctx}");
+    }
+
+    /// The same exact fit in the CW-Skimmer layout: the mode field is 2
+    /// wide there, so the callsign column ends on 41 and the tail follows
+    /// four columns left of the RBN one -- time on column 67.
+    #[test]
+    fn an_exact_fit_callsign_keeps_the_skimmer_time_column_at_67() {
+        let mut spot = capture_spot();
+        spot.callsign = "VK9/W3XYZ/QRP12".to_string();
+        let line = format_line(&spot, "S53A", 2 * 3600 + 36 * 60, LineFormat::Skimmer);
+        assert_eq!(col_of(&line, "0236Z"), 67, "line was: {line}");
     }
 
     /// Decision 3: an identity too long for columns 1-16 shifts the line right

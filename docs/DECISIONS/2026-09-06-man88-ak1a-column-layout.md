@@ -29,7 +29,7 @@ Indexed column-by-column, this gives a fixed absolute-column layout:
 | padding | … | frequency's last char lands on column **24** |
 | frequency, kHz | ends at **24** | `{:.2}` — 2 decimals, never truncated |
 | separator | 25-26 | pads to the callsign column; minimum one space |
-| callsign | **27**-41 | left-justified, minimum width **15** |
+| callsign | **27**-41 | left-justified, minimum width **15**; an exact 15-character fit keeps the mode column at 42, only a genuine overrun takes a separator |
 | mode | **42**-47 | `"CW"` in a 6-wide field; its own padding is the separator |
 | SNR | 48-52 | `{:>2} dB` |
 | separator | 53-54 | two spaces |
@@ -128,6 +128,26 @@ column to 28, and even there the mode column onwards re-anchors at 42.
 Pinned by `a_seven_character_spotter_drifts_only_the_frequency_field`,
 `a_six_character_spotter_on_two_metres_keeps_every_later_column`, and
 `every_spotter_length_and_band_keeps_the_later_columns_anchored`.
+
+A value that **fills** its column exactly is a fit, not an overflow (the
+second PR #114 review raised the 15-character callsign as the case the
+paragraph above got wrong). A Watch List entry of exactly 15 characters
+occupies columns 27-41, which is the callsign column, so the gap before
+the mode field is legitimately zero and the mode column keeps its own
+anchor at 42. Forcing the mandatory separator there instead would have
+made the callsign column 16 wide for that one length and walked the mode,
+SNR, WPM, type and time fields to 43/49/56/64/72 — the exact failure mode
+this ticket exists to remove. The mandatory one-space separator is
+therefore reserved for a genuine overrun (16 characters or more), which
+still shifts the tail as a block. The cost is that this single length
+abuts the mode token for a whitespace-splitting parser; the fixed columns
+win, because a 15-character allowlist entry is already outside the
+callsign grammar while a fixed-column parser is the consumer the ticket
+names. Pinned by
+`a_callsign_that_fills_the_column_exactly_keeps_the_mode_column_at_42`,
+`a_callsign_one_column_past_the_field_keeps_its_mandatory_separator`,
+`an_exact_fit_callsign_and_a_wide_snr_still_keep_the_later_columns`, and
+`an_exact_fit_callsign_keeps_the_skimmer_time_column_at_67`.
 
 Absorbing rather than cascading is manta's own documented choice, not a
 reproduction of how RBN itself pads a longer identity — no multi-line
