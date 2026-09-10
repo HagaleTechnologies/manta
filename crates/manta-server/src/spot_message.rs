@@ -74,6 +74,58 @@ pub fn is_outside_any_dxcc_entity(callsign: &str) -> bool {
     })
 }
 
+/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
+/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
+/// exactly the condition `manta_spots_unresolved_geography_total` counts.
+///
+/// Lives HERE, beside the code it mirrors, rather than in `manta-cli`
+/// (PR #131 review, round 7): a predicate whose whole contract is "answers
+/// the same question `from_spot` answers" drifts the moment the two live in
+/// different crates -- which is precisely how the SSID gap below arose.
+///
+/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
+/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
+/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
+/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
+/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
+/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
+/// alone would let those spots go out carrying `dxDxcc: -1` with the
+/// counter still at zero, silently withholding the one signal this metric
+/// exists to give (MAN-136 round-1 validate code-review finding 1).
+///
+/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
+/// (MAN-136 round-7 review finding 2): `cty.lookup` answers for it through the
+/// base call's prefix, but `from_spot` deliberately discards that answer and
+/// emits `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the
+/// station's real position is unknown -- so the spot does carry the sentinels
+/// this counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
+/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
+/// the whole test.
+///
+/// Takes the callsign VERBATIM: on the dx side that is decoder output, which
+/// never carries an SSID. For the operator's own configured identity use
+/// `station_geography_unresolved` below, which strips it.
+pub fn geography_is_unresolved(cty: &cty::Table, callsign: &str) -> bool {
+    is_outside_any_dxcc_entity(callsign) || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
+}
+
+/// `geography_is_unresolved` for the operator's OWN `[server].station_callsign`,
+/// which -- unlike decoder output -- may carry an RBN `-N` per-band SSID
+/// (MAN-89 / D4).
+///
+/// The SSID is stripped HERE rather than at the call site (PR #131 review,
+/// round 7): `from_spot` above resolves the de side through
+/// `config::strip_ssid`, so any caller that classified the raw configured
+/// value would be answering a different question than the one it is reporting
+/// on. Left unstripped, an SSID'd mobile identity like `K5ARH/MM-1` reaches
+/// `is_outside_any_dxcc_entity` as `MM-1` rather than `MM` (so the /MM test
+/// misses) while `cty.lookup` still resolves through the allocated `K`
+/// prefix -- and every spot from that node goes out carrying the de-side
+/// sentinels with `manta_spots_unresolved_geography_total` stuck at zero.
+pub fn station_geography_unresolved(cty: &cty::Table, station_call: &str) -> bool {
+    geography_is_unresolved(cty, crate::config::strip_ssid(station_call))
+}
+
 /// The contract-required geography fields for ONE side of a spot, resolved
 /// together so `dxDxcc` can never disagree with the continent/CQ zone/lat/lon
 /// emitted beside it. `cq_zone` has no `de` counterpart on the wire schema
@@ -196,7 +248,14 @@ impl SpotMessage {
         // which cty.dat DOES answer (through the base call's prefix) but the
         // answer is wrong by definition -- see its doc comment.
         let dx = Geography::resolve(&spot.callsign, cty);
-        let de = Geography::resolve(station_call, cty);
+        // MAN-89: `station_call` may carry an RBN `-N` per-band SSID, which is a
+        // manta node index with no geographic meaning -- and which `cty.dat`'s
+        // exact-call alias rows would refuse to match (cty.rs:143-169 strips
+        // `/`-portable suffixes only). Resolve the operator's actual callsign;
+        // `de_call` and `id` below keep the full identity. Stripping before
+        // `Geography::resolve` also keeps `is_outside_any_dxcc_entity`'s
+        // `/MM`//`AM` check reading the same string the lookup does.
+        let de = Geography::resolve(crate::config::strip_ssid(station_call), cty);
         // `band` must be derived from the SAME rounded value reported as
         // `frequency` -- computing it from the unrounded `spot.freq_hz`
         // separately (round-5 review finding) could disagree with
@@ -262,6 +321,41 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             track_id: 7,
             sample_ts: 12_345,
         }
+    }
+
+    /// MAN-89: `station_callsign` may now carry a `-N` SSID, but `cty.dat`'s
+    /// exact-call alias rows (`prefix_entry`, cty.rs:143-154) only tolerate a
+    /// `/`-portable suffix, never `-` -- so an operator whose OWN callsign has an
+    /// exact override (`4U1UN` etc.) would silently lose it and fall through to a
+    /// generic prefix with the wrong entity, continent and coordinates. Measured
+    /// before the fix: `4U1UN` -> NA/lat 40.75, `4U1UN-1` -> EU/lat 42.82.
+    /// The `-N` is a manta band index with no geographic meaning; strip it for
+    /// the lookup, keep it in the identity.
+    #[test]
+    fn de_geography_ignores_the_ssid_on_an_exact_alias_callsign() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let bare = SpotMessage::from_spot(&sample_spot(), "4U1UN", &cty, "v", 0, 1);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "4U1UN-1", &cty, "v", 0, 1);
+
+        assert_eq!(ssid.de_dxcc, bare.de_dxcc);
+        assert_eq!(ssid.de_continent, bare.de_continent);
+        assert_eq!(ssid.de_lat, bare.de_lat);
+        assert_eq!(ssid.de_lon, bare.de_lon);
+        // The wire identity keeps the SSID -- geography is stripped, identity is not.
+        assert_eq!(ssid.de_call, "4U1UN-1");
+        assert!(ssid.id.starts_with("4U1UN-1:"));
+    }
+
+    /// An ordinary prefix callsign was never affected either way; pin it so a
+    /// future change to `strip_ssid` can't quietly start mangling the common case.
+    #[test]
+    fn de_geography_is_unchanged_for_an_ordinary_prefix_callsign() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let bare = SpotMessage::from_spot(&sample_spot(), "W5AU", &cty, "v", 0, 1);
+        let ssid = SpotMessage::from_spot(&sample_spot(), "W5AU-1", &cty, "v", 0, 1);
+        assert_eq!(ssid.de_dxcc, bare.de_dxcc);
+        assert_eq!(ssid.de_continent, bare.de_continent);
+        assert_eq!(ssid.de_lat, bare.de_lat);
     }
 
     #[test]

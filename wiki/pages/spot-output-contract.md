@@ -19,6 +19,7 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 ## Pointers
 
 - RBN telnet format and the command grammar manta supports (`sh/dx`, filters): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- What an operator may spell in `station_callsign`/`login_callsign` — including RBN's per-band `CALL-N` SSID, which the de-side identity on both surfaces carries verbatim while the `cty.dat` geography lookup behind `deContinent`/`deLat`/`deLon` sees it stripped: `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`. That record, not this page, is authoritative for the grammar; the server still appends its own `-#`.
 - JSON spot schema: **the schema is an ecosystem contract that belongs in the `dispensa` repo** (JSON Schema, ADR pending — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. When it lands, this page should point at the corresponding ADR in plain text.
 - cqdx is the intended first-class JSON ingest consumer (README "Relationship to sibling projects"); the boundary is referenced across repos, not linked from this wiki.
 

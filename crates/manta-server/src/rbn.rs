@@ -77,6 +77,22 @@ mod tests {
         assert!(line.ends_with("0000Z"), "line was: {line}");
     }
 
+    /// MAN-89 / D4: the `-#` suffix composes with an operator-configured `-N`
+    /// SSID to produce RBN's own `CALL-N-#` node identity.
+    #[test]
+    fn an_ssid_spotter_renders_as_call_n_hash() {
+        let line = format_line(&sample_spot(), "W5AU-1", 11_520);
+        assert!(line.starts_with("DX de W5AU-1-#:"), "line was: {line}");
+        // Never truncated, never abutting -- holds under any column layout.
+        assert!(
+            line.trim_end()
+                .strip_prefix("DX de W5AU-1-#:")
+                .unwrap()
+                .starts_with(' '),
+            "identity ran into the frequency: {line}"
+        );
+    }
+
     #[test]
     fn a_long_portable_call_is_separated_from_the_mode_field() {
         let mut spot = sample_spot();

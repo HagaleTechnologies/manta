@@ -4,6 +4,11 @@
 //! alphanumeric characters with at least one digit, at least one letter,
 //! ending in a letter, plus an optional portable designator (`/P`, `/QRP`,
 //! `/MM`, `/AM`, `/M`, or `/<digit>`).
+//!
+//! Scope: decoder output only. NOT operator-identity validation -- see
+//! `manta_server::config::check_operator_callsign` (MAN-45/MAN-89) for why a
+//! configured station callsign needs a wider, separately-designed rule
+//! (real DXCC prefix overrides, and RBN's `CALL-N-#` per-band SSIDs).
 
 /// True if `call` has the rough shape of an amateur-radio callsign.
 pub fn is_plausible(call: &str) -> bool {
