@@ -185,7 +185,11 @@ impl TrackDecoder {
             Engine::EdgeLegacy => {
                 let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
                 let mut events = Vec::new();
-                if let Some(ev) = self.evidence.push(amp, n, sample_ts) {
+                // Codex review, PR #161 round 9: `push` can now return more
+                // than one eligible center per input sample (a shrinking
+                // hold window draining its backlog) -- see
+                // `Evidence::push`'s doc comment.
+                for ev in self.evidence.push(amp, n, sample_ts) {
                     self.snr_from_evidence(&ev);
                     for run in self.edge.push(&ev) {
                         self.on_run(run, &mut events);
@@ -227,7 +231,12 @@ impl TrackDecoder {
     ) -> Vec<DecoderEvent> {
         let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
         let mut events = Vec::new();
-        if let Some(ev) = self.evidence.push(amp, n, sample_ts) {
+        // Codex review, PR #161 round 9: `push` can now return more than
+        // one eligible center per input sample -- see `Evidence::push`'s
+        // doc comment. Re-applying `set_u_ref` feedback per returned hop
+        // (not just once at the end) matches the same per-hop feedback
+        // pattern `finish()`'s incremental flush loop already uses.
+        for ev in self.evidence.push(amp, n, sample_ts) {
             self.snr_from_evidence(&ev);
             for c in self.hsmm.push(&ev) {
                 self.emit_committed(c, &mut events);

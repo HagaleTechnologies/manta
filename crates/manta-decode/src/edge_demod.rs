@@ -141,7 +141,7 @@ mod tests {
         let mut edge = EdgeDemod::new(12.0);
         let mut runs = Vec::new();
         for (i, &a) in env.iter().enumerate() {
-            if let Some(ev) = evidence.push(a, noise_amp, i as u64 * 256) {
+            for ev in evidence.push(a, noise_amp, i as u64 * 256) {
                 runs.extend(edge.push(&ev));
             }
         }
@@ -172,7 +172,7 @@ mod tests {
         let mut evidence = Evidence::new(EvidenceConfig::default());
         let mut edge = EdgeDemod::new(12.0);
         for (i, &a) in env.iter().enumerate() {
-            if let Some(ev) = evidence.push(a, noise_amp, i as u64 * 256) {
+            for ev in evidence.push(a, noise_amp, i as u64 * 256) {
                 edge.push(&ev);
             }
         }

@@ -113,7 +113,19 @@ impl Evidence {
         );
     }
 
-    pub fn push(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) -> Option<HopEvidence> {
+    /// Codex review, PR #161 round 9: returns every center that becomes
+    /// eligible from this one input sample, not just one. `set_u_ref`
+    /// shrinking `h` (a genuine speed increase) can make several already-
+    /// buffered centers eligible at once; the old one-in-one-out design
+    /// emitted only the first of them per call, so each SUBSEQUENT input
+    /// added one new sample and drained exactly one center -- the backlog
+    /// never actually contracted, and evidence (and therefore spots) kept
+    /// carrying the OLD, slower-speed latency instead of collapsing to
+    /// the new `hold_dits * u_ref` delay SPEC v2 §1.2 specifies. Usually
+    /// returns 0 or 1 elements (matching the old behavior exactly when
+    /// `h` is stable or growing); returns more only in the window-shrink
+    /// catch-up case this fixes.
+    pub fn push(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) -> Vec<HopEvidence> {
         let a_s = match self.a_s {
             None => amp,
             Some(p) => p + self.alpha_a * (amp - p),
@@ -124,27 +136,30 @@ impl Evidence {
         if self.line.len() > MAX_RETAIN {
             self.line.pop_front();
         }
-        let front_global = self.hop_in - self.line.len() as u64;
-        if self.next_center_g < front_global {
-            // Fell behind the retained window (should not happen with a
-            // generous MAX_RETAIN in practice); jump to the oldest
-            // available sample rather than panic on the subtraction below.
-            self.next_center_g = front_global;
+        let mut out = Vec::new();
+        loop {
+            let front_global = self.hop_in - self.line.len() as u64;
+            if self.next_center_g < front_global {
+                // Fell behind the retained window (should not happen with a
+                // generous MAX_RETAIN in practice); jump to the oldest
+                // available sample rather than panic on the subtraction below.
+                self.next_center_g = front_global;
+            }
+            let local = (self.next_center_g - front_global) as usize;
+            // `checked_add` guards against a pathological `h` (e.g. from an
+            // unvalidated `set_u_ref` input) overflowing `usize`; treat an
+            // overflow the same as "not enough lookahead yet" rather than
+            // panicking (debug) or wrapping into a spurious true / OOB index
+            // (release). The debug_assert!s in `new()`/`set_u_ref()` are the
+            // primary guard -- this is the release-build backstop.
+            match local.checked_add(self.h) {
+                Some(reach) if reach < self.line.len() => {}
+                _ => break, // not enough forward lookahead yet (or overflow)
+            }
+            out.push(self.emit(local));
+            self.next_center_g += 1;
         }
-        let local = (self.next_center_g - front_global) as usize;
-        // `checked_add` guards against a pathological `h` (e.g. from an
-        // unvalidated `set_u_ref` input) overflowing `usize`; treat an
-        // overflow the same as "not enough lookahead yet" rather than
-        // panicking (debug) or wrapping into a spurious true / OOB index
-        // (release). The debug_assert!s in `new()`/`set_u_ref()` are the
-        // primary guard -- this is the release-build backstop.
-        match local.checked_add(self.h) {
-            Some(reach) if reach < self.line.len() => {}
-            _ => return None, // not enough forward lookahead yet (or overflow)
-        }
-        let ev = self.emit(local);
-        self.next_center_g += 1;
-        Some(ev)
+        out
     }
 
     /// Drain and emit exactly the next flushed hop, or `None` once the
@@ -320,9 +335,7 @@ mod tests {
         let mut e = Evidence::new(cfg);
         let mut out = Vec::new();
         for (i, &a) in env.iter().enumerate() {
-            if let Some(h) = e.push(a, noise_amp, i as u64 * 512) {
-                out.push(h);
-            }
+            out.extend(e.push(a, noise_amp, i as u64 * 512));
         }
         out.extend(e.flush());
         out
@@ -344,20 +357,12 @@ mod tests {
         let mut e = Evidence::new(EvidenceConfig::default());
         let mut out = Vec::new();
         for _ in 0..300 {
-            if let Some(h) = e.push(1.0, 0.0, 0) {
-                out.push(h);
-            }
+            out.extend(e.push(1.0, 0.0, 0));
         }
-        if let Some(h) = e.push(0.75, 0.0, 0) {
-            out.push(h);
-        }
-        if let Some(h) = e.push(0.25, 0.0, 0) {
-            out.push(h);
-        }
+        out.extend(e.push(0.75, 0.0, 0));
+        out.extend(e.push(0.25, 0.0, 0));
         for _ in 0..200 {
-            if let Some(h) = e.push(0.75, 0.0, 0) {
-                out.push(h);
-            }
+            out.extend(e.push(0.75, 0.0, 0));
         }
         out.extend(e.flush());
         let hi = out
@@ -457,7 +462,7 @@ mod tests {
     #[test]
     fn gate_off_when_keying_depth_under_6_db() {
         let mut e = Evidence::new(EvidenceConfig::default());
-        let last = (0..600).filter_map(|_| e.push(1.0, 0.8, 0)).last().unwrap();
+        let last = (0..600).flat_map(|_| e.push(1.0, 0.8, 0)).last().unwrap();
         assert!(!last.present);
         assert_eq!(last.llr, -EvidenceConfig::default().llr_clip);
     }
@@ -469,11 +474,36 @@ mod tests {
             .round() as usize;
         for i in 0..h {
             assert!(
-                e.push(1.0, 0.01, i as u64).is_none(),
+                e.push(1.0, 0.01, i as u64).is_empty(),
                 "hop {i} emitted early"
             );
         }
-        assert!(e.push(1.0, 0.01, h as u64).is_some());
+        assert!(!e.push(1.0, 0.01, h as u64).is_empty());
+    }
+
+    #[test]
+    fn shrinking_the_hold_window_drains_the_whole_backlog_in_one_call() {
+        // Codex review, PR #161 round 9: a speed increase (`set_u_ref`
+        // shrinking `h`) can make several already-buffered centers
+        // eligible at once. The old one-in-one-out `push()` emitted only
+        // the first of them per call, so the backlog took dozens of
+        // subsequent hops to actually drain -- this proves it now drains
+        // in the very next call instead.
+        let mut e = Evidence::new(EvidenceConfig::default());
+        let h_before = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops)
+            .round() as usize;
+        // Feed enough hops to reach steady state (well past h_before) so
+        // the backlog is exactly at the initial window width.
+        for i in 0..(h_before as u64 * 3) {
+            e.push(1.0, 0.01, i);
+        }
+        e.set_u_ref(1.0); // shrinks h to hold_dits * 1.0 = 4
+        let drained = e.push(1.0, 0.01, h_before as u64 * 3);
+        assert!(
+            drained.len() > 1,
+            "expected the shrink to drain multiple backlogged centers in one call, got {}",
+            drained.len()
+        );
     }
 
     // [RULING, SDD execution 2026-09-09, Task 4 fix round 1] (I2): the
@@ -573,9 +603,7 @@ mod tests {
             if i == 200 {
                 e.set_u_ref(40.0); // h grows to 160, past its original value
             }
-            if let Some(h) = e.push(amp, 0.05, i as u64) {
-                out.push(h);
-            }
+            out.extend(e.push(amp, 0.05, i as u64));
         }
         out.extend(e.flush());
 

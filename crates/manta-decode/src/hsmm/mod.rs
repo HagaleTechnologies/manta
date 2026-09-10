@@ -346,14 +346,29 @@ impl HsmmDecoder {
         self.live.sort_by(token_order);
         let best = self.live[0].clone();
         let hist = best.hist.clone();
+        // Codex review, PR #161 round 9: a live forced commit
+        // (`commit::commit`) drops every token that disagreed with the
+        // just-committed entry BEFORE scoring the next one
+        // (`tokens.retain(...)`), so a rejected runner-up never
+        // contributes its score to a LATER entry's margin. Computing
+        // every entry's margin against the same static `self.live`
+        // instead let a hypothesis rejected at an EARLY entry keep
+        // dragging down `s_alt` (and appearing in `alternatives`) for
+        // every entry after it, artificially depressing confidence and
+        // reported alternatives for characters it never actually
+        // competed for -- contaminating downstream spot-confidence and
+        // separation measurements. Mirror the same per-entry filtering
+        // here on a local copy.
+        let mut live = self.live.clone();
         for (j, e) in hist.iter().enumerate() {
-            let (confidence, alternatives) = commit::margin(&self.live, j, &self.cfg);
+            let (confidence, alternatives) = commit::margin(&live, j, &self.cfg);
             out.push(Committed {
                 glyph: e.glyph,
                 sample_ts: e.sample_ts,
                 confidence,
                 alternatives,
             });
+            live.retain(|t| t.hist.get(j).map(|he| he.glyph) == Some(e.glyph));
         }
         if best.phase == Phase::AfterMark {
             if let Some(g) = MorseTree::shared().glyph(best.node) {
@@ -517,6 +532,65 @@ mod tests {
         assert!(
             out.iter().any(|c| c.sample_ts == 100),
             "the genuinely uncommitted entry at sample_ts=100 must still be emitted: {out:?}"
+        );
+    }
+
+    #[test]
+    fn finish_does_not_let_an_early_rejected_hypothesis_depress_a_later_entrys_confidence() {
+        // Codex review, PR #161 round 9: a live forced commit drops a
+        // disagreeing runner-up before scoring the next entry -- a
+        // rejected hypothesis must not keep depressing confidence for
+        // entries after the one it disagreed on.
+        let cfg = HsmmConfig::default();
+        let best_hist = vec![
+            token::HistEntry {
+                glyph: Some(Glyph::Char('A')),
+                sample_ts: 100,
+                born_hop: 1,
+            },
+            token::HistEntry {
+                glyph: Some(Glyph::Char('B')),
+                sample_ts: 200,
+                born_hop: 2,
+            },
+        ];
+        let best_token = |hist: Vec<token::HistEntry>| Token {
+            node: MorseTree::ROOT,
+            phase: Phase::AfterSpace,
+            u: 13.0,
+            score: 10.0,
+            hist,
+            anchor_hop: 2,
+        };
+
+        let mut dec_baseline = HsmmDecoder::new(cfg.clone());
+        dec_baseline.live = vec![best_token(best_hist.clone())];
+        let out_baseline = dec_baseline.finish();
+
+        let mut dec_with_rejected = HsmmDecoder::new(cfg);
+        dec_with_rejected.live = vec![
+            best_token(best_hist),
+            Token {
+                node: MorseTree::ROOT,
+                phase: Phase::AfterSpace,
+                u: 13.0,
+                score: 9.5, // close, but loses token_order to the best token
+                hist: vec![token::HistEntry {
+                    glyph: Some(Glyph::Char('C')), // disagrees at entry 0 only
+                    sample_ts: 100,
+                    born_hop: 1,
+                }],
+                anchor_hop: 1,
+            },
+        ];
+        let out_with_rejected = dec_with_rejected.finish();
+
+        let conf_baseline_1 = out_baseline[1].confidence;
+        let conf_with_rejected_1 = out_with_rejected[1].confidence;
+        assert!(
+            (conf_baseline_1 - conf_with_rejected_1).abs() < 1e-5,
+            "entry 1's confidence must be unaffected by a runner-up that only disagreed at \
+             entry 0 (baseline {conf_baseline_1}, with-rejected {conf_with_rejected_1})"
         );
     }
 }
