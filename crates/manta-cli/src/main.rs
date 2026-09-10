@@ -1279,8 +1279,15 @@ fn run_status(
         .enable_all()
         .build()?;
     let outcome = rt.block_on(async move {
-        let targets = tokio::time::timeout(
-            timeout,
+        // MAN-44 review: ONE end-to-end deadline spans resolution and the
+        // fetch. Giving each leg its own full `timeout` let a lookup that
+        // finished just under the wire be followed by a fresh, full-length
+        // connect/read window, so `--timeout-secs 5` could take nearly ten
+        // seconds -- twice the give-up bound the flag advertises, and twice
+        // what a cron/Nagios check budgeted for.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let targets = tokio::time::timeout_at(
+            deadline,
             tokio::task::spawn_blocking(move || {
                 resolve_status_addr(addr_owned.as_deref(), server.as_ref())
             }),
@@ -1288,7 +1295,12 @@ fn run_status(
         .await
         .map_err(|_| anyhow!("resolving the daemon's address timed out"))?
         .context("resolving the daemon's address panicked")??;
-        fetch_status(&targets, timeout)
+        // Only what's LEFT of the deadline goes to the fetch. A zero
+        // remainder is not special-cased: `fetch_status` bounds itself with
+        // this duration and reports the same "timed out talking to ..."
+        // error it would for any other exhausted budget.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        fetch_status(&targets, remaining)
             .await
             .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
     });
@@ -2556,7 +2568,6 @@ mod tests {
         assert!(accepted2, "second configured target must be connected to");
     }
 
-<<<<<<< HEAD
     // MAN-44: uplink health at a glance -- `manta status` + `GET /status`.
 
     #[test]
@@ -2968,7 +2979,8 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
         );
-=======
+    }
+
     // MAN-56: input-layer health counters wiring.
 
     /// A wrapper `IqSource` that forgets to forward `health_counters`
@@ -3061,7 +3073,6 @@ mod tests {
         assert!(!m
             .render_prometheus_text()
             .contains("manta_input_malformed_packets_total{"));
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
     }
 
     // MAN-136 round-1 validate code-review finding 1: the increment
