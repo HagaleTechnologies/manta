@@ -319,14 +319,29 @@ impl HsmmDecoder {
         // anything this decoder already committed before reading off the
         // tail, so a straggler token cloned from an older, un-trimmed
         // anchor snapshot can't resurface an already-emitted entry here.
+        //
+        // Codex review, PR #161 round 7: the old `while ... hist.first()
+        // ...` loop only ever stripped a leading, CONTIGUOUS run of sealed
+        // entries -- correct for `commit::commit`'s own use (that
+        // function re-checks the front on every outer-loop pass, so a
+        // newly-revealed sealed front is caught next iteration -- and it
+        // never reads past the front in a single pass anyway), but wrong
+        // here, where this check runs only once before reading the WHOLE
+        // history. A stale-anchor token can hold [an uncommitted entry,
+        // ..., an entry some OTHER lineage already committed and sealed]
+        // -- sealing is keyed globally on `(sample_ts, is_char)`, not per
+        // token, so a token whose own earlier entry never matched
+        // consensus (and so was never stripped) can still carry a LATER
+        // entry that happens to match what a different, already-committed
+        // lineage sealed. The old front-only check left that buried
+        // sealed entry in place, and the loop below would then re-emit it
+        // as a duplicate `CharDecoded`/`WordBoundary`, corrupting the
+        // final decoded text. `retain` removes every sealed entry
+        // anywhere in the history, not just a leading run.
+        let sealed = &self.sealed;
         for t in self.live.iter_mut() {
-            while t
-                .hist
-                .first()
-                .is_some_and(|e| self.sealed.contains(&(e.sample_ts, e.glyph.is_some())))
-            {
-                t.hist.remove(0);
-            }
+            t.hist
+                .retain(|e| !sealed.contains(&(e.sample_ts, e.glyph.is_some())));
         }
         self.live.sort_by(token_order);
         let best = self.live[0].clone();
@@ -461,6 +476,47 @@ mod tests {
             (post_reseed_best_retained - 0.0).abs() < 1e-4,
             "the best retained old token must be shifted down to exactly 0.0 (the fresh seeds' \
              own baseline), got {post_reseed_best_retained}"
+        );
+    }
+
+    #[test]
+    fn finish_does_not_reemit_an_entry_sealed_by_a_different_lineage() {
+        // Codex review, PR #161 round 7: sealing is keyed globally on
+        // (sample_ts, is_char), not per token, so a stale-anchor token can
+        // hold an uncommitted entry followed by a LATER entry some other
+        // lineage already committed and sealed. The old front-only strip
+        // in `finish()` missed this buried sealed entry and would re-emit
+        // it as a duplicate CharDecoded.
+        let mut dec = HsmmDecoder::new(HsmmConfig::default());
+        dec.sealed.push((200, true)); // a different lineage already committed a char at ts=200
+        dec.live = vec![Token {
+            node: MorseTree::ROOT,
+            phase: Phase::AfterSpace,
+            u: 13.0,
+            score: 1.0,
+            hist: vec![
+                token::HistEntry {
+                    glyph: Some(Glyph::Char('A')),
+                    sample_ts: 100,
+                    born_hop: 5,
+                },
+                token::HistEntry {
+                    glyph: Some(Glyph::Char('B')),
+                    sample_ts: 200,
+                    born_hop: 10,
+                },
+            ],
+            anchor_hop: 10,
+        }];
+        let out = dec.finish();
+        assert!(
+            !out.iter().any(|c| c.sample_ts == 200),
+            "must not re-emit the entry at sample_ts=200, already sealed by a different \
+             lineage: {out:?}"
+        );
+        assert!(
+            out.iter().any(|c| c.sample_ts == 100),
+            "the genuinely uncommitted entry at sample_ts=100 must still be emitted: {out:?}"
         );
     }
 }
