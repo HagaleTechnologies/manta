@@ -77,9 +77,22 @@ impl GateEntry {
     /// (sweeps are throttled to a periodic interval, not run on every
     /// call) ahead of a genuinely fresher one a different neighbor bucket
     /// away.
+    ///
+    /// Uses `accepted`'s actual maximum, not `.last()` (Codex review, PR
+    /// #152, round 13): `Validator::resolve_pending_beacons` can replay a
+    /// deferred candidate's older `sample_ts` well after a newer one
+    /// already landed on the same entry (a long-lived track's Beacon
+    /// candidate is only judged at track close, which can happen long
+    /// after other, more recent activity already touched this entry
+    /// through the ordinary path) -- `accepted` is not guaranteed to stay
+    /// in timestamp order, so `.last()` (the most-recently-*pushed*
+    /// element) can be older than the true latest occurrence, wrongly
+    /// reporting this entry as stale and letting `record`'s expired-home
+    /// check delete still-live repetition credit.
     fn most_recent(&self) -> Option<u64> {
         self.accepted
-            .last()
+            .iter()
+            .max()
             .copied()
             .into_iter()
             .chain(self.last_seen_by_track.values().copied())
@@ -266,7 +279,18 @@ impl RepetitionGate {
                 None => true,
             }
         };
-        entry.last_seen_by_track.insert(track_id, sample_ts);
+        // Codex review, PR #152, round 13: never regress a track's own
+        // watermark. `Validator::resolve_pending_beacons` can call
+        // `record` with an older, deferred `sample_ts` well after a newer
+        // one already landed for the same track_id on this entry --
+        // overwriting unconditionally would move that track's own
+        // last-seen time backward, corrupting `is_rapid_own_repeat`'s
+        // read on any later call.
+        entry
+            .last_seen_by_track
+            .entry(track_id)
+            .and_modify(|existing| *existing = (*existing).max(sample_ts))
+            .or_insert(sample_ts);
         if is_distinct_occurrence {
             entry.accepted.push(sample_ts);
         }
@@ -702,6 +726,51 @@ mod tests {
             gate.record(3, 14_000_000.0, "K5ARH", 11 * one_second / 10),
             1,
             "C is only 0.2s after B's rejected touch -- still a likely duplicate of the same occurrence, must not clear the gap just because it's 1.1s past A's accepted timestamp"
+        );
+    }
+
+    /// Codex review, PR #152, round 13: `Validator::resolve_pending_beacons`
+    /// can call `record` with an older, deferred `sample_ts` for a track
+    /// well after a newer touch from that same track already landed on
+    /// this entry (a long-lived track's Beacon candidate is only judged at
+    /// track close). `accepted` is not guaranteed to stay in timestamp
+    /// order once that happens -- `most_recent()` must still find the true
+    /// latest activity (via `.iter().max()`, not `.last()`), and the
+    /// out-of-order replay must never regress the track's own watermark in
+    /// `last_seen_by_track`. Without both fixes, a later genuinely-live
+    /// touch at the same home bucket can be wrongly judged "expired" and
+    /// discarded, destroying real, still-live repetition credit.
+    #[test]
+    fn an_out_of_order_deferred_replay_does_not_corrupt_the_entrys_recency() {
+        let mut gate = RepetitionGate::new(FS);
+        let window_samples = (WINDOW_SECONDS * FS) as u64;
+
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 8_000_000), 1);
+        assert_eq!(gate.record(1, 14_000_000.0, "K5ARH", 8_100_000), 2);
+
+        // The deferred replay: the SAME track's own much older pending
+        // sample_ts, arriving last in call order (simulating
+        // resolve_pending_beacons firing at track close).
+        gate.record(1, 14_000_000.0, "K5ARH", 500);
+
+        // A later, genuinely live touch. Relative to the old replayed
+        // timestamp (500) this looks expired (comfortably past the
+        // window), but relative to the entry's TRUE most recent activity
+        // (8,100,000) it's still well within the window -- the entry must
+        // be recognized as live, not discarded and restarted from 1.
+        let now = 8_700_000;
+        assert!(
+            now - 500 >= window_samples,
+            "sanity check: must look expired relative to the stale replayed timestamp"
+        );
+        assert!(
+            now - 8_100_000 < window_samples,
+            "sanity check: must still be genuinely live relative to the true latest activity"
+        );
+        assert_eq!(
+            gate.record(4, 14_000_000.0, "K5ARH", now),
+            3,
+            "an out-of-order deferred replay must not make a genuinely live entry look expired and discard its real history"
         );
     }
 }
