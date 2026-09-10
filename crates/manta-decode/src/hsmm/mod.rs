@@ -212,6 +212,27 @@ impl HsmmDecoder {
         let u_max = self.live.iter().map(|t| t.u).fold(self.cfg.u_min, f32::max);
         let reach_norm = (1.5 * 7.0 * u_max).ceil() as u64;
         let reach_sil = (80.0 * u_max).ceil() as u64;
+        // Codex review, PR #161 round 21: prune stale anchors HERE, before
+        // candidate generation, rather than only after a successful
+        // commit further down. `cands.is_empty()` below returns early
+        // whenever `present` keeps rising but no candidate ever survives
+        // (e.g. brief decoder-gate bursts spaced farther apart than
+        // reach_norm/reach_sil) -- that early return used to skip the
+        // only age-based pruning of `self.anchors`, so a long-lived noisy
+        // track could accumulate anchors without bound, and every later
+        // anchor step would scan the whole, ever-growing collection. This
+        // check depends only on `ev.hop` and `reach_sil` (both already
+        // known here, unrelated to whether any candidate is produced this
+        // hop), so hoisting it changes nothing about which anchors get
+        // pruned on the normal path -- it just also runs on the early
+        // return.
+        while let Some(front) = self.anchors.front() {
+            if ev.hop - front.hop > reach_sil {
+                self.anchors.pop_front();
+            } else {
+                break;
+            }
+        }
         let mut cands: Vec<Token> = Vec::new();
         for a in self.anchors.iter() {
             let d = ev.hop - a.hop;
@@ -265,6 +286,11 @@ impl HsmmDecoder {
             &mut self.sealed,
         ));
         self.live = merged.clone();
+        // The just-pushed anchor is always age 0 relative to `ev.hop`, so
+        // it can never itself need pruning here -- the age-based prune
+        // now runs unconditionally earlier in this function (see the
+        // round-21 comment above), which already covers this anchor's
+        // eventual retirement on some later hop.
         self.anchors.push_back(Anchor {
             hop: ev.hop,
             sample_ts: ev.sample_ts,
@@ -272,13 +298,6 @@ impl HsmmDecoder {
             min_hist_ts: min_hist_ts(&merged),
             tokens: merged,
         });
-        while let Some(front) = self.anchors.front() {
-            if ev.hop - front.hop > reach_sil {
-                self.anchors.pop_front();
-            } else {
-                break;
-            }
-        }
         // [Task 8 fix, review round 4] Bound `sealed`'s growth: the safe
         // prune bound is the minimum `sample_ts` over BOTH (a) every hist
         // entry of every token in every currently-live anchor (round 3's
@@ -591,6 +610,42 @@ mod tests {
             (conf_baseline_1 - conf_with_rejected_1).abs() < 1e-5,
             "entry 1's confidence must be unaffected by a runner-up that only disagreed at \
              entry 0 (baseline {conf_baseline_1}, with-rejected {conf_with_rejected_1})"
+        );
+    }
+
+    #[test]
+    fn push_prunes_stale_anchors_even_when_no_candidate_survives() {
+        // Codex review, PR #161 round 21: `cands.is_empty()` used to
+        // return early WITHOUT pruning stale anchors -- when `present`
+        // keeps rising but no candidate ever survives (brief bursts
+        // spaced farther apart than reach_norm/reach_sil), a long-lived
+        // noisy track could accumulate anchors without bound. Construct
+        // an anchor old enough that no candidate can ever be generated
+        // from it (d > reach_sil), verify it gets pruned anyway.
+        let cfg = HsmmConfig::default();
+        let mut dec = HsmmDecoder::new(cfg);
+        dec.push(&ev(0, true, false)); // reseed: one anchor at hop 0
+        assert_eq!(
+            dec.anchors.len(),
+            1,
+            "sanity: one anchor after the first reseed"
+        );
+
+        // Far enough forward that this anchor is now older than reach_sil
+        // (80 * u_max, u_max = 38.0 for the default largest seed unit ->
+        // reach_sil = 3040) -- `present` stays true, so no new reseed
+        // fires here.
+        let far_hop = 100_000u64;
+        let out = dec.push(&ev(far_hop, true, true));
+        assert!(
+            out.is_empty(),
+            "sanity: expected no commits from a candidate-free anchor step, got {out:?}"
+        );
+        assert!(
+            dec.anchors.is_empty(),
+            "the stale anchor from hop 0 must be pruned even though no candidate survived \
+             this far-future anchor step, got anchors at hops {:?}",
+            dec.anchors.iter().map(|a| a.hop).collect::<Vec<_>>()
         );
     }
 }
