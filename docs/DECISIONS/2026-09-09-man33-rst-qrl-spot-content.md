@@ -100,6 +100,42 @@ not "whatever's currently in view".
 Rejected: reusing the promotion-only guard; clearing QRL? after N words (an
 arbitrary constant with nothing real to calibrate it against).
 
+**Revised on the PR #159 review round (round 1):** a `ClosureKind::Bookkeeping`
+merge is not the end of the identity, so the loser's annotations migrate to the
+survivor instead of dying with its `TrackState`
+(`Validator::migrate_message_annotations`) — same reasoning that already
+carried pending Beacon candidates across a merge.
+
+**Revised again on round 2 (Codex, `crates/manta-spot/src/validator.rs:526`):**
+the survivor a closure *names* is not necessarily the identity still being
+tracked. `TrackManager::merge_converged`'s "already a loser" guard excludes
+only losers, not survivors, so one batch can close a chain (`2 -> 1` together
+with `1 -> 3`); `process_hops` then sorts `TrackClosed` by `track_id`, so
+`1 -> 3` is delivered *before* `2 -> 1` and track 2's migration target is a
+track the validator has already closed and removed. The same shape arises
+whenever a survivor's own closure (a hang-expiry, an eviction) sorts ahead of
+its loser's. Migrating as named both stranded the annotations on a dead
+track_id and resurrected per-track_id state that no further `TrackClosed`
+would ever free — the MAN-19 leak, reopened.
+
+Resolution: the validator resolves the named survivor to the identity still
+carrying it before migrating, via a bounded `track_id -> survivor` map of
+closures it has already processed (`Validator::{resolve_migration_target,
+note_closed}`, `MAX_CLOSED_SURVIVORS = 512`, above the shipped `track_cap`
+default of 500 so a still-needed redirect is never the one dropped). The
+stored value is itself already resolved, so chains stay flat. Chosen over the
+reviewer's alternative of reordering closures leaves-to-roots in
+`manta-engine`, because resolving in the consumer also covers the
+survivor-closed-by-an-unrelated-reason ordering — which no merge-internal
+ordering rule can reach — and it applies to the pending-Beacon migration on
+the same line at no extra cost. A dropped redirect degrades to "no survivor"
+(annotations discarded, pending beacons counted lost), never to resurrecting
+removed state; `dropped_survivor_watermark` is what makes that one-directional.
+Covered by `chained_merge_forwards_annotations_to_the_final_survivor`,
+`a_survivor_closed_for_good_takes_no_migrated_annotations` and
+`a_dropped_redirect_degrades_to_no_survivor`, all three of which fail against
+the pre-fix migrate-as-named behaviour.
+
 ## Decision 4: JSON Lines stream only — never the RBN telnet line
 
 `rbn::format_line` is the RBN/aggregator compatibility surface, shared with
