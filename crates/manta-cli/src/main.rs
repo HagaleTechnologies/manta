@@ -1,5 +1,5 @@
-//! `manta` CLI. M0 surface: decode a WAV fixture, generate golden vectors.
-//! The daemon (SDR input, servers) arrives at M2/M3 (ROADMAP).
+//! `manta` CLI: decode a WAV fixture, generate golden vectors, and run the
+//! daemon (SDR input, telnet/JSON/metrics servers, RBN uplinks) via `run`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -62,8 +62,13 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Decode a live off-air CW signal continuously from real audio.
-    Listen {
+    /// Run manta as a daemon, or copy live off-air CW continuously.
+    ///
+    /// D11/MAN-77: `run` is the daemon entry point. `listen` is kept as a
+    /// visible alias for ad hoc audio/dev testing (see
+    /// docs/DECISIONS/2026-09-06-broad-review-decisions.md).
+    #[command(visible_alias = "listen")]
+    Run {
         /// Input device name substring (default input device if omitted).
         #[arg(long, conflicts_with = "source")]
         device: Option<String>,
@@ -72,8 +77,10 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -116,8 +123,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -154,10 +161,10 @@ enum Command {
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
         /// (ARCHITECTURE §7-§8) alongside the decode loop.
-        #[arg(long)]
-        server_config: Option<PathBuf>,
+        #[arg(long, alias = "server-config")]
+        config: Option<PathBuf>,
         /// RF dial frequency in Hz, overriding the source's own
-        /// `center_freq_hz()`. Required with --server-config when the
+        /// `center_freq_hz()`. Required with --config when the
         /// source is a plain audio device or --source WAV file, since
         /// neither reports a real RF frequency (KiwiSDR/SoapySDR already
         /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
@@ -168,7 +175,7 @@ enum Command {
         /// Fixed replay epoch, Unix seconds -- overrides the replayed
         /// file's own mtime as the wall-clock instant SpotBus treats as
         /// `sample_ts == 0`. Only meaningful with --source (file replay)
-        /// and --server-config; ignored for a live source. Without this,
+        /// and --config; ignored for a live source. Without this,
         /// the epoch is the file's mtime, which is real and reproducible
         /// for an untouched file but changes if the file is copied,
         /// downloaded, or restored without preserving filesystem metadata
@@ -189,8 +196,10 @@ enum Command {
         #[arg(long, conflicts_with = "device")]
         source: Option<PathBuf>,
         /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
         kiwi_host: Option<String>,
         /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
         #[arg(long, default_value = "8073", requires = "kiwi_host")]
@@ -230,8 +239,8 @@ enum Command {
         /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
         /// Requires --soapy-freq and --soapy-rate.
         #[cfg(feature = "soapy")]
-        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"]))]
-        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source"]))]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
         /// RF center frequency in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
@@ -264,6 +273,96 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
+    },
+    /// Bounded-duration health check: is this source hearing anything real?
+    /// Runs the real decode pipeline for --duration, then reports track/SNR/
+    /// spot stats and a verdict -- distinguishes "no signal" from "signal but
+    /// not decoding" from "working end to end," which a bare `listen` run
+    /// with zero spots can't tell apart on its own.
+    Doctor {
+        /// Duration in seconds (3-3600; see manta_engine::doctor::{MIN_DURATION,MAX_DURATION}).
+        #[arg(long, default_value_t = 10)]
+        duration: u64,
+        #[arg(long, conflicts_with = "source")]
+        device: Option<String>,
+        #[arg(long, conflicts_with = "device")]
+        source: Option<PathBuf>,
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq.
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        kiwi_host: Option<String>,
+        /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
+        #[arg(long, default_value = "8073", requires = "kiwi_host")]
+        kiwi_port: u16,
+        /// RF center frequency in Hz. Required with --kiwi-host.
+        #[arg(long, requires = "kiwi_host")]
+        kiwi_freq: Option<f64>,
+        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
+        #[arg(long, requires = "kiwi_host", default_value = "")]
+        kiwi_password: String,
+        /// Per-source frequency-calibration correction, in ppm (config key
+        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
+        /// correction).
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            value_parser = parse_freq_correction_ppm,
+            allow_negative_numbers = true
+        )]
+        freq_correction_ppm: f64,
+        /// Operator Watch List (ARCHITECTURE §6, MAN-28). Repeatable.
+        #[arg(long)]
+        allowlist: Vec<String>,
+        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
+        #[arg(long)]
+        blocklist: Option<PathBuf>,
+        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
+        /// range per line (MAN-31).
+        #[arg(long)]
+        notch: Option<PathBuf>,
+        /// SoapySDR driver args (e.g. "driver=sdrplay"), feature `soapy`.
+        /// Requires --soapy-freq and --soapy-rate.
+        #[cfg(feature = "soapy")]
+        #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
+        #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        soapy_driver: Option<String>,
+        /// RF center frequency in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --soapy-driver.
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_rate: Option<f64>,
+        /// Gain in dB (omit for AGC, if the device supports it).
+        #[cfg(feature = "soapy")]
+        #[arg(long, requires = "soapy_driver")]
+        soapy_gain: Option<f64>,
+        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
+        /// Requires --hpsdr-freq and --hpsdr-rate.
+        #[cfg(feature = "hpsdr")]
+        #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
+        #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
+        hpsdr_host: Option<String>,
+        /// HPSDR/Hermes control port (default 1024, the standard Metis
+        /// discovery/control port).
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        hpsdr_port: u16,
+        /// RF center frequency in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
+        hpsdr_freq: Option<f64>,
+        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[cfg(feature = "hpsdr")]
+        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
+        hpsdr_rate: Option<f64>,
+        /// Emit the DoctorReport as one JSON object on stdout instead of a
+        /// human-readable summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -411,6 +510,10 @@ impl IqSource for FixedCenterFreqSource {
 
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
+    }
+
+    fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
+        self.inner.health_counters()
     }
 }
 
@@ -695,7 +798,7 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
-/// Handles the `Listen` on-spot closure needs to feed a running spot server.
+/// Handles what the `Run` on-spot closure needs to feed a running spot server.
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
@@ -710,6 +813,46 @@ struct SpotServer {
     /// `SHUTDOWN_DRAIN_DEADLINE`) instead of guessing a fixed sleep
     /// duration -- see `shutdown_runtime_after_drain`.
     tasks: manta_server::tasks::ClientTasks,
+    /// MAN-136/MAN-45: the same `cty::Table` handed to `JsonStreamConfig`,
+    /// kept here too so the publish callback can check resolvability once
+    /// per spot for `manta_spots_unresolved_geography_total` -- checking
+    /// inside `SpotMessage::from_spot` would scale with connected client
+    /// count instead of spot count.
+    cty: std::sync::Arc<manta_spot::cty::Table>,
+    /// Whether the operator's OWN station callsign (config, not decoder
+    /// output -- and not required to be cty-resolvable) already forces the
+    /// de-side `UNKNOWN_*` sentinels. Resolved ONCE at `start_spot_server`
+    /// time rather than per spot: `station_callsign` cannot change for the
+    /// life of the process, so re-running the same binary search on every
+    /// spot only re-derives a constant.
+    station_geography_unresolved: bool,
+}
+
+/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
+/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
+/// exactly the condition `manta_spots_unresolved_geography_total` counts.
+///
+/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
+/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
+/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
+/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
+/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
+/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
+/// alone would let those spots go out carrying `dxDxcc: -1` with the
+/// counter still at zero, silently withholding the one signal this metric
+/// exists to give (round-1 validate code-review finding 1).
+///
+/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
+/// (round-7 review finding 2): `cty.lookup` answers for it through the base
+/// call's prefix, but `from_spot` deliberately discards that answer and emits
+/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
+/// real position is unknown -- so the spot does carry the sentinels this
+/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
+/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
+/// the whole test.
+fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
+    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
+        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
 }
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
@@ -744,7 +887,126 @@ struct SpotServer {
 /// one spot. The previous 2s value was shorter than even a single one of
 /// those 10s writes, so a genuinely slow-but-completing client was
 /// routinely cut off mid-drain for no reason (round-15 review finding).
-const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+///
+/// MAN-45 (round-16 finding): as of this change, the value that actually
+/// bounds ONE client's drain is `manta_server::tasks::CLIENT_DRAIN_DEADLINE`
+/// -- each of the three per-client drain loops (telnet's, json_stream's TCP
+/// and WS) now enforces its own inner deadline and counts whatever it
+/// abandons when that fires, so a healthy handler always returns from
+/// `await_all` well within its own budget. This constant is now a
+/// registry-wide *scheduling backstop* above that per-client bound (see the
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// test below) -- it no longer needs sizing against any particular spot
+/// count, only against `CLIENT_DRAIN_DEADLINE` plus scheduling margin.
+///
+/// MAN-45 remediate (round-16 P1, finding 2): "scheduling margin" above
+/// CLIENT_DRAIN_DEADLINE isn't the whole story -- `CLIENT_DRAIN_DEADLINE`
+/// only bounds a handler's OWN `_ = shutdown.changed() =>` branch body.
+/// `tokio::select!` doesn't poll that branch again until whichever OTHER
+/// branch is currently running resolves, so a handler already mid-write
+/// when shutdown fires can burn up to its own current branch's full
+/// worst-case time BEFORE it even reaches the drain branch and starts
+/// that 20s clock. The largest such branch across all three handlers is
+/// telnet's live-spot write (`manta_server::telnet::WRITE_TIMEOUT`, TWO
+/// separately-timed writes per spot) -- json_stream's TCP/WS write and
+/// Pong-reply arms are each a single `WRITE_TIMEOUT`, strictly smaller.
+/// So the true worst case this deadline must outlive is `2 *
+/// telnet::WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE`, not
+/// `CLIENT_DRAIN_DEADLINE` alone (asserted directly by
+/// `the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline`
+/// below). telnet's `sh/dx` replay loop is bounded to the SAME worst case
+/// as the live-write arm rather than its own unbounded backlog depth: it
+/// re-checks `shutdown.has_changed()` before every history entry and, the
+/// moment it's observed, `break`s back to the `select!` loop's own drain
+/// branch to deliver the live `rx` backlog with that branch's full unused
+/// budget, rather than abandoning it (validation round 17, CR-2/CR-3 --
+/// the remaining history replay itself is simply not re-attempted, since
+/// those entries were already published and counted once).
+///
+/// Validation round 17 (CR-1): this model above only accounts for
+/// branches INSIDE the `select!` loop -- it does NOT need to also budget
+/// for `telnet::handle_client`'s pre-loop login handshake (prompt write,
+/// login-line read, banner write; up to `WRITE_TIMEOUT +
+/// bounded_io::IDLE_READ_TIMEOUT + WRITE_TIMEOUT` = 50s) because that
+/// handshake itself now races `shutdown.changed()` at every step and
+/// bails out (counting its subscribed `rx` backlog) the moment shutdown
+/// fires, instead of running any of those three waits to completion
+/// first. A stalled pre-login client therefore contributes close to zero
+/// to shutdown latency, not up to 50s -- if a future change ever makes
+/// that handshake NOT shutdown-aware again, this deadline's true worst
+/// case would need to grow to include it.
+///
+/// MAN-45 remediate (code-review round 18, finding 3): the same was true,
+/// but NOT yet fixed, of `json_stream::serve`'s pre-loop phase --
+/// `looks_like_websocket_handshake`'s classifying peek (up to
+/// `PEEK_TIMEOUT`, or `HANDSHAKE_TIMEOUT` once any byte had arrived) and
+/// `handle_ws_client`'s own `accept_async_with_config` step (up to another
+/// `HANDSHAKE_TIMEOUT`) previously never observed `shutdown` either. Both
+/// now race `shutdown.changed()` the same way telnet's handshake does, so
+/// this deadline's safety margin no longer rests on the coincidence that
+/// json_stream's *unraced* worst case (20s) happened to be smaller than
+/// telnet's live-write branch (`2 * telnet::WRITE_TIMEOUT` = 20s) already
+/// budgeted for above -- it now holds because BOTH pre-loop phases are
+/// shutdown-aware by design, matching this deadline's own model.
+///
+/// MAN-45 remediate (code-review round 19, P1): the "at most ONE in-flight
+/// branch body precedes the drain" step of that model is now ENFORCED, not
+/// assumed. `tokio::select!` picks a random ready arm, so a client with a
+/// backlog could previously win the live-spot arm repeatedly after shutdown
+/// was signalled -- an unbounded number of `2 * WRITE_TIMEOUT` writes
+/// before its own `CLIENT_DRAIN_DEADLINE` clock ever started, which this
+/// deadline cannot cover at any constant value. Every client-write-capable
+/// arm in all three handler loops (`telnet::handle_client`'s live-spot and
+/// command-read arms, `json_stream`'s TCP live-spot and socket-read arms,
+/// and its WS live-spot and frame arms) now carries an
+/// `if !shutdown.has_changed()` precondition, so once shutdown is pending
+/// the drain arm is the only arm those loops can still select. The worst
+/// case therefore really is one already-selected branch body plus
+/// `CLIENT_DRAIN_DEADLINE`, which is what the value below is sized for.
+///
+/// MAN-45 remediate (round-19 P1, re-raised against an earlier head): the
+/// "one branch body" half of that budget is now also asserted END-TO-END,
+/// not only arithmetically here --
+/// `telnet_acceptance::shutdown_bounds_live_writes_to_at_most_one_before_the_drain`
+/// queues a backlog, signals shutdown before the client task can wake, and
+/// asserts across repeated trials that at most ONE live spot write precedes
+/// the drain and that every queued spot is then delivered or counted. "At
+/// most one", not zero, is deliberate: a handler already parked in
+/// `select!` when shutdown fires evaluated its preconditions before the
+/// flag was set, so it can still take the live-spot arm once -- which is
+/// precisely the single branch body this deadline budgets for, above. See
+/// that test's own doc comment for what it does and does not prove (with
+/// fast localhost writes the unguarded build stays inside the bound too;
+/// exceeding it needs a client that has stopped reading, so each write runs
+/// the full `WRITE_TIMEOUT`).
+/// MAN-45 remediate (code-review round 19, P1): **changing this value is
+/// not self-contained** -- it is the floor for the CALLER-side stop grace
+/// period an operator must configure, and two documents state that period
+/// as a literal number: `README.md`'s Docker install section (`docker stop
+/// -t 60`) and `Dockerfile`'s STOPSIGNAL comment block. Both said 30s,
+/// sized against the pre-MAN-45 25s value; against 50s here, a 30s
+/// container timeout SIGKILLs the daemon partway through the very drain
+/// this constant exists to allow, before it can record the abandoned
+/// backlog on `manta_spots_dropped_write_failed_total` (the counter each
+/// handler's drain loop charges when its own `CLIENT_DRAIN_DEADLINE`
+/// expires -- `manta_spots_dropped_shutdown_total` covers only a client
+/// still in pre-login/handshake, whose backlog had not been offered for
+/// delivery yet; that is not the same as the connection having written
+/// nothing, since the telnet banner and WS-accept branches are reached
+/// after the login prompt / part of the 101 response is already on the
+/// wire) --
+/// recreating the silent truncation the drain work removed. Both are now
+/// 60s, leaving margin over this deadline. If this constant grows again,
+/// raise them with it.
+const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// How often the server runtime copies the engine's live track count into
+/// the `manta_active_tracks` gauge. The decode loop runs on the MAIN
+/// thread, outside the tokio runtime that owns `Metrics`, so a poller is
+/// the bridge -- the same shape MAN-55's `confirmed_live_handle` watcher
+/// already uses. 4 Hz is far finer than any Prometheus scrape interval and
+/// costs one relaxed atomic load per tick.
+const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
@@ -773,6 +1035,30 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
+/// How often the daemon samples an input source's `InputHealthCounters`
+/// into `Metrics` (MAN-56). An order of magnitude below any realistic
+/// Prometheus scrape interval, so a scrape never sees more than ~1 s of
+/// staleness; the tick itself is three relaxed atomic loads and one
+/// `BTreeMap` insert. Deliberately slower than the `confirmed_live` poll
+/// (200 ms, see the `confirmed_live_handle` wiring below), which is tuned
+/// for a single startup transition rather than a forever-loop.
+const INPUT_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Snapshot `manta-input`'s counters into `manta-server`'s own,
+/// dependency-free mirror struct. The two crates deliberately share no
+/// type -- that disjointness is what keeps `manta-server` free of any
+/// `manta-input` dependency (ARCHITECTURE §3/§8) -- so `manta-cli`, which
+/// depends on both, is where the translation belongs.
+fn input_health_of(
+    counters: &manta_input::InputHealthCounters,
+) -> manta_server::metrics::InputHealth {
+    manta_server::metrics::InputHealth {
+        dropped_packets: counters.dropped_packets(),
+        gaps_detected: counters.gaps_detected(),
+        malformed_packets: counters.malformed_packets(),
+    }
+}
+
 fn start_spot_server(
     config_path: &std::path::Path,
     sample_rate_hz: f64,
@@ -792,7 +1078,7 @@ fn start_spot_server(
     // debugging without a code change.
     //
     // MAN-59 review round 6 (P1): `fmt()` writes to stdout by default,
-    // but `Command::Listen --json` ALSO writes DecoderEvents/spots as
+    // but `Command::Run --json` ALSO writes DecoderEvents/spots as
     // JSON Lines to stdout (below) -- AGENTS.md's "file input ->
     // byte-identical spot logs" hard requirement means any interleaved
     // non-JSON tracing line corrupts that machine-readable stream for
@@ -852,7 +1138,11 @@ fn start_spot_server(
                 cfg.telnet_max_connections_per_ip,
             ),
             telnet_ip_command_limiter,
+<<<<<<< HEAD
             cfg.line_format,
+=======
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+>>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
         ));
         let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::json_stream::MAX_INBOUND_PINGS,
@@ -865,13 +1155,14 @@ fn start_spot_server(
             manta_server::json_stream::JsonStreamConfig {
                 bus: bus.clone(),
                 metrics: metrics.clone(),
-                cty,
+                cty: cty.clone(),
                 station_call: cfg.station_callsign.clone(),
                 decoder_version,
                 // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
                 // need shutdown_rx -- can't let this be the moving consumer
                 // anymore now that there are more consumers.
                 shutdown: shutdown_rx.clone(),
+                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             },
             tasks.clone(),
             manta_server::tasks::new_connection_limiter(
@@ -929,11 +1220,14 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
+            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            cty,
         },
     ))
 }
 
 fn main() -> Result<()> {
+    warn_deprecations();
     match Cli::parse().command {
         Command::Decode {
             path,
@@ -974,7 +1268,7 @@ fn main() -> Result<()> {
                 manifest.expected_freq_hz
             );
         }
-        Command::Listen {
+        Command::Run {
             device,
             source,
             kiwi_host,
@@ -1002,7 +1296,7 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
-            server_config,
+            config,
             dial_freq_hz,
             replay_epoch,
         } => {
@@ -1031,9 +1325,9 @@ fn main() -> Result<()> {
                 "audio"
             };
 
-            if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+            if config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
-                    "--dial-freq-hz is required with --server-config when using a plain \
+                    "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
                      frequency (KiwiSDR/SoapySDR already know theirs from \
                      --kiwi-freq/--soapy-freq)"
@@ -1088,93 +1382,152 @@ fn main() -> Result<()> {
             };
 
             // Kept alive for the process lifetime: dropping it would stop
-            // the spawned server tasks. `None` when --server-config wasn't
+            // the spawned server tasks. `None` when --config wasn't
             // given, in which case `spot_server` stays None too. `epoch`/
             // `session_nonce` are deliberately computed IN this branch, not
-            // above it -- `--source`-only replay (no --server-config) never
+            // above it -- `--source`-only replay (no --config) never
             // consumes either, and computing `session_nonce` means hashing
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server) = match server_config {
-                Some(path) => {
-                    // `epoch` feeds SpotBus's wall-clock conversion (every
-                    // JSON `timestamp`/RBN Zulu field a client observes) --
-                    // a live session's epoch is this process's real start
-                    // time; a replay session's defaults to the replayed
-                    // file's own mtime, a genuine timestamp that's stable
-                    // across reruns of the SAME untouched file, but changes
-                    // across a copy/download/restore that doesn't preserve
-                    // filesystem metadata even though the recording's
-                    // content is identical -- pass --replay-epoch to pin an
-                    // exact value when that matters more than "whatever
-                    // this machine's copy says" (round-7 review finding;
-                    // see the flag's own doc comment for the full
-                    // rationale, and `epoch_for_replay_path`'s for why
-                    // neither "always now()" nor a content-hash alone was
-                    // right before this flag existed). `session_nonce` is
-                    // the separate, spot-id-uniqueness-only value:
-                    // recording-content-derived for file replay (so
-                    // different recordings never collide on id even at the
-                    // same track/sample position), nanosecond-precision-now
-                    // for a live session (so two live sessions started
-                    // within the same wall-clock second don't collide
-                    // either).
-                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                    let session_nonce: u128 = match &replay_path {
-                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
-                        // Live session: `epoch` above is already SystemTime::now().
-                        None => epoch
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .expect("epoch predates the Unix epoch")
-                            .as_nanos(),
-                    };
+            let (server_runtime, spot_server, active_tracks, mut active_tracks_poller) =
+                match config {
+                    Some(path) => {
+                        // `epoch` feeds SpotBus's wall-clock conversion (every
+                        // JSON `timestamp`/RBN Zulu field a client observes) --
+                        // a live session's epoch is this process's real start
+                        // time; a replay session's defaults to the replayed
+                        // file's own mtime, a genuine timestamp that's stable
+                        // across reruns of the SAME untouched file, but changes
+                        // across a copy/download/restore that doesn't preserve
+                        // filesystem metadata even though the recording's
+                        // content is identical -- pass --replay-epoch to pin an
+                        // exact value when that matters more than "whatever
+                        // this machine's copy says" (round-7 review finding;
+                        // see the flag's own doc comment for the full
+                        // rationale, and `epoch_for_replay_path`'s for why
+                        // neither "always now()" nor a content-hash alone was
+                        // right before this flag existed). `session_nonce` is
+                        // the separate, spot-id-uniqueness-only value:
+                        // recording-content-derived for file replay (so
+                        // different recordings never collide on id even at the
+                        // same track/sample position), nanosecond-precision-now
+                        // for a live session (so two live sessions started
+                        // within the same wall-clock second don't collide
+                        // either).
+                        let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                        let session_nonce: u128 = match &replay_path {
+                            Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                            // Live session: `epoch` above is already SystemTime::now().
+                            None => epoch
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .expect("epoch predates the Unix epoch")
+                                .as_nanos(),
+                        };
 
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
-                    // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` has no equivalent
-                    // hook yet -- manta-engine exposes no live track-count
-                    // API for `listen()`'s callbacks to read, so it stays
-                    // at Metrics::default()'s 0 until that surface exists.
-                    //
-                    // MAN-55: for a source where `open()` succeeding
-                    // doesn't confirm a live device (HPSDR's UDP
-                    // connect/send need no peer response at all),
-                    // `confirmed_live_handle()` returns Some, and health
-                    // starts false, flipping true only once the source's
-                    // own read loop has actually processed a valid
-                    // packet. Every other source type (Kiwi/Soapy/audio/
-                    // file) returns None from the trait's default and
-                    // keeps the original immediate-true behavior, since
-                    // opening those already implies liveness.
-                    match src.confirmed_live_handle() {
-                        Some(live) => {
-                            server.metrics.set_source_health(source_name, false);
-                            let metrics = server.metrics.clone();
+                        let (rt, server) =
+                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                        // MAN-45 (round-9 finding): the daemon's own copy of the
+                        // gauge `manta_engine::listen_with_observers` updates as
+                        // it runs (on the MAIN thread, outside this tokio
+                        // runtime) -- polled into `Metrics` below, the same
+                        // bridge shape MAN-55's `confirmed_live_handle` watcher
+                        // uses for source liveness.
+                        let active_tracks =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        // MAN-45 remediate (code-review finding 1): the
+                        // `JoinHandle` is kept, not discarded, so the shutdown
+                        // sequence below can abort this poller and WAIT for it
+                        // to actually stop before writing the deterministic
+                        // zero -- otherwise a tick already in flight can read
+                        // the still-stale gauge and write it right back after
+                        // the zero, undoing it.
+                        let active_tracks_poller = {
+                            let gauge = active_tracks.clone();
+                            let track_metrics = server.metrics.clone();
                             rt.spawn(async move {
-                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                loop {
+                                    track_metrics.set_active_tracks(
+                                        gauge.load(std::sync::atomic::Ordering::Relaxed),
+                                    );
+                                    tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
                                 }
-                                metrics.set_source_health(source_name, true);
+                            })
+                        };
+                        // MAN-55: for a source where `open()` succeeding
+                        // doesn't confirm a live device (HPSDR's UDP
+                        // connect/send need no peer response at all),
+                        // `confirmed_live_handle()` returns Some, and health
+                        // starts false, flipping true only once the source's
+                        // own read loop has actually processed a valid
+                        // packet. Every other source type (Kiwi/Soapy/audio/
+                        // file) returns None from the trait's default and
+                        // keeps the original immediate-true behavior, since
+                        // opening those already implies liveness.
+                        match src.confirmed_live_handle() {
+                            Some(live) => {
+                                server.metrics.set_source_health(source_name, false);
+                                let metrics = server.metrics.clone();
+                                rt.spawn(async move {
+                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
+                                        tokio::time::sleep(std::time::Duration::from_millis(200))
+                                            .await;
+                                    }
+                                    metrics.set_source_health(source_name, true);
+                                });
+                            }
+                            None => server.metrics.set_source_health(source_name, true),
+                        }
+
+                        // MAN-56: HPSDR's packet loss/malformed counters are
+                        // input-layer state manta-server cannot compute itself
+                        // (it has no manta-input dependency). Sample them into
+                        // Metrics on a timer, the same wiring-layer-injection
+                        // shape `set_source_health` uses above -- and read the
+                        // handle HERE, before `listen(src, ..)` below takes
+                        // ownership of the source for the rest of the run.
+                        // Sources with no wire-packet loss model return None
+                        // and publish no series at all, which is deliberate:
+                        // a permanently-zero counter reads as "no loss" rather
+                        // than "not measured" (ARCHITECTURE §8's
+                        // "absent means not measured" distinction).
+                        if let Some(counters) = src.health_counters() {
+                            let metrics = server.metrics.clone();
+                            // Published once eagerly so the series exists (at
+                            // 0) from the very first scrape rather than only
+                            // after one poll interval.
+                            metrics.set_input_health(source_name, input_health_of(&counters));
+                            rt.spawn(async move {
+                                loop {
+                                    tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                                    metrics
+                                        .set_input_health(source_name, input_health_of(&counters));
+                                }
                             });
                         }
-                        None => server.metrics.set_source_health(source_name, true),
+
+                        (
+                            Some(rt),
+                            Some(server),
+                            Some(active_tracks),
+                            Some(active_tracks_poller),
+                        )
                     }
-                    (Some(rt), Some(server))
-                }
-                None => (None, None),
-            };
+                    None => (None, None, None, None),
+                };
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-            let listen_result = manta_engine::listen(
+            let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
                 stop,
+                manta_engine::ListenObservers {
+                    active_tracks: active_tracks.clone(),
+                },
                 |ev| {
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
@@ -1199,11 +1552,25 @@ fn main() -> Result<()> {
                 // Provisional CLI-debugging text/JSON printed below is NOT
                 // the ecosystem wire contract -- that's `spot_server`
                 // (manta-server's telnet/JSON-Lines/WebSocket fan-out,
-                // ARCHITECTURE §7), fed here when --server-config is set.
+                // ARCHITECTURE §7), fed here when --config is set.
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
                         server.metrics.record_spot();
+                        // MAN-136/MAN-45: counted ONCE per spot here, NOT
+                        // inside `SpotMessage::from_spot` -- that runs once
+                        // per connected JSON/WS client (json_stream.rs:126),
+                        // so counting there would scale with client count
+                        // instead of spot count. Checks BOTH sides: the
+                        // operator's own station_callsign is config, not
+                        // decoder output, and isn't required to resolve --
+                        // but it also never changes, so its side is
+                        // resolved once at start_spot_server time.
+                        if geography_is_unresolved(&server.cty, &spot.callsign)
+                            || server.station_geography_unresolved
+                        {
+                            server.metrics.record_unresolved_geography();
+                        }
                     }
                     if json {
                         println!("{}", serde_json::json!({ "spot": spot }));
@@ -1230,6 +1597,32 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
+                // MAN-45 remediate (code-review finding 1): the engine's
+                // own gauge is already 0 on the SUCCESS path
+                // (TrackManager::finish() closed every track before
+                // `listen_with_observers` returned), but NOT on the ERROR
+                // path -- `listen_result` above is deliberately captured
+                // rather than `?`-ed so an SDR disconnect or WAV read
+                // failure still runs this drain sequence (round-7 finding),
+                // and on that path `listen_with_observers` returns before
+                // reaching `tm.finish()`'s trailing zero, leaving the
+                // shared `AtomicU64` at the last processed chunk's nonzero
+                // count. The still-running poller reads that stale value
+                // every `ACTIVE_TRACKS_POLL_INTERVAL` and would overwrite
+                // the deterministic zero below within one tick if left
+                // running -- abort it and AWAIT its actual termination
+                // first (not just issue the abort and hope), so no
+                // in-flight tick can race the zero-write below. A metrics
+                // scrape landing anywhere in the `SHUTDOWN_DRAIN_DEADLINE`
+                // window that follows must never see a stale nonzero
+                // count for a daemon with no live tracks.
+                if let Some(poller) = active_tracks_poller.take() {
+                    poller.abort();
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(poller);
+                    }
+                }
+                server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
             }
             // `server_runtime`/`spot_server` are always constructed as a
@@ -1315,8 +1708,208 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Doctor {
+            duration,
+            device,
+            source,
+            kiwi_host,
+            kiwi_port,
+            kiwi_freq,
+            kiwi_password,
+            freq_correction_ppm,
+            allowlist,
+            blocklist,
+            notch,
+            #[cfg(feature = "soapy")]
+            soapy_driver,
+            #[cfg(feature = "soapy")]
+            soapy_freq,
+            #[cfg(feature = "soapy")]
+            soapy_rate,
+            #[cfg(feature = "soapy")]
+            soapy_gain,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_host,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_port,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_freq,
+            #[cfg(feature = "hpsdr")]
+            hpsdr_rate,
+            json,
+        } => {
+            // Checked before any source is opened -- otherwise an invalid
+            // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
+            // connect/activate already spent real time (or hung/failed for
+            // an unrelated hardware reason), and the user never sees the
+            // actual duration error at all (round-5 review finding).
+            let duration_secs = duration;
+            if !(manta_engine::MIN_DURATION.as_secs()..=manta_engine::MAX_DURATION.as_secs())
+                .contains(&duration_secs)
+            {
+                bail!(
+                    "--duration must be between {} and {} seconds, got {duration_secs}",
+                    manta_engine::MIN_DURATION.as_secs(),
+                    manta_engine::MAX_DURATION.as_secs()
+                );
+            }
+            let kiwi = KiwiOpts {
+                host: kiwi_host,
+                port: kiwi_port,
+                freq: kiwi_freq,
+                password: kiwi_password,
+            };
+            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+            #[cfg(feature = "hpsdr")]
+            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
+                host: hpsdr_host,
+                port: hpsdr_port,
+                freq: hpsdr_freq,
+                rate: hpsdr_rate,
+            })?;
+            #[cfg(not(feature = "hpsdr"))]
+            let hpsdr_source: Option<Box<dyn IqSource>> = None;
+            let src = match hpsdr_source {
+                Some(src) => src,
+                None => {
+                    #[cfg(feature = "soapy")]
+                    {
+                        open_source(
+                            device,
+                            source,
+                            kiwi,
+                            SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            },
+                        )?
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        open_source(device, source, kiwi)?
+                    }
+                }
+            };
+            let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
+            if json {
+                // `verdict()` is computed, not a stored field, so a plain
+                // `serde_json::to_string(&report)` omits the command's
+                // primary health classification entirely -- merge it in as
+                // an extra key rather than making JSON consumers duplicate
+                // the classification policy themselves.
+                let mut value = serde_json::to_value(&report)?;
+                if let serde_json::Value::Object(ref mut map) = value {
+                    map.insert(
+                        "verdict".to_string(),
+                        serde_json::to_value(report.verdict())?,
+                    );
+                }
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                print_doctor_report(&report);
+            }
+        }
     }
     Ok(())
+}
+
+/// Which replaced CLI spelling the operator typed, if any.
+///
+/// D11/MAN-77 promoted `listen --server-config` to `run --config`. clap
+/// cannot answer this: an alias is normalized to the subcommand's canonical
+/// name inside `Parser::possible_subcommand` before `ArgMatches` ever sees
+/// it, and `MatchedArg` records no alias spelling for flags either. So the
+/// only source of truth is raw argv, read before `Cli::parse()`.
+#[derive(Debug, PartialEq, Eq)]
+enum Deprecation {
+    /// `listen` used to start the daemon (i.e. with a config file). Plain
+    /// `listen --device`/`--kiwi-host` is NOT deprecated -- MAN-77's title
+    /// keeps `listen` for ad hoc audio/dev testing.
+    ListenVerb,
+    /// `--server-config`, under either verb.
+    ServerConfigFlag,
+}
+
+fn deprecations<I: IntoIterator<Item = String>>(args: I) -> Vec<Deprecation> {
+    let argv: Vec<String> = args.into_iter().collect();
+    let is_flag = |name: &str| {
+        argv.iter()
+            .any(|a| a == name || a.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
+    };
+    let mut out = Vec::new();
+    let has_config = is_flag("--config") || is_flag("--server-config");
+    if argv.get(1).map(String::as_str) == Some("listen") && has_config {
+        out.push(Deprecation::ListenVerb);
+    }
+    if is_flag("--server-config") {
+        out.push(Deprecation::ServerConfigFlag);
+    }
+    out
+}
+
+/// stderr, not `tracing::warn!`: the only `tracing_subscriber` init in this
+/// binary lives inside `start_spot_server`, so a parse-time `warn!` would be
+/// dropped. stderr is also the stream `--json`'s JSON Lines consumer never
+/// reads (see `start_spot_server`'s MAN-59 round-6 note), so this cannot
+/// corrupt the byte-identical spot log AGENTS.md requires.
+///
+/// Known, accepted limitation: a flag *value* that is literally the string
+/// `--server-config` (e.g. a blocklist path so named) would trigger a
+/// spurious notice, because the scan is positional-unaware by design -- it
+/// runs before clap, so it cannot know which tokens are values. The failure
+/// mode is one extra stderr line, never a wrong exit code or a changed
+/// behavior.
+fn warn_deprecations() {
+    let argv = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+    for d in deprecations(argv) {
+        match d {
+            Deprecation::ListenVerb => eprintln!(
+                "warning: starting the daemon with `manta listen` is deprecated and will be \
+                 removed in a future release; use `manta run --config` instead."
+            ),
+            Deprecation::ServerConfigFlag => eprintln!(
+                "warning: `--server-config` is deprecated and will be removed in a future \
+                 release; use `--config` instead."
+            ),
+        }
+    }
+}
+
+/// Human-readable `manta doctor` summary. `--json` bypasses this entirely
+/// in favor of the raw `DoctorReport`.
+fn print_doctor_report(report: &manta_engine::DoctorReport) {
+    println!(
+        "source: {:.0} Hz sample rate, {:.1} Hz center, observed for {:.1}s",
+        report.sample_rate_hz,
+        report.center_freq_hz,
+        report.duration.as_secs_f64()
+    );
+    println!(
+        "tracks: {} promoted, {} TrackMeta updates, {} closed",
+        report.tracks_promoted, report.track_meta_count, report.tracks_closed
+    );
+    match (report.snr_db_min, report.snr_db_median, report.snr_db_max) {
+        (Some(min), Some(median), Some(max)) => {
+            println!("snr_2500_db: min={min:.1} median={median:.1} max={max:.1}");
+        }
+        // `tracks_promoted` is verdict()'s own authoritative signal for
+        // "did anything really happen" -- match its logic exactly rather
+        // than re-deriving it from a different combination of fields.
+        _ if report.tracks_promoted == 0 => {
+            println!("snr_2500_db: no TrackMeta events -- no track ever promoted")
+        }
+        _ => println!(
+            "snr_2500_db: a track was promoted but no TrackMeta ever landed for it before this \
+             run ended"
+        ),
+    }
+    println!(
+        "decode: {} chars ({} distinct), {} confirmed spots",
+        report.chars_decoded, report.distinct_chars, report.spots_confirmed
+    );
+    println!("verdict: {}", report.verdict().summary());
 }
 
 #[cfg(test)]
@@ -1329,6 +1922,73 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
+    /// must never fire before a handler's own drain deadline, or
+    /// `shutdown_timeout` aborts a drain that was still inside its budget
+    /// and the abandoned queue goes uncounted again -- the exact failure
+    /// rounds 15 and 16 both landed on from different directions. The
+    /// margin covers task scheduling, not another spot's write.
+    ///
+    /// MAN-45 remediate (round-16 P1, finding 2): `CLIENT_DRAIN_DEADLINE`
+    /// alone under-counts the true worst case -- a handler already mid-
+    /// write when shutdown fires doesn't even START its own drain
+    /// deadline until that in-progress `select!` branch resolves. Asserts
+    /// the FULL relationship (`2 * telnet::WRITE_TIMEOUT +
+    /// CLIENT_DRAIN_DEADLINE`, telnet's live-spot write being the largest
+    /// such in-progress branch across all three handlers), not just the
+    /// drain deadline in isolation -- see `SHUTDOWN_DRAIN_DEADLINE`'s own
+    /// doc comment for the full argument.
+    #[test]
+    fn the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline() {
+        let worst_case_before_drain_starts = 2 * manta_server::telnet::WRITE_TIMEOUT;
+        let true_worst_case =
+            worst_case_before_drain_starts + manta_server::tasks::CLIENT_DRAIN_DEADLINE;
+        assert!(
+            SHUTDOWN_DRAIN_DEADLINE > true_worst_case,
+            "SHUTDOWN_DRAIN_DEADLINE ({SHUTDOWN_DRAIN_DEADLINE:?}) must exceed the true \
+             worst case of {true_worst_case:?} (2 * telnet::WRITE_TIMEOUT = \
+             {worst_case_before_drain_starts:?}, the largest in-progress `select!` branch \
+             a handler can already be running when shutdown fires, plus \
+             CLIENT_DRAIN_DEADLINE = {:?} for its own drain loop once it gets there)",
+            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
+    }
+
+    #[test]
+    fn deprecation_notices_fire_only_for_the_replaced_spellings() {
+        fn notices(argv: &[&str]) -> Vec<Deprecation> {
+            deprecations(argv.iter().map(|s| s.to_string()))
+        }
+        // D-3: the daemon-via-listen path is deprecated ...
+        assert_eq!(
+            notices(&["manta", "listen", "--server-config", "m.toml"]),
+            vec![Deprecation::ListenVerb, Deprecation::ServerConfigFlag]
+        );
+        assert_eq!(
+            notices(&["manta", "listen", "--config", "m.toml"]),
+            vec![Deprecation::ListenVerb]
+        );
+        // ... the ad hoc audio path the ticket title preserves is NOT.
+        assert_eq!(notices(&["manta", "listen", "--device", "hw:1"]), vec![]);
+        assert_eq!(notices(&["manta", "listen"]), vec![]);
+        // The flag is deprecated under either verb.
+        assert_eq!(
+            notices(&["manta", "run", "--server-config", "m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        // `--flag=value` form must be caught too.
+        assert_eq!(
+            notices(&["manta", "run", "--server-config=m.toml"]),
+            vec![Deprecation::ServerConfigFlag]
+        );
+        // The canonical spelling is silent.
+        assert_eq!(notices(&["manta", "run", "--config", "m.toml"]), vec![]);
+        assert_eq!(notices(&["manta", "run", "--device", "hw:1"]), vec![]);
+        // Other subcommands are never implicated.
+        assert_eq!(notices(&["manta", "decode", "/tmp/v1.wav"]), vec![]);
+        assert_eq!(notices(&["manta", "soak", "--duration", "10"]), vec![]);
     }
 
     #[test]
@@ -1731,5 +2391,164 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    // MAN-56: input-layer health counters wiring.
+
+    /// A wrapper `IqSource` that forgets to forward `health_counters`
+    /// silently swallows the inner source's counters via the trait's
+    /// `None` default -- the metrics would just be absent, with nothing
+    /// failing loudly. Same hazard `confirmed_live_handle` carries; both
+    /// are asserted here.
+    #[test]
+    fn fixed_center_freq_source_forwards_both_optional_trait_signals() {
+        use manta_input::InputHealthCounters;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        struct StubSource {
+            counters: Arc<InputHealthCounters>,
+            live: Arc<AtomicBool>,
+        }
+        impl IqSource for StubSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
+                Some(self.live.clone())
+            }
+            fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+                Some(self.counters.clone())
+            }
+        }
+
+        let counters = Arc::new(InputHealthCounters::new());
+        let live = Arc::new(AtomicBool::new(false));
+        let wrapped = FixedCenterFreqSource {
+            inner: Box::new(StubSource {
+                counters: counters.clone(),
+                live: live.clone(),
+            }),
+            freq_hz: 14_025_000.0,
+        };
+
+        assert!(Arc::ptr_eq(&wrapped.health_counters().unwrap(), &counters));
+        assert!(Arc::ptr_eq(
+            &wrapped.confirmed_live_handle().unwrap(),
+            &live
+        ));
+    }
+
+    #[test]
+    fn input_health_of_snapshots_all_three_counters_without_transposing_them() {
+        // Three same-typed u64s: a transposition would be invisible to any
+        // test that used equal values (MAN-56 D7).
+        let c = manta_input::InputHealthCounters::new();
+        c.record_dropped(7);
+        c.record_gap();
+        c.record_gap();
+        c.record_malformed();
+        let h = input_health_of(&c);
+        assert_eq!(h.dropped_packets, 7);
+        assert_eq!(h.gaps_detected, 2);
+        assert_eq!(h.malformed_packets, 1);
+    }
+
+    #[test]
+    fn a_source_without_counters_publishes_no_input_health_series() {
+        struct StubSourceNoCounters;
+        impl IqSource for StubSourceNoCounters {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let m = manta_server::metrics::Metrics::new();
+        // Mirrors the wiring above: `None` means we never call
+        // set_input_health.
+        let src: Box<dyn IqSource> = Box::new(StubSourceNoCounters);
+        if let Some(c) = src.health_counters() {
+            m.set_input_health("file", input_health_of(&c));
+        }
+        assert!(!m
+            .render_prometheus_text()
+            .contains("manta_input_malformed_packets_total{"));
+    }
+
+    // MAN-136 round-1 validate code-review finding 1: the increment
+    // condition for `manta_spots_unresolved_geography_total` must match the
+    // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
+    // sentinels -- the RESOLVED ADIF entity number, not merely whether
+    // `cty.lookup` returned an entry.
+
+    const GEOGRAPHY_CTY_FIXTURE: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N;
+";
+    /// One `dxcc.tsv` row for the fixture above, in the vendored file's
+    /// `<primary-prefix>\t<adif-number>\t<name>` shape.
+    const GEOGRAPHY_DXCC_FIXTURE: &str = "K\t291\tUnited States\n";
+
+    #[test]
+    fn a_callsign_with_a_resolved_entity_number_is_not_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(cty.lookup("W1AW").and_then(|e| e.dxcc), Some(291));
+        assert!(!geography_is_unresolved(&cty, "W1AW"));
+    }
+
+    #[test]
+    fn an_unresolvable_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(cty.lookup("QQ1AAA").is_none(), "test premise");
+        assert!(geography_is_unresolved(&cty, "QQ1AAA"));
+    }
+
+    #[test]
+    fn a_maritime_or_aeronautical_mobile_callsign_is_counted_as_unresolved() {
+        // /MM and /AM resolve through the base prefix, so the entity-number
+        // test alone reads them as resolved -- but `SpotMessage::from_spot`
+        // emits UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE and null lat/lon for them,
+        // so the counter must not sit at zero while those go out.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(
+            cty.lookup("W1AW/MM").and_then(|e| e.dxcc),
+            Some(291),
+            "test premise: the base prefix still resolves"
+        );
+        assert!(geography_is_unresolved(&cty, "W1AW/MM"));
+        assert!(geography_is_unresolved(&cty, "W1AW/AM"));
+        assert!(!geography_is_unresolved(&cty, "W1AW/P"));
+    }
+
+    #[test]
+    fn a_cty_resolvable_callsign_with_no_dxcc_row_is_still_counted_as_unresolved() {
+        // The cty.dat/dxcc.tsv drift state: `cty.dat` was hand-refreshed
+        // (data/SOURCES.md has no refresh automation) without regenerating
+        // the TSV, so geography resolves -- non-null dxLat/dxLon -- while
+        // the entity number does not, and the spot goes out with
+        // `dxDxcc: -1`. Counting `lookup().is_none()` missed exactly this.
+        let cty = manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, "");
+        let entry = cty.lookup("W1AW").expect("geography still resolves");
+        assert_eq!(entry.dxcc, None, "test premise: only the number is missing");
+        assert_eq!(entry.continent, "NA");
+        assert!(
+            geography_is_unresolved(&cty, "W1AW"),
+            "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
+        );
     }
 }
