@@ -1138,11 +1138,8 @@ fn start_spot_server(
                 cfg.telnet_max_connections_per_ip,
             ),
             telnet_ip_command_limiter,
-<<<<<<< HEAD
             cfg.line_format,
-=======
             manta_server::tasks::CLIENT_DRAIN_DEADLINE,
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
         ));
         let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::json_stream::MAX_INBOUND_PINGS,
