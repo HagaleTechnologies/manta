@@ -579,13 +579,39 @@ fn open_source(
 /// mono audio. Anything else falls through to `AudioIqSource::from_wav_file`
 /// so its own existing validation error (not a new one invented here) is
 /// what the operator sees, exactly as before this change.
+/// Peeks a WAV file's channel count without decoding samples -- 2 means
+/// raw complex IQ (`WavIqSource`), anything else falls through to
+/// `AudioIqSource`'s mono real-audio path. Returns `false` (not IQ) on any
+/// read failure, so a bad/missing file degrades to the pre-existing
+/// `AudioIqSource::from_wav_file` error path rather than a new one.
+fn is_2channel_iq_wav(path: &Path) -> bool {
+    hound::WavReader::open(path)
+        .map(|r| r.spec().channels == 2)
+        .unwrap_or(false)
+}
+
+/// Whether `source` names a 2-channel IQ WAV carrying a real RF center
+/// frequency via its `<stem>.json` sidecar (`WavIqSource`'s own
+/// convention, see `manta_input::Sidecar`) -- if so, the `--config`
+/// RF-awareness gate below should not require a redundant
+/// `--dial-freq-hz` (MAN-169 round-3 Codex finding: `has_rf_aware_source`
+/// previously only checked kiwi/soapy/hpsdr flags, so a daemon replay of
+/// an IQ file with real sidecar metadata was wrongly rejected). Checked
+/// cheaply (a header peek + file existence), without duplicating
+/// `WavIqSource::open`'s own sidecar-parsing/validation -- a missing or
+/// malformed sidecar just means "not RF-aware", handled identically to
+/// every other non-RF-aware source already.
+fn source_has_rf_center_freq_sidecar(source: &Option<PathBuf>) -> bool {
+    let Some(path) = source else {
+        return false;
+    };
+    is_2channel_iq_wav(path) && path.with_extension("json").exists()
+}
+
 fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
         Some(path) => {
-            let is_iq = hound::WavReader::open(&path)
-                .map(|r| r.spec().channels == 2)
-                .unwrap_or(false);
-            if is_iq {
+            if is_2channel_iq_wav(&path) {
                 Box::new(manta_input::WavIqSource::open(&path)?)
             } else {
                 Box::new(manta_input::AudioIqSource::from_wav_file(&path)?)
@@ -2003,7 +2029,10 @@ fn main() -> Result<()> {
             let has_hpsdr_source = hpsdr_host.is_some();
             #[cfg(not(feature = "hpsdr"))]
             let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
+            let has_rf_aware_source = kiwi_host.is_some()
+                || has_soapy_source
+                || has_hpsdr_source
+                || source_has_rf_center_freq_sidecar(&source);
             let source_name = if kiwi_host.is_some() {
                 "kiwi"
             } else if has_soapy_source {

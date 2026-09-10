@@ -293,6 +293,37 @@ fn capture_rate_hz_replays_a_2channel_iq_wav_through_wav_iq_source() {
 }
 
 #[test]
+fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
+    // MAN-169 round-3 Codex finding: `has_rf_aware_source` (the gate behind
+    // `--dial-freq-hz is required with --config`) only checked kiwi/soapy/
+    // hpsdr CLI flags -- a 2-channel IQ WAV replay with a real
+    // `<stem>.json` sidecar center frequency (the same file format Task 2's
+    // `WavIqSource` round-2 fix unlocked for --capture-rate-hz) was still
+    // wrongly rejected as "not RF-aware" and forced a redundant
+    // --dial-freq-hz, even though the source already reports a real RF
+    // center via WavIqSource::center_freq_hz(). This proves the gate no
+    // longer fires for that case -- the run still fails (the --config path
+    // doesn't exist), but it must fail for THAT reason, not the
+    // --dial-freq-hz one, proving the RF-awareness check itself now passes.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1(); // fs=96_000, center_freq_hz=14_000_000 (nonzero)
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("--dial-freq-hz"),
+        "RF-awareness gate should not fire for an IQ WAV with a real sidecar: {stderr}"
+    );
+}
+
+#[test]
 fn capture_rate_hz_rejects_non_finite_and_degenerately_small_values() {
     // MAN-169 whole-branch review finding: a small --capture-rate-hz (e.g.
     // 187.5 Hz, reachable as 48000/256) resolves to a Channelizer with
