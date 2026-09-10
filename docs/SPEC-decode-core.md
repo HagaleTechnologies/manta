@@ -114,10 +114,13 @@ measures ~17 Hz instead (see the V31 row below; tracked in issue #177).
 An optional stage between the `IqSource` and the channelizer: a cascade
 of `log2(factor)` Kaiser-windowed halfband FIR decimate-by-2 stages,
 `factor` restricted to powers of two. Each stage's ideal cutoff sits at
-its own input Nyquist/2 (the output Nyquist after that stage's
-decimate-by-2), Kaiser-windowed at the same beta/stopband target as the
-channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated rate
-must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
+`CUTOFF_FRACTION * fs_in` (0.235, deliberately below the theoretical
+quarter-band point `fs_in/4` -- the output Nyquist after that stage's
+decimate-by-2 -- reserving a transition-band margin so full stopband
+attenuation is actually reached by the new Nyquist rather than only
+somewhere past it), Kaiser-windowed at the same beta/stopband target as
+the channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated
+rate must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
 Module: `manta-dsp::decimate`.
 
 A halfband filter has every other tap forced to zero by construction
@@ -127,7 +130,17 @@ cost per output sample. The current implementation does not exploit this:
 structurally-zero ones, so the 2x MAC saving is not yet realized. This is a
 known, deliberate gap for now (tracked in issue #176), not an oversight,
 and there is likewise no criterion bench yet measuring this stage's cost
-against the repo's Pi4 CPU budget.
+against the repo's Pi4 CPU budget. Moving the cutoff off exactly `fs_in/4`
+(above) also gives up this exact-zero-tap property, so issue #176's skip
+opportunity no longer applies to this stage regardless.
+
+**Known limitation** (issue #179): the `CUTOFF_FRACTION` margin means
+channels near the decimated Nyquist edge see real, non-negligible
+attenuation (roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge,
+for a 96k->48k stage) while still being exposed to the channelizer as
+ordinary trackable channels -- a real CW signal landing there can lose
+enough SNR to go undetected. The channelizer has no concept of decimation
+and does not yet exclude or de-weight these transition-band channels.
 
 ---
 

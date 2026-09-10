@@ -7,7 +7,16 @@
 //! Each stage's design cutoff is deliberately a bit below the theoretical
 //! quarter-band point (see `CUTOFF_FRACTION`), reserving a transition-band
 //! margin so full stopband attenuation is actually reached by the new
-//! Nyquist rather than only somewhere past it -- without the margin, a
+//! Nyquist rather than only somewhere past it. KNOWN LIMITATION (issue
+//! #179): this margin means channels near the decimated Nyquist edge see
+//! real, non-negligible attenuation (roughly -6 dB to -22 dB in the last
+//! ~1.5 kHz below the edge) while still being exposed to the channelizer
+//! as ordinary trackable channels -- a real CW signal landing there can
+//! lose enough SNR to go undetected, or a partially-attenuated edge
+//! channel can still show some spurious activity. The channelizer has no
+//! concept of decimation and does not yet exclude or de-weight these
+//! transition-band channels; see issue #179 for the follow-up. Without
+//! the margin, a
 //! signal just above the new Nyquist could alias into a false in-band
 //! track/spot at the mirrored RF frequency.
 
