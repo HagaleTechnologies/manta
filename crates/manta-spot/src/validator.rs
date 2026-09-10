@@ -68,6 +68,61 @@ const MAX_PENDING_BEACONS: usize = 8;
 /// `dropped_survivor_watermark` is for.
 const MAX_CLOSED_SURVIVORS: usize = 512;
 
+/// Bounds `Validator::deferred_annotations` -- MAN-33's message
+/// annotations parked for a merge survivor that has not produced a
+/// decoder event yet (Codex review on PR #159, round 11). Migrating
+/// straight into `tracks` with `entry(..).or_default()` was the bug:
+/// `TrackManager::merge_converged` requires only the LOSER to have
+/// emitted (manta-engine/src/track.rs's MAN-19 filter) and a bare
+/// promotion deliberately does not set that flag, so a survivor that
+/// never emits anything of its own never produces a `TrackClosed` -- and
+/// the `TrackState` materialized for it by the migration was then never
+/// freed, reintroducing exactly the unbounded per-track_id growth the
+/// closure teardown exists to prevent. Parking the annotations here
+/// instead materializes no `TrackState` at all: the survivor adopts them
+/// in `track_mut` if and when it produces its first event (which is also
+/// what earns it its own eventual `TrackClosed`), and otherwise they
+/// simply age out under this cap. Sized like `MAX_CLOSED_SURVIVORS`,
+/// above `PipelineConfig::track_cap`'s default 500, and dropped in the
+/// same INSERTION order for the same reasons; dropping one only ever
+/// degrades a migration to "annotations lost", never to leaked state.
+const MAX_DEFERRED_ANNOTATIONS: usize = 512;
+
+/// MAN-33's per-track message annotations, named apart from `TrackState`
+/// so a merge can carry them without a `TrackState` to put them in --
+/// see `MAX_DEFERRED_ANNOTATIONS`.
+#[derive(Default)]
+struct MessageAnnotations {
+    /// See `Spot::rst`.
+    rst: Option<String>,
+    /// `sample_ts` of the `WordBoundary` that produced `rst`; meaningless
+    /// while `rst` is `None`. See `TrackState::rst_ts`.
+    rst_ts: u64,
+    /// See `Spot::qrl_query`.
+    qrl_query: bool,
+}
+
+/// Folds `incoming` into an existing `(rst, rst_ts, qrl_query)` triple.
+/// `qrl_query` is a latch, so it simply ORs in. `rst` is "the most
+/// recently decoded RST" (CW Skimmer band-map semantics), so the
+/// chronologically LATEST of the two wins -- which is why `rst_ts`
+/// exists. Shared by the two directions a merge can take (straight into
+/// a live `TrackState`, or out of `deferred_annotations` when the
+/// survivor finally materializes one) so both obey the identical
+/// precedence rule.
+fn fold_annotations(
+    rst: &mut Option<String>,
+    rst_ts: &mut u64,
+    qrl_query: &mut bool,
+    incoming: MessageAnnotations,
+) {
+    *qrl_query |= incoming.qrl_query;
+    if incoming.rst.is_some() && (rst.is_none() || incoming.rst_ts > *rst_ts) {
+        *rst = incoming.rst;
+        *rst_ts = incoming.rst_ts;
+    }
+}
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -352,6 +407,19 @@ pub struct Validator {
     /// (the MAN-19 leak) -- and it is only reachable at all in the
     /// pathological regime where an eviction happens.
     dropped_survivor_watermark: u32,
+    /// MAN-33 annotations carried by a merge whose survivor has no
+    /// `TrackState` yet, held here instead of materializing one for it --
+    /// see `MAX_DEFERRED_ANNOTATIONS`. Adopted by `track_mut` on that
+    /// survivor's first event; never read for a track that already has a
+    /// `TrackState`.
+    deferred_annotations: BTreeMap<u32, MessageAnnotations>,
+    /// The `deferred_annotations` keys in the order they were parked, so
+    /// the oldest is dropped first at the cap -- the same insertion-order
+    /// policy (and the same reasons) as `closed_survivor_order`. An id
+    /// stays here after `track_mut` adopts and removes it from the map,
+    /// so THIS deque's length is what the cap is enforced against; the
+    /// map is a subset of it.
+    deferred_annotation_order: std::collections::VecDeque<u32>,
     gate: RepetitionGate,
     dedupe: Dedupe,
     freq_calibration: f64,
@@ -370,6 +438,8 @@ impl Validator {
             closed_survivors: BTreeMap::new(),
             closed_survivor_order: std::collections::VecDeque::new(),
             dropped_survivor_watermark: 0,
+            deferred_annotations: BTreeMap::new(),
+            deferred_annotation_order: std::collections::VecDeque::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
             freq_calibration: 1.0,
@@ -452,7 +522,7 @@ impl Validator {
                 confidence,
                 ..
             } => {
-                let track = self.tracks.entry(*track_id).or_default();
+                let track = self.track_mut(*track_id);
                 match glyph {
                     Glyph::Char(c) => {
                         track.current.text.push(c.to_ascii_uppercase());
@@ -472,7 +542,7 @@ impl Validator {
                 track_id,
                 sample_ts,
             } => {
-                let track = self.tracks.entry(*track_id).or_default();
+                let track = self.track_mut(*track_id);
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
                     // MAN-33: scan the word that just completed, not the
@@ -501,7 +571,7 @@ impl Validator {
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
-                let track = self.tracks.entry(*track_id).or_default();
+                let track = self.track_mut(*track_id);
                 track.wpm = *wpm;
                 track.wpm_confirmed = true;
                 // No retry here, and no Beacon-WPM decision here either
@@ -519,7 +589,7 @@ impl Validator {
                 snr_2500_db,
                 freq_hz,
             } => {
-                let track = self.tracks.entry(*track_id).or_default();
+                let track = self.track_mut(*track_id);
                 let had_meta = track.has_meta;
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
@@ -1267,30 +1337,105 @@ impl Validator {
     /// now represents, and would otherwise vanish when the loser's
     /// `TrackState` is removed moments later.
     ///
-    /// `qrl_query` is a latch, so it simply ORs in. `rst` is "the most
-    /// recently decoded RST" (CW Skimmer band-map semantics), so the
-    /// chronologically LATEST of the two wins -- the survivor keeps its
+    /// Precedence is `fold_annotations`': a `qrl_query` latch, and "the
+    /// most recently decoded RST" wins for `rst` (the survivor keeps its
     /// own when it decoded one at or after the loser's, which is why
-    /// `rst_ts` exists. An eviction (no survivor) has nowhere to migrate
+    /// `rst_ts` exists). An eviction (no survivor) has nowhere to migrate
     /// to and never reaches here; unlike a pending beacon there is
     /// nothing suppressed to count, since an annotation is decoration on
     /// a spot rather than a candidate that could have become one.
+    ///
+    /// A survivor that has produced no decoder event yet has no
+    /// `TrackState`, and this must NOT create one for it -- see
+    /// `defer_annotations`/`MAX_DEFERRED_ANNOTATIONS`.
     fn migrate_message_annotations(&mut self, track_id: u32, survivor_track_id: u32) {
         let Some(track) = self.tracks.get(&track_id) else {
             return;
         };
-        let (rst, rst_ts, qrl_query) = (track.rst.clone(), track.rst_ts, track.qrl_query);
-        if rst.is_none() && !qrl_query {
-            // Nothing to carry -- don't materialize survivor state that
-            // no event has asked for yet.
+        let carried = MessageAnnotations {
+            rst: track.rst.clone(),
+            rst_ts: track.rst_ts,
+            qrl_query: track.qrl_query,
+        };
+        if carried.rst.is_none() && !carried.qrl_query {
+            // Nothing to carry.
             return;
         }
-        let survivor = self.tracks.entry(survivor_track_id).or_default();
-        survivor.qrl_query |= qrl_query;
-        if rst.is_some() && (survivor.rst.is_none() || rst_ts > survivor.rst_ts) {
-            survivor.rst = rst;
-            survivor.rst_ts = rst_ts;
+        if let Some(survivor) = self.tracks.get_mut(&survivor_track_id) {
+            fold_annotations(
+                &mut survivor.rst,
+                &mut survivor.rst_ts,
+                &mut survivor.qrl_query,
+                carried,
+            );
+            return;
         }
+        // The survivor has produced no decoder event yet, so it has no
+        // `TrackState` -- and `entry(..).or_default()`ing one here was the
+        // MAN-19 leak all over again (Codex review on PR #159, round 11):
+        // `merge_converged` requires only the LOSER to have emitted, so an
+        // eventless survivor merged or evicted before it ever decodes
+        // anything is filtered out of `TrackClosed` and nothing would ever
+        // free that state. Park the annotations instead; `track_mut`
+        // adopts them if the survivor does eventually speak.
+        self.defer_annotations(survivor_track_id, carried);
+    }
+
+    /// `self.tracks`' entry for `track_id`, created on first use. THE one
+    /// place a `TrackState` is materialized, so a survivor that had
+    /// annotations parked for it by `migrate_message_annotations` picks
+    /// them up the moment it produces its own first decoder event -- the
+    /// same event that sets `manta-engine`'s `has_emitted` and so
+    /// guarantees this state an eventual `TrackClosed` to free it (Codex
+    /// review on PR #159, round 11; see `MAX_DEFERRED_ANNOTATIONS`).
+    fn track_mut(&mut self, track_id: u32) -> &mut TrackState {
+        let carried = if self.tracks.contains_key(&track_id) {
+            None
+        } else {
+            self.deferred_annotations.remove(&track_id)
+        };
+        let track = self.tracks.entry(track_id).or_default();
+        if let Some(carried) = carried {
+            fold_annotations(
+                &mut track.rst,
+                &mut track.rst_ts,
+                &mut track.qrl_query,
+                carried,
+            );
+        }
+        track
+    }
+
+    /// Parks `carried` for a survivor that has no `TrackState`, folding
+    /// into whatever an earlier merge already parked for the same id (a
+    /// chain of merges can reach the same eventless survivor more than
+    /// once). Bounded by `MAX_DEFERRED_ANNOTATIONS`, dropping the entry
+    /// parked LONGEST AGO first -- the same insertion-order policy
+    /// `note_closed` uses for `closed_survivors`. The cap is enforced
+    /// against `deferred_annotation_order`, not the map, because
+    /// `track_mut` removes adopted ids from the map without touching the
+    /// deque: bounding the deque bounds both, whereas bounding only the
+    /// map would let the deque grow one stale id per adoption forever.
+    fn defer_annotations(&mut self, survivor_track_id: u32, carried: MessageAnnotations) {
+        if let Some(existing) = self.deferred_annotations.get_mut(&survivor_track_id) {
+            fold_annotations(
+                &mut existing.rst,
+                &mut existing.rst_ts,
+                &mut existing.qrl_query,
+                carried,
+            );
+            return;
+        }
+        while self.deferred_annotation_order.len() >= MAX_DEFERRED_ANNOTATIONS {
+            let Some(dropped) = self.deferred_annotation_order.pop_front() else {
+                // Unreachable: the deque is non-empty whenever its length
+                // is at the cap. Break rather than spin.
+                break;
+            };
+            self.deferred_annotations.remove(&dropped);
+        }
+        self.deferred_annotations.insert(survivor_track_id, carried);
+        self.deferred_annotation_order.push_back(survivor_track_id);
     }
 
     /// The one point where every `PendingBeacon` captured for `track_id`
@@ -2380,5 +2525,90 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review on PR #159, round 11: migrating MAN-33 annotations
+    /// into the survivor with `entry(..).or_default()` materialized a
+    /// `TrackState` for a survivor that has emitted nothing.
+    /// `merge_converged` requires only the LOSER to have emitted and a
+    /// bare promotion deliberately does not set `has_emitted`, so such a
+    /// survivor is filtered out of `TrackClosed` entirely -- nothing would
+    /// ever free that state, and repeated merges rebuild exactly the
+    /// unbounded growth MAN-19's teardown exists to prevent. The
+    /// annotations must be parked instead, and adopted only if the
+    /// survivor does eventually speak (which is what earns it a
+    /// `TrackClosed` of its own).
+    #[test]
+    fn merge_into_an_eventless_survivor_materializes_no_track_state() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        run(&transmission_events(1, &["QRL?", "TU", "5NN"], 0), &mut v);
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        assert!(
+            v.tracks.is_empty(),
+            "no `TrackState` may exist for a survivor that has emitted \
+             nothing -- no `TrackClosed` would ever free it, got {:?}",
+            v.tracks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            v.deferred_annotations.contains_key(&2),
+            "the loser's annotations must be parked for the survivor"
+        );
+
+        // The survivor speaks: it now has a `TrackState` (and so an
+        // eventual `TrackClosed`), and adopts what was parked.
+        seed_meta(&mut v, 2);
+        let spots = run(
+            &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+            &mut v,
+        );
+        assert_eq!(spots.len(), 1, "spots were {spots:?}");
+        assert_eq!(spots[0].rst.as_deref(), Some("599"));
+        assert!(spots[0].qrl_query);
+        assert!(
+            !v.deferred_annotations.contains_key(&2),
+            "an adopted parking slot must be released"
+        );
+    }
+
+    /// The parking lot itself must not become the leak it replaced: a
+    /// daemon whose merge survivors never speak parks one entry per merge
+    /// forever otherwise (Codex review on PR #159, round 11).
+    #[test]
+    fn deferred_annotations_stay_bounded() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let n = MAX_DEFERRED_ANNOTATIONS + 5;
+        let mut ts = 0u64;
+        for i in 0..n {
+            let loser = (i as u32) * 2 + 1;
+            run(&transmission_events(loser, &["QRL?"], ts), &mut v);
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id: loser,
+                closure: ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(loser + 1),
+                },
+            });
+            ts += 1_000_000;
+        }
+        assert!(
+            v.tracks.is_empty(),
+            "every loser closed and no survivor ever spoke, got {:?}",
+            v.tracks.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            v.deferred_annotation_order.len(),
+            MAX_DEFERRED_ANNOTATIONS,
+            "the parking lot is capped"
+        );
+        assert!(v.deferred_annotations.len() <= MAX_DEFERRED_ANNOTATIONS);
+        assert!(
+            !v.deferred_annotations.contains_key(&2),
+            "the entry parked longest ago is the one dropped"
+        );
     }
 }
