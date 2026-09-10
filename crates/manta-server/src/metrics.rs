@@ -3,12 +3,60 @@
 //! tracks..."; MAN-12 scenario 3 ("operators can inspect health without
 //! reading source"). `Metrics` owns what `manta-server` genuinely knows
 //! (spots published, connected clients per protocol) and exposes
-//! `set_active_tracks`/`set_source_health` for the daemon wiring layer to
-//! inject engine-owned numbers manta-server has no way to compute itself.
+//! `set_active_tracks`/`set_source_health`/`set_input_health` for the
+//! daemon wiring layer to inject engine-owned numbers manta-server has no
+//! way to compute itself.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
+
+/// Spots abandoned when a client connection terminates on a failed write,
+/// or (via `Metrics::record_dropped_shutdown`) on a clean shutdown with no
+/// write having failed or timed out (an earlier handshake write may well
+/// have succeeded -- see `spots_dropped_shutdown_total`). `in_flight_spot`
+/// is true when the write that just failed was carrying a NEWLY-LOST live
+/// spot (that spot is lost too) and false for a control-frame write --
+/// telnet's `Filter set:` acknowledgement, the WebSocket Pong reply --
+/// where nothing was in flight but the receiver's queue is abandoned all
+/// the same.
+/// `still_queued` is `rx.len()`.
+///
+/// MAN-45 remediate (code-review round 18, finding 1): telnet's `sh/dx`
+/// history-replay write-failure site also passes `false`, even though a
+/// write did fail there -- the entry it was writing is a REPLAY of a spot
+/// already published (and already counted once in `manta_spots_total`,
+/// often already delivered live to this same client), not newly-lost live
+/// data, so neither it nor the rest of the unreplayed history iterator is
+/// summed into `still_queued`. Only that call site's live `rx` backlog is
+/// real, newly-abandoned loss.
+///
+/// One function rather than the arithmetic open-coded at each site: rounds
+/// 11-16 each found one more write path with this accounting missing or
+/// subtly different, and the differences between `1 + rx.len()` and bare
+/// `rx.len()` are exactly what made each one easy to get wrong. Extracted
+/// for the same reason `json_stream::is_ws_protocol_violation` was: so the
+/// policy is testable without a live socket.
+pub fn abandoned_spot_count(in_flight_spot: bool, still_queued: usize) -> u64 {
+    still_queued as u64 + u64::from(in_flight_spot)
+}
+
+/// Packet-level input-stream health for one source, injected by the daemon
+/// wiring layer (see module doc) -- `manta-server` has no `manta-input`
+/// dependency and cannot read these itself (MAN-56). Deliberately a
+/// separate type from `manta_input::InputHealthCounters` rather than a
+/// shared one: keeping the two crates' types disjoint is what preserves
+/// that dependency boundary; `manta-cli`, which depends on both, does the
+/// translation.
+///
+/// The values are the source's current *absolute* monotonic totals, not
+/// deltas -- `set_input_health` overwrites, it does not accumulate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputHealth {
+    pub dropped_packets: u64,
+    pub gaps_detected: u64,
+    pub malformed_packets: u64,
+}
 
 #[derive(Default)]
 pub struct Metrics {
@@ -16,11 +64,56 @@ pub struct Metrics {
     spots_dropped_lagged_total: AtomicU64,
     spots_suppressed_by_filter_total: AtomicU64,
     spots_dropped_write_failed_total: AtomicU64,
+    /// MAN-45 remediate (code-review round 18, finding 2): a client's
+    /// subscribed backlog abandoned because the daemon shut down while
+    /// that client was still in telnet's pre-login handshake or
+    /// json_stream's pre-loop WS-detection peek/handshake -- NO write
+    /// itself timed out or failed on this path, the daemon shut down
+    /// cleanly. Kept out of `spots_dropped_write_failed_total` for the
+    /// same reason `uplink_disconnected_total` is kept out of
+    /// `uplink_write_failed_total`: that counter's own name and
+    /// Prometheus HELP text ("a client's socket write timed out or
+    /// failed") would otherwise mislead an operator into diagnosing a
+    /// failing client socket when the real cause was a normal shutdown.
+    spots_dropped_shutdown_total: AtomicU64,
+    /// MAN-45 remediate (code-review round 19, P2): history entries
+    /// abandoned mid-`sh/dx` replay -- the entry whose write just failed
+    /// plus every entry left unreplayed behind it, and the unreplayed
+    /// remainder when the replay loop defers to the shutdown drain.
+    ///
+    /// A DEDICATED counter (one of the two remedies the reviewer offered)
+    /// rather than more `record_write_failed` calls, for the same reason
+    /// `spots_dropped_shutdown_total` is separate: a replayed `sh/dx`
+    /// entry is a RE-send of a spot already published and already counted
+    /// once in `manta_spots_total` -- often already delivered live to this
+    /// same client before `sh/dx` was even issued. Summing it into
+    /// `spots_dropped_write_failed_total` would let that counter exceed
+    /// `manta_spots_total` and would break the "delivered + counted ==
+    /// published" invariant the acceptance suite asserts on it. Keeping it
+    /// here makes the loss VISIBLE (ARCHITECTURE §8: no silent loss)
+    /// without corrupting the live-delivery arithmetic.
+    spots_replay_abandoned_total: AtomicU64,
+    /// MAN-136/MAN-45: a spot's dx or de callsign couldn't be resolved
+    /// against `cty.dat` -- or resolved only through the base prefix of a
+    /// `/MM`/`/AM` call, whose real position is unknowable from it -- so it
+    /// was emitted with the `UNKNOWN_DXCC`/`UNKNOWN_CONTINENT`/
+    /// `UNKNOWN_CQ_ZONE` sentinels instead of real geography. ARCHITECTURE §8: "every dropped/evicted/suppressed item is
+    /// counted" -- an operator otherwise has no way to notice this is
+    /// happening. Incremented once per spot at publish time (`main.rs`), not
+    /// inside `SpotMessage::from_spot` (which runs once per connected
+    /// client).
+    spots_unresolved_geography_total: AtomicU64,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
+    /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
+    /// counters. Engine/input-owned figures, injected by the daemon wiring
+    /// layer on a timer -- see `manta-cli`'s `INPUT_HEALTH_POLL_INTERVAL`.
+    /// Sources with no wire-packet loss model never call `set_input_health`,
+    /// so they publish no series rather than a permanently-zero one.
+    input_health: RwLock<BTreeMap<String, InputHealth>>,
     uplink_sent_total: AtomicU64,
     uplink_suppressed_total: AtomicU64,
     uplink_lagged_total: AtomicU64,
@@ -83,6 +176,55 @@ impl Metrics {
             .fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Read accessor for the write-failure counter, mirroring the
+    /// `uplink_*_total` getters -- lets an acceptance test assert the
+    /// "delivered + counted == published" invariant (ARCHITECTURE §8)
+    /// without parsing the Prometheus text body.
+    pub fn spots_dropped_write_failed_total(&self) -> u64 {
+        self.spots_dropped_write_failed_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// See `spots_dropped_shutdown_total`'s doc comment for why this is a
+    /// separate counter from `record_write_failed` rather than another
+    /// caller of it.
+    pub fn record_dropped_shutdown(&self, n: u64) {
+        self.spots_dropped_shutdown_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Read accessor mirroring `spots_dropped_write_failed_total` -- lets a
+    /// test assert the two counters independently (e.g. that a clean
+    /// shutdown mid-handshake charges this one and leaves the write-failure
+    /// counter untouched).
+    pub fn spots_dropped_shutdown_total(&self) -> u64 {
+        self.spots_dropped_shutdown_total.load(Ordering::Relaxed)
+    }
+
+    /// `n` `sh/dx` history entries were abandoned without being replayed
+    /// to the requesting client. See `spots_replay_abandoned_total`'s doc
+    /// comment for why this is its own counter rather than another caller
+    /// of `record_write_failed`.
+    pub fn record_replay_abandoned(&self, n: u64) {
+        self.spots_replay_abandoned_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Read accessor mirroring the other loss-counter getters, so an
+    /// acceptance test can assert replay loss independently of live loss.
+    pub fn spots_replay_abandoned_total(&self) -> u64 {
+        self.spots_replay_abandoned_total.load(Ordering::Relaxed)
+    }
+
+    /// MAN-136/MAN-45: call once per spot (not per connected client) when
+    /// either the dx or de callsign didn't resolve against `cty.dat`, so the
+    /// wire message carries the `UNKNOWN_*` sentinels instead of real
+    /// geography.
+    pub fn record_unresolved_geography(&self) {
+        self.spots_unresolved_geography_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inc_telnet_clients(&self) {
         self.telnet_clients.fetch_add(1, Ordering::Relaxed);
     }
@@ -118,6 +260,18 @@ impl Metrics {
             .write()
             .expect("source_health lock poisoned")
             .insert(source.to_string(), healthy);
+    }
+
+    /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
+    /// counters. Engine/input-owned figures, injected by the daemon wiring
+    /// layer on a timer -- see `main.rs`'s `INPUT_HEALTH_POLL_INTERVAL`.
+    /// Sources with no wire-packet loss model never call this, so they
+    /// publish no series rather than a permanently-zero one.
+    pub fn set_input_health(&self, source: &str, health: InputHealth) {
+        self.input_health
+            .write()
+            .expect("input_health lock poisoned")
+            .insert(source.to_string(), health);
     }
 
     // MAN-32: RBN uplink counters. ARCHITECTURE §8's "every
@@ -257,6 +411,34 @@ impl Metrics {
                 .load(Ordering::Relaxed)
         ));
 
+        out.push_str(
+            "# HELP manta_spots_dropped_shutdown_total Spots abandoned because the daemon shut down while a client was still in its pre-login/handshake phase, before any socket write timed out or failed.\n",
+        );
+        out.push_str("# TYPE manta_spots_dropped_shutdown_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_dropped_shutdown_total {}\n",
+            self.spots_dropped_shutdown_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_replay_abandoned_total `sh/dx` history entries abandoned without being replayed, because the replay write failed or the daemon shut down mid-replay. Counted separately from live-delivery loss: these are re-sends of spots already counted in manta_spots_total.\n",
+        );
+        out.push_str("# TYPE manta_spots_replay_abandoned_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_replay_abandoned_total {}\n",
+            self.spots_replay_abandoned_total.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(
+            "# HELP manta_spots_unresolved_geography_total Spots emitted with an UNKNOWN_DXCC/UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE sentinel on the dx or de side, because the callsign did not resolve against cty.dat, OR its entity carries no row in the vendored dxcc.tsv, OR it carries a /MM or /AM designator that places it outside any DXCC entity.\n",
+        );
+        out.push_str("# TYPE manta_spots_unresolved_geography_total counter\n");
+        out.push_str(&format!(
+            "manta_spots_unresolved_geography_total {}\n",
+            self.spots_unresolved_geography_total
+                .load(Ordering::Relaxed)
+        ));
+
         out.push_str("# HELP manta_telnet_clients_connected Currently connected telnet clients.\n");
         out.push_str("# TYPE manta_telnet_clients_connected gauge\n");
         out.push_str(&format!(
@@ -302,6 +484,50 @@ impl Metrics {
                 if *healthy { 1 } else { 0 }
             ));
         }
+
+        // MAN-56: input-layer packet loss/malformed counters. Absent, not
+        // zero, for sources with no wire-packet loss model -- the read
+        // guard is taken once for all three families below (one consistent
+        // view; three separate acquisitions could straddle a writer).
+        let input_health = self
+            .input_health
+            .read()
+            .expect("input_health lock poisoned");
+
+        out.push_str(
+            "# HELP manta_input_dropped_packets_total Input packets estimated lost in transit before reaching the decoder, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_dropped_packets_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_dropped_packets_total{{source=\"{source}\"}} {}\n",
+                h.dropped_packets
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_input_gaps_detected_total Distinct input-stream gap events detected, per source (one gap may account for several dropped packets).\n",
+        );
+        out.push_str("# TYPE manta_input_gaps_detected_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_gaps_detected_total{{source=\"{source}\"}} {}\n",
+                h.gaps_detected
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_input_malformed_packets_total Input datagrams discarded as malformed -- wrong length, or correct length but failed framing/sync validation (MAN-22), per source.\n",
+        );
+        out.push_str("# TYPE manta_input_malformed_packets_total counter\n");
+        for (source, h) in input_health.iter() {
+            out.push_str(&format!(
+                "manta_input_malformed_packets_total{{source=\"{source}\"}} {}\n",
+                h.malformed_packets
+            ));
+        }
+
+        drop(input_health);
 
         out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
@@ -370,6 +596,32 @@ impl Metrics {
 mod tests {
     use super::*;
 
+    /// MAN-45 (PR #63 round-16 finding, revised round-18 remediate finding
+    /// 1): the shapes every write-failure/clean-shutdown site in
+    /// `telnet`/`json_stream` needs, in one place: a failed LIVE-SPOT write
+    /// loses the in-flight spot too; a failed CONTROL-frame write (telnet's
+    /// filter ack, the WS Pong reply) or a clean-shutdown disconnect loses
+    /// only the queue; and `sh/dx`'s history-replay write failure is the
+    /// SAME shape as a control-frame write, not a spot write -- the entry
+    /// being written is a replay of an already-published, already-counted
+    /// spot, so neither it nor the rest of the unreplayed history iterator
+    /// is newly-lost data.
+    #[test]
+    fn abandoned_spot_count_covers_every_write_failure_and_shutdown_shape() {
+        // Live-spot write: the in-flight spot plus everything still retained.
+        assert_eq!(abandoned_spot_count(true, 7), 8);
+        // Control-frame write, or a clean shutdown with no write attempted:
+        // nothing was in flight, the queue is still lost.
+        assert_eq!(abandoned_spot_count(false, 7), 7);
+        // Nothing queued, control frame: nothing to charge.
+        assert_eq!(abandoned_spot_count(false, 0), 0);
+        // `sh/dx` history-replay write failure: same shape as a
+        // control-frame write -- the failed write and the rest of the
+        // history iterator are replays, not newly-lost live spots, so only
+        // the live `rx` backlog counts.
+        assert_eq!(abandoned_spot_count(false, 7), 7);
+    }
+
     #[test]
     fn renders_spot_count_as_a_prometheus_counter() {
         let m = Metrics::new();
@@ -432,6 +684,62 @@ mod tests {
         assert!(text.contains("manta_spots_dropped_write_failed_total 7"));
     }
 
+    /// MAN-45 remediate (code-review round 18, finding 2): a clean-shutdown
+    /// disconnect must count separately from a genuine write failure, so an
+    /// operator reading `spots_dropped_write_failed_total`'s "socket write
+    /// timed out or failed" HELP text never sees a shutdown-only session
+    /// misattributed to it.
+    #[test]
+    fn renders_dropped_shutdown_count_as_a_prometheus_counter_distinct_from_write_failed() {
+        let m = Metrics::new();
+        m.record_dropped_shutdown(2);
+        m.record_dropped_shutdown(5);
+        assert_eq!(m.spots_dropped_shutdown_total(), 7);
+        assert_eq!(m.spots_dropped_write_failed_total(), 0);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_dropped_shutdown_total counter"));
+        assert!(text.contains("manta_spots_dropped_shutdown_total 7"));
+    }
+
+    /// MAN-45 (round-6 review finding).
+    /// MAN-45 remediate (code-review round 19, P2): abandoned `sh/dx`
+    /// replay entries must be VISIBLE (ARCHITECTURE §8) without inflating
+    /// `manta_spots_dropped_write_failed_total`, whose "delivered +
+    /// counted == published" invariant would break if re-sends of
+    /// already-published spots were summed into it.
+    #[test]
+    fn replay_abandoned_is_counted_separately_from_write_failed() {
+        let m = Metrics::new();
+        m.record_replay_abandoned(1 + 4);
+        m.record_replay_abandoned(3);
+        assert_eq!(m.spots_replay_abandoned_total(), 8);
+        assert_eq!(m.spots_dropped_write_failed_total(), 0);
+        assert_eq!(m.spots_dropped_shutdown_total(), 0);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_replay_abandoned_total counter"));
+        assert!(text.contains("manta_spots_replay_abandoned_total 8"));
+        assert!(text.contains("manta_spots_dropped_write_failed_total 0"));
+    }
+
+    #[test]
+    fn unresolved_geography_is_counted_and_exposed() {
+        let m = Metrics::new();
+        m.record_unresolved_geography();
+        m.record_unresolved_geography();
+        assert!(m
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 2"));
+    }
+
+    #[test]
+    fn unresolved_geography_counter_is_present_at_zero_before_any_spot() {
+        // A counter that only appears once it fires is invisible to an operator
+        // building a dashboard -- the other spot counters all render at 0.
+        assert!(Metrics::new()
+            .render_prometheus_text()
+            .contains("manta_spots_unresolved_geography_total 0"));
+    }
+
     #[test]
     fn renders_per_source_health_as_labeled_gauge() {
         let m = Metrics::new();
@@ -440,6 +748,82 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    // MAN-56: input-layer packet loss/malformed counters.
+
+    #[test]
+    fn renders_per_source_input_health_as_labeled_counters() {
+        let m = Metrics::new();
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 12,
+                gaps_detected: 3,
+                malformed_packets: 4,
+            },
+        );
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_dropped_packets_total counter"));
+        assert!(text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 12"#));
+        assert!(text.contains(r#"manta_input_gaps_detected_total{source="hpsdr"} 3"#));
+        assert!(text.contains(r#"manta_input_malformed_packets_total{source="hpsdr"} 4"#));
+    }
+
+    #[test]
+    fn input_health_reflects_the_latest_absolute_totals_not_a_sum() {
+        // The wiring layer pushes the source's current monotonic totals on
+        // a timer; two pushes must not double-count (MAN-56 D4).
+        let m = Metrics::new();
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 2,
+                ..Default::default()
+            },
+        );
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 5,
+                ..Default::default()
+            },
+        );
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 5"#));
+        assert!(!text.contains(r#"manta_input_dropped_packets_total{source="hpsdr"} 7"#));
+    }
+
+    #[test]
+    fn sources_that_never_report_input_health_publish_no_series() {
+        // An absent series, not a frozen 0 -- ARCHITECTURE §8 already flags
+        // "served but never populated" (manta_active_tracks) as actively
+        // misleading to an operator.
+        let m = Metrics::new();
+        m.set_source_health("audio", true);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_malformed_packets_total counter"));
+        assert!(!text.contains("manta_input_malformed_packets_total{"));
+    }
+
+    #[test]
+    fn input_health_families_render_their_samples_contiguously() {
+        // Prometheus text format requires all samples of one metric family
+        // to be grouped; three sources interleaved per-family would be
+        // malformed.
+        let m = Metrics::new();
+        m.set_input_health(
+            "hpsdr",
+            InputHealth {
+                dropped_packets: 1,
+                gaps_detected: 1,
+                malformed_packets: 1,
+            },
+        );
+        let text = m.render_prometheus_text();
+        let dropped = text.find("manta_input_dropped_packets_total{").unwrap();
+        let gaps_help = text.find("# HELP manta_input_gaps_detected_total").unwrap();
+        assert!(dropped < gaps_help);
     }
 
     // MAN-32: RBN uplink counters.

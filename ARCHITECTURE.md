@@ -21,7 +21,7 @@ marked **(research-dependent)** are the only intentionally open questions.
  IQ/WAV file ──▶│       │ config                    ┌──────────▼────────────┐  │
  rig audio ────▶│       │                           │  decoder pool         │  │
  (cpal)         │       │                           │  (per-signal CW       │  │
-                │       │                           │   decoders, N ≤ 500)  │  │
+                │       │                           │   decoders, N ≤ 1200) │  │
                 │       │                           └──────────┬────────────┘  │
                 │       │                                      │ decoded text  │
                 │  ┌────┴─────┐   ┌─────────────┐   ┌──────────▼────────────┐  │
@@ -127,6 +127,14 @@ instances, not one instance retuning — simpler, and SDRs are cheap.
 
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
+This ring-overrun counting is still aspirational (`manta-engine::soak`'s module
+doc tracks the blocker: `coppa-audio::CpalSource` doesn't expose its ring's
+`overflow_count()` publicly). Distinct and already shipped (MAN-56): HPSDR's
+wire-level UDP packet loss/malformed-datagram counters
+(`manta_input::InputHealthCounters`, §8) reach the Prometheus `/metrics`
+endpoint today — a different layer (lost/rejected datagrams before demux, not
+ring backpressure after it), not a partial implementation of the ring gauge
+above.
 
 ## 4. Channelizer (`manta-dsp`)
 
@@ -157,8 +165,12 @@ keying doesn't inflate its own floor). A channel goes *active* when smoothed pow
 exceeds floor + threshold (default 6 dB) with hysteresis (3 dB drop + 5 s hang to
 survive QSB and inter-word gaps). Active channel ⇒ a **track** (center channel ±1
 neighbor, combined by max-power selection) ⇒ a decoder is leased from the pool.
-Track cap (default 500) with lowest-SNR eviction; evictions are counted and
-reported (no silent coverage loss).
+Track cap (default 1200, MAN-166: raised from 500, which was never
+stress-tested against real contest-band signal density and was pinned at
+its ceiling for the entire duration of a real 15-minute recording,
+`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`) with
+lowest-SNR eviction; evictions are counted and reported (no silent
+coverage loss).
 
 **CPU budget** (the reason this whole design is viable):
 
@@ -227,23 +239,37 @@ transmission may never produce again).
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
    single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`DE`
-   token appears anywhere in the window at all, a deliberately coarse
-   guard against mistagging an ordinary, unrecognized CQ/DE call as
-   Beacon). Context determines spot type (CQ / DE / BEACON) — RBN spots
-   carry this flag.
+   token appears anywhere in the window at all (the token must be a
+   complete decoded word, not a substring glued to punctuation inside
+   one), a deliberately coarse guard against mistagging an ordinary,
+   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+   is counted once, as `SuppressionCounts::power_step_guard` (§8); an
+   occurrence already evaluated as a Beacon before the guard appeared is
+   not a loss and is not counted). Context
+   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
-   refreshable) — a call with an unallocated prefix is rejected.
+   refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
+   also joined, on that same primary-prefix field, against a small vendored
+   ADIF DXCC entity-number table (`data/dxcc.tsv`, MAN-136) — refreshed
+   together, see `crates/manta-spot/data/SOURCES.md` — which is what lets
+   `manta-server`'s JSON stream populate `dxDxcc`/`deDxcc` (§7).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
-   the same track before first spot (CW ops repeat their calls; single decodes
-   are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
-   SNR, SCP/cty hits). **Exemption**: messages already type-tagged `BEACON` by
-   step 1's context parse skip this gate entirely — NCDXF-style beacons ID
-   once per power-step cycle and legitimately won't repeat within the window
-   (MAN-28).
+4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
+   before first spot (CW ops repeat their calls; single decodes are
+   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+   `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
+   real signal's `track_id` changes across a close+reopen, so repetition is
+   tracked per frequency instead, with a minimum-gap check across
+   *different* track_ids to still reject two tracks concurrently decoding
+   one real transmission as a false second confirmation — see
+   `crates/manta-spot/src/gate.rs`. Confidence = f(decoder confidence,
+   repetitions, SNR, SCP/cty hits). **Exemption**: messages already
+   type-tagged `BEACON` by step 1's context parse skip this gate entirely
+   — NCDXF-style beacons ID once per power-step cycle and legitimately
+   won't repeat within the window (MAN-28).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
@@ -286,9 +312,35 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts.
+  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
+  resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
+  `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
+  `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
+  see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
-  are disconnected, never back-pressure the pipeline.
+  are disconnected, never back-pressure the pipeline. At shutdown each
+  client's queued backlog is drained on a best-effort basis bounded by a
+  per-client deadline (`tasks::CLIENT_DRAIN_DEADLINE`) that starts once the
+  handler's shutdown branch actually runs; anything the deadline abandons is
+  counted in `manta_spots_dropped_write_failed_total`, never silently
+  truncated (§8). A handler already mid-write when shutdown fires still has
+  to finish that one write first — bounded by its own `WRITE_TIMEOUT` — before
+  it can even reach the drain branch; telnet's `sh/dx` history replay
+  re-checks the shutdown signal before every history entry and, the moment
+  it's observed, defers to the loop's own drain branch to deliver the live
+  backlog with that branch's full unused budget rather than abandoning it,
+  so its worst case matches the live-write arm's rather than scaling with
+  replay depth (MAN-45 remediate, round-16 P1; round 17, CR-2/CR-3). The
+  registry-wide `SHUTDOWN_DRAIN_DEADLINE` (`manta-cli`) is sized to outlive
+  that combined true worst case — `2 * telnet::WRITE_TIMEOUT +
+  CLIENT_DRAIN_DEADLINE`, not `CLIENT_DRAIN_DEADLINE` alone — see that
+  constant's own doc comment for the full accounting. Telnet's pre-login
+  handshake (prompt/read/banner, before a client ever reaches that loop) is
+  excluded from this worst case because it is itself shutdown-aware: each
+  step races `shutdown.changed()` and bails out, counting its backlog,
+  rather than running its own (up to 50s combined) timeouts to completion
+  first (round 17, CR-1).
 - **Exposure policy (normative, not just observed behavior):** both servers are
   designed to be internet-reachable with no client authentication, matching the
   DX cluster/RBN ecosystem's own long-standing convention (CW Skimmer, SkimSrv,
@@ -318,23 +370,62 @@ validation (MAN-28). Dedupe (step 5) still applies.
   own yet (decode-pipeline internals, not the network-facing surface
   MAN-59 scoped to), and `manta --status` hitting a local control socket
   for live stats is similarly not yet implemented. Prometheus text
-  endpoint (feature `metrics`): input overruns, active tracks, evictions,
-  decode rate, spots/min, per-stage queue depths, spot confidence
-  histogram — also aspirational for several of these fields; the
-  currently-implemented subset is `manta_spots_total`,
-  `manta_spots_dropped_lagged_total`,
+  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
+  doc was stale — no Cargo `metrics` feature has ever existed; the
+  endpoint is unconditionally compiled and served whenever
+  `--config` is set — `--server-config` is MAN-77's deprecated alias of
+  that flag): active tracks, evictions, decode rate,
+  spots/min, per-stage queue depths, spot confidence histogram — still
+  aspirational for several of these fields; the currently-implemented
+  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
-  **`manta_active_tracks` is served but not populated** (corrected
-  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
-  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
-  own comment says the engine exposes no hook for it yet — so every
-  production daemon run reports a constant `0`, not a real track count.
-  Listed separately from the "currently-implemented" set above so an
-  operator doesn't read a served-but-frozen placeholder as live data.
+  `manta_spots_dropped_write_failed_total`,
+  `manta_spots_dropped_shutdown_total` (backlog abandoned because the
+  daemon shut down while a client was still in its PRE-LOGIN/handshake
+  phase — telnet's login prompt/read/banner and the JSON stream's
+  WS-detection peek and WS-accept, the only sites that charge it — with no
+  socket write having failed or timed out, exactly as the Prometheus HELP
+  text says. It does NOT mean no write was attempted: the telnet
+  login-read and banner branches are reached only after the `login: `
+  prompt was already written successfully (`telnet.rs`), and the WS-accept
+  branch can fire after `accept_async_with_config` has already put part of
+  the 101 response on the wire. What it does mean is that the client never
+  got past its handshake, so none of its backlog had been offered to a
+  write yet. It is NOT the
+  graceful-drain series: a per-client drain loop that exhausts
+  `tasks::CLIENT_DRAIN_DEADLINE` records whatever it abandons on
+  `manta_spots_dropped_write_failed_total` (§7), so that is the counter
+  to watch for drain-deadline loss),
+  `manta_spots_replay_abandoned_total` (`sh/dx` history entries never
+  replayed because the replay write failed or shutdown intervened — kept
+  out of the write-failure counter because a replay entry was already
+  counted once in `manta_spots_total`),
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that
+  went out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or
+  de callsign didn't resolve against `cty.dat`, *or* it resolved but its
+  entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
+  or `/AM` designator that places it outside any DXCC entity),
+  `manta_active_tracks`, per-protocol client-connected gauges,
+  `manta_source_health`, the uplink counters, and (MAN-56, landed
+  2026-09-04) `manta_input_dropped_packets_total`/
+  `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
+  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
+  per-stage queue depths, decode rate, spots/min, spot-confidence
+  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  deviation, a different gap from MAN-56's wire-level packet counters).
+  The three `manta_input_*` series are published only for sources that
+  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
+  report none) and are **absent**, not a frozen zero, for every other
+  source — the same "absent means not measured" distinction that motivated
+  the `manta_active_tracks` caveat before it was populated.
+  **`manta_active_tracks` is now populated** (MAN-45, corrected
+  2026-09-04): `manta_engine::listen_with_observers` publishes
+  `TrackManager::active_track_count()` into a shared handle as the decode
+  loop runs (`ListenObservers`); the daemon's server runtime polls it into
+  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
+  (every other caller — `soak()`, the CPU-budget bench, both integration
+  tests) is unchanged and pays nothing for this.
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`

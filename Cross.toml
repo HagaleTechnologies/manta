@@ -1,5 +1,12 @@
 # Cross-compilation config for `cross` (cross-rs), used by
-# .github/workflows/release.yml for both Linux gnu targets.
+# .github/workflows/release.yml and release-publish.yml for both Linux gnu
+# targets.
+#
+# `git` is installed for both targets because the workspace's git
+# dependencies (coppa-{dsp,audio,channel}) are fetched INSIDE the cross-rs
+# container, and this repo's .cargo/config.toml sets `[net]
+# git-fetch-with-cli = true` -- so cargo needs a `git` binary there, not just
+# on the host runner. apt is a no-op if the image already carries one.
 #
 # `cpal` (live audio input, crates/manta-input) is an unconditional
 # dependency -- not behind any feature flag -- and its Linux backend links
@@ -15,7 +22,7 @@
 [target.x86_64-unknown-linux-gnu]
 pre-build = [
     "apt-get update",
-    "apt-get install --assume-yes libasound2-dev",
+    "apt-get install --assume-yes libasound2-dev git",
 ]
 
 # aarch64-unknown-linux-gnu: covers Raspberry Pi OS 64-bit and other ARM
@@ -26,5 +33,5 @@ pre-build = [
 pre-build = [
     "dpkg --add-architecture arm64",
     "apt-get update",
-    "apt-get install --assume-yes libasound2-dev:arm64",
+    "apt-get install --assume-yes libasound2-dev:arm64 git",
 ]
