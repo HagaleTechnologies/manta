@@ -277,10 +277,38 @@ impl Evidence {
             false
         } else {
             match self.line.get(center + 1) {
-                Some(&(next_amp, _, _, _)) => {
-                    let u = ((next_amp - n) / (m - n).max(1e-9)).clamp(-0.5, 1.5);
-                    let next_llr = ((u - 0.5) / (self.cfg.sigma_u * self.cfg.sigma_u))
-                        .clamp(-self.cfg.llr_clip, self.cfg.llr_clip);
+                Some(&(next_amp, _, next_n, _)) => {
+                    // Codex review, PR #161 round 13: predict the sign
+                    // using the SAME (m, n) pair `emit(center + 1)` will
+                    // itself actually use when it's later called for
+                    // real -- not `center`'s own (m, n). The centered-max
+                    // window shifts by one position between adjacent
+                    // centers (dropping `line[center-h]`, admitting
+                    // `line[center+1+h]` if in range) and each buffered
+                    // sample carries its own noise_amp, so both `m` and
+                    // `n` can genuinely differ hop-to-hop. Using
+                    // `center`'s stale pair here predicted a sign the
+                    // next center's own real computation never actually
+                    // reached, permanently missing (or fabricating) the
+                    // current-to-next crossing this lookahead exists to
+                    // detect -- confirmed directly: a small-window (h=1)
+                    // steady-baseline-then-dip probe reliably produced an
+                    // unanchored real sign flip under the old formula.
+                    let next_lo = (center + 1).saturating_sub(self.h);
+                    let next_hi = (center + 1 + self.h).min(self.line.len() - 1);
+                    let mut next_m = 0.0f32;
+                    for i in next_lo..=next_hi {
+                        next_m = next_m.max(self.line[i].1);
+                    }
+                    let next_present = next_m >= 2.0 * next_n;
+                    let next_llr = if next_present {
+                        let u =
+                            ((next_amp - next_n) / (next_m - next_n).max(1e-9)).clamp(-0.5, 1.5);
+                        ((u - 0.5) / (self.cfg.sigma_u * self.cfg.sigma_u))
+                            .clamp(-self.cfg.llr_clip, self.cfg.llr_clip)
+                    } else {
+                        -self.cfg.llr_clip
+                    };
                     let next_sign: i8 = if next_llr > 0.0 {
                         1
                     } else if next_llr < 0.0 {
@@ -364,6 +392,91 @@ mod tests {
         }
         out.extend(e.flush());
         out
+    }
+
+    #[test]
+    fn sign_edge_catches_a_transition_the_old_stale_center_levels_missed() {
+        // Codex review, PR #161 round 13: the lookahead sign prediction
+        // must use the SAME (m, n) pair center+1's own `emit()` call will
+        // actually use, not center's stale values. This is a direct,
+        // empirically-confirmed repro (found by running the code, not
+        // hand-derived): a small window (h=1) with a steady high baseline
+        // (always `present`) followed by a brief dip reliably produces an
+        // unanchored sign flip under the old center-levels formula, since
+        // the dip's own centered-max window differs from the levels used
+        // to predict it one hop earlier.
+        let cfg = EvidenceConfig {
+            hold_dits: 1.0,
+            u_init_hops: 1.0, // h = round(1.0 * 1.0) = 1
+            sigma_u: 0.1,     // sharpen the LLR so small u shifts flip sign cleanly
+            ..EvidenceConfig::default()
+        };
+        let mut e = Evidence::new(cfg);
+        let n = 1.0f32;
+        let baseline = 2.5f32;
+        let mut out = Vec::new();
+        for i in 0..50u64 {
+            out.extend(e.push(baseline, n, i * 512));
+        }
+        for i in 50..53u64 {
+            out.extend(e.push(1.6, n, i * 512));
+        }
+        for i in 53..56u64 {
+            out.extend(e.push(baseline, n, i * 512));
+        }
+        let sign = |llr: f32| -> i8 {
+            if llr > 0.0 {
+                1
+            } else if llr < 0.0 {
+                -1
+            } else {
+                0
+            }
+        };
+        for w in out.windows(2) {
+            if sign(w[0].llr) != sign(w[1].llr) {
+                assert!(
+                    w[0].anchor,
+                    "hop {} -> {} sign changed ({} -> {}) but the earlier hop wasn't anchored",
+                    w[0].hop, w[1].hop, w[0].llr, w[1].llr
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sign_edge_anchors_every_genuine_sign_transition_between_emitted_hops() {
+        // Codex review, PR #161 round 13: the lookahead sign prediction
+        // must use the SAME (m, n) pair center+1's own `emit()` call will
+        // actually use, not center's stale values -- the centered-max
+        // window shifts by one position between adjacent centers, so a
+        // mismatch here can predict a sign the next center's own real
+        // computation never reaches, missing a genuine current-to-next
+        // crossing permanently. Verify directly: for every pair of
+        // consecutively emitted hops whose LLR sign differs, the earlier
+        // hop must be flagged as an anchor.
+        let dit_hops = 13usize;
+        let env = keyed(dit_hops, 45.0, 20);
+        let noise_amp = 10f32.powf(-45.0 / 20.0) * 0.5;
+        let evs = run(&env, noise_amp);
+        let sign = |llr: f32| -> i8 {
+            if llr > 0.0 {
+                1
+            } else if llr < 0.0 {
+                -1
+            } else {
+                0
+            }
+        };
+        for w in evs.windows(2) {
+            if sign(w[0].llr) != sign(w[1].llr) {
+                assert!(
+                    w[0].anchor,
+                    "hop {} -> {} sign changed ({} -> {}) but the earlier hop wasn't anchored",
+                    w[0].hop, w[1].hop, w[0].llr, w[1].llr
+                );
+            }
+        }
     }
 
     // [RULING, SDD execution 2026-09-09, Task 4 fix round 1]: this test as

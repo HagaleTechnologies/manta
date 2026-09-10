@@ -1136,6 +1136,20 @@ fn load_decode_config_file(
             cfg.noise.noise_min_bias_db
         );
     }
+    // Codex review, PR #161 round 13: a negative `lookahead_dits` makes
+    // every non-consensus history entry's nonnegative age always exceed
+    // the (negative) forced-commit threshold, reducing the HSMM to
+    // greedy commits and producing misleading confidence/decoded text; a
+    // NaN or infinite value disables forced commits entirely.
+    if !cfg.hsmm.lookahead_dits.is_finite() || cfg.hsmm.lookahead_dits < 0.0 {
+        bail!(
+            "[decode] lookahead_dits must be finite and nonnegative in {} (got {}; a negative \
+             value forces every non-consensus entry immediately, and a non-finite value \
+             disables forced commits entirely)",
+            path.display(),
+            cfg.hsmm.lookahead_dits
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2638,6 +2652,24 @@ mod tests {
     fn load_decode_config_file_rejects_infinite_noise_min_bias_db() {
         let f = write_temp_file(b"[decode]\nnoise_min_bias_db = inf\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_lookahead_dits() {
+        let f = write_temp_file(b"[decode]\nlookahead_dits = -1.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_lookahead_dits() {
+        let f = write_temp_file(b"[decode]\nlookahead_dits = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_accepts_zero_lookahead_dits() {
+        let f = write_temp_file(b"[decode]\nlookahead_dits = 0.0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_ok());
     }
 
     #[test]
