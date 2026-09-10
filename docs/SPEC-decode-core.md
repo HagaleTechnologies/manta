@@ -642,12 +642,12 @@ allowlist = []
 line_format = "rbn"
 ```
 
-<<<<<<< HEAD
-The `[server]` block carries further transport keys (listen addresses,
-per-IP connection and command budgets) that are deployment settings rather
-than normative constants of this spec; `crates/manta-server/src/config.rs`
-is their reference.
-=======
+The `[server]` block's only normative key here is `line_format` above
+(`"rbn"` default | `"skimmer"`, MAN-88); its further transport keys (listen
+addresses, per-IP connection and command budgets) are deployment settings
+rather than normative constants of this spec, and
+`crates/manta-server/src/config.rs` is their reference.
+
 `SPEC-decode-core-v2.md` §7 adds a `[decode]` `engine` key (`"legacy"` |
 `"edge-legacy"` | `"hsmm"`, see that doc's §0) plus the `EdgeLegacy`/`Hsmm`
 evidence/noise/HSMM tunables, additive over this table -- see that
@@ -656,7 +656,6 @@ document's §7 for the full v2 key list and defaults. Parsed by
 `manta-cli`'s `Listen` (and, after MAN-166 Task 13's follow-up, `Decode`/
 `Oracle`) subcommands' `--engine`/`--server-config` handling -- soon `run`'s
 per MAN-77.
->>>>>>> 4e71cba3442a49645d1a795ff439274c2b94e400
 
 ## 10. Deviations from ARCHITECTURE.md
 
