@@ -641,7 +641,11 @@ fn open_audio_source(
 /// happens to exist (MAN-169 round-4 Codex finding: a sidecar existing
 /// with `center_freq_hz: 0.0` -- IqSource's own "unknown center" sentinel
 /// -- is indistinguishable from "no sidecar" once parsed, so existence
-/// alone isn't enough to bypass the --dial-freq-hz guard below).
+/// alone isn't enough to bypass the --dial-freq-hz guard below). Requires
+/// strictly positive, not just nonzero (MAN-169 round-5 Codex finding: a
+/// negative `center_freq_hz` passed the old `!= 0.0` check and would have
+/// published negative/invalid RF frequencies through spot outputs) -- an
+/// RF dial frequency in this domain is never zero or negative.
 fn source_iq_has_real_rf_center(source: &Option<PathBuf>, source_iq: bool) -> bool {
     if !source_iq {
         return false;
@@ -650,7 +654,7 @@ fn source_iq_has_real_rf_center(source: &Option<PathBuf>, source_iq: bool) -> bo
         return false;
     };
     manta_input::WavIqSource::open(path)
-        .map(|src| src.center_freq_hz() != 0.0)
+        .map(|src| src.center_freq_hz() > 0.0)
         .unwrap_or(false)
 }
 

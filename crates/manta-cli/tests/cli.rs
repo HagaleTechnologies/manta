@@ -359,6 +359,32 @@ fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
 }
 
 #[test]
+fn config_still_requires_dial_freq_hz_for_a_negative_sidecar_center_freq() {
+    // MAN-169 round-5 Codex finding: source_iq_has_real_rf_center's old
+    // `!= 0.0` check treated a negative center_freq_hz as RF-aware too --
+    // an RF dial frequency in this domain is never negative, so a negative
+    // sidecar value must still trip the --dial-freq-hz guard, the same as
+    // the round-4 zero-sentinel case.
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.center_freq_hz = -1_000_000.0;
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dial-freq-hz"),
+        "a negative sidecar center_freq_hz must still require --dial-freq-hz: {stderr}"
+    );
+}
+
+#[test]
 fn config_requires_dial_freq_hz_for_an_iq_wav_with_a_zero_sidecar_center() {
     // MAN-169 round-4 Codex finding (Finding B): a `<stem>.json` sidecar
     // existing is not proof its `center_freq_hz` is meaningful --

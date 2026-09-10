@@ -12,16 +12,30 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+/// Scratch buffer size for reading from `inner`, in inner-source samples --
+/// fixed and reused across calls rather than sized from the caller's
+/// remaining output capacity (MAN-169 round-5 Codex finding: a packetized
+/// source like HPSDR only ever fills a few hundred samples per `read()`
+/// regardless of buffer size, so sizing the scratch buffer from a large
+/// caller request -- e.g. `listen()`'s ~2 s startup calibration read --
+/// allocated and zeroed a multi-hundred-thousand-sample `Vec` on every loop
+/// iteration: wasted work, and real memory-pressure/UDP-packet-loss risk on
+/// a Pi4). A file/bulk source just takes a few more `read()` calls to fill
+/// the same total, which is cheap (no syscall, no DSP-comparable cost).
+const RAW_CHUNK_SAMPLES: usize = 4096;
+
 pub struct DecimatingSource {
     inner: Box<dyn IqSource>,
     decimator: Decimator,
     fs_out: f64,
-    factor: usize,
     /// Decimated samples produced by a prior inner read that didn't fit
     /// in the caller's buffer -- carried over so no decimated sample is
     /// ever dropped just because the caller's buffer was smaller than one
     /// inner read happened to produce.
     pending: VecDeque<Complex32>,
+    /// Reused scratch buffer for `inner.read()`, sized once at construction
+    /// (`RAW_CHUNK_SAMPLES * factor`) -- see `RAW_CHUNK_SAMPLES`.
+    raw: Vec<Complex32>,
 }
 
 impl DecimatingSource {
@@ -48,8 +62,8 @@ impl DecimatingSource {
             inner,
             decimator,
             fs_out,
-            factor,
             pending: VecDeque::new(),
+            raw: vec![Complex32::new(0.0, 0.0); RAW_CHUNK_SAMPLES * factor],
         })
     }
 }
@@ -65,12 +79,11 @@ impl IqSource for DecimatingSource {
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         while self.pending.is_empty() {
-            let mut raw = vec![Complex32::new(0.0, 0.0); buf.len().max(1) * self.factor];
-            let n = self.inner.read(&mut raw)?;
+            let n = self.inner.read(&mut self.raw)?;
             if n == 0 {
                 return Ok(0);
             }
-            let decimated = self.decimator.process(&raw[..n]);
+            let decimated = self.decimator.process(&self.raw[..n]);
             self.pending.extend(decimated);
         }
         let n = buf.len().min(self.pending.len());
@@ -132,6 +145,73 @@ mod tests {
                 Complex32::new(phi.cos() as f32, phi.sin() as f32)
             })
             .collect()
+    }
+
+    /// A packetized `IqSource` test double mimicking HPSDR: each `read()`
+    /// call fills at most `packet_len` samples regardless of the caller's
+    /// buffer size, proving `DecimatingSource` no longer sizes its scratch
+    /// buffer from the caller's remaining output capacity (MAN-169
+    /// round-5 Codex finding).
+    struct PacketizedSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        packet_len: usize,
+    }
+
+    impl IqSource for PacketizedSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let n = buf
+                .len()
+                .min(self.packet_len)
+                .min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_stays_correct_against_a_packetized_source_with_a_large_caller_buffer() {
+        // MAN-169 round-5 Codex finding: sizing the scratch buffer from the
+        // caller's remaining output capacity (buf.len() * factor) meant a
+        // large caller request (e.g. listen()'s ~2 s startup calibration
+        // read) allocated and zeroed a multi-hundred-thousand-sample Vec on
+        // every loop iteration, even though a packetized source like HPSDR
+        // only ever fills a few hundred samples per read() regardless of
+        // buffer size. Prove correctness still holds against a source that
+        // caps every read() at a small fixed packet size (126, HPSDR's real
+        // per-packet count), using a caller buffer far larger than that
+        // packet size -- the exact shape a large calibration read produces.
+        let fs_in = 192_000.0;
+        let n_in = 40_000;
+        let inner: Box<dyn IqSource> = Box::new(PacketizedSource {
+            samples: tone(2_000.0, n_in, fs_in),
+            cursor: 0,
+            fs: fs_in,
+            packet_len: 126,
+        });
+        let mut src = DecimatingSource::new(inner, 48_000.0).unwrap(); // factor 4
+        let mut buf = vec![Complex32::new(0.0, 0.0); 20_000];
+        let mut total = 0usize;
+        loop {
+            let n = src.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let expected = n_in / 4;
+        assert!(
+            (total as i64 - expected as i64).unsigned_abs() < 200,
+            "total {total}, expected ~{expected}"
+        );
     }
 
     #[test]
