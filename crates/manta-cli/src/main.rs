@@ -1055,15 +1055,20 @@ fn load_decode_config_file(
             cfg.hsmm.conf_kappa
         );
     }
-    // Codex review, PR #161 round 5: `dur_sigma = 0` reaches
+    // Codex review, PR #161 rounds 5 and 16: `dur_sigma = 0` reaches
     // `log_dur_prior`'s `2 * dur_sigma * dur_sigma` denominator -- an
     // exactly-nominal-duration segment computes 0/0, and every other
     // segment computes an infinite (non-nominal) score, corrupting
-    // pruning and every downstream confidence.
-    if !cfg.hsmm.dur_sigma.is_finite() || cfg.hsmm.dur_sigma <= 0.0 {
+    // pruning and every downstream confidence. Round 5's `> 0.0` check
+    // alone isn't a strong enough floor: a finite-but-tiny value (e.g.
+    // 1e-30) still passes it, yet `2.0 * dur_sigma * dur_sigma`
+    // underflows to exactly 0.0 in f32 -- same underflow class as
+    // timing_sigma's `MIN_TIMING_SIGMA` floor below.
+    const MIN_DUR_SIGMA: f32 = 1e-3;
+    if !cfg.hsmm.dur_sigma.is_finite() || cfg.hsmm.dur_sigma < MIN_DUR_SIGMA {
         bail!(
-            "[decode] dur_sigma must be finite and strictly positive in {} (got {}; 0 makes an \
-             exactly-nominal segment's duration prior compute 0/0)",
+            "[decode] dur_sigma must be finite and >= {MIN_DUR_SIGMA} in {} (got {}; smaller \
+             values can underflow log_dur_prior's denominator to 0/0)",
             path.display(),
             cfg.hsmm.dur_sigma
         );
@@ -2625,6 +2630,15 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_zero_dur_sigma() {
         let f = write_temp_file(b"[decode]\ndur_sigma = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_dur_sigma_too_small_to_avoid_underflow() {
+        // Codex review, PR #161 round 16: 1e-30 is finite and > 0.0 (so
+        // round 5's original check alone passed it), but 2*dur_sigma^2
+        // underflows to exactly 0.0 in f32.
+        let f = write_temp_file(b"[decode]\ndur_sigma = 1e-30\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
