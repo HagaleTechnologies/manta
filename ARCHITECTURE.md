@@ -242,7 +242,12 @@ transmission may never produce again).
    (the interrogative form only — a bare `QRL` is the *response* "the
    frequency is in use" and is not flagged). Both are carried on the spot as
    annotations — the most recently decoded RST, and a QRL-query flag sticky
-   for the track's lifetime. **Neither gates any step below**: a callsign that fails grammar/cty/repetition is
+   for the track's lifetime. Both follow the *signal identity*, not the
+   track id: when two converged tracks merge, the losing track's QRL flag
+   and its RST (if it is the chronologically later of the two) migrate to
+   the survivor, exactly as pending Beacon candidates do, since the
+   survivor continues the same station's transmission. **Neither gates any
+   step below**: a callsign that fails grammar/cty/repetition is
    not rescued by carrying an RST. They reach the JSON Lines stream (§7)
    only; the RBN telnet line is a fixed compatibility format with no field
    slot for them, matching CW Skimmer, which shows its own 599/QRL? labels

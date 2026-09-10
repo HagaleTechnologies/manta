@@ -159,3 +159,119 @@ fn track_closed_clears_both_annotations() {
     );
     assert!(spots[0].rst.is_none() && !spots[0].qrl_query);
 }
+
+/// Codex review on PR #159: a `ClosureKind::Bookkeeping` merge is not the end
+/// of the signal -- `manta_engine`'s track manager defines the survivor as
+/// continuing the same identity (track.rs:778-784), so an RST or `QRL?` that
+/// only the LOSING track happened to decode is still true of the station the
+/// survivor now represents, and must migrate rather than die with the loser's
+/// `TrackState`.
+#[test]
+fn merge_carries_the_losers_annotations_to_the_survivor() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    run(&transmission_events(1, &["QRL?", "TU", "5NN"], 0), &mut v);
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: Some(2),
+        },
+    });
+
+    seed_meta(&mut v, 2);
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+        &mut v,
+    );
+    assert_eq!(spots.len(), 1, "spots were {spots:?}");
+    assert_eq!(
+        spots[0].rst.as_deref(),
+        Some("599"),
+        "the loser's RST must survive the merge"
+    );
+    assert!(
+        spots[0].qrl_query,
+        "the loser's QRL? flag must survive the merge"
+    );
+}
+
+/// The migrated RST is still "the most recently decoded" one: when both sides
+/// of a merge decoded one, the chronologically later wins -- here the
+/// survivor's own, decoded after the loser's.
+#[test]
+fn merge_keeps_the_survivors_newer_rst() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    run(&transmission_events(1, &["TU", "5NN"], 0), &mut v);
+    seed_meta(&mut v, 2);
+    run(&transmission_events(2, &["TU", "339"], 100_000), &mut v);
+
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: Some(2),
+        },
+    });
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 200_000),
+        &mut v,
+    );
+    assert_eq!(spots.len(), 1, "spots were {spots:?}");
+    assert_eq!(
+        spots[0].rst.as_deref(),
+        Some("339"),
+        "the survivor's own, later RST must not be overwritten by the loser's older one"
+    );
+}
+
+/// The mirror case: the loser decoded the later RST, so ITS value wins on the
+/// survivor.
+#[test]
+fn merge_prefers_the_losers_rst_when_it_is_the_later_one() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 2);
+    run(&transmission_events(2, &["TU", "339"], 0), &mut v);
+    seed_meta(&mut v, 1);
+    run(&transmission_events(1, &["TU", "5NN"], 100_000), &mut v);
+
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: Some(2),
+        },
+    });
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 200_000),
+        &mut v,
+    );
+    assert_eq!(spots.len(), 1, "spots were {spots:?}");
+    assert_eq!(
+        spots[0].rst.as_deref(),
+        Some("599"),
+        "the more recently decoded RST wins regardless of which track decoded it"
+    );
+}
+
+/// An eviction (`Bookkeeping` with no survivor) has nowhere to migrate to --
+/// the annotations must simply go away with the track, and must never leak
+/// into a later track that happens to reuse the id.
+#[test]
+fn eviction_drops_annotations_with_no_survivor() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    run(&transmission_events(1, &["QRL?", "TU", "5NN"], 0), &mut v);
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: None,
+        },
+    });
+
+    seed_meta(&mut v, 1);
+    let spots = run(
+        &transmission_events(1, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+        &mut v,
+    );
+    assert_eq!(spots.len(), 1, "spots were {spots:?}");
+    assert!(spots[0].rst.is_none() && !spots[0].qrl_query);
+}
