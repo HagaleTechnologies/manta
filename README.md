@@ -42,13 +42,11 @@ and the reason the network works as well as it does.
 Those are Windows programs, and Skimmer Server's own system requirements ask
 for an x86 CPU with SSE3, so there is no native build for the platforms a lot
 of amateur radio now runs on: Linux, ARM, a headless Raspberry Pi at a remote
-antenna. CW Skimmer can be coaxed onto x86-64 Linux under Wine, and operators
-do run it that way, but that is a workaround and it leaves ARM out entirely.
-`manta` is a second, independent implementation that runs natively there — and
-on macOS and Windows as well — a headless daemon, open source, with documented
-algorithms and golden-vector regression tests anyone can read, run, and check.
-Shared infrastructure is healthier with more than one implementation of it, on
-more than one operating system.
+antenna. `manta` is a second, independent implementation with native builds
+for exactly those platforms — and for macOS and Windows as well — a headless
+daemon, open source, with documented algorithms and golden-vector regression
+tests anyone can read, run, and check. Shared infrastructure is healthier with
+more than one implementation of it, on more than one operating system.
 
 ## Installation
 
@@ -172,9 +170,9 @@ criteria.
   though the channelizer architecture does not preclude them later.
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
-- Not a multi-process orchestrator. `manta` is a single Rust binary — there
-  is no separate aggregator or companion program to install and start
-  alongside it.
+- Not a multi-process orchestrator. `manta` is a single Rust binary, not a
+  stack of programs to sequence-launch — though it can sit behind a stock
+  RBN Aggregator like any other skimmer.
 - No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
   CAT/rig control to align a narrowband receiver with the channelizer.
   `manta` does ingest a local audio device (`listen`/`listen --device`,
