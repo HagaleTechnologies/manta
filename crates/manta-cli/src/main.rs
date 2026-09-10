@@ -1000,14 +1000,6 @@ fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool
 /// raise them with it.
 const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
-/// How often the server runtime copies the engine's live track count into
-/// the `manta_active_tracks` gauge. The decode loop runs on the MAIN
-/// thread, outside the tokio runtime that owns `Metrics`, so a poller is
-/// the bridge -- the same shape MAN-55's `confirmed_live_handle` watcher
-/// already uses. 4 Hz is far finer than any Prometheus scrape interval and
-/// costs one relaxed atomic load per tick.
-const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
 /// `SHUTDOWN_DRAIN_DEADLINE`. `Runtime::shutdown_timeout`'s `duration`
@@ -1434,42 +1426,40 @@ fn main() -> Result<()> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server, active_tracks, mut active_tracks_poller) =
-                match config {
-                    Some(path) => {
-                        // `epoch` feeds SpotBus's wall-clock conversion (every
-                        // JSON `timestamp`/RBN Zulu field a client observes) --
-                        // a live session's epoch is this process's real start
-                        // time; a replay session's defaults to the replayed
-                        // file's own mtime, a genuine timestamp that's stable
-                        // across reruns of the SAME untouched file, but changes
-                        // across a copy/download/restore that doesn't preserve
-                        // filesystem metadata even though the recording's
-                        // content is identical -- pass --replay-epoch to pin an
-                        // exact value when that matters more than "whatever
-                        // this machine's copy says" (round-7 review finding;
-                        // see the flag's own doc comment for the full
-                        // rationale, and `epoch_for_replay_path`'s for why
-                        // neither "always now()" nor a content-hash alone was
-                        // right before this flag existed). `session_nonce` is
-                        // the separate, spot-id-uniqueness-only value:
-                        // recording-content-derived for file replay (so
-                        // different recordings never collide on id even at the
-                        // same track/sample position), nanosecond-precision-now
-                        // for a live session (so two live sessions started
-                        // within the same wall-clock second don't collide
-                        // either).
-                        let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                        let session_nonce: u128 = match &replay_path {
-                            Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
-                            // Live session: `epoch` above is already SystemTime::now().
-                            None => epoch
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .expect("epoch predates the Unix epoch")
-                                .as_nanos(),
-                        };
+            let (server_runtime, spot_server) = match config {
+                Some(path) => {
+                    // `epoch` feeds SpotBus's wall-clock conversion (every
+                    // JSON `timestamp`/RBN Zulu field a client observes) --
+                    // a live session's epoch is this process's real start
+                    // time; a replay session's defaults to the replayed
+                    // file's own mtime, a genuine timestamp that's stable
+                    // across reruns of the SAME untouched file, but changes
+                    // across a copy/download/restore that doesn't preserve
+                    // filesystem metadata even though the recording's
+                    // content is identical -- pass --replay-epoch to pin an
+                    // exact value when that matters more than "whatever
+                    // this machine's copy says" (round-7 review finding;
+                    // see the flag's own doc comment for the full
+                    // rationale, and `epoch_for_replay_path`'s for why
+                    // neither "always now()" nor a content-hash alone was
+                    // right before this flag existed). `session_nonce` is
+                    // the separate, spot-id-uniqueness-only value:
+                    // recording-content-derived for file replay (so
+                    // different recordings never collide on id even at the
+                    // same track/sample position), nanosecond-precision-now
+                    // for a live session (so two live sessions started
+                    // within the same wall-clock second don't collide
+                    // either).
+                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                    let session_nonce: u128 = match &replay_path {
+                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                        // Live session: `epoch` above is already SystemTime::now().
+                        None => epoch
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .expect("epoch predates the Unix epoch")
+                            .as_nanos(),
+                    };
 
-<<<<<<< HEAD
                     let (rt, server) = start_spot_server(
                         &path,
                         SourceInfo {
@@ -1483,8 +1473,13 @@ fn main() -> Result<()> {
                     // Real, if coarse, health signal: this source opened
                     // and is running. `active_tracks` is populated below,
                     // from `manta_engine::listen_with_track_count`'s
-                    // observer, which reports `TrackManager`'s own
-                    // promoted-track count (MAN-122).
+                    // per-batch observer, which reports `TrackManager`'s
+                    // own promoted-and-decoding track count straight into
+                    // `Metrics` (MAN-122) -- superseding MAN-45's 250 ms
+                    // poller over a shared atomic, which published the
+                    // coarser `active_track_count()` and could not be kept
+                    // alongside it without the two writers fighting over
+                    // the same gauge.
                     //
                     // MAN-55: for a source where `open()` succeeding
                     // doesn't confirm a live device (HPSDR's UDP
@@ -1500,90 +1495,16 @@ fn main() -> Result<()> {
                         Some(live) => {
                             server.metrics.set_source_health(source_name, false);
                             let metrics = server.metrics.clone();
-=======
-                        let (rt, server) =
-                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
-                        // MAN-45 (round-9 finding): the daemon's own copy of the
-                        // gauge `manta_engine::listen_with_observers` updates as
-                        // it runs (on the MAIN thread, outside this tokio
-                        // runtime) -- polled into `Metrics` below, the same
-                        // bridge shape MAN-55's `confirmed_live_handle` watcher
-                        // uses for source liveness.
-                        let active_tracks =
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                        // MAN-45 remediate (code-review finding 1): the
-                        // `JoinHandle` is kept, not discarded, so the shutdown
-                        // sequence below can abort this poller and WAIT for it
-                        // to actually stop before writing the deterministic
-                        // zero -- otherwise a tick already in flight can read
-                        // the still-stale gauge and write it right back after
-                        // the zero, undoing it.
-                        let active_tracks_poller = {
-                            let gauge = active_tracks.clone();
-                            let track_metrics = server.metrics.clone();
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                             rt.spawn(async move {
-                                loop {
-                                    track_metrics.set_active_tracks(
-                                        gauge.load(std::sync::atomic::Ordering::Relaxed),
-                                    );
-                                    tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
+                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                 }
-                            })
-                        };
-                        // MAN-55: for a source where `open()` succeeding
-                        // doesn't confirm a live device (HPSDR's UDP
-                        // connect/send need no peer response at all),
-                        // `confirmed_live_handle()` returns Some, and health
-                        // starts false, flipping true only once the source's
-                        // own read loop has actually processed a valid
-                        // packet. Every other source type (Kiwi/Soapy/audio/
-                        // file) returns None from the trait's default and
-                        // keeps the original immediate-true behavior, since
-                        // opening those already implies liveness.
-                        match src.confirmed_live_handle() {
-                            Some(live) => {
-                                server.metrics.set_source_health(source_name, false);
-                                let metrics = server.metrics.clone();
-                                rt.spawn(async move {
-                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(200))
-                                            .await;
-                                    }
-                                    metrics.set_source_health(source_name, true);
-                                });
-                            }
-                            None => server.metrics.set_source_health(source_name, true),
-                        }
-
-                        // MAN-56: HPSDR's packet loss/malformed counters are
-                        // input-layer state manta-server cannot compute itself
-                        // (it has no manta-input dependency). Sample them into
-                        // Metrics on a timer, the same wiring-layer-injection
-                        // shape `set_source_health` uses above -- and read the
-                        // handle HERE, before `listen(src, ..)` below takes
-                        // ownership of the source for the rest of the run.
-                        // Sources with no wire-packet loss model return None
-                        // and publish no series at all, which is deliberate:
-                        // a permanently-zero counter reads as "no loss" rather
-                        // than "not measured" (ARCHITECTURE §8's
-                        // "absent means not measured" distinction).
-                        if let Some(counters) = src.health_counters() {
-                            let metrics = server.metrics.clone();
-                            // Published once eagerly so the series exists (at
-                            // 0) from the very first scrape rather than only
-                            // after one poll interval.
-                            metrics.set_input_health(source_name, input_health_of(&counters));
-                            rt.spawn(async move {
-                                loop {
-                                    tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
-                                    metrics
-                                        .set_input_health(source_name, input_health_of(&counters));
-                                }
+                                metrics.set_source_health(source_name, true);
                             });
                         }
+                        None => server.metrics.set_source_health(source_name, true),
+                    }
 
-<<<<<<< HEAD
                     // MAN-56: HPSDR's packet loss/malformed counters are
                     // input-layer state manta-server cannot compute itself
                     // (it has no manta-input dependency). Sample them into
@@ -1594,8 +1515,8 @@ fn main() -> Result<()> {
                     // Sources with no wire-packet loss model return None
                     // and publish no series at all, which is deliberate:
                     // a permanently-zero counter reads as "no loss" rather
-                    // than "not measured" (ARCHITECTURE §8, "absent means
-                    // not measured").
+                    // than "not measured" (ARCHITECTURE §8's
+                    // "absent means not measured" distinction).
                     if let Some(counters) = src.health_counters() {
                         let metrics = server.metrics.clone();
                         // Published once eagerly so the series exists (at
@@ -1608,38 +1529,26 @@ fn main() -> Result<()> {
                                 metrics.set_input_health(source_name, input_health_of(&counters));
                             }
                         });
-=======
-                        (
-                            Some(rt),
-                            Some(server),
-                            Some(active_tracks),
-                            Some(active_tracks_poller),
-                        )
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                     }
-                    None => (None, None, None, None),
-                };
+
+                    (Some(rt), Some(server))
+                }
+                None => (None, None),
+            };
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-<<<<<<< HEAD
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
             let mut pipeline_ready_logged = false;
             let listen_result = manta_engine::listen_with_track_count(
-=======
-            let listen_result = manta_engine::listen_with_observers(
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                 src,
                 &cfg,
                 stop,
-                manta_engine::ListenObservers {
-                    active_tracks: active_tracks.clone(),
-                },
                 |ev| {
                     use manta_decode::events::DecoderEvent;
                     if json {
@@ -1748,31 +1657,20 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
-                // MAN-45 remediate (code-review finding 1): the engine's
-                // own gauge is already 0 on the SUCCESS path
-                // (TrackManager::finish() closed every track before
-                // `listen_with_observers` returned), but NOT on the ERROR
-                // path -- `listen_result` above is deliberately captured
-                // rather than `?`-ed so an SDR disconnect or WAV read
-                // failure still runs this drain sequence (round-7 finding),
-                // and on that path `listen_with_observers` returns before
-                // reaching `tm.finish()`'s trailing zero, leaving the
-                // shared `AtomicU64` at the last processed chunk's nonzero
-                // count. The still-running poller reads that stale value
-                // every `ACTIVE_TRACKS_POLL_INTERVAL` and would overwrite
-                // the deterministic zero below within one tick if left
-                // running -- abort it and AWAIT its actual termination
-                // first (not just issue the abort and hope), so no
-                // in-flight tick can race the zero-write below. A metrics
-                // scrape landing anywhere in the `SHUTDOWN_DRAIN_DEADLINE`
-                // window that follows must never see a stale nonzero
-                // count for a daemon with no live tracks.
-                if let Some(poller) = active_tracks_poller.take() {
-                    poller.abort();
-                    if let Some(rt) = server_runtime.as_ref() {
-                        let _ = rt.block_on(poller);
-                    }
-                }
+                // MAN-45 remediate (code-review finding 1), kept through the
+                // MAN-122 merge: `listen_with_track_count` reports 0 on both
+                // its success path (after `TrackManager::finish()`) and its
+                // error path (`listen_result` above is deliberately captured
+                // rather than `?`-ed, so an SDR disconnect or WAV read failure
+                // still runs this drain sequence -- round-7 finding), so the
+                // gauge is already 0 by the time we get here. Written again,
+                // unconditionally, because that is a property of the engine
+                // rather than of this call site, and a metrics scrape landing
+                // anywhere in the `SHUTDOWN_DRAIN_DEADLINE` window that
+                // follows must never see a stale nonzero count for a daemon
+                // with no live tracks. No poller to shut down any more: the
+                // observer writes `Metrics` directly from the decode thread,
+                // so there is no in-flight tick that could race this zero.
                 server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
             }

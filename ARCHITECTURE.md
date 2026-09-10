@@ -400,15 +400,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
-<<<<<<< HEAD
-  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
-  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
-  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
-  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
-  gauges, `manta_source_health`, `manta_active_tracks` (MAN-122, below),
-  the uplink counters, and (MAN-56,
-  landed 2026-09-04) `manta_input_dropped_packets_total`/
-=======
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the
   daemon shut down while a client was still in its PRE-LOGIN/handshake
   phase — telnet's login prompt/read/banner and the JSON stream's
@@ -434,10 +425,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   de callsign didn't resolve against `cty.dat`, *or* it resolved but its
   entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
   or `/AM` designator that places it outside any DXCC entity),
-  `manta_active_tracks`, per-protocol client-connected gauges,
+  `manta_active_tracks` (MAN-122, below), per-protocol
+  client-connected gauges,
   `manta_source_health`, the uplink counters, and (MAN-56, landed
   2026-09-04) `manta_input_dropped_packets_total`/
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
   (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
   per-stage queue depths, decode rate, spots/min, spot-confidence
@@ -447,7 +438,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   The three `manta_input_*` series are published only for sources that
   actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
   report none) and are **absent**, not a frozen zero, for every other
-<<<<<<< HEAD
   source — "absent means not measured", so an operator never reads a
   placeholder as live data.
   **`manta_active_tracks` is now populated** (corrected 2026-09-07,
@@ -474,17 +464,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   deliberately *not* `TrackManager::active_track_count()`, which also
   counts unconfirmed CANDIDATEs (noise-blip rise crossings that lease no
   decoder) and keeps its own meaning for `soak_metrics`.
-=======
-  source — the same "absent means not measured" distinction that motivated
-  the `manta_active_tracks` caveat before it was populated.
-  **`manta_active_tracks` is now populated** (MAN-45, corrected
-  2026-09-04): `manta_engine::listen_with_observers` publishes
-  `TrackManager::active_track_count()` into a shared handle as the decode
-  loop runs (`ListenObservers`); the daemon's server runtime polls it into
-  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
-  (every other caller — `soak()`, the CPU-budget bench, both integration
-  tests) is unchanged and pays nothing for this.
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+  This **supersedes MAN-45's `ListenObservers`/`listen_with_observers`**
+  (2026-09-04), which published `active_track_count()` into a shared
+  `AtomicU64` that the daemon's server runtime polled into `Metrics` every
+  250 ms. Both mechanisms existed to stop this gauge reading a frozen `0`,
+  and the two cannot coexist: the poller and the per-batch observer would be
+  two writers of one gauge, publishing two different counts. The per-batch
+  observer is the one kept — finer count, no poll lag — and it keeps MAN-45's
+  round-19 guarantee that the count is zeroed on EVERY exit path out of the
+  decode loop (`listen_with_track_count` reports 0 after the inner loop
+  returns, error paths included, in place of MAN-45's `Drop` guard).
   **`manta_source_health` is one-sided** (corrected 2026-09-03, review
   round 7, filed as **MAN-64**): the only production call site
   (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`

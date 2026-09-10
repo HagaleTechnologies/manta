@@ -9,7 +9,7 @@ use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
 use manta_spot::Validator;
 use num_complex::Complex32;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// One chunk read per loop iteration, in samples.
@@ -21,71 +21,13 @@ const CHUNK_SAMPLES: usize = 2048;
 /// startup lead-in padding below it.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
-/// Optional live handles into a running `listen()` loop, for a caller that
-/// needs to observe engine-owned state the callbacks can't see.
-///
-/// MAN-45 (PR #63 round-9 finding): the daemon's `manta_active_tracks` gauge
-/// reported a constant 0 because `listen()` owns its `TrackManager`
-/// internally and exposed no live count -- `Metrics::set_active_tracks` had
-/// no non-test caller. A shared atomic rather than another callback: the
-/// consumer (`manta-cli`'s server runtime) polls on its own schedule and
-/// must never be able to block the decode loop, which is exactly the shape
-/// `IqSource::confirmed_live_handle` already uses for source liveness
-/// (MAN-55).
-#[derive(Clone, Default)]
-pub struct ListenObservers {
-    /// Updated after each processed chunk with `TrackManager::active_track_count()`.
-    /// `None` (the default) skips the store entirely, so `listen()`'s
-    /// existing callers -- including `soak()` and the CPU-budget bench --
-    /// pay nothing.
-    pub active_tracks: Option<Arc<AtomicU64>>,
-}
-
-/// Zeroes the active-track observer on EVERY exit path out of
-/// `listen_with_observers`, not just the happy one.
-///
-/// MAN-45 (PR #63 round-19 finding, P2): `IqSource::read` failing after at
-/// least one track had become active returned through `?` before
-/// `tm.finish()` and the final `report_active_tracks`, leaving the observer
-/// pinned at its last nonzero value while the `TrackManager` behind it was
-/// already dropped -- a ghost count any long-lived consumer of
-/// `listen_with_observers` would keep publishing after a device disconnect
-/// or a file-read error. `manta-cli` happened to paper over this by zeroing
-/// its own separate `Metrics` gauge; nothing made that true for other
-/// callers. A `Drop` guard rather than cleanup appended to the end of the
-/// function, because the error paths are precisely the ones that never
-/// reached the end.
-struct ActiveTracksGuard(Option<Arc<AtomicU64>>);
-
-impl ActiveTracksGuard {
-    /// Also zeroes on construction: a caller reusing one handle across runs
-    /// (or one that seeded it with a nonzero value) must not see the
-    /// previous run's tail count until the first chunk is processed.
-    fn new(gauge: Option<Arc<AtomicU64>>) -> Self {
-        let guard = Self(gauge);
-        guard.clear();
-        guard
-    }
-
-    fn clear(&self) {
-        if let Some(gauge) = &self.0 {
-            gauge.store(0, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for ActiveTracksGuard {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
 /// Run the streaming decode loop against `src` until `read` returns 0 (EOF,
 /// file replay) or `stop` is set (Ctrl-C, live audio). Each decoded event is
 /// passed to `on_event` as it's produced. Design doc §4.
 ///
-/// Unchanged entry point: `listen_with_observers` with no observers. Kept so
-/// MAN-45's engine addition costs its four existing call sites nothing.
+/// Unchanged entry point: `listen_with_track_count` with a no-op observer.
+/// Kept so the engine's live-count addition costs its four existing call
+/// sites nothing.
 pub fn listen(
     src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
@@ -93,13 +35,12 @@ pub fn listen(
     on_event: impl FnMut(&DecoderEvent),
     on_spot: impl FnMut(&crate::Spot),
 ) -> Result<()> {
-<<<<<<< HEAD
     listen_with_track_count(src, cfg, stop, on_event, on_spot, |_n| {})
 }
 
 /// `listen()` plus a live per-batch observer: `on_tracks` is called with
 /// `TrackManager::decoding_track_count()` after every batch the pipeline
-/// processes, including the final `finish()`, which reports 0.
+/// processes, and with 0 on every exit path out of the loop.
 ///
 /// MAN-122 review round 2: it fires on EVERY batch, not only when the
 /// count changes. The call is the daemon's only per-batch signal that the
@@ -124,36 +65,48 @@ pub fn listen(
 /// Kept as a separate entry point rather than a sixth parameter on
 /// `listen()` so the existing callers and tests are untouched; `listen()`
 /// is now a no-op-observer wrapper over this.
+///
+/// Supersedes MAN-45's `ListenObservers`/`listen_with_observers` shared-atomic
+/// observer, removed in the MAN-122 merge: both existed to stop
+/// `manta_active_tracks` reporting a frozen 0, and keeping two mechanisms
+/// writing the same gauge would have had the 250 ms poller overwrite the
+/// status line's count with a different one (`active_track_count()`, which
+/// also counts unconfirmed CANDIDATEs that lease no decoder). This entry
+/// point keeps MAN-45's two guarantees -- the count is the manager's own, and
+/// it is zeroed on EVERY exit path, not just the happy one (see the wrapper
+/// below, which replaces MAN-45's `ActiveTracksGuard`) -- while reporting the
+/// finer count with no poll lag.
 pub fn listen_with_track_count(
-=======
-    listen_with_observers(
-        src,
-        cfg,
-        stop,
-        ListenObservers::default(),
-        on_event,
-        on_spot,
-    )
+    src: Box<dyn IqSource>,
+    cfg: &PipelineConfig,
+    stop: Arc<AtomicBool>,
+    on_event: impl FnMut(&DecoderEvent),
+    on_spot: impl FnMut(&crate::Spot),
+    mut on_tracks: impl FnMut(usize),
+) -> Result<()> {
+    // MAN-45 (PR #63 round-19 finding, P2) / MAN-122 review round 3: report 0
+    // on EVERY exit path out of the loop below, not just the happy one. A
+    // mid-stream `IqSource::read` failure -- an SDR disconnecting, say --
+    // returns through `?` before the end-of-stream report, which would leave
+    // `manta_active_tracks` (and the status line's `tracks=`) frozen at its
+    // last nonzero value for the whole shutdown drain, up to
+    // `SHUTDOWN_DRAIN_DEADLINE` (25 s), while the metrics listener is still
+    // answering scrapes with decoders that no longer exist. Done here rather
+    // than at each `?` so the startup paths (calibration read, channelizer
+    // and validator construction) are covered too.
+    let result = listen_inner(src, cfg, stop, on_event, on_spot, &mut on_tracks);
+    on_tracks(0);
+    result
 }
 
-/// Like `listen`, but additionally publishes engine-owned live state
-/// (currently just the active-track count) into `observers` as the decode
-/// loop runs. See `ListenObservers`'s doc comment for why this is a shared
-/// atomic rather than a third callback.
-pub fn listen_with_observers(
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+fn listen_inner(
     mut src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
     stop: Arc<AtomicBool>,
-    observers: ListenObservers,
     mut on_event: impl FnMut(&DecoderEvent),
     mut on_spot: impl FnMut(&crate::Spot),
-    mut on_tracks: impl FnMut(usize),
+    on_tracks: &mut impl FnMut(usize),
 ) -> Result<()> {
-    // Declared before the first `?` below so that EVERY early return from
-    // here on clears the observer -- see `ActiveTracksGuard`'s doc comment.
-    let _active_tracks_guard = ActiveTracksGuard::new(observers.active_tracks.clone());
-
     // Validated up front so a bad config value fails fast, before spending
     // CALIBRATION_SECONDS reading from a live device (MAN-29).
     let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
@@ -191,15 +144,6 @@ pub fn listen_with_observers(
         validator.allowlist(call);
     }
 
-    // O(1) (`TrackManager::active_track_count` is `tracks.len()`), once per
-    // processed chunk and skipped entirely when no observer is registered
-    // -- immaterial against the Pi4 CPU budget.
-    let report_active_tracks = |tm: &crate::track::TrackManager| {
-        if let Some(gauge) = &observers.active_tracks {
-            gauge.store(tm.active_track_count() as u64, Ordering::Relaxed);
-        }
-    };
-
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
     let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
@@ -209,44 +153,24 @@ pub fn listen_with_observers(
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
     on_tracks(tm.decoding_track_count());
-=======
-    report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
     on_tracks(tm.decoding_track_count());
-=======
-    report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        // A read error must not escape via `?` before the gauge is
-        // zeroed. The end-of-stream `on_tracks(0)` below is only reached
-        // on a clean EOF or a `stop` request, so a mid-stream failure --
-        // an SDR disconnecting, say -- would otherwise leave
-        // `manta_active_tracks` (and the status line's `tracks=`) frozen
-        // at its last nonzero value for the whole shutdown drain, up to
-        // `SHUTDOWN_DRAIN_DEADLINE` (25 s), while the metrics listener is
-        // still answering scrapes with decoders that no longer exist.
-        // Publish 0 first, then propagate the original error unchanged.
-        let n = match src.read(&mut chunk) {
-            Ok(n) => n,
-            Err(e) => {
-                on_tracks(0);
-                return Err(e);
-            }
-        };
+        // A read error propagates unchanged; `listen_with_track_count`'s
+        // wrapper reports the zero that the end-of-stream path below would
+        // otherwise have been the only source of.
+        let n = src.read(&mut chunk)?;
         if n == 0 {
             break;
         }
@@ -258,11 +182,7 @@ pub fn listen_with_observers(
                 on_spot(&spot);
             }
         }
-<<<<<<< HEAD
         on_tracks(tm.decoding_track_count());
-=======
-        report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
@@ -270,17 +190,11 @@ pub fn listen_with_observers(
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
     // `finish()` flushes and drops every decoder: nothing is being decoded
     // once the stream has ended, so the gauge must not be left holding the
-    // last live value after a source disconnects or a replay hits EOF.
+    // last live value after a source disconnects or a replay hits EOF. The
+    // wrapper above reports the same 0 on the error paths.
     on_tracks(0);
-=======
-    // `finish()` closes every remaining track, so the gauge must settle
-    // back to 0 here rather than being left at whatever the last processed
-    // chunk reported.
-    report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
     Ok(())
 }
 
@@ -312,117 +226,6 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
-    }
-
-    /// MAN-45 (PR #63 round-9 finding): `manta_active_tracks` reported a
-    /// constant 0 on every production run because `listen()` exposed no
-    /// live track count to its caller -- `TrackManager::active_track_count()`
-    /// existed but was reachable only from inside the engine. This proves
-    /// the observer handle tracks the real count during the run and settles
-    /// at 0 afterward (`TrackManager::finish()` closes every track).
-    #[test]
-    fn listen_with_observers_publishes_a_live_active_track_count() {
-        use std::sync::atomic::AtomicU64;
-
-        let spec = manta_testkit::vectors::v1();
-        let rendered = manta_testkit::vectors::render(&spec).unwrap();
-        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
-            samples: rendered.samples,
-            cursor: 0,
-            fs: spec.fs,
-            center_freq_hz: spec.center_freq_hz,
-        });
-
-        let gauge = Arc::new(AtomicU64::new(0));
-        let observed = gauge.clone();
-        let mut peak = 0u64;
-        listen_with_observers(
-            src,
-            &PipelineConfig::default(),
-            Arc::new(AtomicBool::new(false)),
-            ListenObservers {
-                active_tracks: Some(gauge.clone()),
-            },
-            |_ev| peak = peak.max(observed.load(Ordering::Relaxed)),
-            |_spot| {},
-        )
-        .unwrap();
-
-        assert!(
-            peak >= 1,
-            "V1's single strong signal must show as an active track mid-run"
-        );
-        assert_eq!(
-            gauge.load(Ordering::Relaxed),
-            0,
-            "finish() closes every track"
-        );
-    }
-
-    /// MAN-45 (PR #63 round-19 finding, P2): an `IqSource::read` error after
-    /// tracks had become active used to return through `?` with the observer
-    /// still holding that nonzero count, so a caller polling the handle kept
-    /// reporting ghost tracks for a `TrackManager` that no longer existed.
-    #[test]
-    fn the_active_track_observer_is_cleared_when_listen_exits_with_an_error() {
-        use std::sync::atomic::AtomicU64;
-
-        /// Fails its `read` as soon as the observer reports at least one
-        /// active track -- exactly the "device disconnected mid-run" shape
-        /// the finding describes.
-        struct FailsOnceTracksAreActive {
-            inner: FixedFreqSource,
-            observed: Arc<AtomicU64>,
-        }
-
-        impl manta_input::IqSource for FailsOnceTracksAreActive {
-            fn sample_rate(&self) -> f64 {
-                self.inner.sample_rate()
-            }
-            fn center_freq_hz(&self) -> f64 {
-                self.inner.center_freq_hz()
-            }
-            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-                if self.observed.load(Ordering::Relaxed) > 0 {
-                    anyhow::bail!("simulated device disconnect");
-                }
-                self.inner.read(buf)
-            }
-        }
-
-        let spec = manta_testkit::vectors::v1();
-        let rendered = manta_testkit::vectors::render(&spec).unwrap();
-        let gauge = Arc::new(AtomicU64::new(0));
-        let src: Box<dyn manta_input::IqSource> = Box::new(FailsOnceTracksAreActive {
-            inner: FixedFreqSource {
-                samples: rendered.samples,
-                cursor: 0,
-                fs: spec.fs,
-                center_freq_hz: spec.center_freq_hz,
-            },
-            observed: gauge.clone(),
-        });
-
-        let err = listen_with_observers(
-            src,
-            &PipelineConfig::default(),
-            Arc::new(AtomicBool::new(false)),
-            ListenObservers {
-                active_tracks: Some(gauge.clone()),
-            },
-            |_ev| {},
-            |_spot| {},
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("simulated device disconnect"),
-            "the read error must propagate, not be swallowed: {err}"
-        );
-        assert_eq!(
-            gauge.load(Ordering::Relaxed),
-            0,
-            "the observer must not keep reporting tracks whose TrackManager is gone"
-        );
     }
 
     /// The default path must stay exactly as cheap as before --

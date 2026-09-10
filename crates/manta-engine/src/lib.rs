@@ -2,11 +2,7 @@
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
 pub mod listen;
-<<<<<<< HEAD
 pub use listen::{listen, listen_with_track_count};
-=======
-pub use listen::{listen, listen_with_observers, ListenObservers};
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
