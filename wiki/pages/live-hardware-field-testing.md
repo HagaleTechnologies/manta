@@ -8,9 +8,11 @@ sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
   - docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md
+  - docs/DECISIONS/2026-09-10-synchronized-rbn-capture-proves-detection-gap-is-manta-side.md
   - docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md
+  - docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md
 verified:
-  commit: 5b22b62
+  commit: 0495f37
   date: 2026-09-10
 links:
   - spot-validation
@@ -161,15 +163,37 @@ engine/examples/man171_power_map.rs` does this against a captured WAV.
 If the target frequency isn't measurably above the ambient floor even in
 raw channelizer output, the signal isn't reaching the ADC at a meaningful
 level — that's an antenna/RF-path question, not a manta code question,
-and no amount of detector tuning will fix it. Confirmed 2026-09-10: a
-synchronized 40m capture showed RBN-confirmed signals up to 61 dB reading
-≤1.5 dB above ambient in raw channelizer power, while WWV (10.000 MHz —
-about as strong and reliable as HF gets) showed no distinguishable
-carrier either. Suspect a disconnected/misconfigured antenna before
-touching `crates/manta-dsp/src/floor.rs` or `crates/manta-engine/src/
-track.rs`. `crates/manta-input/examples/iq_probe.rs` (build with
-`--features soapy`) captures a fresh WAV+JSON sidecar via manta's own
-`SoapySdrIqSource` for this kind of check.
+and no amount of detector tuning will fix it. A synchronized 40m capture
+on one physical rig showed RBN-confirmed signals up to 61 dB reading
+≤1.5 dB above ambient in raw channelizer power, with WWV (10.000 MHz —
+about as strong and reliable as HF gets) showing no distinguishable
+carrier either — that rig's antenna was disconnected/misconfigured.
+`crates/manta-input/examples/iq_probe.rs` (build with `--features soapy`)
+captures a fresh WAV+JSON sidecar via manta's own `SoapySdrIqSource` for
+this kind of check; `crates/manta-engine/examples/man171_power_map.rs`
+does the raw-power-vs-floor comparison itself.
+
+**Correction, same day, different physical RSP1B**: don't treat "no
+distinguishable WWV carrier" as proof of total antenna disconnection
+without checking relative to a proper noise floor, not just eyeballing
+it — a from-scratch single-bin correlation against WWV's exact carrier
+frequency, run on this session's actual RSP1B, found a real, reproducible,
+frequency-locked WWV signal both before and after further changes (-58 to
+-54 dB relative to broadband RMS, consistently the strongest of several
+tested bins) — weak, but clearly present, not absent. **The fix that
+actually resolved this rig's detection gap was physical**: reseating all
+antenna/feedline connections and adding a common-mode choke cut broadband
+RMS noise by ~13.5 dB (no antenna disconnection was involved) and
+immediately produced the session's first fully validated real spot
+(`WI9Q`, a verified-real US callsign, confidence 0.43-0.54, real SNR,
+plausible WPM — matching none of the known artifact signatures above) —
+see `docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md`.
+The technique (raw channelizer power vs. floor, a WWV sanity check) is
+sound and worth reusing; the specific "disconnected antenna" diagnosis
+from one session doesn't generalize to every RSP1B setup automatically —
+weak-but-present is a real, different failure mode from absent, and
+common-mode noise on the feedline is a real, different fix from
+reconnecting a cable.
 
 **A genuine hardware artifact can still look exactly like a manta bug.**
 The same session found a real, absolute-RF-frequency-locked comb of
