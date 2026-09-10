@@ -4,13 +4,9 @@
 //! the metrics listener... Prometheus text endpoint... spot rate, active
 //! tracks..."; MAN-12 scenario 3 ("operators can inspect health without
 //! reading source"). `Metrics` owns what `manta-server` genuinely knows
-<<<<<<< HEAD
 //! (spots published, connected clients per protocol, per-target uplink
-//! state) and exposes `set_active_tracks`/`set_source_health` for the
-=======
-//! (spots published, connected clients per protocol) and exposes
+//! state) and exposes
 //! `set_active_tracks`/`set_source_health`/`set_input_health` for the
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 //! daemon wiring layer to inject engine-owned numbers manta-server has no
 //! way to compute itself.
 
@@ -280,8 +276,6 @@ fn escape_label_value(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-<<<<<<< HEAD
-=======
 /// Packet-level input-stream health for one source, injected by the daemon
 /// wiring layer (see module doc) -- `manta-server` has no `manta-input`
 /// dependency and cannot read these itself (MAN-56). Deliberately a
@@ -299,8 +293,6 @@ pub struct InputHealth {
     pub malformed_packets: u64,
 }
 
-#[derive(Default)]
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 pub struct Metrics {
     spots_total: AtomicU64,
     spots_dropped_lagged_total: AtomicU64,
@@ -321,7 +313,12 @@ pub struct Metrics {
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
-<<<<<<< HEAD
+    /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
+    /// counters. Engine/input-owned figures, injected by the daemon wiring
+    /// layer on a timer -- see `manta-cli`'s `INPUT_HEALTH_POLL_INTERVAL`.
+    /// Sources with no wire-packet loss model never call `set_input_health`,
+    /// so they publish no series rather than a permanently-zero one.
+    input_health: RwLock<BTreeMap<String, InputHealth>>,
     /// Registered uplink targets, in config order (MAN-44). Written once
     /// per target at daemon wiring time (`start_spot_server`'s call to
     /// `register_uplink_target`), read on every render/status snapshot.
@@ -338,30 +335,6 @@ impl Default for Metrics {
     fn default() -> Self {
         Self::new()
     }
-=======
-    /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
-    /// counters. Engine/input-owned figures, injected by the daemon wiring
-    /// layer on a timer -- see `manta-cli`'s `INPUT_HEALTH_POLL_INTERVAL`.
-    /// Sources with no wire-packet loss model never call `set_input_health`,
-    /// so they publish no series rather than a permanently-zero one.
-    input_health: RwLock<BTreeMap<String, InputHealth>>,
-    uplink_sent_total: AtomicU64,
-    uplink_suppressed_total: AtomicU64,
-    uplink_lagged_total: AtomicU64,
-    uplink_write_failed_total: AtomicU64,
-    uplink_disconnected_total: AtomicU64,
-    uplink_reconnects_total: AtomicU64,
-    /// Count of currently-connected uplink targets, not a single 0/1 flag
-    /// -- MAN-42 can spawn multiple independent `uplink::serve` tasks
-    /// sharing this one `Metrics`, and each only increments/decrements its
-    /// own connect/disconnect transition (see `mark_uplink_connected`/
-    /// `mark_uplink_disconnected`). A shared last-writer-wins boolean would
-    /// let one target's failed reconnect attempt clear the gauge while
-    /// another target is genuinely, unrelatedly connected (round-1 review
-    /// finding on MAN-42/PR). For the common single-target case this is
-    /// still exactly 0 or 1, same as before MAN-42.
-    uplink_connected_count: AtomicI64,
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 }
 
 impl Metrics {
@@ -377,6 +350,7 @@ impl Metrics {
             ws_clients: AtomicI64::new(0),
             active_tracks: AtomicU64::new(0),
             source_health: RwLock::new(BTreeMap::new()),
+            input_health: RwLock::new(BTreeMap::new()),
             uplink_targets: RwLock::new(Vec::new()),
             started_at: Instant::now(),
         }
@@ -490,14 +464,12 @@ impl Metrics {
             .insert(source.to_string(), healthy);
     }
 
-<<<<<<< HEAD
     /// Wall-clock time since this `Metrics` (and so the daemon) started
     /// (MAN-44) -- `status.rs` renders this as `manta status`'s "daemon
     /// up ..." line.
     pub fn uptime(&self) -> Duration {
         self.started_at.elapsed()
     }
-=======
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
     /// counters. Engine/input-owned figures, injected by the daemon wiring
     /// layer on a timer -- see `main.rs`'s `INPUT_HEALTH_POLL_INTERVAL`.
@@ -509,12 +481,6 @@ impl Metrics {
             .expect("input_health lock poisoned")
             .insert(source.to_string(), health);
     }
-
-    // MAN-32: RBN uplink counters. ARCHITECTURE §8's "every
-    // dropped/evicted/suppressed item is counted" invariant applies here
-    // too -- a dry-run-suppressed or lag-dropped spot must be visible,
-    // not silent.
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 
     // MAN-44: per-target uplink registry.
 
@@ -1011,7 +977,6 @@ mod tests {
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
     }
 
-<<<<<<< HEAD
     #[test]
     fn source_health_label_is_escaped_in_prometheus_output() {
         let m = Metrics::new();
@@ -1020,8 +985,6 @@ mod tests {
         assert!(text.contains(r#"manta_source_health{source="weird\"source"} 1"#));
     }
 
-    // MAN-44: per-target uplink registry.
-=======
     // MAN-56: input-layer packet loss/malformed counters.
 
     #[test]
@@ -1098,8 +1061,7 @@ mod tests {
         assert!(dropped < gaps_help);
     }
 
-    // MAN-32: RBN uplink counters.
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
+    // MAN-44: per-target uplink registry.
 
     #[test]
     fn registered_target_records_its_own_counters_and_aggregates_sum_them() {

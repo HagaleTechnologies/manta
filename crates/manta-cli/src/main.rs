@@ -1258,8 +1258,9 @@ fn format_addrs(addrs: &[std::net::SocketAddr]) -> String {
 /// resolver then blocked for the OS's own `resolv.conf` budget (commonly
 /// 10-40s) regardless of what the operator asked for. Same precedent as
 /// `uplink::connect_any_resolved_address`'s own bounded `lookup_host`: DNS
-/// resolution gets its own timeout window, separate from (and prior to)
-/// the connect/fetch window `fetch_status` itself already bounds.
+/// resolution is bounded too -- but against ONE shared deadline with the
+/// connect/fetch window `fetch_status` bounds, so `--timeout-secs` is the
+/// whole command's give-up bound rather than a per-stage one.
 fn run_status(
     server_config: Option<&std::path::Path>,
     addr: Option<&str>,
@@ -1279,8 +1280,14 @@ fn run_status(
         .enable_all()
         .build()?;
     let outcome = rt.block_on(async move {
-        let targets = tokio::time::timeout(
-            timeout,
+        // MAN-44 review: ONE end-to-end deadline spanning resolution AND
+        // fetch, not a fresh `timeout` for each. Resolution finishing just
+        // under the bound followed by a stalled connect/response used to
+        // take nearly 2x `--timeout-secs`, and `--timeout-secs` advertises
+        // a single give-up bound a cron/Nagios check budgets against.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let targets = tokio::time::timeout_at(
+            deadline,
             tokio::task::spawn_blocking(move || {
                 resolve_status_addr(addr_owned.as_deref(), server.as_ref())
             }),
@@ -1288,7 +1295,11 @@ fn run_status(
         .await
         .map_err(|_| anyhow!("resolving the daemon's address timed out"))?
         .context("resolving the daemon's address panicked")??;
-        fetch_status(&targets, timeout)
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out talking to {}", format_addrs(&targets));
+        }
+        fetch_status(&targets, remaining)
             .await
             .with_context(|| format!("could not reach daemon at {}", format_addrs(&targets)))
     });
@@ -2556,7 +2567,6 @@ mod tests {
         assert!(accepted2, "second configured target must be connected to");
     }
 
-<<<<<<< HEAD
     // MAN-44: uplink health at a glance -- `manta status` + `GET /status`.
 
     #[test]
@@ -2968,7 +2978,8 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
         );
-=======
+    }
+
     // MAN-56: input-layer health counters wiring.
 
     /// A wrapper `IqSource` that forgets to forward `health_counters`
@@ -3061,7 +3072,6 @@ mod tests {
         assert!(!m
             .render_prometheus_text()
             .contains("manta_input_malformed_packets_total{"));
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
     }
 
     // MAN-136 round-1 validate code-review finding 1: the increment
