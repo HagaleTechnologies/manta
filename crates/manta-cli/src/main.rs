@@ -1098,6 +1098,20 @@ fn load_decode_config_file(
             manta_decode::evidence::MAX_RETAIN,
         );
     }
+    // Codex review, PR #161 round 8: `speed_alpha = nan` deserializes and
+    // passes every check above; the first duration update
+    // (`u += speed_alpha * (target - u)`) then makes `u` NaN, and every
+    // subsequent duration prior/score derived from it goes NaN too --
+    // beam ordering can then retain those hypotheses independently of
+    // real evidence, silently corrupting or emptying the output.
+    if !cfg.hsmm.speed_alpha.is_finite() {
+        bail!(
+            "[decode] speed_alpha must be finite in {} (got {}; a non-finite value poisons \
+             every subsequent speed update and duration prior with NaN)",
+            path.display(),
+            cfg.hsmm.speed_alpha
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2371,6 +2385,12 @@ mod tests {
     fn load_decode_config_file_accepts_the_default_hold_dits() {
         let f = write_temp_file(b"[decode]\n");
         assert!(load_decode_config_file(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_speed_alpha() {
+        let f = write_temp_file(b"[decode]\nspeed_alpha = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
     #[test]
