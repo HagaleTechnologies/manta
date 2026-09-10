@@ -6,6 +6,7 @@
 //! polyphase filterbank (SPEC §1.1-1.3) that supersedes `single`/`freqest`.
 
 pub mod channelizer;
+pub mod decimate;
 pub mod floor;
 pub mod freqest;
 pub mod hilbert;
