@@ -242,7 +242,7 @@ impl Lifecycle {
 }
 
 use manta_decode::decoder::{DecodeConfig, TrackDecoder};
-use manta_decode::events::DecoderEvent;
+use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_dsp::channelizer::{interpolate_offset, power_db, HopOutput};
 use manta_dsp::floor::{FloorBank, Gate};
 use std::collections::BTreeMap;
@@ -317,6 +317,55 @@ impl Track {
             pending: Vec::new(),
             has_emitted: false,
         }
+    }
+
+    /// Drain this track's queued `pending` samples through its decoder,
+    /// then call `finish()` -- used for a genuine end-of-signal closure
+    /// (HangExpired/Silent: a sustained real gap has already been
+    /// observed), before its `pending` queue would otherwise be silently
+    /// discarded along with the rest of the removed `Track`. Without the
+    /// drain, `finish()`'s "true final speed" could be stale by up to a
+    /// full batch's worth of already-queued samples (Codex review on
+    /// PR #154, round 6) -- exactly the state a held-back `manta-spot`
+    /// Beacon-WPM candidate needs at `TrackClosed` time. No-op (empty
+    /// `Vec`) if this track never had a decoder. See `finish_decoder_speed_only`
+    /// for Merged/Evicted, where forcing finalization would fabricate
+    /// content instead (round 7).
+    fn finish_decoder(&mut self) -> Vec<DecoderEvent> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Vec::new();
+        };
+        let pending = std::mem::take(&mut self.pending);
+        let mut events: Vec<DecoderEvent> = pending
+            .into_iter()
+            .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+            .collect();
+        events.extend(decoder.finish());
+        events
+    }
+
+    /// Same pending-drain as `finish_decoder`, but calls
+    /// `TrackDecoder::finish_speed_only` instead of `finish` -- for
+    /// Merged/Evicted closures, which are pure track bookkeeping (another
+    /// track claimed the channel, or the track cap was exceeded), not
+    /// evidence the RF signal itself ended. The track could be genuinely
+    /// mid-character at this instant; forcing that to resolve into a
+    /// character (as `finish_decoder` legitimately does for a real
+    /// trailing gap) would fabricate content that was never actually
+    /// confirmed -- Codex review on PR #154, round 7 found this could
+    /// synthesize a "T" character, forming the exact `<call> T` Beacon
+    /// pattern out of noise.
+    fn finish_decoder_speed_only(&mut self) -> Vec<DecoderEvent> {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Vec::new();
+        };
+        let pending = std::mem::take(&mut self.pending);
+        let mut events: Vec<DecoderEvent> = pending
+            .into_iter()
+            .flat_map(|(mag, ts)| decoder.push_envelope(mag, ts))
+            .collect();
+        events.extend(decoder.finish_speed_only());
+        events
     }
 
     /// Query the current lifecycle state. SPEC §2.4.
@@ -482,7 +531,16 @@ impl TrackManager {
     /// input) is always `false` here; the decoder pool runs after this
     /// whole batch, so no per-hop decode result is available yet to feed
     /// back into the same hop's lifecycle bookkeeping.
-    fn step_hop(&mut self, hop: &HopOutput, sample_ts: u64) -> (Vec<u32>, Vec<DecoderEvent>) {
+    #[allow(clippy::type_complexity)]
+    fn step_hop(
+        &mut self,
+        hop: &HopOutput,
+        sample_ts: u64,
+    ) -> (
+        Vec<(u32, ClosureKind)>,
+        Vec<DecoderEvent>,
+        Vec<DecoderEvent>,
+    ) {
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         assert_eq!(
             hop.power.len(),
@@ -502,6 +560,16 @@ impl TrackManager {
         // Drive existing tracks; collect closures to apply after the loop
         // (avoids mutating `self.tracks` while iterating it).
         let mut closed: Vec<u32> = Vec::new();
+        // Codex review on PR #154, round 8: `Silent` (no character
+        // decoded for `gc_hops`) does NOT imply an observed RF gap the
+        // way `HangExpired` (sustained `drop` for `hang_hops`) does -- it
+        // can fire on a track that's still ACTIVE with a real, continuous
+        // signal, just not producing decoded characters. Only
+        // `HangExpired` may use the forcing `finish_decoder`; `Silent`
+        // must go through `finish_decoder_speed_only` below, same as
+        // Merged/Evicted.
+        let mut close_reasons: std::collections::HashMap<u32, CloseReason> =
+            std::collections::HashMap::new();
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
         for id in ids {
             let n = self.n_channels();
@@ -515,6 +583,7 @@ impl TrackManager {
             match event {
                 LifecycleEvent::Closed(reason) => {
                     self.close_counts.record(reason);
+                    close_reasons.insert(id, reason);
                     closed.push(id);
                 }
                 LifecycleEvent::Promoted => {
@@ -590,10 +659,39 @@ impl TrackManager {
         // `decode_samples` (which picks the *lowest* track_id present as
         // its single-track report) never used to see, silently changing
         // which track gets reported.
+        // Codex review on PR #154, round 5: a track closed here
+        // (HangExpired/Silent -- Merged/Evicted below have the matching
+        // fix) previously had its `TrackDecoder` silently dropped without
+        // ever calling `finish()`, discarding any buffered demod/beam
+        // state -- including the true final speed estimate a held-back
+        // `manta-spot` Beacon-WPM candidate needs to retry against
+        // (SPEC-decode-core.md §5's `finish()` contract was previously
+        // only honored at overall stream end, in `TrackManager::finish`
+        // below). Draining it here and threading the events out gives
+        // every closure path the same guarantee `TrackManager::finish`
+        // already had. `Track::finish_decoder` (round 6) also drains any
+        // samples still queued in `pending` THIS batch first -- without
+        // that, `finish()` alone would reflect only whatever the decoder
+        // processed as of the end of the PREVIOUS `process_hops` batch.
+        let mut closure_flush_events: Vec<DecoderEvent> = Vec::new();
         closed.retain(|id| {
-            self.tracks
-                .remove(id)
-                .is_some_and(|track| track.has_emitted)
+            let Some(mut track) = self.tracks.remove(id) else {
+                return false;
+            };
+            if !track.has_emitted {
+                return false;
+            }
+            // Only a genuine, sustained observed RF gap (HangExpired) may
+            // force an in-progress mark to resolve; Silent's own trigger
+            // (no character decoded) says nothing about whether the
+            // signal is still there (round 8).
+            let events = if close_reasons.get(id) == Some(&CloseReason::HangExpired) {
+                track.finish_decoder()
+            } else {
+                track.finish_decoder_speed_only()
+            };
+            closure_flush_events.extend(events);
+            true
         });
         self.recompute_ownership();
 
@@ -623,9 +721,38 @@ impl TrackManager {
             }
         }
         self.recompute_ownership();
-        closed.extend(self.merge_converged());
-        closed.extend(self.evict_over_cap());
-        (closed, promoted_events)
+        // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
+        // RF gap -- proof the signal actually ended. Silent fires after 30 s
+        // of no *decoded character*, which a continuous carrier or other
+        // undecodable signal satisfies just as well as a real end-of-signal;
+        // `finish_decoder_speed_only()` above deliberately can't force such
+        // a still-open run to resolve, so the WPM it reports can still be a
+        // stale, transient pre-carrier estimate. Judging a deferred Beacon
+        // against that stale value would readmit exactly the false-positive
+        // class this PR exists to close. So Silent gets `Bookkeeping` (no
+        // survivor) like Merged/Evicted -- its pending beacons are counted
+        // and discarded, never resolved, since no genuine signal-ending
+        // observation is available for them.
+        let mut closed_with_kind: Vec<(u32, ClosureKind)> = closed
+            .into_iter()
+            .map(|id| {
+                let kind = if close_reasons.get(&id) == Some(&CloseReason::HangExpired) {
+                    ClosureKind::SignalEnded
+                } else {
+                    ClosureKind::Bookkeeping {
+                        survivor_track_id: None,
+                    }
+                };
+                (id, kind)
+            })
+            .collect();
+        let (merged_ids, merged_flush) = self.merge_converged();
+        closed_with_kind.extend(merged_ids);
+        closure_flush_events.extend(merged_flush);
+        let (evicted_ids, evicted_flush) = self.evict_over_cap();
+        closed_with_kind.extend(evicted_ids);
+        closure_flush_events.extend(evicted_flush);
+        (closed_with_kind, promoted_events, closure_flush_events)
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -649,25 +776,30 @@ impl TrackManager {
     }
 
     /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
-    /// the lower-current-SNR one is closed.
-    fn merge_converged(&mut self) -> Vec<u32> {
+    /// the lower-current-SNR one is closed. Returns the closed ids (with
+    /// `ClosureKind::Bookkeeping` naming the surviving track -- round 9,
+    /// PR #154: the loser's identity may continue there, so a consumer
+    /// holding deferred per-identity evidence must migrate it rather than
+    /// judge it now) plus any final `finish()` events their decoders
+    /// produced (round 5 -- see `step_hop`'s matching comment).
+    fn merge_converged(&mut self) -> (Vec<(u32, ClosureKind)>, Vec<DecoderEvent>) {
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
-        let mut to_close = Vec::new();
+        let mut to_close: Vec<(u32, u32)> = Vec::new(); // (loser, survivor)
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 let (a, b) = (ids[i], ids[j]);
-                if to_close.contains(&a) || to_close.contains(&b) {
+                if to_close.iter().any(|&(loser, _)| loser == a || loser == b) {
                     continue;
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
                 if (ca - cb).abs() < 1.0 {
-                    let loser = if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db
-                    {
-                        a
-                    } else {
-                        b
-                    };
-                    to_close.push(loser);
+                    let (loser, survivor) =
+                        if self.tracks[&a].current_snr_db <= self.tracks[&b].current_snr_db {
+                            (a, b)
+                        } else {
+                            (b, a)
+                        };
+                    to_close.push((loser, survivor));
                 }
             }
         }
@@ -675,25 +807,37 @@ impl TrackManager {
         // actually emitted a real event -- see the matching comment in
         // `step_hop` (a track promoted this same batch can be merged away
         // before ever getting a `drain_pool` pass).
+        let mut flush_events: Vec<DecoderEvent> = Vec::new();
         let ever_emitted_closed = to_close
             .into_iter()
-            .filter(|id| {
+            .filter_map(|(loser, survivor)| {
                 self.close_counts.record(CloseReason::Merged);
-                self.tracks
-                    .remove(id)
-                    .is_some_and(|track| track.has_emitted)
+                let mut track = self.tracks.remove(&loser)?;
+                if !track.has_emitted {
+                    return None;
+                }
+                flush_events.extend(track.finish_decoder_speed_only());
+                Some((
+                    loser,
+                    ClosureKind::Bookkeeping {
+                        survivor_track_id: Some(survivor),
+                    },
+                ))
             })
             .collect();
         if !ids.is_empty() {
             self.recompute_ownership();
         }
-        ever_emitted_closed
+        (ever_emitted_closed, flush_events)
     }
 
     /// SPEC §2.4/ARCHITECTURE §4: track cap with lowest-current-SNR
-    /// eviction.
-    fn evict_over_cap(&mut self) -> Vec<u32> {
+    /// eviction. Returns the evicted ids plus any final `finish()` events
+    /// their decoders produced (Codex review on PR #154, round 5 -- see
+    /// `step_hop`'s matching comment).
+    fn evict_over_cap(&mut self) -> (Vec<(u32, ClosureKind)>, Vec<DecoderEvent>) {
         let mut evicted = Vec::new();
+        let mut flush_events: Vec<DecoderEvent> = Vec::new();
         while self.tracks.len() > self.cfg.track_cap {
             let loser = *self
                 .tracks
@@ -704,16 +848,23 @@ impl TrackManager {
             self.close_counts.record(CloseReason::Evicted);
             // MAN-19: only report as `TrackClosed`-worthy if it actually
             // emitted a real event -- see `step_hop`'s matching comment.
-            if self
-                .tracks
-                .remove(&loser)
-                .is_some_and(|track| track.has_emitted)
-            {
-                evicted.push(loser);
+            if let Some(mut track) = self.tracks.remove(&loser) {
+                if track.has_emitted {
+                    flush_events.extend(track.finish_decoder_speed_only());
+                    // No survivor -- an eviction just stops tracking this
+                    // identity, with no successor to migrate deferred
+                    // evidence to (round 9).
+                    evicted.push((
+                        loser,
+                        ClosureKind::Bookkeeping {
+                            survivor_track_id: None,
+                        },
+                    ));
+                }
             }
         }
         self.recompute_ownership();
-        evicted
+        (evicted, flush_events)
     }
 
     /// Process one `Channelizer::process()` slice: sequential per-hop
@@ -729,12 +880,14 @@ impl TrackManager {
         hops: &[HopOutput],
         hop_to_sample_ts: impl Fn(u64) -> u64,
     ) -> Vec<DecoderEvent> {
-        let mut closed_ids: Vec<u32> = Vec::new();
+        let mut closed_ids: Vec<(u32, ClosureKind)> = Vec::new();
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
+        let mut closure_flush_events: Vec<DecoderEvent> = Vec::new();
         for h in hops {
-            let (closed, promoted) = self.step_hop(h, hop_to_sample_ts(h.m));
+            let (closed, promoted, closure_flush) = self.step_hop(h, hop_to_sample_ts(h.m));
             closed_ids.extend(closed);
             promoted_events.extend(promoted);
+            closure_flush_events.extend(closure_flush);
         }
         let pool_events = self.drain_pool();
         // SPEC §2.4 GC timer: reset the silent counter for every track that
@@ -781,6 +934,17 @@ impl TrackManager {
             .collect();
         let mut events = pool_events;
         events.extend(promoted_events);
+        // Final `finish()` events from tracks closed THIS batch via
+        // HangExpired/Silent/Merged/Evicted (Codex review on PR #154,
+        // round 5) -- kept out of `promoted_ts_by_track`'s source data
+        // above deliberately: these events' own `event_sample_ts` (0 for
+        // SpeedUpdate) must not overwrite a same-track genuine promotion
+        // timestamp were one to exist this same batch (it can't in
+        // practice -- a track promoted and closed within the same batch
+        // never reaches `has_emitted`, per the existing MAN-19 exclusion
+        // below -- but keeping this a separate vector makes that
+        // non-interaction structural rather than incidental).
+        events.extend(closure_flush_events);
         // MAN-19: emit one `TrackClosed` per track closed this batch (any
         // CloseReason) so downstream per-track_id state (`manta-spot`'s
         // `Validator::tracks`, `RepetitionGate::seen`) has a signal to
@@ -791,7 +955,7 @@ impl TrackManager {
         events.extend(
             closed_ids
                 .into_iter()
-                .map(|track_id| DecoderEvent::TrackClosed { track_id }),
+                .map(|(track_id, closure)| DecoderEvent::TrackClosed { track_id, closure }),
         );
         events.sort_by_key(|e| {
             (
@@ -849,7 +1013,11 @@ impl TrackManager {
         events.extend(
             closed_ids
                 .into_iter()
-                .map(|track_id| DecoderEvent::TrackClosed { track_id }),
+                .map(|track_id| DecoderEvent::TrackClosed {
+                    track_id,
+                    // Overall stream end -- always a genuine end-of-signal (round 9).
+                    closure: ClosureKind::SignalEnded,
+                }),
         );
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         self.tracks.clear();
@@ -973,7 +1141,7 @@ pub(crate) fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
-        | DecoderEvent::TrackClosed { track_id } => *track_id,
+        | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
     }
 }
 
@@ -1151,7 +1319,7 @@ mod tests {
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         let mut saw_promotion = false;
         for m in (250 * 15)..(250 * 15 + 60) {
-            let (_, promoted) = tm.step_hop(&hop(m, power.clone()), m);
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
             if promoted
                 .iter()
                 .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
@@ -1322,6 +1490,177 @@ mod tests {
             tm.close_counts().merged,
             1,
             "issue #26: merge must be counted"
+        );
+    }
+
+    /// Minimal rectangular CW envelope, one amplitude sample per HOP (not
+    /// per raw sample) -- mirrors `manta_decode::decoder`'s own private
+    /// test helper of the same shape, duplicated here since it isn't
+    /// exported across the crate boundary. Just enough to get a
+    /// `TrackDecoder`'s speed tracker ready (needs 5 marks).
+    /// Real inter-character gaps included (unlike a single-character
+    /// helper), so earlier characters can decode live via ordinary
+    /// `push_envelope` calls -- but deliberately no final trailing gap,
+    /// so the LAST character's last mark element stays genuinely "open"
+    /// (matches a real mid-transmission truncation, e.g. a merge/eviction
+    /// landing mid-character). Round 7: this distinction between "real
+    /// gaps already observed" and "still open, no gap yet" is exactly
+    /// what `finish_speed_only` must respect and `finish` legitimately
+    /// may not.
+    fn rect_envelope_hops(text: &str, dit_hops: u32) -> Vec<f32> {
+        let mut env = Vec::new();
+        let mut push = |level: f32, hops: u32| {
+            for _ in 0..hops {
+                env.push(level);
+            }
+        };
+        let chars: Vec<char> = text.chars().collect();
+        for (ci, c) in chars.iter().enumerate() {
+            let pat = manta_decode::tree::pattern_for(*c).unwrap();
+            let els: Vec<char> = pat.chars().collect();
+            for (ei, e) in els.iter().enumerate() {
+                push(1.0, if *e == '.' { dit_hops } else { 3 * dit_hops });
+                if ei < els.len() - 1 {
+                    push(0.0, dit_hops);
+                }
+            }
+            if ci < chars.len() - 1 {
+                push(0.0, 3 * dit_hops);
+            }
+        }
+        env
+    }
+
+    /// Codex review on PR #154, round 5: a track closed via `merge_converged`
+    /// previously had its `TrackDecoder` silently dropped without calling
+    /// `finish()`, discarding its true final speed estimate -- exactly the
+    /// state a held-back `manta-spot` Beacon-WPM candidate needs to retry
+    /// against once the track legitimately closes (not just at overall
+    /// stream EOF, which `TrackManager::finish` already handled).
+    #[test]
+    fn merge_converged_never_fabricates_a_character_from_a_dangling_mark() {
+        // "PARIS" with real inter-character gaps but no final trailing
+        // gap: P/A/R/I decode live during setup; "S" is genuinely still
+        // open (mid-mark) when merge happens -- exactly the round-7
+        // scenario (a merge/eviction landing mid-character).
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.center = 20.4;
+            weak.current_snr_db = 8.0;
+            let mut decoder = TrackDecoder::new(weak_id, DecodeConfig::default());
+            for (i, &a) in rect_envelope_hops("PARIS", 18).iter().enumerate() {
+                decoder.push_envelope(a, i as u64);
+            }
+            weak.decoder = Some(decoder);
+            weak.has_emitted = true;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.center = 21.1;
+            strong.current_snr_db = 18.0;
+        }
+
+        let (closed, flush_events) = tm.merge_converged();
+        assert_eq!(
+            closed,
+            vec![(
+                weak_id,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(strong_id)
+                }
+            )],
+            "merge_converged must name the surviving track (round 9) so the \
+             loser's deferred evidence can be migrated to it"
+        );
+        // Before this fix, merge_converged called the full (forcing)
+        // `finish()`, which would resolve "S"'s dangling mark into a
+        // fabricated character/word that was never actually confirmed by
+        // a real on-air gap.
+        assert!(
+            !flush_events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. })),
+            "merge_converged must never fabricate a character/word from an in-progress mark, got {flush_events:?}"
+        );
+        assert!(
+            flush_events.iter().all(|e| event_track_id(e) == weak_id),
+            "flush events must belong to the closed track, got {flush_events:?}"
+        );
+    }
+
+    /// Codex review on PR #154, round 6: `step_hop` queues each hop's
+    /// sample into `track.pending`, drained through the decoder only once
+    /// per `process_hops` batch via `drain_pool` -- which never runs for a
+    /// track closed mid-batch (it removes the track first). Simulates
+    /// that exact scenario: samples queued in `pending`, never yet fed to
+    /// the decoder, at the moment of merge closure.
+    #[test]
+    fn merge_converged_drains_queued_pending_samples_before_finishing() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.center = 20.4;
+            weak.current_snr_db = 8.0;
+            weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
+            // Queued exactly as `step_hop` would (magnitude, sample_ts)
+            // pairs in `pending` -- NOT fed through push_envelope yet.
+            weak.pending = rect_envelope_hops("PARIS", 18)
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| (a, i as u64))
+                .collect();
+            weak.has_emitted = true;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.center = 21.1;
+            strong.current_snr_db = 18.0;
+        }
+
+        let (closed, flush_events) = tm.merge_converged();
+        assert_eq!(
+            closed,
+            vec![(
+                weak_id,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(strong_id)
+                }
+            )],
+            "merge_converged must name the surviving track (round 9) so the \
+             loser's deferred evidence can be migrated to it"
+        );
+        // Before this fix, the queued `pending` samples were discarded
+        // along with the rest of the removed `Track` -- `finish()` alone
+        // (on a decoder that never saw a single push_envelope call) would
+        // produce nothing.
+        assert!(
+            !flush_events.is_empty(),
+            "merge_converged must drain queued pending samples through the decoder before finishing, got nothing"
         );
     }
 
