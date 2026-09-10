@@ -51,6 +51,22 @@ KiwiSDR input.
   V2/V5/V6/issue #25. Per this repo's own design ("classical decoder first;
   ML fusion only at M4, gated on beating the classical baseline under
   simulated fading"), closing that gap is M4's job, not M2's.
+- **Real-conditions vectors VR1–VR8** (`docs/SPEC-decode-core-v2.md` §8.2:
+  contest speed 40/45 WPM, ≥ 45 dB in-channel keying depth, hard transmitter
+  edges/clicks, co-channel occupancy, non-3:1 weighting, tight Farnsworth-free
+  spacing) pass per that spec's §8.4 gate. Added 2026-09-09 (MAN-166,
+  decision recorded in
+  `docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` §8):
+  V1–V10 alone did not catch the real-signal keying-threshold defect that
+  the B2/K5TR benchmark exposed (a threshold decision 17–30 dB below the
+  mark on real 25–60 dB-deep signals), because none of V1–V10 exercises
+  contest speed above 35 WPM with deep keying and hard edges together. VR
+  vectors are a standing acceptance bar for every future decode-core
+  change, not a one-time gate for the v2 redesign. **Measured against
+  `engine = "hsmm"` 2026-09-09** (SPEC v2 §8.4 Task 12,
+  `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`): 3/9 pass
+  (VR6a, VR6b, VR7), 6/9 fail (VR1–VR5, VR8) — this gate is **not yet
+  cleared**.
 - Criterion bench: full pipeline at 192 kS/s with 300 active tracks uses < 50 %
   of one core on an M-series Mac AND < 1 core on a Raspberry Pi 4. **Neither
   leg is currently a resolved pass** — see
@@ -102,7 +118,14 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
   receives well-formed RBN-format spots.
 - **Parity benchmark**: on ≥ 2 h of recorded contest-weekend IQ, manta achieves
   ≥ 80 % recall of RBN's spots for the same slice with ≤ 5 % false (bogus-call)
-  spots. Numbers published in the repo, whatever they are.
+  spots. **Primary metric (added 2026-09-09, MAN-166): score against a single
+  co-located spotter's own spots** (`scripts/score-against-rbn.py --spotter
+  <call>`, e.g. K5TR for the B2 recording — same antenna/receiver as the
+  capture) rather than all worldwide RBN spotters; recall against the full
+  worldwide set is secondary/informational, since most of those bins are
+  heard only by distant skimmers manta's own antenna cannot reach (56 % of
+  B2's 1,441 worldwide bins were heard by exactly one skimmer). Numbers
+  published in the repo, whatever they are.
 - cqdx ingests the JSON stream in a dev environment.
 - 7-day unattended soak feeding spots continuously.
 

@@ -315,6 +315,7 @@ mod tests {
                 sample_ts: 20,
                 glyph: manta_decode::tree::Glyph::Char('W'),
                 confidence: 1.0,
+                alternatives: Vec::new(),
             },
         ];
         assert_eq!(primary_track_id(&events), Some(2));

@@ -34,7 +34,12 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 coppa-audio = { workspace = true }
+libc = { workspace = true }
 serde_json = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
+<<<<<<< HEAD
 tokio = { workspace = true, features = ["test-util"] }
+=======
+sha2 = { workspace = true }
+>>>>>>> 4e71cba3442a49645d1a795ff439274c2b94e400

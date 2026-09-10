@@ -83,22 +83,44 @@ def load_manta_spots(path, capture_start, sample_rate_hz):
     return out
 
 
-def load_rbn_truth(path, capture_start):
+def load_rbn_truth(path, capture_start, spotters=None, min_spotters=1):
+    """RBN daily-dump rows -> ([{callsign, freq_hz, time}], excluded_count).
+
+    `capture_start` is accepted for call-site signature compatibility with the rest of
+    this script (main's decode-report loading uses it); this function itself has never
+    used it for anything -- truth-row timestamps come entirely from each row's own `date`
+    column, not from the recording's start time.
+
+    `spotters`, if given, restricts truth rows to that set of spotter callsigns (e.g.
+    {"K5TR"} for the co-located reference spotter) before grammar exclusion or dedup --
+    this makes `excluded` count only rows within the spotter-filtered scope, not the
+    ones filtered out entirely. `min_spotters`, if > 1, additionally drops any call+kHz
+    bin not corroborated by at least that many distinct (post-spotter-filter) spotters.
+    """
     truth = []
     excluded = 0
     with open(path) as f:
         reader = csv.DictReader(f)
         for row in reader:
+            spotter = row["callsign"].upper()
+            if spotters and spotter not in spotters:
+                continue
             call = row["dx"].upper()
             if not _is_plausible_callsign(call):
                 excluded += 1
                 continue
             ts = datetime.strptime(row["date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             truth.append({
+                "spotter": spotter,
                 "callsign": call,
                 "freq_hz": float(row["freq"]) * 1000.0,
                 "time": ts,
             })
+    if min_spotters > 1:
+        heard = {}
+        for t in truth:
+            heard.setdefault((t["callsign"], round(t["freq_hz"] / 1000.0)), set()).add(t["spotter"])
+        truth = [t for t in truth if len(heard[(t["callsign"], round(t["freq_hz"] / 1000.0))]) >= min_spotters]
     return truth, excluded
 
 
@@ -189,10 +211,16 @@ def main():
     ap.add_argument("--time-tol-s", type=_finite("--time-tol-s", min_inclusive=0), default=90.0,
                      help="Max seconds between a manta spot and some real RBN observation of that call+freq (default: 90s, matching RepetitionGate's own window)")
     ap.add_argument("--show-samples", type=int, default=10)
+    ap.add_argument("--spotter", action="append", default=None,
+                     help="Only use truth rows from this spotter callsign (repeatable), e.g. --spotter K5TR for the co-located reference")
+    ap.add_argument("--min-spotters", type=int, default=1,
+                     help="Only count call+kHz bins heard by at least N distinct spotters")
     args = ap.parse_args()
 
     manta_spots = load_manta_spots(args.decode_report, args.capture_start, args.sample_rate_hz)
-    truth, excluded = load_rbn_truth(args.rbn_truth_csv, args.capture_start)
+    spotters = {s.upper() for s in args.spotter} if args.spotter else None
+    truth, excluded = load_rbn_truth(args.rbn_truth_csv, args.capture_start,
+                                      spotters=spotters, min_spotters=args.min_spotters)
     truth_by_key = dedup_truth(truth)
 
     tp, fp, fn_keys = match(manta_spots, truth_by_key, args.freq_tol_hz, args.time_tol_s)
@@ -200,8 +228,23 @@ def main():
     n_manta = len(manta_spots)
     n_truth = len(truth_by_key)
     precision = len(tp) / n_manta if n_manta else 0.0
-    recall = len(tp) / n_truth if n_truth else 0.0
+    # Codex review, PR #161: `len(tp)` counts manta SPOTS, not unique matched
+    # truth bins -- a re-spot of the same call+kHz (e.g. after the 10-minute
+    # dedupe window) appends a second entry to `tp` for the same truth item,
+    # which would double-count that one truth item and can inflate recall
+    # past 100%. `n_truth - len(fn_keys)` is the count of truth bins that
+    # matched at least one manta spot, which is what recall means.
+    recall = (n_truth - len(fn_keys)) / n_truth if n_truth else 0.0
 
+    # Codex review, PR #161 round 19: the implementation plan
+    # (docs/superpowers/plans/2026-09-09-decode-core-v2.md lines 135-147)
+    # requires printing the resolved truth filter in the header --
+    # otherwise runs with different --spotter/--min-spotters values are
+    # indistinguishable except by their resulting counts, making the
+    # reported precision/recall impossible to reproduce reliably.
+    spotters_desc = ", ".join(sorted(spotters)) if spotters else "all"
+    print(f"spotters: {spotters_desc}")
+    print(f"min_spotters: {args.min_spotters}")
     print(f"manta spots: {n_manta}")
     print(f"RBN truth rows excluded (callsign shape manta's grammar can never accept): {excluded}")
     print(f"RBN truth unique call+kHz bins in window: {n_truth}")

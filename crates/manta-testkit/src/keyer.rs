@@ -29,16 +29,31 @@ pub struct KeyerSpec {
     /// Raised-cosine rise/fall, contained inside the element. SPEC §7: 5 ms.
     pub rise_ms: f64,
     pub jitter: Option<Jitter>,
+    /// Dah:dit duration ratio. Standard Morse is 3.0; SPEC v2 §8.2 VR6
+    /// exercises non-standard operator "weighting" (2.6/3.4) that a
+    /// classical decoder's 3:1-tuned thresholds must still tolerate.
+    pub weight: f32,
+    /// Inter-character gap, in dit units (of `gap_unit`). Standard Morse is
+    /// 3.0; SPEC v2 §8.2 VR7 tightens this to 2.5 (Farnsworth-free tight
+    /// spacing).
+    pub char_gap_units: f32,
+    /// Inter-word gap, in dit units (of `gap_unit`). Standard Morse is 7.0;
+    /// SPEC v2 §8.2 VR7 tightens this to 5.0.
+    pub word_gap_units: f32,
 }
 
 impl KeyerSpec {
-    /// A clean keyer at `wpm` with 5 ms raised-cosine edges and no jitter. SPEC §7.
+    /// A clean keyer at `wpm` with 5 ms raised-cosine edges, no jitter, and
+    /// standard 3:1 weighting / 3-dit char gap / 7-dit word gap. SPEC §7.
     pub fn new(wpm: f32) -> Self {
         KeyerSpec {
             wpm,
             char_wpm: None,
             rise_ms: 5.0,
             jitter: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
         }
     }
 }
@@ -104,8 +119,17 @@ fn normalize(text: &str) -> String {
 
 /// Append one word's segments. `unit` = dit ms (content/char speed).
 /// `gap_unit` = inter-character gap ms (spacing speed; equals `unit` unless
-/// Farnsworth is active). Returns Err on unknown chars.
-fn push_word(b: &mut SegmentBuilder, word: &str, unit: f64, gap_unit: f64) -> Result<()> {
+/// Farnsworth is active). `weight` = dah:dit ratio (3.0 nominal). `char_gap_units`
+/// = inter-character gap, in `gap_unit`s (3.0 nominal). Returns Err on unknown
+/// chars.
+fn push_word(
+    b: &mut SegmentBuilder,
+    word: &str,
+    unit: f64,
+    gap_unit: f64,
+    weight: f32,
+    char_gap_units: f32,
+) -> Result<()> {
     let chars: Vec<char> = word.chars().collect();
     for (ci, c) in chars.iter().enumerate() {
         let Some(pattern) = pattern_for(*c) else {
@@ -113,13 +137,20 @@ fn push_word(b: &mut SegmentBuilder, word: &str, unit: f64, gap_unit: f64) -> Re
         };
         let els: Vec<char> = pattern.chars().collect();
         for (ei, e) in els.iter().enumerate() {
-            b.push(true, if *e == '.' { unit } else { 3.0 * unit });
+            b.push(
+                true,
+                if *e == '.' {
+                    unit
+                } else {
+                    weight as f64 * unit
+                },
+            );
             if ei < els.len() - 1 {
                 b.push(false, unit);
             }
         }
         if ci < chars.len() - 1 {
-            b.push(false, 3.0 * gap_unit);
+            b.push(false, char_gap_units as f64 * gap_unit);
         }
     }
     Ok(())
@@ -169,9 +200,9 @@ pub fn key_text(text: &str, spec: &KeyerSpec, fs: f64) -> Result<(Vec<f32>, Stri
     let mut b = SegmentBuilder::new(spec.jitter);
     let words: Vec<&str> = norm.split(' ').collect();
     for (wi, w) in words.iter().enumerate() {
-        push_word(&mut b, w, unit, gap_unit)?;
+        push_word(&mut b, w, unit, gap_unit, spec.weight, spec.char_gap_units)?;
         if wi < words.len() - 1 {
-            b.push(false, 7.0 * gap_unit);
+            b.push(false, spec.word_gap_units as f64 * gap_unit);
         }
     }
     let env = render(&b.segs, spec.rise_ms, fs, None);
@@ -202,7 +233,14 @@ pub fn key_text_loop(
                     segs: Vec::new(),
                     rng: b.rng.take(),
                 };
-                push_word(&mut scratch, &c.to_string(), unit, gap_unit)?;
+                push_word(
+                    &mut scratch,
+                    &c.to_string(),
+                    unit,
+                    gap_unit,
+                    spec.weight,
+                    spec.char_gap_units,
+                )?;
                 let char_ms: f64 = scratch.segs.iter().map(|s| s.dur_ms).sum();
                 b.rng = scratch.rng.take();
                 if elapsed + char_ms > budget_ms {
@@ -212,17 +250,17 @@ pub fn key_text_loop(
                 elapsed += char_ms;
                 keyed.push(*c);
                 if ci < chars.len() - 1 {
-                    b.push(false, 3.0 * gap_unit);
+                    b.push(false, spec.char_gap_units as f64 * gap_unit);
                     elapsed += b.segs.last().unwrap().dur_ms;
                 }
             }
             if wi < words.len() - 1 {
-                b.push(false, 7.0 * gap_unit);
+                b.push(false, spec.word_gap_units as f64 * gap_unit);
                 elapsed += b.segs.last().unwrap().dur_ms;
                 keyed.push(' ');
             }
         }
-        b.push(false, 7.0 * gap_unit);
+        b.push(false, spec.word_gap_units as f64 * gap_unit);
         elapsed += b.segs.last().unwrap().dur_ms;
         keyed.push(' ');
         if elapsed >= budget_ms {
@@ -325,6 +363,9 @@ mod tests {
                 sigma: 0.08,
                 seed: 42,
             }),
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
         };
         let (a, _) = key_text("PARIS", &spec, FS).unwrap();
         let (b, _) = key_text("PARIS", &spec, FS).unwrap();
@@ -361,6 +402,9 @@ mod tests {
             char_wpm: Some(25.0),
             rise_ms: 5.0,
             jitter: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
         };
         let (env_fast, _) = key_text("E", &fast, FS).unwrap();
         let (env_fw, _) = key_text("E", &farnsworth, FS).unwrap();
@@ -381,5 +425,42 @@ mod tests {
     #[test]
     fn unknown_character_errors() {
         assert!(key_text("A#B", &KeyerSpec::new(20.0), FS).is_err());
+    }
+
+    #[test]
+    fn weight_and_gap_units_change_segment_lengths() {
+        let mut spec = KeyerSpec::new(30.0);
+        spec.weight = 2.6;
+        spec.char_gap_units = 2.5;
+        spec.word_gap_units = 5.0;
+        // Zero the raised-cosine rise for this test: with the default 5 ms
+        // rise, `render`'s edge smoothing (see `paris_mark_durations_at_20wpm`
+        // and `edges_are_raised_cosine_not_clicks` above, which already cover
+        // edge shape) crosses the >0.5 threshold `rise_ms` late/early at each
+        // mark boundary -- at this test's 3 kHz rate that is 15 samples,
+        // enough to shift run indices and blow the assertions' +/-2 sample
+        // tolerance. This test is about segment *lengths* responding to
+        // `weight`/`char_gap_units`/`word_gap_units`, not edge shape, so
+        // isolate it from that interaction.
+        spec.rise_ms = 0.0;
+        let (env, _) = key_text("E T", &spec, 3000.0).unwrap(); // 3 kHz render for cheap counting
+                                                                // dit = 40 ms = 120 samples; dah = 2.6 dits = 312; word gap = 5 dits = 600
+        let on: Vec<bool> = env.iter().map(|&v| v > 0.5).collect();
+        let mut runs = vec![];
+        let mut cur = on[0];
+        let mut n: i32 = 0;
+        for &v in &on {
+            if v == cur {
+                n += 1
+            } else {
+                runs.push((cur, n));
+                cur = v;
+                n = 1;
+            }
+        }
+        runs.push((cur, n));
+        assert!((runs[0].1 - 120).abs() <= 2, "dit {runs:?}");
+        assert!((runs[1].1 - 600).abs() <= 2, "word gap {runs:?}");
+        assert!((runs[2].1 - 312).abs() <= 2, "dah {runs:?}");
     }
 }

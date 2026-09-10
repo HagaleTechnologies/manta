@@ -84,10 +84,14 @@ spot lines covering 957 unique DX callsigns / 1,451 unique call+kHz bins,
 straight from real skimmers copying the real air during CQ WW CW 2025.
 Score a `manta decode --json` report against it with
 `scripts/score-against-rbn.py` (repo root); see that script's docstring
-for usage. This is the ARCHITECTURE.md §9 "Golden IQ corpus" benchmark
-(recorded band segment + RBN's own spots as reference labels ->
-recall/precision) for real M3-grade validation, not just synthetic
-fixtures.
+for usage, including `--spotter`/`--min-spotters` filtering -- spotter
+filtering is useful for co-located reference validation (K5TR's signal
+path is nearly identical to manta's hardware); consensus filtering
+(multi-spotter agreement) is useful for rejecting receiver artifacts that
+don't appear on multiple independent systems. This is the ARCHITECTURE.md
+§9 "Golden IQ corpus" benchmark (recorded band segment + RBN's own spots
+as reference labels -> recall/precision) for real M3-grade validation, not
+just synthetic fixtures.
 
 First baseline run (2026-09-08, this recording, unmodified pipeline):
 **197 manta spots vs. 1,441 scoreable RBN truth bins -> 29.9% precision,
@@ -96,9 +100,6 @@ scorer bugs -- unbounded-time matching, and RBN truth rows manta's own
 grammar can structurally never accept counted as misses; both fixed in
 `scripts/score-against-rbn.py`, see that script's docstring), alongside
 41,174 distinct tracks opened over the 15 minutes (613k characters
-decoded) for those 197 spots -- the detector is opening far more tracks
-than the real simultaneous-signal count implies, and most never survive
-to a validated spot. Filed as MAN-166.
 
 Follow-up (2026-09-09, `docs/DECISIONS/
 2026-09-09-man166-confirm-hops-and-track-cap.md`): root-caused the
@@ -122,7 +123,15 @@ track within 1.0 channel" assumption doesn't hold in dense real contest
 packing, and most surviving real spots still reflect only one clean
 decode ever captured (not a repetition/tracking problem) -- pointing at
 raw decode-core accuracy under genuine HF noise as the dominant remaining
-gap. Both folded into MAN-166 as open follow-up work.
+
+**Legacy-vs-hsmm and K5TR-only comparison**: see
+`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` §2 for the
+canonical follow-up measurement against this same recording (MAN-166's
+decode-core-v2 stage-2 gate) -- both engines, both K5TR-only and all-RBN
+recall/precision. Its all-RBN legacy figures (59/1441 = 4.09% recall,
+197 spots -> 29.95% precision) are the same measurement as the baseline
+above, to within rounding; don't duplicate a second, independently-drifting
+copy of these numbers here -- point to that doc instead.
 
 `vp8geo_cw.mp3` and `wpx_cw_iq_96khz.wav` have no verified ground truth
 (no confirmed capture UTC/band/frequency, no time-aligned transcript) --
