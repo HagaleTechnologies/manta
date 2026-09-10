@@ -970,6 +970,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
