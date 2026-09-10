@@ -21,7 +21,7 @@ marked **(research-dependent)** are the only intentionally open questions.
  IQ/WAV file ──▶│       │ config                    ┌──────────▼────────────┐  │
  rig audio ────▶│       │                           │  decoder pool         │  │
  (cpal)         │       │                           │  (per-signal CW       │  │
-                │       │                           │   decoders, N ≤ 500)  │  │
+                │       │                           │   decoders, N ≤ 1200) │  │
                 │       │                           └──────────┬────────────┘  │
                 │       │                                      │ decoded text  │
                 │  ┌────┴─────┐   ┌─────────────┐   ┌──────────▼────────────┐  │
@@ -165,8 +165,12 @@ keying doesn't inflate its own floor). A channel goes *active* when smoothed pow
 exceeds floor + threshold (default 6 dB) with hysteresis (3 dB drop + 5 s hang to
 survive QSB and inter-word gaps). Active channel ⇒ a **track** (center channel ±1
 neighbor, combined by max-power selection) ⇒ a decoder is leased from the pool.
-Track cap (default 500) with lowest-SNR eviction; evictions are counted and
-reported (no silent coverage loss).
+Track cap (default 1200, MAN-166: raised from 500, which was never
+stress-tested against real contest-band signal density and was pinned at
+its ceiling for the entire duration of a real 15-minute recording,
+`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`) with
+lowest-SNR eviction; evictions are counted and reported (no silent
+coverage loss).
 
 **CPU budget** (the reason this whole design is viable):
 
@@ -253,13 +257,19 @@ transmission may never produce again).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
-   the same track before first spot (CW ops repeat their calls; single decodes
-   are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
-   SNR, SCP/cty hits). **Exemption**: messages already type-tagged `BEACON` by
-   step 1's context parse skip this gate entirely — NCDXF-style beacons ID
-   once per power-step cycle and legitimately won't repeat within the window
-   (MAN-28).
+4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
+   before first spot (CW ops repeat their calls; single decodes are
+   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+   `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
+   real signal's `track_id` changes across a close+reopen, so repetition is
+   tracked per frequency instead, with a minimum-gap check across
+   *different* track_ids to still reject two tracks concurrently decoding
+   one real transmission as a false second confirmation — see
+   `crates/manta-spot/src/gate.rs`. Confidence = f(decoder confidence,
+   repetitions, SNR, SCP/cty hits). **Exemption**: messages already
+   type-tagged `BEACON` by step 1's context parse skip this gate entirely
+   — NCDXF-style beacons ID once per power-step cycle and legitimately
+   won't repeat within the window (MAN-28).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
