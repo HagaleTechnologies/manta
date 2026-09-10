@@ -282,7 +282,11 @@ pub async fn serve(
                     // handler and is not counted in either client gauge,
                     // so nothing to decrement. Its subscribed `rx` backlog
                     // is abandoned the same as telnet's pre-login CR-1
-                    // branches; no write was ever attempted here either.
+                    // branches. At THIS site specifically no write has run
+                    // yet (classification only peeks at buffered input);
+                    // elsewhere the counter means only that no write
+                    // failed or timed out and no queued spot was offered
+                    // for delivery -- not that nothing was written.
                     if log_enabled {
                         tracing::info!(
                             "json_stream: shutdown signalled during handshake classification, disconnecting"

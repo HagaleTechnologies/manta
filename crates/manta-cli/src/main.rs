@@ -990,7 +990,11 @@ fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool
 /// backlog on `manta_spots_dropped_write_failed_total` (the counter each
 /// handler's drain loop charges when its own `CLIENT_DRAIN_DEADLINE`
 /// expires -- `manta_spots_dropped_shutdown_total` covers only a client
-/// still in pre-login/handshake, before any write was attempted) --
+/// still in pre-login/handshake, whose backlog had not been offered for
+/// delivery yet; that is not the same as the connection having written
+/// nothing, since the telnet banner and WS-accept branches are reached
+/// after the login prompt / part of the 101 response is already on the
+/// wire) --
 /// recreating the silent truncation the drain work removed. Both are now
 /// 60s, leaving margin over this deadline. If this constant grows again,
 /// raise them with it.

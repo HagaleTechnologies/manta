@@ -72,8 +72,14 @@ daemon mid-drain, before it can either deliver the remaining backlog or
 record what it abandoned on `manta_spots_dropped_write_failed_total` —
 the series each handler's drain loop charges when its per-client
 deadline expires. (`manta_spots_dropped_shutdown_total` is the separate
-series for a client still in its pre-login/handshake phase, before any
-write was attempted; it is not where graceful-drain loss shows up.)
+series for a client still in its pre-login/handshake phase: no write
+failed or timed out, and none of that client's queued spots had been
+offered for delivery yet. It does NOT mean the connection performed no
+writes — the telnet login-read and banner branches are reached only
+after the `login: ` prompt went out successfully, and the WS-accept
+branch can fire once `accept_async_with_config` has already put part of
+the 101 response on the wire. It is not where graceful-drain loss shows
+up.)
 Either way, a SIGKILL is the silent truncation those counters exist to
 prevent. Use the same 60s value for
 `--stop-timeout` on `docker run`, `stop_grace_period` on Compose, and
