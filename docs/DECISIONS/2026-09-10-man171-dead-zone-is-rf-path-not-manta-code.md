@@ -201,6 +201,26 @@ promote -> Silent-close -> immediate-respawn-attempt -> cooldown-elapses
 without the fix -- 2 promotions where only 1 is expected before the
 cooldown window elapses).
 
+**Correction (Codex review, PR #174 round 4, P1, correct):** the initial
+version of this fix armed the cooldown unconditionally on every `Silent`
+close, but `Silent` alone does not prove the RF signal actually ended --
+only `HangExpired` does (an existing distinction this file's own comments
+already make elsewhere, e.g. in `merge_converged`/`evict_over_cap`'s
+`ClosureKind` handling). A real, weak/marginal signal could plausibly
+close `Silent` (30 s with no decoded character) shortly before it
+genuinely stops transmitting -- and the flat cooldown would then wrongly
+suppress a *different*, genuinely new station that starts on the same
+channel during the remaining window, a real false negative worse than the
+churn it was fixing. Fixed: the cooldown now clears the moment the
+channel's own `rise` drops (a real observed RF gap), not just after the
+fixed `gc_hops` timer -- a true stationary artifact's `rise` never drops
+on its own, so its cooldown is unaffected; a channel that goes genuinely
+quiet is immediately available again. Second regression test:
+`track::tests::respawn_cooldown_clears_once_the_channel_actually_goes_
+quiet` (promote -> Silent-close -> channel genuinely goes quiet -> a new
+signal on the same channel must promote normally; verified to fail
+without this correction).
+
 ## Result 3 (retracted): the "90 s to first decode" churn was a testing artifact, not a real bug
 
 An earlier version of this doc claimed a distinct, production-affecting

@@ -830,6 +830,22 @@ impl TrackManager {
         let power_db_vals: Vec<f64> = hop.power.iter().map(|&p| power_db(p)).collect();
         self.floor.update(&power_db_vals);
         let (rise, drop) = self.gate.update(&power_db_vals, &self.floor);
+        // MAN-171 (Codex review, PR #174 round 4, correct): clear a
+        // channel's respawn cooldown the moment its own `rise` genuinely
+        // drops. `CloseReason::Silent` does NOT prove the RF signal ended
+        // -- only `HangExpired` does (see this file's other comments on
+        // that exact distinction) -- so a track that closes Silent while a
+        // real, weak/marginal signal just wasn't producing decoded
+        // characters, and *then* that signal actually ends, must not keep
+        // blocking a genuinely different station that shows up on the same
+        // channel during the remaining cooldown window. A true stationary
+        // artifact's `rise` never drops on its own, so this never touches
+        // its cooldown.
+        for (k, &r) in rise.iter().enumerate() {
+            if !r && self.channel_cooldown_until[k] > 0 {
+                self.channel_cooldown_until[k] = 0;
+            }
+        }
         self.recompute_ownership();
 
         let past_warmup = self.hop_counter >= self.cfg.warmup_hops;
@@ -2000,6 +2016,82 @@ mod tests {
         assert!(
             repromoted,
             "channel 10 never re-promoted even after the full cooldown window elapsed"
+        );
+    }
+
+    /// Regression, MAN-171 (Codex review, PR #174 round 4): `CloseReason::
+    /// Silent` does not prove the RF signal actually ended -- a real, weak/
+    /// marginal signal can close Silent (30s with no decoded character)
+    /// while still genuinely present, or shortly before it actually ends.
+    /// The respawn cooldown must not keep blocking a genuinely *different*
+    /// station that shows up on the same channel once the old signal's own
+    /// `rise` has dropped -- that drop is the real observed RF gap the
+    /// cooldown's persistent-artifact rationale depends on. Only a channel
+    /// whose `rise` never drops (a true stationary artifact) should still
+    /// be blocked for the full cooldown window (covered by the sibling
+    /// test above).
+    #[test]
+    fn respawn_cooldown_clears_once_the_channel_actually_goes_quiet() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0); // +20 dB above floor, never decoded
+
+        let mut m = 250u64 * 15;
+        let mut promotions = 0u32;
+        for _ in 0..12_000 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            promotions += promoted
+                .iter()
+                .filter(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+                .count() as u32;
+            m += 1;
+            if promotions > 0 && tm.tracks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            promotions, 1,
+            "expected exactly one promotion before the Silent close"
+        );
+        assert_eq!(tm.tracks.len(), 0, "the closed track must be gone");
+
+        // The old signal genuinely ends -- channel 10 goes quiet, `rise`
+        // drops. A few hops is enough for the gate's EMA to settle below
+        // threshold given the +20 dB jump.
+        let quiet = quiet_power(n);
+        for _ in 0..40 {
+            tm.step_hop(&hop(m, quiet.clone()), m);
+            m += 1;
+        }
+
+        // A genuinely different station now starts on the same channel,
+        // well within what would still be the flat cooldown window (30s =
+        // 11250 hops) -- it must be allowed to promote normally, not be
+        // silently suppressed by a cooldown that no longer applies.
+        let mut repromoted = false;
+        for _ in 0..60 {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if promoted
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackPromoted { .. }))
+            {
+                repromoted = true;
+                break;
+            }
+            m += 1;
+        }
+        assert!(
+            repromoted,
+            "a new signal on channel 10 was suppressed by a stale cooldown after the old \
+             signal's rise genuinely dropped -- the cooldown must clear on a real RF gap"
         );
     }
 
