@@ -225,6 +225,46 @@ fn capture_rate_hz_that_divides_evenly_decimates_and_still_decodes() {
 }
 
 #[test]
+fn capture_rate_hz_rejects_non_finite_and_degenerately_small_values() {
+    // MAN-169 whole-branch review finding: a small --capture-rate-hz (e.g.
+    // 187.5 Hz, reachable as 48000/256) resolves to a Channelizer with
+    // hop=0, which hangs Channelizer::process's read-advancing loop
+    // forever. Caught here, at CLI-parse time -- before any source is
+    // opened -- via parse_capture_rate_hz's MIN_CAPTURE_RATE_HZ floor, not
+    // just later at Decimator::new's own construction-time check.
+    // "-inf"/negative values aren't exercised here, same reasoning as
+    // hpsdr_rate_rejects_non_finite_values above: clap treats a leading
+    // "-" as a new flag rather than this value unless
+    // `allow_negative_numbers` is set, which this flag doesn't need since
+    // every legitimate rate is positive.
+    for bad_rate in ["NaN", "inf", "0", "187.5", "500"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args([
+                "run",
+                "--source",
+                "/nonexistent-for-this-test.wav",
+                "--capture-rate-hz",
+                bad_rate,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--capture-rate-hz {bad_rate} should be rejected before any I/O"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("capture-rate-hz"),
+            "expected an explanatory error for --capture-rate-hz {bad_rate}, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("nonexistent-for-this-test"),
+            "should fail at CLI-parse time, before the source file is ever opened: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn the_ad_hoc_listen_path_is_not_nagged() {
     // The ticket title keeps `listen` for audio/dev testing, and
     // docs/RUNBOOKS/m1-w1aw-live-copy.md still instructs `listen --device`.

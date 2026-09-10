@@ -162,7 +162,7 @@ enum Command {
         /// a power of two, and the result must itself be a valid
         /// channelizer table rate (fs/93.75 a power of two). Omit to use
         /// the source's native rate unchanged (today's behavior).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
         /// TOML config with a `[server]`-shaped `ServerConfig` (station
         /// callsign + ports). When given, also starts the telnet cluster
@@ -285,7 +285,7 @@ enum Command {
         /// a power of two, and the result must itself be a valid
         /// channelizer table rate (fs/93.75 a power of two). Omit to use
         /// the source's native rate unchanged (today's behavior).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
     },
     /// Bounded-duration health check: is this source hearing anything real?
@@ -378,7 +378,7 @@ enum Command {
         /// a power of two, and the result must itself be a valid
         /// channelizer table rate (fs/93.75 a power of two). Omit to use
         /// the source's native rate unchanged (today's behavior).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
         /// Emit the DoctorReport as one JSON object on stdout instead of a
         /// human-readable summary.
@@ -551,6 +551,39 @@ fn maybe_decimate(src: Box<dyn IqSource>, capture_rate_hz: Option<f64>) -> Resul
         }
         _ => Ok(src),
     }
+}
+
+/// Lower bound for `--capture-rate-hz`. `manta_dsp::decimate::Decimator::
+/// new` rejects any target rate whose channel count (`fs_out/93.75`) is
+/// below 4 (a `Channelizer` with `hop = n/4 == 0` never terminates its
+/// read-advancing loop -- MAN-169 whole-branch review finding). That floor
+/// alone is 4*93.75 = 375 Hz, but this constant is set well above it (same
+/// 1000 Hz floor `--hpsdr-rate` already uses via `MIN_HPSDR_RATE_HZ`) as a
+/// second, earlier layer of defense: rejecting a degenerate
+/// `--capture-rate-hz` here, at CLI-parse time, fails before any live SDR
+/// device is opened/activated and produces a clearer error message than
+/// the DSP-layer construction error would.
+const MIN_CAPTURE_RATE_HZ: f64 = 1_000.0;
+
+/// Clap value parser for `--capture-rate-hz`: rejects non-finite (NaN/
+/// infinity) and implausibly small values at CLI-parse time, before any
+/// live SDR device is opened -- matching `parse_hpsdr_rate_hz`'s pattern.
+/// The full validation (evenly divides the source's native rate by a power
+/// of two, and the result is itself a valid channelizer table rate) still
+/// happens later in `DecimatingSource::new`/`Decimator::new`, once the
+/// source's actual native rate is known; this is a cheap, early rejection
+/// of obviously-bad input (e.g. a negative or degenerately tiny value that
+/// would otherwise reach `Channelizer::new` with `hop == 0` and hang).
+fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
+    let hz: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --capture-rate-hz {s:?}: {e}"))?;
+    if !hz.is_finite() || hz < MIN_CAPTURE_RATE_HZ {
+        return Err(format!(
+            "--capture-rate-hz must be a finite number of Hz >= {MIN_CAPTURE_RATE_HZ}, got {hz}"
+        ));
+    }
+    Ok(hz)
 }
 
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
