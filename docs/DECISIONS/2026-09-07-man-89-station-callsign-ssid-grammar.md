@@ -102,6 +102,32 @@ technical notes asked to fix together.
    a digit somewhere between it and the segment's first letter. The accepted forms above are
    unchanged -- every one of them already ends in a letter.
 
+   A DIGIT-LED segment qualifies too (PR #131 review, round 6). "Some digit with at least one
+   letter BEFORE it" excluded the special-event calls whose only digit is the leading prefix
+   numeral: `4AFARU`, `4GRID` and `5NNHR` are all in the vendored `crates/manta-spot/data/
+   master.scp`, and `grammar::is_plausible` -- the validator this one replaced -- accepted every
+   one of them, so rejecting them broke the strict-superset property this ticket claims and would
+   have stopped those operators' daemons from starting at all. `config::is_complete_callsign`
+   now also accepts a segment whose FIRST character is a digit and whose first letter is at index
+   1 -- one leading numeral, then letters, then a letter last. The `first_letter == 1` bound
+   keeps `12A` out (no ITU prefix carries two leading numerals), and the trailing-letter rule
+   from round 5 is unchanged, so `W12`, `W1A2`, `4GRID2` and `5NNHR9` all stay rejected. Because
+   the separating-digit shape no longer implies the round-3 length bound for this new shape, that
+   bound is now restated explicitly in the predicate (`4G` is rejected). Re-measured over the
+   whole vendored `master.scp`: 50,001 entries, and the only line the predicate rejects is the
+   file's own `!!Order,1,1` header.
+
+8. **The unresolved-geography metric classifies the SSID-STRIPPED station callsign** (PR #131
+   review, round 6). `SpotMessage::from_spot` resolves the de side through
+   `config::strip_ssid(station_call)`, but `manta-cli::start_spot_server` precomputed
+   `station_geography_unresolved` from the raw `cfg.station_callsign`. For a mobile node
+   identity such as `K5ARH/MM-1`, `is_outside_any_dxcc_entity` then sees `MM-1` instead of `MM`
+   (so the /MM test misses) while `cty.lookup` still resolves through the allocated `K` prefix --
+   the spot goes out with the de-side `NO_DXCC_ENTITY` sentinel and unknown geography while
+   `manta_spots_unresolved_geography_total` stays at zero for every spot the node emits. The
+   precomputation now applies the same `strip_ssid` the emit path applies, so the counter's
+   condition and the sentinel's condition are derived from one string.
+
 ## Non-goals
 
 - Auto-generating the `N` band index. `manta-cli` still hardcodes a single DDC; a real per-band

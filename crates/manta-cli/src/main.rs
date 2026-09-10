@@ -1067,7 +1067,20 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
-            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            // MAN-89 (PR #131 review, round 6): stripped exactly as
+            // `SpotMessage::from_spot` strips it before `Geography::resolve`
+            // (spot_message.rs), because this flag has to answer the SAME
+            // question that path answers. Left unstripped, an SSID'd mobile
+            // identity like `K5ARH/MM-1` reaches
+            // `is_outside_any_dxcc_entity` as `MM-1` rather than `MM` (so the
+            // /MM test misses) while `cty.lookup` still resolves through the
+            // allocated `K` prefix -- and every spot from that node would go
+            // out carrying the de-side sentinels with the counter stuck at
+            // zero.
+            station_geography_unresolved: geography_is_unresolved(
+                &cty,
+                manta_server::config::strip_ssid(&cfg.station_callsign),
+            ),
             cty,
         },
     ))
@@ -2186,5 +2199,44 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             geography_is_unresolved(&cty, "W1AW"),
             "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
         );
+    }
+
+    // MAN-89 (PR #131 review, round 6): `station_geography_unresolved` is
+    // precomputed from the operator's configured `station_callsign`, which
+    // may carry an RBN `-N` per-band SSID. It must be classified through the
+    // SAME string `SpotMessage::from_spot` resolves -- the SSID-stripped one
+    // -- or a mobile node's spots go out with the de-side sentinels while
+    // `manta_spots_unresolved_geography_total` stays at zero.
+
+    #[test]
+    fn an_ssid_bearing_mobile_station_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        for call in ["K5ARH/MM-1", "K5ARH/AM-1", "K5ARH/MM-99"] {
+            assert!(
+                !geography_is_unresolved(&cty, call),
+                "test premise: unstripped, {call} reads as resolved -- this is the bug"
+            );
+            assert!(
+                geography_is_unresolved(&cty, manta_server::config::strip_ssid(call)),
+                "{call} carries the de-side sentinels and must be counted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ssid_bearing_ordinary_station_callsign_is_not_counted_as_unresolved() {
+        // The other direction: stripping must not turn a perfectly resolvable
+        // node identity into a counted one.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(!geography_is_unresolved(
+            &cty,
+            manta_server::config::strip_ssid("W1AW-1")
+        ));
+        assert!(!geography_is_unresolved(
+            &cty,
+            manta_server::config::strip_ssid("W1AW/P-2")
+        ));
     }
 }

@@ -59,7 +59,7 @@ const MIN_CALLSIGN_LEN: usize = 3;
 /// to the END of the segment -- i.e. some digit with at least one letter
 /// BEFORE it, and the segment's LAST character a letter. `W1A`, `W5AU`,
 /// `4U1UN`, `3DA0RS`, `GB3LER` and multi-digit special-event forms like
-/// `LZ130LO` all satisfy it.
+/// `LZ130LO` all satisfy it, as do the digit-led special-event forms below.
 ///
 /// Structure, not just character classes (PR #131 review, round 4): a
 /// predicate that only asks for `MIN_CALLSIGN_LEN` characters plus "some
@@ -75,11 +75,20 @@ const MIN_CALLSIGN_LEN: usize = 3;
 /// in every amateur callsign, so a segment ending in a digit is a typo at any
 /// length.
 ///
-/// The length bound is implied rather than restated: a letter, then a digit,
-/// then a letter is already `MIN_CALLSIGN_LEN` characters. Prefix (`JW/`) and
-/// portable/beacon suffix (`/P`, `/B`, `/3`) segments legitimately fail this
-/// and stay accepted -- `check_operator_callsign` only requires that ONE
-/// segment pass.
+/// A DIGIT-LED segment satisfies it too (PR #131 review, round 6): the
+/// vendored `master.scp` carries `4AFARU`, `4GRID` and `5NNHR`, whose only
+/// digit PRECEDES the first letter, so "a digit with a letter before it"
+/// alone would lock those operators out of starting the daemon. The
+/// digit-ending forms this predicate exists to reject are unaffected --
+/// `W12` and `W1A2` still fail on the trailing-letter rule, which is what
+/// separates a missing suffix from a leading numeral.
+///
+/// The length bound is restated explicitly for that digit-led shape: the
+/// separating-digit shape implies `MIN_CALLSIGN_LEN` on its own (letter,
+/// digit, letter), but a leading digit plus one letter does not. Prefix
+/// (`JW/`) and portable/beacon suffix (`/P`, `/B`, `/3`) segments
+/// legitimately fail this and stay accepted -- `check_operator_callsign`
+/// only requires that ONE segment pass.
 fn is_complete_callsign(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     let Some(first_letter) = bytes.iter().position(u8::is_ascii_alphabetic) else {
@@ -92,6 +101,17 @@ fn is_complete_callsign(segment: &str) -> bool {
     };
     if !last.is_ascii_alphabetic() {
         return false;
+    }
+    if bytes.len() < MIN_CALLSIGN_LEN {
+        return false;
+    }
+    // `4GRID`: a SINGLE leading numeral is the prefix, and the letters after
+    // it are the whole call. `first_letter == 1` is what keeps this narrow --
+    // ITU digit-led prefixes carry exactly one numeral (`4U`, `3D`, `5N`), so
+    // `12A` is still a typo -- and the segment already ends in a letter, so
+    // this cannot readmit a suffix-less `W12` either.
+    if bytes[0].is_ascii_digit() && first_letter == 1 {
+        return true;
     }
     let last_letter = bytes.len() - 1;
     bytes
@@ -505,7 +525,16 @@ mod tests {
             "4U1UN",        // exact cty.dat alias, digit-leading prefix
             "LZ130LO",      // special-event call: several separating digits
             "W1A/P",        // the shortest real call, MIN_CALLSIGN_LEN exactly
-            "w3xyz",        // lowercase accepted ...
+            // PR #131 review round 6: digit-led special-event calls whose ONLY
+            // digit precedes the first letter -- all three are in the vendored
+            // master.scp, and the grammar this validator replaced accepted them.
+            "4AFARU",
+            "4GRID",
+            "5NNHR",
+            "4GRID-1",  // ... and they take a per-band SSID like any other
+            "4GRID/P",  // ... and a portable suffix
+            "JW/4GRID", // ... and a DXCC prefix override
+            "w3xyz",    // lowercase accepted ...
         ] {
             let cfg: ServerConfig = toml::from_str(&format!(r#"station_callsign = {good:?}"#))
                 .unwrap_or_else(|e| panic!("{good:?} should be accepted: {e}"));
@@ -580,6 +609,14 @@ mod tests {
             "W1A2/P",
             "LZ130LO5",
             "4U1UN0",
+            // PR #131 review round 6: admitting the digit-led shape must not
+            // readmit anything that ends in a digit, nor drop the length floor
+            // the separating-digit shape used to imply on its own.
+            "4G",
+            "4G-1",
+            "4GRID2",
+            "12A/P",
+            "5NNHR9",
         ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));
