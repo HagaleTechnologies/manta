@@ -93,8 +93,30 @@ pub fn listen(
     on_event: impl FnMut(&DecoderEvent),
     on_spot: impl FnMut(&crate::Spot),
 ) -> Result<()> {
-<<<<<<< HEAD
-    listen_with_track_count(src, cfg, stop, on_event, on_spot, |_n| {})
+    listen_inner(
+        src,
+        cfg,
+        stop,
+        ListenObservers::default(),
+        on_event,
+        on_spot,
+        |_n| {},
+    )
+}
+
+/// Like `listen`, but additionally publishes engine-owned live state
+/// (currently just the active-track count) into `observers` as the decode
+/// loop runs. See `ListenObservers`'s doc comment for why this is a shared
+/// atomic rather than a third callback.
+pub fn listen_with_observers(
+    src: Box<dyn IqSource>,
+    cfg: &PipelineConfig,
+    stop: Arc<AtomicBool>,
+    observers: ListenObservers,
+    on_event: impl FnMut(&DecoderEvent),
+    on_spot: impl FnMut(&crate::Spot),
+) -> Result<()> {
+    listen_inner(src, cfg, stop, observers, on_event, on_spot, |_n| {})
 }
 
 /// `listen()` plus a live per-batch observer: `on_tracks` is called with
@@ -121,27 +143,38 @@ pub fn listen(
 /// real decoders are running on weak or unmodulated signals. This is the
 /// count that cannot lie about that.
 ///
-/// Kept as a separate entry point rather than a sixth parameter on
-/// `listen()` so the existing callers and tests are untouched; `listen()`
-/// is now a no-op-observer wrapper over this.
+/// Distinct from `listen_with_observers`'s `ListenObservers::active_tracks`
+/// (MAN-45), which publishes `TrackManager::active_track_count()` -- every
+/// open track, unconfirmed CANDIDATEs included -- into a shared atomic a
+/// consumer polls on its own schedule. The two coexist rather than one
+/// replacing the other: MAN-45's atomic is for a consumer that must never
+/// be able to block the decode loop, this callback is for one that needs
+/// every batch edge and the promoted-only count. A caller wants one or the
+/// other, never both writing the same gauge -- see `manta-cli`, which uses
+/// this one.
 pub fn listen_with_track_count(
-=======
-    listen_with_observers(
+    src: Box<dyn IqSource>,
+    cfg: &PipelineConfig,
+    stop: Arc<AtomicBool>,
+    on_event: impl FnMut(&DecoderEvent),
+    on_spot: impl FnMut(&crate::Spot),
+    on_tracks: impl FnMut(usize),
+) -> Result<()> {
+    listen_inner(
         src,
         cfg,
         stop,
         ListenObservers::default(),
         on_event,
         on_spot,
+        on_tracks,
     )
 }
 
-/// Like `listen`, but additionally publishes engine-owned live state
-/// (currently just the active-track count) into `observers` as the decode
-/// loop runs. See `ListenObservers`'s doc comment for why this is a shared
-/// atomic rather than a third callback.
-pub fn listen_with_observers(
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+/// The one decode loop behind `listen`, `listen_with_observers` and
+/// `listen_with_track_count`. Private so the three public entry points
+/// above stay at the shapes their own callers were written against.
+fn listen_inner(
     mut src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
     stop: Arc<AtomicBool>,
@@ -209,22 +242,16 @@ pub fn listen_with_observers(
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
-    on_tracks(tm.decoding_track_count());
-=======
     report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    on_tracks(tm.decoding_track_count());
     for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
-    on_tracks(tm.decoding_track_count());
-=======
     report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    on_tracks(tm.decoding_track_count());
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -237,7 +264,7 @@ pub fn listen_with_observers(
         // an SDR disconnecting, say -- would otherwise leave
         // `manta_active_tracks` (and the status line's `tracks=`) frozen
         // at its last nonzero value for the whole shutdown drain, up to
-        // `SHUTDOWN_DRAIN_DEADLINE` (25 s), while the metrics listener is
+        // `SHUTDOWN_DRAIN_DEADLINE` (50 s), while the metrics listener is
         // still answering scrapes with decoders that no longer exist.
         // Publish 0 first, then propagate the original error unchanged.
         let n = match src.read(&mut chunk) {
@@ -258,11 +285,8 @@ pub fn listen_with_observers(
                 on_spot(&spot);
             }
         }
-<<<<<<< HEAD
-        on_tracks(tm.decoding_track_count());
-=======
         report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+        on_tracks(tm.decoding_track_count());
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
@@ -270,17 +294,12 @@ pub fn listen_with_observers(
             on_spot(&spot);
         }
     }
-<<<<<<< HEAD
-    // `finish()` flushes and drops every decoder: nothing is being decoded
-    // once the stream has ended, so the gauge must not be left holding the
-    // last live value after a source disconnects or a replay hits EOF.
-    on_tracks(0);
-=======
-    // `finish()` closes every remaining track, so the gauge must settle
-    // back to 0 here rather than being left at whatever the last processed
-    // chunk reported.
+    // `finish()` closes every remaining track and drops every decoder:
+    // nothing is open and nothing is being decoded once the stream has
+    // ended, so neither observer may be left holding the last live value
+    // after a source disconnects or a replay hits EOF.
     report_active_tracks(&tm);
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    on_tracks(0);
     Ok(())
 }
 
