@@ -139,8 +139,19 @@ fn the_daemon_logs_a_startup_banner_before_any_client_connects() {
 ///
 /// What is left here is the half that needs the real binary and cannot
 /// race: readiness is not claimed for a daemon whose pipeline never
-/// started, and a daemon that never decodes never emits a status line
-/// either.
+/// started.
+///
+/// Review round 3: the status timer is DISABLED here
+/// (`status_interval_secs = 0`), and this test no longer asserts anything
+/// about status-line timing. It used to run a 1 s timer and assert no
+/// `manta status:` line was ever emitted -- but `status.rs` deliberately
+/// permits status lines before the first batch (that is what
+/// `pipeline=starting`/`stalled` is for), so on a runner that takes more
+/// than one second to reach calibration EOF the independent Tokio timer
+/// legitimately emits one and the assertion goes red on correct
+/// behaviour. The absence of a status line was never an invariant; the
+/// timer's behaviour is pinned under a controlled clock in
+/// `manta-server`'s `status_line_acceptance.rs` instead.
 #[test]
 fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
     let dir = tempfile::tempdir().unwrap();
@@ -149,7 +160,9 @@ fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
     // processed. Deterministic on any machine at any speed -- it is a
     // property of the fixture, not of how fast the fixture is consumed.
     let wav = silent_48k_wav(dir.path(), 1);
-    let cfg_path = write_server_config(dir.path(), 1);
+    // 0 disables the status task outright, so nothing in this test races
+    // the wall clock against how long the process takes to fail.
+    let cfg_path = write_server_config(dir.path(), 0);
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
         .args([
@@ -181,8 +194,11 @@ fn a_daemon_whose_pipeline_never_starts_never_claims_to_be_ready() {
         "the daemon exited during calibration without decoding anything -- it must \
          never have claimed readiness: {stderr}"
     );
+    // With the timer disabled this pins the config switch, not a timing
+    // property: `status_interval_secs = 0` must spawn no status task at
+    // all, however long the process lives before it fails.
     assert!(
         !stderr.contains("manta status:"),
-        "no status line can be emitted by a daemon that never got past calibration: {stderr}"
+        "status_interval_secs = 0 must emit no status line at all: {stderr}"
     );
 }

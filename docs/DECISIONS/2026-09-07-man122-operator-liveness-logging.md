@@ -69,6 +69,18 @@ Prometheus text: it is a liveness edge, not a figure worth graphing. This
 is why `listen_with_track_count`'s observer now fires on every batch
 rather than only on a change — see below.
 
+**`starting` is bounded by a grace period** (review round 3). "No batch
+yet" was originally classified as `starting` unconditionally, which made a
+daemon wedged *before* its first batch — a first `IqSource::read` that
+blocks, a source that never accumulates the two-second calibration window —
+report `starting` on every status line for the rest of its life: the one
+wedge the field was added to catch was the one wedge it could not name.
+Zero progress now reads as `starting` only within `status::STARTUP_GRACE`
+(30 s, ~15x the calibration window: ample for a KiwiSDR TCP connect or a
+SoapySDR device init, and shorter than the 60 s default interval, so the
+very first status line of a wedged startup already says `stalled`), and as
+`stalled` after it. Nonzero progress is never reclassified by elapsed time.
+
 **Shutdown beats the interval tick** (review round 2). The status task's
 `select!` is `biased` with the shutdown arm first, and re-checks
 `shutdown.borrow()` after the sleep arm wins. Unbiased, `select!` picks at
