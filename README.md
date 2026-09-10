@@ -165,6 +165,30 @@ The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden
 test vectors.
 
+### Outbound RBN uplink
+
+manta can also log into an RBN spot-collection endpoint as a client and
+forward its own spots there. Add one `[[rbn_uplink]]` block per target to
+the daemon config:
+
+```toml
+[server]
+station_callsign = "W3XYZ"
+
+[[rbn_uplink]]
+enabled = true
+target_host = "rbn.example.org"
+target_port = 7000
+# dry_run defaults to TRUE: manta connects and logs in, so you can verify
+# credentials and reachability, but transmits no spots. Set it to false
+# only once you actually intend to feed a live target.
+# dry_run = false
+```
+
+The uplink has not yet been verified against a real RBN ingest (see
+[ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
+which mode each target is in at startup.
+
 ## Status
 
 Pre-1.0. What exists and what does not:
@@ -181,7 +205,8 @@ Pre-1.0. What exists and what does not:
 - **Known limits:** the classical decoder loses copy under heavy HF fading on
   a few golden vectors (issues #25 and #28). Closing that gap is the M4 ML
   fusion stage, gated on beating the classical baseline under simulated
-  fading.
+  fading. The outbound RBN uplink is unverified against a real RBN ingest and
+  ships dry-run by default until that verification lands.
 
 [ROADMAP.md](ROADMAP.md) has the milestone breakdown with acceptance
 criteria.
