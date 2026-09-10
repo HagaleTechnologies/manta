@@ -96,6 +96,7 @@ mod tests {
         fs: f64,
         center_freq_hz: f64,
         live: Option<Arc<AtomicBool>>,
+        counters: Option<Arc<InputHealthCounters>>,
     }
 
     impl IqSource for InMemorySource {
@@ -113,6 +114,9 @@ mod tests {
         }
         fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
             self.live.clone()
+        }
+        fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+            self.counters.clone()
         }
     }
 
@@ -133,6 +137,7 @@ mod tests {
             fs: 192_000.0,
             center_freq_hz: 14_000_000.0,
             live: None,
+            counters: None,
         });
         let src = DecimatingSource::new(inner, 48_000.0).unwrap();
         assert_eq!(src.sample_rate(), 48_000.0);
@@ -147,6 +152,7 @@ mod tests {
             fs: 192_000.0,
             center_freq_hz: 14_035_000.0,
             live: Some(live.clone()),
+            counters: None,
         });
         let src = DecimatingSource::new(inner, 48_000.0).unwrap();
         assert_eq!(src.center_freq_hz(), 14_035_000.0);
@@ -163,6 +169,7 @@ mod tests {
             fs: fs_in,
             center_freq_hz: 0.0,
             live: None,
+            counters: None,
         });
         let mut src = DecimatingSource::new(inner, 48_000.0).unwrap(); // factor 4
         let mut total = 0usize;
@@ -191,6 +198,7 @@ mod tests {
             fs: 192_000.0,
             center_freq_hz: 0.0,
             live: None,
+            counters: None,
         });
         assert!(DecimatingSource::new(inner, 70_000.0).is_err());
     }
@@ -203,7 +211,34 @@ mod tests {
             fs: 100_000.0,
             center_freq_hz: 0.0,
             live: None,
+            counters: None,
         });
         assert!(DecimatingSource::new(inner, 50_000.0).is_err());
+    }
+
+    #[test]
+    fn health_counters_forward_to_the_inner_source() {
+        let counters = Arc::new(InputHealthCounters::new());
+        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+            samples: tone(1_000.0, 1_000, 192_000.0),
+            cursor: 0,
+            fs: 192_000.0,
+            center_freq_hz: 14_000_000.0,
+            live: None,
+            counters: Some(counters.clone()),
+        });
+        let src = DecimatingSource::new(inner, 48_000.0).unwrap();
+        let forwarded_counters = src.health_counters().unwrap();
+        assert_eq!(
+            forwarded_counters.dropped_packets(),
+            counters.dropped_packets()
+        );
+        // Record a packet drop in the original counters
+        counters.record_dropped(5);
+        // Verify the forwarded reference sees the same update
+        assert_eq!(
+            forwarded_counters.dropped_packets(),
+            5
+        );
     }
 }
