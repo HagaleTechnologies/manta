@@ -1995,6 +1995,29 @@ fn main() -> Result<()> {
                 None => src,
             };
 
+            // MAN-122 review round 6 (P2): installed HERE -- before
+            // `start_spot_server` binds the sockets and logs the
+            // `listening:` startup banner naming them -- and not after it,
+            // as an earlier revision did. That banner is an advertisement:
+            // a supervisor or operator that reacts to it by immediately
+            // sending SIGINT/SIGTERM must not hit the signal's DEFAULT
+            // disposition, which terminates the daemon outright and skips
+            // the client/status shutdown drain that MAN-85's handler
+            // exists to guarantee. Installing the handler first makes the
+            // whole observable window -- banner included -- covered by the
+            // drain. A signal landing before the decode loop starts is
+            // handled correctly by construction: `listen_with_observers`
+            // observes `stop` and returns, and the shutdown sequence below
+            // runs on that path exactly as it does for a signal arriving
+            // mid-decode. The banner itself still precedes the listener
+            // tasks (see `start_spot_server`), so its ordering against
+            // per-connection lines is unchanged.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_handler = stop.clone();
+            ctrlc::set_handler(move || {
+                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+            })?;
+
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
             // given, in which case `spot_server` stays None too. `epoch`/
@@ -2147,24 +2170,22 @@ fn main() -> Result<()> {
                     None => (None, None, None, None),
                 };
 
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stop_handler = stop.clone();
-            ctrlc::set_handler(move || {
-                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
-            })?;
-            // Printed AFTER the handler is installed, and via `eprintln!`
-            // rather than `tracing::info!` because the subscriber is only
-            // initialized inside `start_spot_server` -- a plain `listen`
-            // (no --server-config) has no subscriber at all. Two jobs:
-            // `listen` otherwise prints nothing at startup (2026-09-05
-            // review, lens 1 #4/#7), and it is the readiness handshake
-            // `tests/signal_shutdown.rs` waits for -- signalling any
-            // earlier races `set_handler` and kills the child under the OS
-            // default disposition regardless of MAN-85's fix. If the
-            // fuller startup banner (lens 1 #7) ever replaces this line,
-            // it must still be emitted here, after `set_handler`, and
-            // `READY_MARKER` updated to match. stdout stays pure JSON
-            // under `--json` (MAN-59 round 6); this goes to stderr.
+            // Printed via `eprintln!` rather than `tracing::info!` because
+            // the subscriber is only initialized inside
+            // `start_spot_server` -- a plain `listen` (no --server-config)
+            // has no subscriber at all. Two jobs: `listen` otherwise prints
+            // nothing at startup (2026-09-05 review, lens 1 #4/#7), and it
+            // is the readiness handshake `tests/signal_shutdown.rs` waits
+            // for. It remains AFTER `ctrlc::set_handler`, which as of
+            // review round 6 runs further above (before `start_spot_server`
+            // and its `listening:` banner), so every startup line this
+            // daemon emits -- this marker and the banner alike -- is now
+            // published with the handler already installed; no line
+            // advertises a daemon that would still die on the signal's
+            // default disposition. If the fuller startup banner (lens 1 #7)
+            // ever replaces this line, `READY_MARKER` must be updated to
+            // match. stdout stays pure JSON under `--json` (MAN-59
+            // round 6); this goes to stderr.
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
