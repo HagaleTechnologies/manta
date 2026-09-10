@@ -129,6 +129,16 @@ struct PendingBeacon {
     freq_hz: f64,
     snr_db: f32,
     char_confidences: Vec<f32>,
+    /// The track_id that originally captured this candidate -- NOT
+    /// necessarily the track_id it's eventually resolved under (Codex
+    /// review, PR #152, round 14): `migrate_or_discard_pending_beacons`
+    /// moves a `PendingBeacon` into a merge survivor's own list, and
+    /// resolving it there under the survivor's track_id would wrongly
+    /// grant it `RepetitionGate`'s rapid-same-track exemption even though
+    /// it's a genuinely different track's (duplicate-spawn) candidate --
+    /// letting one real over-the-air occurrence, captured by two
+    /// overlapping tracks, reach `reps >= 2` on its own.
+    origin_track_id: u32,
 }
 
 #[derive(Default)]
@@ -1099,6 +1109,7 @@ impl Validator {
             freq_hz,
             snr_db,
             char_confidences,
+            origin_track_id: track_id,
         });
         None
     }
@@ -1170,10 +1181,18 @@ impl Validator {
         pending
             .into_iter()
             .filter_map(|pb| {
-                let reps = self
-                    .gate
-                    .record(track_id, pb.freq_hz, &pb.candidate, pb.sample_ts)
-                    as u32;
+                // pb.origin_track_id, not the resolving `track_id`
+                // (Codex review, PR #152, round 14): a migrated
+                // PendingBeacon must keep the identity that ACTUALLY
+                // captured it, or a merge survivor resolving a different
+                // track's candidate here would wrongly grant it the
+                // rapid-same-track exemption -- letting one real
+                // over-the-air occurrence, captured by two overlapping
+                // duplicate-spawn tracks, reach reps >= 2 on its own.
+                let reps =
+                    self.gate
+                        .record(pb.origin_track_id, pb.freq_hz, &pb.candidate, pb.sample_ts)
+                        as u32;
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {
                     confidence =
@@ -1550,6 +1569,89 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review, PR #152, round 14: two duplicate-spawn tracks (a
+    /// known real phenomenon -- spectral splatter spawning more than one
+    /// candidate for one signal) each independently capture the SAME real
+    /// transmission as a Beacon candidate, then both merge into the same
+    /// survivor. Resolving both under the survivor's own track_id would
+    /// wrongly grant the second one the rapid-same-track exemption (it
+    /// looks like the survivor's own back-to-back repeat), letting one
+    /// real over-the-air occurrence self-confirm to `reps == 2` --
+    /// contaminating the SHARED RepetitionGate entry enough that an
+    /// unrelated, later ORDINARY (non-Beacon) decode of the same callsign
+    /// would see the repetition gate already satisfied despite only one
+    /// real transmission ever having happened. Preserving each
+    /// candidate's true origin_track_id keeps the cross-track minimum-gap
+    /// rule effective across the merge.
+    #[test]
+    fn duplicate_tracks_capturing_the_same_beacon_do_not_self_confirm_through_a_shared_survivor() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        let words = ["K5ARH", "T"];
+
+        seed_meta(&mut v, 1);
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        seed_meta(&mut v, 3);
+        let spots = run(&transmission_events(3, &words, 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // Both duplicate-spawn tracks merge into the same survivor, as
+        // pure bookkeeping -- neither closure is proof either signal
+        // ended.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 3,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+
+        // The survivor closes for real, at a plausible speed -- resolving
+        // BOTH migrated candidates. Beacon candidates always spot
+        // regardless of reps (ARCHITECTURE §6.4), so both resolve
+        // normally either way; the bug is only observable downstream.
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 2,
+            wpm: 25.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::SignalEnded,
+        });
+        // Both migrated candidates are identical in every dedupe-relevant
+        // way (same callsign/freq/sample_ts, since both duplicate tracks
+        // decoded the exact same synthetic transmission) -- spot-level
+        // dedupe correctly collapses that to a single emitted spot. The
+        // real point of this test is the ordinary decode below, not the
+        // count here.
+        assert!(
+            !spots.is_empty(),
+            "at least one candidate resolves, got {spots:?}"
+        );
+
+        // A near-simultaneous ORDINARY (non-Beacon) decode of the same
+        // callsign, on a genuinely different track. Only one real
+        // over-the-air occurrence has ever happened here -- the two
+        // Beacon candidates were duplicate spawns of that SAME
+        // transmission, and (with origin_track_id preserved) correctly
+        // rejected as near-duplicates of each other. The ordinary
+        // repetition gate must NOT already see reps >= 2 from that alone.
+        seed_meta(&mut v, 6);
+        let spots = run(&transmission_events(6, &["DE", "K5ARH", "K"], 700), &mut v);
+        assert!(
+            spots.is_empty(),
+            "the merged duplicate Beacon candidates must not have already satisfied the \
+             ordinary repetition gate -- only one real occurrence ever happened, got {spots:?}"
+        );
     }
 
     /// Codex review on PR #154, round 9: an Evicted closure has no
