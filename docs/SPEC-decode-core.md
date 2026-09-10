@@ -99,8 +99,10 @@ Per hop, for a track with peak channel `k₀`:
 - Only **key-down** hops (§3.4) with `SNR ≥ 6 dB` contribute.
 - Track centroid: power-weighted running mean over the track lifetime:
   `C = Σ (k₀ + δ_m)·P₀[m] / Σ P₀[m]` (accumulate in `f64`).
-- Spot frequency: `f_spot = f(0) + C·Δ` rounded to 0.1 kHz for the telnet
-  output, full precision (Hz) in the JSON stream.
+- Spot frequency: `f_spot = f(0) + C·Δ` rounded to **0.01 kHz** for the
+  telnet output (MAN-88 — RBN's live feed carries 2 decimals of kHz; the
+  previous one-decimal rounding discarded 10 Hz of the estimator's real
+  precision), full precision (Hz) in the JSON stream.
 
 With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
 error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
@@ -618,7 +620,33 @@ freq_correction_ppm = 0.0
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 allowlist = []
+
+[server]
+# Which fixed-column wire layout the INBOUND telnet cluster server renders
+# each spot line in (§1.4's 0.01 kHz rounding rule, ARCHITECTURE.md §7,
+# MAN-88). Accepted values, exhaustive -- an
+# unrecognized one is rejected at startup, never silently defaulted:
+#   "rbn"     (default) the RBN relay's AK1A layout: frequency to 0.01 kHz
+#             ending at column 24, 15-wide callsign column starting at
+#             column 27, 6-wide mode field ("CW") at column 42, time at
+#             column 71. Matches a live telnet.reversebeacon.net:7000
+#             capture byte-for-byte.
+#   "skimmer" the CW-Skimmer-native layout: same geometry with the mode
+#             field deleted, so everything after the callsign column
+#             shifts left by 4 and time lands at column 67. For operators
+#             running manta behind W3OA's Aggregator.
+# Scoped to the inbound listener only: the outbound `[[rbn_uplink]]`
+# client always emits "rbn" regardless of this key. See
+# docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md (Decisions 1-3)
+# for the measured column table and that scoping.
+line_format = "rbn"
 ```
+
+The `[server]` block's only normative key here is `line_format` above
+(`"rbn"` default | `"skimmer"`, MAN-88); its further transport keys (listen
+addresses, per-IP connection and command budgets) are deployment settings
+rather than normative constants of this spec, and
+`crates/manta-server/src/config.rs` is their reference.
 
 `SPEC-decode-core-v2.md` §7 adds a `[decode]` `engine` key (`"legacy"` |
 `"edge-legacy"` | `"hsmm"`, see that doc's §0) plus the `EdgeLegacy`/`Hsmm`

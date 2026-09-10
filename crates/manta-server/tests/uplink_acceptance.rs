@@ -165,7 +165,12 @@ async fn logs_in_and_forwards_a_published_spot() {
     assert_eq!(login_line.trim_end(), STATION_CALL);
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     harness.bus.publish(spot);
 
     let mut line = String::new();
@@ -471,7 +476,12 @@ async fn spot_is_forwarded_to_every_configured_target() {
     assert_eq!(login2.trim_end(), STATION_CALL);
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     harness.bus.publish(spot);
 
     let mut line1 = String::new();
@@ -513,7 +523,12 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
     assert_eq!(login_up.trim_end(), STATION_CALL);
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     harness.bus.publish(spot);
 
     let mut line = String::new();
@@ -551,6 +566,7 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
         &spot2,
         STATION_CALL,
         harness.bus.unix_ts_for(spot2.sample_ts),
+        rbn::LineFormat::Rbn,
     );
     harness.bus.publish(spot2);
     let mut line2 = String::new();
@@ -559,6 +575,40 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
         .expect("reachable target stopped receiving spots while the other target retried")
         .unwrap();
     assert_eq!(line2.trim_end(), expected2);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-88 Decision 1: `[server].line_format` does not reach the uplink --
+/// `RbnUplinkConfig` has no `line_format` field of its own, and
+/// `forward_loop` pins `rbn::LineFormat::Rbn` unconditionally. Asserted
+/// against literal columns (mode column present, time at column 71), the
+/// bytes actually read back off the mock target's socket, not just the
+/// return value of `rbn::format_line` the other tests in this file build
+/// their expectation from.
+#[tokio::test]
+async fn the_uplink_always_emits_the_rbn_layout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spot = sample_spot();
+    let unix_ts = harness.bus.unix_ts_for(spot.sample_ts);
+    harness.bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the forwarded spot line")
+        .unwrap();
+    let line = line.trim_end();
+
+    assert_eq!(line.find("CW").unwrap() + 1, 42, "line was: {line:?}");
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(line.find(&zulu).unwrap() + 1, 71, "line was: {line:?}");
 
     let _ = harness.shutdown_tx.send(true);
 }

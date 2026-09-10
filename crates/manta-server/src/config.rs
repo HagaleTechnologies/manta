@@ -200,6 +200,23 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
+    /// Which telnet wire layout the INBOUND cluster server emits
+    /// (MAN-88). Defaults to `"rbn"`, the RBN relay's fixed-column AK1A
+    /// layout that downstream loggers parse today. `"skimmer"` selects
+    /// the CW-Skimmer-native layout (no mode column) that W3OA's
+    /// Aggregator consumes -- set it only when manta is running behind
+    /// an Aggregator install.
+    ///
+    /// Deliberately scoped to `[server]` and NOT applied to
+    /// `[[rbn_uplink]]` (MAN-88 Decision 1): an uplink's peer is an RBN
+    /// spot-collection endpoint, not an Aggregator reading from manta,
+    /// and MAN-90 has not yet verified what that endpoint accepts --
+    /// letting an inbound-listener key silently change the bytes on that
+    /// unverified path is exactly the coupling
+    /// `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D2 warns
+    /// against. `uplink::forward_loop` pins `LineFormat::Rbn`.
+    #[serde(default)]
+    pub line_format: crate::rbn::LineFormat,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -657,6 +674,41 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn line_format_defaults_to_the_rbn_relay_layout() {
+        let cfg: ServerConfig = toml::from_str(r#"station_callsign = "W3XYZ""#).unwrap();
+        assert_eq!(cfg.line_format, crate::rbn::LineFormat::Rbn);
+    }
+
+    #[test]
+    fn line_format_skimmer_selects_the_cw_skimmer_layout() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            line_format = "skimmer"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.line_format, crate::rbn::LineFormat::Skimmer);
+    }
+
+    /// A typo must fail loudly at startup rather than silently falling back to
+    /// the default -- same reasoning as `RbnUplinkConfig`'s `dry_run` guard.
+    #[test]
+    fn an_unknown_line_format_is_rejected() {
+        let err = toml::from_str::<ServerConfig>(
+            r#"
+            station_callsign = "W3XYZ"
+            line_format = "aggregator"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("line_format") || err.to_string().contains("aggregator"),
+            "error was: {err}"
+        );
     }
 
     #[test]

@@ -305,8 +305,14 @@ validation (MAN-28). Dedupe (step 5) still applies.
 ## 7. Output layer (`manta-server`)
 
 - **Telnet DX cluster server** (default :7300): standard login prompt, emits
-  RBN-format spots —
-  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
+  spots in RBN's fixed-column AK1A layout —
+  `DX de W3XYZ-#:  14027.10  JA1ABC         CW    23 dB  28 WPM  CQ      0312Z`
+  (frequency to 0.01 kHz ending at column 24, a 15-wide callsign column,
+  time at column 71 — MAN-88, measured against a live
+  `telnet.reversebeacon.net:7000` capture). `[server].line_format =
+  "skimmer"` selects the CW-Skimmer-native variant (no mode column) for
+  operators running manta behind W3OA's Aggregator, which expects CW
+  Skimmer's own layout rather than the RBN relay's.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
   clients not to choke. This is the RBN/aggregator compatibility surface.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
