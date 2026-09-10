@@ -1117,6 +1117,19 @@ fn load_decode_config_file(
             cfg.hsmm.speed_alpha
         );
     }
+    // Codex review, PR #161 round 17: a finite but NEGATIVE speed_alpha
+    // moves `u += speed_alpha * (target - u)` away from the observed
+    // segment duration instead of toward it -- repeated short segments
+    // then drive `u` toward a clamp boundary, producing incorrect WPM
+    // reports and killing otherwise-valid duration hypotheses.
+    if cfg.hsmm.speed_alpha < 0.0 {
+        bail!(
+            "[decode] speed_alpha must be nonnegative in {} (got {}; a negative gain moves the \
+             speed estimate away from observed durations instead of toward them)",
+            path.display(),
+            cfg.hsmm.speed_alpha
+        );
+    }
     // Codex review, PR #161 round 10: `mark_insert_penalty = nan` reaches
     // `SegType::log_type_prior`; the first Dit/Dah transition then gives
     // every candidate a NaN score, so beam ordering no longer reflects
@@ -2666,6 +2679,12 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_nan_speed_alpha() {
         let f = write_temp_file(b"[decode]\nspeed_alpha = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_negative_speed_alpha() {
+        let f = write_temp_file(b"[decode]\nspeed_alpha = -0.1\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
