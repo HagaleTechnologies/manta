@@ -334,12 +334,15 @@ async fn handle_client(
     //
     // MAN-45 remediate (code-review round 18, finding 2): these three
     // branches record into `record_dropped_shutdown`, NOT
-    // `record_write_failed` -- nothing was written and nothing failed here,
-    // the daemon shut down cleanly. The prior version called
-    // `record_write_failed`, which contradicts that counter's own doc
-    // comment and Prometheus HELP text ("a write... timed out or failed")
-    // and would make an operator reading it suspect failing client sockets
-    // on every ordinary shutdown with a stalled pre-login client.
+    // `record_write_failed` -- no write failed or timed out here, the daemon
+    // shut down cleanly. (Writes may already have HAPPENED: the login-read
+    // and banner branches are only reached once the `login: ` prompt went
+    // out successfully. What none of the three did is fail a write.) The
+    // prior version called `record_write_failed`, which contradicts that
+    // counter's own doc comment and Prometheus HELP text ("a write...
+    // timed out or failed") and would make an operator reading it suspect
+    // failing client sockets on every ordinary shutdown with a stalled
+    // pre-login client.
     tokio::select! {
         result = write_with_timeout(&mut wr, b"login: \r\n") => {
             result?;

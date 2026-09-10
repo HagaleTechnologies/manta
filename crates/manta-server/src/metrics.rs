@@ -12,12 +12,14 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// Spots abandoned when a client connection terminates on a failed write,
-/// or (via `Metrics::record_dropped_shutdown`) on a clean shutdown before
-/// any write was attempted. `in_flight_spot` is true when the write that
-/// just failed was carrying a NEWLY-LOST live spot (that spot is lost too)
-/// and false for a control-frame write -- telnet's `Filter set:`
-/// acknowledgement, the WebSocket Pong reply -- where nothing was in
-/// flight but the receiver's queue is abandoned all the same.
+/// or (via `Metrics::record_dropped_shutdown`) on a clean shutdown with no
+/// write having failed or timed out (an earlier handshake write may well
+/// have succeeded -- see `spots_dropped_shutdown_total`). `in_flight_spot`
+/// is true when the write that just failed was carrying a NEWLY-LOST live
+/// spot (that spot is lost too) and false for a control-frame write --
+/// telnet's `Filter set:` acknowledgement, the WebSocket Pong reply --
+/// where nothing was in flight but the receiver's queue is abandoned all
+/// the same.
 /// `still_queued` is `rx.len()`.
 ///
 /// MAN-45 remediate (code-review round 18, finding 1): telnet's `sh/dx`

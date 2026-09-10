@@ -373,8 +373,15 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the
   daemon shut down while a client was still in its PRE-LOGIN/handshake
   phase — telnet's login prompt/read/banner and the JSON stream's
-  WS-detection peek and WS-accept, the only sites that charge it — before
-  any socket write was attempted, let alone failed. It is NOT the
+  WS-detection peek and WS-accept, the only sites that charge it — with no
+  socket write having failed or timed out, exactly as the Prometheus HELP
+  text says. It does NOT mean no write was attempted: the telnet
+  login-read and banner branches are reached only after the `login: `
+  prompt was already written successfully (`telnet.rs`), and the WS-accept
+  branch can fire after `accept_async_with_config` has already put part of
+  the 101 response on the wire. What it does mean is that the client never
+  got past its handshake, so none of its backlog had been offered to a
+  write yet. It is NOT the
   graceful-drain series: a per-client drain loop that exhausts
   `tasks::CLIENT_DRAIN_DEADLINE` records whatever it abandons on
   `manta_spots_dropped_write_failed_total` (§7), so that is the counter
