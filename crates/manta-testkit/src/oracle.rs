@@ -252,6 +252,17 @@ pub fn run_oracle(
     window_s: f64,
     cfg: &DecodeConfig,
 ) -> Result<(Vec<OracleResult>, OracleSummary)> {
+    // Codex review, PR #161 round 2: a negative window_s makes s1 < s0 below,
+    // panicking on the iq[s0..s1] slice; zero or NaN silently produces an
+    // empty/undefined window per spot instead of a load-time error; infinity
+    // decodes the entire capture for every spot. Validate here, at the
+    // public oracle boundary, rather than only at the CLI, since this
+    // function is directly callable from other code (tests, future
+    // callers) that never goes through clap's value_parser.
+    anyhow::ensure!(
+        window_s.is_finite() && window_s > 0.0,
+        "window_s must be finite and positive (got {window_s})"
+    );
     let mut results = Vec::with_capacity(spots.len());
     for spot in spots {
         let mut ch = Channelizer::new(fs, center_hz).map_err(anyhow::Error::msg)?;

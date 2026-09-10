@@ -87,7 +87,7 @@ enum Command {
         /// the hour (Codex review, PR #161).
         #[arg(long, value_parser = parse_capture_start)]
         capture_start: i64,
-        #[arg(long, default_value_t = 40.0)]
+        #[arg(long, default_value_t = 40.0, value_parser = parse_window_s)]
         window_s: f64,
         /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
         /// given, its values are the baseline; an explicit --engine overrides
@@ -743,6 +743,24 @@ fn parse_capture_start(s: &str) -> std::result::Result<i64, String> {
         .map_err(|e| format!("invalid --capture-start {s:?}: {e}"))
 }
 
+// Codex review, PR #161 round 2: a negative --window-s makes run_oracle's
+// s1 < s0, panicking on the iq[s0..s1] slice; zero/NaN silently produces an
+// empty window; infinity decodes the whole capture per spot. Reject at the
+// CLI boundary too (run_oracle itself now also validates -- see that
+// function's doc comment -- but a CLI-level rejection gives a clap usage
+// error instead of a bail! from inside the command's execution path).
+fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
+    let window_s: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid --window-s {s:?}: {e}"))?;
+    if !window_s.is_finite() || window_s <= 0.0 {
+        return Err(format!(
+            "--window-s must be finite and positive, got {window_s}"
+        ));
+    }
+    Ok(window_s)
+}
+
 fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
@@ -1008,6 +1026,18 @@ fn load_decode_config_file(
             "[decode] flush_gap_dits must be finite and positive in {} (got {})",
             path.display(),
             cfg.flush_gap_dits
+        );
+    }
+    // Codex review, PR #161 round 2: a negative or non-finite `llr_clip`
+    // reaches `f32::clamp(-llr_clip, llr_clip)` on the first keying-present
+    // evidence hop in both edge-legacy and hsmm, panicking on inverted or
+    // NaN bounds exactly like the tau_hi_bounds_ms case above.
+    if !cfg.evidence.llr_clip.is_finite() || cfg.evidence.llr_clip <= 0.0 {
+        bail!(
+            "[decode] llr_clip must be finite and positive in {} (got {}; f32::clamp panics on \
+             a negative or non-finite bound)",
+            path.display(),
+            cfg.evidence.llr_clip
         );
     }
     Ok(cfg)

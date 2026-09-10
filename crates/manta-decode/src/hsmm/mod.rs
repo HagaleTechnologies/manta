@@ -86,10 +86,13 @@ pub struct HsmmDecoder {
     hop: u64,
     last_prefix: f64,
     last_ts: u64,
-    /// [Task 8 fix] `(sample_ts, glyph)` pairs ever actually committed; see
-    /// `commit::commit`'s doc comment for why this must be keyed on
-    /// `sample_ts` (not `born_hop`) and threaded through every call.
-    sealed: Vec<(u64, Option<Glyph>)>,
+    /// [Task 8 fix; round 6 changed the value to `is_char` rather than the
+    /// specific `Glyph`] `(sample_ts, is_char)` pairs ever actually
+    /// committed; see `commit::commit`'s doc comment for why this must be
+    /// keyed on `sample_ts` (not `born_hop`), why the value is the entry
+    /// KIND rather than its exact value, and why it's threaded through
+    /// every call.
+    sealed: Vec<(u64, bool)>,
 }
 
 impl HsmmDecoder {
@@ -285,7 +288,7 @@ impl HsmmDecoder {
             while t
                 .hist
                 .first()
-                .is_some_and(|e| self.sealed.contains(&(e.sample_ts, e.glyph)))
+                .is_some_and(|e| self.sealed.contains(&(e.sample_ts, e.glyph.is_some())))
             {
                 t.hist.remove(0);
             }

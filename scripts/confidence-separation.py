@@ -60,7 +60,14 @@ def main():
     ap.add_argument("--spotter", action="append", default=None,
                      help="Only use truth rows from this spotter callsign (repeatable)")
     ap.add_argument("--min-spotters", type=int, default=1)
-    ap.add_argument("--min-separation", type=float, default=None,
+    # Codex review, PR #161 round 2: a plain `type=float` accepted `nan`,
+    # and `separation < args.min_separation` is always False against nan --
+    # the gate below would then exit 0 unconditionally instead of ever
+    # failing, silently turning off the check `--min-separation` exists
+    # for. Reuse the existing finite-number validator (no bound needed
+    # here -- unlike score-against-rbn.py's tolerances, a negative
+    # separation threshold is a legitimate, meaningful value to gate on).
+    ap.add_argument("--min-separation", type=scorer._finite("--min-separation"), default=None,
                      help="Exit 1 if median(true) - median(bogus) confidence is below this")
     args = ap.parse_args()
 

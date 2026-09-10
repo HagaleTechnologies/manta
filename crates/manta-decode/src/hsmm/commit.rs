@@ -13,9 +13,25 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
     let best = &tokens[0];
     let g = best.hist.get(j).map(|e| e.glyph);
     let mut alts: Vec<(Option<Glyph>, f32)> = Vec::new();
+    // Codex review, PR #161 round 2: `s_alt` (the runner-up score the
+    // margin is computed against) must include every token that
+    // DISAGREES with `best` at entry `j` -- including one that hasn't
+    // appended entry `j` at all yet (`tg` outer `None`, e.g. it's shorter
+    // or behind on a forced commit). The old code only ever folded
+    // `alts`' own scores into `s_alt`, and `alts` only ever holds tokens
+    // with an actual glyph/boundary value to report as an alternative --
+    // an undecided token has none, so it was silently excluded from
+    // `s_alt` too, letting a real, still-live, near-tied competitor
+    // inflate confidence toward sigmoid(4kappa/kappa) ~= 0.982 instead of
+    // the ~0.5 its true score gap implies. Track `s_alt` independently of
+    // `alts` so every disagreeing token counts toward the margin, while
+    // `alts` (the reported alternative list) still only ever contains
+    // tokens with a real glyph/boundary to show.
+    let mut s_alt = f32::NEG_INFINITY;
     for t in tokens.iter().skip(1) {
         let tg = t.hist.get(j).map(|e| e.glyph);
         if tg != g {
+            s_alt = s_alt.max(t.score);
             if let Some(og) = tg.flatten() {
                 if !alts.iter().any(|(a, _)| *a == Some(og)) {
                     alts.push((Some(og), t.score));
@@ -25,10 +41,6 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
             }
         }
     }
-    let s_alt = alts
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::NEG_INFINITY, f32::max);
     let s_alt = if s_alt.is_finite() {
         s_alt
     } else {
@@ -81,13 +93,32 @@ pub fn margin(tokens: &[Token], j: usize, cfg: &HsmmConfig) -> (f32, Vec<(Glyph,
 /// `sample_ts` (`Token::successor`'s `seg_start_ts` parameter) -- fixed
 /// once when that ancestor anchor was created, identical across every
 /// re-derivation from it no matter how large `d` grows. Sealing on
-/// `(sample_ts, glyph)` instead correctly recognizes every re-derived
+/// `(sample_ts, is_char)` instead correctly recognizes every re-derived
 /// candidate as the same already-decided instant and strips it before
 /// the consensus/forced check ever sees it, while still letting a
-/// legitimately different glyph or word-boundary entry at that same
-/// instant (same `sample_ts`, `glyph: None` vs `Some(_)`, since a
-/// closing transition emits at most one of each) commit in its own
-/// right once evidence resolves it.
+/// legitimately different word-boundary entry at that same instant
+/// (same `sample_ts`, `glyph: None` vs `Some(_)`, since a closing
+/// transition emits at most one of each) commit in its own right once
+/// evidence resolves it.
+///
+/// [Task 8 fix, review round 6, Codex on PR #161]: the seal key is
+/// `(sample_ts, is_char)` -- whether the entry is a character at all,
+/// NOT the specific glyph -- because a retained older anchor re-deriving
+/// an already-committed gap under a different node/speed hypothesis can
+/// disagree with the winning hypothesis on WHICH character it is while
+/// agreeing on WHEN and THAT it's a character. Sealing on the exact
+/// `(sample_ts, glyph)` pair (the original design) only strips a
+/// re-derivation that happens to name the same glyph already committed;
+/// once the winning hypothesis's token falls outside its valid
+/// silence-duration window and stops being re-derived, a runner-up
+/// lineage's disagreeing glyph at that same `sample_ts` was never in
+/// `sealed` at all and could surface as a second, contradictory
+/// `CharDecoded` for an instant already resolved -- the validator then
+/// appends both characters into corrupted spot text. At most one
+/// character and one word-boundary decision can ever be correct for a
+/// given `sample_ts` (a closing transition emits at most one of each),
+/// so sealing by kind rather than by value is exactly as permissive as
+/// the real invariant requires.
 ///
 /// [Task 8 fix, review round 2]: the strip runs at the *top of every loop
 /// iteration*, not just once on entry. Committing one entry can reveal a
@@ -104,7 +135,7 @@ pub fn commit(
     tokens: &mut Vec<Token>,
     now_hop: u64,
     cfg: &HsmmConfig,
-    sealed: &mut Vec<(u64, Option<Glyph>)>,
+    sealed: &mut Vec<(u64, bool)>,
 ) -> Vec<Committed> {
     let mut out = Vec::new();
     loop {
@@ -112,7 +143,7 @@ pub fn commit(
             while t
                 .hist
                 .first()
-                .is_some_and(|e| sealed.contains(&(e.sample_ts, e.glyph)))
+                .is_some_and(|e| sealed.contains(&(e.sample_ts, e.glyph.is_some())))
             {
                 t.hist.remove(0);
             }
@@ -144,7 +175,7 @@ pub fn commit(
         for t in tokens.iter_mut() {
             t.hist.remove(0);
         }
-        sealed.push((head.sample_ts, head.glyph));
+        sealed.push((head.sample_ts, head.glyph.is_some()));
     }
     out
 }
