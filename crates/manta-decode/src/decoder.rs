@@ -433,10 +433,21 @@ impl TrackDecoder {
                 }
             }
             Engine::Hsmm => {
-                for ev in self.evidence.flush() {
+                // Codex review, PR #161 round 4: drain one hop at a time
+                // (`flush_one`, not the eager `flush()`) and re-apply
+                // `best_u()` -> `set_u_ref()` after each, exactly matching
+                // `push_hop_hsmm`'s live-path feedback loop -- see
+                // `Evidence::flush_one`'s doc comment for why the eager
+                // batch drain let the tail run against a stale hold
+                // window instead of adapting to a genuine late speed
+                // change.
+                while let Some(ev) = self.evidence.flush_one() {
                     self.snr_from_evidence(&ev);
                     for c in self.hsmm.push(&ev) {
                         self.emit_committed(c, &mut events);
+                    }
+                    if let Some(u) = self.hsmm.best_u() {
+                        self.evidence.set_u_ref(u);
                     }
                 }
                 for c in self.hsmm.finish() {

@@ -140,6 +140,37 @@ impl Evidence {
         Some(ev)
     }
 
+    /// Drain and emit exactly the next flushed hop, or `None` once the
+    /// delay line is exhausted.
+    ///
+    /// Codex review, PR #161 round 4: unlike `flush()` (which eagerly
+    /// materializes the WHOLE remaining tail in one call), this lets a
+    /// caller apply the live path's per-hop feedback -- `HsmmDecoder`'s
+    /// `best_u()` -> `Evidence::set_u_ref()` loop that `push_hop_hsmm`
+    /// runs after every single hop -- between successive flushed hops
+    /// too. `decoder::finish()`'s old `Engine::Hsmm` branch called the
+    /// eager `flush()` up front and only afterward looped over the
+    /// already-computed results, so that feedback never ran during the
+    /// tail: every flushed hop was centered/gated using whichever `h`
+    /// (hold-window width) was in effect from the last LIVE hop, even if
+    /// the true speed changes right at end-of-recording -- often still
+    /// the initial ~15-hop seed unit for a short input that never got far
+    /// enough into `push_hop_hsmm` to adapt. That stale window could
+    /// alter or lose the final characters.
+    pub fn flush_one(&mut self) -> Option<HopEvidence> {
+        let front_global = self.hop_in - self.line.len() as u64;
+        if self.next_center_g < front_global {
+            self.next_center_g = front_global;
+        }
+        let local = (self.next_center_g - front_global) as usize;
+        if local >= self.line.len() {
+            return None;
+        }
+        let ev = self.emit(local);
+        self.next_center_g += 1;
+        Some(ev)
+    }
+
     pub fn flush(&mut self) -> Vec<HopEvidence> {
         // SDD execution 2026-09-09, Task 8a: `next_center_g` is a global,
         // `h`-independent counter, so draining here needs no special-casing
@@ -147,17 +178,8 @@ impl Evidence {
         // replaced) -- just keep emitting the next global center until the
         // buffer is exhausted.
         let mut out = Vec::new();
-        loop {
-            let front_global = self.hop_in - self.line.len() as u64;
-            if self.next_center_g < front_global {
-                self.next_center_g = front_global;
-            }
-            let local = (self.next_center_g - front_global) as usize;
-            if local >= self.line.len() {
-                break;
-            }
-            out.push(self.emit(local));
-            self.next_center_g += 1;
+        while let Some(ev) = self.flush_one() {
+            out.push(ev);
         }
         out
     }

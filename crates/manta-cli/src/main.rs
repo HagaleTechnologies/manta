@@ -1003,6 +1003,58 @@ fn load_decode_config_file(
             path.display()
         );
     }
+    // Codex review, PR #161 round 5: `sigma_u = 0` puts a hop exactly on
+    // the normalized half-amplitude decision surface at `0 / 0`, making
+    // the LLR (and every downstream accumulated prefix) permanently NaN;
+    // a non-finite value corrupts every present hop the same way. Both
+    // edge-legacy and hsmm then silently stop decoding or propagate NaN
+    // scores.
+    if !cfg.evidence.sigma_u.is_finite() || cfg.evidence.sigma_u <= 0.0 {
+        bail!(
+            "[decode] sigma_u must be finite and positive in {} (got {}; 0 or non-finite makes \
+             every present hop's LLR permanently NaN)",
+            path.display(),
+            cfg.evidence.sigma_u
+        );
+    }
+    // Codex review, PR #161 round 5: an empty `seed_units_hops` list
+    // deserializes and passes every check above, but every keying onset
+    // then seeds zero tokens -- candidate generation stays empty forever
+    // and the command silently emits no decoded text or spots. Require at
+    // least one seed unit, and that every seed is itself finite and
+    // positive (a bad seed is exactly as silently broken as an empty
+    // list, just one hypothesis worth instead of all of them).
+    if cfg.hsmm.seed_units_hops.is_empty() {
+        bail!(
+            "[decode] seed_units_hops must have at least one entry in {} (an empty list seeds \
+             zero tokens at every keying onset, silently emitting no decoded text)",
+            path.display()
+        );
+    }
+    if let Some(bad) = cfg
+        .hsmm
+        .seed_units_hops
+        .iter()
+        .find(|u| !u.is_finite() || **u <= 0.0)
+    {
+        bail!(
+            "[decode] every seed_units_hops entry must be finite and positive in {} (got {bad})",
+            path.display()
+        );
+    }
+    // Codex review, PR #161 round 5: `conf_kappa = 0` makes the common
+    // no-competing-hypothesis path (s_alt == best.score) compute `0 / 0`
+    // in `margin`'s confidence sigmoid, emitting a NaN character/word-
+    // boundary confidence that then contaminates every downstream spot-
+    // confidence calculation and JSON report.
+    if !cfg.hsmm.conf_kappa.is_finite() || cfg.hsmm.conf_kappa <= 0.0 {
+        bail!(
+            "[decode] conf_kappa must be finite and strictly positive in {} (got {}; 0 makes the \
+             no-competing-hypothesis confidence path compute 0/0)",
+            path.display(),
+            cfg.hsmm.conf_kappa
+        );
+    }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
     // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
     // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
@@ -2218,6 +2270,36 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_zero_hsmm_beam() {
         let f = write_temp_file(b"[decode]\nbeam = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_sigma_u() {
+        let f = write_temp_file(b"[decode]\nsigma_u = 0\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_nan_sigma_u() {
+        let f = write_temp_file(b"[decode]\nsigma_u = nan\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_empty_seed_units_hops() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = []\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_nonpositive_seed_unit() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = [9.0, 0.0, 18.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_zero_conf_kappa() {
+        let f = write_temp_file(b"[decode]\nconf_kappa = 0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
