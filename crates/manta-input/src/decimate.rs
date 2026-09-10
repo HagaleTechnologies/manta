@@ -26,8 +26,13 @@ pub struct DecimatingSource {
 
 impl DecimatingSource {
     /// Wrap `inner` (reporting `inner.sample_rate()`, Hz) with a decimator
-    /// targeting `target_rate_hz`. Errors (non-power-of-two factor,
-    /// non-table target rate) match `Decimator::new`'s.
+    /// targeting `target_rate_hz`. This wrapper's own pre-check raises a
+    /// distinct error message when `target_rate_hz` doesn't evenly divide
+    /// `inner.sample_rate()` by a power of two (a factor that isn't even an
+    /// integer never reaches `Decimator::new` at all); a target rate that
+    /// *does* divide evenly but still fails the channelizer's table
+    /// constraint (or the minimum-channel-count floor) surfaces
+    /// `Decimator::new`'s own error unchanged.
     pub fn new(inner: Box<dyn IqSource>, target_rate_hz: f64) -> Result<Self> {
         let fs_in = inner.sample_rate();
         let factor = (fs_in / target_rate_hz).round() as usize;
@@ -188,6 +193,49 @@ mod tests {
             (total as i64 - expected as i64).unsigned_abs() < 200,
             "total {total}, expected ~{expected}"
         );
+    }
+
+    #[test]
+    fn read_output_is_bit_identical_to_processing_the_whole_input_at_once() {
+        // Only asserting a sample COUNT (as
+        // read_yields_roughly_input_len_over_factor_samples_then_eof does
+        // above) doesn't prove the `pending`-buffer draining logic in
+        // read() never drops, duplicates, or reorders a sample. Use a
+        // caller buffer size (137) that does NOT evenly divide the
+        // decimation factor (4), so buffer boundaries never align with
+        // factor boundaries, then compare against calling
+        // `Decimator::process` directly on the whole input.
+        let fs_in = 192_000.0;
+        let n_in = 40_000;
+        let samples = tone(2_000.0, n_in, fs_in);
+
+        let inner: Box<dyn IqSource> = Box::new(InMemorySource {
+            samples: samples.clone(),
+            cursor: 0,
+            fs: fs_in,
+            center_freq_hz: 0.0,
+            live: None,
+            counters: None,
+        });
+        let mut src = DecimatingSource::new(inner, 48_000.0).unwrap(); // factor 4
+        let mut via_read: Vec<Complex32> = Vec::new();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 137];
+        loop {
+            let n = src.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            via_read.extend_from_slice(&buf[..n]);
+        }
+
+        let mut direct = manta_dsp::decimate::Decimator::new(fs_in, 4).unwrap();
+        let via_direct = direct.process(&samples);
+
+        assert_eq!(via_read.len(), via_direct.len());
+        for (a, b) in via_read.iter().zip(via_direct.iter()) {
+            assert_eq!(a.re.to_bits(), b.re.to_bits());
+            assert_eq!(a.im.to_bits(), b.im.to_bits());
+        }
     }
 
     #[test]
