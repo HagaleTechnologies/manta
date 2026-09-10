@@ -334,14 +334,21 @@ pub(crate) struct Track {
     /// The track's leased decoder, allocated on CANDIDATE -> ACTIVE
     /// promotion (SPEC §2.4/§5); `None` before promotion.
     decoder: Option<TrackDecoder>,
-    /// `(amplitude, raw_power, sample_ts)` queued this hop-batch by
-    /// `step_hop`, drained once per `process_hops` call by `drain_pool`
-    /// (ARCHITECTURE §10's decoder pool). `raw_power` is kept separate
-    /// from `amplitude` (rather than derived as `amplitude * amplitude`)
-    /// so the noise tracker always sees the tracked channel's real,
-    /// full-bandwidth power even when `amplitude` is a narrowband-refined
-    /// value (Codex review, PR #178) -- see `decoder_input`'s doc comment.
-    pending: Vec<(f32, f32, u64)>,
+    /// `(amplitude, raw_power, spectral_ref_power, sample_ts)` queued this
+    /// hop-batch by `step_hop`, drained once per `process_hops` call by
+    /// `drain_pool` (ARCHITECTURE §10's decoder pool). `raw_power` is kept
+    /// separate from `amplitude` (rather than derived as `amplitude *
+    /// amplitude`) so the noise tracker always sees the tracked channel's
+    /// real, full-bandwidth power even when `amplitude` is a narrowband-
+    /// refined value (Codex review, PR #178) -- see `decoder_input`'s doc
+    /// comment. `spectral_ref_power` (SPEC v2 §2.2's min-of-six-neighbors
+    /// reference, linear) is computed by `step_hop` from `FloorBank`, not
+    /// `decoder_input` (a `Track` method with no access to the floor bank,
+    /// a `TrackManager` field) -- always `Some` since `FloorBank` has a
+    /// real value for every channel from construction onward (Codex
+    /// review, PR #178: this was hard-coded `None` before, so
+    /// `NoiseTracker`'s spectral-discounting branch never activated).
+    pending: Vec<(f32, f32, Option<f32>, u64)>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -534,7 +541,9 @@ impl Track {
         let pending = std::mem::take(&mut self.pending);
         let mut events: Vec<DecoderEvent> = pending
             .into_iter()
-            .flat_map(|(amp, raw_power, ts)| decoder.push_hop(amp, raw_power, None, ts))
+            .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
+            })
             .collect();
         events.extend(decoder.finish());
         events
@@ -558,7 +567,9 @@ impl Track {
         let pending = std::mem::take(&mut self.pending);
         let mut events: Vec<DecoderEvent> = pending
             .into_iter()
-            .flat_map(|(amp, raw_power, ts)| decoder.push_hop(amp, raw_power, None, ts))
+            .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
+            })
             .collect();
         events.extend(decoder.finish_speed_only());
         events
@@ -779,6 +790,28 @@ impl TrackManager {
             track.update_centroid(k, &hop.power, n);
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
+            // SPEC v2 §2.2's min-of-six-neighbors spectral reference,
+            // converted from dB to linear power (the unit
+            // `NoiseTracker::push`'s `spectral_ref_power` expects) --
+            // `FloorBank::spectral_reference_db` always has a real value
+            // for every channel from construction onward, so this is
+            // unconditionally `Some` (Codex review, PR #178: previously
+            // hard-coded `None` at both `decoder_input` push sites below,
+            // so `NoiseTracker`'s spectral-discounting branch never
+            // activated for the v2 engines).
+            //
+            // Centered on the rounded CENTROID channel (matching
+            // `decoder_input`'s own `c = round(c_f)`), NOT `k` (Codex
+            // review, PR #178 round 4): `k` is the instantaneous
+            // max-power channel and can flicker on noise/QRM even while
+            // the true centroid stays put -- the guard band this
+            // reference defines must stay centered on where the track
+            // actually is, not wherever `k` momentarily points. A
+            // populated-neighbor probe measured -50 dB at `k` vs the
+            // correct -90 dB at the centroid when the two differed.
+            let c = track.center.round() as usize;
+            let spectral_ref_power =
+                Some(10f64.powf(self.floor.spectral_reference_db(c) / 10.0) as f32);
             let char_emitted = false; // GC timer input; refined below once a decoder exists.
             let event = track.lifecycle.on_hop(rise[k], drop[k], char_emitted);
             match event {
@@ -801,8 +834,8 @@ impl TrackManager {
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
-                    let input = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
-                    track.pending.push(input);
+                    let (amp, raw_power, ts) = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                    track.pending.push((amp, raw_power, spectral_ref_power, ts));
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
@@ -842,8 +875,9 @@ impl TrackManager {
                         if let Some(decoder) = track.decoder.as_mut() {
                             decoder.set_freq_hz(freq_hz);
                         }
-                        let input = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
-                        track.pending.push(input);
+                        let (amp, raw_power, ts) =
+                            track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                        track.pending.push((amp, raw_power, spectral_ref_power, ts));
                     }
                 }
             }
@@ -1252,7 +1286,9 @@ impl TrackManager {
             .flat_map_iter(|(decoder, pending)| {
                 pending
                     .into_iter()
-                    .flat_map(|(amp, raw_power, ts)| decoder.push_hop(amp, raw_power, None, ts))
+                    .flat_map(|(amp, raw_power, spectral_ref_power, ts)| {
+                        decoder.push_hop(amp, raw_power, spectral_ref_power, ts)
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1783,6 +1819,116 @@ mod tests {
     }
 
     #[test]
+    fn step_hop_populates_spectral_ref_power_instead_of_hard_coded_none() {
+        // Codex review, PR #178: `pending`'s spectral_ref_power was
+        // hard-coded `None` at both `decoder_input` push sites in
+        // `step_hop`, so `NoiseTracker`'s SPEC v2 §2.2 spectral-
+        // discounting branch (`max(N_temp, β·N_spec)`) never activated
+        // for the edge-legacy/hsmm engines -- QRM/clicks weren't
+        // discounted as the spec requires.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _) = *track
+            .pending
+            .last()
+            .expect("the promotion hop itself must have queued a pending entry");
+        assert!(
+            spectral_ref_power.is_some(),
+            "spectral_ref_power must be populated from FloorBank, not hard-coded None"
+        );
+    }
+
+    #[test]
+    fn spectral_ref_power_centers_on_the_centroid_not_the_flickering_owned_channel() {
+        // Codex review, PR #178 round 4: `select_channel` only ever picks
+        // within the track's owned window {c-1, c, c+1} (`c =
+        // round(center)`), so `k` and `c` can differ by at most one
+        // channel -- but SPEC v2 §2.2's spectral reference must stay
+        // centered on `c`, not wherever `k` momentarily points, or a
+        // strong neighbor just inside `k`'s guard band (but outside
+        // `c`'s) spuriously elevates the reference and suppresses valid
+        // evidence. This reproduces Codex's own `FloorBank` probe: with
+        // channels [7,8,9,13,14,15] loud (-50 dB) and everything else at
+        // the -90 dB floor, c=10's neighbor set {6,7,8,12,13,14} still
+        // has two quiet escapes (6, 12) and correctly reads -90 dB;
+        // k=11's neighbor set {7,8,9,13,14,15} is entirely loud and would
+        // (incorrectly) read -50 dB if used instead.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, 64);
+        let mut power = quiet_power(64);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut promoted_id = None;
+        for m in (250 * 15)..(250 * 15 + 60) {
+            let (_, promoted, _) = tm.step_hop(&hop(m, power.clone()), m);
+            if let Some(id) = promoted.iter().find_map(|e| match e {
+                DecoderEvent::TrackPromoted { track_id, .. } => Some(*track_id),
+                _ => None,
+            }) {
+                promoted_id = Some(id);
+                break;
+            }
+        }
+        let id = promoted_id.expect("must promote a track within the loop");
+        {
+            let track = tm.tracks.get_mut(&id).unwrap();
+            track.center = 10.0; // pin exactly at c=10, sidestepping interpolation drift
+        }
+
+        let floor = 1e-9f32; // -90 dB
+        let loud = 1e-9 * 10f32.powf(40.0 / 10.0); // -50 dB
+        let mid = 1e-9 * 10f32.powf(50.0 / 10.0); // -40 dB (channel 10)
+        let strong = 1e-9 * 10f32.powf(60.0 / 10.0); // -30 dB (channel 11, the k-winner)
+        let mut divergent_power = vec![floor; 64];
+        for &ch in &[7usize, 8, 9, 13, 14, 15] {
+            divergent_power[ch] = loud;
+        }
+        divergent_power[10] = mid;
+        divergent_power[11] = strong; // max in owned window {9,10,11} -> k=11
+
+        let m2 = 250 * 15 + 60;
+        tm.step_hop(&hop(m2, divergent_power), m2);
+
+        let track = tm.tracks.get(&id).unwrap();
+        let (_, _, spectral_ref_power, _) = *track
+            .pending
+            .last()
+            .expect("this hop must have queued a pending entry");
+        let ref_db = 10.0 * spectral_ref_power.unwrap().log10();
+        assert!(
+            ref_db < -80.0,
+            "spectral reference must stay centered on the centroid c=10 (correct: ~-90 dB), not \
+             the flickering owned channel k=11 (buggy: ~-50 dB); got {ref_db} dB"
+        );
+    }
+
+    #[test]
     fn adjacent_strong_channel_is_absorbed_not_a_new_track() {
         let mut tm = TrackManager::new(
             64,
@@ -2076,12 +2222,12 @@ mod tests {
             weak.current_snr_db = 8.0;
             weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
             // Queued exactly as `step_hop` would (amplitude, raw_power,
-            // sample_ts) triples in `pending` -- NOT fed through
-            // push_hop yet.
+            // spectral_ref_power, sample_ts) tuples in `pending` -- NOT
+            // fed through push_hop yet.
             weak.pending = rect_envelope_hops("PARIS", 18)
                 .into_iter()
                 .enumerate()
-                .map(|(i, a)| (a, a * a, i as u64))
+                .map(|(i, a)| (a, a * a, None, i as u64))
                 .collect();
             weak.has_emitted = true;
         }
