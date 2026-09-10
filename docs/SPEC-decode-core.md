@@ -652,7 +652,10 @@ freq_correction_ppm = 0.0
 # default) uses the source's native rate unchanged. Must evenly divide
 # the source's native rate by a power of two, and must itself satisfy
 # fs/93.75 being a power of two. manta_dsp::decimate::Decimator,
-# manta_input::DecimatingSource.
+# manta_input::DecimatingSource. CLI-only for now (--capture-rate-hz) --
+# like freq_correction_ppm above, DaemonConfigFile does not yet model
+# this [input] table, so setting this key in a daemon TOML config file
+# has no effect; only the CLI flag reaches maybe_decimate.
 # capture_rate_hz = 48000   # omit entirely to use the source's native rate
 
 [spot]

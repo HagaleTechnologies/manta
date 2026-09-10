@@ -243,7 +243,7 @@ mod tests {
     // here, asserting the classic halfband property (every even-offset tap
     // from the center exactly zero). That property is unique to a design
     // cutoff of exactly `fc_norm = 0.25` (`sinc(k/2) = 0` for even nonzero
-    // `k`); it no longer holds now that `CUTOFF_FRACTION` (0.23) moves the
+    // `k`); it no longer holds now that `CUTOFF_FRACTION` (0.235) moves the
     // cutoff off `0.25` by design, to reserve a transition-band margin
     // (see `CUTOFF_FRACTION`'s doc comment). Deleted rather than reworded
     // to "merely small": at the new cutoff there's no particular reason
@@ -306,7 +306,7 @@ mod tests {
     fn halfband_passband_is_flat_near_dc() {
         let fs = 192_000.0;
         let h = design_halfband(HALFBAND_TAPS);
-        // Well inside the new (0.23 * fs = 44.16 kHz) cutoff; DC-normalized
+        // Well inside the new (0.235 * fs = 45.12 kHz) cutoff; DC-normalized
         // gain should sit close to 0 dB.
         let gain_db = response_db(&h, 5_000.0, fs);
         assert!(gain_db.abs() < 0.5, "passband gain {gain_db} dB");
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn halfband_passband_is_flat_near_new_cutoff_edge() {
         // Confirms the passband stays flat well inside the new, slightly
-        // narrower cutoff (CUTOFF_FRACTION * fs = 44.16 kHz at 192 kHz),
+        // narrower cutoff (CUTOFF_FRACTION * fs = 45.12 kHz at 192 kHz),
         // not just far below it near DC.
         let fs = 192_000.0;
         let h = design_halfband(HALFBAND_TAPS);
