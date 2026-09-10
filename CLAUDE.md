@@ -20,7 +20,9 @@ is still open**: Pi4 CPU-budget leg (also paused pending MAN-100 through
 MAN-113 landing in full, not just MAN-107-113 above — D6) and 24 h
 live-SDR soak are unmet — both need physical hardware not
 reachable from this environment.
-`manta-dsp::single`/`freqest` deprecated in place.
+`manta-dsp::single`/`freqest` deprecated in place. Variable-width capture
+(issue #169, `--capture-rate-hz`) implemented -- see
+docs/superpowers/specs/2026-09-09-variable-width-capture-design.md.
 
 ## Documents (read in this order)
 
@@ -100,7 +102,6 @@ in other clones, branches, or worktrees.
   --squash` right after opening; GitHub merges it unattended once required
   CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green. See
   docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md.
-
 
 ## Code review convergence
 

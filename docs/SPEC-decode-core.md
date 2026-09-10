@@ -106,6 +106,17 @@ With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
 error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
 oscillator, which is out of scope (config `input.freq_correction_ppm` exists).
 
+### 1.5 Decimation (variable-width capture, issue #169)
+
+An optional stage between the `IqSource` and the channelizer: a cascade
+of `log2(factor)` Kaiser-windowed halfband FIR decimate-by-2 stages,
+`factor` restricted to powers of two. Each stage's ideal cutoff sits at
+its own input Nyquist/2 (the output Nyquist after that stage's
+decimate-by-2), Kaiser-windowed at the same beta/stopband target as the
+channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated rate
+must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
+Module: `manta-dsp::decimate`.
+
 ---
 
 ## 2. Noise floor & signal-presence detection
@@ -537,10 +548,14 @@ in the fixture manifest. Text payload (unless stated):
 | V8w | pileup-50-fading | same scene as V8 | Watterson CCIR-poor, jitter 8 % | ≥ 90 % of signals with mean SNR ≥ +6 dB decoded with CER < 10 %; 0 bogus callsigns; 0 cross-channel ghost decodes |
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
+| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz (same pass criteria as V1) |
 
 M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate M2
 (multi-track engine). The RBN-parity corpus benchmark remains the M3 gate
-(ARCHITECTURE §9) and is not redefined here.
+(ARCHITECTURE §9) and is not redefined here. V31 gates variable-width capture
+(issue #169); unlike V1–V10 it is a standalone test in
+`crates/manta-cli/tests/golden_decimated_capture.rs`, not part of the
+`manta-testkit::vectors` V1–V10 fixture table.
 
 ### 7.1 `manta-spot` validator vectors (M3 sub-project 1)
 
@@ -613,6 +628,12 @@ cluster_alpha = 0.15
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]
 # (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29.
 freq_correction_ppm = 0.0
+# Target post-decimation capture rate, Hz (issue #169). None (the
+# default) uses the source's native rate unchanged. Must evenly divide
+# the source's native rate by a power of two, and must itself satisfy
+# fs/93.75 being a power of two. manta_dsp::decimate::Decimator,
+# manta_input::DecimatingSource.
+capture_rate_hz = none
 
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty

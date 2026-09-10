@@ -125,6 +125,20 @@ band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
 near 100 Hz regardless of input rate (§4). Multi-band via multiple daemon
 instances, not one instance retuning — simpler, and SDRs are cheap.
 
+**Variable-width capture** (issue #169): an optional decimation stage
+(`manta-dsp::decimate::Decimator`, wrapped as `manta-input::
+DecimatingSource`) sits between a live `IqSource` and the channelizer.
+Operators select a narrower effective capture rate via
+`--capture-rate-hz`; the SDR still opens at its best native rate, and a
+cascade of Kaiser-windowed halfband FIR decimate-by-2 stages narrows it
+down before the channelizer ever sees it. Only exact power-of-two
+factors are supported (no general resampling), and the resulting rate
+must itself satisfy the channelizer's `fs/93.75` table constraint.
+Motivated by field evidence (docs/DECISIONS/2026-09-09-soapy-gain-is-
+inverted-attenuation-scale.md, docs/DECISIONS/2026-09-09-20m-dial-shift-
+edge-artifact-confirmed.md) that a narrower capture bandwidth can
+improve real-signal detection on some hardware.
+
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
 This ring-overrun counting is still aspirational (`manta-engine::soak`'s module
