@@ -63,15 +63,16 @@ fn clean_signal_decodes_correctly_after_192khz_to_48khz_decimation() {
     // and native 192 kHz gives 15.697 Hz error -- both close to this
     // decimated-path's 17.396 Hz *with zero decimator involvement*. So the
     // gap versus V1's 96 kHz-tuned 10 Hz bound is a channel-table-size-
-    // dependent property of the frequency estimator itself (same root
-    // cause class as the AWGN-vs-fine-frequency-interpolator effect
-    // documented in docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md
-    // pin 9, which widened this exact bound to 25 Hz for the same reason
-    // before the EMA-based estimator later reclaimed 10 Hz at 96 kHz only),
-    // not a decimator artifact and not a decode regression -- CER above is
-    // 0.0155, identical to V1's own measured floor. 25 Hz reuses that
-    // already-vetted bound rather than inventing a new one, with real
-    // margin over the measured 17.396 Hz.
+    // dependent property of the frequency estimator itself -- a different
+    // mechanism than the one documented in
+    // docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md pin 9 (AWGN
+    // corrupting the interpolator's weak neighbor bin at high-offset hops,
+    // a placeholder-detector-era limitation), not a decimator artifact and
+    // not a decode regression -- CER above is 0.0155, identical to V1's own
+    // measured floor. The 25 Hz *magnitude* reuses pin 9's precedent as a
+    // previously-accepted round number, not because pin 9 covers this same
+    // failure mode -- it doesn't -- with real margin over the measured
+    // 17.396 Hz.
     let freq = report["freq_hz"].as_f64().unwrap();
     assert!(
         (freq - rendered.expected_freq_hz).abs() <= 25.0,

@@ -126,8 +126,9 @@ near 100 Hz regardless of input rate (§4). Multi-band via multiple daemon
 instances, not one instance retuning — simpler, and SDRs are cheap.
 
 **Variable-width capture** (issue #169): an optional decimation stage
-(`manta-dsp::decimate::Decimator`, wrapped as `manta-input::
-DecimatingSource`) sits between a live `IqSource` and the channelizer.
+(`manta-dsp::decimate::Decimator`, wrapped as
+`manta-input::DecimatingSource`) sits between a live `IqSource` and the
+channelizer.
 Operators select a narrower effective capture rate via
 `--capture-rate-hz`; the SDR still opens at its best native rate, and a
 cascade of Kaiser-windowed halfband FIR decimate-by-2 stages narrows it

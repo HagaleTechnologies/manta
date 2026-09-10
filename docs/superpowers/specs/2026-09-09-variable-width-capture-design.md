@@ -1,10 +1,10 @@
 # Variable-width capture (decimated channelizer input): Design
 
-Design for issue #169, motivated by tonight's live-hardware investigation
-(`docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`,
-`docs/DECISIONS/2026-09-09-20m-dial-shift-edge-artifact-confirmed.md`): a
-narrower 96 kHz capture produced the first plausible real CW catch of the
-night, at half manta's usual 192 kHz passband. Today the channelizer's
+Design for issue #169, motivated by live-hardware field evidence
+(2026-09-09) that a narrower capture bandwidth can improve real-signal
+detection on some hardware: a narrower 96 kHz capture produced the first
+plausible real CW catch of the night, at half manta's usual 192 kHz
+passband. Today the channelizer's
 input rate is whatever the SDR natively reports — there is no decimation
 stage between source and channelizer, so the only usable capture
 bandwidths are whichever of the hardware's native rates happen to satisfy
@@ -40,11 +40,17 @@ Out of scope (explicitly deferred):
   one channelizer feeds exactly one `TrackManager`, same shape as today.
   Real orchestration/output-routing work for concurrent pipelines is a
   follow-up issue if ever wanted.
-- `AudioIqSource`: already fixed at 48 kHz (`TARGET_RATE_HZ`), no
-  decimation applicable or needed. Its dormant `coppa-audio` resampler gap
-  (no `rubato` dep, no `mod resampler;`) is unrelated — that's an
-  *upsampling-from-arbitrary-device-rates* problem, not this ticket's
-  *downsampling-a-power-of-two-multiple* problem, and stays out of scope.
+- Special-casing `AudioIqSource` out of the CLI wiring. The wrap point is a
+  single generic one applied uniformly to whatever `open_source` returns
+  (kiwi/soapy/hpsdr/audio/file replay alike), not a per-source-type
+  decision — simpler than excluding `AudioIqSource` specially, and a no-op
+  whenever `--capture-rate-hz` is omitted or already matches the source's
+  native rate. `AudioIqSource` itself is fixed at 48 kHz (`TARGET_RATE_HZ`),
+  so decimating it is rarely useful in practice, but nothing in the wiring
+  excludes it. Its dormant `coppa-audio` resampler gap (no `rubato` dep, no
+  `mod resampler;`) is unrelated — that's an *upsampling-from-arbitrary-
+  device-rates* problem, not this ticket's *downsampling-a-power-of-two-
+  multiple* problem, and stays out of scope.
 - General arbitrary-ratio resampling. Every realistic target rate here
   (192k, 96k, 48k, 24k...) is an exact power-of-two divisor of a
   power-of-two-table-compatible source rate, so only exact-ratio halfband

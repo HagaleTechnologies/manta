@@ -105,6 +105,9 @@ Per hop, for a track with peak channel `k₀`:
 With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
 error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
 oscillator, which is out of scope (config `input.freq_correction_ppm` exists).
+This ≪ 10 Hz claim is empirically channel-table-size (N) dependent: it was
+measured at N = 1024 (the 96 kHz table V1 uses); V31's 48 kHz/N = 512 table
+measures ~17 Hz instead (see the V31 row below; tracked in issue #177).
 
 ### 1.5 Decimation (variable-width capture, issue #169)
 
@@ -116,6 +119,15 @@ decimate-by-2), Kaiser-windowed at the same beta/stopband target as the
 channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated rate
 must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
 Module: `manta-dsp::decimate`.
+
+A halfband filter has every other tap forced to zero by construction
+(except the center tap), which in principle halves the multiply-accumulate
+cost per output sample. The current implementation does not exploit this:
+`HalfbandStage::process` iterates all taps unconditionally, including the
+structurally-zero ones, so the 2x MAC saving is not yet realized. This is a
+known, deliberate gap for now (tracked in issue #176), not an oversight,
+and there is likewise no criterion bench yet measuring this stage's cost
+against the repo's Pi4 CPU budget.
 
 ---
 
@@ -548,7 +560,15 @@ in the fixture manifest. Text payload (unless stated):
 | V8w | pileup-50-fading | same scene as V8 | Watterson CCIR-poor, jitter 8 % | ≥ 90 % of signals with mean SNR ≥ +6 dB decoded with CER < 10 %; 0 bogus callsigns; 0 cross-channel ghost decodes |
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
-| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz (same pass criteria as V1) |
+| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 25 Hz |
+
+V31's freq-error bound (25 Hz) differs from V1's (10 Hz) because the fine-
+frequency estimator's error is channel-table-size dependent, not a
+`Decimator` regression: measured ~17.4 Hz at the decimated path's N = 512
+table size vs. V1's N = 1024 (96 kHz) table. Confirmed by two no-decimator
+control renders of the same scene -- native 48 kHz and native 192 kHz both
+independently measure a similar ~15-17 Hz error with zero decimator
+involvement (see `crates/manta-cli/tests/golden_decimated_capture.rs`).
 
 M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate M2
 (multi-track engine). The RBN-parity corpus benchmark remains the M3 gate
@@ -633,7 +653,7 @@ freq_correction_ppm = 0.0
 # the source's native rate by a power of two, and must itself satisfy
 # fs/93.75 being a power of two. manta_dsp::decimate::Decimator,
 # manta_input::DecimatingSource.
-capture_rate_hz = none
+# capture_rate_hz = 48000   # omit entirely to use the source's native rate
 
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
