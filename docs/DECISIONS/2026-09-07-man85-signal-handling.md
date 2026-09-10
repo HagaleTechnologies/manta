@@ -60,17 +60,21 @@ and leave SIGHUP alone.
 
 ## Related, deliberately not changed here
 
-- **`SHUTDOWN_DRAIN_DEADLINE`'s shape.** MAN-45 records that one flat 25 s
-  budget covering `await_all`'s entire task registry cannot bound an
-  unbounded number of individually-compliant per-client backlogs. That is a
-  pre-existing property of the SIGINT path; MAN-85 only makes SIGTERM reach
-  it.
+- **`SHUTDOWN_DRAIN_DEADLINE`'s shape.** MAN-45 records that one flat
+  registry-wide budget -- 50 s as MAN-45 left it, sized to outlive
+  `2 * telnet::WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE` = 40 s -- covering
+  `await_all`'s entire task registry cannot bound an unbounded number of
+  individually-compliant per-client backlogs. That is a pre-existing
+  property of the SIGINT path; MAN-85 only makes SIGTERM reach it.
 - **`Command::Soak`.** It registers no signal handler at all and stops on
   its own `duration` watchdog (`crates/manta-engine/src/soak.rs`). A soak
   run still cannot be interrupted by any signal.
-- **`README.md`'s `docker stop -t 30` guidance.** It is about the drain's
+- **`README.md`'s `docker stop -t 60` guidance.** It is about the drain's
   *duration* exceeding Docker's 10 s default grace period, not about which
-  signal triggers it, and stays correct.
+  signal triggers it, and stays correct. The 60 s figure is the caller-side
+  grace period MAN-45's review round 19 settled on so it stays above the
+  50 s `SHUTDOWN_DRAIN_DEADLINE`; the `Dockerfile` comment carries the same
+  pair. Both must move together if that deadline ever grows again.
 
 ## Migration note: MAN-75 packaging artifacts become redundant, not wrong
 
