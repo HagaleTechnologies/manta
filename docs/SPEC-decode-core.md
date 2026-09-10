@@ -620,6 +620,20 @@ freq_correction_ppm = 0.0
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 allowlist = []
+
+[server]
+# Which telnet wire layout the INBOUND cluster server emits (MAN-88).
+# "rbn" (default) is the RBN relay's fixed-column AK1A layout -- frequency
+# to 0.01 kHz ending at column 24, a 15-wide callsign column starting at
+# column 27, the 6-wide mode column at 42, and the time at column 71 (§1.4,
+# docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md). "skimmer" selects
+# the CW-Skimmer-native layout, which is the same geometry with the mode
+# column deleted (time at column 67), for operators running manta behind
+# W3OA's Aggregator. Any other value is rejected at startup.
+#
+# Scoped to the inbound listener only: `[[rbn_uplink]]` has no
+# `line_format` key and always emits the "rbn" layout (MAN-88 Decision 1).
+line_format = "rbn"
 ```
 
 ## 10. Deviations from ARCHITECTURE.md
