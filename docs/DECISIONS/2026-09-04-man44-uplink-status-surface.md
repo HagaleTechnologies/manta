@@ -89,11 +89,16 @@ labels already expose.
   `metrics.rs` is reused directly as the per-target shape rather than a
   second, parallel struct, so there is exactly one Rust definition of the
   wire shape) and `render_human` (the one-screen text `manta status`
-  prints). `active_tracks` is `Option<u64>`, hardcoded `None` in
-  `StatusDoc::from_metrics` — `Metrics::set_active_tracks` has no
-  production call site (ARCHITECTURE §8's existing "served but not
-  populated" caution), and wrapping the getter's always-real `0` here
-  would repeat that exact mistake instead of avoiding it. Never includes
+  prints). `active_tracks` is `Option<u64>`, filled from
+  `Metrics::active_tracks()` — MAN-45 (ARCHITECTURE §8, corrected
+  2026-09-04) gave `set_active_tracks` a real production call site (the
+  daemon's 250 ms `ACTIVE_TRACKS_POLL_INTERVAL` poller), so this is a live
+  count, not the frozen `0` the old "served but not populated" caution
+  warned about. It was briefly hardcoded `None` here on that stale
+  reading, which made `/status` and `manta status` report `null`/"n/a"
+  while `/metrics` reported the real number (MAN-44 review CR-B); the
+  `Option` survives only so a daemon that sends no count at all renders
+  "n/a" instead of a fabricated `0`. Never includes
   `login_callsign`: knowing *which* target is broken is the point;
   which callsign it logs in as isn't, and the type it's built from
   (`UplinkTargetSnapshot`) has no such field to leak even by accident.

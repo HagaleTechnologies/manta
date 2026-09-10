@@ -27,14 +27,20 @@ pub struct StatusDoc {
     pub telnet_clients: i64,
     pub json_clients: i64,
     pub ws_clients: i64,
-    /// `None` while `Metrics::set_active_tracks` has no production call
-    /// site (ARCHITECTURE.md's "served but never populated" caution) --
-    /// serialized as `null` and rendered "n/a" rather than a misleading
-    /// live-looking `0`. Deliberately NOT `Some(metrics.active_tracks())`:
-    /// that getter genuinely exists and always returns a number, but
-    /// wrapping it here would repeat exactly the mistake this field's
-    /// `Option` exists to prevent, since nothing in production ever calls
-    /// `set_active_tracks` today.
+    /// The live decoder-track count, from the same gauge `/metrics`
+    /// publishes as `manta_active_tracks`. `Some` for any daemon that
+    /// builds this document: MAN-45 (ARCHITECTURE.md §8, corrected
+    /// 2026-09-04) gave `Metrics::set_active_tracks` a real production
+    /// call site -- `manta-cli`'s server runtime polls
+    /// `manta_engine::listen_with_observers`'s shared handle into
+    /// `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms) -- so this
+    /// is a live number, not the frozen `0` the earlier "served but never
+    /// populated" caution warned about (MAN-44 review CR-B).
+    ///
+    /// Stays `Option` for the schema contract, not because the daemon
+    /// still withholds it: an older daemon (or a future one that drops
+    /// the field) serializes `null`, and `render_human` prints "n/a"
+    /// rather than a fabricated `0`.
     pub active_tracks: Option<u64>,
     pub uplink: UplinkStatus,
 }
@@ -89,7 +95,12 @@ impl StatusDoc {
             telnet_clients: metrics.telnet_clients(),
             json_clients: metrics.json_clients(),
             ws_clients: metrics.ws_clients(),
-            active_tracks: None,
+            // MAN-44 review CR-B: the live gauge, not a hardcoded `None`.
+            // `manta-cli`'s poller (`ACTIVE_TRACKS_POLL_INTERVAL`, 250ms)
+            // has fed `set_active_tracks` since MAN-45, so discarding it
+            // here made `/status` and every `manta status` report
+            // `null`/"n/a" while `/metrics` reported the real count.
+            active_tracks: Some(metrics.active_tracks()),
             uplink: UplinkStatus {
                 health,
                 connected_targets,
@@ -144,9 +155,9 @@ pub fn render_human(doc: &StatusDoc) -> String {
         doc.telnet_clients,
         doc.json_clients + doc.ws_clients
     ));
-    // ARCHITECTURE.md's own caution: `active_tracks` has no production
-    // call site yet, so it is labeled rather than shown as a
-    // misleadingly-live-looking 0.
+    // A daemon that reports no `active_tracks` at all (an older one, or a
+    // future one that drops the field) is shown as "n/a" rather than a
+    // fabricated 0 -- a live daemon always sends the real count.
     out.push_str(&format!(
         "  active tracks  {}\n\n",
         match doc.active_tracks {
@@ -247,13 +258,25 @@ mod tests {
     }
 
     #[test]
-    fn human_render_marks_known_placeholder_fields_so_they_are_not_read_as_live() {
-        // ARCHITECTURE.md -- active_tracks is frozen at 0 in production
-        // (no real call site). Surfacing it unlabeled in a health view
-        // would repeat exactly the mistake that caution exists to
-        // prevent.
-        let out = render_human(&StatusDoc::from_metrics(&metrics_fixture()));
-        assert!(out.contains("active tracks  n/a"));
+    fn active_tracks_reports_the_live_gauge_rather_than_a_null_placeholder() {
+        // MAN-44 review CR-B: `manta-cli`'s poller feeds
+        // `set_active_tracks` every 250ms (MAN-45), so `/status` and
+        // `manta status` must show that count -- they used to hardcode
+        // `None` and report "n/a" while `/metrics` reported the truth.
+        let m = metrics_fixture();
+        m.set_active_tracks(12);
+        let doc = StatusDoc::from_metrics(&m);
+        assert_eq!(doc.active_tracks, Some(12));
+        assert!(render_human(&doc).contains("active tracks  12"));
+    }
+
+    #[test]
+    fn a_status_doc_without_active_tracks_renders_n_a_rather_than_a_fabricated_zero() {
+        // The field stays `Option` for the schema contract: a daemon that
+        // sends no count at all must not be rendered as "0 tracks".
+        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
+        doc.active_tracks = None;
+        assert!(render_human(&doc).contains("active tracks  n/a"));
     }
 
     #[test]

@@ -1371,16 +1371,18 @@ fn format_addrs(addrs: &[std::net::SocketAddr]) -> String {
 /// (CR-A).
 ///
 /// `resolve_status_addr` runs INSIDE the tokio runtime, on the blocking
-/// pool, under its own `timeout_secs`-bounded `tokio::time::timeout`
-/// (MAN-44 code review CR-2): the previous version called it before the
-/// runtime -- and therefore before any timer -- existed, so `--timeout-secs`
-/// bounded connect+read but not the blocking `ToSocketAddrs` lookup a
-/// hostname `--addr` or `bind_addr` triggers. An unreachable or slow
-/// resolver then blocked for the OS's own `resolv.conf` budget (commonly
-/// 10-40s) regardless of what the operator asked for. Same precedent as
-/// `uplink::connect_any_resolved_address`'s own bounded `lookup_host`: DNS
-/// resolution gets its own timeout window, separate from (and prior to)
-/// the connect/fetch window `fetch_status` itself already bounds.
+/// pool (MAN-44 code review CR-2): the previous version called it before
+/// the runtime -- and therefore before any timer -- existed, so
+/// `--timeout-secs` bounded connect+read but not the blocking
+/// `ToSocketAddrs` lookup a hostname `--addr` or `bind_addr` triggers. An
+/// unreachable or slow resolver then blocked for the OS's own
+/// `resolv.conf` budget (commonly 10-40s) regardless of what the operator
+/// asked for.
+///
+/// Resolution and the fetch share ONE end-to-end deadline rather than a
+/// timeout window each (see `deadline`/`remaining` in the body): giving
+/// each leg its own full `timeout` would let `--timeout-secs 5` take
+/// nearly ten seconds, twice the give-up bound the flag advertises.
 fn run_status(
     server_config: Option<&std::path::Path>,
     addr: Option<&str>,
