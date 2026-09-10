@@ -22,6 +22,69 @@ use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
 use std::path::Path;
 
+/// Packet-level health counters for an input source that can lose or
+/// discard whole packets on the wire (MAN-56, following MAN-22's
+/// malformed-packet counting).
+///
+/// Defined at the crate root, deliberately NOT inside the
+/// `#[cfg(feature = "hpsdr")]` `hpsdr` module: `IqSource` itself is
+/// compiled unconditionally, so naming a feature-gated type in
+/// `health_counters`' signature would make the trait -- and every
+/// non-HPSDR build, including plain `cargo test --workspace` -- require
+/// `--features hpsdr`.
+///
+/// Atomic rather than mutex-guarded for the same reason
+/// `HpsdrIqSource::confirmed_live` is (MAN-55): a metrics reader must
+/// never take the packet-pump's lock just to read counters. Reading all
+/// three is not one atomic snapshot -- these are independent monotonic
+/// counters sampled on a timer, where a straddled read is
+/// indistinguishable from a sample taken a microsecond earlier.
+#[derive(Debug, Default)]
+pub struct InputHealthCounters {
+    dropped_packets: std::sync::atomic::AtomicU64,
+    gaps_detected: std::sync::atomic::AtomicU64,
+    malformed_packets: std::sync::atomic::AtomicU64,
+}
+
+impl InputHealthCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `n` packets are estimated to have been lost in transit.
+    pub fn record_dropped(&self, n: u64) {
+        self.dropped_packets
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One gap *event* (which may account for several dropped packets).
+    pub fn record_gap(&self) {
+        self.gaps_detected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One datagram discarded as not-a-valid-packet (MAN-22).
+    pub fn record_malformed(&self) {
+        self.malformed_packets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn dropped_packets(&self) -> u64 {
+        self.dropped_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn gaps_detected(&self) -> u64 {
+        self.gaps_detected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn malformed_packets(&self) -> u64 {
+        self.malformed_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// A source of complex IQ samples: file, SDR, or (later) audio/network. ARCHITECTURE §3.
 pub trait IqSource {
     /// The source's native complex sample rate, S/s.
@@ -44,6 +107,23 @@ pub trait IqSource {
     /// reads `true`, rather than assuming liveness the instant `open()`
     /// returns.
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+
+    /// Shared packet-loss/malformed counters for sources that can lose or
+    /// discard whole packets on the wire (MAN-56). Returns `None` (the
+    /// default) for sources with no such failure mode -- a file has no
+    /// packets, and KiwiSDR/SoapySDR/audio currently count nothing of the
+    /// kind. A caller with `Some(handle)` may keep polling it after the
+    /// source itself has been moved into `manta_engine::listen`, which is
+    /// the whole reason this is a shared handle rather than a `&self`
+    /// snapshot getter.
+    ///
+    /// **Wrapper types must forward this**, exactly as `manta-cli`'s
+    /// `FixedCenterFreqSource` does -- the default `None` otherwise
+    /// silently swallows the inner source's counters. Not enforceable by
+    /// the type system; see that impl.
+    fn health_counters(&self) -> Option<std::sync::Arc<InputHealthCounters>> {
         None
     }
 }
@@ -222,6 +302,45 @@ mod tests {
         w.write_sample(0.0f32).unwrap();
         w.finalize().unwrap();
         assert!(WavIqSource::open(&wav).is_err());
+    }
+
+    // MAN-56: input-layer health counters.
+
+    #[test]
+    fn a_source_with_no_packet_loss_model_reports_no_health_counters() {
+        // The trait's default: only sources that actually count something
+        // override it (MAN-56 D1), so file/audio/kiwi/soapy stay untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let src = WavIqSource::open(&wav).unwrap();
+        assert!(src.health_counters().is_none());
+    }
+
+    #[test]
+    fn input_health_counters_accumulate_monotonically() {
+        let c = InputHealthCounters::new();
+        assert_eq!(
+            (
+                c.dropped_packets(),
+                c.gaps_detected(),
+                c.malformed_packets()
+            ),
+            (0, 0, 0)
+        );
+        c.record_dropped(3);
+        c.record_dropped(2);
+        c.record_gap();
+        c.record_malformed();
+        c.record_malformed();
+        assert_eq!(
+            (
+                c.dropped_packets(),
+                c.gaps_detected(),
+                c.malformed_packets()
+            ),
+            (5, 1, 2)
+        );
     }
 
     #[test]
