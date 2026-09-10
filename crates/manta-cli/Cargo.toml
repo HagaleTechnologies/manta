@@ -38,4 +38,8 @@ libc = { workspace = true }
 serde_json = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
+<<<<<<< HEAD
 hound = { workspace = true }
+=======
+sha2 = { workspace = true }
+>>>>>>> 4e71cba3442a49645d1a795ff439274c2b94e400

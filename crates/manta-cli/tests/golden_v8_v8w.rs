@@ -245,3 +245,129 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts() {
         );
     }
 }
+
+// --- SPEC v2 §8.4 Task 12: `--engine hsmm` copies of V8/V8w, at the same
+// SPEC §7 bars as their legacy counterparts above. SPEC v2 §8.1 requires
+// hsmm to clear V8w (legacy's known fading gap), not just V8. Measured
+// 2026-09-09 -- see docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+
+fn decode_report_hsmm(
+    spec: &manta_testkit::vectors::VectorSpec,
+) -> (serde_json::Value, manta_testkit::vectors::Manifest) {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = manta_testkit::vectors::write_fixture_set(spec, dir.path()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join(format!("{}.wav", spec.name)))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (serde_json::from_slice(&out.stdout).unwrap(), manifest)
+}
+
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v8_pileup_validates_at_least_45_of_50_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v8();
+    let (report, manifest) = decode_report_hsmm(&spec);
+    let known_calls: HashSet<&str> = manifest
+        .keyed_texts
+        .iter()
+        .map(|t| call_from_keyed_text(t))
+        .collect();
+    assert_eq!(
+        known_calls.len(),
+        50,
+        "V8 fixture must have 50 unique callsigns"
+    );
+
+    let spots = spotted_calls(&report);
+    let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
+
+    let validated = known_calls.iter().filter(|c| spotted.contains(**c)).count();
+    assert!(
+        validated >= 45,
+        "V8/hsmm must validate >= 45/50 callsigns, got {validated}/50 (spotted: {spotted:?})"
+    );
+
+    let bogus: Vec<&str> = spotted
+        .iter()
+        .filter(|c| !known_calls.contains(**c))
+        .copied()
+        .collect();
+    assert!(
+        bogus.is_empty(),
+        "V8/hsmm must spot 0 bogus callsigns, got {bogus:?}"
+    );
+}
+
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v8w_pileup_fading_decodes_90pct_of_strong_signals_with_hsmm_engine() {
+    let spec = manta_testkit::vectors::v8w();
+    let (report, manifest) = decode_report_hsmm(&spec);
+    let tracks = per_track(&report);
+    let known_calls: HashSet<&str> = manifest
+        .keyed_texts
+        .iter()
+        .map(|t| call_from_keyed_text(t))
+        .collect();
+
+    let matched = match_tracks_by_freq(&manifest, &tracks);
+    let strong: Vec<usize> = spec
+        .signals
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.snr_2500_db >= 6.0)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !strong.is_empty(),
+        "V8w must have at least one >= +6 dB signal"
+    );
+
+    let mut good = 0;
+    for &i in &strong {
+        let (decoded_text, _freq) = matched[i];
+        let cer = manta_testkit::cer::cer(&manifest.keyed_texts[i], decoded_text);
+        if cer < 0.10 {
+            good += 1;
+        }
+    }
+    let pct = good as f64 / strong.len() as f64;
+    assert!(
+        pct >= 0.90,
+        "V8w/hsmm must decode >= 90% of >= +6 dB signals at CER < 10%, got {good}/{} ({:.1}%)",
+        strong.len(),
+        pct * 100.0
+    );
+
+    let spots = spotted_calls(&report);
+    let spotted: HashSet<&str> = spots.iter().map(|(c, _)| c.as_str()).collect();
+    let bogus: Vec<&str> = spotted
+        .iter()
+        .filter(|c| !known_calls.contains(**c))
+        .copied()
+        .collect();
+    assert!(
+        bogus.is_empty(),
+        "V8w/hsmm must spot 0 bogus callsigns, got {bogus:?}"
+    );
+
+    for call in &known_calls {
+        let track_ids: HashSet<u64> = spots
+            .iter()
+            .filter(|(c, _)| c == call)
+            .map(|(_, tid)| *tid)
+            .collect();
+        assert!(
+            track_ids.len() <= 1,
+            "callsign {call} spotted from {} distinct tracks, expected <= 1 (ghost decode)",
+            track_ids.len()
+        );
+    }
+}

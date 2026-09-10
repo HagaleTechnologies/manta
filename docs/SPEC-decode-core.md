@@ -620,6 +620,15 @@ freq_correction_ppm = 0.0
 allowlist = []
 ```
 
+`SPEC-decode-core-v2.md` §7 adds a `[decode]` `engine` key (`"legacy"` |
+`"edge-legacy"` | `"hsmm"`, see that doc's §0) plus the `EdgeLegacy`/`Hsmm`
+evidence/noise/HSMM tunables, additive over this table -- see that
+document's §7 for the full v2 key list and defaults. Parsed by
+`manta_decode::config_file::DecodeConfigFile` and threaded into
+`manta-cli`'s `Listen` (and, after MAN-166 Task 13's follow-up, `Decode`/
+`Oracle`) subcommands' `--engine`/`--server-config` handling -- soon `run`'s
+per MAN-77.
+
 ## 10. Deviations from ARCHITECTURE.md
 
 1. **Kaiser prototype is new code, not reused** (§1.2): `coppa-dsp::filter`
