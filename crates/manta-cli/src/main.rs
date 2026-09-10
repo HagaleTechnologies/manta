@@ -1600,12 +1600,18 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-<<<<<<< HEAD
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
             let mut pipeline_ready_logged = false;
-=======
+            // A second handle on the same flag `stop` below hands to the
+            // engine: `listen_with_observers` runs its padding and
+            // calibration batches -- and so calls `on_tracks` twice --
+            // before its read loop ever consults `stop`, so a SIGINT that
+            // lands during the two-second startup calibration would
+            // otherwise publish `ready: decoding` for a run that is already
+            // shutting down (MAN-122 review round 5, P2).
+            let stop_ready = stop.clone();
             // Printed AFTER the handler is installed, and via `eprintln!`
             // rather than `tracing::info!` because the subscriber is only
             // initialized inside `start_spot_server` -- a plain `listen`
@@ -1620,7 +1626,6 @@ fn main() -> Result<()> {
             // `READY_MARKER` updated to match. stdout stays pure JSON
             // under `--json` (MAN-59 round 6); this goes to stderr.
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
->>>>>>> 8ed910326650742ef7c499942c65075efa7b4004
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -1712,7 +1717,17 @@ fn main() -> Result<()> {
                         // built and the TrackManager has processed real
                         // hops. The startup banner above only ever claimed
                         // bound sockets (review round 2).
-                        if !pipeline_ready_logged {
+                        // Cancellation check, not just a once-guard: see
+                        // `stop_ready`'s definition above. `stop` is
+                        // monotonic (the handler only ever stores `true`),
+                        // so a stop observed here suppresses the event for
+                        // the rest of the run -- which is what's wanted,
+                        // since the decode loop breaks on the same flag at
+                        // its next iteration and never reaches a state worth
+                        // calling ready.
+                        if !pipeline_ready_logged
+                            && !stop_ready.load(std::sync::atomic::Ordering::Relaxed)
+                        {
                             pipeline_ready_logged = true;
                             tracing::info!(
                                 "{}",
