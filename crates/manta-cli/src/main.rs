@@ -157,6 +157,13 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
+        /// Decimate the source down to this rate before the channelizer
+        /// (issue #169) -- must evenly divide the source's native rate by
+        /// a power of two, and the result must itself be a valid
+        /// channelizer table rate (fs/93.75 a power of two). Omit to use
+        /// the source's native rate unchanged (today's behavior).
+        #[arg(long)]
+        capture_rate_hz: Option<f64>,
         /// TOML config with a `[server]`-shaped `ServerConfig` (station
         /// callsign + ports). When given, also starts the telnet cluster
         /// server, JSON Lines/WebSocket stream, and metrics endpoint
@@ -273,6 +280,13 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
+        /// Decimate the source down to this rate before the channelizer
+        /// (issue #169) -- must evenly divide the source's native rate by
+        /// a power of two, and the result must itself be a valid
+        /// channelizer table rate (fs/93.75 a power of two). Omit to use
+        /// the source's native rate unchanged (today's behavior).
+        #[arg(long)]
+        capture_rate_hz: Option<f64>,
     },
     /// Bounded-duration health check: is this source hearing anything real?
     /// Runs the real decode pipeline for --duration, then reports track/SNR/
@@ -359,6 +373,13 @@ enum Command {
         #[cfg(feature = "hpsdr")]
         #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
         hpsdr_rate: Option<f64>,
+        /// Decimate the source down to this rate before the channelizer
+        /// (issue #169) -- must evenly divide the source's native rate by
+        /// a power of two, and the result must itself be a valid
+        /// channelizer table rate (fs/93.75 a power of two). Omit to use
+        /// the source's native rate unchanged (today's behavior).
+        #[arg(long)]
+        capture_rate_hz: Option<f64>,
         /// Emit the DoctorReport as one JSON object on stdout instead of a
         /// human-readable summary.
         #[arg(long)]
@@ -514,6 +535,21 @@ impl IqSource for FixedCenterFreqSource {
 
     fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
         self.inner.health_counters()
+    }
+}
+
+/// Wrap `src` in a `DecimatingSource` targeting `capture_rate_hz`, unless
+/// it's `None` or already matches the source's native rate (a no-op in
+/// either case -- omitting `--capture-rate-hz` reproduces today's exact
+/// behavior). Applied uniformly regardless of source type (kiwi/soapy/
+/// hpsdr/audio/file replay), mirroring how `dial_freq_hz`'s
+/// `FixedCenterFreqSource` wrap is already applied uniformly below.
+fn maybe_decimate(src: Box<dyn IqSource>, capture_rate_hz: Option<f64>) -> Result<Box<dyn IqSource>> {
+    match capture_rate_hz {
+        Some(target) if (target - src.sample_rate()).abs() > 1e-6 => {
+            Ok(Box::new(manta_input::DecimatingSource::new(src, target)?))
+        }
+        _ => Ok(src),
     }
 }
 
@@ -1171,6 +1207,7 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
+            capture_rate_hz,
             config,
             dial_freq_hz,
             replay_epoch,
@@ -1248,6 +1285,7 @@ fn main() -> Result<()> {
                     }
                 }
             };
+            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
             let src: Box<dyn IqSource> = match dial_freq_hz {
                 Some(freq_hz) => Box::new(FixedCenterFreqSource {
                     inner: src,
@@ -1479,6 +1517,7 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
+            capture_rate_hz,
         } => {
             let kiwi = KiwiOpts {
                 host: kiwi_host,
@@ -1519,6 +1558,7 @@ fn main() -> Result<()> {
                     }
                 }
             };
+            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {
@@ -1553,6 +1593,7 @@ fn main() -> Result<()> {
             hpsdr_freq,
             #[cfg(feature = "hpsdr")]
             hpsdr_rate,
+            capture_rate_hz,
             json,
         } => {
             // Checked before any source is opened -- otherwise an invalid
@@ -1609,6 +1650,7 @@ fn main() -> Result<()> {
                     }
                 }
             };
+            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
             let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain

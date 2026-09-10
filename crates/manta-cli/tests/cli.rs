@@ -183,6 +183,48 @@ fn deprecated_daemon_spelling_warns_on_stderr_and_names_the_replacement() {
 }
 
 #[test]
+fn capture_rate_hz_that_does_not_evenly_divide_the_source_rate_is_a_clean_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 48_000.0; // AudioIqSource requires exactly 48000 Hz native
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "20000"]) // 48000/20000 is not an integer
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--capture-rate-hz") || stderr.contains("power of two"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn capture_rate_hz_that_divides_evenly_decimates_and_still_decodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 48_000.0; // AudioIqSource requires exactly 48000 Hz native
+    spec.duration_s = 10.0; // short scene, this test only proves the wiring runs end-to-end
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "24000"]) // 48000 -> 24000, factor 2
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn the_ad_hoc_listen_path_is_not_nagged() {
     // The ticket title keeps `listen` for audio/dev testing, and
     // docs/RUNBOOKS/m1-w1aw-live-copy.md still instructs `listen --device`.
