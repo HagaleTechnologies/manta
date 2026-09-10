@@ -2098,21 +2098,45 @@ async fn fetch_status_inner(
 /// -- deliberately NOT exit 1, which means "asked, and the uplink is
 /// unhealthy". Version skew is a tooling problem, not an uplink problem.
 ///
+/// The version is read BEFORE the document is deserialized into
+/// `StatusDoc`, not after: an incompatible future schema is exactly the
+/// one that may have dropped or renamed a field this build requires, and
+/// deserializing first would then fail with "not a valid status document"
+/// -- reporting a malformed daemon when the real cause is version skew,
+/// and hiding the one message that tells an operator which side to
+/// upgrade. Reading the version off a `serde_json::Value` first makes the
+/// check hold for EVERY document carrying a version this build does not
+/// understand, structurally compatible or not. (The extra intermediate
+/// parse costs nothing worth counting: one kilobytes-sized document, once,
+/// per `manta status` invocation.)
+///
+/// A body with no `schema_version` at all -- or a non-integer one -- is
+/// deliberately NOT a version error: it is a wrong endpoint answering
+/// `GET /status`, and it falls through to the structural parse so it
+/// fails on "not a valid status document" instead.
+///
 /// Separated from `fetch_status_inner` so this is testable without a
 /// socket; `fetch_status_inner` has no other post-read logic to keep.
 fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
     use manta_server::status::STATUS_SCHEMA_VERSION;
 
-    let doc: manta_server::status::StatusDoc =
+    let value: serde_json::Value =
         serde_json::from_str(body).context("status body was not a valid status document")?;
-    if doc.schema_version != STATUS_SCHEMA_VERSION {
-        bail!(
-            "daemon reports status schema_version {} but this manta build understands only {} \
-             -- upgrade whichever of the daemon and the CLI is older",
-            doc.schema_version,
-            STATUS_SCHEMA_VERSION
-        );
+    if let Some(version) = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        if version != u64::from(STATUS_SCHEMA_VERSION) {
+            bail!(
+                "daemon reports status schema_version {} but this manta build understands only {} \
+                 -- upgrade whichever of the daemon and the CLI is older",
+                version,
+                STATUS_SCHEMA_VERSION
+            );
+        }
     }
+    let doc: manta_server::status::StatusDoc =
+        serde_json::from_value(value).context("status body was not a valid status document")?;
     Ok(doc)
 }
 
@@ -3415,6 +3439,34 @@ mod tests {
         assert!(
             err.contains("schema_version 2") && err.contains("understands only 1"),
             "the error must name both versions so an operator knows which side to upgrade: {err}"
+        );
+    }
+
+    /// The version check must not depend on the newer document still
+    /// deserializing into THIS build's `StatusDoc`: the incompatible
+    /// schema that motivates the check is precisely the one that may have
+    /// dropped a field this build requires. Reading the version after a
+    /// structural parse would report that document as malformed and never
+    /// name the skew, so an operator would go looking for a broken daemon
+    /// instead of an out-of-date CLI.
+    #[test]
+    fn version_skew_is_reported_even_when_the_newer_document_no_longer_deserializes() {
+        let doc =
+            manta_server::status::StatusDoc::from_metrics(&manta_server::metrics::Metrics::new());
+        let mut v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&doc).unwrap())
+            .expect("this build's own document must be JSON");
+        v["schema_version"] = serde_json::json!(2);
+        // A v2 that removed a field this build requires -- the case a
+        // parse-then-check order would misdiagnose.
+        v.as_object_mut().unwrap().remove("spots_total");
+
+        let err = parse_status_doc(&v.to_string())
+            .expect_err("a schema_version this build does not understand must not be rendered")
+            .to_string();
+        assert!(
+            err.contains("schema_version 2") && err.contains("understands only 1"),
+            "version skew must be named even when the document is also structurally \
+             incompatible, otherwise the operator only learns the daemon is 'invalid': {err}"
         );
     }
 
