@@ -8,9 +8,10 @@ sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
   - docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md
+  - docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md
 verified:
-  commit: 455e1af
-  date: 2026-09-09
+  commit: 5b22b62
+  date: 2026-09-10
 links:
   - spot-validation
   - overview
@@ -149,6 +150,38 @@ showed the antenna/RSP1B/tuner chain is healthy end-to-end — the quiet
 propagation, not a configuration problem. Before chasing a hardware
 explanation for "nothing heard," check whether the band/time-of-day
 combination is even expected to be active.
+
+## Before blaming the detector: check if the signal even reaches the channelizer
+
+A "zero tracks despite a strong RBN-confirmed signal" finding feels like a
+detector/track-manager bug, but check one level lower first: run *only*
+the channelizer (bypassing `floor`/`gate`/`TrackManager` entirely) and
+look at raw per-channel power at the target frequency. `crates/manta-
+engine/examples/man171_power_map.rs` does this against a captured WAV.
+If the target frequency isn't measurably above the ambient floor even in
+raw channelizer output, the signal isn't reaching the ADC at a meaningful
+level — that's an antenna/RF-path question, not a manta code question,
+and no amount of detector tuning will fix it. Confirmed 2026-09-10: a
+synchronized 40m capture showed RBN-confirmed signals up to 61 dB reading
+≤1.5 dB above ambient in raw channelizer power, while WWV (10.000 MHz —
+about as strong and reliable as HF gets) showed no distinguishable
+carrier either. Suspect a disconnected/misconfigured antenna before
+touching `crates/manta-dsp/src/floor.rs` or `crates/manta-engine/src/
+track.rs`. `crates/manta-input/examples/iq_probe.rs` (build with
+`--features soapy`) captures a fresh WAV+JSON sidecar via manta's own
+`SoapySdrIqSource` for this kind of check.
+
+**A genuine hardware artifact can still look exactly like a manta bug.**
+The same session found a real, absolute-RF-frequency-locked comb of
+"birdies" every exact 8 kHz (confirmed on two different bands/dial
+settings — it doesn't move with the tuned center, ruling out a
+channelizer/rotation bug) — almost certainly an SDR/USB clock-harmonic
+artifact. `floor.rs`'s neighborhood-clamp (SPEC §2.2) never lets such a
+persistent, unmodulated interferer's channel learn to ignore it, so it
+free-runs a spawn/promote/30s-Silent-close/respawn cycle for the whole
+session. Don't assume every ~8kHz-spaced or grid-aligned spurious
+`TrackPromoted` cluster is a manta bug — check whether it survives a
+retune to a different band/frequency first.
 
 ## Setup gotchas
 
