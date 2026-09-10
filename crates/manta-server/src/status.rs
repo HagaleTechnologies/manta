@@ -27,14 +27,20 @@ pub struct StatusDoc {
     pub telnet_clients: i64,
     pub json_clients: i64,
     pub ws_clients: i64,
-    /// `None` while `Metrics::set_active_tracks` has no production call
-    /// site (ARCHITECTURE.md's "served but never populated" caution) --
-    /// serialized as `null` and rendered "n/a" rather than a misleading
-    /// live-looking `0`. Deliberately NOT `Some(metrics.active_tracks())`:
-    /// that getter genuinely exists and always returns a number, but
-    /// wrapping it here would repeat exactly the mistake this field's
-    /// `Option` exists to prevent, since nothing in production ever calls
-    /// `set_active_tracks` today.
+    /// The daemon's live decoder-track count, from
+    /// `Metrics::active_tracks()`. ARCHITECTURE.md §8's "served but never
+    /// populated" caution about `manta_active_tracks` was CORRECTED on
+    /// 2026-09-04 (MAN-45): `manta_engine::listen_with_observers`
+    /// publishes `TrackManager::active_track_count()` into a shared
+    /// handle, and `manta-cli` polls it into `Metrics` every
+    /// `ACTIVE_TRACKS_POLL_INTERVAL` (250 ms). That poller is spawned in
+    /// the same `--config` branch that starts the listener serving this
+    /// document, so any reachable `/status` has a live value behind it --
+    /// hardcoding `None` here (MAN-44 review) only made `/status` and
+    /// `manta status` disagree with `/metrics` on the same daemon.
+    /// Still an `Option` on the wire: `null` is what a daemon built
+    /// before that poller existed emits, and `render_human` keeps
+    /// rendering that as "n/a" rather than a live-looking `0`.
     pub active_tracks: Option<u64>,
     pub uplink: UplinkStatus,
 }
@@ -89,7 +95,7 @@ impl StatusDoc {
             telnet_clients: metrics.telnet_clients(),
             json_clients: metrics.json_clients(),
             ws_clients: metrics.ws_clients(),
-            active_tracks: None,
+            active_tracks: Some(metrics.active_tracks()),
             uplink: UplinkStatus {
                 health,
                 connected_targets,
@@ -144,8 +150,9 @@ pub fn render_human(doc: &StatusDoc) -> String {
         doc.telnet_clients,
         doc.json_clients + doc.ws_clients
     ));
-    // ARCHITECTURE.md's own caution: `active_tracks` has no production
-    // call site yet, so it is labeled rather than shown as a
+    // A current daemon always sends a real count (see the field's doc
+    // comment); `None` means a pre-MAN-45 daemon that never populated the
+    // gauge, and that is labeled rather than shown as a
     // misleadingly-live-looking 0.
     out.push_str(&format!(
         "  active tracks  {}\n\n",
@@ -247,13 +254,25 @@ mod tests {
     }
 
     #[test]
-    fn human_render_marks_known_placeholder_fields_so_they_are_not_read_as_live() {
-        // ARCHITECTURE.md -- active_tracks is frozen at 0 in production
-        // (no real call site). Surfacing it unlabeled in a health view
-        // would repeat exactly the mistake that caution exists to
-        // prevent.
-        let out = render_human(&StatusDoc::from_metrics(&metrics_fixture()));
-        assert!(out.contains("active tracks  n/a"));
+    fn status_reports_the_same_live_active_track_count_metrics_does() {
+        // MAN-44 review: `from_metrics` hardcoded `None`, so `/status`
+        // and `manta status` reported "n/a" on a daemon whose
+        // `/metrics` was reporting a real count from MAN-45's poller.
+        let m = metrics_fixture();
+        m.set_active_tracks(7);
+        let doc = StatusDoc::from_metrics(&m);
+        assert_eq!(doc.active_tracks, Some(7));
+        assert!(render_human(&doc).contains("active tracks  7"));
+    }
+
+    #[test]
+    fn human_render_marks_an_absent_active_track_count_so_it_is_not_read_as_live() {
+        // Only a daemon older than MAN-45's poller sends `null` here.
+        // Surfacing that as `0` in a health view would read as a live
+        // "no tracks", which is exactly what it is not.
+        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
+        doc.active_tracks = None;
+        assert!(render_human(&doc).contains("active tracks  n/a"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ manta status — daemon up 3h 12m
 
   spots published      18432
   telnet clients       2      json/ws clients  1
-  active tracks  n/a
+  active tracks  41
 
 RBN uplink: DEGRADED — 1 of 2 enabled targets connected
 

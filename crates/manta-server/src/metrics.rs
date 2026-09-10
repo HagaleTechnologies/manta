@@ -547,9 +547,10 @@ impl Metrics {
 
     /// Engine-owned figure, injected by the daemon wiring layer (see
     /// module doc) -- `manta-server` has no track manager of its own.
-    /// `None` until a real call site sets it (ARCHITECTURE.md: no
-    /// production caller exists yet) -- `status.rs` renders that as
-    /// "n/a", not a misleading live-looking `0`.
+    /// The production caller is `manta-cli`'s 250 ms poller over
+    /// `manta_engine::listen_with_observers`' shared handle (MAN-45), so
+    /// on a running daemon this is live, not a frozen `0`; `status.rs`
+    /// serves it as `StatusDoc::active_tracks`.
     pub fn set_active_tracks(&self, count: u64) {
         self.active_tracks.store(count, Ordering::Relaxed);
     }
