@@ -17,10 +17,17 @@ fading-robustness gap is classical-DSP work to fix before M4** (MAN-107
 through MAN-113), not deferred to M4 ML fusion by design — see
 docs/DECISIONS/2026-09-06-broad-review-decisions.md D8. **M2 acceptance
 is still open**: Pi4 CPU-budget leg (also paused pending MAN-100 through
-MAN-113 landing in full, not just MAN-107-113 above — D6) and 24 h
-live-SDR soak are unmet — both need physical hardware not
-reachable from this environment.
-`manta-dsp::single`/`freqest` deprecated in place.
+MAN-113 landing in full, not just MAN-107-113 above — D6), 24 h live-SDR
+soak, and **VR1–VR8** (ROADMAP.md's M2 "Accept when", a standing gate
+since 2026-09-09, not a one-time redesign check — 3/9 pass, see below)
+are unmet — the first two need physical hardware not reachable from this
+environment.
+`manta-dsp::single`/`freqest` deprecated in place. `decode.engine` default
+is still `legacy`; `hsmm` (MAN-166 decode-core-v2) is implemented and
+CLI-reachable but not promoted — stage-2 gate measured FAIL 2026-09-09
+(oracle as_word 56%/framed 32% vs required 60%/40%; 4/11 V-vectors, 3/9
+VR-vectors pass) — see
+docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
 
 ## Documents (read in this order)
 

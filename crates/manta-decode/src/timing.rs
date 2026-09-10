@@ -23,6 +23,13 @@ const DRIFT_OFF_FRAC: f64 = 0.40;
 // large majority of those (11 -> 4 failures, reproduced across two
 // independent random seeds) with zero cases regressing pass -> fail.
 const CHAR_GAP_DITS: f32 = 1.6;
+// SPEC v2 §0 stage-1 wiring (Task 5): the `EdgeLegacy`/`Hsmm` engines feed
+// the same `GapClassifier` from the evidence front end's half-amplitude
+// keying decision instead of `Demod`'s hysteresis+debounce state machine,
+// which does not carry the constant ~15-20ms mark-duration overshoot that
+// motivated lowering `CHAR_GAP_DITS` above -- so those engines use the
+// SPEC-nominal 2.0 threshold instead, restored here as a distinct constant.
+pub(crate) const CHAR_GAP_DITS_NOMINAL: f32 = 2.0;
 const WORD_GAP_DITS: f32 = 5.0; // SPEC §9 decode.word_gap_dits
 const FARNS_LONG_U: f32 = 1.5; // SPEC §4.2 long-gap floor
                                // SPEC §9 decode.min_count nominally pins 8. **[DEVIATION]** lowered to 5,
@@ -348,15 +355,26 @@ pub enum GapClass {
 pub struct GapClassifier {
     pair: ClusterPair,
     long_seen: u32,
+    char_gap_dits: f32,
 }
 
 impl GapClassifier {
-    /// A classifier with no gaps observed yet. SPEC §4.2.
+    /// A classifier with no gaps observed yet, using the `Legacy` engine's
+    /// `CHAR_GAP_DITS` deviation (1.6; see the constant's doc comment).
+    /// SPEC §4.2.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::new_with(CHAR_GAP_DITS)
+    }
+
+    /// A classifier with an explicit inter-element/inter-char boundary, in
+    /// dit units. SPEC v2 §0: `EdgeLegacy`/`Hsmm` pass the SPEC-nominal
+    /// `CHAR_GAP_DITS_NOMINAL` (2.0); `Legacy` uses `new()`.
+    pub fn new_with(char_gap_dits: f32) -> Self {
         GapClassifier {
             pair: ClusterPair::new(None),
             long_seen: 0,
+            char_gap_dits,
         }
     }
 
@@ -428,7 +446,7 @@ impl GapClassifier {
         } else {
             WORD_GAP_DITS
         };
-        let class = if u < CHAR_GAP_DITS {
+        let class = if u < self.char_gap_dits {
             GapClass::InterElement
         } else if u < word_thr {
             GapClass::InterChar

@@ -4,10 +4,12 @@
 //! coppa-dsp has no FIR designer), a single-channel extractor shim, and an
 //! FFT-peak frequency estimator. `channelizer` is the M2 full N-channel WOLA
 //! polyphase filterbank (SPEC §1.1-1.3) that supersedes `single`/`freqest`.
+//! `refine` is decode-core-v2 §3's optional per-track narrowband refiner.
 
 pub mod channelizer;
 pub mod floor;
 pub mod freqest;
 pub mod hilbert;
 pub mod proto;
+pub mod refine;
 pub mod single;
