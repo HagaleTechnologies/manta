@@ -1517,7 +1517,6 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-<<<<<<< HEAD
             // Printed AFTER the handler is installed, and via `eprintln!`
             // rather than `tracing::info!` because the subscriber is only
             // initialized inside `start_spot_server` -- a plain `listen`
@@ -1532,10 +1531,7 @@ fn main() -> Result<()> {
             // `READY_MARKER` updated to match. stdout stays pure JSON
             // under `--json` (MAN-59 round 6); this goes to stderr.
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
-            let listen_result = manta_engine::listen(
-=======
             let listen_result = manta_engine::listen_with_observers(
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                 src,
                 &cfg,
                 stop,
