@@ -564,9 +564,33 @@ fn open_source(
     open_audio_source(device, source)
 }
 
+/// `--source <path>.wav` covers two distinct file formats sharing the same
+/// flag: a mono real-audio recording (M1 "Audio passband" input, e.g.
+/// captured from a rig's RX line-out -- decoded via `AudioIqSource`'s
+/// Hilbert transform, hard-pinned to 48000 Hz) and a 2-channel raw complex-
+/// IQ recording at any rate (`WavIqSource`, the same format `decode`/
+/// `oracle` already read directly, and the only format that can feed
+/// `--capture-rate-hz` decimation for file replay -- MAN-169 round-2 Codex
+/// finding: routing every `--source` WAV through `AudioIqSource`
+/// unconditionally meant a 96/192 kS/s IQ replay could never reach here,
+/// since `AudioIqSource::from_wav_file` rejects every rate but 48000).
+/// Disambiguated by channel count, the one cheap, unambiguous signal
+/// available without decoding samples: 2 channels means IQ (I, Q), 1 means
+/// mono audio. Anything else falls through to `AudioIqSource::from_wav_file`
+/// so its own existing validation error (not a new one invented here) is
+/// what the operator sees, exactly as before this change.
 fn open_audio_source(device: Option<String>, source: Option<PathBuf>) -> Result<Box<dyn IqSource>> {
     Ok(match source {
-        Some(path) => Box::new(manta_input::AudioIqSource::from_wav_file(&path)?),
+        Some(path) => {
+            let is_iq = hound::WavReader::open(&path)
+                .map(|r| r.spec().channels == 2)
+                .unwrap_or(false);
+            if is_iq {
+                Box::new(manta_input::WavIqSource::open(&path)?)
+            } else {
+                Box::new(manta_input::AudioIqSource::from_wav_file(&path)?)
+            }
+        }
         None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
     })
 }

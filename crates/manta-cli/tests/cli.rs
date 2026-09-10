@@ -259,6 +259,40 @@ fn capture_rate_hz_that_divides_evenly_decimates_and_still_decodes() {
 }
 
 #[test]
+fn capture_rate_hz_replays_a_2channel_iq_wav_through_wav_iq_source() {
+    // MAN-169 round-2 Codex finding: `open_audio_source` used to route
+    // every `--source <path>.wav` through `AudioIqSource::from_wav_file`
+    // unconditionally, which hard-rejects every rate but 48000 Hz -- so a
+    // 96/192 kS/s raw complex-IQ replay (the format `decode`/`oracle`
+    // already read directly) could never reach `--capture-rate-hz`'s
+    // decimation wrapper via the CLI at all; only golden-vector tests that
+    // called `Decimator` directly (`golden_decimated_capture.rs`) ever
+    // exercised that combination. This drives the real `run --source ...
+    // --capture-rate-hz ...` CLI path end-to-end against a genuine
+    // 2-channel 96 kHz IQ WAV to prove `open_audio_source` now detects the
+    // 2-channel case and routes it through `WavIqSource` instead, unlocking
+    // decimated file replay the same way it already works for live SDR
+    // sources.
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 96_000.0;
+    spec.duration_s = 10.0; // short scene, this test only proves the wiring runs end-to-end
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "48000"]) // 96000 -> 48000, factor 2
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn capture_rate_hz_rejects_non_finite_and_degenerately_small_values() {
     // MAN-169 whole-branch review finding: a small --capture-rate-hz (e.g.
     // 187.5 Hz, reachable as 48000/256) resolves to a Channelizer with
