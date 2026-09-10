@@ -53,6 +53,62 @@ impl Default for DetectorConfig {
     /// channelizer's ~14 dB processing gain (2500 Hz SNR -> 93.75 Hz channel
     /// SNR) keeps even the weakest golden vector (V3, +6 dB-in-2500) ~14 dB
     /// clear of the threshold, so it still promotes and decodes.
+    ///
+    /// **`confirm_hops` stays at SPEC §2.3/§2.4's literal 19 (~50.7ms) --
+    /// deliberately, after measuring a real problem with it and rejecting
+    /// the obvious fix.** MAN-166, 2026-09-09, investigated further in
+    /// `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`.
+    /// The above paragraph's own "20 WPM dit is ~22 hops" observation
+    /// already implies a real problem this never closed: 19 hops needs
+    /// 50.7ms of *unbroken* rise from a CANDIDATE's very first hop, and a
+    /// dit alone is shorter than that at any real contest speed above
+    /// ~20 WPM (30ms at 40 WPM, 34ms at 35 WPM, 40ms at 30 WPM) -- so on
+    /// real contest-speed CW, any word/character starting with a
+    /// dit-leading letter (E, I, S, H, 5, ...) structurally cannot promote
+    /// its own opening element, spawning a fresh CANDIDATE every dit-onset
+    /// that immediately dies `Unconfirmed`, over and over, until a
+    /// dah-leading element promotes it or the transmission ends.
+    /// Confirmed as the majority contributor to `unconfirmed` being 68.8%
+    /// of all real-recording track churn (`crates/manta-testkit`'s B2
+    /// golden vector) -- but **lowering `confirm_hops` to fix it breaks
+    /// V10** (a real, currently-passing golden vector at 15 WPM/Farnsworth
+    /// char_wpm=25): the decoder's Farnsworth gap-classifier bootstrap
+    /// (`manta_decode::timing::FARNS_MIN_COUNT`) is apparently sensitive
+    /// to *which hop* a track promotes on, and there's a hard cliff, not a
+    /// gradual tradeoff -- confirm_hops=17 reproduces the exact same
+    /// broken decode as confirm_hops=8 (CER 0.2368 either way, letter-by-
+    /// letter word-boundary corruption on the opening transmission),
+    /// confirm_hops=18 passes clean, and 18 vs 19 (48.0ms vs 50.7ms) is
+    /// too close to the original to meaningfully help any real
+    /// contest-speed dit (still needs >40 WPM headroom this doesn't give).
+    /// `track_cap` was verified independent of this (V10 passes at
+    /// `confirm_hops: 19` regardless of `track_cap`). This confirm_hops/
+    /// Farnsworth-bootstrap coupling needs a real manta-decode-level fix
+    /// (decouple the gap-classifier's bootstrap from detector promotion
+    /// timing) before `confirm_hops` can safely move -- out of scope for
+    /// this change; folded into the wider real-world decode-accuracy
+    /// investigation the same MAN-166 finding opened.
+    ///
+    /// **`track_cap` deviates from its prior 500** (ARCHITECTURE §4, not a
+    /// SPEC value), raised to 1200, same MAN-166 decision doc. 500 was
+    /// never stress-tested against real contest-band signal density: on
+    /// the B2 recording it was pinned at its ceiling for the *entire* 15
+    /// minutes, forcing 71,149 `evicted` closes (cap pressure alone --
+    /// `evict_over_cap()` fires only when `tracks.len() > cap`) as real,
+    /// confirmed signals were killed purely to make room for competitors.
+    /// `merged` (52,330 closes, `merge_converged()`'s independent
+    /// frequency-proximity convergence, SPEC §2.5, always run before
+    /// `evict_over_cap()` in `step_hop`) is a *separate* mechanism, not
+    /// cap pressure -- the decision doc's own uncapped experiment shows
+    /// `merged` closes actually *rose* (52,330 -> 56,739) when the cap was
+    /// removed, the opposite of what cap pressure would predict (Codex
+    /// review, PR #152, round 10 -- corrected an earlier version of this
+    /// comment that conflated the two). Removing the cap entirely on that
+    /// same recording measured real organic peak demand at 886 concurrent
+    /// active tracks; 1200 keeps meaningful headroom above that without
+    /// picking an arbitrarily huge number. (Any relationship to manta's
+    /// Pi4 CPU-budget gate, MAN-18/MAN-49, is explicitly out of scope for
+    /// this change -- see that decision doc.)
     fn default() -> Self {
         DetectorConfig {
             on_snr_db: 12.0,
@@ -61,7 +117,7 @@ impl Default for DetectorConfig {
             hang_hops: 1875,
             gc_hops: 11250,
             warmup_hops: 750,
-            track_cap: 500,
+            track_cap: 1200,
         }
     }
 }
