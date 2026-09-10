@@ -2295,4 +2295,90 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "the second loser's QRL? flag must still reach the final survivor"
         );
     }
+
+    /// The other half of the round-3 eviction-order harm: the reviewer
+    /// named BOTH "subsequent RST/QRL annotations are discarded" AND
+    /// "pending beacons are incorrectly treated as lost to eviction", but
+    /// only the annotation half was pinned above. A `PendingBeacon` on a
+    /// later merge loser must reach the FINAL survivor through a redirect
+    /// that was recorded while the map was already at capacity -- and
+    /// `pending_beacon_lost_to_eviction` must stay at 0, because no
+    /// eviction of a still-needed redirect happened. Under key-ordered
+    /// eviction the redirect for track 5 was gone by the time loser 9
+    /// named it, so the beacon was discarded and miscounted as lost.
+    #[test]
+    fn a_fresh_redirect_carries_a_pending_beacon_to_the_final_survivor() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 3);
+        seed_meta(&mut v, 5);
+        seed_meta(&mut v, 8);
+        seed_meta(&mut v, 9);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 3,
+            wpm: 25.0,
+        });
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 9,
+            wpm: 22.0,
+        });
+        // Only the last loser in the batch captured a Beacon candidate.
+        let spots = run(&transmission_events(9, &["K5ARH", "T"], 0), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // Fill the map to capacity with older, higher-id closures.
+        for track_id in 1_000..1_000 + MAX_CLOSED_SURVIVORS as u32 {
+            seed_meta(&mut v, track_id);
+            v.ingest(&DecoderEvent::TrackClosed {
+                track_id,
+                closure: ClosureKind::SignalEnded,
+            });
+        }
+
+        // The chain's intermediate closes onto the final survivor: newest
+        // entry, smallest key.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 5,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(3),
+            },
+        });
+        // An unrelated closure falls between the intermediate and the
+        // loser that carries the beacon.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 8,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(5),
+            },
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 9,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(5),
+            },
+        });
+        assert!(
+            spots.is_empty(),
+            "a merge must never itself resolve the migrated candidate, got {spots:?}"
+        );
+        assert_eq!(
+            v.suppression_counts().pending_beacon_lost_to_eviction,
+            0,
+            "the redirect was live, so nothing may be counted lost to eviction"
+        );
+
+        // The final survivor closes for real: the beacon must resolve
+        // there, at the SURVIVOR's own final speed.
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 3,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(
+            spots.len(),
+            1,
+            "the migrated candidate must resolve at the final survivor's \
+             true close, got {spots:?}"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
 }
