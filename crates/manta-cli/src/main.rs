@@ -1600,10 +1600,27 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+<<<<<<< HEAD
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
             let mut pipeline_ready_logged = false;
+=======
+            // Printed AFTER the handler is installed, and via `eprintln!`
+            // rather than `tracing::info!` because the subscriber is only
+            // initialized inside `start_spot_server` -- a plain `listen`
+            // (no --server-config) has no subscriber at all. Two jobs:
+            // `listen` otherwise prints nothing at startup (2026-09-05
+            // review, lens 1 #4/#7), and it is the readiness handshake
+            // `tests/signal_shutdown.rs` waits for -- signalling any
+            // earlier races `set_handler` and kills the child under the OS
+            // default disposition regardless of MAN-85's fix. If the
+            // fuller startup banner (lens 1 #7) ever replaces this line,
+            // it must still be emitted here, after `set_handler`, and
+            // `READY_MARKER` updated to match. stdout stays pure JSON
+            // under `--json` (MAN-59 round 6); this goes to stderr.
+            eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+>>>>>>> 8ed910326650742ef7c499942c65075efa7b4004
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
