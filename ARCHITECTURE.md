@@ -21,7 +21,7 @@ marked **(research-dependent)** are the only intentionally open questions.
  IQ/WAV file ──▶│       │ config                    ┌──────────▼────────────┐  │
  rig audio ────▶│       │                           │  decoder pool         │  │
  (cpal)         │       │                           │  (per-signal CW       │  │
-                │       │                           │   decoders, N ≤ 500)  │  │
+                │       │                           │   decoders, N ≤ 1200) │  │
                 │       │                           └──────────┬────────────┘  │
                 │       │                                      │ decoded text  │
                 │  ┌────┴─────┐   ┌─────────────┐   ┌──────────▼────────────┐  │
@@ -127,6 +127,14 @@ instances, not one instance retuning — simpler, and SDRs are cheap.
 
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
+This ring-overrun counting is still aspirational (`manta-engine::soak`'s module
+doc tracks the blocker: `coppa-audio::CpalSource` doesn't expose its ring's
+`overflow_count()` publicly). Distinct and already shipped (MAN-56): HPSDR's
+wire-level UDP packet loss/malformed-datagram counters
+(`manta_input::InputHealthCounters`, §8) reach the Prometheus `/metrics`
+endpoint today — a different layer (lost/rejected datagrams before demux, not
+ring backpressure after it), not a partial implementation of the ring gauge
+above.
 
 ## 4. Channelizer (`manta-dsp`)
 
@@ -157,8 +165,12 @@ keying doesn't inflate its own floor). A channel goes *active* when smoothed pow
 exceeds floor + threshold (default 6 dB) with hysteresis (3 dB drop + 5 s hang to
 survive QSB and inter-word gaps). Active channel ⇒ a **track** (center channel ±1
 neighbor, combined by max-power selection) ⇒ a decoder is leased from the pool.
-Track cap (default 500) with lowest-SNR eviction; evictions are counted and
-reported (no silent coverage loss).
+Track cap (default 1200, MAN-166: raised from 500, which was never
+stress-tested against real contest-band signal density and was pinned at
+its ceiling for the entire duration of a real 15-minute recording,
+`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`) with
+lowest-SNR eviction; evictions are counted and reported (no silent
+coverage loss).
 
 **CPU budget** (the reason this whole design is viable):
 
@@ -227,23 +239,37 @@ transmission may never produce again).
    `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
    for NCDXF-style power-step beacons the decoder can't resolve past a
    single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`DE`
-   token appears anywhere in the window at all, a deliberately coarse
-   guard against mistagging an ordinary, unrecognized CQ/DE call as
-   Beacon). Context determines spot type (CQ / DE / BEACON) — RBN spots
-   carry this flag.
+   token appears anywhere in the window at all (the token must be a
+   complete decoded word, not a substring glued to punctuation inside
+   one), a deliberately coarse guard against mistagging an ordinary,
+   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+   is counted once, as `SuppressionCounts::power_step_guard` (§8); an
+   occurrence already evaluated as a Beacon before the guard appeared is
+   not a loss and is not counted). Context
+   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
 2. **Callsign plausibility**: structural grammar (prefix-digit-suffix, portable
    designators `/P /QRP /3`), then prefix lookup against **cty.dat** (bundled,
-   refreshable) — a call with an unallocated prefix is rejected.
+   refreshable) — a call with an unallocated prefix is rejected. `cty.dat` is
+   also joined, on that same primary-prefix field, against a small vendored
+   ADIF DXCC entity-number table (`data/dxcc.tsv`, MAN-136) — refreshed
+   together, see `crates/manta-spot/data/SOURCES.md` — which is what lets
+   `manta-server`'s JSON stream populate `dxDxcc`/`deDxcc` (§7).
 3. **SCP cross-check** (optional, default on if file present): membership in
    `master.scp` (contest super-check-partial list) *raises* confidence; absence
    only lowers it (new/rare calls must still spot, not just well-known ones).
-4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s on
-   the same track before first spot (CW ops repeat their calls; single decodes
-   are overwhelmingly garble). Confidence = f(decoder confidence, repetitions,
-   SNR, SCP/cty hits). **Exemption**: messages already type-tagged `BEACON` by
-   step 1's context parse skip this gate entirely — NCDXF-style beacons ID
-   once per power-step cycle and legitimately won't repeat within the window
-   (MAN-28).
+4. **Repetition requirement**: a callsign must decode ≥ 2 times within 90 s
+   before first spot (CW ops repeat their calls; single decodes are
+   overwhelmingly garble). **Deviates from "the same track" (MAN-166,
+   `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
+   real signal's `track_id` changes across a close+reopen, so repetition is
+   tracked per frequency instead, with a minimum-gap check across
+   *different* track_ids to still reject two tracks concurrently decoding
+   one real transmission as a false second confirmation — see
+   `crates/manta-spot/src/gate.rs`. Confidence = f(decoder confidence,
+   repetitions, SNR, SCP/cty hits). **Exemption**: messages already
+   type-tagged `BEACON` by step 1's context parse skip this gate entirely
+   — NCDXF-style beacons ID once per power-step cycle and legitimately
+   won't repeat within the window (MAN-28).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
@@ -286,7 +312,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
-  existing ecosystem contracts.
+  existing ecosystem contracts. Every spot carries a non-null, real `dxDxcc`/
+  `deDxcc` (an ADIF DXCC entity number, MAN-136) whenever the callsign
+  resolves against `cty.dat`; when it doesn't, `dxDxcc`/`dxContinent`/
+  `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
+  `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
+  see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline.
 - **Exposure policy (normative, not just observed behavior):** both servers are
@@ -318,16 +349,33 @@ validation (MAN-28). Dedupe (step 5) still applies.
   own yet (decode-pipeline internals, not the network-facing surface
   MAN-59 scoped to), and `manta --status` hitting a local control socket
   for live stats is similarly not yet implemented. Prometheus text
-  endpoint (feature `metrics`): input overruns, active tracks, evictions,
-  decode rate, spots/min, per-stage queue depths, spot confidence
-  histogram — also aspirational for several of these fields; the
-  currently-implemented subset is `manta_spots_total`,
-  `manta_spots_dropped_lagged_total`,
+  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
+  doc was stale — no Cargo `metrics` feature has ever existed; the
+  endpoint is unconditionally compiled and served whenever
+  `--config` is set — `--server-config` is MAN-77's deprecated alias of
+  that flag): active tracks, evictions, decode rate,
+  spots/min, per-stage queue depths, spot confidence histogram — still
+  aspirational for several of these fields; the currently-implemented
+  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
+  `manta_spots_dropped_write_failed_total`,
+  `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
+  out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
+  callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
+  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
+  gauges, `manta_source_health`, the uplink counters, and (MAN-56,
+  landed 2026-09-04) `manta_input_dropped_packets_total`/
+  `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
+  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
+  per-stage queue depths, decode rate, spots/min, spot-confidence
+  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  deviation, a different gap from MAN-56's wire-level packet counters).
+  The three `manta_input_*` series are published only for sources that
+  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
+  report none) and are **absent**, not a frozen zero, for every other
+  source — same "absent means not measured" distinction as
+  `manta_active_tracks` below.
   **`manta_active_tracks` is served but not populated** (corrected
   2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
   `set_active_tracks`'s only non-test call site is absent — `main.rs`'s

@@ -28,6 +28,15 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      # MAN-36 (PR #99 review): `rust-toolchain.toml` selects the compiler
+      # every leg below builds with -- the Windows/macOS runners via their
+      # `dtolnay/rust-toolchain` step, the `cross` legs via `rustc --print
+      # sysroot`, and the Docker builder stage via rustup inside the image.
+      # The documented bump procedure opens a PR touching ONLY that file, so
+      # without it listed here none of those legs would validate the new
+      # compiler and a target-specific regression would stay hidden until a
+      # `v*` tag is pushed.
+      - 'rust-toolchain.toml'
   workflow_dispatch: {}
 
 env:
