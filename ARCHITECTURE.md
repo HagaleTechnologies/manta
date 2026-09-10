@@ -127,6 +127,14 @@ instances, not one instance retuning — simpler, and SDRs are cheap.
 
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
+This ring-overrun counting is still aspirational (`manta-engine::soak`'s module
+doc tracks the blocker: `coppa-audio::CpalSource` doesn't expose its ring's
+`overflow_count()` publicly). Distinct and already shipped (MAN-56): HPSDR's
+wire-level UDP packet loss/malformed-datagram counters
+(`manta_input::InputHealthCounters`, §8) reach the Prometheus `/metrics`
+endpoint today — a different layer (lost/rejected datagrams before demux, not
+ring backpressure after it), not a partial implementation of the ring gauge
+above.
 
 ## 4. Channelizer (`manta-dsp`)
 
@@ -329,6 +337,7 @@ validation (MAN-28). Dedupe (step 5) still applies.
   record to reconstruct an abuse incident after the fact. Still
   aspirational: `manta-input`/`manta-engine` carry no logging of their
   own yet (decode-pipeline internals, not the network-facing surface
+<<<<<<< HEAD
   MAN-59 scoped to). **`manta status` implemented** (2026-09-04, MAN-44,
   `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`): reads a
   JSON `StatusDoc` (`crates/manta-server/src/status.rs`) served on
@@ -351,16 +360,45 @@ validation (MAN-28). Dedupe (step 5) still applies.
   histogram — also aspirational for several of these fields; the
   currently-implemented subset is `manta_spots_total`,
   `manta_spots_dropped_lagged_total`,
+=======
+  MAN-59 scoped to), and `manta --status` hitting a local control socket
+  for live stats is similarly not yet implemented. Prometheus text
+  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
+  doc was stale — no Cargo `metrics` feature has ever existed; the
+  endpoint is unconditionally compiled and served whenever
+  `--config` is set — `--server-config` is MAN-77's deprecated alias of
+  that flag): active tracks, evictions, decode rate,
+  spots/min, per-stage queue depths, spot confidence histogram — still
+  aspirational for several of these fields; the currently-implemented
+  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
+>>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
   `manta_spots_unresolved_geography_total` (MAN-136/MAN-45 — a spot that went
   out carrying an `UNKNOWN_*` sentinel on either side, i.e. its dx or de
   callsign didn't resolve against `cty.dat`, *or* it resolved but its entity
+<<<<<<< HEAD
   has no row in the vendored `dxcc.tsv`), per-protocol
   client-connected gauges, `manta_source_health`, the uplink counters, and
   (MAN-44) per-target `manta_uplink_target_*` series
   (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
   per-stage queue depths, which MAN-56 tracks as a separate gap.
+=======
+  has no row in the vendored `dxcc.tsv`), per-protocol client-connected
+  gauges, `manta_source_health`, the uplink counters, and (MAN-56,
+  landed 2026-09-04) `manta_input_dropped_packets_total`/
+  `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
+  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
+  per-stage queue depths, decode rate, spots/min, spot-confidence
+  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  a `coppa-audio` API addition, `manta-engine::soak`'s documented
+  deviation, a different gap from MAN-56's wire-level packet counters).
+  The three `manta_input_*` series are published only for sources that
+  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
+  report none) and are **absent**, not a frozen zero, for every other
+  source — same "absent means not measured" distinction as
+  `manta_active_tracks` below.
+>>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
   **`manta_active_tracks` is served but not populated** (corrected
   2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
   `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
