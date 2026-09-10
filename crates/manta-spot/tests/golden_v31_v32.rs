@@ -159,3 +159,108 @@ fn track_closed_clears_both_annotations() {
     );
     assert!(spots[0].rst.is_none() && !spots[0].qrl_query);
 }
+
+/// Codex review on PR #159: a `Bookkeeping` merge continues the same
+/// signal identity on the survivor, so annotations decoded only on the
+/// losing track must move with it instead of dying with its `TrackState`.
+#[test]
+fn a_merge_carries_the_losers_annotations_to_the_survivor() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    run(&transmission_events(1, &["QRL?", "5NN"], 0), &mut v);
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: Some(2),
+        },
+    });
+
+    seed_meta(&mut v, 2);
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+        &mut v,
+    );
+    assert_eq!(spots.len(), 1, "spots were {spots:?}");
+    assert_eq!(
+        spots[0].rst.as_deref(),
+        Some("599"),
+        "the merged-away track's RST must survive on the survivor"
+    );
+    assert!(
+        spots[0].qrl_query,
+        "the merged-away track's QRL? must survive on the survivor"
+    );
+}
+
+/// Last-value-wins is by DECODE time, not by merge order: a merge must
+/// not resurrect the loser's older report over a fresher one the
+/// survivor already holds.
+#[test]
+fn a_merge_keeps_whichever_rst_was_decoded_latest() {
+    // Loser decoded "5NN" first; survivor decoded "339" afterwards.
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    seed_meta(&mut v, 2);
+    run(&transmission_events(1, &["5NN"], 0), &mut v);
+    run(&transmission_events(2, &["339"], 100_000), &mut v);
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: Some(2),
+        },
+    });
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 200_000),
+        &mut v,
+    );
+    assert_eq!(
+        spots[0].rst.as_deref(),
+        Some("339"),
+        "the survivor's newer RST must not be overwritten by the loser's stale one"
+    );
+
+    // Mirror image: the loser holds the newer report, so it wins.
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    seed_meta(&mut v, 2);
+    run(&transmission_events(2, &["339"], 0), &mut v);
+    run(&transmission_events(1, &["5NN"], 100_000), &mut v);
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: Some(2),
+        },
+    });
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 200_000),
+        &mut v,
+    );
+    assert_eq!(
+        spots[0].rst.as_deref(),
+        Some("599"),
+        "the loser's newer RST must replace the survivor's stale one"
+    );
+}
+
+/// An eviction (`Bookkeeping` with no survivor) has nowhere to migrate
+/// to -- the annotations drop with the track and must not reappear on
+/// any later one.
+#[test]
+fn an_eviction_drops_the_annotations() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    run(&transmission_events(1, &["QRL?", "5NN"], 0), &mut v);
+    v.ingest(&DecoderEvent::TrackClosed {
+        track_id: 1,
+        closure: ClosureKind::Bookkeeping {
+            survivor_track_id: None,
+        },
+    });
+
+    seed_meta(&mut v, 2);
+    let spots = run(
+        &transmission_events(2, &["CQ", "K5ARH", "CQ", "K5ARH"], 100_000),
+        &mut v,
+    );
+    assert!(spots[0].rst.is_none() && !spots[0].qrl_query);
+}

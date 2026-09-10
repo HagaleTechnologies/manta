@@ -176,6 +176,12 @@ struct TrackState {
     next_word_seq: u64,
     /// MAN-33: see `Spot::rst`. Updated on every completed word.
     rst: Option<String>,
+    /// `sample_ts` of the `WordBoundary` that produced the current `rst`
+    /// (0 while `rst` is None). Only used to pick the chronologically
+    /// latest of two reports when a merge folds a losing track's
+    /// annotations into its survivor -- see `migrate_annotations` (Codex
+    /// review on PR #159).
+    rst_sample_ts: u64,
     /// MAN-33: see `Spot::qrl_query`. Set once, never cleared while the
     /// track lives.
     qrl_query: bool,
@@ -425,6 +431,7 @@ impl Validator {
                     // WORD_WINDOW. Also O(1) per word instead of a rescan.
                     if let Some(rst) = message::parse_rst(&word.text) {
                         track.rst = Some(rst);
+                        track.rst_sample_ts = *sample_ts;
                     }
                     track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
@@ -505,6 +512,10 @@ impl Validator {
                     ClosureKind::SignalEnded => self.resolve_pending_beacons(*track_id),
                     ClosureKind::Bookkeeping { survivor_track_id } => {
                         self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
+                        // MAN-33's per-track annotations are part of the
+                        // same continuing identity and migrate on exactly
+                        // the same terms (Codex review on PR #159).
+                        self.migrate_annotations(*track_id, *survivor_track_id);
                         Vec::new()
                     }
                 };
@@ -1084,6 +1095,53 @@ impl Validator {
             None => {
                 self.suppression_counts.pending_beacon_lost_to_eviction += pending.len() as u64;
             }
+        }
+    }
+
+    /// A merge continues the SAME signal identity on the survivor
+    /// (`manta-engine`'s `track.rs`, `absorb`/merge path), so the losing
+    /// track's MAN-33 annotations belong to that survivor exactly as its
+    /// `PendingBeacon`s do. Without this, an RST or `QRL?` decoded only
+    /// on the loser dies with its `TrackState` in `ingest`'s `TrackClosed`
+    /// arm and every later spot the survivor emits silently omits it
+    /// (Codex review on PR #159).
+    ///
+    /// The two fields merge on their own established semantics: `qrl_query`
+    /// is sticky, so it ORs in; `rst` is last-value-wins, so the loser's
+    /// only replaces the survivor's when it was decoded strictly LATER
+    /// (`rst_sample_ts`) -- a merge must never resurrect a stale report
+    /// over a fresher one the survivor already holds. Ordering by the
+    /// decoding timestamp rather than by merge order is what makes this
+    /// hold in both directions, since which of two converged tracks is
+    /// the survivor is a detector-side decision unrelated to which one
+    /// heard the newer report.
+    ///
+    /// An eviction (`survivor_track_id: None`) has nowhere to migrate to
+    /// and simply drops them with the track. Unlike a lost
+    /// `PendingBeacon` that is counted per ARCHITECTURE §8, no counter is
+    /// bumped: an annotation is not a suppressed spot -- it gates
+    /// nothing, and a spot still emits without it.
+    fn migrate_annotations(&mut self, track_id: u32, survivor_track_id: Option<u32>) {
+        let Some(survivor) = survivor_track_id else {
+            return;
+        };
+        let Some(track) = self.tracks.get(&track_id) else {
+            return;
+        };
+        let (rst, rst_sample_ts, qrl_query) =
+            (track.rst.clone(), track.rst_sample_ts, track.qrl_query);
+        // Nothing to carry over: don't materialize a `TrackState` for a
+        // survivor that has none yet (MAN-19's leak boundary).
+        if rst.is_none() && !qrl_query {
+            return;
+        }
+        let survivor_track = self.tracks.entry(survivor).or_default();
+        survivor_track.qrl_query |= qrl_query;
+        if rst.is_some()
+            && (survivor_track.rst.is_none() || rst_sample_ts > survivor_track.rst_sample_ts)
+        {
+            survivor_track.rst = rst;
+            survivor_track.rst_sample_ts = rst_sample_ts;
         }
     }
 
