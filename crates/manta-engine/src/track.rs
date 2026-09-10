@@ -1814,6 +1814,7 @@ mod tests {
                 sample_ts: 50,
                 glyph: manta_decode::tree::Glyph::Char('W'),
                 confidence: 1.0,
+                alternatives: Vec::new(),
             },
         ];
         sort_like_process_hops(&mut events);
@@ -1877,6 +1878,7 @@ mod tests {
                 sample_ts: 50,
                 glyph: manta_decode::tree::Glyph::Char('W'),
                 confidence: 1.0,
+                alternatives: Vec::new(),
             },
             DecoderEvent::TrackPromoted {
                 track_id: 2,
@@ -1929,6 +1931,7 @@ mod tests {
                 sample_ts: 100,
                 glyph: manta_decode::tree::Glyph::Char('W'),
                 confidence: 1.0,
+                alternatives: Vec::new(),
             },
         ];
         sort_like_process_hops(&mut events);

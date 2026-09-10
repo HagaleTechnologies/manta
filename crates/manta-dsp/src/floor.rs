@@ -17,6 +17,10 @@ const FLOOR_QUANTILE: f64 = 0.25;
 const BLOCK_CHANNELS: usize = 32;
 const BLOCK_ALLOWANCE_DB: f64 = 3.0;
 
+/// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
+/// alpha = 1 - e^(-2.667/40).
+const GATE_EMA_ALPHA: f64 = 0.0645;
+
 fn bin_index(power_db: f64) -> usize {
     (((power_db - HIST_MIN_DB) / BIN_WIDTH_DB).floor() as isize).clamp(0, HIST_BINS as isize - 1)
         as usize
@@ -100,6 +104,29 @@ pub struct FloorBank {
     floor_db: Vec<f64>,
     block_floor_db: Vec<f64>,
     hop_counter: u64,
+    /// Per-hop EMA (tau = 40 ms, same alpha as Gate) of each channel's
+    /// LINEAR power, kept here so the decoder's spectral noise reference
+    /// (SPEC v2 §2.2) needs no extra per-channel state.
+    ///
+    /// Codex review, PR #161 round 12: SPEC v2 §2.1-2.2 defines `P_s` as
+    /// an EMA of LINEAR channel power, not dB. Averaging dB values
+    /// directly understates exactly the transient this reference exists
+    /// to catch: a one-hop rise from -90 to -30 dB averages to about
+    /// -86 dB in dB-space (`GATE_EMA_ALPHA` is small, so the dB-space
+    /// mean barely moves) but about -42 dB in linear-power space -- the
+    /// correct answer, since a linear-power EMA is dominated by the
+    /// large new value the way real leakage power actually behaves.
+    /// Stored in linear units; `spectral_reference_db` converts the
+    /// selected minimum back to dB when read.
+    smoothed_lin: Vec<f64>,
+    smoothed_init: bool,
+}
+
+/// `10^(db/10)`, the inverse of `manta_dsp::channelizer::power_db`'s
+/// `10*log10(power)` (minus that function's epsilon, negligible outside
+/// the extreme floor).
+fn db_to_linear(db: f64) -> f64 {
+    10f64.powf(db / 10.0)
 }
 
 impl FloorBank {
@@ -111,6 +138,8 @@ impl FloorBank {
             floor_db: vec![HIST_MIN_DB; n_channels],
             block_floor_db: vec![HIST_MIN_DB; n_blocks],
             hop_counter: 0,
+            smoothed_lin: vec![db_to_linear(HIST_MIN_DB); n_channels],
+            smoothed_init: false,
         }
     }
 
@@ -129,6 +158,17 @@ impl FloorBank {
             power_db.len(),
             self.channels.len()
         );
+        if self.smoothed_init {
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
+                let p_lin = db_to_linear(p);
+                *s += GATE_EMA_ALPHA * (p_lin - *s);
+            }
+        } else {
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
+                *s = db_to_linear(p);
+            }
+            self.smoothed_init = true;
+        }
         if self.hop_counter % DECIMATION_HOPS == 0 {
             for (ch, &p) in self.channels.iter_mut().zip(power_db) {
                 ch.push(p);
@@ -150,11 +190,20 @@ impl FloorBank {
         let block = k / BLOCK_CHANNELS;
         self.floor_db[k].min(self.block_floor_db[block] + BLOCK_ALLOWANCE_DB)
     }
-}
 
-/// SPEC §2.3: tau=40ms at the channelizer's fixed 375 Hz hop rate ->
-/// alpha = 1 - e^(-2.667/40).
-const GATE_EMA_ALPHA: f64 = 0.0645;
+    /// SPEC v2 §2.2: minimum of the 40 ms-smoothed power over the six
+    /// guard-banded neighbor channels c±2..c±4 (wrapping), in dB,
+    /// uncorrected for the min-of-six bias (the decoder applies it).
+    pub fn spectral_reference_db(&self, c: usize) -> f64 {
+        let n = self.smoothed_lin.len() as isize;
+        let mut m = f64::INFINITY;
+        for d in [-4isize, -3, -2, 2, 3, 4] {
+            let k = (c as isize + d).rem_euclid(n) as usize;
+            m = m.min(self.smoothed_lin[k]);
+        }
+        10.0 * m.log10()
+    }
+}
 
 /// Per-channel EMA-smoothed power + rise/drop hysteresis booleans. SPEC
 /// §2.3. Carries **no** persistence/timing state (confirm-hop-counting,
@@ -398,6 +447,67 @@ mod tests {
             (gate.smoothed_db(0) - -70.0).abs() < 0.01,
             "after 500 more hops the EMA should have converged near -70.0, got {}",
             gate.smoothed_db(0)
+        );
+    }
+
+    #[test]
+    fn spectral_reference_is_min_over_guard_banded_neighbors() {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[10] = -30.0; // the track itself
+        p[11] = -40.0; // guard cell, must be ignored
+        p[12] = -70.0;
+        p[13] = -85.0;
+        p[14] = -80.0; // c+2..c+4
+        p[8] = -60.0;
+        p[7] = -95.0;
+        p[6] = -75.0; // c-2..c-4
+        for _ in 0..400 {
+            bank.update(&p);
+        } // let the EMA settle
+        let r = bank.spectral_reference_db(10);
+        assert!(
+            (r - -95.0).abs() < 0.2,
+            "expected min over {{6,7,8,12,13,14}} = -95 dB, got {r}"
+        );
+    }
+
+    #[test]
+    fn spectral_reference_wraps_at_band_edges() {
+        let mut bank = FloorBank::new(64);
+        let mut p = vec![-90.0; 64];
+        p[62] = -99.0; // c = 0 -> c-2 wraps to 62
+        for _ in 0..400 {
+            bank.update(&p);
+        }
+        assert!((bank.spectral_reference_db(0) - -99.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn spectral_reference_ema_averages_linear_power_not_db() {
+        // Codex review, PR #161 round 12: SPEC v2 §2.1-2.2 defines P_s as
+        // an EMA of LINEAR channel power. A dB-space EMA badly understates
+        // a transient rise: after settling at -90 dB, one hop at -30 dB
+        // averages to about -86 dB in dB-space but about -42 dB in
+        // linear-power space -- the correct answer, since real leakage
+        // power should actually raise the reference. Bump every guard-band
+        // neighbor of channel 10 identically so the min-of-six selection
+        // reflects the transient directly.
+        let mut bank = FloorBank::new(64);
+        let steady = vec![-90.0; 64];
+        for _ in 0..400 {
+            bank.update(&steady);
+        }
+        let mut bumped = steady.clone();
+        for &k in &[6usize, 7, 8, 12, 13, 14] {
+            bumped[k] = -30.0;
+        }
+        bank.update(&bumped);
+        let r = bank.spectral_reference_db(10);
+        assert!(
+            (r - -42.0).abs() < 1.0,
+            "expected the linear-power EMA answer (~-42 dB) after a one-hop transient across \
+             every guard-band neighbor, got {r}"
         );
     }
 }
