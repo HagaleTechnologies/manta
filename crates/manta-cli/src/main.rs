@@ -1042,6 +1042,27 @@ fn load_decode_config_file(
             path.display()
         );
     }
+    // Codex review, PR #161 round 18: a seed outside the decoder's
+    // supported [u_min, u_max] speed range (7.5..=56 hops/dit) is finite
+    // and positive and so passed the check above, but can't produce a
+    // valid initial mark transition for any real 8-60 WPM signal -- a
+    // seed list containing only such values silently emits no decoded
+    // text.
+    if let Some(bad) = cfg
+        .hsmm
+        .seed_units_hops
+        .iter()
+        .find(|u| **u < cfg.hsmm.u_min || **u > cfg.hsmm.u_max)
+    {
+        bail!(
+            "[decode] every seed_units_hops entry must be within the supported speed range \
+             [{}, {}] hops/dit in {} (got {bad}; outside that range, the seed can't produce a \
+             valid initial mark transition for any real signal)",
+            cfg.hsmm.u_min,
+            cfg.hsmm.u_max,
+            path.display()
+        );
+    }
     // Codex review, PR #161 round 4: `conf_kappa = 0` makes the common
     // no-competing-hypothesis path (s_alt == best.score) compute `0 / 0`
     // in `margin`'s confidence sigmoid, emitting a NaN character/word-
@@ -2631,6 +2652,18 @@ mod tests {
     #[test]
     fn load_decode_config_file_rejects_a_nonpositive_seed_unit() {
         let f = write_temp_file(b"[decode]\nseed_units_hops = [9.0, 0.0, 18.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_seed_unit_below_u_min() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = [1.0]\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_seed_unit_above_u_max() {
+        let f = write_temp_file(b"[decode]\nseed_units_hops = [100.0]\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
