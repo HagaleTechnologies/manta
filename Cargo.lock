@@ -883,6 +883,7 @@ dependencies = [
  "clap",
  "coppa-audio",
  "ctrlc",
+ "libc",
  "manta-decode",
  "manta-engine",
  "manta-input",
