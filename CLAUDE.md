@@ -27,7 +27,9 @@ is still `legacy`; `hsmm` (MAN-166 decode-core-v2) is implemented and
 CLI-reachable but not promoted — stage-2 gate measured FAIL 2026-09-09
 (oracle as_word 56%/framed 32% vs required 60%/40%; 4/11 V-vectors, 3/9
 VR-vectors pass) — see
-docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
+docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md. Variable-width
+capture (issue #169, `--capture-rate-hz`) implemented -- see
+docs/superpowers/specs/2026-09-09-variable-width-capture-design.md.
 
 ## Documents (read in this order)
 
@@ -107,7 +109,6 @@ in other clones, branches, or worktrees.
   --squash` right after opening; GitHub merges it unattended once required
   CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green. See
   docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md.
-
 
 ## Code review convergence
 

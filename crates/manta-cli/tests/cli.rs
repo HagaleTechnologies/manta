@@ -217,6 +217,245 @@ fn deprecated_daemon_spelling_warns_on_stderr_and_names_the_replacement() {
 }
 
 #[test]
+fn capture_rate_hz_that_does_not_evenly_divide_the_source_rate_is_a_clean_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 48_000.0; // AudioIqSource requires exactly 48000 Hz native
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "20000"]) // 48000/20000 is not an integer
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--capture-rate-hz") || stderr.contains("power of two"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn capture_rate_hz_that_divides_evenly_decimates_and_still_decodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 48_000.0; // AudioIqSource requires exactly 48000 Hz native
+    spec.duration_s = 10.0; // short scene, this test only proves the wiring runs end-to-end
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "24000"]) // 48000 -> 24000, factor 2
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn capture_rate_hz_replays_a_2channel_iq_wav_through_wav_iq_source() {
+    // MAN-169 round-2 Codex finding: `open_audio_source` used to route
+    // every `--source <path>.wav` through `AudioIqSource::from_wav_file`
+    // unconditionally, which hard-rejects every rate but 48000 Hz -- so a
+    // 96/192 kS/s raw complex-IQ replay (the format `decode`/`oracle`
+    // already read directly) could never reach `--capture-rate-hz`'s
+    // decimation wrapper via the CLI at all; only golden-vector tests that
+    // called `Decimator` directly (`golden_decimated_capture.rs`) ever
+    // exercised that combination. This drives the real `run --source ...
+    // --capture-rate-hz ...` CLI path end-to-end against a genuine
+    // 2-channel 96 kHz IQ WAV to prove `open_audio_source` now detects the
+    // 2-channel case and routes it through `WavIqSource` instead, unlocking
+    // decimated file replay the same way it already works for live SDR
+    // sources.
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 96_000.0;
+    spec.duration_s = 10.0; // short scene, this test only proves the wiring runs end-to-end
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--capture-rate-hz", "48000"]) // 96000 -> 48000, factor 2
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn without_source_iq_a_2channel_wav_is_still_treated_as_stereo_audio() {
+    // MAN-169 round-4 Codex finding (Finding A): channel count alone can't
+    // distinguish a genuine 2-channel raw-IQ capture from an ordinary
+    // stereo real-audio recording -- both `WavIqSource` and `AudioIqSource`
+    // accept 2-channel WAVs. Without `--source-iq`, `--source` must always
+    // go through `AudioIqSource::from_wav_file` (the pre-round-2, and
+    // pre-this-PR, default), never `WavIqSource`. Proven indirectly: v1()'s
+    // default fs is 96000 Hz, and `AudioIqSource::from_wav_file` hard-
+    // rejects every rate but 48000 -- so this must fail with that source's
+    // own "48000" error, not a `WavIqSource`-shaped success or a different
+    // error, proving the 2-channel WAV was never silently reinterpreted as
+    // IQ.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1(); // fs=96_000, 2-channel WAV, no --source-iq
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("48000"),
+        "expected AudioIqSource's rate-mismatch error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("IQ WAV must have"),
+        "must not go through WavIqSource without --source-iq: {stderr}"
+    );
+}
+
+#[test]
+fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
+    // MAN-169 round-3 Codex finding: `has_rf_aware_source` (the gate behind
+    // `--dial-freq-hz is required with --config`) only checked kiwi/soapy/
+    // hpsdr CLI flags -- a 2-channel IQ WAV replay with a real
+    // `<stem>.json` sidecar center frequency (the same file format Task 2's
+    // `WavIqSource` round-2 fix unlocked for --capture-rate-hz) was still
+    // wrongly rejected as "not RF-aware" and forced a redundant
+    // --dial-freq-hz, even though the source already reports a real RF
+    // center via WavIqSource::center_freq_hz(). This proves the gate no
+    // longer fires for that case -- the run still fails (the --config path
+    // doesn't exist), but it must fail for THAT reason, not the
+    // --dial-freq-hz one, proving the RF-awareness check itself now passes.
+    // Requires --source-iq (round-4: no more channel-count sniffing).
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1(); // fs=96_000, center_freq_hz=14_000_000 (nonzero)
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("--dial-freq-hz"),
+        "RF-awareness gate should not fire for an IQ WAV with a real sidecar: {stderr}"
+    );
+}
+
+#[test]
+fn config_still_requires_dial_freq_hz_for_a_negative_sidecar_center_freq() {
+    // MAN-169 round-5 Codex finding: source_iq_has_real_rf_center's old
+    // `!= 0.0` check treated a negative center_freq_hz as RF-aware too --
+    // an RF dial frequency in this domain is never negative, so a negative
+    // sidecar value must still trip the --dial-freq-hz guard, the same as
+    // the round-4 zero-sentinel case.
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.center_freq_hz = -1_000_000.0;
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dial-freq-hz"),
+        "a negative sidecar center_freq_hz must still require --dial-freq-hz: {stderr}"
+    );
+}
+
+#[test]
+fn config_requires_dial_freq_hz_for_an_iq_wav_with_a_zero_sidecar_center() {
+    // MAN-169 round-4 Codex finding (Finding B): a `<stem>.json` sidecar
+    // existing is not proof its `center_freq_hz` is meaningful --
+    // `center_freq_hz: 0.0` is `WavIqSource`'s own "unknown center"
+    // sentinel (the same value it reports when there's no sidecar at all),
+    // so existence-only checking wrongly bypassed the --dial-freq-hz guard
+    // for a source that doesn't actually report a real RF center. This
+    // proves the opposite of the sibling "real sidecar" test above: the
+    // guard must still fire when the sidecar's value is the zero sentinel.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        center_freq_hz: 0.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dial-freq-hz"),
+        "a sidecar with center_freq_hz: 0.0 must not bypass the --dial-freq-hz guard: {stderr}"
+    );
+}
+
+#[test]
+fn capture_rate_hz_rejects_non_finite_and_degenerately_small_values() {
+    // MAN-169 whole-branch review finding: a small --capture-rate-hz (e.g.
+    // 187.5 Hz, reachable as 48000/256) resolves to a Channelizer with
+    // hop=0, which hangs Channelizer::process's read-advancing loop
+    // forever. Caught here, at CLI-parse time -- before any source is
+    // opened -- via parse_capture_rate_hz's MIN_CAPTURE_RATE_HZ floor, not
+    // just later at Decimator::new's own construction-time check.
+    // "-inf"/negative values aren't exercised here, same reasoning as
+    // hpsdr_rate_rejects_non_finite_values above: clap treats a leading
+    // "-" as a new flag rather than this value unless
+    // `allow_negative_numbers` is set, which this flag doesn't need since
+    // every legitimate rate is positive.
+    for bad_rate in ["NaN", "inf", "0", "187.5", "500"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args([
+                "run",
+                "--source",
+                "/nonexistent-for-this-test.wav",
+                "--capture-rate-hz",
+                bad_rate,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--capture-rate-hz {bad_rate} should be rejected before any I/O"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("capture-rate-hz"),
+            "expected an explanatory error for --capture-rate-hz {bad_rate}, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("nonexistent-for-this-test"),
+            "should fail at CLI-parse time, before the source file is ever opened: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn the_ad_hoc_listen_path_is_not_nagged() {
     // The ticket title keeps `listen` for audio/dev testing, and
     // docs/RUNBOOKS/m1-w1aw-live-copy.md still instructs `listen --device`.

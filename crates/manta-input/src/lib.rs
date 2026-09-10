@@ -8,6 +8,9 @@ pub use audio::{AudioIqSource, TARGET_RATE_HZ};
 pub mod kiwi;
 pub use kiwi::KiwiIqSource;
 
+pub mod decimate;
+pub use decimate::DecimatingSource;
+
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]
