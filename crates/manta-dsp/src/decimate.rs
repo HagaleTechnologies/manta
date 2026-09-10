@@ -19,10 +19,9 @@ fn sinc(x: f64) -> f64 {
 }
 
 /// Number of taps in each halfband decimate-by-2 stage. Odd length,
-/// Kaiser-windowed at the channelizer prototype's 80 dB target (SPEC
-/// §1.2's `KAISER_BETA`) so the decimator isn't the weakest link in the
-/// alias-rejection chain. Starting value; raised in Step 2 below if the
-/// stopband test doesn't clear -78 dB.
+/// Kaiser-windowed at the channelizer prototype's 80 dB stopband target
+/// (SPEC §1.2's `KAISER_BETA`) so the decimator isn't the weakest link in
+/// the alias-rejection chain.
 pub const HALFBAND_TAPS: usize = 127;
 
 /// Design one halfband lowpass stage: ideal cutoff at fs_in/4 (the new
@@ -49,6 +48,11 @@ pub fn design_halfband(taps: usize) -> Vec<f32> {
 /// One halfband decimate-by-2 stage: direct-form FIR, computed only at
 /// kept (every-other) input instants -- never spends a multiply-
 /// accumulate on a sample that will be dropped.
+///
+/// NOTE: does not (yet) skip the ~half of `taps` that are structurally
+/// exactly zero (the classic halfband property) -- see
+/// `docs/SPEC-decode-core.md` §1.5 and issue #176 for the unrealized 2x
+/// MAC saving and the still-missing Pi4 CPU-budget bench for this stage.
 struct HalfbandStage {
     taps: Vec<f32>,
     hist: std::collections::VecDeque<Complex32>,
@@ -98,7 +102,13 @@ impl Decimator {
     /// satisfy the channelizer's `fs/93.75` power-of-two table constraint
     /// (same validation shape as `Channelizer::new`/
     /// `SingleChannelExtractor::new`) -- a bad target rate fails here, at
-    /// construction, not silently downstream.
+    /// construction, not silently downstream. Also rejects a channel count
+    /// `n < 4`: `Channelizer::new` sets `hop = n / 4`, which is exactly 0
+    /// for `n` in `{1, 2}` (both of which are otherwise valid powers of
+    /// two) -- `Channelizer::process`'s `self.read += self.hop` loop then
+    /// never advances and never terminates, hanging the process on its
+    /// first call. `n == 4` gives `hop == 1`, which advances fine, so `n >=
+    /// 4` is the exact safe floor, not merely a conservative guess.
     pub fn new(fs_in: f64, factor: usize) -> Result<Self, String> {
         if factor == 0 || !factor.is_power_of_two() {
             return Err(format!("decimation factor {factor} must be a power of two"));
@@ -106,9 +116,10 @@ impl Decimator {
         let fs_out = fs_in / factor as f64;
         let nf = fs_out / CHANNEL_SPACING_HZ;
         let n = nf.round() as usize;
-        if (nf - n as f64).abs() > 1e-9 || !n.is_power_of_two() {
+        if (nf - n as f64).abs() > 1e-9 || !n.is_power_of_two() || n < 4 {
             return Err(format!(
-                "unsupported target rate {fs_out}: fs/93.75 must be a power of two"
+                "unsupported target rate {fs_out}: fs/93.75 must be a power of two >= 4 \
+                 (a channelizer with fewer than 4 channels has hop=0 and hangs)"
             ));
         }
         let n_stages = factor.trailing_zeros() as usize;
@@ -218,6 +229,20 @@ mod tests {
         // fs_in=100_000, factor=2 (a power of two) -> fs_out=50_000, whose
         // fs/93.75 = 533.33.. is not an integer, let alone a power of two.
         assert!(Decimator::new(100_000.0, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_degenerate_channel_count_that_would_hang_the_channelizer() {
+        // fs_in=48_000, factor=256 (a power of two) -> fs_out=187.5, whose
+        // fs/93.75 = 2 IS a power of two, so the old check alone would
+        // accept this -- but Channelizer::new's hop = n/4 = 0 for n=2,
+        // which hangs Channelizer::process's read-advancing loop forever.
+        // Must be rejected at construction, not hang the process later.
+        assert!(Decimator::new(48_000.0, 256).is_err());
+        // n=1 (fs_out=93.75) is equally degenerate.
+        assert!(Decimator::new(375.0, 4).is_err());
+        // n=4 (fs_out=375, hop=1) is the smallest table size that is safe.
+        assert!(Decimator::new(1_500.0, 4).is_ok());
     }
 
     #[test]
