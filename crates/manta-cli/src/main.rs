@@ -1009,10 +1009,16 @@ fn load_decode_config_file(
     // a non-finite value corrupts every present hop the same way. Both
     // edge-legacy and hsmm then silently stop decoding or propagate NaN
     // scores.
-    if !cfg.evidence.sigma_u.is_finite() || cfg.evidence.sigma_u <= 0.0 {
+    // Codex review, PR #161 round 20: fresh evidence beyond the zero-value
+    // case above -- a finite-but-tiny sigma_u (e.g. 1e-30) still passes
+    // `> 0.0`, yet `sigma_u * sigma_u` underflows to exactly 0.0 in f32,
+    // permanently poisoning the evidence prefix with NaN. Same underflow
+    // class as dur_sigma's MIN_DUR_SIGMA floor.
+    const MIN_SIGMA_U: f32 = 1e-3;
+    if !cfg.evidence.sigma_u.is_finite() || cfg.evidence.sigma_u < MIN_SIGMA_U {
         bail!(
-            "[decode] sigma_u must be finite and positive in {} (got {}; 0 or non-finite makes \
-             every present hop's LLR permanently NaN)",
+            "[decode] sigma_u must be finite and >= {MIN_SIGMA_U} in {} (got {}; smaller values \
+             can underflow the LLR denominator to 0/0)",
             path.display(),
             cfg.evidence.sigma_u
         );
@@ -1112,12 +1118,20 @@ fn load_decode_config_file(
             cfg.evidence.hold_dits
         );
     }
-    if max_h >= manta_decode::evidence::MAX_RETAIN as f64 {
+    // Codex review, PR #161 round 20: fresh evidence beyond the earlier
+    // retention-bound fix -- `Evidence::set_u_ref` rounds `hold_dits *
+    // u_ref` before enforcing `h < MAX_RETAIN` (`.round().max(1.0)`), so
+    // comparing the unrounded product here can accept a value that
+    // rounds UP into the cap once actually used (e.g. hold_dits=73.14 at
+    // u_max=56 gives 4095.84, accepted here, but rounds to 4096).
+    // Compare the same rounded value Evidence itself uses.
+    let max_h_rounded = max_h.round().max(1.0);
+    if max_h_rounded >= manta_decode::evidence::MAX_RETAIN as f64 {
         bail!(
-            "[decode] hold_dits={} is too large in {}: at the configured u_max={}, the hold \
-             window (hold_dits * u_max = {max_h}) would reach or exceed Evidence's internal \
-             retention cap ({}), silently truncating the delay line and discarding evidence \
-             centers",
+            "[decode] hold_dits={} is too large in {}: at the configured u_max={}, the rounded \
+             hold window (round(hold_dits * u_max) = {max_h_rounded}) would reach or exceed \
+             Evidence's internal retention cap ({}), silently truncating the delay line and \
+             discarding evidence centers",
             cfg.evidence.hold_dits,
             path.display(),
             cfg.hsmm.u_max,
@@ -2644,6 +2658,15 @@ mod tests {
     }
 
     #[test]
+    fn load_decode_config_file_rejects_a_sigma_u_too_small_to_avoid_underflow() {
+        // Codex review, PR #161 round 20: 1e-30 is finite and > 0.0 (so
+        // the original check alone passed it), but sigma_u * sigma_u
+        // underflows to exactly 0.0 in f32.
+        let f = write_temp_file(b"[decode]\nsigma_u = 1e-30\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
     fn load_decode_config_file_rejects_empty_seed_units_hops() {
         let f = write_temp_file(b"[decode]\nseed_units_hops = []\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
@@ -2700,6 +2723,17 @@ mod tests {
         // hold_dits (300) at the default u_max (56.0) computes h = 16800,
         // far past Evidence's MAX_RETAIN (4096).
         let f = write_temp_file(b"[decode]\nhold_dits = 300\n");
+        assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn load_decode_config_file_rejects_a_hold_dits_that_only_overflows_after_rounding() {
+        // Codex review, PR #161 round 20: hold_dits=73.14 at the default
+        // u_max (56.0) computes an UNROUNDED product of 4095.84 -- under
+        // MAX_RETAIN (4096) -- but Evidence::set_u_ref rounds before
+        // enforcing the cap, and round(4095.84) = 4096, which is not
+        // "well under" MAX_RETAIN.
+        let f = write_temp_file(b"[decode]\nhold_dits = 73.14\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
