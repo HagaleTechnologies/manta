@@ -26,7 +26,10 @@
 //! United States entry reads `91.87`), while this module's `Entry::lon`
 //! uses the ordinary east-positive convention (GeoJSON, most mapping
 //! libraries) that `manta-server`'s JSON stream (`dxLon`/`deLon`) is
-//! expected to emit.
+//! expected to emit. The primary-prefix field (field 8) doubles as the join
+//! key into the vendored `dxcc.tsv` ADIF DXCC entity-number table (MAN-136,
+//! `Table::parse_with_dxcc`) -- AD1C's `cty.dat` itself carries no ADIF
+//! entity numbers.
 
 /// Per-entity metadata carried alongside a prefix, from the `cty.dat`
 /// header line's `cq-zone`/`continent`/`lat`/`lon` fields (see the module
@@ -39,6 +42,14 @@ pub struct Entry {
     pub cq_zone: u16,
     pub lat: f64,
     pub lon: f64,
+    /// ADIF DXCC entity number for this entity, joined from the vendored
+    /// `dxcc.tsv` on the `cty.dat` header's primary-prefix field (MAN-136).
+    /// `None` only if the two vendored files have drifted -- which
+    /// `every_entity_in_the_vendored_cty_dat_resolves_an_adif_dxcc_number`
+    /// exists to catch. Callers must treat `None` as "unknown", never as a
+    /// number: ADIF's code 0 means "confirmed NOT in any DXCC entity", a
+    /// different and false claim.
+    pub dxcc: Option<u16>,
 }
 
 /// One accumulated `(prefix, entry, is_exact)` row, tracked separately
@@ -62,8 +73,16 @@ pub struct Table {
 }
 
 impl Table {
-    /// Parses a `cty.dat` file's full contents.
+    /// Parses a `cty.dat` file's full contents, joining each entity against
+    /// the vendored ADIF DXCC number table.
     pub fn parse(cty_dat: &str) -> Self {
+        Self::parse_with_dxcc(cty_dat, crate::DXCC_TSV)
+    }
+
+    /// `parse` with an explicit DXCC table -- for tests that need to exercise
+    /// a drifted or malformed table without touching the vendored file.
+    pub fn parse_with_dxcc(cty_dat: &str, dxcc_tsv: &str) -> Self {
+        let dxcc_table = parse_dxcc_table(dxcc_tsv);
         let mut rows: Vec<(Row, bool /* is_starred */)> = Vec::new();
         for raw_entry in cty_dat.split(';') {
             let raw_entry = raw_entry.trim();
@@ -73,9 +92,16 @@ impl Table {
             let Some(alias_start) = raw_entry.rfind(':') else {
                 continue; // malformed entry, skip
             };
-            let Some((entry, is_starred)) = parse_header(&raw_entry[..alias_start]) else {
+            let header = &raw_entry[..alias_start];
+            let Some((mut entry, is_starred)) = parse_header(header) else {
                 continue; // malformed header, skip
             };
+            entry.dxcc = parse_header_primary_prefix(header).and_then(|pfx| {
+                dxcc_table
+                    .binary_search_by(|row: &(String, u16)| row.0.as_str().cmp(pfx.as_str()))
+                    .ok()
+                    .map(|i| dxcc_table[i].1)
+            });
             for alias in raw_entry[alias_start + 1..].split(',') {
                 if let Some((prefix, is_exact, zone_override)) = clean_alias(alias) {
                     let mut entry = entry.clone();
@@ -187,9 +213,41 @@ fn parse_header(header: &str) -> Option<(Entry, bool)> {
             continent: fields[3].to_uppercase(),
             lat: fields[4].parse().ok()?,
             lon: -raw_lon, // west-positive (AD1C) -> east-positive; see module doc.
+            dxcc: None,    // filled in by the caller -- see `Table::parse_with_dxcc`.
         },
         is_starred,
     ))
+}
+
+/// The header's primary-prefix field (field 8), `*` stripped, uppercased --
+/// the join key into `dxcc.tsv`. A starred subentity joins on its own
+/// prefix, which AD1C maps to its PARENT's DXCC number (Sicily -> Italy's
+/// 248), which is exactly the desired behavior.
+fn parse_header_primary_prefix(header: &str) -> Option<String> {
+    let fields: Vec<&str> = header.split(':').map(str::trim).collect();
+    if fields.len() != 8 {
+        return None;
+    }
+    Some(fields[7].trim_start_matches('*').to_uppercase())
+}
+
+/// Parses `dxcc.tsv` into a prefix-sorted lookup table. Comment (`#`) and
+/// blank lines are skipped; a row missing either field, or whose second
+/// field isn't a number, is skipped rather than shifting the table.
+fn parse_dxcc_table(tsv: &str) -> Vec<(String, u16)> {
+    let mut v: Vec<(String, u16)> = tsv
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let pfx = f.next()?.trim().to_uppercase();
+            let num: u16 = f.next()?.trim().parse().ok()?;
+            Some((pfx, num))
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v.dedup_by(|a, b| a.0 == b.0);
+    v
 }
 
 /// Strips a leading `=` (exact-call marker) and any trailing
@@ -440,5 +498,88 @@ China:            24: 44: AS:  35.0: -103.0: -8.0: BY:
     fn lookup_returns_none_for_unallocated_callsign() {
         let table = Table::parse(FIXTURE);
         assert!(table.lookup("ZZ9ZZZ").is_none());
+    }
+
+    /// MAN-136: the whole point of vendoring the table is that it covers the
+    /// vendored cty.dat COMPLETELY. A `cty.dat` refresh that adds an entity the
+    /// table doesn't know would otherwise silently downgrade that entity's spots
+    /// to the UNKNOWN_DXCC sentinel forever. This test is the tripwire: it fails
+    /// loudly at refresh time instead.
+    #[test]
+    fn every_entity_in_the_vendored_cty_dat_resolves_an_adif_dxcc_number() {
+        let table = Table::parse(crate::CTY_DAT);
+        let missing: Vec<&str> = table
+            .entries
+            .iter()
+            .filter(|r| r.entry.dxcc.is_none())
+            .map(|r| r.prefix.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "prefixes with no ADIF DXCC number (refresh data/dxcc.tsv via \
+             scripts/gen-dxcc-table.sh): {missing:?}"
+        );
+    }
+
+    /// Spot-checks against the REAL vendored data, across the shapes that
+    /// exercise different parts of the lookup: a generic prefix, a longest-match
+    /// subdivision, a starred subentity (which must inherit its PARENT's number,
+    /// not get one of its own), and an exact-call alias carrying a portable
+    /// suffix.
+    #[test]
+    fn real_callsigns_resolve_their_documented_adif_entity_numbers() {
+        let t = Table::parse(crate::CTY_DAT);
+        for (call, want) in [
+            ("W1AW", 291),     // United States, generic K/W/N prefix
+            ("JA1ABC", 339),   // Japan
+            ("KL7AB", 6),      // Alaska -- longest match beats the generic K
+            ("KH6XX", 110),    // Hawaii -- ditto
+            ("VE3ABC", 1),     // Canada
+            ("G3ABC", 223),    // England
+            ("GM4XYZ", 279),   // Scotland
+            ("IT9ABC", 248),   // Sicily -- STARRED subentity, inherits Italy's 248
+            ("JW/LB2PG", 259), // Svalbard -- via the JW/ prefix
+        ] {
+            assert_eq!(t.lookup(call).and_then(|e| e.dxcc), Some(want), "{call}");
+        }
+    }
+
+    /// A genuinely unallocated call still resolves to nothing at all -- the DXCC
+    /// work must not accidentally make the allocation gate more permissive.
+    /// NOTE: "ZZ9ZZZ" is NOT usable here -- it resolves to Brazil (108) against
+    /// the real vendored file via the ZZ prefix, and so does "NOCALL" (291, via
+    /// N). ITU allocates no Q prefixes, so QQ1AAA is genuinely unallocated.
+    #[test]
+    fn an_unallocated_callsign_still_resolves_to_nothing() {
+        let t = Table::parse(crate::CTY_DAT);
+        assert!(t.lookup("QQ1AAA").is_none());
+        assert!(!t.is_allocated("QQ1AAA"));
+    }
+
+    /// The table parser tolerates the file's own comment/blank lines and skips
+    /// malformed rows rather than panicking or shifting the whole table.
+    #[test]
+    fn dxcc_table_parser_skips_comments_blanks_and_malformed_rows() {
+        let cty = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N;
+";
+        let tsv = "# comment\n\nK\t291\tUnited States\nBOGUS-NO-NUMBER\nZZZ\tnotanumber\n";
+        let t = Table::parse_with_dxcc(cty, tsv);
+        assert_eq!(t.lookup("W1AW").and_then(|e| e.dxcc), Some(291));
+    }
+
+    /// An entity absent from the table resolves geography but not a DXCC number
+    /// -- the UNKNOWN_DXCC path in `spot_message` depends on exactly this.
+    #[test]
+    fn an_entity_missing_from_the_dxcc_table_resolves_geography_but_no_number() {
+        let cty = "\
+Atlantis:        99: 99: EU:  0.0:  0.0:  0.0:  XQ9:
+    XQ9;
+";
+        let t = Table::parse_with_dxcc(cty, "K\t291\tUnited States\n");
+        let e = t.lookup("XQ9AA").expect("geography still resolves");
+        assert_eq!(e.continent, "EU");
+        assert_eq!(e.dxcc, None);
     }
 }
