@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
 
-<<<<<<< HEAD
 /// Spots abandoned when a client connection terminates on a failed write,
 /// or (via `Metrics::record_dropped_shutdown`) on a clean shutdown before
 /// any write was attempted. `in_flight_spot` is true when the write that
@@ -38,7 +37,8 @@ use std::sync::RwLock;
 /// policy is testable without a live socket.
 pub fn abandoned_spot_count(in_flight_spot: bool, still_queued: usize) -> u64 {
     still_queued as u64 + u64::from(in_flight_spot)
-=======
+}
+
 /// Packet-level input-stream health for one source, injected by the daemon
 /// wiring layer (see module doc) -- `manta-server` has no `manta-input`
 /// dependency and cannot read these itself (MAN-56). Deliberately a
@@ -54,7 +54,6 @@ pub struct InputHealth {
     pub dropped_packets: u64,
     pub gaps_detected: u64,
     pub malformed_packets: u64,
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 }
 
 #[derive(Default)]

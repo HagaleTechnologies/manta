@@ -1470,6 +1470,34 @@ fn main() -> Result<()> {
                             }
                             None => server.metrics.set_source_health(source_name, true),
                         }
+
+                        // MAN-56: HPSDR's packet loss/malformed counters are
+                        // input-layer state manta-server cannot compute itself
+                        // (it has no manta-input dependency). Sample them into
+                        // Metrics on a timer, the same wiring-layer-injection
+                        // shape `set_source_health` uses above -- and read the
+                        // handle HERE, before `listen(src, ..)` below takes
+                        // ownership of the source for the rest of the run.
+                        // Sources with no wire-packet loss model return None
+                        // and publish no series at all, which is deliberate:
+                        // a permanently-zero counter reads as "no loss" rather
+                        // than "not measured" (ARCHITECTURE §8's
+                        // "absent means not measured" distinction).
+                        if let Some(counters) = src.health_counters() {
+                            let metrics = server.metrics.clone();
+                            // Published once eagerly so the series exists (at
+                            // 0) from the very first scrape rather than only
+                            // after one poll interval.
+                            metrics.set_input_health(source_name, input_health_of(&counters));
+                            rt.spawn(async move {
+                                loop {
+                                    tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                                    metrics
+                                        .set_input_health(source_name, input_health_of(&counters));
+                                }
+                            });
+                        }
+
                         (
                             Some(rt),
                             Some(server),
@@ -1477,42 +1505,8 @@ fn main() -> Result<()> {
                             Some(active_tracks_poller),
                         )
                     }
-<<<<<<< HEAD
                     None => (None, None, None, None),
                 };
-=======
-
-                    // MAN-56: HPSDR's packet loss/malformed counters are
-                    // input-layer state manta-server cannot compute itself
-                    // (it has no manta-input dependency). Sample them into
-                    // Metrics on a timer, the same wiring-layer-injection
-                    // shape `set_source_health` uses above -- and read the
-                    // handle HERE, before `listen(src, ..)` below takes
-                    // ownership of the source for the rest of the run.
-                    // Sources with no wire-packet loss model return None
-                    // and publish no series at all, which is deliberate:
-                    // a permanently-zero counter reads as "no loss" rather
-                    // than "not measured" (cf. ARCHITECTURE §8's
-                    // manta_active_tracks caveat).
-                    if let Some(counters) = src.health_counters() {
-                        let metrics = server.metrics.clone();
-                        // Published once eagerly so the series exists (at
-                        // 0) from the very first scrape rather than only
-                        // after one poll interval.
-                        metrics.set_input_health(source_name, input_health_of(&counters));
-                        rt.spawn(async move {
-                            loop {
-                                tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
-                                metrics.set_input_health(source_name, input_health_of(&counters));
-                            }
-                        });
-                    }
-
-                    (Some(rt), Some(server))
-                }
-                None => (None, None),
-            };
->>>>>>> 20e91d58961caba4d8523ddbd38998f44a38977a
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
