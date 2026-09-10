@@ -113,19 +113,12 @@ impl Evidence {
         );
     }
 
-    /// Codex review, PR #161 round 9: returns every center that becomes
-    /// eligible from this one input sample, not just one. `set_u_ref`
-    /// shrinking `h` (a genuine speed increase) can make several already-
-    /// buffered centers eligible at once; the old one-in-one-out design
-    /// emitted only the first of them per call, so each SUBSEQUENT input
-    /// added one new sample and drained exactly one center -- the backlog
-    /// never actually contracted, and evidence (and therefore spots) kept
-    /// carrying the OLD, slower-speed latency instead of collapsing to
-    /// the new `hold_dits * u_ref` delay SPEC v2 §1.2 specifies. Usually
-    /// returns 0 or 1 elements (matching the old behavior exactly when
-    /// `h` is stable or growing); returns more only in the window-shrink
-    /// catch-up case this fixes.
-    pub fn push(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) -> Vec<HopEvidence> {
+    /// Record one new input sample into the delay line. Emits nothing
+    /// itself -- call `drain_one` afterward (in a loop) to read off every
+    /// center this sample made eligible. See `drain_one`'s doc comment
+    /// for why callers that need per-hop feedback must use this split
+    /// instead of `push`.
+    pub(crate) fn record(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) {
         let a_s = match self.a_s {
             None => amp,
             Some(p) => p + self.alpha_a * (amp - p),
@@ -136,28 +129,60 @@ impl Evidence {
         if self.line.len() > MAX_RETAIN {
             self.line.pop_front();
         }
+    }
+
+    /// Drain exactly one currently-eligible center (bounded by the live
+    /// hold window `h`), or `None` if none is eligible yet.
+    ///
+    /// Codex review, PR #161 round 11: round 9 fixed `push` under-
+    /// draining a shrunk hold window's backlog by looping internally and
+    /// returning the WHOLE newly-eligible batch in one `Vec`. But every
+    /// hop in a single batch was centered using the SAME `self.h` --
+    /// whatever it was when the call started -- since nothing inside one
+    /// `push` call can update `h` mid-loop (`set_u_ref` is only ever
+    /// called by the CALLER, after the whole batch already came back). If
+    /// an early hop's decode result would have changed the speed
+    /// estimate again during catch-up, every LATER hop in that same
+    /// batch still got centered against the STALE window instead of the
+    /// freshly updated one. This method plus `record` let a caller
+    /// (`push_hop_hsmm`) apply `set_u_ref` feedback BETWEEN every single
+    /// drained hop, exactly like `finish()`'s incremental flush loop
+    /// (`flush_one`) already does.
+    pub fn drain_one(&mut self) -> Option<HopEvidence> {
+        let front_global = self.hop_in - self.line.len() as u64;
+        if self.next_center_g < front_global {
+            // Fell behind the retained window (should not happen with a
+            // generous MAX_RETAIN in practice); jump to the oldest
+            // available sample rather than panic on the subtraction below.
+            self.next_center_g = front_global;
+        }
+        let local = (self.next_center_g - front_global) as usize;
+        // `checked_add` guards against a pathological `h` (e.g. from an
+        // unvalidated `set_u_ref` input) overflowing `usize`; treat an
+        // overflow the same as "not enough lookahead yet" rather than
+        // panicking (debug) or wrapping into a spurious true / OOB index
+        // (release). The debug_assert!s in `new()`/`set_u_ref()` are the
+        // primary guard -- this is the release-build backstop.
+        match local.checked_add(self.h) {
+            Some(reach) if reach < self.line.len() => {}
+            _ => return None, // not enough forward lookahead yet (or overflow)
+        }
+        let ev = self.emit(local);
+        self.next_center_g += 1;
+        Some(ev)
+    }
+
+    /// Record one input sample and drain every center it makes eligible
+    /// in one call. Correct for callers with no per-hop feedback to apply
+    /// between drained hops (EdgeLegacy, which never calls `set_u_ref`;
+    /// tests) -- see `drain_one`'s doc comment for why a caller that DOES
+    /// have such feedback (`push_hop_hsmm`) must use `record`+`drain_one`
+    /// directly instead of this convenience wrapper.
+    pub fn push(&mut self, amp: f32, noise_amp: f32, sample_ts: u64) -> Vec<HopEvidence> {
+        self.record(amp, noise_amp, sample_ts);
         let mut out = Vec::new();
-        loop {
-            let front_global = self.hop_in - self.line.len() as u64;
-            if self.next_center_g < front_global {
-                // Fell behind the retained window (should not happen with a
-                // generous MAX_RETAIN in practice); jump to the oldest
-                // available sample rather than panic on the subtraction below.
-                self.next_center_g = front_global;
-            }
-            let local = (self.next_center_g - front_global) as usize;
-            // `checked_add` guards against a pathological `h` (e.g. from an
-            // unvalidated `set_u_ref` input) overflowing `usize`; treat an
-            // overflow the same as "not enough lookahead yet" rather than
-            // panicking (debug) or wrapping into a spurious true / OOB index
-            // (release). The debug_assert!s in `new()`/`set_u_ref()` are the
-            // primary guard -- this is the release-build backstop.
-            match local.checked_add(self.h) {
-                Some(reach) if reach < self.line.len() => {}
-                _ => break, // not enough forward lookahead yet (or overflow)
-            }
-            out.push(self.emit(local));
-            self.next_center_g += 1;
+        while let Some(ev) = self.drain_one() {
+            out.push(ev);
         }
         out
     }
@@ -503,6 +528,39 @@ mod tests {
             drained.len() > 1,
             "expected the shrink to drain multiple backlogged centers in one call, got {}",
             drained.len()
+        );
+    }
+
+    #[test]
+    fn drain_one_reflects_a_set_u_ref_call_made_between_drains() {
+        // Codex review, PR #161 round 11: a caller doing record() once
+        // then drain_one() in a loop, calling set_u_ref BETWEEN drains,
+        // must have each subsequent drain reflect the CURRENT h -- round
+        // 9's original single-call batch design (materializing the whole
+        // newly-eligible Vec inside one `push` call) could not do this,
+        // since nothing inside that one call could ever update `h`
+        // mid-loop.
+        let mut e = Evidence::new(EvidenceConfig::default());
+        let h_before = (EvidenceConfig::default().hold_dits * EvidenceConfig::default().u_init_hops)
+            .round() as usize;
+        for i in 0..(h_before as u64 * 3) {
+            e.push(1.0, 0.01, i);
+        }
+        e.record(1.0, 0.01, h_before as u64 * 3);
+        let h_at_first_drain = e.h;
+        assert!(
+            e.drain_one().is_some(),
+            "sanity: at least one center must be eligible before any shrink"
+        );
+        e.set_u_ref(1.0); // shrinks h to hold_dits * 1.0 = 4
+        assert!(
+            e.h < h_at_first_drain,
+            "sanity: h must have actually shrunk"
+        );
+        assert!(
+            e.drain_one().is_some(),
+            "a set_u_ref call between two drain_one calls (no new record() in between) must \
+             make another backlogged center immediately eligible under the new, smaller h"
         );
     }
 

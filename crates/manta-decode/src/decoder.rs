@@ -231,12 +231,19 @@ impl TrackDecoder {
     ) -> Vec<DecoderEvent> {
         let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
         let mut events = Vec::new();
-        // Codex review, PR #161 round 9: `push` can now return more than
-        // one eligible center per input sample -- see `Evidence::push`'s
-        // doc comment. Re-applying `set_u_ref` feedback per returned hop
-        // (not just once at the end) matches the same per-hop feedback
-        // pattern `finish()`'s incremental flush loop already uses.
-        for ev in self.evidence.push(amp, n, sample_ts) {
+        // Codex review, PR #161 round 11: round 9's fix (letting `push`
+        // return multiple eligible centers per input sample) eagerly
+        // materialized the whole newly-eligible batch using a single,
+        // START-of-call `h` -- so even though this loop calls
+        // `set_u_ref` after every returned hop, a speed change mid-batch
+        // never actually affected any LATER hop already in that same
+        // batch, only hops from the NEXT input sample onward. Using
+        // `record` + `drain_one` instead re-checks the live `h` on every
+        // single drained hop, so feedback takes effect before the next
+        // one is even computed -- exactly like `finish()`'s incremental
+        // flush loop (`flush_one`) already does.
+        self.evidence.record(amp, n, sample_ts);
+        while let Some(ev) = self.evidence.drain_one() {
             self.snr_from_evidence(&ev);
             for c in self.hsmm.push(&ev) {
                 self.emit_committed(c, &mut events);
