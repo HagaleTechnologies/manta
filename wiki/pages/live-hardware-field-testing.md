@@ -176,9 +176,17 @@ decoded and peak SNR both markedly better at `gain=10-20` than at `40`
 (`gain=0` is worse than `40`, though — the front end likely overloads on
 this busy an antenna at max sensitivity, so it's not simply "always use
 the minimum"). **Start future sessions around `gain=15-20` and sweep
-narrower from there, not `40`.** This may substantially explain why prior
-sessions heard almost no real CW despite RBN showing abundant real
-activity on the same frequencies.
+narrower from there, not `40`.**
+
+**Confirmed real but NOT a full fix**: a same-session follow-up capture
+at `gain=15` against live RBN found peak SNR much improved (18.65 dB vs.
+`gain=40`'s 3.81 dB) but **still zero track activity within ±3 kHz of 6
+specific real, multi-skimmer-confirmed RBN spots** in the same window.
+The gain bug is real and worth fixing, but it is not the (or not the
+whole) explanation for "almost no real CW heard" — something else, most
+plausibly the physical antenna/feedline path specifically feeding the
+RSP1B, or a detector/DSP issue that only shows up on real narrowband CW,
+is still the live open question. See the same doc's follow-up section.
 
 **The `sdrplay_apiService` daemon can wedge mid-session** (root-owned
 LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
