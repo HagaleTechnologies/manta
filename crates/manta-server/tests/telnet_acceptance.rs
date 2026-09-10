@@ -22,14 +22,21 @@ async fn spawn_server() -> (
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
-<<<<<<< HEAD
-    spawn_server_with_format(rbn::LineFormat::Rbn).await
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
 }
 
+/// MAN-88: lets a test pick the wire layout (`rbn` vs `skimmer`) while
+/// keeping the production drain deadline.
 async fn spawn_server_with_format(
     line_format: rbn::LineFormat,
-=======
-    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(manta_server::tasks::CLIENT_DRAIN_DEADLINE, line_format).await
 }
 
 /// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
@@ -38,7 +45,22 @@ async fn spawn_server_with_format(
 /// the production `CLIENT_DRAIN_DEADLINE`.
 async fn spawn_server_with_drain_deadline(
     drain_deadline: Duration,
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
+    spawn_server_with(drain_deadline, rbn::LineFormat::Rbn).await
+}
+
+/// The single spawn body both helpers above delegate to -- MAN-45's drain
+/// deadline and MAN-88's line format are independent knobs on the same
+/// server.
+async fn spawn_server_with(
+    drain_deadline: Duration,
+    line_format: rbn::LineFormat,
 ) -> (
     std::net::SocketAddr,
     Arc<SpotBus>,
@@ -78,11 +100,8 @@ async fn spawn_server_with_drain_deadline(
                 manta_server::telnet::MAX_TELNET_COMMANDS,
                 manta_server::telnet::COMMAND_RATE_WINDOW,
             ),
-<<<<<<< HEAD
-            line_format,
-=======
             drain_deadline,
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+            line_format,
         )
         .await;
     });

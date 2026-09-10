@@ -179,11 +179,8 @@ pub async fn serve(
     limiter: ConnectionLimiter,
     ip_quota: IpQuota,
     ip_command_limiter: IpRateLimiter,
-<<<<<<< HEAD
-    line_format: rbn::LineFormat,
-=======
     drain_deadline: Duration,
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    line_format: rbn::LineFormat,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -261,11 +258,8 @@ pub async fn serve(
                 ip_command_limiter,
                 log_enabled,
                 rejection_log_limiter,
-<<<<<<< HEAD
-                line_format,
-=======
                 drain_deadline,
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+                line_format,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -317,11 +311,8 @@ async fn handle_client(
     ip_command_limiter: IpRateLimiter,
     log_enabled: bool,
     rejection_log_limiter: IpRateLimiter,
-<<<<<<< HEAD
-    line_format: rbn::LineFormat,
-=======
     drain_deadline: Duration,
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
+    line_format: rbn::LineFormat,
 ) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
@@ -778,17 +769,6 @@ async fn handle_client(
                                     continue; // a filtered spot costs no budget
                                 }
                             }
-<<<<<<< HEAD
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot, line_format)
-                                .await
-                                .is_err()
-                            {
-                                // The client's socket is presumably dead --
-                                // further writes would just fail too. A
-                                // bare `?` here (the prior behavior)
-                                // propagated the error out of the whole
-                                // handler, abandoning the rest of the
-=======
                             // Checked BEFORE the write, not around it: this
                             // spot has already left `rx`, so a `timeout`
                             // wrapped around the whole loop would drop it
@@ -802,7 +782,13 @@ async fn handle_client(
                                 || !matches!(
                                     tokio::time::timeout(
                                         remaining,
-                                        write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot),
+                                        write_spot_line(
+                                            &mut wr,
+                                            &bus,
+                                            &station_call,
+                                            &bus_spot.spot,
+                                            line_format,
+                                        ),
                                     )
                                     .await,
                                     Ok(Ok(())),
@@ -814,7 +800,6 @@ async fn handle_client(
                                 // too. A bare `?` here (the pre-round-12
                                 // behavior) propagated the error out of the
                                 // whole handler, abandoning the rest of the
->>>>>>> 0e6d4ed3f86fe41e673661ee359226c139357799
                                 // drain loop uncounted (round-12 review
                                 // finding); a flat outer deadline alone
                                 // (the pre-round-16 behavior) let
