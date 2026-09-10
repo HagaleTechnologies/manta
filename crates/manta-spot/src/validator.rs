@@ -2001,7 +2001,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             });
         }
         assert!(
-            v.gate.len() > 0,
+            !v.gate.is_empty(),
             "sanity check: the loop above must actually have populated the gate"
         );
 

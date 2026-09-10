@@ -383,7 +383,7 @@ mod tests {
     /// count -- that's the whole point of keying by frequency bucket
     /// instead of `track_id` (MAN-166). Two `record` calls for the same
     /// bucket+callsign under *different* track_ids (simulating the close
-    /// + reopen), with a `sweep` between them (as `Validator::ingest`
+    /// and reopen), with a `sweep` between them (as `Validator::ingest`
     /// does on every `TrackClosed`), still accumulate to 2.
     #[test]
     fn sweep_between_two_records_does_not_reset_the_count() {
