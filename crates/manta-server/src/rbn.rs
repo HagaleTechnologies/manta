@@ -56,20 +56,31 @@ pub enum LineFormat {
 ///
 /// This is an anchor, not a guarantee: `format_line` keeps a mandatory
 /// one-space separator (Decision 3), so the anchor holds only while
-/// `identity + freq` is at most 23 columns -- i.e. a base callsign of 6
-/// characters or fewer at 8 frequency characters. A 7-character base
-/// callsign (identity 16 + freq 8 = 24) needs that separator, so the
-/// frequency ends at column 25 and the rest of the line shifts one column
-/// right (`VE3ABCD` -> time at column 72). That drift is the documented
-/// choice in `docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md`
-/// Decision 3, pinned by
-/// `a_seven_character_spotter_shifts_the_whole_line_one_column_right`
-/// below; MAN-89's `CALL-N-#` SSIDs push most identities past it.
+/// `identity + freq` is at most 23 columns. Two combinations exceed it: a
+/// 7-character base callsign at an 8-character frequency (identity 16 +
+/// freq 8 = 24, e.g. `VE3ABCD` on 20 m), and a 6-character base callsign
+/// at a 9-character 6-digit-MHz frequency (identity 15 + freq 9 = 24,
+/// e.g. `DL8LAS` on 2 m). Both need that separator, so the frequency ends
+/// at column 25 -- but the drift stops there: `CALL_START_COL` and
+/// `MODE_START_COL` below are absolute anchors, so the callsign, mode,
+/// SNR, WPM, type and time fields all stay on their RBN columns. See
+/// `docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md` Decision 3,
+/// pinned by `a_seven_character_spotter_drifts_only_the_frequency_field`
+/// and `a_six_character_spotter_on_two_metres_keeps_every_later_column`
+/// below.
 const FREQ_END_COL: usize = 24;
 
-/// Minimum width of the callsign column (columns 27-41), so the mode field
-/// starts at column 42.
-const CALL_COL_WIDTH: usize = 15;
+/// The callsign column's first 1-indexed column (columns 27-41), reached
+/// by a two-space separator from a frequency that ended on
+/// `FREQ_END_COL`. An absolute anchor: a frequency field that overran its
+/// own anchor is absorbed here, down to the mandatory one-space separator.
+const CALL_START_COL: usize = 27;
+
+/// The mode field's first 1-indexed column, i.e. the end of the 15-wide
+/// callsign column (27-41). Also an absolute anchor, so an over-long
+/// callsign -- or an already-shifted frequency -- is absorbed here rather
+/// than moving the SNR, WPM, type and time fields.
+const MODE_START_COL: usize = 42;
 
 /// Renders one spot as a fixed-column AK1A `DX de` cluster line, e.g.
 /// `DX de W3XYZ-#:  14027.10  JA1ABC         CW    23 dB  28 WPM  CQ      0312Z`.
@@ -83,8 +94,14 @@ const CALL_COL_WIDTH: usize = 15;
 /// column (MAN-88): the identity and callsign fields are MINIMUM widths
 /// with a guaranteed one-space separator, never truncated -- an oversized
 /// value (e.g. MAN-28's Watch List bypasses callsign-grammar validation)
-/// shifts the rest of the line right rather than corrupting a field or
-/// forging a shorter identity.
+/// shifts the field that follows it right rather than corrupting a field
+/// or forging a shorter identity.
+///
+/// Each anchor is computed from the column the *previous* field actually
+/// ended on, so an overrun is absorbed by the next separator instead of
+/// cascading down the line: a 2 m frequency behind a six-character
+/// spotter (`DX de DL8LAS-#: 144110.00`) costs the frequency field its
+/// own column-24 anchor, and nothing else.
 pub fn format_line(
     spot: &Spot,
     spotter_call: &str,
@@ -98,21 +115,29 @@ pub fn format_line(
 
     let identity = format!("DX de {spotter_call}-#:");
     // `{:.2}` is a *minimum* width: a 2 m frequency (`144110.00`, 9 chars)
-    // widens the field rather than losing a digit, and the identity
-    // padding below absorbs it so column 24 still holds.
+    // widens the field rather than losing a digit. Where the identity's
+    // own padding cannot absorb that extra column, the callsign gap below
+    // does, so only the frequency field itself moves.
     let freq = format!("{freq_khz:.2}");
     // Decision 3: anchor the frequency's last char to FREQ_END_COL, but
     // never let the two fields abut -- truncating an operator's own
     // callsign would forge a wrong spotter ID, and abutting would corrupt
     // the spotter token for whitespace-splitting parsers.
+    let identity_end_col = identity.chars().count();
     let freq_gap = FREQ_END_COL
-        .saturating_sub(identity.chars().count() + freq.chars().count())
+        .saturating_sub(identity_end_col + freq.chars().count())
         .max(1);
-    // Same rule for the callsign column: MAN-28's Watch List bypasses the
-    // callsign grammar, so an allowlisted entry can exceed 15 columns.
-    let call_gap = CALL_COL_WIDTH
-        .saturating_sub(spot.callsign.chars().count())
-        .max(1);
+    let freq_end_col = identity_end_col + freq_gap + freq.chars().count();
+    // Re-anchor on an absolute column rather than a fixed two-space
+    // separator, so a frequency that overran FREQ_END_COL (a 7-character
+    // spotter, or a 6-character one on 2 m) does not push the callsign
+    // and everything after it one column right.
+    let call_gap = CALL_START_COL.saturating_sub(freq_end_col + 1).max(1);
+    let call_end_col = freq_end_col + call_gap + spot.callsign.chars().count();
+    // Same rule for the mode column: MAN-28's Watch List bypasses the
+    // callsign grammar, so an allowlisted entry can exceed the 15-wide
+    // callsign column and eat this gap down to its mandatory space.
+    let mode_gap = MODE_START_COL.saturating_sub(call_end_col + 1).max(1);
     // The mode field's own trailing padding is the separator to the SNR
     // field -- there is no extra gap in the RBN layout (columns 42-47).
     let mode = match line_format {
@@ -121,8 +146,9 @@ pub fn format_line(
     };
 
     format!(
-        "{identity}{:freq_gap$}{freq}  {call}{:call_gap$}{mode}\
+        "{identity}{:freq_gap$}{freq}{:call_gap$}{call}{:mode_gap$}{mode}\
          {snr:>2} dB  {wpm:>2} WPM  {ctx:<6}  {hour:02}{minute:02}Z",
+        "",
         "",
         "",
         call = spot.callsign,
@@ -226,10 +252,11 @@ mod tests {
 
     /// Decision 3's one documented column of drift: a 7-character base
     /// callsign makes `identity + freq` exactly 24 columns, so the mandatory
-    /// separator pushes the frequency to column 25 and the whole line one
-    /// column right. `FREQ_END_COL`'s doc comment says so; this pins it.
+    /// separator pushes the frequency's last char to column 25. The drift
+    /// stops there -- the callsign column re-anchors at 27, so mode and
+    /// time stay on their RBN columns.
     #[test]
-    fn a_seven_character_spotter_shifts_the_whole_line_one_column_right() {
+    fn a_seven_character_spotter_drifts_only_the_frequency_field() {
         let line = format_line(
             &capture_spot(),
             "VE3ABCD",
@@ -241,13 +268,71 @@ mod tests {
             25,
             "line was: {line}"
         );
-        assert_eq!(col_of(&line, "CW"), 43, "line was: {line}");
-        assert_eq!(col_of(&line, "0236Z"), 72, "line was: {line}");
-        // Never abuts: exactly one space separates identity from frequency.
+        assert_eq!(col_of(&line, "N8II"), 27, "line was: {line}");
+        assert_eq!(col_of(&line, "CW"), 42, "line was: {line}");
+        assert_eq!(col_of(&line, "0236Z"), 71, "line was: {line}");
+        // Never abuts: exactly one space separates identity from frequency,
+        // and one more separates the frequency from the callsign column.
         assert!(
-            line.starts_with("DX de VE3ABCD-#: 14011.90"),
+            line.starts_with("DX de VE3ABCD-#: 14011.90 N8II"),
             "line was: {line}"
         );
+    }
+
+    /// MAN-88 review finding: the cross-product the per-field tests missed
+    /// -- a valid six-character spotter (`DL8LAS`) on 2 m, where the
+    /// identity is 15 columns and `144110.00` is 9, so the two together
+    /// already fill the frequency's anchor. The frequency field alone gives
+    /// up its column-24 anchor to keep its mandatory separator; every later
+    /// column a fixed-column parser reads must still be exact.
+    #[test]
+    fn a_six_character_spotter_on_two_metres_keeps_every_later_column() {
+        let mut spot = capture_spot();
+        spot.freq_hz = 144_110_000.0;
+        let line = format_line(&spot, "DL8LAS", 2 * 3600 + 36 * 60, LineFormat::Rbn);
+        assert!(
+            line.starts_with("DX de DL8LAS-#: 144110.00 N8II"),
+            "line was: {line}"
+        );
+        assert_eq!(col_of(&line, "N8II"), 27, "line was: {line}");
+        assert_eq!(col_of(&line, "CW"), 42, "line was: {line}");
+        assert_eq!(col_of(&line, "21 dB"), 48, "line was: {line}");
+        assert_eq!(col_of(&line, "25 WPM"), 55, "line was: {line}");
+        assert_eq!(col_of(&line, "0236Z"), 71, "line was: {line}");
+    }
+
+    /// The same cross-product across the spotter lengths RBN actually
+    /// carries, at every band manta channelizes. Only the fields whose own
+    /// anchor a mandatory separator makes unreachable may move: the mode
+    /// column at 42 and the time at 71 are exact for all 25 combinations,
+    /// and the callsign column is exact for every spotter that leaves room
+    /// for it (a 7-character spotter on 2 m needs identity 16 + freq 9 +
+    /// two separators, which reaches column 27 on its own).
+    #[test]
+    fn every_spotter_length_and_band_keeps_the_later_columns_anchored() {
+        for spotter in ["W4X", "W5AU", "W3XYZ", "DL8LAS", "VE3ABCD"] {
+            for freq_hz in [
+                1_822_500.0,
+                3_573_600.0,
+                14_011_900.0,
+                50_110_000.0,
+                144_110_000.0,
+            ] {
+                let mut spot = capture_spot();
+                spot.freq_hz = freq_hz;
+                let line = format_line(&spot, spotter, 2 * 3600 + 36 * 60, LineFormat::Rbn);
+                let ctx = format!("spotter {spotter} at {freq_hz} Hz: {line}");
+                assert_eq!(col_of(&line, "CW"), 42, "{ctx}");
+                assert_eq!(col_of(&line, "0236Z"), 71, "{ctx}");
+                let call_col = col_of(&line, "N8II");
+                let expect_call_col = if spotter.len() == 7 && freq_hz >= 100_000_000.0 {
+                    28
+                } else {
+                    27
+                };
+                assert_eq!(call_col, expect_call_col, "{ctx}");
+            }
+        }
     }
 
     #[test]

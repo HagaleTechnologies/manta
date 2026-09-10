@@ -28,9 +28,9 @@ Indexed column-by-column, this gives a fixed absolute-column layout:
 | `DX de {spotter}-#:` | 1-… | literal, left-justified |
 | padding | … | frequency's last char lands on column **24** |
 | frequency, kHz | ends at **24** | `{:.2}` — 2 decimals, never truncated |
-| separator | 25-26 | two spaces |
-| callsign | 27-**41** | left-justified, minimum width **15** |
-| mode | 42-47 | `"CW"` in a 6-wide field; its own padding is the separator |
+| separator | 25-26 | pads to the callsign column; minimum one space |
+| callsign | **27**-41 | left-justified, minimum width **15** |
+| mode | **42**-47 | `"CW"` in a 6-wide field; its own padding is the separator |
 | SNR | 48-52 | `{:>2} dB` |
 | separator | 53-54 | two spaces |
 | WPM | 55-60 | `{:>2} WPM` |
@@ -107,13 +107,33 @@ shifts right by exactly the overflow, rather than truncating (which would
 forge a wrong callsign/identity) or abutting the next field (which would
 corrupt the token for whitespace-splitting parsers).
 
-This costs one column of drift for a 7-character base callsign combined
-with an ≥8-character frequency (e.g. spotter `VE3ABCD`, time lands at
-column 72 instead of 71). Every spotter callsign of 6 characters or fewer
-stays exact, which covers the observed RBN spotter population in the one
-available capture. This is manta's own documented choice, not a
+Each field's anchor is computed from the column the **previous field
+actually ended on**, not from a fixed separator width, so an overrun is
+absorbed by the next separator instead of cascading down the line. Two
+combinations exhaust the 24-column identity+frequency budget and so cost
+the *frequency field* its own anchor (it ends at column 25):
+
+- a 7-character base callsign at an 8-character frequency — identity 16 +
+  freq 8 (e.g. `VE3ABCD` on 20 m);
+- a 6-character base callsign at a 9-character 6-digit-MHz frequency —
+  identity 15 + freq 9 (e.g. `DL8LAS` on 2 m, raised by the PR #114
+  review as the cross-product the per-field tests missed).
+
+In both, the callsign column re-anchors at 27 and the mode, SNR, WPM,
+type and time fields stay exactly on their RBN columns — a column-based
+parser reads every field after the frequency correctly. Only the extreme
+of both at once (a 7-character spotter on 2 m: identity 16 + freq 9 +
+two mandatory separators already reaches column 27) pushes the callsign
+column to 28, and even there the mode column onwards re-anchors at 42.
+Pinned by `a_seven_character_spotter_drifts_only_the_frequency_field`,
+`a_six_character_spotter_on_two_metres_keeps_every_later_column`, and
+`every_spotter_length_and_band_keeps_the_later_columns_anchored`.
+
+Absorbing rather than cascading is manta's own documented choice, not a
 reproduction of how RBN itself pads a longer identity — no multi-line
 capture with a longer spotter identity was available to check against.
+What it protects is the property the ticket asked for: a fixed-column
+parser never reads a later field one character late.
 
 **MAN-89** (`CALL-N-#` SSIDs) pushes many spotter identities past the
 16-column budget (`DX de ` + 7-char base call + `-#:`) for base callsigns
