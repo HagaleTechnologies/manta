@@ -709,12 +709,24 @@ Add to `mod tests`:
                 ..DecodeConfig::default()
             },
         );
+        // decoder_input's refine-enabled path reads hop.x[c], so every
+        // hop fed to a promoted track needs real complex spectrum data,
+        // not the bare `hop()` helper (empty `x`, which would panic on
+        // index-out-of-bounds). Build x from power so HopOutput::power
+        // matches exactly (norm_sqr of the real value p.sqrt() is p).
+        let mk_hop = |m: u64, power: &Vec<f32>| {
+            let x: Vec<num_complex::Complex32> = power
+                .iter()
+                .map(|&p| num_complex::Complex32::new(p.sqrt(), 0.0))
+                .collect();
+            hop_with_x(m, x)
+        };
         feed_warmup(&mut tm, n);
         let mut power = quiet_power(n);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         let mut m = 250 * 15;
         loop {
-            tm.step_hop(&hop(m, power.clone()), m);
+            tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
             if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
                 break;
@@ -725,11 +737,11 @@ Add to `mod tests`:
         // Run well past GROUP_DELAY_HOPS so the backlog reaches steady
         // state (exactly d entries buffered at any instant).
         for _ in 0..(d + 5) {
-            tm.step_hop(&hop(m, power.clone()), m);
+            tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
         }
         let pending_before = tm.tracks.get(&id).unwrap().pending.len();
-        tm.step_hop(&hop(m, power.clone()), m); // one more normal hop
+        tm.step_hop(&mk_hop(m, &power), m); // one more normal hop
         m += 1;
         let pending_after_normal_hop = tm.tracks.get(&id).unwrap().pending.len();
         assert_eq!(
@@ -746,7 +758,7 @@ Add to `mod tests`:
         let mut power2 = quiet_power(n);
         power2[11] = 1e-9 * 10f32.powf(20.0 / 10.0);
         tm.tracks.get_mut(&id).unwrap().center = 11.0;
-        tm.step_hop(&hop(m, power2), m);
+        tm.step_hop(&mk_hop(m, &power2), m);
         let pending_after_reset_hop = tm.tracks.get(&id).unwrap().pending.len();
         assert_eq!(
             pending_after_reset_hop - pending_after_normal_hop,
@@ -947,12 +959,24 @@ Add to `mod tests`:
                 ..DecodeConfig::default()
             },
         );
+        // decoder_input's refine-enabled path reads hop.x[c], so every
+        // hop fed to a promoted track needs real complex spectrum data,
+        // not the bare `hop()` helper (empty `x`, which would panic on
+        // index-out-of-bounds). Build x from power so HopOutput::power
+        // matches exactly (norm_sqr of the real value p.sqrt() is p).
+        let mk_hop = |m: u64, power: &Vec<f32>| {
+            let x: Vec<num_complex::Complex32> = power
+                .iter()
+                .map(|&p| num_complex::Complex32::new(p.sqrt(), 0.0))
+                .collect();
+            hop_with_x(m, x)
+        };
         feed_warmup(&mut tm, n);
         let mut power = quiet_power(n);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         let mut m = 250 * 15;
         loop {
-            tm.step_hop(&hop(m, power.clone()), m);
+            tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
             if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
                 break;
@@ -961,7 +985,7 @@ Add to `mod tests`:
         let id = *tm.tracks.keys().next().unwrap();
         let d = GROUP_DELAY_HOPS as u64;
         for _ in 0..(d + 5) {
-            tm.step_hop(&hop(m, power.clone()), m);
+            tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
         }
         let backlog_len = tm.tracks.get(&id).unwrap().refiner_backlog.len();
