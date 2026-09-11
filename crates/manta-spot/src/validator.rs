@@ -1036,9 +1036,20 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate
-                .record(track_id, freq_hz, &candidate, sample_ts, resolved_word_seq)
-                as u32
+            // MAN-100 Scenario 2 / Codex review PR #133 (round 2):
+            // message-distinctness across a track_id change needs to know
+            // whether the PRIOR track has actually closed, not just how
+            // much sample_ts has elapsed -- `self.tracks` (MAN-19 keeps it
+            // authoritative, entries removed on `TrackClosed`) is exactly
+            // that signal. See `gate::message_distinct_indices`'s doc.
+            self.gate.record(
+                track_id,
+                freq_hz,
+                &candidate,
+                sample_ts,
+                resolved_word_seq,
+                |tid| self.tracks.contains_key(&tid),
+            ) as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -1282,6 +1293,7 @@ impl Validator {
                     &pb.candidate,
                     pb.sample_ts,
                     pb.word_seq,
+                    |tid| self.tracks.contains_key(&tid),
                 ) as u32;
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {

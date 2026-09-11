@@ -137,15 +137,15 @@ impl SupportLedger {
         let windowed: Vec<&Obs> = obs.iter().filter(|o| o.sample_ts >= cutoff).collect();
         // Every `Obs` here comes from one `(track_id, text)` entry, so
         // `track_id` is the same for all of them -- the shared helper's
-        // cross-track branch is structurally unreachable in this caller
-        // (there is never a `track_id` change to compare across), so its
-        // `min_occurrence_gap_samples` threshold is passed as 0: inert,
-        // never evaluated, not a behavior change.
+        // cross-track branch (and its `is_track_active` query) is
+        // structurally unreachable in this caller: there is never a
+        // `track_id` change to compare across, so the closure passed here
+        // is never actually called.
         let occurrences: Vec<(u64, u64, u32)> = windowed
             .iter()
             .map(|o| (o.word_seq, o.sample_ts, track_id))
             .collect();
-        let counted = gate::message_distinct_indices(&occurrences, time_gap_samples, 0);
+        let counted = gate::message_distinct_indices(&occurrences, time_gap_samples, &|_| false);
         let reps = counted.len() as u32;
         let conf_sum = counted.iter().map(|&i| windowed[i].geo_conf).sum();
         Support { reps, conf_sum }
