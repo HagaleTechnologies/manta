@@ -5,6 +5,11 @@ on: pull_request_target
 permissions:
   contents: write
   pull-requests: write
+  # Codex round 5: the needs-human staleness check reads the PR's timeline
+  # (labeled events) and comments (staleness markers) -- neither endpoint
+  # is covered by the pull-requests scope that already suffices for label
+  # reads/writes themselves.
+  issues: read
 
 jobs:
   auto-merge:
@@ -38,13 +43,106 @@ jobs:
       # eventual merge only executes once required_approving_review_count
       # is satisfied for real -- which the approval step immediately
       # above already provides. No bypass needed or wanted for this path.
+      #
+      # needs-human guard (learned from widdershins auto-merge.yml round 21,
+      # applied here preemptively rather than rediscovered): this workflow
+      # triggers on `synchronize` too (pull_request_target's default
+      # types), which fires every time Dependabot itself rebases/updates the
+      # PR against a moved base -- a routine, expected event, not a new
+      # human decision. Without this guard, that rebase would silently
+      # re-arm auto-merge on a PR queue-retry-handler.yml already handed
+      # off to a human after its one automatic retry failed, bypassing that
+      # handoff entirely.
+      #
+      # Checked inside the run: block via a fresh API fetch, not in this
+      # step's own `if:` (Codex round 2): `github.event.pull_request.labels`
+      # is a snapshot taken when the webhook fired, not a live read -- if
+      # needs-human gets attached AFTER that snapshot but before this step
+      # actually runs (e.g. `dependabot/fetch-metadata` above ran slowly),
+      # the stale snapshot still reads "no needs-human" and this step would
+      # re-arm auto-merge on a PR that was, by the time it actually acts,
+      # already handed off. A step-level `if:` has no way to re-evaluate
+      # itself against live state right before its `run:` executes; only a
+      # fetch inside the step body can.
       - name: Enable auto-merge for approved update
         if: steps.metadata.outputs.update-type != 'version-update:semver-major'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
-          gh pr merge "$PR_URL" --auto --squash
+          # Staleness check (Codex round 4, hardened round 5): needs-human is PR-wide with no
+          # automatic clearing mechanism (a human decision by design), but queue-retry-handler.yml
+          # tags every attach with the exact SHA it was for -- without checking that at all, a
+          # fresh Dependabot rebase that resolves the original failure reads the exact same
+          # "needs-human present" state the broken one did, and stays silently stalled forever.
+          #
+          # Round 4's first attempt just asked "does ANY marker name an older sha" -- Codex round
+          # 5 found the gap: a maintainer can remove needs-human and later RE-apply it to pause
+          # the CURRENT head for an unrelated reason (or the marker-post for that reapplication
+          # simply failed, since it's best-effort), and this check would still find the OLD
+          # marker from a prior, already-cleared episode and wrongly treat a live pause as stale.
+          # Provenance is now checked against the label's own most recent application (via the
+          # PR's timeline `labeled` event), not just marker content -- only a marker posted AT OR
+          # AFTER that event can be trusted to describe THIS application. Fail closed (keep
+          # pausing) whenever provenance can't be confirmed: no labeled event, no marker, or a
+          # marker older than the most recent labeling.
+          needs_human_is_stale() {
+            local current_head_sha12="$1"
+            local last_labeled_at marker_info marker_created_at recorded_sha12
+            local raw
+            # --slurp + flatten (`add`) before selecting the latest event, fetch and filter as
+            # two explicit &&-chained steps rather than `--jq` passed to `gh api` itself (Codex
+            # round 6, corrected round 7): this CLI version rejects `--slurp` combined with
+            # `--jq`/`--template` outright ("the --slurp option is not supported with --jq or
+            # --template") -- round 6's own fix silently failed on every call via the
+            # `2>/dev/null` swallow, always returning empty and therefore always fail-closed
+            # (permanently pausing, never actually detecting staleness) -- the exact same
+            # incompatibility this repo's own ci.yml already hit and documented (its codex-clean
+            # gate, PR #56). Deliberately not a bare `cmd1 | cmd2` pipe either: this step's
+            # default shell has no `pipefail`, so a pipe's exit status reflects only the last
+            # command -- a genuine `gh api` failure could still slip through if `jq` happened to
+            # accept whatever partial/empty output leaked past it, silently masking a real fetch
+            # error the same way the `--slurp`/`--jq` bug did. Two explicit `&&`-chained
+            # assignments preserve `gh api`'s own exit status visibility.
+            if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
+              last_labeled_at=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-human")] | if length > 0 then (last | .created_at) else "" end' 2>/dev/null)
+            else
+              last_labeled_at=""
+            fi
+            [ -z "$last_labeled_at" ] && return 1
+            if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/comments" 2>/dev/null); then
+              marker_info=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.user.login == "github-actions[bot]") | select(.body | test("queue-retry-handler:needs-human sha=[0-9a-f]{12}")) | [.created_at, (.body | capture("queue-retry-handler:needs-human sha=(?<s>[0-9a-f]{12})").s)] | @tsv] | if length > 0 then last else "" end' 2>/dev/null)
+            else
+              marker_info=""
+            fi
+            [ -z "$marker_info" ] && return 1
+            marker_created_at=$(cut -f1 <<< "$marker_info")
+            recorded_sha12=$(cut -f2 <<< "$marker_info")
+            [ -z "$recorded_sha12" ] && return 1
+            [[ "$marker_created_at" < "$last_labeled_at" ]] && return 1
+            [ "$recorded_sha12" = "$current_head_sha12" ] && return 1
+            return 0
+          }
+
+          current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+          if grep -qxF "needs-human" <<< "$current_labels"; then
+            current_head_sha12=$(gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq '.headRefOid[0:12]')
+            if needs_human_is_stale "$current_head_sha12"; then
+              # Clear the label, not just ignore it (Codex round 5): leaving it attached would
+              # let queue-retry-handler.yml's own retry step see this same stale needs-human on
+              # this new revision's eventual merge-group failure and refuse to retry it --
+              # silently stalling a corrected revision after its very first queue attempt.
+              echo "::notice::needs-human on PR #$PR is stale (provably tied to an earlier revision, not the current head $current_head_sha12) -- clearing it and proceeding to arm auto-merge for the new revision."
+              gh api --method DELETE "repos/${REPO}/issues/${PR}/labels/needs-human" >/dev/null 2>&1 || true
+              gh pr merge "$PR_URL" --auto --squash
+            else
+              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- standing down without re-arming auto-merge."
+            fi
+          else
+            gh pr merge "$PR_URL" --auto --squash
+          fi
 
       - name: Label major updates for review
         if: steps.metadata.outputs.update-type == 'version-update:semver-major'
