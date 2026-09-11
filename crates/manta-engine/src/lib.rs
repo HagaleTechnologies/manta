@@ -38,10 +38,12 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
     match ev {
         DecoderEvent::TrackMeta {
             track_id,
+            sample_ts,
             snr_2500_db,
             freq_hz,
         } => DecoderEvent::TrackMeta {
             track_id: *track_id,
+            sample_ts: *sample_ts,
             snr_2500_db: *snr_2500_db,
             freq_hz: freq_hz * factor,
         },
@@ -307,6 +309,7 @@ mod tests {
             },
             DecoderEvent::TrackMeta {
                 track_id: 2,
+                sample_ts: 15,
                 snr_2500_db: 20.0,
                 freq_hz: 14_012_340.0,
             },

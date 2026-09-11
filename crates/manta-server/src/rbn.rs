@@ -3,6 +3,14 @@
 
 use manta_spot::{Spot, SpotType};
 
+/// MAN-102 / decision D3 (2026-09-06 broad review): RBN and CW Skimmer
+/// quote spot SNR in a 500 Hz reference bandwidth; manta's detector
+/// measures it in 2500 Hz (SPEC §2.3). `10*log10(2500/500) = 6.9897 dB`.
+/// Applied ONLY here, at the telnet/uplink wire boundary -- the JSON
+/// stream keeps the native 2500 Hz value plus an explicit `snrRefHz` (see
+/// `spot_message.rs`), and nothing inside the decode pipeline changes.
+const RBN_REF_BW_CORRECTION_DB: f32 = 6.989_7;
+
 fn spot_type_label(spot_type: SpotType) -> &'static str {
     match spot_type {
         SpotType::Cq => "CQ",
@@ -13,12 +21,14 @@ fn spot_type_label(spot_type: SpotType) -> &'static str {
 }
 
 /// Renders one spot as a standard RBN `DX de` cluster line, e.g.
-/// `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
+/// `DX de W3XYZ-#:  14027.1  JA1ABC   CW  30 dB  28 WPM  CQ  0312Z`.
 ///
 /// `unix_ts_secs` is the spot's wall-clock time (UTC); converting from the
 /// decoder's sample-count timestamp happens at the caller, not here (see
 /// `manta_spot::validator::Spot`'s doc comment on why `Spot` itself carries
-/// no wall-clock time).
+/// no wall-clock time). `snr` is `Spot.snr_db` (SPEC §2.3's native 2500 Hz
+/// measurement) converted to the 500 Hz RBN/CW Skimmer reference bandwidth
+/// -- see `RBN_REF_BW_CORRECTION_DB`.
 pub fn format_line(spot: &Spot, spotter_call: &str, unix_ts_secs: i64) -> String {
     let freq_khz = spot.freq_hz / 1000.0;
     let secs_of_day = unix_ts_secs.rem_euclid(86_400);
@@ -30,7 +40,7 @@ pub fn format_line(spot: &Spot, spotter_call: &str, unix_ts_secs: i64) -> String
         spotter = spotter_call,
         freq = freq_khz,
         call = spot.callsign,
-        snr = spot.snr_db.round() as i32,
+        snr = (spot.snr_db + RBN_REF_BW_CORRECTION_DB).round() as i32,
         wpm = spot.wpm.round() as i32,
         ctx = spot_type_label(spot.spot_type),
     )
@@ -55,12 +65,32 @@ mod tests {
 
     #[test]
     fn formats_the_architecture_doc_example_verbatim() {
-        // 03:12 UTC == 11520 seconds past midnight.
+        // 03:12 UTC == 11520 seconds past midnight. MAN-102/D3: the wire
+        // line reports SNR in RBN/CW Skimmer's 500 Hz reference bandwidth,
+        // not the pipeline's native 2500 Hz -- sample_spot's 2500 Hz value
+        // (see below) plus 6.9897 dB rounds to 30 dB(500).
         let line = format_line(&sample_spot(), "W3XYZ", 11_520);
         assert_eq!(
             line,
-            "DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z"
+            "DX de W3XYZ-#:  14027.1  JA1ABC   CW  30 dB  28 WPM  CQ  0312Z"
         );
+    }
+
+    #[test]
+    fn wire_snr_is_referenced_to_500hz() {
+        // D3/MAN-102: the pipeline measures SNR in 2500 Hz; RBN and CW
+        // Skimmer quote 500 Hz. sample_spot's 2500 Hz value (see above) +
+        // 10*log10(5) rounds to 30 dB(500).
+        let line = format_line(&sample_spot(), "W3XYZ", 11_520);
+        assert!(line.contains("  30 dB  "), "line was: {line}");
+    }
+
+    #[test]
+    fn a_negative_snr_spot_still_renders_a_sane_wire_value() {
+        let mut spot = sample_spot();
+        spot.snr_db = -4.0; // 2500 Hz
+        let line = format_line(&spot, "W3XYZ", 11_520);
+        assert!(line.contains("   3 dB  "), "line was: {line}");
     }
 
     #[test]

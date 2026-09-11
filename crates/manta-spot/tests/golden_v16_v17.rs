@@ -56,6 +56,7 @@ fn run_twice(v: &mut Validator, words: &[&str]) -> Vec<Spot> {
 fn seed_meta(v: &mut Validator, track_id: u32) {
     v.ingest(&DecoderEvent::TrackMeta {
         track_id,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
     });
@@ -102,6 +103,7 @@ fn v17_notched_frequency_never_spots() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_025_050.0,
     });
@@ -138,6 +140,7 @@ fn suppressed_spots_are_counted_by_reason() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_025_050.0,
     });
@@ -154,6 +157,7 @@ fn v17_frequency_outside_notch_still_spots() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_030_000.0,
     });

@@ -193,6 +193,23 @@ Reported track SNR (for spots) is converted from the 93.75 Hz channel to the
 conventional 2500 Hz reference bandwidth:
 `SNR_2500 = (S − F) − 10·log10(2500/93.75) = (S − F) − 14.3 dB`.
 
+`S − F` is **peak-held over each `TrackMeta` reporting interval** (§5's 375
+hops) before conversion: `S` is a τ = 40 ms EMA that decays toward the floor
+on every key-up, so an instantaneous sample is a function of keying phase,
+not of signal strength. The peak over the interval is the settled key-down
+level (MAN-102; see
+`docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for the
+measured rejection of an instantaneous sample and of a key-down mean).
+
+This 2500 Hz value is what `TrackMeta`, `Spot.snr_db`, and the JSON stream
+carry. The telnet and RBN-uplink wire lines convert it to the 500 Hz
+reference bandwidth RBN and CW Skimmer use (`+10·log10(2500/500) ≈ 6.99
+dB`), per decision D3
+(`docs/DECISIONS/2026-09-06-broad-review-decisions.md`) — a rendering step
+at the output boundary only. The internal pipeline, §4.5's confidence `q`,
+and §7's vector pass criteria are all unchanged and remain defined in
+2500 Hz.
+
 ### 2.4 Track lifecycle state machine
 
 States: `IDLE → CANDIDATE → ACTIVE → HANG → CLOSED`.
@@ -429,6 +446,11 @@ c_char ← c_char · q,  q = clamp(SNR_2500 / 20 dB, 0.3, 1.0)
 `q` folds channel quality in so that a clean-timed character in the mud never
 reaches full confidence. Emitted per character in the decoder output stream.
 
+`q`'s `SNR_2500` is still the demod's own §3.2 keying-rail estimate
+(`Demod::snr_2500_db`), not `TrackMeta.snr_2500_db`'s §2.3 floor-based value
+below — deliberately (MAN-102 / decision D3): the two were the same value by
+coincidence before MAN-102, and are now intentionally decoupled, not merged.
+
 ### 4.6 Per-callsign confidence (consumed by `manta-spot`)
 
 **[DEVIATION]** `r` is no longer strictly "on the track" -- MAN-166,
@@ -495,7 +517,7 @@ Per track, an ordered event stream:
 CharDecoded    { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
 WordBoundary   { track_id, sample_ts: u64 }
 SpeedUpdate    { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
-TrackMeta      { track_id, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
+TrackMeta      { track_id, sample_ts: u64, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
 TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;
                  added post-freeze, 2026-09-09 — the exact hop a track is
                  promoted from CANDIDATE to ACTIVE, independent of whether the
@@ -506,6 +528,19 @@ TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
                  emitted for a track that produced at least one other event
                  first.)
 ```
+
+`TrackMeta.snr_2500_db` is §2.3's floor-based `S − F` estimate (peak-held
+over the reporting interval, per §2.3), supplied by the detector layer that
+owns the gate/floor state -- not the §3.2 keying-rail ratio §4.5's `q` uses
+(MAN-102 / decision D3).
+
+`TrackMeta.sample_ts` is the hop that produced it, so §6 rule 6's
+`(sample_ts, track_id)` resequencing places it in its true chronological
+position -- not a synthetic tie value -- among the same batch's
+`CharDecoded`/`WordBoundary` events (MAN-102 review round 2, finding 1:
+tying it to a synthetic `0` let a just-reported SNR retroactively attach to
+characters decoded earlier in the same batch, with the effect's magnitude
+depending on the caller's chunk size).
 
 `sample_ts` is the input-stream sample counter (u64, monotonic from stream
 start). Wall-clock time exists only at the spot-emission boundary
