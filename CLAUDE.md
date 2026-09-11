@@ -125,6 +125,12 @@ in other clones, branches, or worktrees.
   failed MAN-25's merge phase (`could not read .mergify.yml`, ENOENT). Merge
   policy lives in docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md — its
   2026-09-11 amendment is at the top and supersedes everything below it.
+  This paragraph is prose; the enforceable form of it is
+  `crates/manta-cli/tests/synced_ci_files_repo_name.rs`
+  (`retired_mergify_config_is_not_resurrected` /
+  `merge_policy_successor_to_mergify_exists`), which runs in the required
+  `cargo test --workspace` leg. Trust the test, not a doc paragraph, when the
+  two ever disagree.
 
 ## Code review convergence
 

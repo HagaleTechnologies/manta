@@ -45,8 +45,14 @@ with 0 required reviews, independent of whether CI is green. This
 restriction was NOT re-litigated per-repo — it's the same fix every other
 public repo in this rollout (coppa, pancetta) already got, for the
 identical reason. Flagged to Tony for confirmation rather than silently
-assumed; revert the `.mergify.yml` author condition if the original
-unrestricted scope was genuinely intended even for non-collaborator PRs.
+assumed. **That follow-up is spent, and its instruction is dead:** it said
+"revert the author condition if the original unrestricted scope was genuinely
+intended even for non-collaborator PRs", and the condition it named lived in a
+file #185 deleted. There is nothing at that path to open, revert, or edit. The
+equivalent knob today is the author allowlist in the `if:` of
+`.github/workflows/auto-merge-trigger.yml` (see the amendment at the top of
+this doc). Change that, and nothing else, if the scope question is ever
+reopened.
 
 ## Decision
 
