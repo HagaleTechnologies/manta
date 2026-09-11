@@ -1563,7 +1563,16 @@ fn effective_sort_ts(
     promoted_ts_by_track: &std::collections::HashMap<u32, u64>,
 ) -> u64 {
     match e {
-        DecoderEvent::SpeedUpdate { track_id, .. } | DecoderEvent::TrackMeta { track_id, .. } => {
+        // `TrackMeta` now carries a real `sample_ts` (MAN-102 review round
+        // 2) and falls through to `event_sample_ts` below like any other
+        // real-timestamped event -- it no longer needs the same-batch
+        // promotion-timestamp pin `SpeedUpdate` still does (Codex review,
+        // PR #134 round 1: pinning it here silently overrode that real
+        // timestamp, so a `TrackMeta` after an earlier `CharDecoded`/
+        // `WordBoundary` in the same batch sorted to the front instead of
+        // where it actually happened, letting `Validator` apply the new
+        // peak-held SNR to an earlier spot depending on batch chunking).
+        DecoderEvent::SpeedUpdate { track_id, .. } => {
             promoted_ts_by_track.get(track_id).copied().unwrap_or(0)
         }
         other => event_sample_ts(other),
