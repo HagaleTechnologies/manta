@@ -60,10 +60,30 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
 
 When running as a long-lived server (not `--help`), stop it with
-`docker stop -t 30 <container>` — Docker's own default 10-second grace
-period before SIGKILL is shorter than manta's supported drain window for
-a slow client's final write (up to 25s), so the default can cut a
-graceful shutdown off mid-drain.
+`docker stop -t 60 <container>` — Docker's own default 10-second grace
+period before SIGKILL is far shorter than manta's supported graceful-
+shutdown window. The daemon's own internal cutoff is
+`SHUTDOWN_DRAIN_DEADLINE`, **50s** as of MAN-45's per-client drain work
+(up to a 20s in-flight write to a stalled client, plus that client's own
+20s backlog drain, plus slack for task scheduling); the **60s** above is
+the caller-side grace period recommended on top of it, so the daemon
+always reaches its own cutoff first. A shorter timeout SIGKILLs the
+daemon mid-drain, before it can either deliver the remaining backlog or
+record what it abandoned on `manta_spots_dropped_write_failed_total` —
+the series each handler's drain loop charges when its per-client
+deadline expires. (`manta_spots_dropped_shutdown_total` is the separate
+series for a client still in its pre-login/handshake phase: no write
+failed or timed out, and none of that client's queued spots had been
+offered for delivery yet. It does NOT mean the connection performed no
+writes — the telnet login-read and banner branches are reached only
+after the `login: ` prompt went out successfully, and the WS-accept
+branch can fire once `accept_async_with_config` has already put part of
+the 101 response on the wire. It is not where graceful-drain loss shows
+up.)
+Either way, a SIGKILL is the silent truncation those counters exist to
+prevent. Use the same 60s value for
+`--stop-timeout` on `docker run`, `stop_grace_period` on Compose, and
+`terminationGracePeriodSeconds` on Kubernetes.
 
 Both are built by [`.github/workflows/release-publish.yml`](.github/workflows/release-publish.yml)
 directly from each tagged release's commit — every published binary
@@ -82,7 +102,15 @@ as before, and is what the rest of this Quickstart assumes:
 
 ## Quickstart
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.85 or newer, and a `git` executable on `PATH`. Git is a
+build-time requirement, not just a way to clone this repo: manta depends on
+[`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git
+dependency, and `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`
+so cargo fetches it through the `git` binary rather than its built-in
+libgit2 transport (which intermittently fails to resolve a bare pinned rev
+on a cold cache). Without git on `PATH` the build fails at the fetch step,
+before compiling anything. Neither Rust nor git is needed to *run* the
+released binaries or the Docker image above.
 
 ```sh
 # Build
@@ -91,6 +119,12 @@ cargo build --release -p manta-cli
 # Decode a synthetic golden vector from a file (deterministic, no hardware)
 manta gen v1 --out /tmp/v1
 manta decode /tmp/v1/v1.wav
+
+# Run as a daemon: telnet cluster (:7300), JSON Lines/WebSocket (:7301),
+# metrics, and any configured RBN uplinks, all from one config file
+manta run --config manta.toml --kiwi-host kiwi.example.org --kiwi-freq 7030000
+
+# `listen` is an alias of `run`, kept for ad hoc audio and dev testing.
 
 # Copy live CW from a public KiwiSDR on 40 m
 manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
@@ -131,6 +165,30 @@ The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden
 test vectors.
 
+### Outbound RBN uplink
+
+manta can also log into an RBN spot-collection endpoint as a client and
+forward its own spots there. Add one `[[rbn_uplink]]` block per target to
+the daemon config:
+
+```toml
+[server]
+station_callsign = "W3XYZ"
+
+[[rbn_uplink]]
+enabled = true
+target_host = "rbn.example.org"
+target_port = 7000
+# dry_run defaults to TRUE: manta connects and logs in, so you can verify
+# credentials and reachability, but transmits no spots. Set it to false
+# only once you actually intend to feed a live target.
+# dry_run = false
+```
+
+The uplink has not yet been verified against a real RBN ingest (see
+[ROADMAP.md](ROADMAP.md)), which is why dry-run is the default. manta logs
+which mode each target is in at startup.
+
 ## Status
 
 Pre-1.0. What exists and what does not:
@@ -147,7 +205,16 @@ Pre-1.0. What exists and what does not:
 - **Known limits:** the classical decoder loses copy under heavy HF fading on
   a few golden vectors (issues #25 and #28). Closing that gap is the M4 ML
   fusion stage, gated on beating the classical baseline under simulated
-  fading.
+  fading. The outbound RBN uplink is unverified against a real RBN ingest and
+  ships dry-run by default until that verification lands.
+- **Decode engine:** `decode.engine` defaults to `legacy`. A rewritten
+  `hsmm` engine (MAN-166 decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
+  implemented and reachable via `--engine hsmm`, but its stage-2
+  measurement gate (`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`)
+  came back FAIL 2026-09-09: real B2/K5TR oracle recall roughly doubles
+  over `legacy` (`as_word` 27%→56%, `framed` 13%→32%) but falls short of
+  the 60%/40% bar, and most VR/V golden vectors still fail. Not yet a
+  default-engine candidate.
 
 [ROADMAP.md](ROADMAP.md) has the milestone breakdown with acceptance
 criteria.

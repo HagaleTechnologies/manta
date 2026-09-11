@@ -16,18 +16,15 @@ fn word_events(track_id: u32, text: &str, start_ts: u64) -> (Vec<DecoderEvent>, 
     let mut events = Vec::new();
     let mut ts = start_ts;
     for c in text.chars() {
-        events.push(DecoderEvent::CharDecoded {
+        events.push(DecoderEvent::char_decoded(
             track_id,
-            sample_ts: ts,
-            glyph: Glyph::Char(c),
-            confidence: 0.95,
-        });
+            ts,
+            Glyph::Char(c),
+            0.95,
+        ));
         ts += 100;
     }
-    events.push(DecoderEvent::WordBoundary {
-        track_id,
-        sample_ts: ts,
-    });
+    events.push(DecoderEvent::word_boundary(track_id, ts));
     ts += 100;
     (events, ts)
 }
@@ -59,6 +56,7 @@ fn run_twice(v: &mut Validator, words: &[&str]) -> Vec<Spot> {
 fn seed_meta(v: &mut Validator, track_id: u32) {
     v.ingest(&DecoderEvent::TrackMeta {
         track_id,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
     });
@@ -105,6 +103,7 @@ fn v17_notched_frequency_never_spots() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_025_050.0,
     });
@@ -141,6 +140,7 @@ fn suppressed_spots_are_counted_by_reason() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_025_050.0,
     });
@@ -157,6 +157,7 @@ fn v17_frequency_outside_notch_still_spots() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None).with_notch(notch);
     v.ingest(&DecoderEvent::TrackMeta {
         track_id: 1,
+        sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_030_000.0,
     });

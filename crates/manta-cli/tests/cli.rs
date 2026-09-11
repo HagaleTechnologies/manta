@@ -73,6 +73,445 @@ fn unknown_vector_errors() {
     assert!(!out.status.success());
 }
 
+/// `Engine::Hsmm` is a fully implemented, reviewed engine since Task 8
+/// (`TrackDecoder::push_hop_hsmm`) and, as of Task 11, is no longer
+/// rejected by `parse_engine` on any command: `--engine hsmm` must run the
+/// real decode pipeline end to end (not just parse), the same as `legacy`/
+/// `edge-legacy`.
+#[test]
+fn decode_engine_hsmm_runs_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 15.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join("v1.wav"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "must not panic; stderr: {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "--engine hsmm must run successfully; stderr: {stderr}"
+    );
+    // A parseable DecodeReport proves the hsmm engine ran the full
+    // decode -> JSON-report pipeline, not just that clap accepted the flag.
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["events"].is_array());
+}
+
+#[test]
+fn run_is_the_canonical_daemon_verb() {
+    // MAN-77 scenario 1. Repro on e398d46: `manta run --help` exited 2 with
+    // "error: unrecognized subcommand 'run'".
+    let out = manta().args(["run", "--help"]).output().unwrap();
+    assert!(out.status.success(), "manta run --help should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Usage: manta run"), "stdout: {stdout}");
+
+    let top = manta().arg("--help").output().unwrap();
+    let top = String::from_utf8_lossy(&top.stdout);
+    // `run` is listed as a command; `listen` appears only as its alias.
+    assert!(top.contains("  run "), "top-level help: {top}");
+    assert!(top.contains("[alias: listen]"), "top-level help: {top}");
+}
+
+#[test]
+fn listen_is_still_accepted_as_an_alias_of_run() {
+    // The ticket's "existing scripts don't break silently" requirement.
+    let out = manta().args(["listen", "--help"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "manta listen --help should still succeed"
+    );
+}
+
+#[test]
+fn decode_and_gen_are_unaffected_by_the_verb_promotion() {
+    // MAN-77 scenario 2, asserted explicitly rather than left implicit.
+    for sub in ["decode", "gen"] {
+        let out = manta().args([sub, "--help"]).output().unwrap();
+        assert!(out.status.success(), "manta {sub} --help should succeed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("Usage: manta {sub}")),
+            "{sub}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn config_is_the_canonical_daemon_config_flag() {
+    // Repro on e398d46: "error: unexpected argument '--config' found".
+    // Validated before any file I/O, so nonexistent paths provoke the
+    // --dial-freq-hz error, which proves --config was accepted and routed
+    // to the same field --server-config used to reach.
+    let out = manta()
+        .args([
+            "run",
+            "--source",
+            "/nonexistent.wav",
+            "--config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    // The error text must name the new flag, not the old one.
+    assert!(stderr.contains("--config"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("--server-config"),
+        "stale flag name: {stderr}"
+    );
+}
+
+#[test]
+fn server_config_is_still_accepted_as_a_hidden_alias_of_config() {
+    let out = manta()
+        .args([
+            "run",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--dial-freq-hz"));
+
+    // Hidden: help advertises the canonical name only.
+    let help = manta().args(["run", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--config <CONFIG>"), "help: {help}");
+    assert!(
+        !help.contains("--server-config"),
+        "deprecated flag advertised: {help}"
+    );
+}
+
+#[test]
+fn deprecated_daemon_spelling_warns_on_stderr_and_names_the_replacement() {
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`manta run --config`"), "stderr: {stderr}");
+    assert!(stderr.contains("`--config`"), "stderr: {stderr}");
+}
+
+#[test]
+fn capture_rate_hz_that_does_not_evenly_divide_the_source_rate_is_a_clean_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 48_000.0; // AudioIqSource requires exactly 48000 Hz native
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "20000"]) // 48000/20000 is not an integer
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--capture-rate-hz") || stderr.contains("power of two"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn capture_rate_hz_that_divides_evenly_decimates_and_still_decodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 48_000.0; // AudioIqSource requires exactly 48000 Hz native
+    spec.duration_s = 10.0; // short scene, this test only proves the wiring runs end-to-end
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--capture-rate-hz", "24000"]) // 48000 -> 24000, factor 2
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn capture_rate_hz_replays_a_2channel_iq_wav_through_wav_iq_source() {
+    // MAN-169 round-2 Codex finding: `open_audio_source` used to route
+    // every `--source <path>.wav` through `AudioIqSource::from_wav_file`
+    // unconditionally, which hard-rejects every rate but 48000 Hz -- so a
+    // 96/192 kS/s raw complex-IQ replay (the format `decode`/`oracle`
+    // already read directly) could never reach `--capture-rate-hz`'s
+    // decimation wrapper via the CLI at all; only golden-vector tests that
+    // called `Decimator` directly (`golden_decimated_capture.rs`) ever
+    // exercised that combination. This drives the real `run --source ...
+    // --capture-rate-hz ...` CLI path end-to-end against a genuine
+    // 2-channel 96 kHz IQ WAV to prove `open_audio_source` now detects the
+    // 2-channel case and routes it through `WavIqSource` instead, unlocking
+    // decimated file replay the same way it already works for live SDR
+    // sources.
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = 96_000.0;
+    spec.duration_s = 10.0; // short scene, this test only proves the wiring runs end-to-end
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--capture-rate-hz", "48000"]) // 96000 -> 48000, factor 2
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn without_source_iq_a_2channel_wav_is_still_treated_as_stereo_audio() {
+    // MAN-169 round-4 Codex finding (Finding A): channel count alone can't
+    // distinguish a genuine 2-channel raw-IQ capture from an ordinary
+    // stereo real-audio recording -- both `WavIqSource` and `AudioIqSource`
+    // accept 2-channel WAVs. Without `--source-iq`, `--source` must always
+    // go through `AudioIqSource::from_wav_file` (the pre-round-2, and
+    // pre-this-PR, default), never `WavIqSource`. Proven indirectly: v1()'s
+    // default fs is 96000 Hz, and `AudioIqSource::from_wav_file` hard-
+    // rejects every rate but 48000 -- so this must fail with that source's
+    // own "48000" error, not a `WavIqSource`-shaped success or a different
+    // error, proving the 2-channel WAV was never silently reinterpreted as
+    // IQ.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1(); // fs=96_000, 2-channel WAV, no --source-iq
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("48000"),
+        "expected AudioIqSource's rate-mismatch error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("IQ WAV must have"),
+        "must not go through WavIqSource without --source-iq: {stderr}"
+    );
+}
+
+#[test]
+fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
+    // MAN-169 round-3 Codex finding: `has_rf_aware_source` (the gate behind
+    // `--dial-freq-hz is required with --config`) only checked kiwi/soapy/
+    // hpsdr CLI flags -- a 2-channel IQ WAV replay with a real
+    // `<stem>.json` sidecar center frequency (the same file format Task 2's
+    // `WavIqSource` round-2 fix unlocked for --capture-rate-hz) was still
+    // wrongly rejected as "not RF-aware" and forced a redundant
+    // --dial-freq-hz, even though the source already reports a real RF
+    // center via WavIqSource::center_freq_hz(). This proves the gate no
+    // longer fires for that case -- the run still fails (the --config path
+    // doesn't exist), but it must fail for THAT reason, not the
+    // --dial-freq-hz one, proving the RF-awareness check itself now passes.
+    // Requires --source-iq (round-4: no more channel-count sniffing).
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1(); // fs=96_000, center_freq_hz=14_000_000 (nonzero)
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("--dial-freq-hz"),
+        "RF-awareness gate should not fire for an IQ WAV with a real sidecar: {stderr}"
+    );
+}
+
+#[test]
+fn config_still_requires_dial_freq_hz_for_a_negative_sidecar_center_freq() {
+    // MAN-169 round-5 Codex finding: source_iq_has_real_rf_center's old
+    // `!= 0.0` check treated a negative center_freq_hz as RF-aware too --
+    // an RF dial frequency in this domain is never negative, so a negative
+    // sidecar value must still trip the --dial-freq-hz guard, the same as
+    // the round-4 zero-sentinel case.
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.center_freq_hz = -1_000_000.0;
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dial-freq-hz"),
+        "a negative sidecar center_freq_hz must still require --dial-freq-hz: {stderr}"
+    );
+}
+
+#[test]
+fn config_requires_dial_freq_hz_for_an_iq_wav_with_a_zero_sidecar_center() {
+    // MAN-169 round-4 Codex finding (Finding B): a `<stem>.json` sidecar
+    // existing is not proof its `center_freq_hz` is meaningful --
+    // `center_freq_hz: 0.0` is `WavIqSource`'s own "unknown center"
+    // sentinel (the same value it reports when there's no sidecar at all),
+    // so existence-only checking wrongly bypassed the --dial-freq-hz guard
+    // for a source that doesn't actually report a real RF center. This
+    // proves the opposite of the sibling "real sidecar" test above: the
+    // guard must still fire when the sidecar's value is the zero sentinel.
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        center_freq_hz: 0.0,
+        ..manta_testkit::vectors::v1()
+    };
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("v1.wav"))
+        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--dial-freq-hz"),
+        "a sidecar with center_freq_hz: 0.0 must not bypass the --dial-freq-hz guard: {stderr}"
+    );
+}
+
+#[test]
+fn capture_rate_hz_rejects_non_finite_and_degenerately_small_values() {
+    // MAN-169 whole-branch review finding: a small --capture-rate-hz (e.g.
+    // 187.5 Hz, reachable as 48000/256) resolves to a Channelizer with
+    // hop=0, which hangs Channelizer::process's read-advancing loop
+    // forever. Caught here, at CLI-parse time -- before any source is
+    // opened -- via parse_capture_rate_hz's MIN_CAPTURE_RATE_HZ floor, not
+    // just later at Decimator::new's own construction-time check.
+    // "-inf"/negative values aren't exercised here, same reasoning as
+    // hpsdr_rate_rejects_non_finite_values above: clap treats a leading
+    // "-" as a new flag rather than this value unless
+    // `allow_negative_numbers` is set, which this flag doesn't need since
+    // every legitimate rate is positive.
+    for bad_rate in ["NaN", "inf", "0", "187.5", "500"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args([
+                "run",
+                "--source",
+                "/nonexistent-for-this-test.wav",
+                "--capture-rate-hz",
+                bad_rate,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--capture-rate-hz {bad_rate} should be rejected before any I/O"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("capture-rate-hz"),
+            "expected an explanatory error for --capture-rate-hz {bad_rate}, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("nonexistent-for-this-test"),
+            "should fail at CLI-parse time, before the source file is ever opened: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn the_ad_hoc_listen_path_is_not_nagged() {
+    // The ticket title keeps `listen` for audio/dev testing, and
+    // docs/RUNBOOKS/m1-w1aw-live-copy.md still instructs `listen --device`.
+    let out = manta()
+        .args(["listen", "--kiwi-host", "example.com"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("deprecated"), "unexpected nag: {stderr}");
+}
+
+#[test]
+fn deprecation_notices_never_touch_stdout() {
+    // AGENTS.md: file input -> byte-identical spot logs. stdout carries the
+    // JSON Lines stream; a warning there would corrupt it. Uses the same
+    // argv as `deprecated_daemon_spelling_warns_on_stderr_and_names_the_replacement`
+    // (which does emit both notices) -- `listen --help` emits no notice at
+    // all, so it can't catch an eprintln!->println! regression.
+    let out = manta()
+        .args([
+            "listen",
+            "--source",
+            "/nonexistent.wav",
+            "--server-config",
+            "/nonexistent.toml",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("deprecated"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("deprecated"),
+        "test is vacuous unless a notice actually fires; stderr: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn non_utf8_argv_does_not_panic() {
+    // Regression: warn_deprecations() used to scan std::env::args(), which
+    // panics on non-UTF-8 argv. It runs as main()'s first statement, before
+    // Cli::parse() (which uses args_os() via clap and tolerates non-UTF-8
+    // paths) ever sees the argv -- so this must not panic for ANY
+    // subcommand, not only the deprecated spellings. Filenames are byte
+    // strings on Linux/macOS and need not be UTF-8.
+    use std::os::unix::ffi::OsStrExt as _;
+    let bad_path = std::ffi::OsStr::from_bytes(b"/tmp/man77-non-utf8-\xff.wav");
+    let out = manta().arg("decode").arg(bad_path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    // The nonexistent (and non-UTF-8-named) file should fail like any other
+    // missing file, not crash the argv scan before Cli::parse() runs.
+    assert!(!out.status.success());
+}
+
 #[test]
 fn kiwi_host_without_freq_is_a_clean_error() {
     let out = manta()
@@ -105,6 +544,119 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+}
+
+/// SPEC v2 §0/§7: `manta listen` gets the same `--engine` flag `manta
+/// decode` already has (Task 6), threaded through to the same
+/// `PipelineConfig`/`DecodeConfig` `manta_engine::listen` reads (Task 9).
+/// `hsmm` (Task 8, no longer CLI-gated as of Task 11) is included alongside
+/// `legacy`/`edge-legacy` -- all three are recognized `Engine` values with
+/// no rejection anywhere in this command.
+/// A full decode-success run (as `decode_accepts_engine_flag`, Task 9
+/// brief, does for `decode`) isn't used here: `--source` requires a real
+/// 48 kHz mono audio WAV (`AudioIqSource`, not `decode`'s 96 kHz complex-IQ
+/// vector format), and a synthetic clean one hits a pre-existing,
+/// `#[ignore]`'d `AudioIqSource`/Hilbert near-DC leakage bug
+/// (`manta-engine`'s `listen_decodes_a_clean_real_audio_signal`,
+/// <https://github.com/HagaleTechnologies/manta/issues/21>) that spuriously
+/// promotes extra tracks -- not something Task 9 should newly depend on
+/// being fixed. Instead: for each valid engine value, confirm clap accepts
+/// the flag (exit code is NOT clap's arg-error 2) and the run fails for the
+/// EXPECTED downstream reason (the nonexistent source file), proving
+/// `--engine` parsed successfully and `merge_cli_engine`/
+/// `load_decode_config_file` ran without erroring before ever reaching
+/// `open_source`.
+#[test]
+fn listen_accepts_engine_flag_for_every_valid_value() {
+    for engine in ["legacy", "edge-legacy", "hsmm"] {
+        let out = manta()
+            .args(["listen", "--engine", engine, "--source", "/nonexistent.wav"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{engine}: expected a failure");
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "{engine}: --engine must not be rejected as a bad argument"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+            "{engine}: expected the nonexistent-source-file error, got: {stderr}"
+        );
+    }
+}
+
+/// Regression, black-box: SPEC v2 §7 requires an explicit `--engine` to
+/// override `[decode]`'s `engine` key. An earlier version validated
+/// `engine = "hsmm"` at TOML-deserialize time -- BEFORE the CLI override
+/// was ever consulted -- so a config file staging `engine = "hsmm"` failed
+/// immediately even with `--engine legacy` on the command line, and the
+/// override never got a chance to run. As of Task 11 `hsmm` is no longer
+/// CLI-gated at all, but the precedence rule this test protects still
+/// matters: exercises the actual `manta` subprocess (not just the internal
+/// merge functions) both ways -- an explicit `--engine legacy` must beat a
+/// hsmm-staged file, and with no override the file's own `hsmm` value must
+/// be honored (both cases failing only for the expected, unrelated
+/// downstream reason: the nonexistent source file).
+#[test]
+fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
+    use std::io::Write as _;
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        f,
+        r#"
+        [server]
+        station_callsign = "W3XYZ"
+        [decode]
+        engine = "hsmm"
+        "#
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    // With --engine legacy: the override must win over the file's hsmm
+    // value and fail only for the expected downstream reason (source file
+    // doesn't exist).
+    let out = manta()
+        .args(["listen", "--engine", "legacy", "--server-config"])
+        .arg(f.path())
+        .args(["--source", "/nonexistent.wav", "--dial-freq-hz", "14027000"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a failure (nonexistent source)"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "--engine must not be rejected as a bad argument"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+        "expected the nonexistent-source-file error, got: {stderr}"
+    );
+
+    // With NO --engine override: the file's own hsmm value is honored (not
+    // rejected) and the run still fails only for the same unrelated,
+    // expected reason.
+    let out = manta()
+        .args(["listen", "--server-config"])
+        .arg(f.path())
+        .args(["--source", "/nonexistent.wav", "--dial-freq-hz", "14027000"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a failure (nonexistent source)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+        "expected the nonexistent-source-file error, got: {stderr}"
+    );
 }
 
 #[test]

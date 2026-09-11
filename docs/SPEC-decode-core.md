@@ -105,6 +105,42 @@ Per hop, for a track with peak channel `k₀`:
 With ≥ 100 key-down hops (any real CW transmission) the estimator's standard
 error is ≪ 10 Hz; absolute accuracy is then bounded by the SDR's reference
 oscillator, which is out of scope (config `input.freq_correction_ppm` exists).
+This ≪ 10 Hz claim is empirically channel-table-size (N) dependent: it was
+measured at N = 1024 (the 96 kHz table V1 uses); V31's 48 kHz/N = 512 table
+measures ~17 Hz instead (see the V31 row below; tracked in issue #177).
+
+### 1.5 Decimation (variable-width capture, issue #169)
+
+An optional stage between the `IqSource` and the channelizer: a cascade
+of `log2(factor)` Kaiser-windowed halfband FIR decimate-by-2 stages,
+`factor` restricted to powers of two. Each stage's ideal cutoff sits at
+`CUTOFF_FRACTION * fs_in` (0.235, deliberately below the theoretical
+quarter-band point `fs_in/4` -- the output Nyquist after that stage's
+decimate-by-2 -- reserving a transition-band margin so full stopband
+attenuation is actually reached by the new Nyquist rather than only
+somewhere past it), Kaiser-windowed at the same beta/stopband target as
+the channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated
+rate must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
+Module: `manta-dsp::decimate`.
+
+A halfband filter has every other tap forced to zero by construction
+(except the center tap), which in principle halves the multiply-accumulate
+cost per output sample. The current implementation does not exploit this:
+`HalfbandStage::process` iterates all taps unconditionally, including the
+structurally-zero ones, so the 2x MAC saving is not yet realized. This is a
+known, deliberate gap for now (tracked in issue #176), not an oversight,
+and there is likewise no criterion bench yet measuring this stage's cost
+against the repo's Pi4 CPU budget. Moving the cutoff off exactly `fs_in/4`
+(above) also gives up this exact-zero-tap property, so issue #176's skip
+opportunity no longer applies to this stage regardless.
+
+**Known limitation** (issue #179): the `CUTOFF_FRACTION` margin means
+channels near the decimated Nyquist edge see real, non-negligible
+attenuation (roughly -6 dB to -22 dB in the last ~1.5 kHz below the edge,
+for a 96k->48k stage) while still being exposed to the channelizer as
+ordinary trackable channels -- a real CW signal landing there can lose
+enough SNR to go undetected. The channelizer has no concept of decimation
+and does not yet exclude or de-weight these transition-band channels.
 
 ---
 
@@ -156,6 +192,23 @@ Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
 Reported track SNR (for spots) is converted from the 93.75 Hz channel to the
 conventional 2500 Hz reference bandwidth:
 `SNR_2500 = (S − F) − 10·log10(2500/93.75) = (S − F) − 14.3 dB`.
+
+`S − F` is **peak-held over each `TrackMeta` reporting interval** (§5's 375
+hops) before conversion: `S` is a τ = 40 ms EMA that decays toward the floor
+on every key-up, so an instantaneous sample is a function of keying phase,
+not of signal strength. The peak over the interval is the settled key-down
+level (MAN-102; see
+`docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for the
+measured rejection of an instantaneous sample and of a key-down mean).
+
+This 2500 Hz value is what `TrackMeta`, `Spot.snr_db`, and the JSON stream
+carry. The telnet and RBN-uplink wire lines convert it to the 500 Hz
+reference bandwidth RBN and CW Skimmer use (`+10·log10(2500/500) ≈ 6.99
+dB`), per decision D3
+(`docs/DECISIONS/2026-09-06-broad-review-decisions.md`) — a rendering step
+at the output boundary only. The internal pipeline, §4.5's confidence `q`,
+and §7's vector pass criteria are all unchanged and remain defined in
+2500 Hz.
 
 ### 2.4 Track lifecycle state machine
 
@@ -393,10 +446,29 @@ c_char ← c_char · q,  q = clamp(SNR_2500 / 20 dB, 0.3, 1.0)
 `q` folds channel quality in so that a clean-timed character in the mud never
 reaches full confidence. Emitted per character in the decoder output stream.
 
+`q`'s `SNR_2500` is still the demod's own §3.2 keying-rail estimate
+(`Demod::snr_2500_db`), not `TrackMeta.snr_2500_db`'s §2.3 floor-based value
+below — deliberately (MAN-102 / decision D3): the two were the same value by
+coincidence before MAN-102, and are now intentionally decoupled, not merged.
+
 ### 4.6 Per-callsign confidence (consumed by `manta-spot`)
 
+**[DEVIATION]** `r` is no longer strictly "on the track" -- MAN-166,
+2026-09-09 (`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`,
+`crates/manta-spot/src/gate.rs`). A real signal's `track_id` changes every
+time its track closes and reopens (e.g. a 5s silence timer), which a
+literal per-track `r` would reset on every churn regardless of whether the
+same callsign was still genuinely repeating -- confirmed as a real bug
+against a genuine 40m contest recording. `r` is counted per
+(frequency-bucket, callsign) instead, which survives that churn; a decode
+from a *different* track_id within a reasoned minimum gap of the most
+recent one is still rejected as a likely concurrent duplicate (two tracks
+decoding the same real transmission), while the same track_id always
+counts (one decode stream can't decode the same instant twice) --
+`RepetitionGate::record`'s own doc has the full mechanism.
+
 For a candidate callsign of `n` characters with confidences `c₁..c_n`,
-decoded `r` distinct times on the track within the 90 s window:
+decoded `r` distinct times within the 90 s window:
 
 ```
 c_call = (Π cᵢ)^(1/n) · (1 − 0.5^r)
@@ -409,12 +481,94 @@ and are specified in `manta-spot`, not here. The ≥ 2-repetition gate for
 first spot is unchanged for non-beacon, non-allowlisted spot types; a
 message already type-tagged `BEACON` by the context parse (ARCHITECTURE §6
 step 1), or a callsign the operator has explicitly allowlisted (ARCHITECTURE
-§6's Watch List), is exempt from this gate and may spot on its first decode
-(MAN-28) — `r` still feeds `c_call` above unchanged, so a single-decode spot
-of either kind still carries the `r=1` confidence penalty. An allowlisted
-callsign also bypasses ARCHITECTURE §6 steps 1 (context parse -- tagged
-`SpotType::Unknown` when no CQ/DE/UP/beacon pattern matched) and 2
-(grammar/cty) entirely.
+§6's Watch List), is exempt from this gate — never needs a second, distinct
+decode (MAN-28). `r` still feeds `c_call` above unchanged, so a spot of
+either kind still carries the `r=1` confidence penalty at the repetition
+count it actually resolved with. An allowlisted callsign also bypasses
+ARCHITECTURE §6 steps 1 (context parse -- tagged `SpotType::Unknown` when no
+CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, and may spot
+the instant its pattern completes, as before.
+
+**Beacon emission timing (amended 2026-09-09, see
+`docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md`):** a
+non-allowlisted `BEACON`-tagged candidate no longer spots "on the first
+decode" in the sense of immediately as it's parsed. It is captured (grammar/
+cty/blocklist/notch checked immediately, as always) but held until the
+track's true close (`TrackClosed`), and only then evaluated against the
+track's true final reported speed (an implausibly fast final speed --
+`manta-spot`'s `MAX_PLAUSIBLE_WPM`, a validator-local heuristic, not a SPEC
+value -- permanently discards it; nothing here is retried). This was found
+necessary in practice: a live WPM reading taken at the moment of first
+decode is not yet the track's true, settled value, and gating emission on
+it (in either direction) reopened exactly the noise-artifact false-positive
+problem the heuristic exists to close. The repetition-gate exemption itself
+is unchanged -- a non-allowlisted beacon still never needs a second, distinct
+decode -- only the MOMENT of emission moved from "first decode" to "track
+close." An allowlisted callsign is unaffected by this and still spots
+immediately.
+
+**"Distinct" (MAN-100).** Two decodes of the same callsign text on a track
+count as separate repetitions toward `r` only when at least
+`MIN_MESSAGE_WORD_GAP = 3` decoded words on that track separate them, **or**
+at least `MIN_MESSAGE_TIME_GAP_SECONDS = 60` seconds of `sample_ts` separate
+them (MAN-100 remediation C2). SPEC's own default payload template repeats
+the callsign back-to-back within one transmission (`CQ CQ DE <CALL> <CALL>
+K`, §7's payload note) — without the word-gap half of this rule, that
+single, possibly fading-corrupted message alone could satisfy the ≥
+2-repetition gate. 3 words sits strictly between the one-word gap inside a
+single message and the minimum five-word gap between two separate ones
+(`<CALL> K CQ CQ DE <CALL>`). That word-gap reasoning assumes SPEC's own
+payload template, though, and does not hold for a real, shorter ID (e.g.
+"DE `<CALL>`", 2 words) — the time-gap half exists for exactly that case: 60
+s comfortably covers a full "CQ CQ DE `<CALL>` `<CALL>` K" transmission even
+at 8 WPM (this section's slowest supported speed, ~40 s for that template)
+with margin, while staying well under the 90 s ledger/gate window itself.
+The beacon/allowlist exemptions above are unaffected — they never consult
+`r`'s distinctness rule at all. A short "DE `<CALL>`" ID repeated only
+twice at ordinary (sub-60 s) cadence remains unspotted under this rule — an
+accepted, bounded recall cost (MAN-100 remediation C2, quantified; V43),
+not tightened further: any time-gap threshold low enough to rescue it would
+also treat a single corrupted message's own doubled utterance as two
+distinct messages, reopening the hole this rule exists to close.
+
+**Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
+Before a candidate spots, it is checked against every other decoded,
+spottable-shaped word observed on the same track within the same 90 s
+window. It is withheld if a confusable, better-supported rival exists —
+"confusable" meaning a shared contiguous substring relationship, or a
+shared prefix of at least 3 characters with edit distance ≤ 2 — where
+"better-supported" means strictly more message-distinct repetitions (ties
+broken by summed per-occurrence confidence), or the candidate being a
+strict prefix of a rival that has been observed at all (≥ 1 message-distinct
+repetition — shape alone decides a prefix-containment pair once the rival
+exists, however little support it has). An earlier attempt (MAN-100
+remediation C5) also required the rival to independently clear the same
+≥ 2-repetition floor a spottable candidate must, on the reasoning that a
+single stray, garbled decode that happens to be a textual prefix-extension
+of a well-supported candidate should not be enough on its own to veto it;
+reverted in remediation round 3 because it excluded the ticket's own
+measured case (a 3-rep truncation losing to a genuine, longer call that
+had only a single observation on the track) — the two shapes are
+numerically indistinguishable from the ledger alone, and the measured,
+real case takes priority over the unmeasured, synthetic one that motivated
+C5. Symmetrically, a rival that is itself a strict prefix of the
+candidate never wins this comparison on repetition count alone (MAN-100
+remediation C1) — shape decides a prefix-containment pair in both
+directions, not just when the shorter form is being arbitrated. This
+mechanism is purely subtractive: it can only withhold a spot the rest of
+this section would otherwise emit, never produce one, and it never fires
+against an operator-allowlisted callsign, one present in the bundled SCP
+list, or a candidate already type-tagged `BEACON` (MAN-100 remediation C3 —
+the same once-per-cycle reasoning as this section's own beacon
+repetition-gate exemption above: a beacon's structurally low rep count
+would otherwise let a confusable, fading-corrupted rival permanently
+outrank it). The per-track ledger this arbitration reads evicts an entry
+once its newest observation ages out of the 90 s window (MAN-100
+remediation C6), so a long-lived track's key space stays bounded by what's
+currently live rather than growing with track history. See
+`manta-spot::variant`/`manta-spot::support` for the exact relation and
+comparison, and the MAN-100 decision record for the measured rationale
+behind the prefix-only asymmetry.
 
 ---
 
@@ -423,11 +577,33 @@ callsign also bypasses ARCHITECTURE §6 steps 1 (context parse -- tagged
 Per track, an ordered event stream:
 
 ```
-CharDecoded { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
-WordBoundary { track_id, sample_ts: u64 }
-SpeedUpdate { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
-TrackMeta   { track_id, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
+CharDecoded    { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
+WordBoundary   { track_id, sample_ts: u64 }
+SpeedUpdate    { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
+TrackMeta      { track_id, sample_ts: u64, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
+TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;
+                 added post-freeze, 2026-09-09 — the exact hop a track is
+                 promoted from CANDIDATE to ACTIVE, independent of whether the
+                 decoder subsequently produces anything. See
+                 docs/DECISIONS/2026-09-09-doctor-track-promoted-event.md.)
+TrackClosed    { track_id }  (added post-freeze, MAN-19 — a track has closed
+                 and will never emit another event under this track_id; only
+                 emitted for a track that produced at least one other event
+                 first.)
 ```
+
+`TrackMeta.snr_2500_db` is §2.3's floor-based `S − F` estimate (peak-held
+over the reporting interval, per §2.3), supplied by the detector layer that
+owns the gate/floor state -- not the §3.2 keying-rail ratio §4.5's `q` uses
+(MAN-102 / decision D3).
+
+`TrackMeta.sample_ts` is the hop that produced it, so §6 rule 6's
+`(sample_ts, track_id)` resequencing places it in its true chronological
+position -- not a synthetic tie value -- among the same batch's
+`CharDecoded`/`WordBoundary` events (MAN-102 review round 2, finding 1:
+tying it to a synthetic `0` let a just-reported SNR retroactively attach to
+characters decoded earlier in the same batch, with the effect's magnitude
+depending on the caller's chunk size).
 
 `sample_ts` is the input-stream sample counter (u64, monotonic from stream
 start). Wall-clock time exists only at the spot-emission boundary
@@ -495,10 +671,22 @@ in the fixture manifest. Text payload (unless stated):
 | V8w | pileup-50-fading | same scene as V8 | Watterson CCIR-poor, jitter 8 % | ≥ 90 % of signals with mean SNR ≥ +6 dB decoded with CER < 10 %; 0 bogus callsigns; 0 cross-channel ghost decodes |
 | V9 | drift | 18 WPM, +12 dB, drift +50 Hz/min, EA8AAA | AWGN | 1 track (no split); char ≥ 90 %; final freq tracks within 15 Hz |
 | V10 | farnsworth | 15 WPM chars / 25 WPM char-speed (Farnsworth), +15 dB, G4XXX | AWGN | char ≥ 95 %; word boundaries 100 % correct |
+| V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 25 Hz |
+
+V31's freq-error bound (25 Hz) differs from V1's (10 Hz) because the fine-
+frequency estimator's error is channel-table-size dependent, not a
+`Decimator` regression: measured ~17.4 Hz at the decimated path's N = 512
+table size vs. V1's N = 1024 (96 kHz) table. Confirmed by two no-decimator
+control renders of the same scene -- native 48 kHz and native 192 kHz both
+independently measure a similar ~15-17 Hz error with zero decimator
+involvement (see `crates/manta-cli/tests/golden_decimated_capture.rs`).
 
 M0 = V1 passing end-to-end from a WAV file. M1 = V1–V6. V7–V10 and V8w gate M2
 (multi-track engine). The RBN-parity corpus benchmark remains the M3 gate
-(ARCHITECTURE §9) and is not redefined here.
+(ARCHITECTURE §9) and is not redefined here. V31 gates variable-width capture
+(issue #169); unlike V1–V10 it is a standalone test in
+`crates/manta-cli/tests/golden_decimated_capture.rs`, not part of the
+`manta-testkit::vectors` V1–V10 fixture table.
 
 ### 7.1 `manta-spot` validator vectors (M3 sub-project 1)
 
@@ -518,7 +706,7 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V15 | dedupe | Repeat spot inside the 10 min window, then an SNR jump >= 6 dB | Suppressed inside the window; allowed after the SNR jump |
 | V16 | bad-call blocklist | Callsign present vs. absent from the operator's bad-call list | Present → 0 spots; absent → spots normally |
 | V17 | notched frequency | Track frequency inside vs. outside a notched range | Inside → 0 spots; outside → spots normally |
-| V18 | beacon-repetition-exemption | 1 decode of a `V V V <call>` beacon pattern | `BEACON`-tagged spot emits on the first decode, gate not applied (MAN-28) |
+| V18 | beacon-repetition-exemption | 1 decode of a `V V V <call>` beacon pattern, track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes -- repetition gate not applied regardless (MAN-28); emission TIMING moved to track-close 2026-09-09, see §4's amendment note -- no spot before `TrackClosed` |
 | V19 | allowlist-bypass | A single decode of a callsign with an unallocated cty prefix, explicitly allowlisted | Spots despite failing grammar/cty and despite only 1 decode (MAN-28 Watch List) |
 | V20 | allowlist-no-context | An allowlisted callsign decoded with no CQ/DE/UP/beacon framing at all | Spots, tagged `SpotType::Unknown` (MAN-28 Watch List, the primary NCDXF-beacon case) |
 | V21 | allowlist-independent-of-context | A stale, already-attempted context match (e.g. `CQ K5ARH`, decoded once, never spotted) sits in the window when a different, freshly-allowlisted word arrives | The allowlisted word still spots -- context-match and allowlist candidates are evaluated independently, not one-or-the-other by priority (MAN-28 Watch List) |
@@ -529,8 +717,15 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
-| V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
-| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37) | `BEACON`-tagged spot emits on the first decode, gate not applied -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern |
+| V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
+| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+| V38 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V38b (per-track scoping) and V38c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
+| V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the ≥ 2-rep gate; the second message completes it |
+| V40 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
+| V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
+| V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
+| V43 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
+| V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
 
 ---
 
@@ -571,12 +766,30 @@ cluster_alpha = 0.15
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]
 # (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29.
 freq_correction_ppm = 0.0
+# Target post-decimation capture rate, Hz (issue #169). None (the
+# default) uses the source's native rate unchanged. Must evenly divide
+# the source's native rate by a power of two, and must itself satisfy
+# fs/93.75 being a power of two. manta_dsp::decimate::Decimator,
+# manta_input::DecimatingSource. CLI-only for now (--capture-rate-hz) --
+# like freq_correction_ppm above, DaemonConfigFile does not yet model
+# this [input] table, so setting this key in a daemon TOML config file
+# has no effect; only the CLI flag reaches maybe_decimate.
+# capture_rate_hz = 48000   # omit entirely to use the source's native rate
 
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
 allowlist = []
 ```
+
+`SPEC-decode-core-v2.md` §7 adds a `[decode]` `engine` key (`"legacy"` |
+`"edge-legacy"` | `"hsmm"`, see that doc's §0) plus the `EdgeLegacy`/`Hsmm`
+evidence/noise/HSMM tunables, additive over this table -- see that
+document's §7 for the full v2 key list and defaults. Parsed by
+`manta_decode::config_file::DecodeConfigFile` and threaded into
+`manta-cli`'s `Listen` (and, after MAN-166 Task 13's follow-up, `Decode`/
+`Oracle`) subcommands' `--engine`/`--server-config` handling -- soon `run`'s
+per MAN-77.
 
 ## 10. Deviations from ARCHITECTURE.md
 
