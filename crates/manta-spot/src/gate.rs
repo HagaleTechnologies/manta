@@ -130,10 +130,8 @@ pub(crate) fn message_distinct_indices(
 
 /// The incremental counterpart to `message_distinct_indices`, for
 /// `RepetitionGate` (Codex review, PR #133 round 6). Classifies exactly
-/// ONE new occurrence -- decided once, right now, against `accepted`'s
-/// last entry that was itself classified message-distinct (searching
-/// backward, skipping any that weren't) -- and that verdict is then
-/// frozen forever in the entry pushed to `accepted`. Never re-run the
+/// ONE new occurrence -- decided once, right now -- and that verdict is
+/// then frozen forever in the entry pushed to `accepted`. Never re-run the
 /// whole-history version of this decision against `accepted` later: doing
 /// so would re-read `is_track_active` for a track_id whose liveness may
 /// have changed since the pair was first (correctly) compared in real
@@ -142,8 +140,27 @@ pub(crate) fn message_distinct_indices(
 /// into A's while A was still active, then A closes; a later recompute
 /// would see A "inactive" and wrongly count B's already-decided
 /// occurrence as a second message from what was really one transmission.
-/// Same decision rule as `message_distinct_indices`, applied once instead
-/// of replayed.
+///
+/// Same-track first, THEN last-counted (Codex review, PR #133 round 8):
+/// checks this track_id's own most recent occurrence -- regardless of
+/// whether THAT one was itself counted -- before falling back to the
+/// entry's last message-distinct occurrence overall. Word_seq/time-gap
+/// collapsing is purely a same-track concept (word_seq isn't even
+/// comparable across a differing track_id), unrelated to any OTHER
+/// track's liveness, so a still-active track's own continuation must be
+/// judged against its own prior word -- and, if it's the same message,
+/// is ITSELF false (not the start of a new message), regardless of
+/// whether the word it's joining was itself `true` or `false`: a
+/// message's own SECOND word is never `true` just because the message's
+/// FIRST word was. Skipping straight to "last counted" (round 6's
+/// original design) let a still-active track B's second word get compared
+/// against a DIFFERENT, now-closed track A instead of against B's own
+/// first word -- `!is_track_active(A)` then counted it as distinct purely
+/// because A had closed, even though B (B's own track) never did and B's
+/// two words were really one message. Falls through to the last-counted
+/// comparison only when this track's own predecessor says "genuinely
+/// distinct" (or it has none) -- that fallback IS a legitimate new
+/// real-time comparison, unaffected by round 6's constraint.
 fn classify_new_occurrence(
     accepted: &[(u64, u64, u32, bool)],
     seq: u64,
@@ -152,6 +169,19 @@ fn classify_new_occurrence(
     time_gap_samples: u64,
     is_track_active: &impl Fn(u32) -> bool,
 ) -> bool {
+    if let Some(&(same_ts, same_seq, ..)) = accepted.iter().rev().find(|&&(_, _, t, _)| t == tid) {
+        let gap = ts.saturating_sub(same_ts);
+        let distinct_from_own_last =
+            seq >= same_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples;
+        if !distinct_from_own_last {
+            // Same message as my own last word -- I'm not myself the
+            // start of a new one, regardless of whether THAT word was
+            // (e.g. two adjacent words right after the message's own
+            // first, counted, word: both later words are false, not a
+            // copy of the first word's true).
+            return false;
+        }
+    }
     let last_counted = accepted.iter().rev().find(|&&(.., counted)| counted);
     match last_counted {
         None => true,
@@ -889,6 +919,57 @@ mod tests {
             "t=0 has aged out of the 90s window, so t=5s must be promoted \
              to its own message -- the station never actually stopped \
              repeating"
+        );
+    }
+
+    /// Codex review, PR #133 (round 8): a still-active track's own second
+    /// word must be judged against ITS OWN prior word, never against a
+    /// DIFFERENT track's (possibly since-closed) entry. Track A (tid 1)
+    /// decodes once, counted. Track B (tid 2) decodes the same callsign
+    /// while A is still active -- correctly collapsed into A's message.
+    /// A then closes, but B never does: B decodes its OWN second word
+    /// (word_seq close to its own first, comfortably past the 1s
+    /// near-duplicate gap so it's accepted) with a closure reporting A
+    /// inactive. Before this fix, `classify_new_occurrence` skipped B's
+    /// own uncounted first word and compared this new one against A
+    /// instead, via the cross-track branch -- `!is_track_active(A)`
+    /// counted it as distinct purely because A had closed, even though B
+    /// itself never did and B's two words were really one message.
+    #[test]
+    fn a_still_active_tracks_own_second_word_is_judged_against_itself_not_a_closed_track() {
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 0, always_active), 1);
+        let three_point_four_seconds = (3.4 * FS) as u64;
+        assert_eq!(
+            gate.record(
+                2,
+                7_080_000.0,
+                "K5ARH",
+                three_point_four_seconds,
+                0,
+                always_active
+            ),
+            1,
+            "B's first word collapses into A's message while A is active"
+        );
+
+        // B's OWN second word, 2s later (past the near-duplicate gap),
+        // same track, word_seq close to B's own first -- with A now
+        // reported inactive.
+        let five_point_four_seconds = (5.4 * FS) as u64;
+        assert_eq!(
+            gate.record(
+                2,
+                7_080_000.0,
+                "K5ARH",
+                five_point_four_seconds,
+                1,
+                |tid| tid != 1
+            ),
+            1,
+            "B's second word is the same message as B's own first word -- \
+             A closing must not manufacture a false second confirmation \
+             from what is still B's own single, still-active message"
         );
     }
 
