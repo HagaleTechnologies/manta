@@ -225,6 +225,11 @@ impl SpotMessage {
                 "{station_call}:{session_nonce}:{}:{}:{}",
                 spot.track_id, spot.sample_ts, spot.callsign
             ),
+            // Still the pre-rename project name, deliberately: this is a
+            // wire value on the shared spot schema (dispensa/cqdx), not
+            // prose, so it cannot be renamed in manta alone. Tracked as a
+            // coordinated cross-repo follow-up in
+            // docs/DECISIONS/2026-09-01-rename-to-manta.md.
             source: "skimmer",
             timestamp: unix_ts_secs,
             // cqdx overwrites this on receipt; see the field's schema doc.

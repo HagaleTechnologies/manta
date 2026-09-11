@@ -57,9 +57,21 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
   `.mergify.yml` carried a sixth reference and was guarded alongside them until
   the native-merge-queue cutover (#185, 2026-09-11) deleted the file outright;
   its replacement, `.github/workflows/auto-merge-trigger.yml`, never carried the
-  old name. Nothing in this repo names the pre-rename project any more, so the
-  ticket's acceptance grep (`git grep -i skimmer -- .github .mergify.yml`) still
-  returns nothing.
+  old name. No *comment or prose* in this repo names the pre-rename project any
+  more, so the ticket's acceptance grep (`git grep -i skimmer -- .github
+  .mergify.yml`) still returns nothing.
+
+  **Do not read that as "nothing names the old project" — one live value still
+  does, deliberately.** `crates/manta-server/src/spot_message.rs:228` emits
+  `source: "skimmer"` on every JSON spot, and three tests pin that exact string
+  (`crates/manta-server/tests/json_stream_acceptance.rs:120` and `:609`,
+  `crates/manta-server/src/spot_message.rs:314`). It is not an oversight of this
+  rename: per `CLAUDE.md`, the JSON spot schema is an ecosystem contract shared
+  with `dispensa`/`cqdx`, so the field is a wire value that cannot be renamed in
+  manta alone -- changing it here unilaterally breaks consumers. It is therefore
+  out of scope for MAN-25 (a comment-only ticket) and tracked as a coordinated
+  cross-repo follow-up below. When this ADR is used as the rename inventory,
+  that field is the one known outstanding item.
 
 ## Follow-ups
 
@@ -67,6 +79,13 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
 - Set the GitHub repository description and topics.
 - Sibling repos that link to `HagaleTechnologies/skimmer` (cqdx, coppa,
   dispensa) rely on the redirect until touched for other reasons.
+- **Outstanding, cross-repo:** `crates/manta-server/src/spot_message.rs`'s
+  `source: "skimmer"` JSON field (and the three tests pinning it) still carries
+  the old project name. Renaming it is a wire-protocol change to the shared spot
+  schema, so it needs a `dispensa`/`cqdx` co-ordinated ticket -- consumers must
+  accept the new value before manta emits it (or accept both during a
+  transition). Not filed from the MAN-25 session, which held no Linear
+  credential; recorded here so the inventory is not lost.
 - MAN-25: apply the same rename in the upstream `wait-for-codex.yml` /
   `ci.yml` template (canonical copy cited as `credenza`, PR #30) so the next
   manual port carries the new name. Requires access to that repo; tracked
