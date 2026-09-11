@@ -172,16 +172,16 @@ calls without having been tuned to make any measured test pass.
   arbitrates between the repetition gate and dedupe in
   `evaluate_candidate`. New `SuppressionCounts::variant` counter
   (ARCHITECTURE §8: every suppression is counted).
-- Golden vectors V31 (variant arbitration, plus V31b per-track scoping and
-  V31c the head-merge negative control) and V32 (same-message repetition)
+- Golden vectors V38 (variant arbitration, plus V38b per-track scoping and
+  V38c the head-merge negative control) and V39 (same-message repetition)
   in `crates/manta-spot/tests/golden_v11_v15.rs`. Two pre-existing tests
   whose event sequences relied on the old same-message-counts-as-two
   semantics (`v29_provenance_bound_to_exact_word_occurrence_across_repetitions`,
   `cq_call_with_trailing_t_spots_once_as_cq_not_beacon`) were updated to
   source their second repetition from a genuinely separate message —
   their original subject (provenance binding; the CQ/DE power-step guard)
-  is unchanged. V33-V35 (arrival-order, short-ID time gap, beacon exemption)
-  added in the first remediation round; V36 (short-ID ordinary-cadence
+  is unchanged. V40-V42 (arrival-order, short-ID time gap, beacon exemption)
+  added in the first remediation round; V43 (short-ID ordinary-cadence
   acceptance) added in the second.
 
 ## Risks and how each is bounded
@@ -211,7 +211,7 @@ shipped rule and its golden vectors didn't cover. All three are fixed in
 this same PR, re-verified against V8/V8w with the replay harness (both
 scenes byte-for-byte unchanged: V8w 21 spots/20 distinct/0 bogus, V8 51
 spots/49 distinct/0 bogus — identical to the numbers measured above), and
-pinned with golden vectors V33–V35 (`docs/SPEC-decode-core.md` §7.1).
+pinned with golden vectors V40–V42 (`docs/SPEC-decode-core.md` §7.1).
 
 - **C1 — the prefix asymmetry was one-directional.** `longer_containment`
   only fired when the *rival* was the longer form; nothing stopped a
@@ -224,10 +224,10 @@ pinned with golden vectors V33–V35 (`docs/SPEC-decode-core.md` §7.1).
   the candidate (`support.rs`'s `shorter_prefix_of_candidate` arm),
   symmetric with the existing `longer_containment` arm and still
   prefix-only for the same reason: a head-merge rival (`DEN3NXI` vs
-  `N3NXI`) is a suffix relationship, so this arm never touches it (V31c
+  `N3NXI`) is a suffix relationship, so this arm never touches it (V38c
   stays green). This does not (and architecturally cannot) retroactively
   revoke a spot the truncation already emitted before the genuine call
-  was ever observed — V33 documents that scope boundary explicitly.
+  was ever observed — V40 documents that scope boundary explicitly.
 - **C2 — `count_message_distinct` never consulted `sample_ts`.** A
   two-word ID (e.g. `DE <CALL>`) puts the callsign only 2 word_seqs apart
   across genuinely *separate* transmissions, below
@@ -264,13 +264,13 @@ pinned with golden vectors V33–V35 (`docs/SPEC-decode-core.md` §7.1).
 ## Second remediation round (validate-plan attempt 3, 2026-09-07)
 
 The second validate-plan pass found the first remediation round's own golden
-vector for Scenario 1 (V31) was non-discriminating (it passed unchanged on
+vector for Scenario 1 (V38) was non-discriminating (it passed unchanged on
 `e398d46`, because `context::parse`'s single-match-per-window `DE_RE` never
 let "K5AR" surface as its own candidate in that event sequence), plus three
 further code-review gaps in the shipped mechanism.
 
-- **F1/F2 — V31 was vacuous.** Fixed by applying the same 16-word
-  filler-aging technique V33/V35 already use: age the well-supported
+- **F1/F2 — V38 was vacuous.** Fixed by applying the same 16-word
+  filler-aging technique V40/V42 already use: age the well-supported
   genuine call's earlier context match fully out of the window before the
   truncation is ever decoded, so the truncation reaches its own 2 reps
   (clearing the bare repetition gate on its own -- confirmed red on
@@ -315,7 +315,7 @@ further code-review gaps in the shipped mechanism.
   rescue a 20 s cadence would also treat a single corrupted "CQ CQ DE
   `<CALL>` `<CALL>` K" message's own doubled utterance -- typically only a
   few seconds apart -- as two distinct messages, reopening the exact hole
-  this rule exists to close. Pinned as accepted, current behaviour by V36
+  this rule exists to close. Pinned as accepted, current behaviour by V43
   rather than left unquantified.
 
 Not re-run against the real V8w/V8 fixtures this round (same constraint the
@@ -374,9 +374,9 @@ Re-measured end to end against the real V8w fixture after the revert:
 
 Matches the ticket's own acceptance criterion and this document's original
 headline table exactly. `crates/manta-spot/tests/golden_v11_v15.rs`'s
-`v37_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape` pins
+`v44_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape` pins
 this literal shape as a golden vector (`docs/SPEC-decode-core.md` §7.1,
-V37) so it cannot silently regress again; `support.rs`'s
+V44) so it cannot silently regress again; `support.rs`'s
 `a_strict_prefix_loses_to_a_longer_form_even_with_more_reps` unit test is
 restored to the plan's original 1-rep-rival spec, and a new
 `a_lone_single_observation_rival_still_overrides_by_shape` unit test
@@ -438,7 +438,7 @@ addressed inline in this PR.
   pending MAN-100 through MAN-113), D8 (classical-DSP fixes before M4).
 - Code: `crates/manta-spot/src/variant.rs`, `crates/manta-spot/src/support.rs`,
   `crates/manta-spot/src/gate.rs`, `crates/manta-spot/src/validator.rs`.
-- Vectors: `docs/SPEC-decode-core.md` §4.6, §7.1 (V29, V31, V32, V33–V36);
+- Vectors: `docs/SPEC-decode-core.md` §4.6, §7.1 (V29, V38, V39, V40–V43);
   `crates/manta-spot/tests/golden_v11_v15.rs`.
 - Replay harness: `crates/manta-cli/examples/replay_spots.rs`,
   `wiki/pages/replay-spots-harness.md`.

@@ -10,13 +10,21 @@
 //! `docs/DECISIONS/2026-09-07-man100-variant-arbitration.md` and
 //! `wiki/pages/replay-spots-harness.md`.
 //!
-//! Usage: `replay_spots <report.json> <calls.txt>`
+//! Usage: `replay_spots <report.json> <calls.txt> [sample_rate_hz]`
 //!
 //! `<report.json>` is the stdout of `manta decode --json <wav>` (a
 //! `manta_engine::DecodeReport`, serialized). `<calls.txt>` is a
 //! newline-separated list of the scene's genuine callsigns (e.g. a fixture
 //! manifest's known set), used only to tag each replayed spot
 //! genuine/bogus in the printed summary -- it never affects what spots.
+//! `[sample_rate_hz]` defaults to 96 kHz (every fixture this repo
+//! generates, SPEC §7 / `manta-testkit::vectors::VectorSpec::fs`) but MUST
+//! be overridden to the WAV's actual rate for a report produced with
+//! `manta decode --capture-rate-hz <n>` -- `DecodeReport` carries no
+//! sample-rate field of its own (Codex review, PR #133), so this can't be
+//! inferred from the report; passing the wrong rate silently doubles or
+//! halves the 60 s message gap, 90 s repetition window, and 10 min dedupe
+//! window against what the original run actually used.
 //!
 //! `DecoderEvent` derives both `Serialize` and `Deserialize`, so this
 //! deserializes the saved report's `events` array directly rather than
@@ -32,17 +40,29 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 /// The `sample_ts` values in a saved report are raw-IQ sample indices at
-/// the WAV's own sample rate. Every fixture this repo generates (SPEC §7,
-/// `manta-testkit::vectors::VectorSpec::fs`) is 96 kHz, so a report
-/// replayed here must originate from a 96 kHz source for its 90 s
-/// window/gate math to mean what it meant when the report was produced.
-const FS: f64 = 96_000.0;
+/// the WAV's own sample rate -- see the module doc's `[sample_rate_hz]`
+/// note for why this can't just be read out of the report itself.
+const DEFAULT_FS: f64 = 96_000.0;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let [_, report_path, calls_path] = args.as_slice() else {
-        eprintln!("usage: replay_spots <report.json> <calls.txt>");
-        std::process::exit(2);
+    let (report_path, calls_path, fs) = match args.as_slice() {
+        [_, report_path, calls_path] => (report_path, calls_path, DEFAULT_FS),
+        [_, report_path, calls_path, sample_rate_hz] => {
+            let fs: f64 = sample_rate_hz.parse().unwrap_or_else(|e| {
+                eprintln!("invalid sample_rate_hz {sample_rate_hz:?}: {e}");
+                std::process::exit(2);
+            });
+            if !fs.is_finite() || fs <= 0.0 {
+                eprintln!("sample_rate_hz must be a finite, positive number, got {fs}");
+                std::process::exit(2);
+            }
+            (report_path, calls_path, fs)
+        }
+        _ => {
+            eprintln!("usage: replay_spots <report.json> <calls.txt> [sample_rate_hz]");
+            std::process::exit(2);
+        }
     };
 
     let report_text = std::fs::read_to_string(report_path)
@@ -63,7 +83,7 @@ fn main() {
         .filter(|l| !l.is_empty())
         .collect();
 
-    let mut validator = Validator::bundled(FS);
+    let mut validator = Validator::bundled(fs);
     let start = Instant::now();
     let mut spots = Vec::new();
     for ev in &events {

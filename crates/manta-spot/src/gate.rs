@@ -46,30 +46,49 @@ pub const MIN_MESSAGE_TIME_GAP_SECONDS: f64 = 60.0;
 /// assumed ascending in `sample_ts` (and, within any one run of matching
 /// `track_id`s, in `word_seq` too, since `word_seq` only resets at a track
 /// boundary) -- that count toward
-/// message-distinctness: an occurrence counts if it's the first, if its
-/// `track_id` differs from the previously *counted* occurrence's, or if it
+/// message-distinctness: an occurrence counts if it's the first, if it
 /// clears `MIN_MESSAGE_WORD_GAP` word_seqs *or* `time_gap_samples`
-/// sample_ts beyond it. The track_id check exists because `word_seq` is a
-/// per-track word index (it resets to 0 on every new track), so it is not
-/// comparable across two different tracks at all -- without this, a real
+/// sample_ts beyond the previously *counted* occurrence (same track_id
+/// only -- `word_seq` isn't comparable across a differing `track_id`), or
+/// if its `track_id` differs from the previously *counted* occurrence's
+/// AND it clears `min_occurrence_gap_samples` (`RepetitionGate`'s own
+/// near-duplicate-track threshold, `MIN_OCCURRENCE_GAP_SECONDS`).
+///
+/// The track_id branch exists because `word_seq` is a per-track word index
+/// (it resets to 0 on every new track), so it is not comparable across two
+/// different tracks at all -- without SOME cross-track allowance, a real
 /// signal's confirming re-decode on a fresh `track_id` after a close+reopen
 /// (MAN-166) could land on a `word_seq`/`sample_ts` pair close enough to the
-/// prior track's own that it got collapsed into "the same message" and never
-/// reached the repetition floor (`RepetitionGate::record`'s
-/// `MIN_OCCURRENCE_GAP_SECONDS` check has already ruled out a near-
-/// simultaneous duplicate-spawn track by the time an occurrence from a
-/// different track_id reaches here, so a differing track_id is always a
-/// genuinely separate message). Shared by `RepetitionGate` and
+/// prior track's own that it got collapsed into "the same message" and
+/// never reached the repetition floor. But a differing `track_id` is NOT
+/// by itself sufficient (Codex review, PR #133): `RepetitionGate::record`'s
+/// own `MIN_OCCURRENCE_GAP_SECONDS` near-duplicate check only compares an
+/// incoming occurrence against the entry's aggregate `most_recent()`, and
+/// a track's *own* rapid-repeat exemption (`is_rapid_own_repeat`) can still
+/// let that track's second word into `accepted` well within
+/// `min_occurrence_gap_samples` of a DIFFERENT track's already-accepted
+/// occurrence -- two duplicate-spawn tracks decoding one doubled-call
+/// transmission ("CQ CQ DE <CALL> <CALL> K") near-simultaneously can leave
+/// track A's first copy accepted, track B's own near-simultaneous first
+/// copy rejected as a near-duplicate, and track B's adjacent second copy
+/// accepted via ITS OWN rapid-repeat exemption a fraction of a second
+/// later -- landing two still-close-in-time occurrences from different
+/// track_ids in `accepted`. Re-applying the same near-duplicate gap here,
+/// pairwise between consecutive *counted* occurrences, is what actually
+/// distinguishes that single transmission from a genuine, later
+/// confirmation on a fresh track. Shared by `RepetitionGate` and
 /// `support::SupportLedger` (MAN-100 Scenario 1), which must count
 /// repetitions by the same rule so a candidate's gate-facing rep count and
 /// its ledger-facing support figure never disagree about what counts as a
 /// separate message -- `support::SupportLedger::support_in_window` folds
 /// `conf_sum` over exactly the occurrences this returns. `SupportLedger`'s
 /// own entries are keyed by `(track_id, text)`, so every occurrence it
-/// passes in shares one `track_id` and the new check is a no-op there.
+/// passes in shares one `track_id` and the track_id branch is a no-op
+/// there regardless of what it's passed for `min_occurrence_gap_samples`.
 pub(crate) fn message_distinct_indices(
     occurrences: &[(u64, u64, u32)],
     time_gap_samples: u64,
+    min_occurrence_gap_samples: u64,
 ) -> Vec<usize> {
     let mut counted = Vec::new();
     let mut last_counted: Option<(u64, u64, u32)> = None;
@@ -77,9 +96,12 @@ pub(crate) fn message_distinct_indices(
         let counts = match last_counted {
             None => true,
             Some((prev_seq, prev_ts, prev_tid)) => {
-                tid != prev_tid
-                    || seq >= prev_seq + MIN_MESSAGE_WORD_GAP
-                    || ts.saturating_sub(prev_ts) >= time_gap_samples
+                let gap = ts.saturating_sub(prev_ts);
+                if tid != prev_tid {
+                    gap >= min_occurrence_gap_samples || gap >= time_gap_samples
+                } else {
+                    seq >= prev_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples
+                }
             }
         };
         if counts {
@@ -95,8 +117,9 @@ pub(crate) fn message_distinct_indices(
 pub(crate) fn count_message_distinct(
     occurrences: &[(u64, u64, u32)],
     time_gap_samples: u64,
+    min_occurrence_gap_samples: u64,
 ) -> usize {
-    message_distinct_indices(occurrences, time_gap_samples).len()
+    message_distinct_indices(occurrences, time_gap_samples, min_occurrence_gap_samples).len()
 }
 
 /// Width of a frequency bucket, in Hz (MAN-166). See `RepetitionGate`'s
@@ -124,7 +147,7 @@ const FREQ_BUCKET_HZ: f64 = 100.0;
 /// specifically so the transmission carries its own two confirmations)
 /// is always genuine, since one continuous decode stream can't decode the
 /// same instant twice.
-const MIN_OCCURRENCE_GAP_SECONDS: f64 = 1.0;
+pub(crate) const MIN_OCCURRENCE_GAP_SECONDS: f64 = 1.0;
 
 /// Clamps well inside `i64`'s range so `record`'s `b - 1..=b + 1` neighbor
 /// arithmetic can never overflow (Codex review, PR #152) -- a non-finite
@@ -436,7 +459,11 @@ impl RepetitionGate {
             .map(|&(ts, seq, tid)| (seq, ts, tid))
             .collect();
         occurrences.sort_unstable_by_key(|&(seq, ts, _)| (ts, seq));
-        count_message_distinct(&occurrences, self.time_gap_samples)
+        count_message_distinct(
+            &occurrences,
+            self.time_gap_samples,
+            self.min_occurrence_gap_samples,
+        )
     }
 
     /// See `records_total`'s doc.
@@ -577,6 +604,40 @@ mod tests {
             "10 000 samples (~0.1s) is nowhere near \
              MIN_MESSAGE_TIME_GAP_SECONDS, so the word-gap rule alone \
              should decide, same as before this change"
+        );
+    }
+
+    /// Codex review, PR #133 (P1): a differing `track_id` alone must NOT be
+    /// sufficient for message-distinctness. Reproduces the exact failure
+    /// mode found: two duplicate-spawn tracks (A, B) decoding one doubled-
+    /// call transmission ("CQ CQ DE K5ARH K5ARH K") near-simultaneously.
+    /// Track A's first copy is accepted; track B's own near-simultaneous
+    /// first copy is rejected as a near-duplicate (still within
+    /// `MIN_OCCURRENCE_GAP_SECONDS` of A's touch); track B's adjacent
+    /// SECOND copy is then accepted anyway via its own rapid-own-repeat
+    /// exemption, landing a second, different-track_id, still-close-in-
+    /// time occurrence in `accepted`. Before this fix, `tid != prev_tid`
+    /// alone counted that as a second message and reached `reps == 2` --
+    /// a false confirmation from what was really one transmission.
+    #[test]
+    fn a_duplicate_spawn_tracks_second_copy_does_not_manufacture_a_second_message() {
+        let mut gate = RepetitionGate::new(FS);
+        // Track 1's first copy of the doubled call.
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 1), 1);
+        // Track 2 (duplicate spawn of the same over-the-air signal) decodes
+        // its OWN first copy 0.3s later -- within MIN_OCCURRENCE_GAP_SECONDS
+        // of track 1's touch, so rejected as a near-duplicate (still 1).
+        assert_eq!(gate.record(2, 7_080_000.0, "K5ARH", 30_000, 1), 1);
+        // Track 2's adjacent second copy, 0.3s after ITS OWN first touch --
+        // accepted via its own rapid-own-repeat exemption, but still only
+        // 0.625s after track 1's original touch: not a genuine second
+        // message, so this must still read 1, not 2.
+        assert_eq!(
+            gate.record(2, 7_080_000.0, "K5ARH", 60_000, 2),
+            1,
+            "track 2's own doubled utterance of the SAME transmission must \
+             not manufacture a false second confirmation just because it \
+             landed on a different track_id"
         );
     }
 
@@ -730,6 +791,20 @@ mod tests {
     /// occurrences must not be forgotten outright, or the rejected
     /// track's own next attempt gets compared against the wrong track's
     /// timestamp again and is wrongly rejected a second time.
+    ///
+    /// Timestamps updated (Codex review, PR #133 P1, message-distinctness
+    /// now applies a `min_occurrence_gap_samples` floor across a
+    /// `track_id` change, not just at acceptance): the original 500/600
+    /// sample spacing (~6ms total) is indistinguishable from two
+    /// duplicate-spawn tracks decoding one over-the-air transmission --
+    /// exactly the false-confirmation shape that fix closes -- so it no
+    /// longer counts as 2, correctly. 96_200 keeps this test's actual
+    /// concern (track 2's rejected first attempt does not block its own
+    /// later acceptance -- still comfortably inside
+    /// `min_occurrence_gap_samples` of track 2's OWN prior touch at 500,
+    /// so `is_rapid_own_repeat` still fires) while also clearing
+    /// `min_occurrence_gap_samples` from track 1's original touch at 0, so
+    /// the return value stays a genuine, defensible 2.
     #[test]
     fn a_tracks_own_repeat_counts_even_after_its_first_attempt_was_rejected() {
         let mut gate = RepetitionGate::new(FS);
@@ -738,12 +813,13 @@ mod tests {
         // Track 2's near-simultaneous decode is correctly rejected as a
         // likely duplicate of track 1's.
         assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 500, 1), 1);
-        // Track 2 decodes AGAIN, shortly after its own (rejected) first
-        // attempt -- this is track 2's own second word, not a duplicate
-        // of anyone else, and must count as a second distinct occurrence
-        // even though it's still well under the minimum gap from track
-        // 1's original timestamp.
-        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 600, 10), 2);
+        // Track 2 decodes AGAIN, ~1.002s after track 1's original touch
+        // (comfortably clearing min_occurrence_gap_samples, 96_000) but
+        // still well under it relative to track 2's OWN prior (rejected)
+        // touch at 500 -- this is track 2's own later word, not a
+        // duplicate of anyone else, and must count as a second distinct
+        // occurrence.
+        assert_eq!(gate.record(2, 14_000_000.0, "K5ARH", 96_200, 10), 2);
     }
 
     /// MAN-19's original concern (unbounded growth under sustained track

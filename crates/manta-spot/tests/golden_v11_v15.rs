@@ -1067,7 +1067,7 @@ fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
     );
 }
 
-/// V31 (MAN-100 Scenario 1): a track decodes both a call and a confusable,
+/// V38 (MAN-100 Scenario 1): a track decodes both a call and a confusable,
 /// less-supported truncation of it on separate transmissions. K5ARH
 /// reaches 3 message-distinct repetitions; the truncated K5AR reaches 2 --
 /// enough to itself clear the repetition gate -- but must still lose to
@@ -1079,14 +1079,14 @@ fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
 /// "K5ARH" occurrence and "K5AR" never became its own candidate at all --
 /// the vector passed identically with the arbitration mechanism disabled
 /// (confirmed by checking out the pre-fix source with this test file kept:
-/// it passes unchanged). Fixed the same way V33/V35 force a fresh
+/// it passes unchanged). Fixed the same way V40/V42 force a fresh
 /// candidate: age the earlier match fully out of the window with filler
 /// before the truncation ever appears, so "K5AR" reaches its own 2 reps
 /// (clearing the bare repetition gate on its own -- the property that
 /// makes this vector discriminating: absent step 4b it would spot) and
 /// only then gets arbitrated against the already-well-supported "K5ARH".
 #[test]
-fn v31_truncated_variant_loses_to_the_better_supported_call() {
+fn v38_truncated_variant_loses_to_the_better_supported_call() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1105,7 +1105,7 @@ fn v31_truncated_variant_loses_to_the_better_supported_call() {
     // 16-word context window before K5AR ever appears, so context::parse's
     // single-match-per-window DE_RE surfaces "DE K5AR" as its own fresh
     // candidate instead of resolving (by text) to the still-in-window "DE
-    // K5ARH" match -- the same aging technique V33/V35 use. The ledger's
+    // K5ARH" match -- the same aging technique V40/V42 use. The ledger's
     // own window is time-based (90 s), not word-count-based, so K5ARH's
     // observations stay live there regardless, which is what actually
     // exercises the arbitration under test.
@@ -1133,11 +1133,11 @@ fn v31_truncated_variant_loses_to_the_better_supported_call() {
     );
 }
 
-/// V31b: arbitration is per track. The same truncation shape on two
+/// V38b: arbitration is per track. The same truncation shape on two
 /// different tracks describes two different stations, and both must
 /// still spot -- arbitration must never compare candidates across tracks.
 #[test]
-fn v31b_variant_arbitration_does_not_cross_tracks() {
+fn v38b_variant_arbitration_does_not_cross_tracks() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     seed_meta(&mut v, 2);
@@ -1171,7 +1171,7 @@ fn v31b_variant_arbitration_does_not_cross_tracks() {
     );
 }
 
-/// V31c: a genuine call is not suppressed by a merge artifact that glued a
+/// V38c: a genuine call is not suppressed by a merge artifact that glued a
 /// framing word onto it (the "DE" + call shape measured in the MAN-100
 /// plan's V8 scene). The real call is a strict SUFFIX of the merge
 /// artifact, so the prefix-only containment asymmetry must not fire in
@@ -1181,7 +1181,7 @@ fn v31b_variant_arbitration_does_not_cross_tracks() {
 /// cty and actually reaches arbitration instead of being rejected earlier
 /// for an unrelated reason.
 #[test]
-fn v31c_head_merge_artifact_never_suppresses_the_real_call() {
+fn v38c_head_merge_artifact_never_suppresses_the_real_call() {
     const CTY: &str = "\
 United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     K,W,N,AA,AB,AC,DE;
@@ -1216,12 +1216,12 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     );
 }
 
-/// V32 (MAN-100 Scenario 2): the two adjacent utterances in one "CQ CQ DE
+/// V39 (MAN-100 Scenario 2): the two adjacent utterances in one "CQ CQ DE
 /// <CALL> <CALL> K" transmission are one message's worth of evidence, not
 /// two -- a second, genuinely later transmission is required to clear the
 /// repetition gate.
 #[test]
-fn v32_same_message_repetition_does_not_satisfy_the_gate() {
+fn v39_same_message_repetition_does_not_satisfy_the_gate() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1239,7 +1239,7 @@ fn v32_same_message_repetition_does_not_satisfy_the_gate() {
     );
 }
 
-/// V33 (MAN-100 remediation C1): the prefix-containment asymmetry must
+/// V40 (MAN-100 remediation C1): the prefix-containment asymmetry must
 /// fire regardless of which form is observed first. A strict prefix
 /// (truncation) that arrives on the track FIRST and clears the
 /// repetition gate before the genuine, longer call has any support at
@@ -1254,7 +1254,7 @@ fn v32_same_message_repetition_does_not_satisfy_the_gate() {
 /// genuine call being suppressed afterward, not the truncation spotting
 /// at all.
 #[test]
-fn v33_a_truncation_that_arrives_first_still_lets_the_genuine_call_spot() {
+fn v40_a_truncation_that_arrives_first_still_lets_the_genuine_call_spot() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1297,7 +1297,7 @@ fn v33_a_truncation_that_arrives_first_still_lets_the_genuine_call_spot() {
     );
 }
 
-/// V34 (MAN-100 remediation C2): a short "DE <CALL>" ID puts its callsign
+/// V41 (MAN-100 remediation C2): a short "DE <CALL>" ID puts its callsign
 /// only 2 decoded words apart even across genuinely separate
 /// transmissions -- below `MIN_MESSAGE_WORD_GAP` (3). Before this fix,
 /// `count_message_distinct` consulted only `word_seq`, so this shape
@@ -1306,7 +1306,7 @@ fn v33_a_truncation_that_arrives_first_still_lets_the_genuine_call_spot() {
 /// 13 minutes never spotted). The time-based OR clears it here: 80 s of
 /// `sample_ts` is well past `MIN_MESSAGE_TIME_GAP_SECONDS` (60 s).
 #[test]
-fn v34_a_short_id_repeated_far_apart_in_time_still_clears_the_gate() {
+fn v41_a_short_id_repeated_far_apart_in_time_still_clears_the_gate() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1327,7 +1327,7 @@ fn v34_a_short_id_repeated_far_apart_in_time_still_clears_the_gate() {
     );
 }
 
-/// V35 (MAN-100 remediation C3): a `SpotType::Beacon` candidate is exempt
+/// V42 (MAN-100 remediation C3): a `SpotType::Beacon` candidate is exempt
 /// from step 4b's cross-candidate arbitration, the same way it's already
 /// exempt from the repetition gate two checks earlier (ARCHITECTURE
 /// §6.4) -- an NCDXF-style beacon legitimately IDs once per cycle, so its
@@ -1338,7 +1338,7 @@ fn v34_a_short_id_repeated_far_apart_in_time_still_clears_the_gate() {
 /// beacon's single correct decode (measured: "V V V W6DPH K" x2 then
 /// "V V V W6DPG K" x1 spotted only the corrupted "W6DPH").
 #[test]
-fn v35_beacon_candidates_are_exempt_from_variant_arbitration() {
+fn v42_beacon_candidates_are_exempt_from_variant_arbitration() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1354,7 +1354,7 @@ fn v35_beacon_candidates_are_exempt_from_variant_arbitration() {
     // 16-word context window before W6DPG appears, so `BEACON_RE`'s
     // single-match-per-window scan surfaces "V V V W6DPG" as a candidate
     // instead of resolving (by text) to the still-in-window, earlier "V V
-    // V W6DPH" match -- same technique V33 uses. The ledger's own window
+    // V W6DPH" match -- same technique V40 uses. The ledger's own window
     // is time-based (90 s), not word-count-based, so W6DPH's observations
     // stay live there regardless, which is what actually exercises this
     // fix.
@@ -1383,7 +1383,7 @@ fn v35_beacon_candidates_are_exempt_from_variant_arbitration() {
     );
 }
 
-/// V36 (MAN-100 remediation C2, quantified): a short "DE <CALL>" ID
+/// V43 (MAN-100 remediation C2, quantified): a short "DE <CALL>" ID
 /// repeated at ordinary (sub-60 s) cadence pins an accepted, bounded
 /// recall cost rather than a bug to fix -- `MIN_MESSAGE_TIME_GAP_SECONDS`
 /// is not lowered to rescue this shape, because a single corrupted "CQ CQ
@@ -1391,12 +1391,12 @@ fn v35_beacon_candidates_are_exempt_from_variant_arbitration() {
 /// few seconds apart at any supported WPM, so any threshold low enough to
 /// treat two 20 s-apart transmissions as distinct would also treat that
 /// single corrupted message's doubled utterance as distinct -- reopening
-/// exactly the hole V32 exists to close. Measured: a station that IDs "DE
+/// exactly the hole V39 exists to close. Measured: a station that IDs "DE
 /// <CALL>" exactly twice, 20 s apart, and never again, is not spotted at
 /// all. See `docs/DECISIONS/2026-09-07-man100-variant-arbitration.md`'s
 /// "Risks and how each is bounded" section.
 #[test]
-fn v36_a_short_id_at_ordinary_cadence_is_not_spotted_from_two_reps_alone() {
+fn v43_a_short_id_at_ordinary_cadence_is_not_spotted_from_two_reps_alone() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1416,7 +1416,7 @@ fn v36_a_short_id_at_ordinary_cadence_is_not_spotted_from_two_reps_alone() {
     );
 }
 
-/// V37 (MAN-100 remediation round 3): the literal, measured track-90 V8w
+/// V44 (MAN-100 remediation round 3): the literal, measured track-90 V8w
 /// shape. A well-supported truncation ("W6JQ", 3 message-distinct reps)
 /// must still lose to its own longer, genuine form ("W6JQA") even when
 /// that genuine form has only a single observation on the track at the
@@ -1432,7 +1432,7 @@ fn v36_a_short_id_at_ordinary_cadence_is_not_spotted_from_two_reps_alone() {
 /// reverted behavior end to end so it cannot regress unnoticed again; see
 /// the decision record's third remediation round.
 #[test]
-fn v37_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape() {
+fn v44_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
@@ -1448,7 +1448,7 @@ fn v37_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape() {
     // before W6JQ ever appears, so context::parse's single-match-per-
     // window DE_RE surfaces "DE W6JQ" as its own fresh candidate instead
     // of resolving (by text) to the still-in-window "DE W6JQA" match --
-    // the same aging technique V31/V33 use. The ledger's own window is
+    // the same aging technique V38/V40 use. The ledger's own window is
     // time-based (90 s), not word-count-based, so W6JQA's one observation
     // stays live there regardless.
     let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
