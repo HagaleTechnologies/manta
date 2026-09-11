@@ -114,11 +114,33 @@ fn merge_policy_successor_to_mergify_exists() {
             path.display()
         )
     });
+    // The executable command, not the prose about it: this workflow's header
+    // comment also says `gh pr merge --auto`, so a bare `body.contains(..)`
+    // stayed green even with the arming step deleted (PR #93 review).
+    let arms_auto_merge = body
+        .lines()
+        .map(executable_part)
+        .any(|code| code.contains("gh pr merge") && code.contains("--auto"));
     assert!(
-        body.contains("gh pr merge"),
-        "{rel} no longer arms auto-merge (`gh pr merge` is gone from it). That \
-         call IS the post-#185 admission boundary that replaced .mergify.yml's \
-         pull_request_rules; losing it silently leaves the repo with no \
-         automated merge path at all."
+        arms_auto_merge,
+        "{rel} no longer arms auto-merge: no executable line in it runs \
+         `gh pr merge ... --auto` (the header comment mentioning that command \
+         does not count). That call IS the post-#185 admission boundary that \
+         replaced .mergify.yml's pull_request_rules; losing it silently leaves \
+         the repo with no automated merge path at all."
     );
+}
+
+/// The executable part of `line` -- everything before its first `#`.
+///
+/// Both YAML and the shell inside a `run: |` block start comments with `#`, so
+/// one crude rule covers the whole workflow file. Cutting unconditionally can
+/// only ever discard *more* than a real comment, which fails loudly rather than
+/// passing vacuously -- the direction this guard needs to err in.
+fn executable_part(line: &str) -> &str {
+    let line = line.trim();
+    match line.find('#') {
+        Some(idx) => &line[..idx],
+        None => line,
+    }
 }

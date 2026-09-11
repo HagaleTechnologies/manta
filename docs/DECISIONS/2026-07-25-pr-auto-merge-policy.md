@@ -22,7 +22,13 @@ What replaced it:
   restate it.
 - `required_approving_review_count` is now **1** (was 0), so the "green CI is
   the *only* gate" framing in the Decision section below no longer holds
-  literally either.
+  literally either — **but it still holds for the two trusted authors above**:
+  `auto-merge-trigger.yml` arms their merges with `CODEX_REVIEW_PAT`, a bypass
+  actor on `manta-review-gate` ("always" mode), and the bypass is evaluated
+  against whoever enables auto-merge, not the PR's author. The review
+  requirement therefore binds only non-bypass merge attempts — anyone else's
+  token, or a manual merge. For `thagale` and `catalyst-cloud-connector[bot]`,
+  that workflow's author allow-list is the human gate, not an approval.
 
 Recorded here because this doc is the repo's standing merge-policy pointer
 (`CLAUDE.md` cites it by name): left unamended, it keeps telling readers and
