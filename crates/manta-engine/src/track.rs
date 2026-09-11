@@ -2192,6 +2192,115 @@ mod tests {
     }
 
     #[test]
+    fn step_hop_closure_drains_the_refiners_backlog_before_finishing() {
+        // MAN-194: step_hop's own closure handling (the `closed.retain`
+        // closure, below) drains a closing track's refiner backlog into
+        // `pending` BEFORE calling finish_decoder/finish_decoder_speed_only
+        // -- if a future edit moved the drain after the flush, a real
+        // buffered-but-undelivered observation would be silently discarded
+        // along with the rest of the removed `Track`, exactly the bug
+        // class this branch exists to fix. Uses the same withheld-final-
+        // dit technique as `finish_drains_every_remaining_tracks_refiner_
+        // backlog_before_flushing` above: the decoded text must genuinely
+        // end in "S", not truncate to "I", which is only possible if the
+        // backlog's withheld dit actually reached the decoder before the
+        // flush.
+        let small_cfg = cfg(); // confirm_hops=5, hang_hops=10, gc_hops=20
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            small_cfg,
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        let id = *tm.tracks.keys().next().unwrap();
+        let env = rect_envelope_hops("PARIS", 18);
+        // Withhold exactly the final dit of "S", same split point as the
+        // `finish()` sibling test -- fed live via push_envelope up through
+        // the second dit and its trailing gap (decoded so far: "PARI" plus
+        // ".." == glyph I), with the third dit's real evidence seeded
+        // directly into `refiner_backlog` below instead.
+        let split = env.len() - 18;
+        let mut decoder = TrackDecoder::new(id, DecodeConfig::default());
+        for (i, &a) in env[..split].iter().enumerate() {
+            decoder.push_envelope(a, i as u64);
+        }
+        {
+            let track = tm.tracks.get_mut(&id).unwrap();
+            // Force this track straight to ACTIVE (bypassing the
+            // detector's own rise/gate confirmation machinery, which this
+            // test isn't about) -- same field-level technique the
+            // standalone Lifecycle tests above use.
+            for _ in 1..small_cfg.confirm_hops {
+                track.lifecycle.on_hop(true, false, false);
+            }
+            assert_eq!(
+                track.state(),
+                LifecycleState::Active,
+                "test setup: track must be ACTIVE before driving it to closure"
+            );
+            // Seed the withheld final dit directly into refiner_backlog,
+            // exactly the shape Track::decoder_input leaves behind
+            // mid-burst (Task 1).
+            for (j, &a) in env[split..].iter().enumerate() {
+                track
+                    .refiner_backlog
+                    .push_back((a, a * a, None, (split + j) as u64));
+            }
+            track.has_emitted = true;
+            // Decoder deliberately NOT attached yet -- keeps the
+            // intervening step_hop hops below (needed to genuinely drive
+            // HangExpired through real step_hop) from queuing extra noise
+            // samples into `pending` ahead of the backlog's real content,
+            // which would pollute the decode timeline this test isolates.
+        }
+
+        // Real, uniform-quiet power: FloorBank/Gate both seed directly
+        // from this very first hop's own sample (no warm-up needed), so
+        // every hop's SNR reads ~0 dB -- `drop` (SPEC §2.3) immediately
+        // and forever, exactly the sustained-drop condition step_hop's own
+        // real ACTIVE -> HANG -> HangExpired path needs, with nothing
+        // hand-rolled about the transition itself.
+        let n = 64;
+        let quiet = quiet_power(n);
+        let mut m = 0u64;
+        for _ in 0..(small_cfg.hang_hops - 1) {
+            tm.step_hop(&hop(m, quiet.clone()), m);
+            m += 1;
+        }
+        assert_eq!(
+            tm.tracks.get(&id).unwrap().state(),
+            LifecycleState::Hang,
+            "test setup: track must be HANG, one hop away from HangExpired"
+        );
+        // Attach the decoder now, right before the closing hop -- the
+        // drain this test targets happens inside THIS call, in step_hop's
+        // real `closed.retain` closure.
+        tm.tracks.get_mut(&id).unwrap().decoder = Some(decoder);
+
+        let (closed, _, flush_events) = tm.step_hop(&hop(m, quiet.clone()), m);
+        assert_eq!(
+            closed,
+            vec![(id, ClosureKind::SignalEnded)],
+            "expected step_hop's own closure handling to close this track as HangExpired"
+        );
+        let decoded: String = flush_events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { glyph, .. } => glyph.text_char(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            decoded.ends_with('S'),
+            "the backlog's final withheld dit must still reach the decoder before step_hop's \
+             closure flush, so the track closes out decoding \"S\", not silently truncating to \
+             \"I\" from a dropped backlog -- got decoded={decoded:?}, flush_events={flush_events:?}"
+        );
+    }
+
+    #[test]
     fn finish_drains_every_remaining_tracks_refiner_backlog_before_flushing() {
         // MAN-194 Scenario 2 (EOF): TrackManager::finish must not silently
         // drop a still-open track's buffered-but-undelivered refiner
@@ -2690,6 +2799,69 @@ mod tests {
         );
     }
 
+    /// MAN-194: `evict_over_cap` must drain an evicted track's REFINER
+    /// BACKLOG into `pending` before calling `finish_decoder_speed_only` --
+    /// same reasoning and same discriminating technique as
+    /// `merge_converged_drains_refiner_backlog_before_finishing` above: a
+    /// completely fresh decoder that never saw a single hop cannot produce
+    /// a `SpeedUpdate`/held-run event on its own, so non-empty
+    /// `flush_events` can only mean the backlog's samples genuinely
+    /// reached the decoder through `push_hop` before the flush. Capable of
+    /// failing: moving the drain to after `finish_decoder_speed_only()` in
+    /// `evict_over_cap` leaves `pending` empty at flush time, and the
+    /// untouched fresh decoder then reports nothing.
+    #[test]
+    fn evict_over_cap_drains_refiner_backlog_before_finishing() {
+        let det_cfg = DetectorConfig {
+            track_cap: 1,
+            ..DetectorConfig::default()
+        };
+        let mut tm =
+            TrackManager::new(64, 96_000.0, 14_000_000.0, det_cfg, DecodeConfig::default());
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.current_snr_db = 8.0; // lower SNR -> evicted first
+            weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
+            // Seeded directly into refiner_backlog, NOT `pending` -- see
+            // the matching merge_converged test's doc comment for why this
+            // is the discriminating part.
+            weak.refiner_backlog = rect_envelope_hops("PARIS", 18)
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| (a, a * a, None, i as u64))
+                .collect();
+            weak.has_emitted = true;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.current_snr_db = 18.0;
+        }
+
+        let (evicted, flush_events) = tm.evict_over_cap();
+        assert_eq!(
+            evicted,
+            vec![(
+                weak_id,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }
+            )],
+            "the lower-SNR track must be the one evicted, with no survivor to migrate to"
+        );
+        assert!(
+            !flush_events.is_empty(),
+            "evict_over_cap must drain the refiner backlog into pending through the decoder \
+             before finishing -- a fresh decoder that never saw a hop cannot produce this output \
+             on its own, got nothing"
+        );
+    }
+
     #[test]
     fn merge_closes_the_lower_snr_track_when_centers_converge() {
         // SPEC §2.5: "Two tracks whose centers converge within 1.0 channel
@@ -2942,6 +3114,79 @@ mod tests {
         assert!(
             !flush_events.is_empty(),
             "merge_converged must drain queued pending samples through the decoder before finishing, got nothing"
+        );
+    }
+
+    /// MAN-194: `merge_converged` must drain a merge-loser's REFINER
+    /// BACKLOG into `pending` before calling `finish_decoder_speed_only` --
+    /// the sibling test above already proves finishing drains queued
+    /// `pending`; this proves the NEW backlog -> pending wiring
+    /// specifically. Uses a completely fresh decoder (`TrackDecoder::new`,
+    /// no live `push_envelope` calls at all) with all of "PARIS" seeded
+    /// directly into `refiner_backlog` -- a decoder that has never seen a
+    /// single hop cannot produce a `SpeedUpdate`/held-run event on its own
+    /// (a fresh `Demod` has no held run, and `SpeedTracker::wpm()` starts
+    /// `None`), so `flush_events` non-empty can ONLY mean the backlog's
+    /// samples genuinely reached the decoder through `push_hop` before
+    /// `finish_decoder_speed_only` ran. This is capable of failing: moving
+    /// `drain_refiner_into_pending()` to after `finish_decoder_speed_only()`
+    /// in `merge_converged` leaves `pending` empty at flush time, and the
+    /// untouched fresh decoder then reports nothing.
+    #[test]
+    fn merge_converged_drains_refiner_backlog_before_finishing() {
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(40);
+        let mut ids: Vec<u32> = tm.tracks.keys().copied().collect();
+        ids.sort();
+        let (weak_id, strong_id) = (ids[0], ids[1]);
+
+        {
+            let weak = tm.tracks.get_mut(&weak_id).unwrap();
+            weak.center = 20.4;
+            weak.current_snr_db = 8.0;
+            weak.decoder = Some(TrackDecoder::new(weak_id, DecodeConfig::default()));
+            // Seeded directly into refiner_backlog (exactly the shape
+            // `Track::decoder_input` leaves behind), NOT `pending` -- this
+            // is what distinguishes this test from the sibling above,
+            // which already covers finish_decoder_speed_only's own
+            // pending-draining behavior.
+            weak.refiner_backlog = rect_envelope_hops("PARIS", 18)
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| (a, a * a, None, i as u64))
+                .collect();
+            weak.has_emitted = true;
+        }
+        {
+            let strong = tm.tracks.get_mut(&strong_id).unwrap();
+            strong.center = 21.1;
+            strong.current_snr_db = 18.0;
+        }
+
+        let (closed, flush_events) = tm.merge_converged();
+        assert_eq!(
+            closed,
+            vec![(
+                weak_id,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: Some(strong_id)
+                }
+            )],
+            "merge_converged must name the surviving track (round 9) so the \
+             loser's deferred evidence can be migrated to it"
+        );
+        assert!(
+            !flush_events.is_empty(),
+            "merge_converged must drain the refiner backlog into pending through the decoder \
+             before finishing -- a fresh decoder that never saw a hop cannot produce this output \
+             on its own, got nothing"
         );
     }
 
