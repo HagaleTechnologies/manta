@@ -1,5 +1,35 @@
 # PR auto-merge policy
 
+## AMENDMENT (2026-09-11) — Mergify is gone; read this before the 2026-09-01 one
+
+The native-merge-queue cutover (#185) deleted `.mergify.yml` from this repo.
+Every reference to Mergify, to `.mergify.yml`, or to "Mergify's queue" in the
+2026-09-01 amendment below is now historical: there is no such file to read and
+no such queue to enter, and the instruction to "revert the `.mergify.yml` author
+condition" has nothing left to act on.
+
+What replaced it:
+
+- **Performing the merge** — GitHub's native `merge_queue` ruleset rule on
+  `main-protection`.
+- **Admitting a PR into it** (the trusted-author boundary Mergify's
+  `pull_request_rules` used to own) —
+  `.github/workflows/auto-merge-trigger.yml`, which calls
+  `gh pr merge --auto --squash` only for `thagale` or
+  `catalyst-cloud-connector[bot]`. Dependabot is armed separately by
+  `.github/workflows/dependabot-auto-merge.yml`. That workflow's own header
+  comment is the authoritative explanation of the boundary; this doc does not
+  restate it.
+- `required_approving_review_count` is now **1** (was 0), so the "green CI is
+  the *only* gate" framing in the Decision section below no longer holds
+  literally either.
+
+Recorded here because this doc is the repo's standing merge-policy pointer
+(`CLAUDE.md` cites it by name): left unamended, it keeps telling readers and
+merge tooling that a `.mergify.yml` governs this repo's merges. Following that
+pointer to a deleted file is exactly what failed MAN-25's merge phase
+(`could not read .mergify.yml`, ENOENT).
+
 ## AMENDMENT (2026-09-01)
 
 The "every PR, any author" scope below is narrowed by the codex-clean-gate
