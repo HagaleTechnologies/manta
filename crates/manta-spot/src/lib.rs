@@ -12,7 +12,9 @@ pub mod gate;
 pub mod grammar;
 pub mod notch;
 pub mod scp;
+pub mod support;
 pub mod validator;
+pub mod variant;
 
 pub use blocklist::Blocklist;
 pub use context::SpotType;

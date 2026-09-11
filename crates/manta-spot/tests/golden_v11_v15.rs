@@ -498,9 +498,11 @@ fn v28_reclassification_still_accepted_when_driven_by_a_new_word() {
 
 /// V29: provenance must bind to the exact `Word` occurrence being
 /// evaluated, not whichever occurrence `context::parse`'s regex happened
-/// to match first. "CQ DE K5ARH DE K5ARH" repeats "DE K5ARH" -- the
-/// second, newest K5ARH is the one `evaluate_candidate` selects (its
-/// word-lookup always picks the newest matching word), but
+/// to match first. "CQ DE K5ARH K CQ DE K5ARH" repeats "DE K5ARH" across
+/// two genuinely separate messages (MAN-100 Scenario 2 -- the two
+/// occurrences must be `>= MIN_MESSAGE_WORD_GAP` words apart to both
+/// count) -- the second, newest K5ARH is the one `evaluate_candidate`
+/// selects (its word-lookup always picks the newest matching word), but
 /// `context::parse`'s first-match regex describes the FIRST "DE K5ARH"
 /// occurrence's span. If that mismatch stores the wrong (lower)
 /// `classified_max_seq` on the newest word, then once "CQ" (and the first
@@ -512,7 +514,7 @@ fn v29_provenance_bound_to_exact_word_occurrence_across_repetitions() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
 
-    let words = ["CQ", "DE", "K5ARH", "DE", "K5ARH"];
+    let words = ["CQ", "DE", "K5ARH", "K", "CQ", "DE", "K5ARH"];
     let first = run(&transmission_events(1, &words, 0), &mut v);
     assert!(
         first
@@ -601,12 +603,17 @@ fn a_resolved_named_match_still_suppresses_an_unrelated_power_step_candidate() {
 /// K5ARH") that also decodes a trailing "T", the coarse CQ/DE guard
 /// suppresses the power-step candidate outright (the bare "CQ" is
 /// present) -- K5ARH spots once, as `Cq`, with no Beacon reclassification.
+/// Run twice, 300 000 samples apart (MAN-100 Scenario 2): the two "K5ARH"
+/// utterances inside one "CQ K5ARH K5ARH T" transmission are adjacent
+/// (one message's worth of evidence), so a second, genuinely later
+/// transmission is needed to clear the repetition gate.
 #[test]
 fn cq_call_with_trailing_t_spots_once_as_cq_not_beacon() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let words = ["CQ", "K5ARH", "K5ARH", "T"];
-    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    spots.extend(run(&transmission_events(1, &words, 300_000), &mut v));
     assert!(
         spots
             .iter()
@@ -961,19 +968,32 @@ fn a_previously_attempted_but_unspotted_word_still_counts_its_suppression() {
 }
 
 /// MAN-48: counting stays once-per-occurrence even when another pattern
-/// spotted the same decoded word. "CQ K5ARH K5ARH T" spots K5ARH as Cq via
-/// CQ_CALL_RE in the same `try_spot` pass that burns its power-step
-/// candidacy -- the Beacon classification was still thrown away, which is
-/// what the metric measures, so it counts (once), and the Cq spot is
-/// unaffected. Making the count conditional on whether some *other* pattern
-/// happened to succeed is precisely the coupling Codex's PR #90 finding
-/// rejected.
+/// spotted the same decoded word. "CQ K5ARH K5ARH T" burns the trailing
+/// K5ARH's power-step Beacon candidacy against the CQ_CALL_RE match on the
+/// leading one in the same `try_spot` pass -- the Beacon classification was
+/// still thrown away, which is what the metric measures, so it counts
+/// (once), independent of whether the Cq spot itself has cleared the
+/// repetition gate yet. Making the count conditional on whether some
+/// *other* pattern happened to succeed is precisely the coupling Codex's
+/// PR #90 finding rejected.
+///
+/// MAN-100 remediation C2 changed what "succeeded" means here: the
+/// back-to-back "K5ARH K5ARH" is one message-distinct occurrence, not two
+/// (that collapsing is the whole point of C2 -- it's the exact SPEC
+/// payload shape the ticket targets), so this transmission alone no longer
+/// clears the >= 2-rep repetition gate the way it did before MAN-100. A
+/// second, message-distinct "CQ K5ARH" (word_seq 3+ past the first K5ARH,
+/// no trailing "T" so it captures no Beacon candidacy of its own) supplies
+/// that second rep so the Cq spot -- this test's other assertion -- still
+/// fires, leaving the guard-count assertion the only thing actually under
+/// test.
 #[test]
 fn a_spotted_word_still_counts_its_guard_suppression_once() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let words = ["CQ", "K5ARH", "K5ARH", "T"];
-    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    run(&transmission_events(1, &words, 0), &mut v);
+    let spots = run(&transmission_events(1, &["CQ", "K5ARH"], 200_000), &mut v);
     assert!(
         spots
             .iter()
@@ -1044,5 +1064,416 @@ fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
             .iter()
             .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
         "the captured beacon must still resolve at true close, got {spots:?}"
+    );
+}
+
+/// V38 (MAN-100 Scenario 1): a track decodes both a call and a confusable,
+/// less-supported truncation of it on separate transmissions. K5ARH
+/// reaches 3 message-distinct repetitions; the truncated K5AR reaches 2 --
+/// enough to itself clear the repetition gate -- but must still lose to
+/// the better-supported, containing form on the same track.
+/// MAN-100 remediation F1: the original version of this vector interleaved
+/// "K5ARH"/"K5AR" transmissions without ever aging the earlier "DE K5ARH"
+/// match out of the 16-word context window, so `context::parse`'s
+/// single-match-per-window `DE_RE` kept resolving to the still-in-window
+/// "K5ARH" occurrence and "K5AR" never became its own candidate at all --
+/// the vector passed identically with the arbitration mechanism disabled
+/// (confirmed by checking out the pre-fix source with this test file kept:
+/// it passes unchanged). Fixed the same way V40/V42 force a fresh
+/// candidate: age the earlier match fully out of the window with filler
+/// before the truncation ever appears, so "K5AR" reaches its own 2 reps
+/// (clearing the bare repetition gate on its own -- the property that
+/// makes this vector discriminating: absent step 4b it would spot) and
+/// only then gets arbitrated against the already-well-supported "K5ARH".
+#[test]
+fn v38_truncated_variant_loses_to_the_better_supported_call() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let mut spots = Vec::new();
+
+    // The well-supported genuine call: two separate transmissions, 2
+    // message-distinct reps -- spots immediately, no rival observed yet.
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+
+    // Push the two K5ARH transmissions (8 words) entirely out of the
+    // 16-word context window before K5AR ever appears, so context::parse's
+    // single-match-per-window DE_RE surfaces "DE K5AR" as its own fresh
+    // candidate instead of resolving (by text) to the still-in-window "DE
+    // K5ARH" match -- the same aging technique V40/V42 use. The ledger's
+    // own window is time-based (90 s), not word-count-based, so K5ARH's
+    // observations stay live there regardless, which is what actually
+    // exercises the arbitration under test.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 600_000), &mut v));
+
+    // The truncation, decoded cleanly twice -- enough to clear the bare
+    // repetition gate (>= 2 reps) on its own.
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 900_000 + i * 300_000),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "K5ARH"),
+        "the better-supported call must still spot, got {spots:?}"
+    );
+    assert!(
+        !spots.iter().any(|s| s.callsign == "K5AR"),
+        "a strict prefix of a better-supported call on the same track must \
+         not spot, even once it clears the repetition gate on its own, got {spots:?}"
+    );
+}
+
+/// V38b: arbitration is per track. The same truncation shape on two
+/// different tracks describes two different stations, and both must
+/// still spot -- arbitration must never compare candidates across tracks.
+#[test]
+fn v38b_variant_arbitration_does_not_cross_tracks() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    seed_meta(&mut v, 2);
+
+    let mut spots = Vec::new();
+    for i in 0..3u64 {
+        spots.extend(run(
+            &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(2, &["CQ", "DE", "K5AR", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5ARH" && s.track_id == 1),
+        "K5ARH on track 1 must spot, got {spots:?}"
+    );
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "K5AR" && s.track_id == 2),
+        "K5AR on its own, unrelated track must still spot -- arbitration is \
+         per track, not global, got {spots:?}"
+    );
+}
+
+/// V38c: a genuine call is not suppressed by a merge artifact that glued a
+/// framing word onto it (the "DE" + call shape measured in the MAN-100
+/// plan's V8 scene). The real call is a strict SUFFIX of the merge
+/// artifact, so the prefix-only containment asymmetry must not fire in
+/// this direction, and the ordinary support comparison must let the
+/// far-better-supported real call win. Uses a local fixture that also
+/// allocates the "DE" alias, purely so the merge artifact itself clears
+/// cty and actually reaches arbitration instead of being rejected earlier
+/// for an unrelated reason.
+#[test]
+fn v38c_head_merge_artifact_never_suppresses_the_real_call() {
+    const CTY: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N,AA,AB,AC,DE;
+";
+    let mut v = Validator::new(FS, CTY, None);
+    seed_meta(&mut v, 1);
+
+    // A single 1-rep merge artifact first, decoded as one word ("DE" +
+    // call glued together with no word boundary between them).
+    let mut spots = run(&transmission_events(1, &["CQ", "DEN3NXI", "K"], 0), &mut v);
+
+    // The real call, decoded cleanly across two separate transmissions --
+    // must still spot despite the merge artifact already sitting in the
+    // ledger.
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "N3NXI", "K"], 300_000),
+        &mut v,
+    ));
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "N3NXI", "K"], 600_000),
+        &mut v,
+    ));
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "N3NXI"),
+        "the real call must spot despite a 1-rep head-merge artifact \
+         sharing its text as a suffix, got {spots:?}"
+    );
+    assert!(
+        !spots.iter().any(|s| s.callsign == "DEN3NXI"),
+        "the 1-rep merge artifact must never itself spot, got {spots:?}"
+    );
+}
+
+/// V39 (MAN-100 Scenario 2): the two adjacent utterances in one "CQ CQ DE
+/// <CALL> <CALL> K" transmission are one message's worth of evidence, not
+/// two -- a second, genuinely later transmission is required to clear the
+/// repetition gate.
+#[test]
+fn v39_same_message_repetition_does_not_satisfy_the_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let one_message = ["CQ", "CQ", "DE", "K5ARH", "K5ARH", "K"];
+    let first = run(&transmission_events(1, &one_message, 0), &mut v);
+    assert!(
+        first.is_empty(),
+        "one message's doubled call must not satisfy the >= 2 rep gate, got {first:?}"
+    );
+
+    let second = run(&transmission_events(1, &one_message, 300_000), &mut v);
+    assert!(
+        second.iter().any(|s| s.callsign == "K5ARH"),
+        "a second, genuinely later message must complete the gate, got {second:?}"
+    );
+}
+
+/// V40 (MAN-100 remediation C1): the prefix-containment asymmetry must
+/// fire regardless of which form is observed first. A strict prefix
+/// (truncation) that arrives on the track FIRST and clears the
+/// repetition gate before the genuine, longer call has any support at
+/// all must still let the genuine call spot once it's observed -- before
+/// this fix, `better_supported_rival` only guarded the case where the
+/// truncation was arbitrated against an already-supported longer form,
+/// so this ordering suppressed the genuine call permanently (measured:
+/// "CQ DE W6JQ K" x3 then "CQ DE W6JQA K" x2 spotted only "W6JQ"). Note
+/// this fix cannot (and does not try to) retroactively revoke the
+/// truncation's own earlier spot -- the base, pre-MAN-100 commit already
+/// spotted it in this ordering too; the regression this closes is the
+/// genuine call being suppressed afterward, not the truncation spotting
+/// at all.
+#[test]
+fn v40_a_truncation_that_arrives_first_still_lets_the_genuine_call_spot() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let mut spots = Vec::new();
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQ", "K"], 0),
+        &mut v,
+    ));
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQ", "K"], 300_000),
+        &mut v,
+    ));
+
+    // Push the two W6JQ transmissions (8 words) entirely out of the
+    // 16-word context window (`WORD_WINDOW`) before W6JQA ever appears,
+    // so `context::parse`'s single-match-per-pattern `DE_RE` surfaces "DE
+    // W6JQA" as a candidate instead of resolving (by text) to the
+    // still-in-window, earlier "DE W6JQ" match -- the same aging
+    // technique V29 uses. The ledger's own window is time-based (90 s),
+    // not word-count-based, so W6JQ's observations stay live there
+    // regardless, which is what actually exercises this fix.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 600_000), &mut v));
+
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQA", "K"], 900_000),
+        &mut v,
+    ));
+    spots.extend(run(
+        &transmission_events(1, &["CQ", "DE", "W6JQA", "K"], 1_200_000),
+        &mut v,
+    ));
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "W6JQA"),
+        "the genuine, longer call must still spot once observed, even \
+         though its own strict-prefix truncation arrived first and \
+         already cleared the repetition gate, got {spots:?}"
+    );
+}
+
+/// V41 (MAN-100 remediation C2): a short "DE <CALL>" ID puts its callsign
+/// only 2 decoded words apart even across genuinely separate
+/// transmissions -- below `MIN_MESSAGE_WORD_GAP` (3). Before this fix,
+/// `count_message_distinct` consulted only `word_seq`, so this shape
+/// never cleared the repetition gate no matter how far apart in time the
+/// transmissions actually were (measured: 10 repeats at 80 s spacing over
+/// 13 minutes never spotted). The time-based OR clears it here: 80 s of
+/// `sample_ts` is well past `MIN_MESSAGE_TIME_GAP_SECONDS` (60 s).
+#[test]
+fn v41_a_short_id_repeated_far_apart_in_time_still_clears_the_gate() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let eighty_seconds_samples = (80.0 * FS) as u64;
+    let mut spots = Vec::new();
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["DE", "K5ARH"], i * eighty_seconds_samples),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots.iter().any(|s| s.callsign == "K5ARH"),
+        "a 2-word ID repeated 80 s apart is two genuinely separate \
+         messages and must clear the repetition gate despite its short \
+         word_seq gap, got {spots:?}"
+    );
+}
+
+/// V42 (MAN-100 remediation C3): a `SpotType::Beacon` candidate is exempt
+/// from step 4b's cross-candidate arbitration, the same way it's already
+/// exempt from the repetition gate two checks earlier (ARCHITECTURE
+/// §6.4) -- an NCDXF-style beacon legitimately IDs once per cycle, so its
+/// rep count is structurally low and a confusable rival that happens to
+/// repeat (a fading-corrupted decode of the same beacon) must not be
+/// allowed to outrank it on rep count alone. Before this fix, a 2-rep
+/// corrupted decode permanently suppressed a genuine, once-per-cycle
+/// beacon's single correct decode (measured: "V V V W6DPH K" x2 then
+/// "V V V W6DPG K" x1 spotted only the corrupted "W6DPH").
+#[test]
+fn v42_beacon_candidates_are_exempt_from_variant_arbitration() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let mut spots = Vec::new();
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["V", "V", "V", "W6DPH", "K"], i * 300_000),
+            &mut v,
+        ));
+    }
+
+    // Push both W6DPH transmissions (10 words) entirely out of the
+    // 16-word context window before W6DPG appears, so `BEACON_RE`'s
+    // single-match-per-window scan surfaces "V V V W6DPG" as a candidate
+    // instead of resolving (by text) to the still-in-window, earlier "V V
+    // V W6DPH" match -- same technique V40 uses. The ledger's own window
+    // is time-based (90 s), not word-count-based, so W6DPH's observations
+    // stay live there regardless, which is what actually exercises this
+    // fix.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 600_000), &mut v));
+
+    spots.extend(run(
+        &transmission_events(1, &["V", "V", "V", "W6DPG", "K"], 900_000),
+        &mut v,
+    ));
+
+    // A non-allowlisted Beacon candidate is only ever captured, never
+    // emitted, before `TrackClosed` (the deferred-judgment redesign this
+    // test predates) -- `close_track` supplies a plausible final WPM
+    // (avoiding the separate WPM-implausibility rejection) and closes the
+    // track so both candidates are finally judged.
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
+
+    assert!(
+        spots
+            .iter()
+            .any(|s| s.callsign == "W6DPG" && s.spot_type == SpotType::Beacon),
+        "the genuine once-per-cycle beacon must still spot despite a \
+         better-repeated confusable rival, got {spots:?}"
+    );
+}
+
+/// V43 (MAN-100 remediation C2, quantified): a short "DE <CALL>" ID
+/// repeated at ordinary (sub-60 s) cadence pins an accepted, bounded
+/// recall cost rather than a bug to fix -- `MIN_MESSAGE_TIME_GAP_SECONDS`
+/// is not lowered to rescue this shape, because a single corrupted "CQ CQ
+/// DE <CALL> <CALL> K" message's own two adjacent utterances sit only a
+/// few seconds apart at any supported WPM, so any threshold low enough to
+/// treat two 20 s-apart transmissions as distinct would also treat that
+/// single corrupted message's doubled utterance as distinct -- reopening
+/// exactly the hole V39 exists to close. Measured: a station that IDs "DE
+/// <CALL>" exactly twice, 20 s apart, and never again, is not spotted at
+/// all. See `docs/DECISIONS/2026-09-07-man100-variant-arbitration.md`'s
+/// "Risks and how each is bounded" section.
+#[test]
+fn v43_a_short_id_at_ordinary_cadence_is_not_spotted_from_two_reps_alone() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    let twenty_seconds_samples = (20.0 * FS) as u64;
+    let mut spots = Vec::new();
+    for i in 0..2u64 {
+        spots.extend(run(
+            &transmission_events(1, &["DE", "K5ARH"], i * twenty_seconds_samples),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        spots.is_empty(),
+        "a 2-word ID repeated only twice at ordinary (sub-60s) cadence is \
+         an accepted, bounded recall cost, not a spot, got {spots:?}"
+    );
+}
+
+/// V44 (MAN-100 remediation round 3): the literal, measured track-90 V8w
+/// shape. A well-supported truncation ("W6JQ", 3 message-distinct reps)
+/// must still lose to its own longer, genuine form ("W6JQA") even when
+/// that genuine form has only a single observation on the track at the
+/// time the truncation is arbitrated -- in the real V8w fixture, W6JQA's
+/// own second exact-text occurrence on the track arrives 51 words after
+/// W6JQ has already reached 3 reps and been evaluated, so W6JQA itself
+/// never independently clears the bare repetition gate in this scene.
+/// `MIN_RIVAL_REPS_FOR_SHAPE_OVERRIDE` (MAN-100 remediation C5), which
+/// required a rival to also independently clear the same >= 2-rep floor a
+/// spottable candidate must, silently re-opened exactly this pair --
+/// motivated by a hand-built scenario present in no real fixture, and
+/// never re-measured against V8w before landing. This vector pins the
+/// reverted behavior end to end so it cannot regress unnoticed again; see
+/// the decision record's third remediation round.
+#[test]
+fn v44_the_measured_w6jq_w6jqa_shape_a_1_rep_rival_still_wins_by_shape() {
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+
+    // The genuine, longer call: a single observation only -- the ledger
+    // records it regardless of whether context::parse ever resolves it to
+    // its own DE-anchored candidate.
+    let mut spots = run(
+        &transmission_events(1, &["CQ", "DE", "W6JQA", "K"], 0),
+        &mut v,
+    );
+
+    // Age the "DE W6JQA" context match fully out of the 16-word window
+    // before W6JQ ever appears, so context::parse's single-match-per-
+    // window DE_RE surfaces "DE W6JQ" as its own fresh candidate instead
+    // of resolving (by text) to the still-in-window "DE W6JQA" match --
+    // the same aging technique V38/V40 use. The ledger's own window is
+    // time-based (90 s), not word-count-based, so W6JQA's one observation
+    // stays live there regardless.
+    let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+    let filler_refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+    spots.extend(run(&transmission_events(1, &filler_refs, 300_000), &mut v));
+
+    // The truncation, decoded cleanly three times -- enough to clear the
+    // bare repetition gate on its own (reps=3), matching the real scene.
+    for i in 0..3u64 {
+        spots.extend(run(
+            &transmission_events(1, &["CQ", "DE", "W6JQ", "K"], 900_000 + i * 300_000),
+            &mut v,
+        ));
+    }
+
+    assert!(
+        !spots.iter().any(|s| s.callsign == "W6JQ"),
+        "a 3-rep truncation must still lose to its own longer form even \
+         when that form has only a single observation on the track, got {spots:?}"
+    );
+    assert!(
+        !spots.iter().any(|s| s.callsign == "W6JQA"),
+        "the genuine longer form itself never independently cleared the \
+         repetition gate in this scene (only 1 observation), so it must \
+         not spot either -- matching the real track-90 outcome of no spot \
+         at all rather than a bogus one, got {spots:?}"
     );
 }

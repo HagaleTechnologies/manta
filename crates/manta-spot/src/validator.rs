@@ -6,10 +6,11 @@ use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::dedupe::Dedupe;
-use crate::gate::RepetitionGate;
+use crate::gate::{RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
+use crate::support::SupportLedger;
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::{Glyph, Prosign};
 use std::collections::{BTreeMap, VecDeque};
@@ -139,6 +140,11 @@ struct PendingBeacon {
     /// letting one real over-the-air occurrence, captured by two
     /// overlapping tracks, reach `reps >= 2` on its own.
     origin_track_id: u32,
+    /// The captured word's own `seq` (MAN-100 Scenario 2), threaded to
+    /// `RepetitionGate::record` on eventual resolution so a deferred
+    /// Beacon replay is subject to the same message-distinctness rule as
+    /// every other candidate.
+    word_seq: u64,
 }
 
 #[derive(Default)]
@@ -286,6 +292,10 @@ pub struct SuppressionCounts {
     /// guard destroyed no beacon candidacy there (Codex review on PR #90,
     /// round 10). See `burn_suppressed_power_step_candidate`.
     pub power_step_guard: u64,
+    /// Spots withheld by MAN-100's cross-candidate variant arbitration: a
+    /// confusable, better-supported rival existed on the same track in the
+    /// same window. See `support::SupportLedger`.
+    pub variant: u64,
 }
 
 pub struct Validator {
@@ -294,6 +304,10 @@ pub struct Validator {
     tracks: BTreeMap<u32, TrackState>,
     gate: RepetitionGate,
     dedupe: Dedupe,
+    /// MAN-100 Scenario 1: per-track ledger of every observed,
+    /// spottable-shaped decoded word, used to arbitrate between confusable
+    /// candidates on the same track (see `support::SupportLedger`).
+    ledger: SupportLedger,
     freq_calibration: f64,
     allowlist: std::collections::BTreeSet<String>,
     blocklist: Blocklist,
@@ -322,6 +336,43 @@ pub struct Validator {
     /// O(gate size) scan on every single character.
     last_swept_ts: u64,
     sweep_interval_samples: u64,
+    /// `GATE_WINDOW_SECONDS` in samples, cached at construction -- the
+    /// prune cutoff for `merged_into` below.
+    gate_window_samples: u64,
+    /// track_id -> (its current best-known root survivor, `now_ts` at the
+    /// moment it was closed via `ClosureKind::Bookkeeping`) -- a merge
+    /// survivor exists, so the physical signal's identity continues, it's
+    /// just renamed -- MAN-100 message-distinctness, Codex review PR #133
+    /// rounds 3-4. `self.tracks.remove` (MAN-19) fires for a `Bookkeeping`
+    /// closure exactly the same as a genuine `SignalEnded` one, so absence
+    /// from `self.tracks` alone can't tell `gate::message_distinct_indices`'s
+    /// `is_track_active` query "this track genuinely ended" from "this
+    /// track's identity just moved to a survivor" -- without this, a
+    /// duplicate-spawn track A merging into survivor B mid-transmission
+    /// (A catches the first call utterance, B the second) reads as A
+    /// having "closed," letting B's second word manufacture a false
+    /// second message from what's still one over-the-air transmission.
+    ///
+    /// The root survivor is tracked (not just presence) so a later
+    /// `SignalEnded` on the ROOT can retire every alias that ultimately
+    /// points to it immediately (round 4): without this, A's alias
+    /// outlives the survivor's own genuine close for up to the sweep
+    /// window below, during which a brand-new, unrelated track C
+    /// reopening at the same frequency gets every one of its own
+    /// occurrences wrongly compared against A's stale entry and
+    /// collapsed, suppressing a real repetition-gate confirmation.
+    /// `resolve_survivor_root` handles chained merges (A into B, B later
+    /// into C) by re-pointing existing aliases when their OWN root
+    /// itself merges again, so a chain retires as one unit when its
+    /// final root ends.
+    ///
+    /// Still pruned in lockstep with `gate.sweep()` (same
+    /// `GATE_WINDOW_SECONDS` cutoff) as a memory-bound backstop (MAN-19)
+    /// for a root that lives past this window without ever closing --
+    /// past that window the repetition gate's own `accepted` list has
+    /// already dropped any of the alias's occurrences regardless, so it
+    /// can no longer affect message-distinctness either way.
+    merged_into: BTreeMap<u32, (u32, u64)>,
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -340,6 +391,7 @@ impl Validator {
             tracks: BTreeMap::new(),
             gate: RepetitionGate::new(fs),
             dedupe: Dedupe::new(fs),
+            ledger: SupportLedger::new(fs),
             freq_calibration: 1.0,
             allowlist: std::collections::BTreeSet::new(),
             blocklist: Blocklist::default(),
@@ -348,6 +400,8 @@ impl Validator {
             now_ts: 0,
             last_swept_ts: 0,
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
+            gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
+            merged_into: BTreeMap::new(),
         }
     }
 
@@ -370,6 +424,17 @@ impl Validator {
     fn maybe_sweep(&mut self) {
         if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
             self.gate.sweep(self.now_ts);
+            // `merged_into` bounded the same way, on the same cadence, as
+            // a memory-bound backstop for a root that lives past this
+            // window without ever closing (its own `SignalEnded` retires
+            // its aliases immediately -- see the field's own doc): past
+            // the gate's own window a merged-away track's lineage can no
+            // longer affect message-distinctness (its occurrences are
+            // already gone from `accepted`), so it's safe -- and
+            // necessary, for MAN-19's unbounded-growth concern -- to drop.
+            let cutoff = self.now_ts.saturating_sub(self.gate_window_samples);
+            self.merged_into
+                .retain(|_, &mut (_, merged_ts)| merged_ts >= cutoff);
             self.last_swept_ts = self.now_ts;
         }
     }
@@ -471,16 +536,34 @@ impl Validator {
             } => {
                 self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
+                let mut newly_completed: Option<(String, u64, f32)> = None;
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
                     word.seq = track.next_word_seq;
                     track.next_word_seq += 1;
+                    newly_completed = Some((
+                        word.text.clone(),
+                        word.seq,
+                        confidence::geo_mean(&word.confidences),
+                    ));
                     track.words.push_back(word);
                     if track.words.len() > WORD_WINDOW {
                         track.words.pop_front();
                     }
                 }
                 track.last_sample_ts = *sample_ts;
+                // MAN-100 Scenario 1: the ledger records every observed
+                // word that is ITSELF spottable-shaped (grammar + cty) --
+                // a form that could never be spotted must not be able to
+                // veto one that could. Gated on the same two checks
+                // `evaluate_candidate` runs for a non-allowlisted
+                // candidate below, so the ledger's population is never
+                // wider than what could plausibly spot.
+                if let Some((text, seq, geo)) = newly_completed {
+                    if grammar::is_plausible(&text) && self.cty.is_allocated(&text) {
+                        self.ledger.observe(*track_id, &text, seq, *sample_ts, geo);
+                    }
+                }
                 self.try_spot(*track_id, *sample_ts)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
@@ -552,9 +635,68 @@ impl Validator {
                 // by ITS OWN eventual true close), or discards it if there
                 // is none.
                 let spots = match closure {
-                    ClosureKind::SignalEnded => self.resolve_pending_beacons(*track_id),
+                    ClosureKind::SignalEnded => {
+                        // MAN-100 message-distinctness (Codex review, PR
+                        // #133 round 4): if OTHER track_ids are known
+                        // aliases whose lineage ultimately points to this
+                        // one, this track's genuine end retires them too,
+                        // immediately -- not just whenever the time-based
+                        // sweep below gets around to it. Without this, an
+                        // alias can outlive its own root's real close for
+                        // up to the sweep window, wrongly suppressing a
+                        // brand-new, unrelated track's repetition-gate
+                        // confirmation at the same frequency in the
+                        // meantime.
+                        self.merged_into.retain(|_, (root, _)| *root != *track_id);
+                        self.resolve_pending_beacons(*track_id)
+                    }
                     ClosureKind::Bookkeeping { survivor_track_id } => {
                         self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
+                        // MAN-100 message-distinctness (Codex review, PR
+                        // #133 rounds 3-5): a survivor exists, so this
+                        // track_id's identity continues rather than
+                        // genuinely ending -- record that so
+                        // `gate::message_distinct_indices`'s
+                        // `is_track_active` query doesn't read this as a
+                        // real close and let the survivor's next word
+                        // manufacture a false second message from the
+                        // SAME transmission.
+                        if let Some(survivor) = survivor_track_id {
+                            let root = self.resolve_survivor_root(*survivor);
+                            // A chained merge (A already an alias into
+                            // THIS track_id, which is now itself merging
+                            // further into `root`): re-point A straight
+                            // to the new root so its own eventual
+                            // `SignalEnded` retirement above still finds
+                            // it, instead of leaving A pointed at this
+                            // now-closing intermediate track_id forever.
+                            for (existing_root, _) in self.merged_into.values_mut() {
+                                if *existing_root == *track_id {
+                                    *existing_root = root;
+                                }
+                            }
+                            self.merged_into.insert(*track_id, (root, self.now_ts));
+                        } else {
+                            // An eviction/Silent closure (`survivor_track_id:
+                            // None`) has no lineage to correlate to a future
+                            // reopen, but per this event's own doc comment
+                            // it is STILL not evidence the RF signal ended --
+                            // it just dropped out of tracking, possibly
+                            // still transmitting (round 5). Mark the
+                            // track_id conservatively active under its OWN
+                            // identity (self-referencing root) rather than
+                            // reading it as closed the instant it's evicted:
+                            // without this, a duplicate/replacement track
+                            // decoding the transmission's later utterance
+                            // shortly after this eviction could manufacture
+                            // a false second message. No `SignalEnded` will
+                            // ever arrive for an evicted track_id to retire
+                            // this early (track_ids are never reused), so it
+                            // decays only via the time-based sweep below --
+                            // the same conservative, bounded lifetime a
+                            // no-lineage closure already gets nowhere else.
+                            self.merged_into.insert(*track_id, (*track_id, self.now_ts));
+                        }
                         Vec::new()
                     }
                 };
@@ -583,6 +725,17 @@ impl Validator {
                 // `last_sample_ts` was never a safe sweep reference on its
                 // own.
                 self.tracks.remove(track_id);
+                // MAN-100 Scenario 1: unlike `self.gate` above, the
+                // variant-arbitration ledger is still keyed by `track_id`
+                // (mirrors the pre-MAN-166 `RepetitionGate::forget_track`
+                // pattern), so it's still forgotten on close rather than
+                // swept. Known, unmeasured risk (not one of this ticket's
+                // measured V8/V8w cases): a real signal's track closing
+                // and reopening under a new `track_id` (MAN-166) resets
+                // its observed-word history here, the same class of bug
+                // MAN-166 fixed for the gate -- out of this ticket's scope
+                // to fix pre-emptively; revisit if measured in practice.
+                self.ledger.forget_track(*track_id);
                 self.maybe_sweep();
                 spots
             }
@@ -894,7 +1047,7 @@ impl Validator {
             )
         };
 
-        let (char_confidences, reclassifying) = {
+        let (char_confidences, reclassifying, resolved_word_seq) = {
             let track = self.tracks.get_mut(&track_id)?;
             // Named patterns resolve by text, always to the NEWEST word
             // sharing it (MAN-28 round 13, V29 -- a repeated "DE K5ARH ...
@@ -944,7 +1097,7 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
             word.classified_max_seq = involved_max_seq;
-            (word.confidences.clone(), reclassifying)
+            (word.confidences.clone(), reclassifying, word.seq)
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
@@ -992,7 +1145,23 @@ impl Validator {
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
-            self.gate.record(track_id, freq_hz, &candidate, sample_ts) as u32
+            // MAN-100 Scenario 2 / Codex review PR #133 (round 2):
+            // message-distinctness across a track_id change needs to know
+            // whether the PRIOR track has actually closed, not just how
+            // much sample_ts has elapsed -- `self.tracks` (MAN-19 keeps it
+            // authoritative, entries removed on `TrackClosed`) is exactly
+            // that signal, EXCEPT a `Bookkeeping`-merged track_id: its
+            // identity continues on a survivor, so `self.merged_into`
+            // (round 3) still counts it as active. See
+            // `gate::message_distinct_indices`'s doc.
+            self.gate.record(
+                track_id,
+                freq_hz,
+                &candidate,
+                sample_ts,
+                resolved_word_seq,
+                |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
+            ) as u32
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -1013,6 +1182,43 @@ impl Validator {
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < 2 {
             return None;
         }
+
+        // MAN-100 step 4b: cross-candidate arbitration. Allowlisted calls
+        // are exempt (the Watch List already bypasses grammar/cty and the
+        // repetition gate, MAN-28), so is any call in master.scp -- a
+        // curated list of real, active callsigns, where a false
+        // suppression would cost recall on exactly the population RBN
+        // cares most about -- and so is any `SpotType::Beacon` candidate
+        // (MAN-100 remediation C3), for the same reason step 4's own
+        // repetition gate exempts beacons two checks above: an NCDXF-style
+        // beacon legitimately IDs once per cycle, so its "support" is
+        // structurally capped at a low rep count that a confusable
+        // rival's fading-corrupted repeat can easily outrun on rep count
+        // alone -- measured: "V V V W6DPH K" x2 then "V V V W6DPG K" x1
+        // spotted only the corrupted W6DPH and permanently suppressed the
+        // genuine, once-per-cycle W6DPG. Not exempting would let this
+        // rep-count-based heuristic (tuned for calls that must clear >= 2
+        // reps to spot at all) systematically displace a true beacon spot
+        // with a false one -- worse than the small, bounded risk of a
+        // corrupted beacon variant occasionally spotting unarbitrated,
+        // the same tradeoff already accepted for the allowlist/SCP
+        // exemptions above. All three exemptions only ever *add* spots
+        // relative to the bare rule. Purely subtractive otherwise: this
+        // check can only withhold a spot the rest of the pipeline would
+        // have emitted, never create one.
+        let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
+        if !is_allowlisted
+            && !scp_exempt
+            && spot_type != SpotType::Beacon
+            && self
+                .ledger
+                .better_supported_rival(track_id, &candidate, sample_ts)
+                .is_some()
+        {
+            self.suppression_counts.variant += 1;
+            return None;
+        }
+
         if !self
             .dedupe
             .should_emit(&candidate, freq_hz, snr_db, spot_type, sample_ts)
@@ -1055,7 +1261,7 @@ impl Validator {
         // PR #154, round 3): checking blocklist/notch before this guard
         // would re-count a permanently-suppressed candidate every time an
         // unrelated later word re-triggers a scan that finds it again.
-        let char_confidences = {
+        let (char_confidences, word_seq) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = if let Some(seq) = exact_seq {
                 track.words.iter_mut().find(|w| w.seq == seq)?
@@ -1076,7 +1282,7 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(SpotType::Beacon);
             word.classified_max_seq = involved_max_seq;
-            word.confidences.clone()
+            (word.confidences.clone(), word.seq)
         };
 
         // Operator suppression overrides (MAN-31), same boundary as the
@@ -1113,8 +1319,28 @@ impl Validator {
             snr_db,
             char_confidences,
             origin_track_id: track_id,
+            word_seq,
         });
         None
+    }
+
+    /// Follows `self.merged_into`'s alias chain from `tid` to its current
+    /// best-known root survivor (MAN-100 message-distinctness, Codex
+    /// review PR #133 round 4) -- `tid` itself if it isn't a known alias.
+    /// A track_id passed in as a fresh `survivor_track_id` should always
+    /// already be a root in practice (a currently-live track), but this
+    /// is defensive against a chain forming in an order this code doesn't
+    /// otherwise anticipate. Bounded to `self.merged_into.len() + 1` hops
+    /// so a (should-be-impossible) cycle can never loop forever.
+    fn resolve_survivor_root(&self, tid: u32) -> u32 {
+        let mut current = tid;
+        for _ in 0..=self.merged_into.len() {
+            match self.merged_into.get(&current) {
+                Some(&(root, _)) if root != current => current = root,
+                _ => return current,
+            }
+        }
+        current
     }
 
     /// A `ClosureKind::Bookkeeping` closure is not evidence this
@@ -1192,10 +1418,14 @@ impl Validator {
                 // rapid-same-track exemption -- letting one real
                 // over-the-air occurrence, captured by two overlapping
                 // duplicate-spawn tracks, reach reps >= 2 on its own.
-                let reps =
-                    self.gate
-                        .record(pb.origin_track_id, pb.freq_hz, &pb.candidate, pb.sample_ts)
-                        as u32;
+                let reps = self.gate.record(
+                    pb.origin_track_id,
+                    pb.freq_hz,
+                    &pb.candidate,
+                    pb.sample_ts,
+                    pb.word_seq,
+                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
+                ) as u32;
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {
                     confidence =
@@ -1570,6 +1800,145 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review, PR #133 (round 3): when duplicate-spawn track A
+    /// merges into survivor B mid-transmission (A catches the first call
+    /// utterance, B the second, a few real seconds later), A's identity
+    /// continues on B -- it did not genuinely close. Before this fix,
+    /// `self.tracks.remove` on ANY `TrackClosed` (MAN-19, both closure
+    /// kinds) made `is_track_active(1)` read false the instant A merged,
+    /// letting B's later decode manufacture a false second message from
+    /// what both times was really one over-the-air transmission.
+    #[test]
+    fn a_track_merging_into_a_survivor_mid_transmission_does_not_manufacture_a_second_message() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        // Track 1 merges into track 2 -- bookkeeping only, identity
+        // continues, not proof the signal ended.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        seed_meta(&mut v, 2);
+
+        // Track 2 decodes the SAME call again a few real seconds later --
+        // comfortably clearing the near-duplicate-track gap, but nowhere
+        // near MIN_MESSAGE_TIME_GAP_SECONDS -- still plausibly the same
+        // transmission continuing under its new track_id.
+        let three_seconds = (3.0 * FS) as u64;
+        let spots = run(&transmission_events(2, &words, three_seconds), &mut v);
+        assert!(
+            spots.is_empty(),
+            "track 1's identity continues on survivor track 2 (Bookkeeping \
+             merge) -- this must still read as ONE message, not a second \
+             confirmation, got {spots:?}"
+        );
+    }
+
+    /// Codex review, PR #133 (round 4): once the SURVIVOR of a merge
+    /// genuinely ends (`SignalEnded`), the whole lineage is retired
+    /// immediately, not just whenever the time-based sweep gets to it.
+    /// Track 1 decodes once, merges into survivor track 2, and track 2
+    /// then genuinely ends. A brand-new track 3 reopening at the same
+    /// frequency afterward is exactly the MAN-166 "track closes for real,
+    /// reopens later" scenario this gate exists to handle -- its first
+    /// decode must complete the repetition (comparing against track 1's
+    /// now-correctly-inactive stale entry), not get stuck comparing
+    /// against a lineage that (before this fix) never actually retired.
+    #[test]
+    fn a_survivors_genuine_close_retires_its_merged_aliases_immediately() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        // Track 1 merges into track 2.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+
+        // Track 2 (the survivor) now genuinely ends -- the whole
+        // over-the-air transmission is truly over.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::SignalEnded,
+        });
+
+        // A brand-new track reopens at the same frequency 10s later and
+        // decodes the same call once -- MAN-166's own "close and reopen"
+        // scenario, which must still complete the repetition gate.
+        seed_meta(&mut v, 3);
+        let ten_seconds = (10.0 * FS) as u64;
+        let spots = run(&transmission_events(3, &words, ten_seconds), &mut v);
+        assert_eq!(
+            spots.len(),
+            1,
+            "track 2's genuine close must retire track 1's alias \
+             immediately, so track 3's decode reads as a real second \
+             confirmation (MAN-166 reopen), not get stuck comparing \
+             against a lineage that never retired, got {spots:?}"
+        );
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    /// Codex review, PR #133 (round 5): a `Bookkeeping` closure with no
+    /// survivor (`survivor_track_id: None` -- an eviction/Silent drop) is
+    /// explicitly NOT evidence the RF signal ended, per that event's own
+    /// doc comment, yet has no lineage to correlate to a future track the
+    /// way a merge does. Track 1 decodes once and is evicted; track 2 (a
+    /// duplicate or replacement, not a genuine later reopen) decodes the
+    /// same call a few seconds later -- this must still read as ONE
+    /// message, not a second confirmation, since track 1 might still be
+    /// the exact same over-the-air transmission continuing untracked.
+    #[test]
+    fn an_evicted_tracks_conservative_liveness_prevents_a_false_second_message() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        // Track 1 is evicted -- Bookkeeping with no survivor, not proof
+        // the signal ended.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            },
+        });
+
+        // A different track decodes the same call a few real seconds
+        // later -- plausibly the SAME untracked transmission continuing,
+        // not a genuine new confirmation.
+        seed_meta(&mut v, 2);
+        let three_seconds = (3.0 * FS) as u64;
+        let spots = run(&transmission_events(2, &words, three_seconds), &mut v);
+        assert!(
+            spots.is_empty(),
+            "an evicted track's conservative liveness marker must prevent \
+             a duplicate/replacement track's decode from manufacturing a \
+             false second message, got {spots:?}"
+        );
     }
 
     /// Codex review, PR #152, round 14: two duplicate-spawn tracks (a

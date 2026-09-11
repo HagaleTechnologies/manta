@@ -507,6 +507,69 @@ decode -- only the MOMENT of emission moved from "first decode" to "track
 close." An allowlisted callsign is unaffected by this and still spots
 immediately.
 
+**"Distinct" (MAN-100).** Two decodes of the same callsign text on a track
+count as separate repetitions toward `r` only when at least
+`MIN_MESSAGE_WORD_GAP = 3` decoded words on that track separate them, **or**
+at least `MIN_MESSAGE_TIME_GAP_SECONDS = 60` seconds of `sample_ts` separate
+them (MAN-100 remediation C2). SPEC's own default payload template repeats
+the callsign back-to-back within one transmission (`CQ CQ DE <CALL> <CALL>
+K`, §7's payload note) — without the word-gap half of this rule, that
+single, possibly fading-corrupted message alone could satisfy the ≥
+2-repetition gate. 3 words sits strictly between the one-word gap inside a
+single message and the minimum five-word gap between two separate ones
+(`<CALL> K CQ CQ DE <CALL>`). That word-gap reasoning assumes SPEC's own
+payload template, though, and does not hold for a real, shorter ID (e.g.
+"DE `<CALL>`", 2 words) — the time-gap half exists for exactly that case: 60
+s comfortably covers a full "CQ CQ DE `<CALL>` `<CALL>` K" transmission even
+at 8 WPM (this section's slowest supported speed, ~40 s for that template)
+with margin, while staying well under the 90 s ledger/gate window itself.
+The beacon/allowlist exemptions above are unaffected — they never consult
+`r`'s distinctness rule at all. A short "DE `<CALL>`" ID repeated only
+twice at ordinary (sub-60 s) cadence remains unspotted under this rule — an
+accepted, bounded recall cost (MAN-100 remediation C2, quantified; V43),
+not tightened further: any time-gap threshold low enough to rescue it would
+also treat a single corrupted message's own doubled utterance as two
+distinct messages, reopening the hole this rule exists to close.
+
+**Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
+Before a candidate spots, it is checked against every other decoded,
+spottable-shaped word observed on the same track within the same 90 s
+window. It is withheld if a confusable, better-supported rival exists —
+"confusable" meaning a shared contiguous substring relationship, or a
+shared prefix of at least 3 characters with edit distance ≤ 2 — where
+"better-supported" means strictly more message-distinct repetitions (ties
+broken by summed per-occurrence confidence), or the candidate being a
+strict prefix of a rival that has been observed at all (≥ 1 message-distinct
+repetition — shape alone decides a prefix-containment pair once the rival
+exists, however little support it has). An earlier attempt (MAN-100
+remediation C5) also required the rival to independently clear the same
+≥ 2-repetition floor a spottable candidate must, on the reasoning that a
+single stray, garbled decode that happens to be a textual prefix-extension
+of a well-supported candidate should not be enough on its own to veto it;
+reverted in remediation round 3 because it excluded the ticket's own
+measured case (a 3-rep truncation losing to a genuine, longer call that
+had only a single observation on the track) — the two shapes are
+numerically indistinguishable from the ledger alone, and the measured,
+real case takes priority over the unmeasured, synthetic one that motivated
+C5. Symmetrically, a rival that is itself a strict prefix of the
+candidate never wins this comparison on repetition count alone (MAN-100
+remediation C1) — shape decides a prefix-containment pair in both
+directions, not just when the shorter form is being arbitrated. This
+mechanism is purely subtractive: it can only withhold a spot the rest of
+this section would otherwise emit, never produce one, and it never fires
+against an operator-allowlisted callsign, one present in the bundled SCP
+list, or a candidate already type-tagged `BEACON` (MAN-100 remediation C3 —
+the same once-per-cycle reasoning as this section's own beacon
+repetition-gate exemption above: a beacon's structurally low rep count
+would otherwise let a confusable, fading-corrupted rival permanently
+outrank it). The per-track ledger this arbitration reads evicts an entry
+once its newest observation ages out of the 90 s window (MAN-100
+remediation C6), so a long-lived track's key space stays bounded by what's
+currently live rather than growing with track history. See
+`manta-spot::variant`/`manta-spot::support` for the exact relation and
+comparison, and the MAN-100 decision record for the measured rationale
+behind the prefix-only asymmetry.
+
 ---
 
 ## 5. Decoder output
@@ -654,8 +717,15 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
 | V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
-| V29 | provenance-bound-to-occurrence | "CQ DE K5ARH DE K5ARH" repeats DE-K5ARH; the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
+| V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
 | V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+| V38 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V38b (per-track scoping) and V38c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
+| V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the ≥ 2-rep gate; the second message completes it |
+| V40 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
+| V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
+| V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
+| V43 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
+| V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
 
 ---
 
