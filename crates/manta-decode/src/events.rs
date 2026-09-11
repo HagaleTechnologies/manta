@@ -46,6 +46,11 @@ pub enum DecoderEvent {
         /// timestamp lets the existing `(sample_ts, track_id)` resequence
         /// (SPEC §6 rule 6) place it correctly, the same treatment
         /// `TrackClosed` already gets for an analogous problem.
+        /// `#[serde(default)]` (Codex review, PR #134 round 3) so an event
+        /// log from before this field existed still deserializes -- `0`
+        /// reproduces exactly the old synthetic-timestamp behavior this
+        /// field replaces.
+        #[serde(default)]
         sample_ts: u64,
         snr_2500_db: f32,
         freq_hz: f64,
