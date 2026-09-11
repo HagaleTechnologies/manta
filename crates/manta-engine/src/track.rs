@@ -2094,7 +2094,11 @@ mod tests {
         loop {
             tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
-            if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
+            if tm
+                .tracks
+                .values()
+                .any(|t| t.state() == LifecycleState::Active)
+            {
                 break;
             }
         }
@@ -2158,7 +2162,11 @@ mod tests {
         loop {
             tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
-            if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
+            if tm
+                .tracks
+                .values()
+                .any(|t| t.state() == LifecycleState::Active)
+            {
                 break;
             }
         }
