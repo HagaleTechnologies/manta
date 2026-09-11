@@ -173,13 +173,26 @@ pub(crate) fn message_distinct_indices(
 ///    deferred to (a DIFFERENT, possibly since-closed track) -- avoids
 ///    re-querying that other track's liveness for an already-settled
 ///    relationship, which round 6 forbids.
-/// 3. Otherwise (no same-track history at all, or this occurrence is
-///    genuinely distinct from both of the above): the entry's last
+/// 3. Same as tier 2, but sourced from `own_last_seen` instead of
+///    `accepted` (Codex review, PR #133 round 10): a touch rejected as a
+///    near-duplicate (SPEC's own near-simultaneous-track filter,
+///    `MIN_OCCURRENCE_GAP_SECONDS`) never enters `accepted` at all, so a
+///    track whose ENTIRE history so far was rejected has nothing tiers 1
+///    or 2 can find -- even though `Validator` still remembers its most
+///    recent touch (accepted or not) via `GateEntry::last_seen_by_track`,
+///    now carrying the same `(seq, anchor_ts)` info. Without this tier, a
+///    duplicate-spawn track B whose first copy was rejected (too close to
+///    track A's accepted one) falls straight through to tier 4 on its
+///    SECOND copy, comparing against A directly -- exactly as wrong as
+///    round 8's bug, just one rejection away from it.
+/// 4. Otherwise (no same-track history at all, or this occurrence is
+///    genuinely distinct from all of the above): the entry's last
 ///    message-distinct occurrence overall, same/cross-track rule based on
 ///    its track_id -- a legitimate new real-time comparison, unaffected
 ///    by round 6's constraint since it's evaluated fresh, once, right now.
 fn classify_new_occurrence(
     accepted: &[(u64, u64, u32, bool, u64)],
+    own_last_seen: Option<(u64, u64, u64)>,
     seq: u64,
     ts: u64,
     tid: u32,
@@ -198,6 +211,11 @@ fn classify_new_occurrence(
     } else if let Some(&(l_ts, l_seq, _, _, l_anchor)) =
         accepted.iter().rev().find(|&&(_, _, t, ..)| t == tid)
     {
+        let gap = ts.saturating_sub(l_ts);
+        if seq < l_seq + MIN_MESSAGE_WORD_GAP && gap < time_gap_samples {
+            return (false, l_anchor);
+        }
+    } else if let Some((l_ts, l_seq, l_anchor)) = own_last_seen {
         let gap = ts.saturating_sub(l_ts);
         if seq < l_seq + MIN_MESSAGE_WORD_GAP && gap < time_gap_samples {
             return (false, l_anchor);
@@ -352,13 +370,22 @@ struct GateEntry {
     /// whose anchor is merely a different, still-present entry.
     accepted: Vec<(u64, u64, u32, bool, u64)>,
     /// Every track_id that has touched this entry -- accepted *or*
-    /// rejected as a near-duplicate -- and when it was last seen (Codex
-    /// review, PR #152, round 6): without this, a track whose first
-    /// decode was rejected as a near-duplicate of a *different* track's
-    /// could never establish its own identity here, so its own later,
-    /// genuinely distinct repeat would keep being compared against the
-    /// other track's timestamp instead of recognizing itself.
-    last_seen_by_track: BTreeMap<u32, u64>,
+    /// rejected as a near-duplicate -- with `(sample_ts, word_seq,
+    /// anchor_ts)` of its most recent touch (Codex review, PR #152 round
+    /// 6; extended with word_seq/anchor_ts in PR #133 round 10). Without
+    /// the base map, a track whose first decode was rejected as a
+    /// near-duplicate of a *different* track's could never establish its
+    /// own identity here, so its own later, genuinely distinct repeat
+    /// would keep being compared against the other track's timestamp
+    /// instead of recognizing itself. Without the word_seq/anchor_ts
+    /// extension, a track whose ENTIRE history so far was rejected (never
+    /// once entering `accepted`) leaves `classify_new_occurrence`'s
+    /// same-track tiers with nothing to find, so its next (accepted)
+    /// touch falls through to comparing against a DIFFERENT track's
+    /// current liveness instead of correctly inheriting whatever it was
+    /// rejected as a duplicate of -- see `classify_new_occurrence`'s tier
+    /// 3 doc.
+    last_seen_by_track: BTreeMap<u32, (u64, u64, u64)>,
 }
 
 impl GateEntry {
@@ -388,7 +415,7 @@ impl GateEntry {
             .map(|&(ts, ..)| ts)
             .max()
             .into_iter()
-            .chain(self.last_seen_by_track.values().copied())
+            .chain(self.last_seen_by_track.values().map(|&(ts, _, _)| ts))
             .max()
     }
 }
@@ -566,10 +593,13 @@ impl RepetitionGate {
         // rejected identity must not be able to manufacture a second
         // confirmation for what both times was really the same one
         // over-the-air occurrence.
-        let is_rapid_own_repeat = entry
-            .last_seen_by_track
-            .get(&track_id)
-            .is_some_and(|&last| sample_ts.saturating_sub(last) < self.min_occurrence_gap_samples);
+        let is_rapid_own_repeat =
+            entry
+                .last_seen_by_track
+                .get(&track_id)
+                .is_some_and(|&(last, _, _)| {
+                    sample_ts.saturating_sub(last) < self.min_occurrence_gap_samples
+                });
         // Codex review, PR #152, round 10: the cross-track gap check
         // compares against the entry's MOST RECENT activity overall
         // (`GateEntry::most_recent` -- accepted or merely seen), not just
@@ -589,6 +619,29 @@ impl RepetitionGate {
                 None => true,
             }
         };
+        // MAN-100 Scenario 2 (remediation C2, extended for cross-track
+        // pairs, Codex review PR #133 round 6): classified ONCE, right
+        // now -- see `classify_new_occurrence`'s doc for why this must
+        // never be re-derived later using a track's then-current
+        // (possibly since-changed) liveness. Computed regardless of
+        // `is_distinct_occurrence` (round 10): even a touch about to be
+        // REJECTED as a near-duplicate still needs its own anchor_ts
+        // recorded into `last_seen_by_track` below, so a LATER touch by
+        // this same track -- if its own entire history so far was
+        // rejected -- has something to inherit from (tier 3) instead of
+        // falling through to a different track's current liveness. Reads
+        // `entry.last_seen_by_track` BEFORE this call's own update just
+        // below, so it sees this track's PRIOR state, not itself.
+        let own_last_seen = entry.last_seen_by_track.get(&track_id).copied();
+        let (message_distinct, anchor_ts) = classify_new_occurrence(
+            &entry.accepted,
+            own_last_seen,
+            word_seq,
+            sample_ts,
+            track_id,
+            self.time_gap_samples,
+            &is_track_active,
+        );
         // Codex review, PR #152, round 13: never regress a track's own
         // watermark. `Validator::resolve_pending_beacons` can call
         // `record` with an older, deferred `sample_ts` well after a newer
@@ -599,29 +652,21 @@ impl RepetitionGate {
         entry
             .last_seen_by_track
             .entry(track_id)
-            .and_modify(|existing| *existing = (*existing).max(sample_ts))
-            .or_insert(sample_ts);
+            .and_modify(|existing| {
+                if sample_ts >= existing.0 {
+                    *existing = (sample_ts, word_seq, anchor_ts);
+                }
+            })
+            .or_insert((sample_ts, word_seq, anchor_ts));
         if is_distinct_occurrence {
-            // MAN-100 Scenario 2 (remediation C2, extended for cross-track
-            // pairs, Codex review PR #133 round 6): classified ONCE, right
-            // now, against whatever is currently `accepted`'s last
-            // message-distinct entry -- see `classify_new_occurrence`'s
-            // doc for why this must never be re-derived later using a
-            // track's then-current (possibly since-changed) liveness.
-            let (message_distinct, anchor_ts) = classify_new_occurrence(
-                &entry.accepted,
-                word_seq,
-                sample_ts,
-                track_id,
-                self.time_gap_samples,
-                &is_track_active,
-            );
             entry
                 .accepted
                 .push((sample_ts, word_seq, track_id, message_distinct, anchor_ts));
         }
         entry.accepted.retain(|&(ts, ..)| ts >= cutoff);
-        entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
+        entry
+            .last_seen_by_track
+            .retain(|_, &mut (ts, _, _)| ts >= cutoff);
         promote_orphaned_leader(&mut entry.accepted);
         // Tally the frozen per-occurrence verdicts still inside the
         // window -- never re-derive them (see `accepted`'s own doc).
@@ -669,7 +714,9 @@ impl RepetitionGate {
         let cutoff = now_ts.saturating_sub(self.window_samples);
         self.seen.retain(|_, entry| {
             entry.accepted.retain(|&(ts, ..)| ts >= cutoff);
-            entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
+            entry
+                .last_seen_by_track
+                .retain(|_, &mut (ts, _, _)| ts >= cutoff);
             promote_orphaned_leader(&mut entry.accepted);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
@@ -1027,6 +1074,62 @@ mod tests {
             "B's second word is the same message as B's own first word -- \
              A closing must not manufacture a false second confirmation \
              from what is still B's own single, still-active message"
+        );
+    }
+
+    /// Codex review, PR #133 (round 10): a touch REJECTED as a near-
+    /// duplicate never enters `accepted` at all, so a track whose ENTIRE
+    /// history so far consists of rejected touches leaves both
+    /// `classify_new_occurrence`'s same-track tiers (which only search
+    /// `accepted`) empty -- even though `Validator` still remembers it via
+    /// `last_seen_by_track`. Track A's first word is accepted; track B's
+    /// near-simultaneous first word is rejected as a duplicate of A's
+    /// (still recorded in `last_seen_by_track`, never in `accepted`). A
+    /// then closes, but B never does: B decodes its OWN second word
+    /// (close to its own rejected first, comfortably past the 1s near-
+    /// duplicate gap so THIS one is accepted) with a closure reporting A
+    /// inactive. Before this fix, B's second word had nothing same-track
+    /// to compare against and fell through to comparing against A
+    /// directly -- exactly round 8's bug, just one rejection away.
+    #[test]
+    fn a_rejected_touchs_history_still_anchors_the_tracks_own_later_word() {
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 0, always_active), 1);
+
+        // Track B's near-simultaneous first word -- rejected as a
+        // near-duplicate of A's (well under the 1s gap), while A is
+        // still active. Never enters `accepted`.
+        let zero_point_three_seconds = (0.3 * FS) as u64;
+        assert_eq!(
+            gate.record(
+                2,
+                7_080_000.0,
+                "K5ARH",
+                zero_point_three_seconds,
+                0,
+                always_active
+            ),
+            1,
+            "B's first word is rejected as a near-duplicate of A's"
+        );
+
+        // B's OWN second word, comfortably past the 1s near-duplicate gap
+        // from B's own (rejected) first touch, word_seq close to it --
+        // with A now reported inactive.
+        let zero_point_nine_four_seconds = (0.94 * FS) as u64;
+        assert_eq!(
+            gate.record(
+                2,
+                7_080_000.0,
+                "K5ARH",
+                zero_point_nine_four_seconds,
+                1,
+                |tid| tid != 1
+            ),
+            1,
+            "B's second word must still recognize it's the same message as \
+             B's own (rejected) first word, inherited via last_seen_by_track \
+             -- A closing must not manufacture a false second confirmation"
         );
     }
 
@@ -1510,7 +1613,7 @@ mod tests {
         // Home bucket (140000): a stale entry, its only touch at t=0.
         let mut stale = GateEntry::default();
         stale.accepted.push((0, 0, 1, true, 0));
-        stale.last_seen_by_track.insert(1, 0);
+        stale.last_seen_by_track.insert(1, (0, 0, 0));
         gate.seen.insert((140000, "K5ARH".to_string()), stale);
 
         // Neighbor bucket b+1 (140001): a fresh entry, comfortably within
@@ -1518,7 +1621,7 @@ mod tests {
         let fresh_ts = window_samples - 200_000;
         let mut fresh = GateEntry::default();
         fresh.accepted.push((fresh_ts, 0, 2, true, fresh_ts));
-        fresh.last_seen_by_track.insert(2, fresh_ts);
+        fresh.last_seen_by_track.insert(2, (fresh_ts, 0, fresh_ts));
         gate.seen.insert((140001, "K5ARH".to_string()), fresh);
 
         // A decode arrives at home (b) just past the window boundary
