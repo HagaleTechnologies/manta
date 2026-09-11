@@ -186,6 +186,17 @@ jobs:
             # second one and skipped. Standing down is always correct here: either this is that
             # race (nothing to do, the new head hasn't failed anything yet) or a sibling event
             # already retried it (also nothing to do).
+            #
+            # This assumption depends on auto-merge-trigger.yml never re-arming the SAME
+            # (unchanged) head for an unrelated reason (Codex round 9 found exactly that: its
+            # `edited` trigger type used to fire -- and call `gh pr merge --auto` -- on ANY PR
+            # edit, not just a base retarget, which could re-arm an unchanged already-failed
+            # head and let this branch wrongly treat a genuine same-head failure as stale,
+            # never consuming its retry budget). Fixed at the source in
+            # auto-merge-trigger.yml -- `edited` there now only re-arms when the base branch
+            # itself actually changed, the one case that trigger type was ever added for, and
+            # a PR whose base just changed onto main can't have any prior main-targeting
+            # merge-group failure to preserve a budget for in the first place.
             echo "::notice::Auto-merge is already armed for PR #$PR's current head ($(echo "$head_sha" | cut -c1-12)) -- this can't be the revision that just failed (GitHub disarms auto-merge on every merge-group failure), so a newer push must have landed before this fetch, or a sibling event already retried it. Nothing to act on."
             echo "stale=true" >> "$GITHUB_OUTPUT"
           elif [ "$is_draft" = "true" ]; then

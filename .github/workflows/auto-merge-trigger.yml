@@ -49,8 +49,25 @@ permissions:
 
 jobs:
   auto-merge:
+    # `edited` scoped to a real base retarget only (Codex round 9): `edited` fires on ANY
+    # PR edit -- title, body, labels, base -- but this job calls `gh pr merge --auto`
+    # unconditionally for it, which can re-arm an UNCHANGED head that just failed
+    # merge-group CI for reasons having nothing to do with that failure (someone edits the
+    # description). That breaks pr-state's core assumption in queue-retry-handler.yml
+    # ("if auto-merge is armed, this can't be the head that just failed -- GitHub always
+    # disarms on failure"): a repeated non-base edit could silently avoid ever consuming
+    # the one-retry-ever budget, defeating the whole handler indefinitely. `changes.base`
+    # is present on the edited event's payload only when the base branch itself changed --
+    # the ONE case `edited` was ever added for (a PR retargeted onto main, per widdershins'
+    # own precedent) -- so scoping to it closes this at the root rather than patching every
+    # downstream symptom (queue-retry-handler.yml's own round-9 findings both trace back to
+    # this same cause). Safe if this schema assumption is ever wrong: an absent/undefined
+    # `changes.base` evaluates to null, so the condition just never matches for a NON-base
+    # edit either way -- this job would then simply stop re-arming on `edited` entirely
+    # (a narrower no-op, not a new bug) rather than silently keep the current gap open.
     if: |
       github.event.pull_request.draft == false &&
+      (github.event.action != 'edited' || github.event.changes.base != null) &&
       (
         github.event.pull_request.user.login == 'thagale' ||
         github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]'
