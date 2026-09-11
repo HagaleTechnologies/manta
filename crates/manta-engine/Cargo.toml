@@ -13,6 +13,7 @@ libc = { workspace = true }
 num-complex = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
+smallvec = { workspace = true }
 manta-decode = { workspace = true }
 manta-dsp = { workspace = true }
 manta-input = { workspace = true }

@@ -337,6 +337,7 @@ use manta_dsp::channelizer::{
 };
 use manta_dsp::floor::{FloorBank, Gate};
 use manta_dsp::refine::{Refiner, GROUP_DELAY_HOPS};
+use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, VecDeque};
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
@@ -513,10 +514,10 @@ impl Track {
         hop: &HopOutput,
         sample_ts: u64,
         refine_bw_hz: f32,
-    ) -> Vec<(f32, f32, u64)> {
+    ) -> SmallVec<[(f32, f32, u64); 1]> {
         let raw_power = hop.power[k];
         if refine_bw_hz <= 0.0 {
-            return vec![(raw_power.sqrt(), raw_power, sample_ts)];
+            return smallvec![(raw_power.sqrt(), raw_power, sample_ts)];
         }
         // SPEC v2 §3 requires `c = round(c_f)`: refine the CENTROID
         // channel, not `k` (the instantaneous max-power channel used for
@@ -526,11 +527,10 @@ impl Track {
         let c = self.center.round() as usize;
         let delta = (self.center - c as f64) as f32;
 
-        let mut out: Vec<(f32, f32, u64)> = if self.refiner_channel != Some(c) {
-            self.drain_refiner_backlog()
-        } else {
-            Vec::new()
-        };
+        let mut out: SmallVec<[(f32, f32, u64); 1]> = SmallVec::new();
+        if self.refiner_channel != Some(c) {
+            out.extend(self.drain_refiner_backlog());
+        }
 
         let refiner = self
             .refiner
@@ -1604,7 +1604,8 @@ mod tests {
         let mut track = Track::new(1, 5, &cfg());
         let h = hop_with_x(0, vec![num_complex::Complex32::new(3.0, 4.0); 8]); // |z|=5
         let out = track.decoder_input(5, &h, 1000, 0.0);
-        assert_eq!(out, vec![(5.0, 25.0, 1000)]);
+        let expected: SmallVec<[(f32, f32, u64); 1]> = smallvec![(5.0, 25.0, 1000)];
+        assert_eq!(out, expected);
         assert!(track.refiner.is_none());
     }
 
@@ -1713,9 +1714,10 @@ mod tests {
         for i in 0..full_history_hops {
             let out = track.decoder_input(5, &h, i * 512, 30.0);
             if i >= d {
+                let expected: SmallVec<[(f32, f32, u64); 1]> =
+                    smallvec![(5.0, 25.0, (i - d) * 512)];
                 assert_eq!(
-                    out,
-                    vec![(5.0, 25.0, (i - d) * 512)],
+                    out, expected,
                     "hop {i} (before full convergence at {full_history_hops}) must report the \
                      raw magnitude of its due delayed hop, not a partially-converged FIR output"
                 );
@@ -1743,16 +1745,16 @@ mod tests {
         }
         // Hop D: due observation is hop 0's (loud).
         let out_d = track.decoder_input(5, &h_quiet, d * 512, 30.0);
+        let expected_d: SmallVec<[(f32, f32, u64); 1]> = smallvec![(5.0, 25.0, 0)];
         assert_eq!(
-            out_d,
-            vec![(5.0, 25.0, 0)],
+            out_d, expected_d,
             "hop D must report hop 0's loud observation"
         );
         // Hop D+1: due observation is hop 1's (quiet), not hop 0's replayed.
         let out_d1 = track.decoder_input(5, &h_quiet, (d + 1) * 512, 30.0);
+        let expected_d1: SmallVec<[(f32, f32, u64); 1]> = smallvec![(0.05, 0.0025, 512)];
         assert_eq!(
-            out_d1,
-            vec![(0.05, 0.0025, 512)],
+            out_d1, expected_d1,
             "hop D+1 must report hop 1's OWN quiet observation, not hop 0's loud one replayed"
         );
     }
@@ -1800,9 +1802,10 @@ mod tests {
         // itself not yet due.
         track.center = 6.0;
         let out = track.decoder_input(6, &h, 3 * 512, 30.0);
+        let expected: SmallVec<[(f32, f32, u64); 1]> =
+            smallvec![(5.0, 25.0, 0), (5.0, 25.0, 512), (5.0, 25.0, 1024)];
         assert_eq!(
-            out,
-            vec![(5.0, 25.0, 0), (5.0, 25.0, 512), (5.0, 25.0, 1024)],
+            out, expected,
             "reset must drain the old channel's backlog in order, before starting the new one"
         );
     }
@@ -1819,13 +1822,13 @@ mod tests {
         samples[6] = num_complex::Complex32::new(1.0, 0.0); // channel k=6: power 1
         let h = hop_with_x(0, samples);
         let d = GROUP_DELAY_HOPS as u64;
-        let mut last_out = Vec::new();
+        let mut last_out: SmallVec<[(f32, f32, u64); 1]> = SmallVec::new();
         for i in 0..=d {
             last_out = track.decoder_input(6, &h, i * 512, 30.0);
         }
+        let expected: SmallVec<[(f32, f32, u64); 1]> = smallvec![(5.0, 1.0, 0)];
         assert_eq!(
-            last_out,
-            vec![(5.0, 1.0, 0)],
+            last_out, expected,
             "raw_power must come from k=6 (power 1), not c=5 (power 25) or any refined value"
         );
     }
