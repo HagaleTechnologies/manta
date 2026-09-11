@@ -966,9 +966,13 @@ impl TrackManager {
                     // itself, in queue order, and resets it the instant a
                     // push actually emits `TrackMeta` (review round 1
                     // findings 2/3; see `pending`'s doc comment).
-                    track
-                        .pending
-                        .push((amp, raw_power, spectral_ref_power, ts, track.current_snr_db));
+                    track.pending.push((
+                        amp,
+                        raw_power,
+                        spectral_ref_power,
+                        ts,
+                        track.current_snr_db,
+                    ));
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
