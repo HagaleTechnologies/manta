@@ -114,33 +114,140 @@ fn merge_policy_successor_to_mergify_exists() {
             path.display()
         )
     });
-    // The executable command, not the prose about it: this workflow's header
-    // comment also says `gh pr merge --auto`, so a bare `body.contains(..)`
-    // stayed green even with the arming step deleted (PR #93 review).
-    let arms_auto_merge = body
-        .lines()
-        .map(executable_part)
-        .any(|code| code.contains("gh pr merge") && code.contains("--auto"));
+    // The shell a step actually executes, not the prose about it and not any
+    // other scalar that happens to quote it: this workflow's header comment
+    // says `gh pr merge --auto` too, so a bare `body.contains(..)` stayed green
+    // even with the arming step deleted (PR #93 review), and a comment-stripping
+    // scan of *every* line would still be satisfied by a step `name:` or an
+    // `env:` value carrying the same text (PR #93 review, round 2).
     assert!(
-        arms_auto_merge,
-        "{rel} no longer arms auto-merge: no executable line in it runs \
+        arms_auto_merge(&body),
+        "{rel} no longer arms auto-merge: no `run:` shell in it invokes \
          `gh pr merge ... --auto` (the header comment mentioning that command \
-         does not count). That call IS the post-#185 admission boundary that \
-         replaced .mergify.yml's pull_request_rules; losing it silently leaves \
-         the repo with no automated merge path at all."
+         does not count, and neither does a `name:`/`env:` scalar quoting it). \
+         That call IS the post-#185 admission boundary that replaced \
+         .mergify.yml's pull_request_rules; losing it silently leaves the repo \
+         with no automated merge path at all."
     );
+}
+
+/// Does `body` -- a GitHub Actions workflow -- actually *execute* `gh pr merge
+/// ... --auto` from a step's `run:` shell?
+///
+/// Only `run:` content counts. Every other position in the file is inert with
+/// respect to arming auto-merge: a header comment, a step `name:`, an `env:`
+/// value or a `with:` input can all carry the exact command text while the
+/// workflow does nothing at all, so matching them would let this guard certify
+/// a repo whose merge path is gone.
+fn arms_auto_merge(body: &str) -> bool {
+    run_shell_lines(body)
+        .into_iter()
+        .map(executable_part)
+        .any(|code| code.contains("gh pr merge") && code.contains("--auto"))
+}
+
+/// The shell lines of every `run:` in `body`, in file order.
+///
+/// A deliberately small YAML reader rather than a dependency: it handles the
+/// two `run:` spellings Actions allows -- an inline scalar (`run: cmd`) and a
+/// block scalar (`run: |` / `run: >`, whose body is every following line
+/// indented deeper than the `run:` key itself) -- and nothing else. Anything it
+/// cannot recognise is simply not returned, so an unhandled spelling makes the
+/// guard fail loudly rather than pass vacuously; that is the direction this
+/// guard needs to err in.
+fn run_shell_lines(body: &str) -> Vec<&str> {
+    let mut shell = Vec::new();
+    // `Some(None)` = inside a block scalar whose content indentation is not
+    // pinned yet (no non-blank line seen); `Some(Some(n))` = pinned at column
+    // `n`; `None` = not inside one.
+    let mut block: Option<Option<usize>> = None;
+
+    for line in body.lines() {
+        let indent = line.len() - line.trim_start().len();
+
+        if let Some(content_indent) = block {
+            // A block scalar's indentation is set by its first non-blank line
+            // and it ends at the first non-blank line indented less than that.
+            // Sibling keys of `run:` sit one level shallower, so this is what
+            // keeps a following `name:`/`env:` out of the shell.
+            if line.trim().is_empty() {
+                shell.push(line);
+                continue;
+            }
+            match content_indent {
+                None => {
+                    block = Some(Some(indent));
+                    shell.push(line);
+                    continue;
+                }
+                Some(base) if indent >= base => {
+                    shell.push(line);
+                    continue;
+                }
+                Some(_) => block = None,
+            }
+        }
+
+        let trimmed = line.trim_start();
+        // A step is a sequence item, so its first key arrives as `- run: ...`.
+        let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let Some(value) = key.strip_prefix("run:") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() || value.starts_with('|') || value.starts_with('>') {
+            block = Some(None);
+        } else {
+            shell.push(value);
+        }
+    }
+
+    shell
 }
 
 /// The executable part of `line` -- everything before its first `#`.
 ///
-/// Both YAML and the shell inside a `run: |` block start comments with `#`, so
-/// one crude rule covers the whole workflow file. Cutting unconditionally can
-/// only ever discard *more* than a real comment, which fails loudly rather than
-/// passing vacuously -- the direction this guard needs to err in.
+/// Shell comments inside a `run:` block start with `#`, so this drops them.
+/// Cutting unconditionally can only ever discard *more* than a real comment
+/// (a `#` inside a quoted string, say), which fails loudly rather than passing
+/// vacuously -- again the safe direction here.
 fn executable_part(line: &str) -> &str {
     let line = line.trim();
     match line.find('#') {
         Some(idx) => &line[..idx],
         None => line,
     }
+}
+
+/// `arms_auto_merge` must read `run:` shell and only `run:` shell -- the
+/// property PR #93's review asked for, pinned on synthetic workflows so it
+/// holds independently of what the real file happens to look like today.
+#[test]
+fn arms_auto_merge_counts_run_shell_only() {
+    // Both spellings of an executing step.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto --squash\n"
+    ));
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - name: Enable auto-merge\n        run: |\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    ));
+
+    // The command named anywhere that does not execute it.
+    assert!(!arms_auto_merge(
+        "# calls gh pr merge --auto per PR\non: push\n"
+    ));
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - name: gh pr merge --auto\n        uses: actions/checkout@v4\n"
+    ));
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - env:\n          CMD: gh pr merge --auto --squash\n        uses: actions/checkout@v4\n"
+    ));
+    // A shell comment inside a real `run:` block is still prose.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: |\n          # gh pr merge \"$PR_URL\" --auto --squash\n          echo skipped\n"
+    ));
+    // The block scalar ends where indentation returns to the key's level.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: |\n          echo hi\n        name: gh pr merge --auto\n"
+    ));
 }
