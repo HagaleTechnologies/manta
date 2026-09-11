@@ -650,6 +650,29 @@ jobs:
             exit 1
           fi
 
+          # Disarm any concurrently re-armed auto-merge (Codex round 8): a trusted-author
+          # `edited` run of auto-merge-trigger.yml (or dependabot-auto-merge.yml) can complete
+          # AFTER pr-state read autoMergeRequest as disarmed but BEFORE this step attached
+          # needs-human above -- since the head hasn't changed, that concurrent run's own
+          # live-label check (round 2/5) still read needs-human as absent at the time it ran
+          # and legitimately re-armed the SAME unchanged revision. needs-human guards FUTURE
+          # workflow runs, but doesn't retroactively cancel an auto-merge request already in
+          # flight -- without this recheck, the second-failure PR could still merge (or enter a
+          # third queue attempt) despite being handed off, defeating this step's entire purpose.
+          # Fail the step (not just warn) if disarming can't be confirmed, same as every other
+          # safety-critical verification in this file -- mark-handled's gate on
+          # `steps.handoff.conclusion == 'success'` then correctly withholds the dedup marker.
+          still_armed=$(gh pr view "$PR" --repo "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')
+          if [ "$still_armed" = "true" ]; then
+            echo "::notice::Auto-merge was concurrently re-armed for PR #$PR (commit $HEAD_SHA12) between pr-state's check and this handoff -- disarming it now that the PR has been handed off to a human."
+            gh pr merge "$PR" --repo "${{ github.repository }}" --disable-auto >/dev/null 2>&1 || true
+            still_armed_after=$(gh pr view "$PR" --repo "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')
+            if [ "$still_armed_after" = "true" ]; then
+              echo "::error::Auto-merge is STILL ARMED for PR #$PR (commit $HEAD_SHA12) despite the disable-auto call -- this handoff's 'no more retries' guarantee cannot be relied on until this is fixed by hand. Failing this step so the attempt isn't marked handled."
+              exit 1
+            fi
+          fi
+
           # `|| true` on the comment itself: this is a best-effort notification (and the
           # staleness marker it carries degrades safely to "provenance unconfirmed" if it's
           # ever lost, per round 5's fail-closed design) -- a transient failure here shouldn't
