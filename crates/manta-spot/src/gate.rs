@@ -141,90 +141,140 @@ pub(crate) fn message_distinct_indices(
 /// would see A "inactive" and wrongly count B's already-decided
 /// occurrence as a second message from what was really one transmission.
 ///
-/// Same-track first, THEN last-counted (Codex review, PR #133 round 8):
-/// checks this track_id's own most recent occurrence -- regardless of
-/// whether THAT one was itself counted -- before falling back to the
-/// entry's last message-distinct occurrence overall. Word_seq/time-gap
-/// collapsing is purely a same-track concept (word_seq isn't even
-/// comparable across a differing track_id), unrelated to any OTHER
-/// track's liveness, so a still-active track's own continuation must be
-/// judged against its own prior word -- and, if it's the same message,
-/// is ITSELF false (not the start of a new message), regardless of
-/// whether the word it's joining was itself `true` or `false`: a
-/// message's own SECOND word is never `true` just because the message's
-/// FIRST word was. Skipping straight to "last counted" (round 6's
-/// original design) let a still-active track B's second word get compared
-/// against a DIFFERENT, now-closed track A instead of against B's own
-/// first word -- `!is_track_active(A)` then counted it as distinct purely
-/// because A had closed, even though B (B's own track) never did and B's
-/// two words were really one message. Falls through to the last-counted
-/// comparison only when this track's own predecessor says "genuinely
-/// distinct" (or it has none) -- that fallback IS a legitimate new
-/// real-time comparison, unaffected by round 6's constraint.
+/// Returns `(message_distinct, anchor_ts)`: `anchor_ts` identifies which
+/// entry's `sample_ts` this occurrence's message is represented by -- its
+/// own, if `message_distinct` is true, or (transitively, through any
+/// chain of `false` entries) whichever `true` entry it ultimately defers
+/// to. `promote_orphaned_leader` uses this to tell "my anchor is still
+/// present, so I correctly stay collapsed" from "my anchor aged out, so I
+/// need to be promoted in its place" (Codex review, PR #133 round 9 P2) --
+/// see that function's own doc.
+///
+/// Own-track anchor first, THEN own-track last touch, THEN last-counted
+/// overall (Codex review, PR #133 rounds 8-9): three tiers, each a
+/// fallback for the last.
+///
+/// 1. This track_id's own most recent MESSAGE-DISTINCT occurrence (its
+///    "anchor"), if it has one. Word_seq/time-gap collapsing must be
+///    measured from the anchor specifically, not from whatever this
+///    track's immediately preceding raw touch happened to be (round 9
+///    P1): a station repeating "DE `<CALL>`" at an ordinary cadence
+///    produces word_seqs 1, 3, 5, 7... -- comparing seq 5 against seq 3's
+///    raw value (2 apart, collapses) instead of against seq 1 (the actual
+///    anchor, 4 apart, distinct) chains every later repeat into the
+///    first, permanently blocking the gate from ever completing.
+/// 2. If this track has touched the entry before but never independently
+///    started a message of its own (every prior touch deferred
+///    elsewhere), compare against that most recent touch's raw values
+///    using the same word_seq/time-gap rule, and inherit ITS anchor
+///    (transitively) if not distinct (round 8): a still-active track B's
+///    second word must recognize "I'm still the same message as my OWN
+///    first word" without re-deriving whatever that first word itself
+///    deferred to (a DIFFERENT, possibly since-closed track) -- avoids
+///    re-querying that other track's liveness for an already-settled
+///    relationship, which round 6 forbids.
+/// 3. Otherwise (no same-track history at all, or this occurrence is
+///    genuinely distinct from both of the above): the entry's last
+///    message-distinct occurrence overall, same/cross-track rule based on
+///    its track_id -- a legitimate new real-time comparison, unaffected
+///    by round 6's constraint since it's evaluated fresh, once, right now.
 fn classify_new_occurrence(
-    accepted: &[(u64, u64, u32, bool)],
+    accepted: &[(u64, u64, u32, bool, u64)],
     seq: u64,
     ts: u64,
     tid: u32,
     time_gap_samples: u64,
     is_track_active: &impl Fn(u32) -> bool,
-) -> bool {
-    if let Some(&(same_ts, same_seq, ..)) = accepted.iter().rev().find(|&&(_, _, t, _)| t == tid) {
-        let gap = ts.saturating_sub(same_ts);
-        let distinct_from_own_last =
-            seq >= same_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples;
-        if !distinct_from_own_last {
-            // Same message as my own last word -- I'm not myself the
-            // start of a new one, regardless of whether THAT word was
-            // (e.g. two adjacent words right after the message's own
-            // first, counted, word: both later words are false, not a
-            // copy of the first word's true).
-            return false;
+) -> (bool, u64) {
+    let own_anchor = accepted
+        .iter()
+        .rev()
+        .find(|&&(_, _, t, counted, _)| t == tid && counted);
+    if let Some(&(a_ts, a_seq, _, _, _)) = own_anchor {
+        let gap = ts.saturating_sub(a_ts);
+        if seq < a_seq + MIN_MESSAGE_WORD_GAP && gap < time_gap_samples {
+            return (false, a_ts);
+        }
+    } else if let Some(&(l_ts, l_seq, _, _, l_anchor)) =
+        accepted.iter().rev().find(|&&(_, _, t, ..)| t == tid)
+    {
+        let gap = ts.saturating_sub(l_ts);
+        if seq < l_seq + MIN_MESSAGE_WORD_GAP && gap < time_gap_samples {
+            return (false, l_anchor);
         }
     }
-    let last_counted = accepted.iter().rev().find(|&&(.., counted)| counted);
+
+    let last_counted = accepted.iter().rev().find(|&&(.., counted, _)| counted);
     match last_counted {
-        None => true,
-        Some(&(prev_ts, prev_seq, prev_tid, _)) => {
+        None => (true, ts),
+        Some(&(prev_ts, prev_seq, prev_tid, _, _)) => {
             let gap = ts.saturating_sub(prev_ts);
-            if tid != prev_tid {
+            let distinct = if tid != prev_tid {
                 !is_track_active(prev_tid) || gap >= time_gap_samples
             } else {
                 seq >= prev_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples
+            };
+            if distinct {
+                (true, ts)
+            } else {
+                (false, prev_ts)
             }
         }
     }
 }
 
-/// After pruning, promotes the new leading (earliest-surviving) entry to
-/// message-distinct if it wasn't already (Codex review, PR #133 round 7).
-/// A `message_distinct: false` entry means "same message as whatever
-/// entry preceded it" -- if THAT entry has since aged out of the window
-/// via `retain`, the deferral target no longer exists, and the survivor
-/// is now, by the algorithm's own base case (`classify_new_occurrence`'s
-/// `None => true`), the earliest thing in the window and must count on
-/// its own. Without this, a station repeating at a cadence straddling the
-/// window boundary (its first message's own representative ages out
-/// first) can never re-establish a message of its own and stops being
-/// spotted even though it never actually stopped repeating.
+/// After pruning, promotes an orphaned message's earliest surviving entry
+/// to message-distinct (Codex review, PR #133 round 7). A `message_
+/// distinct: false` entry's `anchor_ts` identifies which entry represents
+/// its message -- if THAT entry has since aged out of the window via
+/// `retain`, the message's own representative is gone, and the earliest
+/// surviving entry that deferred to it must be promoted in its place, or
+/// a station repeating at a cadence straddling the window boundary (its
+/// first message's own representative ages out first) can never
+/// re-establish a message of its own and stops being spotted even though
+/// it never actually stopped repeating.
+///
+/// Checks each orphaned entry's OWN specific `anchor_ts`, not merely
+/// "does some message-distinct entry exist anywhere" (Codex review, PR
+/// #133 round 9 P2): a deferred out-of-order replay (`resolve_pending_
+/// beacons` can push an older `sample_ts` after newer ones already
+/// landed -- see `GateEntry::most_recent`'s doc) can leave a `false`
+/// entry with the SMALLEST `sample_ts` in the vector even though its
+/// actual dependency (a different, `true` entry with a LARGER `sample_ts`,
+/// because it arrived first in push order) is still very much present --
+/// promoting by "smallest timestamp, unconditionally" would count that
+/// pair as two messages despite neither message-separation threshold
+/// being cleared. Entries sharing the same now-missing `anchor_ts` are
+/// promoted and re-pointed together, as one group, so the group stays
+/// internally consistent for any future orphaning.
 ///
 /// Unlike `message_distinct` itself, which must never be revisited using
 /// a track's current liveness (Codex round 6), this is always safe to
 /// redo: it depends only on whether an entry still EXISTS in the window
 /// -- a monotonic, purely time-based fact for a given `now_ts` that never
 /// flickers, not on any external mutable state like `is_track_active`.
-/// Idempotent (a no-op if the leader is already message-distinct), so
-/// safe to call unconditionally after every prune.
-///
-/// Promotes the entry with the smallest `sample_ts`, not `accepted[0]`:
-/// `accepted` is not guaranteed to stay in push/timestamp order (see
-/// `GateEntry::most_recent`'s doc -- a deferred `PendingBeacon` replay can
-/// push an older `sample_ts` after newer ones already landed), so the
-/// vector's first element isn't reliably the chronologically-earliest
-/// survivor.
-fn promote_orphaned_leader(accepted: &mut [(u64, u64, u32, bool)]) {
-    if let Some(earliest) = accepted.iter_mut().min_by_key(|&&mut (ts, ..)| ts) {
-        earliest.3 = true;
+fn promote_orphaned_leader(accepted: &mut [(u64, u64, u32, bool, u64)]) {
+    let present: std::collections::BTreeSet<u64> = accepted.iter().map(|&(ts, ..)| ts).collect();
+    let mut orphan_groups: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
+    for (i, &(_, _, _, counted, anchor_ts)) in accepted.iter().enumerate() {
+        if !counted && !present.contains(&anchor_ts) {
+            orphan_groups.entry(anchor_ts).or_default().push(i);
+        }
+    }
+    for indices in orphan_groups.into_values() {
+        let leader_idx = indices
+            .iter()
+            .copied()
+            .min_by_key(|&i| accepted[i].0)
+            .expect("orphan_groups entries are always non-empty");
+        let leader_ts = accepted[leader_idx].0;
+        accepted[leader_idx].3 = true;
+        accepted[leader_idx].4 = leader_ts;
+        for i in indices {
+            if i != leader_idx {
+                accepted[i].4 = leader_ts;
+            }
+        }
     }
 }
 
@@ -275,15 +325,15 @@ fn bucket(freq_hz: f64) -> i64 {
 
 #[derive(Default)]
 struct GateEntry {
-    /// `(sample_ts, word_seq, track_id, message_distinct)` of every
-    /// *accepted* (distinct, non-near-duplicate) occurrence. The returned
-    /// repetition count is not simply this vec's length: MAN-100 Scenario 2
-    /// requires accepted occurrences to also be message-distinct, since
-    /// SPEC's own default payload template repeats a callsign back-to-back
-    /// within one transmission and both utterances land here as separate
-    /// *accepted* occurrences (they're minutes, not
-    /// `MIN_OCCURRENCE_GAP_SECONDS`, apart) despite being one message's
-    /// worth of evidence.
+    /// `(sample_ts, word_seq, track_id, message_distinct, anchor_ts)` of
+    /// every *accepted* (distinct, non-near-duplicate) occurrence. The
+    /// returned repetition count is not simply this vec's length:
+    /// MAN-100 Scenario 2 requires accepted occurrences to also be
+    /// message-distinct, since SPEC's own default payload template
+    /// repeats a callsign back-to-back within one transmission and both
+    /// utterances land here as separate *accepted* occurrences (they're
+    /// minutes, not `MIN_OCCURRENCE_GAP_SECONDS`, apart) despite being one
+    /// message's worth of evidence.
     ///
     /// `message_distinct` is decided ONCE, by `classify_new_occurrence`,
     /// at the moment this occurrence is pushed -- and never revisited
@@ -293,7 +343,14 @@ struct GateEntry {
     /// closing) retroactively flip an already-settled historical pair's
     /// verdict, manufacturing a false confirmation from what both times
     /// was really one transmission. See `classify_new_occurrence`'s doc.
-    accepted: Vec<(u64, u64, u32, bool)>,
+    ///
+    /// `anchor_ts` (round 9) identifies which entry's `sample_ts`
+    /// represents this occurrence's message: its own, if
+    /// `message_distinct`, or (transitively) whichever `true` entry it
+    /// ultimately defers to. `promote_orphaned_leader` uses it to tell a
+    /// genuinely orphaned entry (its specific anchor aged out) from one
+    /// whose anchor is merely a different, still-present entry.
+    accepted: Vec<(u64, u64, u32, bool, u64)>,
     /// Every track_id that has touched this entry -- accepted *or*
     /// rejected as a near-duplicate -- and when it was last seen (Codex
     /// review, PR #152, round 6): without this, a track whose first
@@ -328,7 +385,7 @@ impl GateEntry {
     fn most_recent(&self) -> Option<u64> {
         self.accepted
             .iter()
-            .map(|&(ts, _, _, _)| ts)
+            .map(|&(ts, ..)| ts)
             .max()
             .into_iter()
             .chain(self.last_seen_by_track.values().copied())
@@ -551,7 +608,7 @@ impl RepetitionGate {
             // message-distinct entry -- see `classify_new_occurrence`'s
             // doc for why this must never be re-derived later using a
             // track's then-current (possibly since-changed) liveness.
-            let message_distinct = classify_new_occurrence(
+            let (message_distinct, anchor_ts) = classify_new_occurrence(
                 &entry.accepted,
                 word_seq,
                 sample_ts,
@@ -561,9 +618,9 @@ impl RepetitionGate {
             );
             entry
                 .accepted
-                .push((sample_ts, word_seq, track_id, message_distinct));
+                .push((sample_ts, word_seq, track_id, message_distinct, anchor_ts));
         }
-        entry.accepted.retain(|&(ts, _, _, _)| ts >= cutoff);
+        entry.accepted.retain(|&(ts, ..)| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
         promote_orphaned_leader(&mut entry.accepted);
         // Tally the frozen per-occurrence verdicts still inside the
@@ -571,7 +628,7 @@ impl RepetitionGate {
         entry
             .accepted
             .iter()
-            .filter(|&&(.., counted)| counted)
+            .filter(|&&(_, _, _, counted, _)| counted)
             .count()
     }
 
@@ -611,7 +668,7 @@ impl RepetitionGate {
     pub fn sweep(&mut self, now_ts: u64) {
         let cutoff = now_ts.saturating_sub(self.window_samples);
         self.seen.retain(|_, entry| {
-            entry.accepted.retain(|&(ts, _, _, _)| ts >= cutoff);
+            entry.accepted.retain(|&(ts, ..)| ts >= cutoff);
             entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
             promote_orphaned_leader(&mut entry.accepted);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
@@ -970,6 +1027,86 @@ mod tests {
             "B's second word is the same message as B's own first word -- \
              A closing must not manufacture a false second confirmation \
              from what is still B's own single, still-active message"
+        );
+    }
+
+    /// Codex review, PR #133 (round 9, P1): word_seq/time-gap collapsing
+    /// must be measured from a track's own last MESSAGE-DISTINCT
+    /// occurrence (its anchor), never from whatever its immediately
+    /// preceding raw touch happened to be. A short ID ("DE `<CALL>`")
+    /// repeating on one track at an ordinary cadence produces word_seqs
+    /// 1, 3, 5, 7... -- comparing seq 5 against seq 3's raw value (2
+    /// apart, collapses) instead of against seq 1 (the real anchor, 4
+    /// apart, distinct) chains every later repeat into the first message
+    /// forever, permanently blocking the gate from ever completing again.
+    #[test]
+    fn same_track_collapsing_measures_from_the_anchor_not_the_immediate_predecessor() {
+        let mut gate = RepetitionGate::new(FS);
+        let twenty_seconds = (20.0 * FS) as u64;
+
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 1, always_active), 1);
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", twenty_seconds, 3, always_active),
+            1,
+            "seq 3 collapses into seq 1's message (gap of 2)"
+        );
+        assert_eq!(
+            gate.record(
+                1,
+                7_080_000.0,
+                "K5ARH",
+                2 * twenty_seconds,
+                5,
+                always_active
+            ),
+            2,
+            "seq 5 must be measured against seq 1 (the anchor, gap of 4, \
+             distinct), not seq 3 (gap of only 2) -- otherwise this cadence \
+             can never complete the repetition gate again"
+        );
+        assert_eq!(
+            gate.record(
+                1,
+                7_080_000.0,
+                "K5ARH",
+                3 * twenty_seconds,
+                7,
+                always_active
+            ),
+            2,
+            "seq 7 collapses into seq 5's message (gap of 2), same pattern \
+             repeating"
+        );
+    }
+
+    /// Codex review, PR #133 (round 9, P2): `promote_orphaned_leader` must
+    /// check each orphaned entry's OWN specific anchor, not merely "does
+    /// some message-distinct entry exist anywhere." A deferred out-of-
+    /// order replay (`resolve_pending_beacons`) can push an OLDER
+    /// `sample_ts` after a newer one already landed -- e.g. a deferred
+    /// Beacon at t=0 arriving after the same call already recorded at
+    /// t=20 -- so the entry with the SMALLEST timestamp is not always the
+    /// chronologically-original one; here it's actually the one that
+    /// deferred to the other. Promoting "smallest timestamp,
+    /// unconditionally" would count this pair as two messages despite
+    /// neither message-separation threshold being cleared.
+    #[test]
+    fn promotion_checks_each_orphans_own_anchor_not_just_smallest_timestamp() {
+        let mut gate = RepetitionGate::new(FS);
+        // t=20 arrives first (e.g. an ordinary decode).
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", 20 * FS as u64, 5, always_active),
+            1
+        );
+        // A deferred replay then pushes t=0, word_seq close to t=20's --
+        // arrives SECOND in call order despite its smaller sample_ts.
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", 0, 3, always_active),
+            1,
+            "t=0 defers to t=20 (word_seq gap of only 2) -- its dependency \
+             (t=20) is still present, so nothing should be orphaned or \
+             promoted just because t=0 happens to have the smaller \
+             timestamp"
         );
     }
 
@@ -1372,7 +1509,7 @@ mod tests {
 
         // Home bucket (140000): a stale entry, its only touch at t=0.
         let mut stale = GateEntry::default();
-        stale.accepted.push((0, 0, 1, true));
+        stale.accepted.push((0, 0, 1, true, 0));
         stale.last_seen_by_track.insert(1, 0);
         gate.seen.insert((140000, "K5ARH".to_string()), stale);
 
@@ -1380,7 +1517,7 @@ mod tests {
         // the window as of the decisive call below.
         let fresh_ts = window_samples - 200_000;
         let mut fresh = GateEntry::default();
-        fresh.accepted.push((fresh_ts, 0, 2, true));
+        fresh.accepted.push((fresh_ts, 0, 2, true, fresh_ts));
         fresh.last_seen_by_track.insert(2, fresh_ts);
         gate.seen.insert((140001, "K5ARH".to_string()), fresh);
 
