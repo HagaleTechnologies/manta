@@ -1,0 +1,69 @@
+name: Auto-Merge Trigger
+
+# Native merge-queue cutover: retires .mergify.yml (this PR). Mergify's own
+# pull_request_rules was doing two jobs at once -- (1) admitting a PR into
+# its queue only if it went green AND was authored by a trusted actor, and
+# (2) actually performing the merge. GitHub's native `merge_queue` ruleset
+# rule (added to main-protection alongside this PR) replaces job (2), but a
+# native merge_queue rule has NO author-based admission control of its own
+# -- something still has to call `gh pr merge --auto` per PR, and whatever
+# does that IS the new job-(1) trust boundary. This job carries that
+# boundary forward directly from .mergify.yml's own trusted-author
+# condition (`author = thagale` OR `author = catalyst-cloud-connector[bot]`
+# OR dependabot-with-a-real-approval) -- manta is public with
+# required_approving_review_count now 1 (was 0) but this workflow arms
+# every merge it triggers via CODEX_REVIEW_PAT, a bypass actor on
+# manta-review-gate ("always" mode). That bypass is evaluated against
+# whoever ENABLES auto-merge, not the PR's author -- so without this job's
+# own author check, using a shared bypass-capable credential here would let
+# ANY green PR skip the review requirement entirely, silently recreating
+# the exact zero-review-merge gap this whole redesign exists to close. The
+# ruleset's required_approving_review_count is real defense-in-depth (it
+# still blocks a manual merge attempt, or a different token, by anyone not
+# on this list) but does not replace this check.
+#
+# Dependabot is deliberately NOT handled here (unlike widdershins, which
+# excludes it only via `github.actor != 'dependabot[bot]'`): GitHub
+# withholds custom Actions secrets from Dependabot-actor-triggered runs, so
+# CODEX_REVIEW_PAT would be empty on exactly the events that would trigger
+# this job for a Dependabot PR. Its own auto-merge is armed instead by
+# dependabot-auto-merge.yml using GITHUB_TOKEN right after it approves --
+# github-actions[bot] isn't a bypass actor on manta-review-gate, so that
+# arm only actually merges once required_approving_review_count is
+# satisfied by its own approval, no bypass needed.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: |
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'needs-human') &&
+      (
+        github.event.pull_request.user.login == 'thagale' ||
+        github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]'
+      )
+    runs-on: ubuntu-latest
+    concurrency:
+      group: auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      # CODEX_REVIEW_PAT, not GITHUB_TOKEN: a merge attributed to
+      # GITHUB_TOKEN suppresses downstream push-triggered events (GitHub's
+      # anti-recursion guard), and -- separately, the reason it must be
+      # THIS specific credential -- only a bypass actor's own token causes
+      # the eventual auto-merge to skip manta-review-gate's required
+      # review, which is the whole point for this job's two trusted
+      # authors (see header comment).
+      - name: Enable auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+        run: |
+          gh pr merge "$PR_URL" --auto --squash
