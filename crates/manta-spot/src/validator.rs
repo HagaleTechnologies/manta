@@ -653,18 +653,14 @@ impl Validator {
                     ClosureKind::Bookkeeping { survivor_track_id } => {
                         self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
                         // MAN-100 message-distinctness (Codex review, PR
-                        // #133 rounds 3-4): a survivor exists, so this
+                        // #133 rounds 3-5): a survivor exists, so this
                         // track_id's identity continues rather than
                         // genuinely ending -- record that so
                         // `gate::message_distinct_indices`'s
                         // `is_track_active` query doesn't read this as a
                         // real close and let the survivor's next word
                         // manufacture a false second message from the
-                        // SAME transmission. An eviction with no survivor
-                        // (`survivor_track_id: None`) has no lineage to
-                        // preserve -- nothing here correlates it to
-                        // whatever track_id a reopened signal gets next,
-                        // so it's left to the normal (closed) treatment.
+                        // SAME transmission.
                         if let Some(survivor) = survivor_track_id {
                             let root = self.resolve_survivor_root(*survivor);
                             // A chained merge (A already an alias into
@@ -680,6 +676,26 @@ impl Validator {
                                 }
                             }
                             self.merged_into.insert(*track_id, (root, self.now_ts));
+                        } else {
+                            // An eviction/Silent closure (`survivor_track_id:
+                            // None`) has no lineage to correlate to a future
+                            // reopen, but per this event's own doc comment
+                            // it is STILL not evidence the RF signal ended --
+                            // it just dropped out of tracking, possibly
+                            // still transmitting (round 5). Mark the
+                            // track_id conservatively active under its OWN
+                            // identity (self-referencing root) rather than
+                            // reading it as closed the instant it's evicted:
+                            // without this, a duplicate/replacement track
+                            // decoding the transmission's later utterance
+                            // shortly after this eviction could manufacture
+                            // a false second message. No `SignalEnded` will
+                            // ever arrive for an evicted track_id to retire
+                            // this early (track_ids are never reused), so it
+                            // decays only via the time-based sweep below --
+                            // the same conservative, bounded lifetime a
+                            // no-lineage closure already gets nowhere else.
+                            self.merged_into.insert(*track_id, (*track_id, self.now_ts));
                         }
                         Vec::new()
                     }
@@ -1880,6 +1896,49 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
              against a lineage that never retired, got {spots:?}"
         );
         assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    /// Codex review, PR #133 (round 5): a `Bookkeeping` closure with no
+    /// survivor (`survivor_track_id: None` -- an eviction/Silent drop) is
+    /// explicitly NOT evidence the RF signal ended, per that event's own
+    /// doc comment, yet has no lineage to correlate to a future track the
+    /// way a merge does. Track 1 decodes once and is evicted; track 2 (a
+    /// duplicate or replacement, not a genuine later reopen) decodes the
+    /// same call a few seconds later -- this must still read as ONE
+    /// message, not a second confirmation, since track 1 might still be
+    /// the exact same over-the-air transmission continuing untracked.
+    #[test]
+    fn an_evicted_tracks_conservative_liveness_prevents_a_false_second_message() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        // Track 1 is evicted -- Bookkeeping with no survivor, not proof
+        // the signal ended.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: None,
+            },
+        });
+
+        // A different track decodes the same call a few real seconds
+        // later -- plausibly the SAME untracked transmission continuing,
+        // not a genuine new confirmation.
+        seed_meta(&mut v, 2);
+        let three_seconds = (3.0 * FS) as u64;
+        let spots = run(&transmission_events(2, &words, three_seconds), &mut v);
+        assert!(
+            spots.is_empty(),
+            "an evicted track's conservative liveness marker must prevent \
+             a duplicate/replacement track's decode from manufacturing a \
+             false second message, got {spots:?}"
+        );
     }
 
     /// Codex review, PR #152, round 14: two duplicate-spawn tracks (a

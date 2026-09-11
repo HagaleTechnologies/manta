@@ -11,8 +11,7 @@
 //! `wiki/pages/replay-spots-harness.md`.
 //!
 //! Usage: `replay_spots <report.json> <calls.txt> [sample_rate_hz]
-//! [--freq-correction-ppm <n>] [--allowlist <CALL>]... [--blocklist <path>]
-//! [--notch <path>]`
+//! [--allowlist <CALL>]... [--blocklist <path>] [--notch <path>]`
 //!
 //! `<report.json>` is the stdout of `manta decode --json <wav>` (a
 //! `manta_engine::DecodeReport`, serialized). `<calls.txt>` is a
@@ -30,11 +29,21 @@
 //!
 //! The remaining flags mirror `manta decode`'s own of the same name
 //! (Codex review, PR #133): `DecodeReport` doesn't preserve the original
-//! run's allowlist/blocklist/notch/freq-correction settings either, and
-//! those affect admission, suppression, frequencies, and dedupe buckets
-//! in the real validator just as much as the sample rate does -- a report
-//! produced with any of them non-default needs the SAME values passed
-//! here, or the replayed spot list won't match the original run's.
+//! run's allowlist/blocklist/notch settings either, and those affect
+//! admission, suppression, and dedupe buckets in the real validator just
+//! as much as the sample rate does -- a report produced with any of them
+//! non-default needs the SAME values passed here, or the replayed spot
+//! list won't match the original run's.
+//!
+//! Deliberately NOT mirrored: `--freq-correction-ppm`. Unlike the other
+//! flags, this one must NEVER be passed through, even if the original run
+//! used it (Codex review, PR #133 round 5): `decode_samples`
+//! (`manta-engine/src/lib.rs`) mutates every serialized `TrackMeta`/
+//! `TrackPromoted` `freq_hz` by the calibration factor AFTER its own
+//! `Validator` pass, specifically so the JSON report's events already
+//! carry corrected frequencies -- applying the same correction again here
+//! would double it, moving notch/dedupe buckets and producing a spot list
+//! that doesn't match the original run.
 //!
 //! `DecoderEvent` derives both `Serialize` and `Deserialize`, so this
 //! deserializes the saved report's `events` array directly rather than
@@ -58,7 +67,6 @@ struct Args {
     report_path: String,
     calls_path: String,
     fs: f64,
-    freq_correction_ppm: f64,
     allowlist: Vec<String>,
     blocklist: Option<String>,
     notch: Option<String>,
@@ -67,8 +75,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: replay_spots <report.json> <calls.txt> [sample_rate_hz] \
-         [--freq-correction-ppm <n>] [--allowlist <CALL>]... \
-         [--blocklist <path>] [--notch <path>]"
+         [--allowlist <CALL>]... [--blocklist <path>] [--notch <path>]"
     );
     std::process::exit(2);
 }
@@ -76,7 +83,6 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut positional = Vec::new();
-    let mut freq_correction_ppm = 0.0;
     let mut allowlist = Vec::new();
     let mut blocklist = None;
     let mut notch = None;
@@ -84,14 +90,6 @@ fn parse_args() -> Args {
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--freq-correction-ppm" => {
-                let v = raw.get(i + 1).unwrap_or_else(|| usage());
-                freq_correction_ppm = v.parse().unwrap_or_else(|e| {
-                    eprintln!("invalid --freq-correction-ppm {v:?}: {e}");
-                    std::process::exit(2);
-                });
-                i += 2;
-            }
             "--allowlist" => {
                 allowlist.push(raw.get(i + 1).unwrap_or_else(|| usage()).clone());
                 i += 2;
@@ -132,7 +130,6 @@ fn parse_args() -> Args {
         report_path,
         calls_path,
         fs,
-        freq_correction_ppm,
         allowlist,
         blocklist,
         notch,
@@ -160,14 +157,11 @@ fn main() {
         .filter(|l| !l.is_empty())
         .collect();
 
-    let mut validator = Validator::bundled(args.fs)
-        .with_freq_correction_ppm(args.freq_correction_ppm)
-        .unwrap_or_else(|e| {
-            panic!(
-                "invalid --freq-correction-ppm {}: {e}",
-                args.freq_correction_ppm
-            )
-        });
+    // No `.with_freq_correction_ppm(...)` here -- see the module doc's
+    // "Deliberately NOT mirrored" note: the report's own freq_hz values
+    // are already calibration-corrected, so applying it again would
+    // double it.
+    let mut validator = Validator::bundled(args.fs);
     for call in &args.allowlist {
         validator.allowlist(call);
     }
