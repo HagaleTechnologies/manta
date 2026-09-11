@@ -58,12 +58,22 @@ jobs:
     # `conclusion: timed_out`, and auto-merge is disarmed exactly the same
     # as a real failure. Omitting it would leave a timed-out merge-group
     # attempt permanently stuck: neither retried nor handed off to a human,
-    # for the one failure mode (a hang) this handler exists to catch. A
-    # plain PR-triggered CI failure is the PR author's own problem to push
-    # a fix for, not something this handler touches.
+    # for the one failure mode (a hang) this handler exists to catch. Also
+    # includes `startup_failure` (Codex round 4): a run can fail to even
+    # start (a runner-provisioning problem, an invalid workflow file on
+    # that specific ref) and GitHub reports that conclusion distinctly from
+    # `failure` -- the queue attempt still cannot merge, and auto-merge is
+    # still disarmed, so it needs the identical retry-or-handoff treatment.
+    # A plain PR-triggered CI failure is the PR author's own problem to
+    # push a fix for, not something this handler touches.
     if: |
       github.event.workflow_run.event == 'merge_group' &&
-      (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled' || github.event.workflow_run.conclusion == 'timed_out')
+      (
+        github.event.workflow_run.conclusion == 'failure' ||
+        github.event.workflow_run.conclusion == 'cancelled' ||
+        github.event.workflow_run.conclusion == 'timed_out' ||
+        github.event.workflow_run.conclusion == 'startup_failure'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Serialize per merge-group attempt (recovered from the branch name
@@ -338,6 +348,18 @@ jobs:
             local existing_labels
             existing_labels=$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/${{ github.repository }}/issues/${PR}/labels" --jq '.[].name')
             if grep -qxF "needs-human" <<< "$existing_labels"; then
+              # Staleness marker (Codex round 4): needs-human has no automatic clearing
+              # mechanism -- it's a human decision point by design (see auto-merge-trigger.yml's
+              # own header comment) -- but without recording WHICH revision it was attached
+              # for, a later push that fixes the problem stays silently stalled: the label is
+              # PR-wide, not SHA-scoped, so a fresh commit reads the exact same "needs-human
+              # present" state the failed one did. auto-merge-trigger.yml/dependabot-auto-merge.yml
+              # now scan for this marker to tell a genuinely-stale handoff (the head has since
+              # moved) from one still covering the PR's current head. Best-effort (`|| true`):
+              # if this fails to post, staleness detection just stays conservative (keeps
+              # pausing), the same safe default as before this feature existed -- it never
+              # makes the pause LESS safe, only potentially longer-lived than necessary.
+              GH_TOKEN="$READ_TOKEN" gh pr comment "$PR" --repo "${{ github.repository }}" --body "<!-- queue-retry-handler:needs-human sha=$HEAD_SHA12 -->" >/dev/null 2>&1 || true
               return 0
             fi
             echo "::error::Could not attach needs-human to PR #$PR -- the handoff comment posted, but the label signal did not land."
@@ -548,8 +570,15 @@ jobs:
           # `|| true` on the comment itself: this is a best-effort notification, not the
           # state-changing action -- a transient failure here shouldn't abort the script under
           # this step's default `bash -e` and skip the needs-human attach-and-verify below, which
-          # is the actual fail-closed mechanism for this step.
-          gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake." || true
+          # is the actual fail-closed mechanism for this step. The trailing HTML-comment marker
+          # (Codex round 4) records exactly which SHA this handoff covers -- needs-human has no
+          # automatic clearing mechanism (a human decision by design), but this marker lets
+          # auto-merge-trigger.yml/dependabot-auto-merge.yml tell a genuinely-stale handoff
+          # (the head has since moved, e.g. the human pushed the fix this comment itself
+          # suggests) from one still covering the PR's current head, instead of the label
+          # silently blocking every future revision forever.
+          gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
+          <!-- queue-retry-handler:needs-human sha=$HEAD_SHA12 -->" || true
 
           # Verify the needs-human label actually attached: `|| true` would let this step report
           # success even if the label doesn't exist (deleted) or the POST fails transiently -- and
@@ -634,11 +663,17 @@ jobs:
             # Verify the disarm actually took (same reasoning as the retry step's own version of
             # this check): don't trust the disable-auto call's own reported success.
             still_armed=$(gh pr view "$PR" --repo "${{ github.repository }}" --json autoMergeRequest --jq '.autoMergeRequest != null')
+            # Both comments below carry the same needs-human staleness marker the handoff step
+            # uses (Codex round 4) -- this path attaches needs-human too, and without recording
+            # the SHA it covers, a later push that fixes the underlying problem would stay
+            # silently stalled by a PR-wide label that never clears itself.
             if [ "$still_armed" = "true" ]; then
               echo "::error::Auto-merge is STILL ARMED for PR #$PR (commit $HEAD_SHA12) despite the disable-auto call."
-              gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Attempted to disarm auto-merge, but could NOT confirm it's actually disabled -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify, or close/reopen the PR." || true
+              gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Attempted to disarm auto-merge, but could NOT confirm it's actually disabled -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify, or close/reopen the PR.
+              <!-- queue-retry-handler:needs-human sha=$HEAD_SHA12 -->" || true
             else
-              gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Disarmed auto-merge rather than risk it -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved." || true
+              gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Disarmed auto-merge rather than risk it -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved.
+              <!-- queue-retry-handler:needs-human sha=$HEAD_SHA12 -->" || true
             fi
 
             # Verify needs-human attached too: this is the last step in the job, so there's no
