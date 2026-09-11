@@ -16,7 +16,11 @@ file playback, single hardwired channel (no PFB), classical decoder chain
   20 WPM / +20 dB SNR / AWGN-only single-signal IQ file (SPEC §7 V1).
 - Proptest round-trip (text → testkit CW → decoder) passes for 10–40 WPM at
   ≥ +15 dB SNR, CER = 0.
-- CI green on Linux + macOS (no SoapySDR dependency in default features).
+- CI green on Linux, macOS, and Windows (no SoapySDR dependency in default
+  features), since MAN-212. `--features soapy` remains Linux/macOS-only in
+  CI — a real Windows SoapySDR build path exists (vcpkg + SoapyRTLSDR from
+  source) but wasn't made reliable enough for CI in that ticket; validated
+  manually instead on real hardware (see the MAN-212 follow-up ticket).
 
 ## M1 — Live audio, one signal, real hardware
 
