@@ -1994,44 +1994,63 @@ mod tests {
     fn step_hop_pushes_every_entry_of_a_multi_entry_burst_into_pending() {
         // MAN-194: once decoder_input starts returning bursts of more than
         // one entry (a reset drain), step_hop's call sites must push EVERY
-        // entry into pending, not just the first/last. This test verifies
-        // that step_hop loops over every entry in decoder_input's burst
-        // return, rather than destructuring a single triple.
+        // entry into pending, not just the first/last.
         let n = 64;
         let mut tm = TrackManager::new(
             n,
             96_000.0,
             14_000_000.0,
             DetectorConfig::default(),
-            DecodeConfig::default(),
+            DecodeConfig {
+                refine_bw_hz: 30.0,
+                ..DecodeConfig::default()
+            },
         );
+        // decoder_input's refine-enabled path reads hop.x[c], so every
+        // hop fed to a promoted track needs real complex spectrum data,
+        // not the bare `hop()` helper (empty `x`, which would panic on
+        // index-out-of-bounds). Build x from power so HopOutput::power
+        // matches exactly (norm_sqr of the real value p.sqrt() is p).
+        let mk_hop = |m: u64, power: &Vec<f32>| {
+            let x: Vec<num_complex::Complex32> = power
+                .iter()
+                .map(|&p| num_complex::Complex32::new(p.sqrt(), 0.0))
+                .collect();
+            hop_with_x(m, x)
+        };
         feed_warmup(&mut tm, n);
         let mut power = quiet_power(n);
         power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
         let mut m = 250 * 15;
         loop {
-            tm.step_hop(&hop(m, power.clone()), m);
+            tm.step_hop(&mk_hop(m, &power), m);
             m += 1;
             if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
                 break;
             }
         }
         let id = *tm.tracks.keys().next().unwrap();
+        let d = GROUP_DELAY_HOPS as u64;
+        // Run well past GROUP_DELAY_HOPS (the promotion hop itself already
+        // counts as one refiner push) so the backlog reaches steady state --
+        // exactly d entries buffered at any instant from here on.
+        for _ in 0..(d + 5) {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+        }
         let pending_before = tm.tracks.get(&id).unwrap().pending.len();
-
-        // Force a channel reassignment: the reset drains backlog entries
-        // in one burst -- step_hop must push all of them into pending,
-        // not just one.
+        // Force a channel reassignment: the reset drains the full, steady-
+        // state backlog (exactly d entries) in one burst -- step_hop must
+        // push all of them into pending, not just one.
         let mut power2 = quiet_power(n);
         power2[11] = 1e-9 * 10f32.powf(20.0 / 10.0);
         tm.tracks.get_mut(&id).unwrap().center = 11.0;
-        tm.step_hop(&hop(m, power2), m);
+        tm.step_hop(&mk_hop(m, &power2), m);
         let pending_after = tm.tracks.get(&id).unwrap().pending.len();
-        assert!(
-            pending_after > pending_before,
-            "step_hop must push entries from a multi-entry burst into pending (got {} before, {} after)",
-            pending_before,
-            pending_after
+        assert_eq!(
+            pending_after - pending_before,
+            d as usize,
+            "step_hop must push every entry of a multi-entry burst into pending, not just one"
         );
     }
 
