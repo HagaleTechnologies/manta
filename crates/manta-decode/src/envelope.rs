@@ -54,7 +54,12 @@ const INIT_HOPS: usize = 375; // SPEC §3.2: rails from the first 1 s
 const AREF_HOPS: usize = 188; // SPEC §3.1: A_ref from the first 500 ms (ms_to_hops(500))
 const MIN_KEYING_RATIO: f32 = 2.0; // SPEC §3.2: < 6 dB apparent depth -> pre-decode
 const E_LO_FLOOR: f32 = 1e-6;
-const SNR_BW_CORR_DB: f32 = 14.3; // SPEC §2.3: 10*log10(2500/93.75)
+/// SPEC §2.3: `10*log10(2500/93.75)`, the channel (93.75 Hz) to 2500 Hz
+/// reference-bandwidth conversion. `pub` (MAN-102) so `manta-engine` can
+/// convert its own floor-based `S - F` estimate with the identical
+/// constant `Demod::snr_2500_db` uses, rather than risking the two
+/// drifting apart under a second, independently-defined copy.
+pub const SNR_BW_CORR_DB: f32 = 14.3;
 
 enum Phase {
     /// Collecting the first INIT_HOPS; retries every INIT_HOPS on failure

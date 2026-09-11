@@ -71,7 +71,14 @@ descriptive and always loses conflicts with code and docs/.
     from manta's expected convention.
   - **SNR convention (still live):** this repo's spec froze SNR-in-2500-Hz;
     the shared `awgn_ref_bw()` design in SPEC-watterson reconciles it with
-    the benchmark harness's 3 kHz convention.
+    the benchmark harness's 3 kHz convention. **Superseded at the
+    wire-output boundary only** by MAN-102 / decision D3
+    (2026-09-06-broad-review-decisions.md): telnet/RBN-uplink spot lines now
+    quote SNR in the 500 Hz RBN/CW Skimmer reference bandwidth, converted
+    from the pipeline's native 2500 Hz value at render time; the JSON stream
+    keeps the native 2500 Hz value plus an explicit `snrRefHz` field. The
+    testkit's input-side 2500 Hz convention this bullet otherwise describes,
+    and the `awgn_ref_bw()` reconciliation, are unaffected.
 - Deterministic decode path is a hard requirement: file input → byte-identical
   spot logs.
 - Classical decoder first; ML fusion (dit's pattern) only at M4, gated on

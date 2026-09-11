@@ -126,6 +126,10 @@ async fn tcp_client_receives_spot_as_json_lines_message() {
     assert_eq!(value["dxContinent"], "AS");
     assert_eq!(value["dxCqZone"], 25);
     assert_eq!(value["dxDxcc"], 339);
+    // MAN-102/D3: the JSON stream keeps the native 2500 Hz measurement
+    // (no telnet/uplink +7 dB conversion) plus an explicit reference field.
+    assert_eq!(value["snr"], 23);
+    assert_eq!(value["snrRefHz"], 2500);
 }
 
 #[tokio::test]
