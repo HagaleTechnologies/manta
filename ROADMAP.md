@@ -19,8 +19,9 @@ file playback, single hardwired channel (no PFB), classical decoder chain
 - CI green on Linux, macOS, and Windows (no SoapySDR dependency in default
   features), since MAN-212. `--features soapy` remains Linux/macOS-only in
   CI — a real Windows SoapySDR build path exists (vcpkg + SoapyRTLSDR from
-  source) but wasn't made reliable enough for CI in that ticket; validated
-  manually instead on real hardware (see the MAN-212 follow-up ticket).
+  source) but wasn't made reliable enough for CI in that ticket; not yet
+  validated on real hardware, tracked as a follow-up (GitHub issue #187 /
+  Linear MAN-215).
 
 ## M1 — Live audio, one signal, real hardware
 

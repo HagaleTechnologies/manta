@@ -110,9 +110,20 @@ once it exists.
   `ubuntu-latest` and `macos-latest`; the `windows-latest` leg was
   attempted (see the vcpkg subsection above) and dropped after hitting a
   concrete, unresolved blocker (`libusb.h` missing for `SoapyRTLSDR`'s
-  from-source build), not left untried by default. `git log` on the
-  MAN-212 branch is the source of truth for what was attempted, since the
-  current CI file shows no trace of it.
+  from-source build), not left untried by default. In short: (1) the
+  `lukka/run-vcpkg` action SHA had to be fixed to a real commit on the
+  `v11.5` tag, since a bad pin broke the whole job's `uses:` resolution,
+  not just Windows; (2) the `vcpkgGitCommitId` pin had to be bumped off a
+  stale 2024-08 baseline, which failed configuring `soapysdr:x64-windows`
+  via Ninja against `windows-latest`'s VS2026/MSVC 14.44 toolset; (3) past
+  that, building `SoapyRTLSDR` from source hit `error C1083: Cannot open
+  include file: 'libusb.h'` -- installing `libusb` via vcpkg and threading
+  its paths into the CMake configure is the likely next step, untried. See
+  the `--features soapy` section above for the full narrative, and
+  [PR #184](https://github.com/HagaleTechnologies/manta/pull/184)'s
+  Commits tab for the exact diffs and error text -- the PR persists after
+  merge independent of this source branch's lifecycle, unlike raw `git
+  log` on the branch itself.
 - No Windows-native equivalent of `crates/manta-cli/tests/signal_shutdown.rs`
   exists -- that test is `#![cfg(unix)]`-gated and simply doesn't run on
   Windows. `ctrlc::set_handler`'s Windows console-event backend is used in
