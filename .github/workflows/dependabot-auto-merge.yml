@@ -38,8 +38,20 @@ jobs:
       # eventual merge only executes once required_approving_review_count
       # is satisfied for real -- which the approval step immediately
       # above already provides. No bypass needed or wanted for this path.
+      #
+      # needs-human guard (learned from widdershins auto-merge.yml round 21,
+      # applied here preemptively rather than rediscovered): this workflow
+      # triggers on `synchronize` too (pull_request_target's default
+      # types), which fires every time Dependabot itself rebases/updates the
+      # PR against a moved base -- a routine, expected event, not a new
+      # human decision. Without this guard, that rebase would silently
+      # re-arm auto-merge on a PR queue-retry-handler.yml already handed
+      # off to a human after its one automatic retry failed, bypassing that
+      # handoff entirely.
       - name: Enable auto-merge for approved update
-        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        if: |
+          steps.metadata.outputs.update-type != 'version-update:semver-major' &&
+          !contains(github.event.pull_request.labels.*.name, 'needs-human')
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
