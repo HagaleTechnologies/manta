@@ -121,6 +121,10 @@ fn run_case(rng: &mut Rng) -> Option<(String, f32, i32, f32, f64)> {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (iq, texts) =
         render_scene(std::slice::from_ref(&sig), fs, duration_s, Some(noise_seed)).unwrap();
