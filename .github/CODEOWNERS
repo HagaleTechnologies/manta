@@ -1,0 +1,58 @@
+# Protects merge of policy-affecting files: workflows, CI/release/toolchain-safety scripts, and
+# build/release configuration. Does NOT gate pre-merge execution -- required-workflow provenance
+# (main-protection ruleset) is the separate execution-time boundary. Part of the fleet CI redesign,
+# phase 2 (manta); see dispensa Q-0064 for the shared cross-repo contract.
+#
+# A policy change needs human review here even when an agent authors the PR -- this file cannot
+# list an agent identity as an owner.
+
+/.github/            @thagale
+/.mergify.yml        @thagale
+
+# cargo build/test resolves exactly this dependency graph -- an unowned edit to any crate's OWN
+# Cargo.toml (not just the workspace root) can change a direct dependency's installed version
+# within its declared range, or add a new one entirely, without ever touching a reviewed file.
+# No leading slash: matches the workspace root AND every crate under crates/*/Cargo.toml
+# (gitignore-style matching, same convention CODEOWNERS uses throughout).
+Cargo.toml           @thagale
+/Cargo.lock          @thagale
+
+# Cross.toml controls the exact cross-compilation toolchain/image used to build release
+# artifacts -- an unowned edit here can substitute a different (unverified) build environment
+# for release builds without touching release.yml itself.
+/Cross.toml          @thagale
+
+# .cargo/config.toml sets git-fetch-with-cli (this workspace's git dependencies otherwise
+# intermittently fail to resolve on a cold cache, per the file's own comment) -- Dockerfile and
+# Cross.toml both rely on it for the same reason. An unowned edit here can silently change
+# build-wide cargo behavior without touching any of the files that actually depend on it (Codex
+# P1, PR #182 round 1).
+/.cargo/             @thagale
+
+# rust-toolchain.toml is enforced by scripts/check-rust-toolchain-pin.sh, CI's own trust
+# mechanism (ci.yml's test job runs it before anything else, specifically so a toolchain
+# mismatch reports as itself, not a confusing downstream diff) -- an unowned edit here changes
+# which toolchain CI/release actually compile with, silently invalidating what a green required
+# check proves.
+/rust-toolchain.toml @thagale
+
+/.gitignore          @thagale
+/.dockerignore       @thagale
+
+/AGENTS.md           @thagale
+/CLAUDE.md           @thagale
+
+/docs/DECISIONS/     @thagale
+
+# Dockerfile is what release-publish.yml actually builds and pushes to GHCR -- an unowned edit
+# here can change the published release image's contents with no corresponding review of
+# release-publish.yml or a version bump.
+/Dockerfile          @thagale
+
+/SECURITY.md         @thagale
+
+# Whole directory, not an enumerated subset: scripts/ includes CI/release-safety-critical checks
+# (check-rust-toolchain-pin.sh, check-dependabot-cargo-unlock.sh) and is small enough that an
+# allowlist here is more likely to silently miss a new script than an unowned file elsewhere is
+# to wrongly gain review friction.
+/scripts/            @thagale

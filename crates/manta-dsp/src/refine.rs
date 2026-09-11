@@ -3,19 +3,21 @@
 //! fractional centroid offset. SPEC v2 §3. Enabled when `decode.refine_bw_hz`
 //! is greater than zero (default 0, meaning off).
 //!
-//! The engine call site (MAN-168, `manta-engine::track`) uses
-//! [`GROUP_DELAY_HOPS`] to size its convergence window: `TAPS` (equal to
-//! `2*GROUP_DELAY_HOPS + 1`) real hops are needed before the FIR's 11-tap
-//! window is no longer partly zero-padded from a reset. It does NOT use
-//! this constant to
-//! pair a refined amplitude with an earlier `sample_ts`, despite that
-//! being this constant's original purpose. A `GROUP_DELAY_HOPS`-delayed
-//! pairing on top of the convergence gate is provably impossible to do
-//! without either skipping hops or duplicating an observation, given an
-//! interface that must emit exactly one amplitude per input hop. See the
-//! call site's own doc comment, and MAN-194, for the full reasoning and
-//! the real fix. The engine currently reports each hop's own `sample_ts`
-//! with no delay compensation instead.
+//! The engine call site (MAN-168/MAN-194, `manta-engine::track::Track::
+//! decoder_input`) uses [`GROUP_DELAY_HOPS`] for both of this constant's
+//! purposes: sizing the convergence window (`TAPS`, equal to
+//! `2*GROUP_DELAY_HOPS + 1`, real hops needed before the FIR's 11-tap
+//! window is no longer partly zero-padded from a reset) AND pairing a
+//! refined amplitude with the correctly delayed `sample_ts` it actually
+//! describes (`Refiner::push`'s output at hop `t` is evidence about hop
+//! `t - GROUP_DELAY_HOPS`, not hop `t`). A one-report-per-hop interface
+//! could not do the latter without either skipping hops or duplicating an
+//! observation at the boundaries (track birth, a channel reset, end of
+//! stream); `decoder_input` returns a `SmallVec` of `(amplitude, raw_power,
+//! spectral_ref_power, sample_ts)` 4-tuples specifically so it can emit
+//! zero, one, or several reports per input hop, which is what a correct
+//! hold-back/drain protocol requires. See MAN-194 and `decoder_input`'s own
+//! doc comment for the full protocol.
 
 use num_complex::Complex32;
 
