@@ -13,10 +13,11 @@
 //! `t - GROUP_DELAY_HOPS`, not hop `t`). A one-report-per-hop interface
 //! could not do the latter without either skipping hops or duplicating an
 //! observation at the boundaries (track birth, a channel reset, end of
-//! stream); `decoder_input` returns `Vec<(f32, f32, u64)>` specifically so
-//! it can emit zero, one, or several reports per input hop, which is what
-//! a correct hold-back/drain protocol requires. See MAN-194 and
-//! `decoder_input`'s own doc comment for the full protocol.
+//! stream); `decoder_input` returns a `SmallVec` of `(amplitude, raw_power,
+//! spectral_ref_power, sample_ts)` 4-tuples specifically so it can emit
+//! zero, one, or several reports per input hop, which is what a correct
+//! hold-back/drain protocol requires. See MAN-194 and `decoder_input`'s own
+//! doc comment for the full protocol.
 
 use num_complex::Complex32;
 
