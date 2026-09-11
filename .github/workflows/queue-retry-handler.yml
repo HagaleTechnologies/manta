@@ -123,12 +123,17 @@ jobs:
           # must still be main (auto-merge-trigger.yml/dependabot-auto-merge.yml only auto-merge
           # into main; other bases lack equivalent required checks), and auto-merge must not
           # already be armed on the current head.
-          pr_json=$(gh pr view "$PR" --repo "${{ github.repository }}" --json state,headRefOid,baseRefName,isDraft,autoMergeRequest)
+          pr_json=$(gh pr view "$PR" --repo "${{ github.repository }}" --json state,headRefOid,baseRefName,isDraft,autoMergeRequest,author)
           pr_state=$(echo "$pr_json" | jq -r .state)
           head_sha=$(echo "$pr_json" | jq -r .headRefOid)
           base_ref=$(echo "$pr_json" | jq -r .baseRefName)
           is_draft=$(echo "$pr_json" | jq -r .isDraft)
           auto_merge_armed=$(echo "$pr_json" | jq -r '.autoMergeRequest != null')
+          # Captured for the retry step below (Codex P1 round 3): it needs to know whether
+          # this PR's author is one of auto-merge-trigger.yml's two trusted, bypass-eligible
+          # authors before deciding which credential is safe to re-arm with.
+          author_login=$(echo "$pr_json" | jq -r .author.login)
+          echo "author_login=$author_login" >> "$GITHUB_OUTPUT"
 
           # Debounce before trusting a "disarmed" reading: the check above only catches the race
           # if auto-merge-trigger.yml's own SEPARATE pull_request_target synchronize handler has
@@ -306,6 +311,7 @@ jobs:
           LABEL: queue-retry-used:${{ steps.pr-state.outputs.head_sha12 }}
           HEAD_SHA12: ${{ steps.pr-state.outputs.head_sha12 }}
           HEAD_SHA: ${{ steps.pr-state.outputs.head_sha }}
+          AUTHOR_LOGIN: ${{ steps.pr-state.outputs.author_login }}
         run: |
           # Shared by both fail-closed branches below: a bare needs-human POST with `|| true`
           # would let this whole step report success even when the ONE signal meant to get a
@@ -373,6 +379,47 @@ jobs:
           # makes it fail explicitly instead of silently arming a revision the retry budget was
           # never computed for.
           #
+          # Needs-human live check: pr-state's own fetch runs, then a 10s debounce, then
+          # dedup and check-retried each make their own API round-trips before this step
+          # even starts -- a maintainer can attach needs-human in that gap, after pr-state
+          # already read the PR clean. auto-merge-trigger.yml and dependabot-auto-merge.yml
+          # both revalidate needs-human against LIVE labels right before their own merge
+          # calls for exactly this reason (Codex round 2 on this same PR); this retry path
+          # re-arms via the same bypass-capable credential below and needs the identical
+          # guard, or a maintainer's just-issued pause could be silently overridden by this
+          # handler's own automatic retry.
+          current_labels=$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/${{ github.repository }}/issues/${PR}/labels" --jq '.[].name')
+          if grep -qxF "needs-human" <<< "$current_labels"; then
+            echo "::notice::PR #$PR now has needs-human (attached after pr-state's own check) -- standing down without consuming this head's retry budget."
+            exit 0
+          fi
+
+          # Trusted-author check (Codex P1 round 3): CODEX_REVIEW_PAT is a bypass actor on
+          # manta-review-gate ("always" mode) -- auto-merge-trigger.yml restricts its own use
+          # of this same credential to exactly the two authors that bypass is meant for
+          # (thagale, catalyst-cloud-connector[bot]). This retry step re-arms EVERY PR that
+          # reaches it, regardless of author, using the SAME credential -- for any other PR
+          # that somehow entered the queue (a manually-approved outside contributor, or
+          # Dependabot, whose own admission path already requires a real satisfied review
+          # rather than a bypass), an unconditional bypass-token re-arm would silently
+          # succeed even if that review were dismissed between the original queue entry and
+          # this retry, undoing the review requirement the PR was supposed to still need.
+          # Use the bypass token only for the two authors it's meant for; everyone else gets
+          # READ_TOKEN (github.token, not a bypass actor), so their retry only actually
+          # merges once the review requirement is STILL satisfied for real.
+          #
+          # GraphQL's Actor.login for a bot omits the "[bot]" suffix the REST/webhook
+          # payloads use elsewhere in this file (confirmed empirically against a real
+          # catalyst-cloud-connector[bot]-authored manta PR: `gh pr view --json author`
+          # returns "app/catalyst-cloud-connector", not "catalyst-cloud-connector[bot]") --
+          # AUTHOR_LOGIN came from pr-state's own `gh pr view --json author`, so it must be
+          # compared against THIS format, not the webhook one auto-merge-trigger.yml uses.
+          if [ "$AUTHOR_LOGIN" = "thagale" ] || [ "$AUTHOR_LOGIN" = "app/catalyst-cloud-connector" ]; then
+            MERGE_TOKEN="$GH_TOKEN"
+          else
+            MERGE_TOKEN="$READ_TOKEN"
+          fi
+
           # Re-check the base immediately before mutating: --match-head-commit pins the head
           # atomically at GitHub's own mutation boundary, but it doesn't pin the base -- `gh pr
           # merge --auto` takes no base argument at all, it just arms auto-merge for the PR AS IT
@@ -385,7 +432,7 @@ jobs:
           current_base=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${{ github.repository }}" --json baseRefName --jq .baseRefName)
           if [ "$current_base" != "main" ]; then
             echo "::notice::PR #$PR's base changed to '$current_base' (was main) since pr-state ran -- auto-merge-trigger.yml itself would refuse this base too. Standing down without consuming this head's retry budget."
-          elif gh pr merge "$PR" --repo "${{ github.repository }}" --auto --squash --match-head-commit "$HEAD_SHA"; then
+          elif GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "${{ github.repository }}" --auto --squash --match-head-commit "$HEAD_SHA"; then
             # GH_TOKEN="$READ_TOKEN" here too: a successful merge call only proves CODEX_REVIEW_PAT
             # has pull-requests:write -- it says nothing about whether it ALSO has issues:write, a
             # genuinely separate scope for a fine-grained PAT. If it doesn't, these two calls
@@ -480,8 +527,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.parse.outputs.pr_number }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA: ${{ steps.pr-state.outputs.head_sha }}
           HEAD_SHA12: ${{ steps.pr-state.outputs.head_sha12 }}
         run: |
+          # Revalidate the head before labeling a second failure (Codex P2 round 3): pr-state
+          # captured HEAD_SHA well before this step runs (dedup and check-retried each take
+          # their own API round-trips in between) -- a new commit landing in that gap gets its
+          # own fresh retry budget on its own eventual merge-group run, same as every other
+          # race in this file, but WITHOUT this check, this step would attach needs-human to
+          # the PR unconditionally: auto-merge-trigger.yml's live-label guard (round 2) would
+          # then refuse to arm the replacement revision, incorrectly stalling a commit that has
+          # never actually failed the queue itself. Retry's own analogous checks (base changed,
+          # head moved) already guard against this same class of race; handoff needed the same.
+          current_head_sha=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+          if [ "$current_head_sha" != "$HEAD_SHA" ]; then
+            echo "::notice::PR #$PR's head moved from $HEAD_SHA12 to ${current_head_sha:0:12} since pr-state ran -- the second-failure handoff for the OLD commit is moot; standing down without labeling the replacement revision."
+            exit 0
+          fi
+
           # `|| true` on the comment itself: this is a best-effort notification, not the
           # state-changing action -- a transient failure here shouldn't abort the script under
           # this step's default `bash -e` and skip the needs-human attach-and-verify below, which
