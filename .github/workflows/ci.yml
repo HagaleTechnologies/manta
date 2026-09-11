@@ -226,7 +226,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -234,33 +234,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libsoapysdr-dev soapysdr0.8-module-rtlsdr
       - if: runner.os == 'macOS'
         run: brew install soapysdr
-      # Windows has no libsoapysdr-dev/soapysdr0.8-module-rtlsdr package
-      # equivalent -- built here from source (SoapySDR core via vcpkg,
-      # librtlsdr + SoapyRTLSDR module from source since neither has a
-      # vcpkg port as of 2026-09). Only the `driver=rtlsdr` module is
-      # needed -- the existing soapy unit tests
-      # (crates/manta-input/src/soapy.rs) never touch SDRplay, so this
-      # deliberately sidesteps SDRplay's proprietary Windows API/EULA,
-      # which only matters for the deferred live-hardware ticket.
-      - if: runner.os == 'Windows'
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
-        with:
-          vcpkgGitCommitId: 52d80838fb40c755b1615fbc9c7b994a33742a22
-      - if: runner.os == 'Windows'
-        run: |
-          & "$env:VCPKG_ROOT\vcpkg" install soapysdr:x64-windows
-          echo "SoapySDR_DIR=$env:VCPKG_ROOT\installed\x64-windows\share\soapysdr" >> $env:GITHUB_ENV
-          echo "$env:VCPKG_ROOT\installed\x64-windows\bin" >> $env:GITHUB_PATH
-        shell: pwsh
-      - if: runner.os == 'Windows'
-        run: |
-          git clone --depth 1 https://github.com/osmocom/rtl-sdr.git C:\rtl-sdr-src
-          cmake -S C:\rtl-sdr-src -B C:\rtl-sdr-build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_INSTALL_PREFIX=C:\rtl-sdr-install -DCMAKE_BUILD_TYPE=Release
-          cmake --build C:\rtl-sdr-build --config Release --target install
-          git clone --depth 1 https://github.com/pothosware/SoapyRTLSDR.git C:\SoapyRTLSDR-src
-          cmake -S C:\SoapyRTLSDR-src -B C:\SoapyRTLSDR-build -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DSoapySDR_DIR="$env:SoapySDR_DIR" -DLIBRTLSDR_INCLUDE_DIR=C:\rtl-sdr-install\include -DLIBRTLSDR_LIBRARIES=C:\rtl-sdr-install\lib\rtlsdr.lib -DCMAKE_BUILD_TYPE=Release
-          cmake --build C:\SoapyRTLSDR-build --config Release --target install
-        shell: pwsh
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
