@@ -49,12 +49,21 @@ jobs:
     # runs on github.run_id (never a shared PR-number group), so a sibling
     # run can't cancel this one structurally -- but an external cancel
     # (manual, a repo-wide event) still disarms auto-merge exactly the same
-    # way a real test failure does, so it's handled identically here. A
+    # way a real test failure does, so it's handled identically here. Also
+    # includes `timed_out`: ci.yml's test/test-soapy/test-hpsdr jobs carry
+    # no explicit `timeout-minutes` of their own, so a genuinely hung run
+    # (a wedged runner, a decoder stuck against real hardware) reaches
+    # GitHub Actions' own platform-default job timeout rather than any
+    # timeout this repo controls -- workflow_run still reports that as
+    # `conclusion: timed_out`, and auto-merge is disarmed exactly the same
+    # as a real failure. Omitting it would leave a timed-out merge-group
+    # attempt permanently stuck: neither retried nor handed off to a human,
+    # for the one failure mode (a hang) this handler exists to catch. A
     # plain PR-triggered CI failure is the PR author's own problem to push
     # a fix for, not something this handler touches.
     if: |
       github.event.workflow_run.event == 'merge_group' &&
-      (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled')
+      (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled' || github.event.workflow_run.conclusion == 'timed_out')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Serialize per merge-group attempt (recovered from the branch name
