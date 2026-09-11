@@ -186,11 +186,14 @@ impl TrackDecoder {
     /// reported in TrackMeta events. SPEC §2.3/§5. See `set_freq_hz` for why
     /// this is pushed down from `manta-engine` rather than computed here:
     /// the noise floor and gate live one crate above this one. MAN-102.
-    /// Consumed only by the `Legacy` engine (see `tick_meta`) -- `EdgeLegacy`
-    /// and `Hsmm` already source `TrackMeta.snr_2500_db` from their own SPEC
-    /// v2 §2.3 evidence-derived estimate (`last_snr`, via `snr_from_evidence`),
-    /// which does not share `Legacy`'s keying-rail-ratio inaccuracy this
-    /// setter exists to fix.
+    /// Consumed by every engine (see `tick_meta`) as the peak-held reported
+    /// *value* -- `last_snr` (via `snr_from_evidence`) is `EdgeLegacy`/
+    /// `Hsmm`'s own SPEC v2 §2.3 evidence-derived estimate, but it is a
+    /// single running instantaneous reading, not peak-held, and can swing
+    /// tens of dB within one message the same way `Legacy`'s keying-rail
+    /// ratio does; `tick_meta` uses it only as the presence gate (Codex
+    /// review, PR #134 round 2) -- `self.snr_2500_db.is_some()` on every
+    /// engine once `manta-engine` has pushed at least one hop.
     pub fn set_snr_2500_db(&mut self, snr_2500_db: f32) {
         self.snr_2500_db = Some(snr_2500_db);
     }
@@ -342,14 +345,19 @@ impl TrackDecoder {
         }
     }
 
-    /// SPEC §5: TrackMeta at the 1 Hz cadence. `Legacy` prefers the engine's
-    /// floor-based SPEC §2.3 peak-hold estimate (`snr_2500_db`, pushed down
-    /// by `manta-engine`, MAN-102), falling back to the keying-rail M0
-    /// stand-in only when no engine-supplied value has ever been set (e.g. a
-    /// `TrackDecoder` driven standalone, outside `manta-engine`).
-    /// `EdgeLegacy`/`Hsmm` use their own SPEC v2 §2.3 evidence-derived
-    /// estimate stashed by `snr_from_evidence`, which does not share
-    /// `Legacy`'s rail-ratio inaccuracy MAN-102 exists to fix.
+    /// SPEC §5: TrackMeta at the 1 Hz cadence. Every engine prefers the
+    /// engine-supplied floor-based SPEC §2.3 peak-hold estimate
+    /// (`snr_2500_db`, pushed down by `manta-engine`, MAN-102) as the
+    /// reported *value*; each engine's own local estimate is used only as
+    /// its presence gate and standalone-driven fallback (`TrackDecoder`
+    /// exercised outside `manta-engine`, e.g. this crate's own unit tests
+    /// and `manta-testkit`'s roundtrip vectors, where `snr_2500_db` is
+    /// never set). `EdgeLegacy`/`Hsmm`'s `last_snr` is a single running
+    /// instantaneous SPEC v2 §2.3 evidence-derived reading, not peak-held,
+    /// and can swing tens of dB within one message the same way `Legacy`'s
+    /// keying-rail ratio does -- reporting it directly reintroduced
+    /// MAN-102's own miscalibration for those two engines (Codex review,
+    /// PR #134 round 2).
     fn tick_meta(&mut self, events: &mut Vec<DecoderEvent>) {
         self.hop_count += 1;
         if self.hop_count % META_INTERVAL_HOPS == 0 {
@@ -374,7 +382,12 @@ impl TrackDecoder {
                     None
                 }
             } else {
-                self.last_snr
+                // `last_snr.is_some()` is the presence gate (evidence has
+                // been seen at least once) -- same role `running()` plays
+                // for `Legacy`. The reported *value* prefers the engine-
+                // supplied peak-hold, falling back to the instantaneous
+                // `last_snr` only when this decoder is driven standalone.
+                self.last_snr.and(self.snr_2500_db.or(self.last_snr))
             };
             if let Some(snr) = snr {
                 events.push(DecoderEvent::TrackMeta {
