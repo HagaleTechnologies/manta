@@ -937,11 +937,13 @@ impl TrackManager {
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
                     track.decoder = Some(TrackDecoder::new(id, self.decode_cfg.clone()));
                     track.decoder.as_mut().unwrap().set_freq_hz(freq_hz);
-                    let (amp, raw_power, ts) = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                    let burst = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
                     let spectral_ref_power = compute_spectral_ref_power
                         .then(|| Self::spectral_ref_power(&self.floor, track.center))
                         .flatten();
-                    track.pending.push((amp, raw_power, spectral_ref_power, ts));
+                    for (amp, raw_power, ts) in burst {
+                        track.pending.push((amp, raw_power, spectral_ref_power, ts));
+                    }
                     // Emitted unconditionally here, at the exact hop the
                     // detector made this decision -- NOT gated by
                     // `has_emitted`/TrackClosed's same-batch-merge filter
@@ -981,12 +983,13 @@ impl TrackManager {
                         if let Some(decoder) = track.decoder.as_mut() {
                             decoder.set_freq_hz(freq_hz);
                         }
-                        let (amp, raw_power, ts) =
-                            track.decoder_input(k, hop, sample_ts, refine_bw_hz);
+                        let burst = track.decoder_input(k, hop, sample_ts, refine_bw_hz);
                         let spectral_ref_power = compute_spectral_ref_power
                             .then(|| Self::spectral_ref_power(&self.floor, track.center))
                             .flatten();
-                        track.pending.push((amp, raw_power, spectral_ref_power, ts));
+                        for (amp, raw_power, ts) in burst {
+                            track.pending.push((amp, raw_power, spectral_ref_power, ts));
+                        }
                     }
                 }
             }
@@ -1984,6 +1987,51 @@ mod tests {
         assert!(
             saw_promotion,
             "step_hop must return a TrackPromoted event at the hop it promotes a track"
+        );
+    }
+
+    #[test]
+    fn step_hop_pushes_every_entry_of_a_multi_entry_burst_into_pending() {
+        // MAN-194: once decoder_input starts returning bursts of more than
+        // one entry (a reset drain), step_hop's call sites must push EVERY
+        // entry into pending, not just the first/last. This test verifies
+        // that step_hop loops over every entry in decoder_input's burst
+        // return, rather than destructuring a single triple.
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut m = 250 * 15;
+        loop {
+            tm.step_hop(&hop(m, power.clone()), m);
+            m += 1;
+            if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
+                break;
+            }
+        }
+        let id = *tm.tracks.keys().next().unwrap();
+        let pending_before = tm.tracks.get(&id).unwrap().pending.len();
+
+        // Force a channel reassignment: the reset drains backlog entries
+        // in one burst -- step_hop must push all of them into pending,
+        // not just one.
+        let mut power2 = quiet_power(n);
+        power2[11] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        tm.tracks.get_mut(&id).unwrap().center = 11.0;
+        tm.step_hop(&hop(m, power2), m);
+        let pending_after = tm.tracks.get(&id).unwrap().pending.len();
+        assert!(
+            pending_after > pending_before,
+            "step_hop must push entries from a multi-entry burst into pending (got {} before, {} after)",
+            pending_before,
+            pending_after
         );
     }
 
