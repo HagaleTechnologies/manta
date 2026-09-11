@@ -22,6 +22,13 @@ Cargo.toml           @thagale
 # for release builds without touching release.yml itself.
 /Cross.toml          @thagale
 
+# .cargo/config.toml sets git-fetch-with-cli (this workspace's git dependencies otherwise
+# intermittently fail to resolve on a cold cache, per the file's own comment) -- Dockerfile and
+# Cross.toml both rely on it for the same reason. An unowned edit here can silently change
+# build-wide cargo behavior without touching any of the files that actually depend on it (Codex
+# P1, PR #182 round 1).
+/.cargo/             @thagale
+
 # rust-toolchain.toml is enforced by scripts/check-rust-toolchain-pin.sh, CI's own trust
 # mechanism (ci.yml's test job runs it before anything else, specifically so a toolchain
 # mismatch reports as itself, not a confusing downstream diff) -- an unowned edit here changes
