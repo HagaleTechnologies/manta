@@ -337,7 +337,7 @@ use manta_dsp::channelizer::{
 };
 use manta_dsp::floor::{FloorBank, Gate};
 use manta_dsp::refine::{Refiner, GROUP_DELAY_HOPS};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 /// One tracked signal. Owns channels `{round(center)-1, round(center),
 /// round(center)+1}` per SPEC §2.5; `center` is a live, per-hop EMA of the
@@ -406,14 +406,24 @@ pub(crate) struct Track {
     /// not on continuous sub-channel drift.
     refiner_channel: Option<usize>,
     /// Real (non-zero-padded) hops fed to `refiner` since its last reset:
-    /// `decoder_input` reports the raw (unrefined) magnitude, not
-    /// `refiner`'s own output, until this reaches `TAPS` (the FIR's full
-    /// window is real) -- see `decoder_input`'s doc comment for why a
-    /// GROUP_DELAY_HOPS-delayed *pairing* on top of that convergence gate
-    /// was tried and reverted (Codex review, PR #178, three consecutive
-    /// rounds surfacing a new duplication/fabrication shape each time; see
-    /// MAN-194). Reset to 0 alongside `refiner.reset()`.
+    /// `decoder_input` withholds any report at all until this reaches
+    /// `GROUP_DELAY_HOPS` (there is no valid delayed observation before
+    /// then), reports the raw magnitude of the due delayed hop while this
+    /// is between `GROUP_DELAY_HOPS` and `TAPS`, and reports the FIR's own
+    /// output once it reaches `TAPS` (the full window is real) -- see
+    /// `decoder_input`'s doc comment for the complete MAN-194 protocol.
+    /// Reset to 0 alongside `refiner.reset()`.
     refiner_hops_since_reset: u64,
+    /// MAN-194: buffered-but-not-yet-reported `(raw_amp, raw_power,
+    /// sample_ts)` triples, oldest first, one pushed per hop fed to
+    /// `refiner`. Holds at most `GROUP_DELAY_HOPS` entries at any instant
+    /// once steady state is reached (one is popped the same hop one is
+    /// pushed, from `refiner_hops_since_reset > GROUP_DELAY_HOPS` on).
+    /// Drained in full (see `drain_refiner_backlog`/
+    /// `drain_refiner_into_pending`) whenever this track's refiner stops
+    /// receiving new input: a channel reset (inside `decoder_input`
+    /// itself), or a closure/end-of-stream (`TrackManager`, Task 3/4).
+    refiner_backlog: VecDeque<(f32, f32, u64)>,
 }
 
 /// SPEC §1.1 f(k) mapping: signed channel offset from center, FFT bin order.
@@ -445,73 +455,83 @@ impl Track {
             refiner: None,
             refiner_channel: None,
             refiner_hops_since_reset: 0,
+            refiner_backlog: VecDeque::new(),
         }
     }
 
-    /// The amplitude to feed this hop's decoder push, the RAW (unrefined)
-    /// power of the detector's owned channel `k` for the noise tracker,
-    /// and the `sample_ts` the amplitude corresponds to (MAN-168, SPEC v2
-    /// §3). Falls back to `(raw_amp, raw_power, sample_ts)` from the same
-    /// channel when refinement is disabled (`refine_bw_hz <= 0.0`, the
-    /// default) -- so `raw_power` always matches SPEC v2 §2.1's "tracked
-    /// channel" regardless of whether refinement is active, which is the
-    /// point: `raw_power` must NOT come from the narrowband-filtered
-    /// amplitude. `TrackDecoder::push_hop`'s calibrated `NoiseTracker`
-    /// expects the full-bandwidth channel's power; the refiner's 30 Hz
-    /// (vs the channel's ~93.75 Hz) passband integrates substantially
-    /// less noise power by design (that's what makes the SIGNAL amplitude
-    /// more accurate) -- Codex review measured the refined amplitude's
-    /// squared power reading ~8.6 dB low relative to `hop.power[k]`, and
-    /// `push_envelope` (the old, amplitude-only call this replaced)
-    /// reconstructed power as `amp * amp`, silently feeding that skewed,
-    /// temporally-correlated series into noise calibration whenever
-    /// refinement was enabled.
+    /// The amplitude(s) to feed this hop's decoder push, the RAW
+    /// (unrefined) power of the detector's owned channel `k` for the noise
+    /// tracker, and the `sample_ts` each amplitude corresponds to (MAN-168/
+    /// MAN-194, SPEC v2 §3). Falls back to a single `(raw_amp, raw_power,
+    /// sample_ts)` triple from the same channel when refinement is disabled
+    /// (`refine_bw_hz <= 0.0`, the default) -- so `raw_power` always matches
+    /// SPEC v2 §2.1's "tracked channel" regardless of whether refinement is
+    /// active. `TrackDecoder::push_hop`'s calibrated `NoiseTracker` expects
+    /// the full-bandwidth channel's power; the refiner's 30 Hz (vs the
+    /// channel's ~93.75 Hz) passband integrates substantially less noise
+    /// power by design, so `raw_power` must NOT come from the narrowband-
+    /// filtered amplitude (Codex review, PR #178: measured ~8.6 dB low).
     ///
-    /// Reports each hop's OWN `sample_ts` -- NOT a `GROUP_DELAY_HOPS`
-    /// -delayed pairing with `refiner`'s output, despite `refine.rs`'s
-    /// original doc comment describing that as the intended design.
-    /// Three consecutive rounds of Codex review on PR #178 each found a
-    /// new bug in an attempted delayed-pairing scheme (a duplicate/
-    /// regressed timestamp; a duplicated single amplitude replayed across
-    /// several hops; then the SAME warm-up observations reported a SECOND
-    /// time once the delay ring filled) -- and it's provable, not just
-    /// hard to get right: with an interface that must emit exactly one
-    /// `(amp, raw_power, ts)` triple per input hop (this codebase has
-    /// already learned the hard way that silently skipping a hop shortens
-    /// the following space run and collapses character boundaries), a
-    /// stream that starts at zero delay can never transition to
-    /// `GROUP_DELAY_HOPS` hops of delay later without either skipping
-    /// `GROUP_DELAY_HOPS` hops (to let the delayed index fall behind) or
-    /// reporting some hop's observation twice. Neither is acceptable, so
-    /// this reports amplitude with NO delay compensation instead: a
-    /// constant, `GROUP_DELAY_HOPS`-hop (~13ms) systematic timestamp
-    /// offset from true wall-clock time, which does not affect the
-    /// RELATIVE durations (dit/dah/space ratios) `HsmmDecoder`/`Demod`
-    /// actually decode from, unlike either alternative. See MAN-194 for
-    /// the real fix: a burst-capable `decoder_input` (returning
-    /// `Vec<(f32, f32, u64)>`) can emit zero or several triples for one
-    /// input hop, which is what a correct drain/prime protocol actually
-    /// requires.
+    /// **MAN-194: returns a burst, not a single triple.** `Refiner::push`'s
+    /// output at hop `t` is evidence about hop `t - GROUP_DELAY_HOPS`, not
+    /// hop `t` (a property of the FIR's linear phase, not a design choice --
+    /// see `refine.rs`'s module doc). A one-report-per-hop interface cannot
+    /// represent "no valid delayed observation yet" or "flush everything
+    /// buffered, the source just stopped" -- exactly what correct delay
+    /// compensation needs at track birth, a channel reset, and end of
+    /// stream. `decoder_input` instead maintains `refiner_backlog`, a small
+    /// ring of not-yet-reported `(raw_amp, raw_power, sample_ts)` triples,
+    /// one pushed per real hop fed to `refiner`:
+    ///
+    /// - While fewer than `GROUP_DELAY_HOPS` real hops have been fed since
+    ///   the last reset, nothing is popped: this call returns an empty
+    ///   `Vec`. There is no valid delayed observation yet, and reporting a
+    ///   same-hop raw substitute here (PR #178's original stopgap) is
+    ///   exactly what caused a content discontinuity at the warm-up/
+    ///   converged transition (MAN-194) -- reporting nothing avoids ever
+    ///   needing to contradict it later.
+    /// - Once `GROUP_DELAY_HOPS` real hops have been fed, exactly one entry
+    ///   pops per call (steady one-report-per-hop cadence, matching the
+    ///   pre-MAN-194 interface's cardinality): the due delayed hop's raw
+    ///   magnitude while its FIR window is still partly zero-padded
+    ///   (`refiner_hops_since_reset < TAPS`), or the FIR's own output
+    ///   (`refiner.push`'s return value THIS call, which already IS the
+    ///   correct value for the due delayed hop) once the window is fully
+    ///   real (`refiner_hops_since_reset >= TAPS`).
+    /// - A channel reset (the centroid's rounded channel changes) first
+    ///   drains every entry still in `refiner_backlog` -- up to
+    ///   `GROUP_DELAY_HOPS` real, already-observed hops that will never get
+    ///   more future context to improve their FIR quality, reported at raw
+    ///   quality -- prepended to this call's own (necessarily empty, since
+    ///   the new channel's counter just reset to 0) contribution. See
+    ///   `drain_refiner_backlog`/`drain_refiner_into_pending` for the same
+    ///   drain used by `TrackManager` at end-of-stream and every other
+    ///   closure path (Task 3/4).
     fn decoder_input(
         &mut self,
         k: usize,
         hop: &HopOutput,
         sample_ts: u64,
         refine_bw_hz: f32,
-    ) -> (f32, f32, u64) {
+    ) -> Vec<(f32, f32, u64)> {
         let raw_power = hop.power[k];
         if refine_bw_hz <= 0.0 {
-            return (raw_power.sqrt(), raw_power, sample_ts);
+            return vec![(raw_power.sqrt(), raw_power, sample_ts)];
         }
         // SPEC v2 §3 requires `c = round(c_f)`: refine the CENTROID
         // channel, not `k` (the instantaneous max-power channel used for
-        // detector ownership/gating elsewhere). `k` can flicker on noise
-        // or a competing near-edge channel even while the true centroid
-        // stays put; each flicker would otherwise reset the FIR and
-        // collapse its output to a single tap (Codex review, PR #161's
-        // MAN-168 wiring).
+        // detector ownership/gating elsewhere) -- see the original MAN-168
+        // wiring comment (Codex review, PR #161) for why `k` can flicker
+        // independently of the true centroid.
         let c = self.center.round() as usize;
         let delta = (self.center - c as f64) as f32;
+
+        let mut out: Vec<(f32, f32, u64)> = if self.refiner_channel != Some(c) {
+            self.drain_refiner_backlog()
+        } else {
+            Vec::new()
+        };
+
         let refiner = self
             .refiner
             .get_or_insert_with(|| Refiner::new(refine_bw_hz, delta));
@@ -522,37 +542,45 @@ impl Track {
         }
         refiner.set_delta(delta);
         // The channelizer's rotation step leaves a checkerboard sign
-        // artifact on odd channels at odd hops (see
-        // `channelizer::odd_channel_sign_correction`'s doc comment); a
-        // phase-sensitive consumer like this derotating/filtering refiner
-        // must correct it before the sample reaches `Refiner::push`, or an
-        // odd-channel track's refined amplitude self-cancels (measured
-        // ~39 dB of spurious attenuation before this correction was
-        // applied here). Always feed the refiner, even during warm-up
-        // below -- its FIR history and phase accumulator need every hop
-        // to converge, regardless of whether THIS hop's output is used.
+        // artifact on odd channels at odd hops; a phase-sensitive consumer
+        // like this derotating/filtering refiner must correct it before the
+        // sample reaches `Refiner::push` (measured ~39 dB of spurious
+        // attenuation before this correction was applied here).
         let corrected = hop.x[c] * odd_channel_sign_correction(hop.m, c);
         let refined_amp = refiner.push(corrected);
         self.refiner_hops_since_reset += 1;
+        let n = self.refiner_hops_since_reset;
 
-        // `TAPS == 2*GROUP_DELAY_HOPS + 1` for this odd-length symmetric
-        // FIR: right after a reset, its 11-tap window is still partly
-        // zero-padded, and `refiner.push`'s output is a ramp-in transient,
-        // not a real observation -- measured ~40% below steady-state
-        // amplitude on a constant tone partway through convergence, a dip
-        // that can flip a legacy/HSMM decision, and (before that) SPEC v2
-        // §3 requires reset loss to report neutral evidence rather than
-        // the transient's spurious negative-LLR swing. Report the raw
-        // (unrefined) magnitude -- exactly what a disabled refiner would
-        // report, already-trusted real evidence -- until the FULL window
-        // is real.
-        let full_history_hops = 2 * GROUP_DELAY_HOPS as u64 + 1; // == TAPS
-        let amp = if self.refiner_hops_since_reset >= full_history_hops {
-            refined_amp
-        } else {
-            hop.power[c].sqrt()
-        };
-        (amp, raw_power, sample_ts)
+        self.refiner_backlog
+            .push_back((hop.power[c].sqrt(), raw_power, sample_ts));
+
+        let d = GROUP_DELAY_HOPS as u64;
+        if n > d {
+            let (due_raw_amp, due_raw_power, due_ts) = self.refiner_backlog.pop_front().expect(
+                "backlog must hold an entry once n > GROUP_DELAY_HOPS: exactly one is pushed \
+                 per call and none are popped until this threshold",
+            );
+            let full_history_hops = 2 * d + 1; // == TAPS
+            let amp = if n >= full_history_hops {
+                refined_amp
+            } else {
+                due_raw_amp
+            };
+            out.push((amp, due_raw_power, due_ts));
+        }
+        out
+    }
+
+    /// MAN-194: pop every buffered-but-undelivered `(raw_amp, raw_power,
+    /// sample_ts)` triple, in order, at raw quality -- used both when
+    /// `decoder_input` detects a channel reset (folded transparently into
+    /// its own returned `Vec`, above) and by `TrackManager` at every other
+    /// point this track's refiner stops receiving new input (see
+    /// `drain_refiner_into_pending`). No attempt is made to improve FIR
+    /// quality for these: no more real input is ever coming from this
+    /// source, so the window can never become more real than it already is.
+    fn drain_refiner_backlog(&mut self) -> Vec<(f32, f32, u64)> {
+        self.refiner_backlog.drain(..).collect()
     }
 
     /// Drain this track's queued `pending` samples through its decoder,
@@ -1513,10 +1541,8 @@ mod tests {
         // construct a Refiner at all.
         let mut track = Track::new(1, 5, &cfg());
         let h = hop_with_x(0, vec![num_complex::Complex32::new(3.0, 4.0); 8]); // |z|=5
-        let (amp, raw_power, ts) = track.decoder_input(5, &h, 1000, 0.0);
-        assert_eq!(amp, 5.0);
-        assert_eq!(raw_power, 25.0);
-        assert_eq!(ts, 1000);
+        let out = track.decoder_input(5, &h, 1000, 0.0);
+        assert_eq!(out, vec![(5.0, 25.0, 1000)]);
         assert!(track.refiner.is_none());
     }
 
@@ -1566,114 +1592,156 @@ mod tests {
     }
 
     #[test]
-    fn decoder_input_reports_each_hops_own_sample_ts_with_no_delay_compensation() {
-        // Codex review, PR #178 (three consecutive rounds, each surfacing
-        // a new duplication/fabrication shape in an attempted
-        // GROUP_DELAY_HOPS-delayed pairing scheme -- see decoder_input's
-        // doc comment): decoder_input reports each hop's OWN sample_ts,
-        // never an earlier one, regardless of convergence state.
+    fn decoder_input_delays_reported_sample_ts_by_group_delay_hops() {
+        // MAN-194: decoder_input now reports the CORRECTLY delayed
+        // sample_ts (GROUP_DELAY_HOPS behind the hop it was fed on), not
+        // the current hop's own ts (PR #178's since-superseded stopgap) --
+        // Refiner::push's output at hop t is evidence about hop t - D.
         let mut track = Track::new(1, 5, &cfg());
         let h = hop_with_x(0, vec![num_complex::Complex32::new(1.0, 0.0); 8]);
-        for i in 0..(GROUP_DELAY_HOPS as u64 + 2) {
+        let d = GROUP_DELAY_HOPS as u64;
+        let mut reported_ts: Vec<u64> = Vec::new();
+        for i in 0..(d + 3) {
             let sample_ts = 1000 + i * 512;
-            let (_, _, ts) = track.decoder_input(5, &h, sample_ts, 30.0);
-            assert_eq!(
-                ts, sample_ts,
-                "hop {i} must report its OWN sample_ts, not an earlier hop's"
-            );
+            let out = track.decoder_input(5, &h, sample_ts, 30.0);
+            reported_ts.extend(out.into_iter().map(|(_, _, ts)| ts));
         }
+        // Hops 0..D-1 report nothing (no valid delayed observation yet);
+        // hop D reports hop 0's ts, hop D+1 reports hop 1's ts, hop D+2
+        // reports hop 2's ts.
+        let expected: Vec<u64> = (0..3).map(|i| 1000 + i * 512).collect();
+        assert_eq!(
+            reported_ts, expected,
+            "must report delayed timestamps starting from hop 0, once due"
+        );
     }
 
     #[test]
-    fn decoder_input_reports_raw_magnitude_during_warm_up_not_the_fir_ramp_in() {
-        // Codex review: a freshly-reset FIR's ramp-in output is not a real
-        // observation -- feeding it as evidence produced five spurious
-        // negative-LLR hops on a genuinely steady tone, violating SPEC v2
-        // §3's requirement that reset loss report neutral (`llr = 0`)
-        // evidence. During warm-up decoder_input must report the RAW
-        // magnitude (matching the disabled-refiner fallback), not
-        // `Refiner::push`'s transient output.
+    fn decoder_input_withholds_any_report_until_a_delayed_observation_exists() {
+        // MAN-194: hops 0..GROUP_DELAY_HOPS-1 have no valid delayed
+        // observation at all (there's nothing D hops in the past yet) --
+        // decoder_input must report NOTHING for them, not a same-hop raw
+        // substitute (the old stopgap this replaces, which caused a
+        // content discontinuity at the warm-up/converged transition).
         let mut track = Track::new(1, 5, &cfg());
         let raw = num_complex::Complex32::new(3.0, 4.0); // |raw| = 5
         let h = hop_with_x(0, vec![raw; 8]);
         for i in 0..GROUP_DELAY_HOPS as u64 {
-            let (amp, _, _) = track.decoder_input(5, &h, i * 512, 30.0);
-            assert_eq!(
-                amp, 5.0,
-                "warm-up hop {i} must report the raw magnitude, not a FIR ramp-in transient"
+            let out = track.decoder_input(5, &h, i * 512, 30.0);
+            assert!(
+                out.is_empty(),
+                "warm-up hop {i} must report nothing, not a same-hop raw substitute"
             );
         }
     }
 
     #[test]
-    fn decoder_input_warm_up_does_not_replay_the_first_observation_as_later_hops() {
-        // Codex review, PR #178: an earlier version of the warm-up fix
-        // reported the RING's stored (oldest/front) raw magnitude on
-        // every warm-up call, rather than each hop's OWN fresh
-        // raw_amp -- since the front entry never advances until the ring
-        // starts popping, that replayed hop 0's single observation
-        // unchanged across every warm-up hop. A loud sample right after a
-        // reset, followed by pure noise, would then fabricate a
-        // synthetic sustained mark the real signal never produced --
-        // `Demod`/HSMM evidence record every push's amplitude, not just
-        // distinct timestamps, so holding the timestamp flat (a
-        // deliberate, separate, and still-correct part of this fix) does
-        // NOT prevent that fabrication on its own. Drive a changing
-        // envelope (loud, then near-silent) through warm-up and confirm
-        // each hop's reported amplitude tracks its OWN input.
+    fn decoder_input_reports_raw_magnitude_for_a_not_yet_fully_converged_delayed_hop() {
+        // Once a delayed observation becomes due (h >= GROUP_DELAY_HOPS)
+        // but its FIR window is still partly zero-padded (h < TAPS), report
+        // the RAW magnitude of that delayed hop -- real evidence, correctly
+        // time-labeled -- not the FIR's own ramp-in transient (Codex
+        // review, PR #178: a ramp-in transient measured ~40% below
+        // steady-state amplitude on a constant tone).
         let mut track = Track::new(1, 5, &cfg());
-        let loud = num_complex::Complex32::new(3.0, 4.0); // |loud| = 5
-        let quiet = num_complex::Complex32::new(0.03, 0.04); // |quiet| = 0.05
+        let raw = num_complex::Complex32::new(3.0, 4.0); // |raw| = 5, power = 25
+        let h = hop_with_x(0, vec![raw; 8]);
+        let d = GROUP_DELAY_HOPS as u64;
+        let full_history_hops = 2 * d + 1;
+        for i in 0..full_history_hops {
+            let out = track.decoder_input(5, &h, i * 512, 30.0);
+            if i >= d {
+                assert_eq!(
+                    out,
+                    vec![(5.0, 25.0, (i - d) * 512)],
+                    "hop {i} (before full convergence at {full_history_hops}) must report the \
+                     raw magnitude of its due delayed hop, not a partially-converged FIR output"
+                );
+            } else {
+                assert!(out.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_input_does_not_replay_one_observation_as_multiple_delayed_hops() {
+        // Regression guard for the exact bug three PR #178 review rounds
+        // found: each delayed hop must report ITS OWN raw observation, not
+        // a single stale one replayed across several due hops.
+        let mut track = Track::new(1, 5, &cfg());
+        let loud = num_complex::Complex32::new(3.0, 4.0); // |loud| = 5, power = 25
+        let quiet = num_complex::Complex32::new(0.03, 0.04); // |quiet| = 0.05, power = 0.0025
         let h_loud = hop_with_x(0, vec![loud; 8]);
         let h_quiet = hop_with_x(0, vec![quiet; 8]);
+        let d = GROUP_DELAY_HOPS as u64;
 
-        let (amp0, _, _) = track.decoder_input(5, &h_loud, 0, 30.0);
-        assert_eq!(amp0, 5.0, "hop 0's own loud observation must be reported");
-
-        for i in 1..GROUP_DELAY_HOPS as u64 {
-            let (amp, _, _) = track.decoder_input(5, &h_quiet, i * 512, 30.0);
-            assert_eq!(
-                amp, 0.05,
-                "warm-up hop {i} must report ITS OWN (quiet) observation, not hop 0's loud one \
-                 replayed"
-            );
+        track.decoder_input(5, &h_loud, 0, 30.0); // hop 0: loud
+        for i in 1..d {
+            track.decoder_input(5, &h_quiet, i * 512, 30.0); // hops 1..D-1: quiet
         }
+        // Hop D: due observation is hop 0's (loud).
+        let out_d = track.decoder_input(5, &h_quiet, d * 512, 30.0);
+        assert_eq!(
+            out_d,
+            vec![(5.0, 25.0, 0)],
+            "hop D must report hop 0's loud observation"
+        );
+        // Hop D+1: due observation is hop 1's (quiet), not hop 0's replayed.
+        let out_d1 = track.decoder_input(5, &h_quiet, (d + 1) * 512, 30.0);
+        assert_eq!(
+            out_d1,
+            vec![(0.05, 0.0025, 512)],
+            "hop D+1 must report hop 1's OWN quiet observation, not hop 0's loud one replayed"
+        );
     }
 
     #[test]
-    fn decoder_input_withholds_refined_amp_until_the_fir_is_fully_converged() {
-        // Codex review, PR #178: forwarding refined_amp as soon as the
-        // delay-pairing ring fills (GROUP_DELAY_HOPS+1 real hops) still
-        // has GROUP_DELAY_HOPS zero-padded taps in the 11-tap window --
-        // measured ~40% below steady-state amplitude on a constant tone.
-        // Full convergence needs TAPS == 2*GROUP_DELAY_HOPS+1 real hops.
-        // Verify: every reported amp up through hop `full_history_hops`
-        // exactly matches the raw magnitude (never the FIR's own,
-        // different, ramp-in output), and by then the ring has been
-        // popping (delay-pairing already active) for several hops.
+    fn decoder_input_reports_refined_amp_once_fully_converged() {
+        // Full convergence needs TAPS == 2*GROUP_DELAY_HOPS+1 real hops fed
+        // to the refiner since reset -- one hop past the raw-magnitude
+        // regime the previous tests cover, the due delayed hop's window is
+        // fully real and decoder_input must report the FIR's own output.
         let mut track = Track::new(1, 5, &cfg());
         let raw = num_complex::Complex32::new(3.0, 4.0); // |raw| = 5
         let h = hop_with_x(0, vec![raw; 8]);
-        let full_history_hops = 2 * GROUP_DELAY_HOPS as u64 + 1;
-        for i in 0..full_history_hops {
-            let (amp, _, _) = track.decoder_input(5, &h, i * 512, 30.0);
-            assert_eq!(
-                amp, 5.0,
-                "hop {i} (before full convergence at hop {full_history_hops}) must still report \
-                 the raw magnitude, not a partially-converged FIR output"
-            );
+        let d = GROUP_DELAY_HOPS as u64;
+        let full_history_hops = 2 * d + 1;
+        for _ in 0..(full_history_hops - 1) {
+            track.decoder_input(5, &h, 0, 30.0);
         }
-        // One hop past full convergence: refined_amp is now safe to
-        // forward. A constant real input at an even channel/hop (no odd
-        // sign-correction flips) converges to something close to the raw
-        // magnitude too, so assert the amplitude is finite and no longer
-        // artificially forced to exactly the raw value by warm-up logic
-        // -- i.e. confirm the code path actually switched, not just that
-        // the numbers happen to coincide.
-        let (converged_amp, _, _) = track.decoder_input(5, &h, full_history_hops * 512, 30.0);
+        let out = track.decoder_input(5, &h, 0, 30.0);
+        assert_eq!(out.len(), 1);
+        let (amp, _, _) = out[0];
         assert!(
-            converged_amp.is_finite() && converged_amp > 0.0,
+            amp.is_finite() && amp > 0.0,
             "post-convergence amplitude must be a real, finite, positive refined value"
+        );
+    }
+
+    #[test]
+    fn decoder_input_reset_drains_the_old_channels_backlog() {
+        // MAN-194: a real centroid-channel change must not silently drop
+        // the old channel's buffered-but-undelivered backlog -- it must be
+        // flushed (raw-quality, since no more real input will ever arrive
+        // for it) as part of the SAME call that detects the reset.
+        let mut track = Track::new(1, 5, &cfg());
+        let h = hop_with_x(0, vec![num_complex::Complex32::new(3.0, 4.0); 8]); // |raw|=5, power=25
+                                                                               // Feed 3 hops on channel 5 (n=1..3, all < D=5, all buffered, none
+                                                                               // popped yet).
+        for i in 0..3u64 {
+            let out = track.decoder_input(5, &h, i * 512, 30.0);
+            assert!(out.is_empty());
+        }
+        // Reassign to channel 6: the reset must drain exactly those 3
+        // buffered hops (raw magnitude, their own original timestamps),
+        // even though the new channel's own contribution this hop is
+        // itself not yet due.
+        track.center = 6.0;
+        let out = track.decoder_input(6, &h, 3 * 512, 30.0);
+        assert_eq!(
+            out,
+            vec![(5.0, 25.0, 0), (5.0, 25.0, 512), (5.0, 25.0, 1024)],
+            "reset must drain the old channel's backlog in order, before starting the new one"
         );
     }
 
@@ -1681,26 +1749,21 @@ mod tests {
     fn decoder_input_raw_power_uses_the_owned_channel_k_even_when_it_differs_from_the_centroid() {
         // Codex review, PR #178: TrackDecoder's calibrated NoiseTracker
         // needs the tracked channel's real, full-bandwidth power (SPEC v2
-        // §2.1), not `amp * amp` -- the refiner's narrowband output
-        // integrates substantially less noise power by design (measured
-        // ~8.6 dB low), so reconstructing power from it (what the old
-        // push_envelope-based call site did) silently skewed noise
-        // calibration whenever refinement was enabled. The detector's
-        // owned/gating channel `k` and the refiner's centroid-rounded
-        // channel `c` can also legitimately differ (the whole point of
-        // the centroid-selection fix earlier in this file's history), so
-        // this must come from `k` specifically, never from `c` or from
-        // any refined value, confirmed here with `k` and `c` set to
+        // §2.1), not a refined value -- confirmed here with k and c set to
         // channels with clearly different powers.
         let mut track = Track::new(1, 5, &cfg()); // center stays 5.0 -> c=5
         let mut samples = vec![num_complex::Complex32::new(1.0, 0.0); 8];
         samples[5] = num_complex::Complex32::new(3.0, 4.0); // channel c=5: power 25
         samples[6] = num_complex::Complex32::new(1.0, 0.0); // channel k=6: power 1
         let h = hop_with_x(0, samples);
-        // k=6 passed explicitly, differing from center's rounded channel c=5.
-        let (_, raw_power, _) = track.decoder_input(6, &h, 0, 30.0);
+        let d = GROUP_DELAY_HOPS as u64;
+        let mut last_out = Vec::new();
+        for i in 0..=d {
+            last_out = track.decoder_input(6, &h, i * 512, 30.0);
+        }
         assert_eq!(
-            raw_power, 1.0,
+            last_out,
+            vec![(5.0, 1.0, 0)],
             "raw_power must come from k=6 (power 1), not c=5 (power 25) or any refined value"
         );
     }
@@ -1708,15 +1771,10 @@ mod tests {
     #[test]
     fn decoder_input_applies_the_odd_channel_sign_correction() {
         // The real channelizer's rotation step bakes the checkerboard sign
-        // artifact into `HopOutput::x[k]` itself (see
-        // `channelizer::odd_channel_sign_correction`'s doc comment); a
-        // synthetic `HopOutput` for a physically-constant tone must
-        // reproduce that same artifact to exercise decoder_input's fix, so
-        // pre-multiply by the same factor here. `decoder_input` must undo
-        // it (the two factors cancel, `(-1)^2 = 1`) before the refiner
-        // sees the sample -- without that, the refiner sees the raw
-        // alternating input and self-cancels it (the ~39 dB attenuation
-        // the Codex review measured against the real channelizer).
+        // artifact into `HopOutput::x[k]` itself; a synthetic `HopOutput`
+        // for a physically-constant tone must reproduce that same artifact
+        // to exercise decoder_input's fix. decoder_input must undo it
+        // before the refiner sees the sample.
         let raw = num_complex::Complex32::new(1.0, 0.0);
         let mean_amp = |channel: usize| -> f32 {
             let mut track = Track::new(1, channel, &cfg());
@@ -1725,10 +1783,12 @@ mod tests {
             for m in 0..200u64 {
                 let artifacted = raw * odd_channel_sign_correction(m, channel);
                 let h = hop_with_x(m, vec![artifacted; 8]);
-                let (amp, _, _) = track.decoder_input(channel, &h, m * 512, 30.0);
+                let out = track.decoder_input(channel, &h, m * 512, 30.0);
                 if m > 50 {
-                    sum += amp;
-                    count += 1;
+                    for (amp, _, _) in out {
+                        sum += amp;
+                        count += 1;
+                    }
                 }
             }
             sum / count as f32
