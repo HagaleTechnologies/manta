@@ -48,11 +48,18 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
   `wait-for-codex.yml`'s own note reads "this repo's copy has no auto-sync, so
   port future template fixes here manually too", and `.github/workflows/`
   contains no sync workflow -- so a local edit is not reverted by machinery. The
-  six remaining comment references were renamed to `manta` (a `manta#45` issue
-  ref resolves through GitHub's rename redirect), and
+  five remaining comment references in the two workflow files were renamed to
+  `manta` (a `manta#45` issue ref resolves through GitHub's rename redirect), and
   `crates/manta-cli/tests/synced_ci_files_repo_name.rs` fails CI if a future
   manual port reintroduces the old name. Editing the upstream template as well
   (see Follow-ups) is what stops a port from carrying it back in the first place.
+
+  `.mergify.yml` carried a sixth reference and was guarded alongside them until
+  the native-merge-queue cutover (#185, 2026-09-11) deleted the file outright;
+  its replacement, `.github/workflows/auto-merge-trigger.yml`, never carried the
+  old name. Nothing in this repo names the pre-rename project any more, so the
+  ticket's acceptance grep (`git grep -i skimmer -- .github .mergify.yml`) still
+  returns nothing.
 
 ## Follow-ups
 
@@ -61,6 +68,8 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
 - Sibling repos that link to `HagaleTechnologies/skimmer` (cqdx, coppa,
   dispensa) rely on the redirect until touched for other reasons.
 - MAN-25: apply the same rename in the upstream `wait-for-codex.yml` /
-  `ci.yml` / `.mergify.yml` template (canonical copy cited as `credenza`,
-  PR #30) so the next manual port carries the new name. Requires access to
-  that repo; tracked separately from the manta-side fix.
+  `ci.yml` template (canonical copy cited as `credenza`, PR #30) so the next
+  manual port carries the new name. Requires access to that repo; tracked
+  separately from the manta-side fix. The upstream `.mergify.yml` template is
+  moot for manta after #185 retired Mergify here, but still worth renaming for
+  the sibling repos that keep using it.

@@ -1,4 +1,4 @@
-//! MAN-25: the three fleet-synced CI/merge-config files must never carry the
+//! MAN-25: the fleet-synced CI/merge-config files must never carry the
 //! pre-rename project name.
 //!
 //! These files are ported by hand from an upstream template (see
@@ -9,7 +9,10 @@
 //! the required `cargo test --workspace` leg and deliberately lives outside the
 //! synced files themselves, so the guard adds no drift against the template.
 //!
-//! Scope is the three files only -- the generic category phrase "CW skimmer"
+//! `.mergify.yml` was a third guarded file until the native-merge-queue cutover
+//! (#185) deleted it; the two workflow files below are what remains.
+//!
+//! Scope is those files only -- the generic category phrase "CW skimmer"
 //! stays legal everywhere else (see docs/DECISIONS/2026-09-01-rename-to-manta.md).
 
 use std::path::{Path, PathBuf};
@@ -23,10 +26,9 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-const SYNCED_FILES: [&str; 3] = [
+const SYNCED_FILES: [&str; 2] = [
     ".github/workflows/ci.yml",
     ".github/workflows/wait-for-codex.yml",
-    ".mergify.yml",
 ];
 
 /// The pre-rename project name. See docs/DECISIONS/2026-09-01-rename-to-manta.md.
@@ -50,7 +52,7 @@ fn synced_ci_files_never_carry_the_pre_rename_project_name() {
 
     assert!(
         offenders.is_empty(),
-        "fleet-synced CI/merge config still names the pre-rename project -- a manual \
+        "fleet-synced CI config still names the pre-rename project -- a manual \
          port from the upstream template most likely reintroduced it. Fix it here AND \
          upstream (see docs/DECISIONS/2026-09-01-rename-to-manta.md):\n{}",
         offenders.join("\n")
