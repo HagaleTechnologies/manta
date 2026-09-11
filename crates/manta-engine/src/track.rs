@@ -583,6 +583,26 @@ impl Track {
         self.refiner_backlog.drain(..).collect()
     }
 
+    /// MAN-194: `TrackManager`-facing wrapper around
+    /// `drain_refiner_backlog` that pairs every drained entry with the SAME
+    /// `spectral_ref_power` (computed once by the caller, since a `Track`
+    /// has no access to the `FloorBank` it comes from -- see
+    /// `TrackManager::spectral_ref_power`'s own doc comment) and pushes it
+    /// straight into `pending`. Reusing one value across a
+    /// `<= GROUP_DELAY_HOPS`-hop-old backlog is a non-issue: SPEC v2 §2.2's
+    /// six-neighbor floor estimate is slow-moving relative to a ~13ms
+    /// window. Called at every point a track's refiner stops receiving new
+    /// input: `TrackManager::step_hop`'s closure handling (below),
+    /// `merge_converged`, `evict_over_cap`, and `TrackManager::finish`
+    /// (Task 4) -- NOT inside `decoder_input`'s own reset handling, which
+    /// has no `spectral_ref_power` to attach and instead folds its drain
+    /// directly into its own returned `Vec`.
+    fn drain_refiner_into_pending(&mut self, spectral_ref_power: Option<f32>) {
+        for (amp, raw_power, ts) in self.drain_refiner_backlog() {
+            self.pending.push((amp, raw_power, spectral_ref_power, ts));
+        }
+    }
+
     /// Drain this track's queued `pending` samples through its decoder,
     /// then call `finish()` -- used for a genuine end-of-signal closure
     /// (HangExpired/Silent: a sustained real gap has already been
@@ -1048,6 +1068,16 @@ impl TrackManager {
             if !track.has_emitted {
                 return false;
             }
+            // MAN-194: this closure is the LAST point this track's refiner
+            // will ever be fed -- drain its backlog into pending BEFORE
+            // finish_decoder*/finish_decoder_speed_only* below (which then
+            // push pending through the decoder as they already do), so a
+            // buffered-but-undelivered real observation isn't silently
+            // dropped along with the rest of the removed `Track`.
+            let spectral_ref_power = compute_spectral_ref_power
+                .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                .flatten();
+            track.drain_refiner_into_pending(spectral_ref_power);
             // Only a genuine, sustained observed RF gap (HangExpired) may
             // force an in-progress mark to resolve; Silent's own trigger
             // (no character decoded) says nothing about whether the
@@ -1193,6 +1223,12 @@ impl TrackManager {
                 if !track.has_emitted {
                     return None;
                 }
+                // MAN-194: same reasoning as step_hop's closure handling --
+                // a merge-loser's refiner also stops receiving input here.
+                let spectral_ref_power = (!matches!(self.decode_cfg.engine, Engine::Legacy))
+                    .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                    .flatten();
+                track.drain_refiner_into_pending(spectral_ref_power);
                 flush_events.extend(track.finish_decoder_speed_only());
                 Some((
                     loser,
@@ -1227,6 +1263,13 @@ impl TrackManager {
             // emitted a real event -- see `step_hop`'s matching comment.
             if let Some(mut track) = self.tracks.remove(&loser) {
                 if track.has_emitted {
+                    // MAN-194: same reasoning as step_hop's closure
+                    // handling -- an evicted track's refiner also stops
+                    // receiving input here.
+                    let spectral_ref_power = (!matches!(self.decode_cfg.engine, Engine::Legacy))
+                        .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                        .flatten();
+                    track.drain_refiner_into_pending(spectral_ref_power);
                     flush_events.extend(track.finish_decoder_speed_only());
                     // No survivor -- an eviction just stops tracking this
                     // identity, with no successor to migrate deferred
@@ -1807,6 +1850,32 @@ mod tests {
     }
 
     #[test]
+    fn drain_refiner_into_pending_flushes_the_full_backlog() {
+        // MAN-194: verifies the primitive TrackManager::finish (Task 4) and
+        // the closure-handling paths below rely on -- draining a track's
+        // refiner backlog directly into `pending`, with no
+        // spectral_ref_power discounting when None is passed through.
+        let mut track = Track::new(1, 5, &cfg());
+        let h = hop_with_x(0, vec![num_complex::Complex32::new(3.0, 4.0); 8]); // |raw|=5, power=25
+        let d = GROUP_DELAY_HOPS as u64;
+        // Steady state: backlog holds exactly d entries once n > d.
+        for i in 0..(d + 3) {
+            track.decoder_input(5, &h, i * 512, 30.0);
+        }
+        assert_eq!(track.refiner_backlog.len(), d as usize);
+        track.drain_refiner_into_pending(None);
+        assert!(
+            track.refiner_backlog.is_empty(),
+            "drain must flush the entire backlog"
+        );
+        assert_eq!(
+            track.pending.len(),
+            d as usize,
+            "drain must deliver every buffered-but-undelivered hop into pending"
+        );
+    }
+
+    #[test]
     fn promotes_after_confirm_hops_of_sustained_rise() {
         let mut lc = Lifecycle::new(&cfg()); // hop 1 (birth) already counted
         for _ in 0..3 {
@@ -2051,6 +2120,81 @@ mod tests {
             pending_after - pending_before,
             d as usize,
             "step_hop must push every entry of a multi-entry burst into pending, not just one"
+        );
+    }
+
+    #[test]
+    fn step_hop_reset_drains_the_refiners_backlog_into_pending() {
+        // Engine-level regression test for MAN-194 Scenario 1 (the
+        // ticket's own Gherkin): a mid-mark channel reassignment must not
+        // silently drop the refiner's buffered-but-undelivered backlog.
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig {
+                refine_bw_hz: 30.0,
+                ..DecodeConfig::default()
+            },
+        );
+        // decoder_input's refine-enabled path reads hop.x[c], so every
+        // hop fed to a promoted track needs real complex spectrum data,
+        // not the bare `hop()` helper (empty `x`, which would panic on
+        // index-out-of-bounds). Build x from power so HopOutput::power
+        // matches exactly (norm_sqr of the real value p.sqrt() is p).
+        let mk_hop = |m: u64, power: &Vec<f32>| {
+            let x: Vec<num_complex::Complex32> = power
+                .iter()
+                .map(|&p| num_complex::Complex32::new(p.sqrt(), 0.0))
+                .collect();
+            hop_with_x(m, x)
+        };
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut m = 250 * 15;
+        loop {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+            if tm.tracks.values().any(|t| t.state() == LifecycleState::Active) {
+                break;
+            }
+        }
+        let id = *tm.tracks.keys().next().unwrap();
+        let d = GROUP_DELAY_HOPS as u64;
+        // Run well past GROUP_DELAY_HOPS so the backlog reaches steady
+        // state (exactly d entries buffered at any instant).
+        for _ in 0..(d + 5) {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+        }
+        let pending_before = tm.tracks.get(&id).unwrap().pending.len();
+        tm.step_hop(&mk_hop(m, &power), m); // one more normal hop
+        m += 1;
+        let pending_after_normal_hop = tm.tracks.get(&id).unwrap().pending.len();
+        assert_eq!(
+            pending_after_normal_hop - pending_before,
+            1,
+            "a steady-state hop with no reset must deliver exactly one pending entry"
+        );
+
+        // Force a channel reassignment: move the strong signal to channel
+        // 11 and directly set the track's live centroid EMA to force the
+        // rounding-boundary crossing this same hop (isolating the reset
+        // from the EMA's normal, much slower settling behavior, which this
+        // test isn't about).
+        let mut power2 = quiet_power(n);
+        power2[11] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        tm.tracks.get_mut(&id).unwrap().center = 11.0;
+        tm.step_hop(&mk_hop(m, &power2), m);
+        let pending_after_reset_hop = tm.tracks.get(&id).unwrap().pending.len();
+        assert_eq!(
+            pending_after_reset_hop - pending_after_normal_hop,
+            d as usize,
+            "a reset hop must drain the full backlog ({d} entries), not just deliver \
+             one entry and silently drop the rest"
         );
     }
 
