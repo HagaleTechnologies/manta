@@ -166,6 +166,38 @@ fn classify_new_occurrence(
     }
 }
 
+/// After pruning, promotes the new leading (earliest-surviving) entry to
+/// message-distinct if it wasn't already (Codex review, PR #133 round 7).
+/// A `message_distinct: false` entry means "same message as whatever
+/// entry preceded it" -- if THAT entry has since aged out of the window
+/// via `retain`, the deferral target no longer exists, and the survivor
+/// is now, by the algorithm's own base case (`classify_new_occurrence`'s
+/// `None => true`), the earliest thing in the window and must count on
+/// its own. Without this, a station repeating at a cadence straddling the
+/// window boundary (its first message's own representative ages out
+/// first) can never re-establish a message of its own and stops being
+/// spotted even though it never actually stopped repeating.
+///
+/// Unlike `message_distinct` itself, which must never be revisited using
+/// a track's current liveness (Codex round 6), this is always safe to
+/// redo: it depends only on whether an entry still EXISTS in the window
+/// -- a monotonic, purely time-based fact for a given `now_ts` that never
+/// flickers, not on any external mutable state like `is_track_active`.
+/// Idempotent (a no-op if the leader is already message-distinct), so
+/// safe to call unconditionally after every prune.
+///
+/// Promotes the entry with the smallest `sample_ts`, not `accepted[0]`:
+/// `accepted` is not guaranteed to stay in push/timestamp order (see
+/// `GateEntry::most_recent`'s doc -- a deferred `PendingBeacon` replay can
+/// push an older `sample_ts` after newer ones already landed), so the
+/// vector's first element isn't reliably the chronologically-earliest
+/// survivor.
+fn promote_orphaned_leader(accepted: &mut [(u64, u64, u32, bool)]) {
+    if let Some(earliest) = accepted.iter_mut().min_by_key(|&&mut (ts, ..)| ts) {
+        earliest.3 = true;
+    }
+}
+
 /// Width of a frequency bucket, in Hz (MAN-166). See `RepetitionGate`'s
 /// doc for why bucketing exists at all, and `record`'s doc for why a
 /// bucket alone isn't sufficient identity.
@@ -503,6 +535,7 @@ impl RepetitionGate {
         }
         entry.accepted.retain(|&(ts, _, _, _)| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
+        promote_orphaned_leader(&mut entry.accepted);
         // Tally the frozen per-occurrence verdicts still inside the
         // window -- never re-derive them (see `accepted`'s own doc).
         entry
@@ -550,6 +583,7 @@ impl RepetitionGate {
         self.seen.retain(|_, entry| {
             entry.accepted.retain(|&(ts, _, _, _)| ts >= cutoff);
             entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
+            promote_orphaned_leader(&mut entry.accepted);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
     }
@@ -816,6 +850,45 @@ mod tests {
             !entry.accepted[1].3,
             "B's already-settled verdict must never be revisited using A's \
              NOW-changed liveness"
+        );
+    }
+
+    /// Codex review, PR #133 (round 7): a `message_distinct: false` entry
+    /// defers to whatever entry preceded it -- if THAT entry ages out of
+    /// the 90s window before the deferring one does, the survivor must be
+    /// promoted to message-distinct, or a station repeating at a cadence
+    /// straddling the window boundary (its first message's own
+    /// representative ages out first) can never re-establish a message of
+    /// its own and silently undercounts, even though it never stopped
+    /// repeating. A doubled utterance at t=0/t=5s collapses to one message
+    /// (t=0 the representative); a genuinely later message at t=91s (past
+    /// the 90s window relative to t=0) must read as a real second
+    /// confirmation once t=0 ages out, promoting t=5s in its place.
+    #[test]
+    fn an_orphaned_occurrence_is_promoted_when_its_anchor_ages_out_of_the_window() {
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 0, always_active), 1);
+        let five_seconds = (5.0 * FS) as u64;
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", five_seconds, 1, always_active),
+            1,
+            "t=5s collapses into t=0's message (word_seq gap of only 1)"
+        );
+
+        let ninety_one_seconds = (91.0 * FS) as u64;
+        assert_eq!(
+            gate.record(
+                1,
+                7_080_000.0,
+                "K5ARH",
+                ninety_one_seconds,
+                10,
+                always_active
+            ),
+            2,
+            "t=0 has aged out of the 90s window, so t=5s must be promoted \
+             to its own message -- the station never actually stopped \
+             repeating"
         );
     }
 
