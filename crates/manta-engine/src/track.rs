@@ -1391,12 +1391,28 @@ impl TrackManager {
     /// after the last `process_hops`.
     pub fn finish(&mut self) -> Vec<DecoderEvent> {
         use rayon::prelude::*;
+        // MAN-194: end-of-stream is another point where every remaining
+        // track's refiner stops receiving new input -- drain each one's
+        // backlog into pending before flushing, same as every other
+        // closure path (Task 3). Done as a plain sequential pass first
+        // (cheap: at most GROUP_DELAY_HOPS entries per track) so the
+        // parallel decode pass below sees a fully-populated `pending`.
+        let compute_spectral_ref_power = !matches!(self.decode_cfg.engine, Engine::Legacy);
+        for track in self.tracks.values_mut() {
+            let spectral_ref_power = compute_spectral_ref_power
+                .then(|| Self::spectral_ref_power(&self.floor, track.center))
+                .flatten();
+            track.drain_refiner_into_pending(spectral_ref_power);
+        }
+        // `finish_decoder` drains `pending` through `push_hop` before
+        // calling `TrackDecoder::finish()` -- exactly what the backlog
+        // just fed into `pending` above needs, and a no-op for any track
+        // whose `pending` was already empty (every track, before MAN-194).
         let mut events: Vec<DecoderEvent> = self
             .tracks
             .values_mut()
-            .filter_map(|t| t.decoder.as_mut())
             .par_bridge()
-            .flat_map_iter(|d| d.finish())
+            .flat_map_iter(|t| t.finish_decoder())
             .collect();
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         // MAN-19 round 3: honor the same teardown contract `process_hops`
@@ -2203,6 +2219,97 @@ mod tests {
             d as usize,
             "a reset hop must drain the full backlog ({d} entries), not just deliver \
              one entry and silently drop the rest"
+        );
+    }
+
+    #[test]
+    fn finish_drains_every_remaining_tracks_refiner_backlog_before_flushing() {
+        // MAN-194 Scenario 2 (EOF): TrackManager::finish must not silently
+        // drop a still-open track's buffered-but-undelivered refiner
+        // backlog -- decoder_input's own unit tests (Task 1) already cover
+        // the underlying delay math exhaustively, so this is purely a
+        // wiring check: does `finish()` actually route `refiner_backlog`
+        // through the decoder before flushing?
+        //
+        // Deviation from the plan's original brief: that version drove a
+        // constant-amplitude synthetic carrier through `step_hop` in a
+        // loop and asserted a `TrackClosed` appeared in `finish()`'s
+        // output. Empirically (verified by running it against both the
+        // old and the new `finish()`), that never happens either way: the
+        // Legacy engine's `Demod` requires >= `MIN_KEYING_RATIO` (2.0)
+        // amplitude spread over its first 375-hop calibration window
+        // before it ever leaves `Phase::Init` and can emit a `Run`
+        // (envelope.rs); a truly constant carrier has a spread of 1.0 and
+        // never calibrates, backlog drained or not, so `has_emitted`
+        // never becomes true and the assertion cannot distinguish correct
+        // from buggy code. Replaced with the same direct
+        // decoder/backlog-seeding pattern already used by
+        // `merge_converged_drains_queued_pending_samples_before_finishing`
+        // just above -- real Morse envelope data (`rect_envelope_hops`),
+        // fed far enough to calibrate and decode "PARI", with the final
+        // letter's evidence withheld from the decoder and placed directly
+        // in `refiner_backlog` instead of being pushed live.
+        let mut tm = TrackManager::new(
+            64,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        let id = *tm.tracks.keys().next().unwrap();
+        {
+            let track = tm.tracks.get_mut(&id).unwrap();
+            track.decoder = Some(TrackDecoder::new(id, DecodeConfig::default()));
+            let env = rect_envelope_hops("PARIS", 18);
+            // "S" is the pattern "..." (3 dits, 18 hops each, separated by
+            // 1-dit gaps): withhold exactly the final dit so the decoder,
+            // fed only up through the second dit and its trailing gap,
+            // has seen only ".." (glyph I) -- the third dit is real
+            // evidence that must still reach the decoder through the
+            // backlog for the track to correctly close out as "S", not
+            // silently truncate to "I".
+            let split = env.len() - 18;
+            let decoder = track.decoder.as_mut().unwrap();
+            for (i, &a) in env[..split].iter().enumerate() {
+                decoder.push_envelope(a, i as u64);
+            }
+            // MAN-194: seed `refiner_backlog` directly with the withheld
+            // tail, exactly the shape `Track::decoder_input` leaves behind
+            // mid-burst (Task 1) -- `(amp, raw_power, sample_ts)` triples
+            // -- rather than routing it through `decoder_input` itself
+            // (already covered by Task 1's own exhaustive unit tests).
+            for (j, &a) in env[split..].iter().enumerate() {
+                track
+                    .refiner_backlog
+                    .push_back((a, a * a, (split + j) as u64));
+            }
+            track.has_emitted = true;
+        }
+        let backlog_len = tm.tracks.get(&id).unwrap().refiner_backlog.len();
+        assert_eq!(
+            backlog_len, 18,
+            "sanity check: the track must have a full backlog of undelivered hops before EOF"
+        );
+
+        let events = tm.finish();
+        assert!(
+            tm.tracks.is_empty(),
+            "finish() must still clear all tracks after draining"
+        );
+        let decoded: String = events
+            .iter()
+            .filter(|e| event_track_id(e) == id)
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { glyph, .. } => glyph.text_char(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            decoded.ends_with('S'),
+            "the backlog's final withheld dit must still reach the decoder so the \
+             track closes out decoding \"S\", not silently truncate to \"I\" from \
+             a dropped backlog -- got decoded={decoded:?}, events={events:?}"
         );
     }
 
