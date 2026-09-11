@@ -423,6 +423,49 @@ Golden vector *waveforms* are unchanged (only the decode path changed), so
 the pending golden-vector freeze is unaffected. Reported WPM values change,
 by design — this is the entire point of the fix.
 
+## Status update (2026-09-11): held on rebase, D9's fading cost is no longer absorbable
+
+Rebasing this PR onto current `main` (post-MAN-100/MAN-101) surfaced that
+D9's accepted cost is worse than it looked at review time. D9 measured the
+V8w regression against `v8w_pileup_fading_decodes_90pct_of_strong_signals_no_ghosts`,
+the ignored raw per-signal CER gate, and called it a non-issue because that
+gate was "already collapsed at baseline" (1/34 -> 0/34, no visible delta on
+a metric that was already failing). That was the only V8w metric available
+to measure against at the time — `v8w_pileup_fading_spots_no_bogus_callsigns`,
+the SPEC §7-mandated 0-bogus/non-vacuous-recall check, existed only nested
+inside that same ignored test and never actually ran in CI (MAN-101's whole
+point). MAN-101 split it out into its own always-run test *after* this PR's
+implement/validate/remediate loop had already finished, so D9's "already
+collapsed" conclusion was never checked against it.
+
+Re-measured on rebase, on the now-independent test: baseline (pre-MAN-103,
+current `main`) validates ~20-21/50 known callsigns with 0 bogus. With
+MAN-103 applied: **0/50 validated, 3 bogus.** This is not "an already-bad
+gate got a little worse" — it is a working, non-vacuous, SPEC-gating
+recall metric going to zero. Confirmed independently (single Watterson-Poor
+signal, no pileup, `crates/manta-engine/tests/scratch_watterson_single.rs`,
+not committed): CER is ~0.60-0.71 **at every SNR from 3 dB to 25 dB** with
+MAN-103's threshold, versus 0.07-0.52 (improving with SNR, as expected) on
+the pre-MAN-103 threshold. SNR-independent corruption at a clean 25 dB is
+exactly D9's named mechanism (`E_hi` losing its downward adaptation path
+under fading, not a noise-margin effect) — this is further confirmation of
+D9's mechanism, not a new one, but it settles that the mechanism's real-world
+cost was undercounted.
+
+One fix attempt was tried and rejected: dropping D5's rail-update exclusion
+(letting every sample update the nearer rail again, `a > mid` / `a <= mid`,
+keeping D3's symmetric key-decision band) still produced ~73/73 garbled
+tracks on V8w — the exclusion is not the sole cause, so a local revert of D5
+alone is not the fix.
+
+**Disposition: held, not merged.** D9 already names the real direction —
+"restore a downward adaptation path for `E_hi`" — but that is new
+classical-DSP fading-robustness work belonging with MAN-107 through MAN-113,
+not a rebase fixup. This PR's rebase-only changes (CHAR_GAP_DITS/hyst_frac
+conflict resolution against MAN-100/PR-#161-era code, `SignalSpec` field
+additions) are otherwise complete and independently correct; only D3-D6's
+own fading cost blocks landing. Tracked as MAN-213 (blocks this ticket).
+
 ## References
 
 - Ticket: MAN-103 (supersedes MAN-7)
