@@ -6,7 +6,7 @@ use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
 use crate::dedupe::Dedupe;
-use crate::gate::RepetitionGate;
+use crate::gate::{RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
 use crate::notch::NotchList;
 use crate::scp;
@@ -336,6 +336,29 @@ pub struct Validator {
     /// O(gate size) scan on every single character.
     last_swept_ts: u64,
     sweep_interval_samples: u64,
+    /// `GATE_WINDOW_SECONDS` in samples, cached at construction -- the
+    /// prune cutoff for `merged_into` below.
+    gate_window_samples: u64,
+    /// track_id -> `now_ts` at the moment it was closed via
+    /// `ClosureKind::Bookkeeping` (a merge survivor exists; the physical
+    /// signal's identity continues, it's just renamed) -- MAN-100
+    /// message-distinctness, Codex review PR #133 round 3.
+    /// `self.tracks.remove` (MAN-19) fires for a `Bookkeeping` closure
+    /// exactly the same as a genuine `SignalEnded` one, so absence from
+    /// `self.tracks` alone can't tell `gate::message_distinct_indices`'s
+    /// `is_track_active` query "this track genuinely ended" from "this
+    /// track's identity just moved to a survivor" -- without this, a
+    /// duplicate-spawn track A merging into survivor B mid-transmission
+    /// (A catches the first call utterance, B the second) reads as A
+    /// having "closed," letting B's second word manufacture a false
+    /// second message from what's still one over-the-air transmission.
+    /// Pruned in lockstep with `gate.sweep()` (same `GATE_WINDOW_SECONDS`
+    /// cutoff): past that window the repetition gate's own `accepted`
+    /// list has already dropped any of A's occurrences, so its lineage
+    /// can no longer affect message-distinctness either way -- bounded
+    /// the same way `self.tracks`/`self.gate` are (MAN-19), not a new
+    /// unbounded-growth risk.
+    merged_into: BTreeMap<u32, u64>,
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -363,6 +386,8 @@ impl Validator {
             now_ts: 0,
             last_swept_ts: 0,
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
+            gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
+            merged_into: BTreeMap::new(),
         }
     }
 
@@ -385,6 +410,14 @@ impl Validator {
     fn maybe_sweep(&mut self) {
         if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
             self.gate.sweep(self.now_ts);
+            // `merged_into` bounded the same way, on the same cadence:
+            // past the gate's own window a merged-away track's lineage
+            // can no longer affect message-distinctness (its occurrences
+            // are already gone from `accepted`), so it's safe -- and
+            // necessary, for MAN-19's unbounded-growth concern -- to drop.
+            let cutoff = self.now_ts.saturating_sub(self.gate_window_samples);
+            self.merged_into
+                .retain(|_, &mut merged_ts| merged_ts >= cutoff);
             self.last_swept_ts = self.now_ts;
         }
     }
@@ -588,6 +621,22 @@ impl Validator {
                     ClosureKind::SignalEnded => self.resolve_pending_beacons(*track_id),
                     ClosureKind::Bookkeeping { survivor_track_id } => {
                         self.migrate_or_discard_pending_beacons(*track_id, *survivor_track_id);
+                        // MAN-100 message-distinctness (Codex review, PR
+                        // #133 round 3): a survivor exists, so this
+                        // track_id's identity continues rather than
+                        // genuinely ending -- record that so
+                        // `gate::message_distinct_indices`'s
+                        // `is_track_active` query doesn't read this as a
+                        // real close and let the survivor's next word
+                        // manufacture a false second message from the
+                        // SAME transmission. An eviction with no survivor
+                        // (`survivor_track_id: None`) has no lineage to
+                        // preserve -- nothing here correlates it to
+                        // whatever track_id a reopened signal gets next,
+                        // so it's left to the normal (closed) treatment.
+                        if survivor_track_id.is_some() {
+                            self.merged_into.insert(*track_id, self.now_ts);
+                        }
                         Vec::new()
                     }
                 };
@@ -1041,14 +1090,17 @@ impl Validator {
             // whether the PRIOR track has actually closed, not just how
             // much sample_ts has elapsed -- `self.tracks` (MAN-19 keeps it
             // authoritative, entries removed on `TrackClosed`) is exactly
-            // that signal. See `gate::message_distinct_indices`'s doc.
+            // that signal, EXCEPT a `Bookkeeping`-merged track_id: its
+            // identity continues on a survivor, so `self.merged_into`
+            // (round 3) still counts it as active. See
+            // `gate::message_distinct_indices`'s doc.
             self.gate.record(
                 track_id,
                 freq_hz,
                 &candidate,
                 sample_ts,
                 resolved_word_seq,
-                |tid| self.tracks.contains_key(&tid),
+                |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
             ) as u32
         };
         {
@@ -1293,7 +1345,7 @@ impl Validator {
                     &pb.candidate,
                     pb.sample_ts,
                     pb.word_seq,
-                    |tid| self.tracks.contains_key(&tid),
+                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
                 ) as u32;
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {
@@ -1669,6 +1721,49 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         assert_eq!(spots[0].callsign, "K5ARH");
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review, PR #133 (round 3): when duplicate-spawn track A
+    /// merges into survivor B mid-transmission (A catches the first call
+    /// utterance, B the second, a few real seconds later), A's identity
+    /// continues on B -- it did not genuinely close. Before this fix,
+    /// `self.tracks.remove` on ANY `TrackClosed` (MAN-19, both closure
+    /// kinds) made `is_track_active(1)` read false the instant A merged,
+    /// letting B's later decode manufacture a false second message from
+    /// what both times was really one over-the-air transmission.
+    #[test]
+    fn a_track_merging_into_a_survivor_mid_transmission_does_not_manufacture_a_second_message() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1); // freq_hz 14_000_000.0
+        let words = ["DE", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 0), &mut v);
+        assert!(
+            spots.is_empty(),
+            "one decode alone must not spot (reps < 2)"
+        );
+
+        // Track 1 merges into track 2 -- bookkeeping only, identity
+        // continues, not proof the signal ended.
+        v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(2),
+            },
+        });
+        seed_meta(&mut v, 2);
+
+        // Track 2 decodes the SAME call again a few real seconds later --
+        // comfortably clearing the near-duplicate-track gap, but nowhere
+        // near MIN_MESSAGE_TIME_GAP_SECONDS -- still plausibly the same
+        // transmission continuing under its new track_id.
+        let three_seconds = (3.0 * FS) as u64;
+        let spots = run(&transmission_events(2, &words, three_seconds), &mut v);
+        assert!(
+            spots.is_empty(),
+            "track 1's identity continues on survivor track 2 (Bookkeeping \
+             merge) -- this must still read as ONE message, not a second \
+             confirmation, got {spots:?}"
+        );
     }
 
     /// Codex review, PR #152, round 14: two duplicate-spawn tracks (a

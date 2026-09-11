@@ -10,7 +10,9 @@
 //! `docs/DECISIONS/2026-09-07-man100-variant-arbitration.md` and
 //! `wiki/pages/replay-spots-harness.md`.
 //!
-//! Usage: `replay_spots <report.json> <calls.txt> [sample_rate_hz]`
+//! Usage: `replay_spots <report.json> <calls.txt> [sample_rate_hz]
+//! [--freq-correction-ppm <n>] [--allowlist <CALL>]... [--blocklist <path>]
+//! [--notch <path>]`
 //!
 //! `<report.json>` is the stdout of `manta decode --json <wav>` (a
 //! `manta_engine::DecodeReport`, serialized). `<calls.txt>` is a
@@ -26,6 +28,14 @@
 //! halves the 60 s message gap, 90 s repetition window, and 10 min dedupe
 //! window against what the original run actually used.
 //!
+//! The remaining flags mirror `manta decode`'s own of the same name
+//! (Codex review, PR #133): `DecodeReport` doesn't preserve the original
+//! run's allowlist/blocklist/notch/freq-correction settings either, and
+//! those affect admission, suppression, frequencies, and dedupe buckets
+//! in the real validator just as much as the sample rate does -- a report
+//! produced with any of them non-default needs the SAME values passed
+//! here, or the replayed spot list won't match the original run's.
+//!
 //! `DecoderEvent` derives both `Serialize` and `Deserialize`, so this
 //! deserializes the saved report's `events` array directly rather than
 //! reconstructing it field-by-field -- a hand-rolled reconstruction would
@@ -35,7 +45,7 @@
 //! one, exactly the failure mode this rewrite closes.
 
 use manta_decode::events::DecoderEvent;
-use manta_spot::Validator;
+use manta_spot::{Blocklist, NotchList, Validator};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -44,11 +54,67 @@ use std::time::Instant;
 /// note for why this can't just be read out of the report itself.
 const DEFAULT_FS: f64 = 96_000.0;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let (report_path, calls_path, fs) = match args.as_slice() {
-        [_, report_path, calls_path] => (report_path, calls_path, DEFAULT_FS),
-        [_, report_path, calls_path, sample_rate_hz] => {
+struct Args {
+    report_path: String,
+    calls_path: String,
+    fs: f64,
+    freq_correction_ppm: f64,
+    allowlist: Vec<String>,
+    blocklist: Option<String>,
+    notch: Option<String>,
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: replay_spots <report.json> <calls.txt> [sample_rate_hz] \
+         [--freq-correction-ppm <n>] [--allowlist <CALL>]... \
+         [--blocklist <path>] [--notch <path>]"
+    );
+    std::process::exit(2);
+}
+
+fn parse_args() -> Args {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut positional = Vec::new();
+    let mut freq_correction_ppm = 0.0;
+    let mut allowlist = Vec::new();
+    let mut blocklist = None;
+    let mut notch = None;
+
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--freq-correction-ppm" => {
+                let v = raw.get(i + 1).unwrap_or_else(|| usage());
+                freq_correction_ppm = v.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --freq-correction-ppm {v:?}: {e}");
+                    std::process::exit(2);
+                });
+                i += 2;
+            }
+            "--allowlist" => {
+                allowlist.push(raw.get(i + 1).unwrap_or_else(|| usage()).clone());
+                i += 2;
+            }
+            "--blocklist" => {
+                blocklist = Some(raw.get(i + 1).unwrap_or_else(|| usage()).clone());
+                i += 2;
+            }
+            "--notch" => {
+                notch = Some(raw.get(i + 1).unwrap_or_else(|| usage()).clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => usage(),
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let (report_path, calls_path, fs) = match positional.as_slice() {
+        [report_path, calls_path] => (report_path.clone(), calls_path.clone(), DEFAULT_FS),
+        [report_path, calls_path, sample_rate_hz] => {
             let fs: f64 = sample_rate_hz.parse().unwrap_or_else(|e| {
                 eprintln!("invalid sample_rate_hz {sample_rate_hz:?}: {e}");
                 std::process::exit(2);
@@ -57,16 +123,27 @@ fn main() {
                 eprintln!("sample_rate_hz must be a finite, positive number, got {fs}");
                 std::process::exit(2);
             }
-            (report_path, calls_path, fs)
+            (report_path.clone(), calls_path.clone(), fs)
         }
-        _ => {
-            eprintln!("usage: replay_spots <report.json> <calls.txt> [sample_rate_hz]");
-            std::process::exit(2);
-        }
+        _ => usage(),
     };
 
-    let report_text = std::fs::read_to_string(report_path)
-        .unwrap_or_else(|e| panic!("reading {report_path}: {e}"));
+    Args {
+        report_path,
+        calls_path,
+        fs,
+        freq_correction_ppm,
+        allowlist,
+        blocklist,
+        notch,
+    }
+}
+
+fn main() {
+    let args = parse_args();
+
+    let report_text = std::fs::read_to_string(&args.report_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", args.report_path));
     let report: serde_json::Value =
         serde_json::from_str(&report_text).expect("report.json must be valid JSON");
     let events: Vec<DecoderEvent> = report["events"]
@@ -76,14 +153,33 @@ fn main() {
         .map(|v| serde_json::from_value(v.clone()).expect("valid DecoderEvent JSON"))
         .collect();
 
-    let known_calls: BTreeSet<String> = std::fs::read_to_string(calls_path)
-        .unwrap_or_else(|e| panic!("reading {calls_path}: {e}"))
+    let known_calls: BTreeSet<String> = std::fs::read_to_string(&args.calls_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", args.calls_path))
         .lines()
         .map(|l| l.trim().to_ascii_uppercase())
         .filter(|l| !l.is_empty())
         .collect();
 
-    let mut validator = Validator::bundled(fs);
+    let mut validator = Validator::bundled(args.fs)
+        .with_freq_correction_ppm(args.freq_correction_ppm)
+        .unwrap_or_else(|e| {
+            panic!(
+                "invalid --freq-correction-ppm {}: {e}",
+                args.freq_correction_ppm
+            )
+        });
+    for call in &args.allowlist {
+        validator.allowlist(call);
+    }
+    if let Some(path) = &args.blocklist {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        validator = validator.with_blocklist(Blocklist::parse(&text));
+    }
+    if let Some(path) = &args.notch {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        validator = validator.with_notch(NotchList::parse(&text));
+    }
+
     let start = Instant::now();
     let mut spots = Vec::new();
     for ev in &events {
