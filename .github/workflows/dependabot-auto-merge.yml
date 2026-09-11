@@ -28,6 +28,24 @@ jobs:
         run: |
           gh pr review "$PR_URL" --approve --body "Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES}"
 
+      # Native merge-queue cutover: arms auto-merge here (not in
+      # auto-merge-trigger.yml) because GitHub withholds custom secrets
+      # like CODEX_REVIEW_PAT from Dependabot-actor-triggered runs --
+      # GITHUB_TOKEN is fine here since it's already proven working for
+      # the approve/label steps above. Arming via GITHUB_TOKEN
+      # (github-actions[bot]) is deliberate, not an oversight: that
+      # identity is NOT a bypass actor on manta-review-gate, so the
+      # eventual merge only executes once required_approving_review_count
+      # is satisfied for real -- which the approval step immediately
+      # above already provides. No bypass needed or wanted for this path.
+      - name: Enable auto-merge for approved update
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "$PR_URL" --auto --squash
+
       - name: Label major updates for review
         if: steps.metadata.outputs.update-type == 'version-update:semver-major'
         env:
