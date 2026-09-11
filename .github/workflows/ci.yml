@@ -245,7 +245,7 @@ jobs:
       - if: runner.os == 'Windows'
         uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
-          vcpkgGitCommitId: 3508985146f1b1d248c67ead13f8f54be5b4f5da
+          vcpkgGitCommitId: 52d80838fb40c755b1615fbc9c7b994a33742a22
       - if: runner.os == 'Windows'
         run: |
           & "$env:VCPKG_ROOT\vcpkg" install soapysdr:x64-windows
