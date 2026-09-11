@@ -42,35 +42,49 @@ pub const MIN_MESSAGE_WORD_GAP: u64 = 3;
 /// itself.
 pub const MIN_MESSAGE_TIME_GAP_SECONDS: f64 = 60.0;
 
-/// The indices into `occurrences` (word_seq, sample_ts) pairs -- assumed
-/// ascending in both fields, as they are whenever pushed by `record`'s/
-/// `SupportLedger::observe`'s in-order calls -- that count toward
-/// message-distinctness: an occurrence counts if it's the first, or if it
+/// The indices into `occurrences` (word_seq, sample_ts, track_id) triples --
+/// assumed ascending in `sample_ts` (and, within any one run of matching
+/// `track_id`s, in `word_seq` too, since `word_seq` only resets at a track
+/// boundary) -- that count toward
+/// message-distinctness: an occurrence counts if it's the first, if its
+/// `track_id` differs from the previously *counted* occurrence's, or if it
 /// clears `MIN_MESSAGE_WORD_GAP` word_seqs *or* `time_gap_samples`
-/// sample_ts beyond the previously *counted* occurrence. Shared by
-/// `RepetitionGate` and `support::SupportLedger` (MAN-100 Scenario 1),
-/// which must count repetitions by the same rule so a candidate's
-/// gate-facing rep count and its ledger-facing support figure never
-/// disagree about what counts as a separate message --
-/// `support::SupportLedger::support_in_window` folds `conf_sum` over
-/// exactly the occurrences this returns.
+/// sample_ts beyond it. The track_id check exists because `word_seq` is a
+/// per-track word index (it resets to 0 on every new track), so it is not
+/// comparable across two different tracks at all -- without this, a real
+/// signal's confirming re-decode on a fresh `track_id` after a close+reopen
+/// (MAN-166) could land on a `word_seq`/`sample_ts` pair close enough to the
+/// prior track's own that it got collapsed into "the same message" and never
+/// reached the repetition floor (`RepetitionGate::record`'s
+/// `MIN_OCCURRENCE_GAP_SECONDS` check has already ruled out a near-
+/// simultaneous duplicate-spawn track by the time an occurrence from a
+/// different track_id reaches here, so a differing track_id is always a
+/// genuinely separate message). Shared by `RepetitionGate` and
+/// `support::SupportLedger` (MAN-100 Scenario 1), which must count
+/// repetitions by the same rule so a candidate's gate-facing rep count and
+/// its ledger-facing support figure never disagree about what counts as a
+/// separate message -- `support::SupportLedger::support_in_window` folds
+/// `conf_sum` over exactly the occurrences this returns. `SupportLedger`'s
+/// own entries are keyed by `(track_id, text)`, so every occurrence it
+/// passes in shares one `track_id` and the new check is a no-op there.
 pub(crate) fn message_distinct_indices(
-    occurrences: &[(u64, u64)],
+    occurrences: &[(u64, u64, u32)],
     time_gap_samples: u64,
 ) -> Vec<usize> {
     let mut counted = Vec::new();
-    let mut last_counted: Option<(u64, u64)> = None;
-    for (i, &(seq, ts)) in occurrences.iter().enumerate() {
+    let mut last_counted: Option<(u64, u64, u32)> = None;
+    for (i, &(seq, ts, tid)) in occurrences.iter().enumerate() {
         let counts = match last_counted {
             None => true,
-            Some((prev_seq, prev_ts)) => {
-                seq >= prev_seq + MIN_MESSAGE_WORD_GAP
+            Some((prev_seq, prev_ts, prev_tid)) => {
+                tid != prev_tid
+                    || seq >= prev_seq + MIN_MESSAGE_WORD_GAP
                     || ts.saturating_sub(prev_ts) >= time_gap_samples
             }
         };
         if counts {
             counted.push(i);
-            last_counted = Some((seq, ts));
+            last_counted = Some((seq, ts, tid));
         }
     }
     counted
@@ -78,7 +92,10 @@ pub(crate) fn message_distinct_indices(
 
 /// See `message_distinct_indices`; `RepetitionGate::record` only needs the
 /// count.
-pub(crate) fn count_message_distinct(occurrences: &[(u64, u64)], time_gap_samples: u64) -> usize {
+pub(crate) fn count_message_distinct(
+    occurrences: &[(u64, u64, u32)],
+    time_gap_samples: u64,
+) -> usize {
     message_distinct_indices(occurrences, time_gap_samples).len()
 }
 
@@ -129,16 +146,17 @@ fn bucket(freq_hz: f64) -> i64 {
 
 #[derive(Default)]
 struct GateEntry {
-    /// `(sample_ts, word_seq)` of every *accepted* (distinct, non-near-
-    /// duplicate) occurrence. The returned repetition count is not simply
-    /// this vec's length: MAN-100 Scenario 2 requires accepted occurrences
-    /// to also be message-distinct (`count_message_distinct` on the
-    /// `word_seq`s, `MIN_MESSAGE_WORD_GAP` apart), since SPEC's own default
+    /// `(sample_ts, word_seq, track_id)` of every *accepted* (distinct,
+    /// non-near-duplicate) occurrence. The returned repetition count is not
+    /// simply this vec's length: MAN-100 Scenario 2 requires accepted
+    /// occurrences to also be message-distinct (`count_message_distinct`,
+    /// `MIN_MESSAGE_WORD_GAP`/`MIN_MESSAGE_TIME_GAP_SECONDS`/track_id apart
+    /// -- see `message_distinct_indices`'s doc), since SPEC's own default
     /// payload template repeats a callsign back-to-back within one
     /// transmission and both utterances land here as separate *accepted*
     /// occurrences (they're minutes, not `MIN_OCCURRENCE_GAP_SECONDS`,
     /// apart) despite being one message's worth of evidence.
-    accepted: Vec<(u64, u64)>,
+    accepted: Vec<(u64, u64, u32)>,
     /// Every track_id that has touched this entry -- accepted *or*
     /// rejected as a near-duplicate -- and when it was last seen (Codex
     /// review, PR #152, round 6): without this, a track whose first
@@ -173,7 +191,7 @@ impl GateEntry {
     fn most_recent(&self) -> Option<u64> {
         self.accepted
             .iter()
-            .map(|&(ts, _)| ts)
+            .map(|&(ts, _, _)| ts)
             .max()
             .into_iter()
             .chain(self.last_seen_by_track.values().copied())
@@ -389,23 +407,35 @@ impl RepetitionGate {
             .and_modify(|existing| *existing = (*existing).max(sample_ts))
             .or_insert(sample_ts);
         if is_distinct_occurrence {
-            entry.accepted.push((sample_ts, word_seq));
+            entry.accepted.push((sample_ts, word_seq, track_id));
         }
-        entry.accepted.retain(|&(ts, _)| ts >= cutoff);
+        entry.accepted.retain(|&(ts, _, _)| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
-        // MAN-100 Scenario 2 (remediation C2): message-distinctness is now
-        // word_seq gap OR sample_ts gap (`count_message_distinct`'s
-        // `time_gap_samples`), not word_seq alone -- see that function's
-        // doc. It expects `(word_seq, sample_ts)` pairs, the opposite
-        // order `accepted` stores them in; built and sorted defensively,
-        // not just collected in push order: `resolve_pending_beacons` can
-        // replay an older, deferred pair after newer ones already landed
-        // on this same entry (see `most_recent`'s doc), and
-        // `count_message_distinct` assumes its input is ascending in both
-        // fields.
-        let mut occurrences: Vec<(u64, u64)> =
-            entry.accepted.iter().map(|&(ts, seq)| (seq, ts)).collect();
-        occurrences.sort_unstable();
+        // MAN-100 Scenario 2 (remediation C2, extended for cross-track
+        // pairs): message-distinctness is track_id difference OR word_seq
+        // gap OR sample_ts gap (`count_message_distinct`'s
+        // `time_gap_samples`) -- see that function's doc. It expects
+        // `(word_seq, sample_ts, track_id)` triples, not the `(sample_ts,
+        // word_seq, track_id)` order `accepted` stores them in; built and
+        // sorted defensively, not just collected in push order:
+        // `resolve_pending_beacons` can replay an older, deferred pair
+        // after newer ones already landed on this same entry (see
+        // `most_recent`'s doc). Sorted by `sample_ts` first, not
+        // `word_seq`: `word_seq` is only monotonic WITHIN one track (it
+        // resets to 0 on every new track_id), so sorting cross-track
+        // occurrences by `word_seq` first can put a fresh track's early,
+        // low-numbered word ahead of an older track's later, high-numbered
+        // one -- `sample_ts` is the only field that stays globally
+        // monotonic across a track close+reopen, and
+        // `count_message_distinct`'s greedy walk needs true chronological
+        // order to compare each occurrence against the one immediately
+        // before it in time.
+        let mut occurrences: Vec<(u64, u64, u32)> = entry
+            .accepted
+            .iter()
+            .map(|&(ts, seq, tid)| (seq, ts, tid))
+            .collect();
+        occurrences.sort_unstable_by_key(|&(seq, ts, _)| (ts, seq));
         count_message_distinct(&occurrences, self.time_gap_samples)
     }
 
@@ -445,7 +475,7 @@ impl RepetitionGate {
     pub fn sweep(&mut self, now_ts: u64) {
         let cutoff = now_ts.saturating_sub(self.window_samples);
         self.seen.retain(|_, entry| {
-            entry.accepted.retain(|&(ts, _)| ts >= cutoff);
+            entry.accepted.retain(|&(ts, _, _)| ts >= cutoff);
             entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
@@ -476,7 +506,10 @@ mod tests {
         let mut gate = RepetitionGate::new(FS);
         gate.record(1, 7_080_000.0, "K5ARH", 0, 0);
         let window_samples = (WINDOW_SECONDS * FS) as u64;
-        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", window_samples + 1, 10), 1);
+        assert_eq!(
+            gate.record(1, 7_080_000.0, "K5ARH", window_samples + 1, 10),
+            1
+        );
     }
 
     #[test]
@@ -853,7 +886,7 @@ mod tests {
 
         // Home bucket (140000): a stale entry, its only touch at t=0.
         let mut stale = GateEntry::default();
-        stale.accepted.push((0, 0));
+        stale.accepted.push((0, 0, 1));
         stale.last_seen_by_track.insert(1, 0);
         gate.seen.insert((140000, "K5ARH".to_string()), stale);
 
@@ -861,7 +894,7 @@ mod tests {
         // the window as of the decisive call below.
         let fresh_ts = window_samples - 200_000;
         let mut fresh = GateEntry::default();
-        fresh.accepted.push((fresh_ts, 0));
+        fresh.accepted.push((fresh_ts, 0, 2));
         fresh.last_seen_by_track.insert(2, fresh_ts);
         gate.seen.insert((140001, "K5ARH".to_string()), fresh);
 

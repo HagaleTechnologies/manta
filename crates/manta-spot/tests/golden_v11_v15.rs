@@ -968,19 +968,32 @@ fn a_previously_attempted_but_unspotted_word_still_counts_its_suppression() {
 }
 
 /// MAN-48: counting stays once-per-occurrence even when another pattern
-/// spotted the same decoded word. "CQ K5ARH K5ARH T" spots K5ARH as Cq via
-/// CQ_CALL_RE in the same `try_spot` pass that burns its power-step
-/// candidacy -- the Beacon classification was still thrown away, which is
-/// what the metric measures, so it counts (once), and the Cq spot is
-/// unaffected. Making the count conditional on whether some *other* pattern
-/// happened to succeed is precisely the coupling Codex's PR #90 finding
-/// rejected.
+/// spotted the same decoded word. "CQ K5ARH K5ARH T" burns the trailing
+/// K5ARH's power-step Beacon candidacy against the CQ_CALL_RE match on the
+/// leading one in the same `try_spot` pass -- the Beacon classification was
+/// still thrown away, which is what the metric measures, so it counts
+/// (once), independent of whether the Cq spot itself has cleared the
+/// repetition gate yet. Making the count conditional on whether some
+/// *other* pattern happened to succeed is precisely the coupling Codex's
+/// PR #90 finding rejected.
+///
+/// MAN-100 remediation C2 changed what "succeeded" means here: the
+/// back-to-back "K5ARH K5ARH" is one message-distinct occurrence, not two
+/// (that collapsing is the whole point of C2 -- it's the exact SPEC
+/// payload shape the ticket targets), so this transmission alone no longer
+/// clears the >= 2-rep repetition gate the way it did before MAN-100. A
+/// second, message-distinct "CQ K5ARH" (word_seq 3+ past the first K5ARH,
+/// no trailing "T" so it captures no Beacon candidacy of its own) supplies
+/// that second rep so the Cq spot -- this test's other assertion -- still
+/// fires, leaving the guard-count assertion the only thing actually under
+/// test.
 #[test]
 fn a_spotted_word_still_counts_its_guard_suppression_once() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let words = ["CQ", "K5ARH", "K5ARH", "T"];
-    let spots = run(&transmission_events(1, &words, 0), &mut v);
+    run(&transmission_events(1, &words, 0), &mut v);
+    let spots = run(&transmission_events(1, &["CQ", "K5ARH"], 200_000), &mut v);
     assert!(
         spots
             .iter()
@@ -1353,6 +1366,13 @@ fn v35_beacon_candidates_are_exempt_from_variant_arbitration() {
         &transmission_events(1, &["V", "V", "V", "W6DPG", "K"], 900_000),
         &mut v,
     ));
+
+    // A non-allowlisted Beacon candidate is only ever captured, never
+    // emitted, before `TrackClosed` (the deferred-judgment redesign this
+    // test predates) -- `close_track` supplies a plausible final WPM
+    // (avoiding the separate WPM-implausibility rejection) and closes the
+    // track so both candidates are finally judged.
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
 
     assert!(
         spots

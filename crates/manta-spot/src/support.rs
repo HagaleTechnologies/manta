@@ -127,6 +127,7 @@ impl SupportLedger {
     /// also guarantees this can never drift from `RepetitionGate`'s own
     /// counting rule (MAN-100 remediation C4).
     fn support_in_window(
+        track_id: u32,
         obs: &[Obs],
         now: u64,
         window_samples: u64,
@@ -134,8 +135,14 @@ impl SupportLedger {
     ) -> Support {
         let cutoff = now.saturating_sub(window_samples);
         let windowed: Vec<&Obs> = obs.iter().filter(|o| o.sample_ts >= cutoff).collect();
-        let occurrences: Vec<(u64, u64)> =
-            windowed.iter().map(|o| (o.word_seq, o.sample_ts)).collect();
+        // Every `Obs` here comes from one `(track_id, text)` entry, so
+        // `track_id` is the same for all of them -- the shared helper's
+        // cross-track-always-distinct check is a structural no-op in this
+        // caller, never a behavior change.
+        let occurrences: Vec<(u64, u64, u32)> = windowed
+            .iter()
+            .map(|o| (o.word_seq, o.sample_ts, track_id))
+            .collect();
         let counted = gate::message_distinct_indices(&occurrences, time_gap_samples);
         let reps = counted.len() as u32;
         let conf_sum = counted.iter().map(|&i| windowed[i].geo_conf).sum();
@@ -147,9 +154,13 @@ impl SupportLedger {
     /// never observed.
     pub fn support(&self, track_id: u32, text: &str, now: u64) -> Support {
         match self.seen.get(&(track_id, text.to_string())) {
-            Some(obs) => {
-                Self::support_in_window(obs, now, self.window_samples, self.time_gap_samples)
-            }
+            Some(obs) => Self::support_in_window(
+                track_id,
+                obs,
+                now,
+                self.window_samples,
+                self.time_gap_samples,
+            ),
             None => Support::default(),
         }
     }
@@ -178,7 +189,8 @@ impl SupportLedger {
             let Some(rel) = variant::relation(candidate, text) else {
                 continue;
             };
-            let s = Self::support_in_window(obs, now, self.window_samples, self.time_gap_samples);
+            let s =
+                Self::support_in_window(*tid, obs, now, self.window_samples, self.time_gap_samples);
             if s.reps == 0 {
                 continue;
             }
