@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "manta",
+    // Without an explicit bin_name, clap falls back to the runtime argv[0]
+    // for "Usage: ..." lines -- on Windows that's "manta.exe" (the actual
+    // executable filename), not "manta". Pin it so help/usage text (and
+    // tests that assert against it, e.g. crates/manta-cli/tests/cli.rs) is
+    // identical across platforms.
+    bin_name = "manta",
     version,
     about = "Open-source wideband CW skimmer: every CW signal in an SDR passband, decoded at once, emitted as RBN-compatible spots"
 )]
