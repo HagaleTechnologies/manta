@@ -54,6 +54,23 @@ pub const MIN_MESSAGE_TIME_GAP_SECONDS: f64 = 60.0;
 /// AND `is_track_active` reports that PREVIOUS occurrence's track_id as no
 /// longer active (or the full `time_gap_samples` has passed regardless).
 ///
+/// **Only safe to call with an `is_track_active` whose answer for a given
+/// track_id never changes across calls** (Codex review, PR #133 round 6):
+/// this function is a pure, stateless recompute over the WHOLE slice every
+/// time, so calling it again later with a DIFFERENT liveness reading for
+/// the same historical track_id changes that pair's verdict retroactively
+/// -- correct the first time (evaluated in real time, as the occurrence
+/// arrives), wrong on replay (a track's later close shouldn't reclassify
+/// an already-settled historical comparison). `support::SupportLedger` is
+/// safe: its entries are keyed by `(track_id, text)`, so every occurrence
+/// in one call shares one `track_id` and the cross-track branch is
+/// structurally unreachable -- `is_track_active` is passed as `&|_|
+/// false` there and never actually queried. `RepetitionGate`, whose
+/// entries span multiple track_ids and whose liveness answers genuinely
+/// drift as tracks close over the life of the gate, does NOT use this
+/// function -- see `classify_new_occurrence` and `GateEntry::accepted`'s
+/// own doc for why it needs a different, incremental design instead.
+///
 /// The track_id branch exists because `word_seq` is a per-track word index
 /// (it resets to 0 on every new track), so it is not comparable across two
 /// different tracks at all -- without SOME cross-track allowance, a real
@@ -80,14 +97,10 @@ pub const MIN_MESSAGE_TIME_GAP_SECONDS: f64 = 60.0;
 /// for a caller that can't or doesn't track liveness (e.g. a saved-report
 /// replay tool) -- at 60s it's comfortably past any real transmission, so
 /// it can never itself manufacture a false confirmation the way a 1s
-/// threshold could. Shared by `RepetitionGate` and `support::SupportLedger`
-/// (MAN-100 Scenario 1), which must count repetitions by the same rule so a
-/// candidate's gate-facing rep count and its ledger-facing support figure
-/// never disagree about what counts as a separate message --
-/// `support::SupportLedger::support_in_window` folds `conf_sum` over
-/// exactly the occurrences this returns. `SupportLedger`'s own entries are
-/// keyed by `(track_id, text)`, so every occurrence it passes in shares one
-/// `track_id` and the track_id branch is structurally unreachable there.
+/// threshold could. Shared logic (the same word_seq/time_gap/track_id
+/// decision rule) with `classify_new_occurrence` below, which `Repetition
+/// Gate` uses instead -- `support::SupportLedger::support_in_window` folds
+/// `conf_sum` over exactly the occurrences this returns.
 pub(crate) fn message_distinct_indices(
     occurrences: &[(u64, u64, u32)],
     time_gap_samples: u64,
@@ -115,14 +128,42 @@ pub(crate) fn message_distinct_indices(
     counted
 }
 
-/// See `message_distinct_indices`; `RepetitionGate::record` only needs the
-/// count.
-pub(crate) fn count_message_distinct(
-    occurrences: &[(u64, u64, u32)],
+/// The incremental counterpart to `message_distinct_indices`, for
+/// `RepetitionGate` (Codex review, PR #133 round 6). Classifies exactly
+/// ONE new occurrence -- decided once, right now, against `accepted`'s
+/// last entry that was itself classified message-distinct (searching
+/// backward, skipping any that weren't) -- and that verdict is then
+/// frozen forever in the entry pushed to `accepted`. Never re-run the
+/// whole-history version of this decision against `accepted` later: doing
+/// so would re-read `is_track_active` for a track_id whose liveness may
+/// have changed since the pair was first (correctly) compared in real
+/// time, retroactively promoting an already-settled historical pair --
+/// e.g. two overlapping tracks A and B, B's occurrence correctly collapsed
+/// into A's while A was still active, then A closes; a later recompute
+/// would see A "inactive" and wrongly count B's already-decided
+/// occurrence as a second message from what was really one transmission.
+/// Same decision rule as `message_distinct_indices`, applied once instead
+/// of replayed.
+fn classify_new_occurrence(
+    accepted: &[(u64, u64, u32, bool)],
+    seq: u64,
+    ts: u64,
+    tid: u32,
     time_gap_samples: u64,
     is_track_active: &impl Fn(u32) -> bool,
-) -> usize {
-    message_distinct_indices(occurrences, time_gap_samples, is_track_active).len()
+) -> bool {
+    let last_counted = accepted.iter().rev().find(|&&(.., counted)| counted);
+    match last_counted {
+        None => true,
+        Some(&(prev_ts, prev_seq, prev_tid, _)) => {
+            let gap = ts.saturating_sub(prev_ts);
+            if tid != prev_tid {
+                !is_track_active(prev_tid) || gap >= time_gap_samples
+            } else {
+                seq >= prev_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples
+            }
+        }
+    }
 }
 
 /// Width of a frequency bucket, in Hz (MAN-166). See `RepetitionGate`'s
@@ -172,17 +213,25 @@ fn bucket(freq_hz: f64) -> i64 {
 
 #[derive(Default)]
 struct GateEntry {
-    /// `(sample_ts, word_seq, track_id)` of every *accepted* (distinct,
-    /// non-near-duplicate) occurrence. The returned repetition count is not
-    /// simply this vec's length: MAN-100 Scenario 2 requires accepted
-    /// occurrences to also be message-distinct (`count_message_distinct`,
-    /// `MIN_MESSAGE_WORD_GAP`/`MIN_MESSAGE_TIME_GAP_SECONDS`/track_id apart
-    /// -- see `message_distinct_indices`'s doc), since SPEC's own default
-    /// payload template repeats a callsign back-to-back within one
-    /// transmission and both utterances land here as separate *accepted*
-    /// occurrences (they're minutes, not `MIN_OCCURRENCE_GAP_SECONDS`,
-    /// apart) despite being one message's worth of evidence.
-    accepted: Vec<(u64, u64, u32)>,
+    /// `(sample_ts, word_seq, track_id, message_distinct)` of every
+    /// *accepted* (distinct, non-near-duplicate) occurrence. The returned
+    /// repetition count is not simply this vec's length: MAN-100 Scenario 2
+    /// requires accepted occurrences to also be message-distinct, since
+    /// SPEC's own default payload template repeats a callsign back-to-back
+    /// within one transmission and both utterances land here as separate
+    /// *accepted* occurrences (they're minutes, not
+    /// `MIN_OCCURRENCE_GAP_SECONDS`, apart) despite being one message's
+    /// worth of evidence.
+    ///
+    /// `message_distinct` is decided ONCE, by `classify_new_occurrence`,
+    /// at the moment this occurrence is pushed -- and never revisited
+    /// afterward (Codex review, PR #133 round 6): earlier revisions
+    /// recomputed this flag fresh across the WHOLE vector on every
+    /// `record` call, which let a track's liveness changing later (e.g.
+    /// closing) retroactively flip an already-settled historical pair's
+    /// verdict, manufacturing a false confirmation from what both times
+    /// was really one transmission. See `classify_new_occurrence`'s doc.
+    accepted: Vec<(u64, u64, u32, bool)>,
     /// Every track_id that has touched this entry -- accepted *or*
     /// rejected as a near-duplicate -- and when it was last seen (Codex
     /// review, PR #152, round 6): without this, a track whose first
@@ -217,7 +266,7 @@ impl GateEntry {
     fn most_recent(&self) -> Option<u64> {
         self.accepted
             .iter()
-            .map(|&(ts, _, _)| ts)
+            .map(|&(ts, _, _, _)| ts)
             .max()
             .into_iter()
             .chain(self.last_seen_by_track.values().copied())
@@ -434,36 +483,33 @@ impl RepetitionGate {
             .and_modify(|existing| *existing = (*existing).max(sample_ts))
             .or_insert(sample_ts);
         if is_distinct_occurrence {
-            entry.accepted.push((sample_ts, word_seq, track_id));
+            // MAN-100 Scenario 2 (remediation C2, extended for cross-track
+            // pairs, Codex review PR #133 round 6): classified ONCE, right
+            // now, against whatever is currently `accepted`'s last
+            // message-distinct entry -- see `classify_new_occurrence`'s
+            // doc for why this must never be re-derived later using a
+            // track's then-current (possibly since-changed) liveness.
+            let message_distinct = classify_new_occurrence(
+                &entry.accepted,
+                word_seq,
+                sample_ts,
+                track_id,
+                self.time_gap_samples,
+                &is_track_active,
+            );
+            entry
+                .accepted
+                .push((sample_ts, word_seq, track_id, message_distinct));
         }
-        entry.accepted.retain(|&(ts, _, _)| ts >= cutoff);
+        entry.accepted.retain(|&(ts, _, _, _)| ts >= cutoff);
         entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
-        // MAN-100 Scenario 2 (remediation C2, extended for cross-track
-        // pairs): message-distinctness is (prior track no longer active OR
-        // full time gap) for a track_id change, else word_seq gap OR
-        // sample_ts gap (`count_message_distinct`'s `time_gap_samples`) --
-        // see that function's doc. It expects `(word_seq, sample_ts,
-        // track_id)` triples, not the `(sample_ts, word_seq, track_id)`
-        // order `accepted` stores them in; built and sorted defensively,
-        // not just collected in push order: `resolve_pending_beacons` can
-        // replay an older, deferred pair after newer ones already landed
-        // on this same entry (see `most_recent`'s doc). Sorted by
-        // `sample_ts` first, not `word_seq`: `word_seq` is only monotonic
-        // WITHIN one track (it resets to 0 on every new track_id), so
-        // sorting cross-track occurrences by `word_seq` first can put a
-        // fresh track's early, low-numbered word ahead of an older track's
-        // later, high-numbered one -- `sample_ts` is the only field that
-        // stays globally monotonic across a track close+reopen, and
-        // `count_message_distinct`'s greedy walk needs true chronological
-        // order to compare each occurrence against the one immediately
-        // before it in time.
-        let mut occurrences: Vec<(u64, u64, u32)> = entry
+        // Tally the frozen per-occurrence verdicts still inside the
+        // window -- never re-derive them (see `accepted`'s own doc).
+        entry
             .accepted
             .iter()
-            .map(|&(ts, seq, tid)| (seq, ts, tid))
-            .collect();
-        occurrences.sort_unstable_by_key(|&(seq, ts, _)| (ts, seq));
-        count_message_distinct(&occurrences, self.time_gap_samples, &is_track_active)
+            .filter(|&&(.., counted)| counted)
+            .count()
     }
 
     /// See `records_total`'s doc.
@@ -502,7 +548,7 @@ impl RepetitionGate {
     pub fn sweep(&mut self, now_ts: u64) {
         let cutoff = now_ts.saturating_sub(self.window_samples);
         self.seen.retain(|_, entry| {
-            entry.accepted.retain(|&(ts, _, _)| ts >= cutoff);
+            entry.accepted.retain(|&(ts, _, _, _)| ts >= cutoff);
             entry.last_seen_by_track.retain(|_, ts| *ts >= cutoff);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
@@ -705,6 +751,71 @@ mod tests {
              transmission's second utterance must not manufacture a false \
              second confirmation just because several real seconds \
              separate the two words"
+        );
+    }
+
+    /// Codex review, PR #133 (round 6): a message-distinctness verdict,
+    /// once decided for a specific occurrence, must never be revisited
+    /// later using a track's CURRENT (possibly since-changed) liveness.
+    /// Track 1 (A) is open when track 2 (B) decodes the same callsign --
+    /// B's occurrence is correctly collapsed into A's message while A is
+    /// still active. A later, unrelated `record` call touching the SAME
+    /// entry, after A has since closed, must not retroactively flip B's
+    /// already-settled verdict -- inspected directly on the frozen
+    /// `accepted` entries, not just the returned count (which, taken
+    /// alone, can't distinguish "B correctly stayed collapsed" from "B was
+    /// wrongly promoted but something else happened to net out the same
+    /// total").
+    #[test]
+    fn a_settled_message_distinct_verdict_is_never_revisited_after_the_fact() {
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(gate.record(1, 7_080_000.0, "K5ARH", 0, 0, always_active), 1);
+        let three_point_four_seconds = (3.4 * FS) as u64;
+        assert_eq!(
+            gate.record(
+                2,
+                7_080_000.0,
+                "K5ARH",
+                three_point_four_seconds,
+                0,
+                always_active
+            ),
+            1,
+            "B's occurrence must collapse into A's message while A is active"
+        );
+
+        let key = (70_800i64, "K5ARH".to_string());
+        let entry = gate.seen.get(&key).expect("entry must exist");
+        assert_eq!(
+            entry.accepted.len(),
+            2,
+            "both occurrences must be accepted (non-near-duplicate)"
+        );
+        assert!(
+            entry.accepted[0].3,
+            "A's occurrence must be message-distinct"
+        );
+        assert!(
+            !entry.accepted[1].3,
+            "B's occurrence must be collapsed, not message-distinct"
+        );
+
+        // A later `record` call touching the SAME entry, comfortably past
+        // the near-duplicate gap, now reporting track 1 (A) as inactive --
+        // simulating A having closed in the meantime. This must NOT
+        // retroactively flip B's already-settled verdict.
+        let ten_seconds = (10.0 * FS) as u64;
+        gate.record(3, 7_080_000.0, "K5ARH", ten_seconds, 0, |tid| tid != 1);
+
+        let entry = gate.seen.get(&key).expect("entry must exist");
+        assert!(
+            entry.accepted[0].3,
+            "A's occurrence must still be message-distinct"
+        );
+        assert!(
+            !entry.accepted[1].3,
+            "B's already-settled verdict must never be revisited using A's \
+             NOW-changed liveness"
         );
     }
 
@@ -1107,7 +1218,7 @@ mod tests {
 
         // Home bucket (140000): a stale entry, its only touch at t=0.
         let mut stale = GateEntry::default();
-        stale.accepted.push((0, 0, 1));
+        stale.accepted.push((0, 0, 1, true));
         stale.last_seen_by_track.insert(1, 0);
         gate.seen.insert((140000, "K5ARH".to_string()), stale);
 
@@ -1115,7 +1226,7 @@ mod tests {
         // the window as of the decisive call below.
         let fresh_ts = window_samples - 200_000;
         let mut fresh = GateEntry::default();
-        fresh.accepted.push((fresh_ts, 0, 2));
+        fresh.accepted.push((fresh_ts, 0, 2, true));
         fresh.last_seen_by_track.insert(2, fresh_ts);
         gate.seen.insert((140001, "K5ARH".to_string()), fresh);
 
