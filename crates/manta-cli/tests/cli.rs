@@ -581,7 +581,14 @@ fn listen_accepts_engine_flag_for_every_valid_value() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+            stderr.contains("nonexistent.wav")
+                || stderr.contains("No such file")
+                // Windows' io::Error Display for ENOENT is "The system
+                // cannot find the file specified." rather than "No such
+                // file" -- but the underlying OS error code (2) is shared
+                // with Unix's ENOENT, so match on that instead of
+                // platform-specific wording.
+                || stderr.contains("os error 2"),
             "{engine}: expected the nonexistent-source-file error, got: {stderr}"
         );
     }
@@ -635,7 +642,14 @@ fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+        stderr.contains("nonexistent.wav")
+            || stderr.contains("No such file")
+            // Windows' io::Error Display for ENOENT is "The system cannot
+            // find the file specified." rather than "No such file" -- but
+            // the underlying OS error code (2) is shared with Unix's
+            // ENOENT, so match on that instead of platform-specific
+            // wording.
+            || stderr.contains("os error 2"),
         "expected the nonexistent-source-file error, got: {stderr}"
     );
 
@@ -654,7 +668,14 @@ fn cli_engine_override_beats_a_hsmm_staged_server_config_file() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("nonexistent.wav") || stderr.contains("No such file"),
+        stderr.contains("nonexistent.wav")
+            || stderr.contains("No such file")
+            // Windows' io::Error Display for ENOENT is "The system cannot
+            // find the file specified." rather than "No such file" -- but
+            // the underlying OS error code (2) is shared with Unix's
+            // ENOENT, so match on that instead of platform-specific
+            // wording.
+            || stderr.contains("os error 2"),
         "expected the nonexistent-source-file error, got: {stderr}"
     );
 }

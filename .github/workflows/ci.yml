@@ -199,7 +199,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -215,7 +215,14 @@ jobs:
       # where the pinned toolchain actually gets auto-installed -- a
       # toolchain mismatch is reported as itself rather than as a confusing
       # downstream fmt/clippy diff or cache-key anomaly.
+      # MAN-212 (Codex, PR #184): explicit `shell: bash` is required on
+      # windows-latest -- a bare `run:` step defaults to pwsh there, which
+      # silently no-ops this Bash script (11ms, zero output, no error)
+      # instead of running it, defeating the toolchain guard on that leg
+      # entirely. Harmless on ubuntu-latest/macos-latest, where bash is
+      # already the default shell.
       - run: scripts/check-rust-toolchain-pin.sh
+        shell: bash
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -246,7 +253,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
