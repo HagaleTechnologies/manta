@@ -154,7 +154,13 @@ fn merge_policy_successor_to_mergify_exists() {
     // applying a settled `if`'s verdict to every one of its arms, would still
     // be satisfied by a call a bare `echo }` had freed from that same uncalled
     // function, or by one written in the `else` of `if true` -- an arm the
-    // shell never executes (PR #93 review, round 11).
+    // shell never executes (PR #93 review, round 11); and closing a
+    // here-document at a delimiter line carrying trailing blanks, reading a
+    // `break` as an ordinary command, or resetting reachability at every
+    // newline with no account of `bash -e` would still be satisfied by a
+    // here-document body `EOF   ` had falsely freed, by a call written under a
+    // `break` in `while true; do ...; done`, or by one written under a bare
+    // `false` (PR #93 review, round 12).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -168,8 +174,9 @@ fn merge_policy_successor_to_mergify_exists() {
          `name:`/`env:` scalar, an `echo` of the command text, an assignment \
          of it to a variable or a here-document body all fail this check, as \
          does naming it only behind a constant gate (`false &&`, the body of \
-         `if false`), in the body of a function nothing calls, or below an \
-         `exit` -- see `arms_auto_merge`). \
+         `if false`), in the body of a function nothing calls, below an \
+         `exit`, below a `break` in the same loop body, or below a bare \
+         `false` the step's own `bash -e` exits on -- see `arms_auto_merge`). \
          That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
          losing it silently leaves the repo with no automated merge path at all."
@@ -232,7 +239,16 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    and a settled `if` now inverts its verdict at `elif`/`else` instead of
 ///    applying the opener's to the whole block, so the `else` of `if true` is
 ///    read as the dead text it is -- and the `else` of `if false` as the branch
-///    the shell takes (`Block::enter_arm`).
+///    the shell takes (`Block::enter_arm`). Round 12 added the three ways the
+///    shell leaves text behind that had no reader here at all: a here-document
+///    delimiter is now matched exactly, so `EOF   ` no longer closes `<<EOF` a
+///    line early and hands the body under it back as commands
+///    (`Heredoc::terminated_by`); a reached `break`/`continue` now ends the
+///    enclosing loop's body, so `while true; do break; gh ...; done` arms
+///    nothing (`LOOP_CONTROL_COMMANDS`, `ShellState::end_loop_body`); and a
+///    bare `false` now ends the step under the `bash -e` an Actions `run:`
+///    defaults to, with each of bash's own errexit exemptions checked first
+///    (`fails_under_errexit`, `Follower`).
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -331,10 +347,30 @@ struct Heredoc {
 impl Heredoc {
     /// Does `line` end this here-document?
     ///
-    /// The terminator is the delimiter alone on its line. Lines arrive here with
-    /// the YAML block's own content indentation already removed but their
-    /// *relative* indentation intact, so an indented `EOF` correctly fails to
-    /// close a plain `<<EOF` -- and correctly does close a `<<-EOF`.
+    /// The terminator is the delimiter *alone* on its line -- nothing before it
+    /// and nothing after it, trailing blanks included. Lines arrive here with
+    /// the YAML block's own content indentation already removed but the rest of
+    /// their whitespace intact, so an indented `EOF` correctly fails to close a
+    /// plain `<<EOF` -- and correctly does close a `<<-EOF`, whose leading tabs
+    /// (and only whose leading tabs) the shell strips first.
+    ///
+    /// Trailing blanks are just as significant, and comparing past them was the
+    /// last way a here-document body could be read as shell: `EOF   ` does not
+    /// close `<<EOF` in bash, so in
+    ///
+    /// ```sh
+    /// cat <<EOF
+    /// EOF␠␠␠
+    /// gh pr merge "$PR_URL" --auto
+    /// EOF
+    /// ```
+    ///
+    /// the `gh` line is still *data* on `cat`'s stdin, while a `trim_end()` here
+    /// closed the here-document a line early and handed that data back to the
+    /// reader as an executed merge path (PR #93 review, round 12). Matching the
+    /// delimiter exactly keeps such a block swallowed to its real terminator,
+    /// which -- as with an unterminated here-document -- only makes this guard
+    /// harder to satisfy.
     fn terminated_by(&self, line: &str) -> bool {
         let Some(delimiter) = self.delimiter.as_deref() else {
             return false;
@@ -344,7 +380,7 @@ impl Heredoc {
         } else {
             line
         };
-        candidate.trim_end() == delimiter
+        candidate == delimiter
     }
 }
 
@@ -464,12 +500,16 @@ fn heredoc_delimiter(chars: &mut Peekable<Chars<'_>>, strip_tabs: bool) -> Hered
 /// folding inside `run_shell_lines`) also means `executable_part` cuts `#`
 /// comments from the folded line, which is where the shell would see them.
 ///
-/// A line that *starts* a shell line keeps its leading whitespace (the block's
-/// own content indentation is already gone; what is left is the indentation the
+/// A line that *starts* a shell line keeps its whitespace at both ends (the
+/// block's own content indentation is already gone; what is left is what the
 /// shell itself sees). `executable_part` trims it back off for tokenising, but
-/// `Heredoc::terminated_by` needs it: an indented `EOF` does not close a plain
-/// `<<EOF`. Only a line *folded onto* a previous one is trimmed, because that is
-/// what YAML folding does to it.
+/// `Heredoc::terminated_by` needs both halves: an indented `EOF` does not close
+/// a plain `<<EOF`, and neither does `EOF   ` -- a delimiter line is the
+/// delimiter *alone*. Trimming the tail here closed a here-document one line
+/// early, so the body line under it was read as a command rather than as the
+/// stdin data bash hands to `cat` (PR #93 review, round 12). Only a line
+/// *folded onto* a previous one is trimmed, because that is what YAML folding
+/// does to it.
 fn folded_run_lines(body: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for run_line in run_shell_lines(body) {
@@ -478,7 +518,7 @@ fn folded_run_lines(body: &str) -> Vec<String> {
                 last.push(' ');
                 last.push_str(run_line.text.trim());
             }
-            _ => lines.push(run_line.text.trim_end().to_owned()),
+            _ => lines.push(run_line.text.to_owned()),
         }
     }
     lines
@@ -599,6 +639,17 @@ struct Block {
     /// a closing `else` certain to run. Vacuously true at the opener, since an
     /// `if` has no arms before its first one.
     every_earlier_arm_is_dead: bool,
+    /// True for `while`/`until`/`for`, the blocks `break` and `continue` act
+    /// on. An `if` or a `case` is not a loop, so a `break` written inside one
+    /// leaves through it to whatever loop encloses *it*.
+    is_loop: bool,
+    /// True once a reached `break`/`continue` has ended this loop's body, so
+    /// every command written below it and still inside the block is text the
+    /// shell never runs -- `while true; do break; gh pr merge "$PR_URL"
+    /// --auto; done` arms nothing, because `break` leaves the loop before the
+    /// `gh` line is ever reached (PR #93 review, round 12). Cleared with the
+    /// block itself: shell below the matching `done` is ordinary shell again.
+    body_terminated: bool,
 }
 
 impl Block {
@@ -714,6 +765,8 @@ fn block_from_opener(words: &[String]) -> Block {
             is_if: false,
             earlier_arm_is_certain: false,
             every_earlier_arm_is_dead: true,
+            is_loop: false,
+            body_terminated: false,
         };
     };
     let condition: Vec<&str> = significant.collect();
@@ -735,6 +788,8 @@ fn block_from_opener(words: &[String]) -> Block {
         is_if: head == "if",
         earlier_arm_is_certain: false,
         every_earlier_arm_is_dead: true,
+        is_loop: matches!(head, "while" | "until" | "for"),
+        body_terminated: false,
     }
 }
 
@@ -793,6 +848,84 @@ fn for_list_is_certain(condition: &[&str]) -> bool {
 /// this one). Refusing text a human can see is live costs a loud failure;
 /// certifying text the shell never reaches costs the merge path itself.
 const TERMINATING_COMMANDS: [&str; 2] = ["exit", "exec"];
+
+/// Commands that end the enclosing *loop body* where they stand, so that
+/// nothing written after one of them -- up to that loop's own `done` -- is ever
+/// reached.
+///
+/// `break` leaves the loop; `continue` jumps back to its head. Either way the
+/// shell never reads the rest of the body on that pass, and never on any later
+/// pass either, because every pass arrives at the same `break`. Treating the
+/// line after one as an ordinary reachable command let
+/// `while true; do break; gh pr merge "$PR_URL" --auto; done` certify this
+/// guard with no merge path the shell can take (PR #93 review, round 12).
+///
+/// Unlike `exit` this is *scoped*: `Block::body_terminated` carries it, and the
+/// matching `done` pops it, so shell below the loop is ordinary shell again.
+const LOOP_CONTROL_COMMANDS: [&str; 2] = ["break", "continue"];
+
+/// The `false` of a bare `false`, and the only command whose *failure* this
+/// reader can settle before the shell runs.
+///
+/// An Actions step's default shell is `bash -e {0}`, and `help set` defines
+/// `-e` as "Exit immediately if a command exits with a non-zero status". So a
+/// reached, ungated `false` ends the step exactly as `exit 1` does, and a
+/// `gh pr merge ... --auto` written below one is dead text -- which the reader
+/// certified as a live merge path while it reset reachability at every newline
+/// (PR #93 review, round 12).
+///
+/// Only bash's own errexit *exemptions* keep a `false` from ending the shell,
+/// and each is checked before this latches: a `false` whose status is consumed
+/// by `&&`/`||`, one that is a non-final member of a pipeline, one run in the
+/// background with `&`, one that is the condition of an `if`/`elif`/`while`/
+/// `until` (which reaches this reader inside the opener's own command, or
+/// behind an `elif`), and one whose status is inverted with `!` (which heads
+/// the command instead, so `is_constant_status` never sees `false` at all).
+/// Anything else this reader cannot settle -- `grep -q x f`, `[ -n "$X" ]` --
+/// stays a run-time answer and latches nothing.
+const STATICALLY_FAILING_COMMAND: &str = "false";
+
+/// What the boundary *after* a simple command does to its exit status -- which
+/// is the whole of what decides whether errexit acts on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follower {
+    /// `;`, a newline, or the end of the shell: nothing consumes the status, so
+    /// `set -e` sees a failure and ends the step.
+    List,
+    /// `&&` or `||`: the status is the operator's own input, and bash exempts
+    /// every member of such a list but the last from errexit. This reader does
+    /// not track which member is last, so it exempts them all -- the permissive
+    /// direction, but the only one that cannot mis-read `false && cmd`.
+    Conditional,
+    /// `|`: a non-final pipeline member's status is discarded. (The *final*
+    /// member is followed by something else, so it arrives here as `List`.)
+    Pipe,
+    /// `&`: the command runs asynchronously and its status never reaches
+    /// errexit at all.
+    Background,
+}
+
+/// Does `words` -- one simple command -- fail statically under errexit, ending
+/// the step where it stands?
+///
+/// The command must be a bare `false` *and* stand where bash lets errexit see
+/// its status. `elif false` is the one exempt spelling that still reaches
+/// `is_constant_status` as a bare `false`, because `significant_words` drops
+/// the `elif` that introduces it; `if false`/`while false`/`until false` keep
+/// their keyword at the head and never look like one.
+fn fails_under_errexit(words: &[String], follower: Follower) -> bool {
+    if follower != Follower::List {
+        return false;
+    }
+    if command_head(words) != Some(STATICALLY_FAILING_COMMAND) || !is_constant_status(words) {
+        return false;
+    }
+    // The condition of an `elif` is a test, not a command errexit acts on.
+    !words
+        .iter()
+        .map(String::as_str)
+        .any(|word| word == "elif" || word == "!")
+}
 
 /// Whether the reader is inside a shell *function body* -- text the shell reads
 /// but does not run until something calls the function.
@@ -973,6 +1106,7 @@ fn push_simple_command(
     words: Vec<String>,
     quoted: Vec<bool>,
     gate: Gate,
+    follower: Follower,
     state: &mut ShellState,
 ) {
     if words.is_empty() {
@@ -989,12 +1123,17 @@ fn push_simple_command(
     let head = command_head(&words).unwrap_or("{");
     let opens_block = BLOCK_OPENERS.contains(&head);
     let closes_block = BLOCK_CLOSERS.contains(&head);
-    let ends_shell = TERMINATING_COMMANDS.contains(&head);
+    // `exit`/`exec` end the shell outright; a bare `false` ends it just as
+    // surely under the `bash -e` an Actions step runs by default.
+    let ends_shell = TERMINATING_COMMANDS.contains(&head) || fails_under_errexit(&words, follower);
+    let ends_loop_body = LOOP_CONTROL_COMMANDS.contains(&head);
     // Unconditionally: the scope is a state machine and every command has to
     // pass through it, not just the ones that end up unreachable.
     let in_function_body = state.functions.absorb(&words, &quoted);
     let in_dead_block = state.blocks.iter().any(|block| block.body_is_dead);
-    let unreachable = gate.dead || in_dead_block || in_function_body || state.terminated;
+    let past_loop_control = state.blocks.iter().any(|block| block.body_terminated);
+    let unreachable =
+        gate.dead || in_dead_block || in_function_body || state.terminated || past_loop_control;
     // A block whose condition is settled is entered on every run, so it does
     // not make its body skippable; every other block does.
     let skippable =
@@ -1007,8 +1146,26 @@ fn push_simple_command(
         // The `exit` itself runs -- `skippable` above is already decided -- and
         // everything after it does not.
         state.terminated = true;
+    } else if ends_loop_body && !unreachable && !gate.gated {
+        state.end_loop_body(loop_control_levels(&words));
     }
     commands.push(SimpleCommand { words, unreachable });
+}
+
+/// How many loops a `break`/`continue` leaves: its optional literal count, or
+/// `None` when there is none to read.
+///
+/// `break 2` leaves two. A count this reader cannot evaluate (`break "$n"`)
+/// reads as `None`, which `ShellState::end_loop_body` treats as *every*
+/// enclosing loop -- refusing more text rather than less, the direction this
+/// reader is allowed to err in.
+fn loop_control_levels(words: &[String]) -> Option<usize> {
+    let mut significant = significant_words(words);
+    significant.next()?;
+    match significant.next() {
+        None => Some(1),
+        Some(count) => count.parse().ok().filter(|levels| *levels > 0),
+    }
 }
 
 /// What the boundary *before* a simple command settled about reaching it.
@@ -1040,9 +1197,53 @@ struct ShellState {
     /// Whether that command sits in a function body, which runs only when
     /// something calls the function.
     functions: FunctionScope,
-    /// Set by a reached `exit`/`exec` and never cleared: the shell is gone, so
-    /// every command after one is text nothing executes.
+    /// Set by a reached `exit`/`exec` -- or by a bare `false` under the `bash
+    /// -e` an Actions step runs by default -- and never cleared: the shell is
+    /// gone, so every command after one is text nothing executes.
     terminated: bool,
+}
+
+impl ShellState {
+    /// Record a reached `break`/`continue`, ending the body of the loop it
+    /// leaves so that the rest of that body reads as the dead text it is.
+    ///
+    /// `levels` counts loops outward from the innermost, as `break N` does;
+    /// `None` -- a count this reader could not evaluate -- leaves the outermost
+    /// one, which is the widest region and so refuses the most text. A
+    /// `break` with no loop around it is the shell's own no-op and ends
+    /// nothing.
+    ///
+    /// The latch only fires when the `break` is reached on *every* pass through
+    /// that loop's body: a `break` nested in an `if` the condition does not
+    /// settle is skipped on some runs, and the command below it is then a
+    /// branch the shell can take. Note that this is a weaker requirement than
+    /// the one an `exit` has to meet -- the loop's own body need not be
+    /// guaranteed, because the text this kills sits in that same body and is
+    /// reached on exactly the passes the `break` is.
+    fn end_loop_body(&mut self, levels: Option<usize>) {
+        let loops: Vec<usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.is_loop)
+            .map(|(idx, _)| idx)
+            .collect();
+        // A count larger than the nesting depth exits every enclosing loop,
+        // which is what `None` means here too.
+        let Some(&target) = (match levels {
+            Some(levels) => loops.iter().rev().nth(levels - 1).or(loops.first()),
+            None => loops.first(),
+        }) else {
+            return;
+        };
+        if self.blocks[target + 1..]
+            .iter()
+            .any(|block| !block.body_is_guaranteed)
+        {
+            return;
+        }
+        self.blocks[target].body_terminated = true;
+    }
 }
 
 /// Split shell source into simple commands, each a list of unquoted tokens plus
@@ -1145,11 +1346,20 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                     // Whether *this* command decides statically what the `&&`
                     // or `||` after it reaches -- read before the words move.
                     let constant_status = is_constant_status(&command);
+                    // What this boundary does to the command's own status,
+                    // which is what decides whether errexit acts on it.
+                    let follower = match c {
+                        _ if doubled => Follower::Conditional,
+                        '|' => Follower::Pipe,
+                        '&' => Follower::Background,
+                        _ => Follower::List,
+                    };
                     push_simple_command(
                         &mut commands,
                         std::mem::take(&mut command),
                         std::mem::take(&mut quoted),
                         gate,
+                        follower,
                         &mut state,
                     );
                     gate = match c {
@@ -1179,7 +1389,16 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
         command.push(token);
         quoted.push(token_quoted);
     }
-    push_simple_command(&mut commands, command, quoted, gate, &mut state);
+    // End of the shell text: nothing consumes the last command's status, so
+    // errexit sees it exactly as it would before a `;`.
+    push_simple_command(
+        &mut commands,
+        command,
+        quoted,
+        gate,
+        Follower::List,
+        &mut state,
+    );
     commands
 }
 
@@ -1997,4 +2216,222 @@ fn arms_auto_merge_folds_folded_block_scalars() {
     assert!(!arms_auto_merge(
         "jobs:\n  m:\n    steps:\n      - run: >\n          echo hi\n        name: gh pr merge --auto\n"
     ));
+}
+
+/// A here-document's terminator is the delimiter *alone* on its line, trailing
+/// blanks included (PR #93 review, round 12: a `trim_end()` on the line closed
+/// `<<EOF` at a line spelled `EOF   `, which bash reads as ordinary body data,
+/// so the here-document body under it was handed back to the reader as
+/// executable shell).
+#[test]
+fn arms_auto_merge_closes_here_documents_only_on_an_exact_delimiter() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case: `EOF   ` is body text, so `cat` still owns every
+    // line up to the real terminator and the `gh` line never reaches the shell.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\n          EOF   \n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+    // A tab is whitespace the delimiter line may not carry either.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\n          EOF\t\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+    // `<<-` strips *leading* tabs from the terminator and nothing else, so a
+    // trailing blank still leaves it open.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<-EOF\n          \tEOF \n          gh pr merge \"$PR_URL\" --auto\n          \tEOF\n"
+    )));
+    // Anything after the delimiter on its line is the same story.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\n          EOF nope\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // The exact delimiter still closes it, and shell resumes on the next line.
+    assert!(arms_auto_merge(&workflow(
+        "          cat <<EOF\n          nothing here\n          EOF\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          cat <<-EOF\n          nothing here\n          \tEOF\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// `break` and `continue` end the enclosing loop's body where they stand, so
+/// the rest of that body is never executed (PR #93 review, round 12: only
+/// `exit`/`exec` affected reachability, so `while true; do break; gh pr merge
+/// "$PR_URL" --auto; done` satisfied the guard although bash leaves the loop
+/// before it ever reads the `gh` line).
+#[test]
+fn arms_auto_merge_rejects_shell_below_loop_control() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case, in both spellings of the boundary.
+    assert!(!arms_auto_merge(&workflow(
+        "          while true; do break; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          while true\n          do\n            break\n            gh pr merge \"$PR_URL\" --auto\n          done\n"
+    )));
+    // `continue` jumps to the loop head, so the rest of the body is just as
+    // unreachable -- on this pass and on every later one, which all arrive at
+    // the same `continue`.
+    assert!(!arms_auto_merge(&workflow(
+        "          while true; do continue; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    // Every loop keyword, not just `while`.
+    assert!(!arms_auto_merge(&workflow(
+        "          for f in a b; do break; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          until false; do break; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    // The loop's own condition need not be settled: the text this kills sits in
+    // the same body and is reached on exactly the passes the `break` is.
+    assert!(!arms_auto_merge(&workflow(
+        "          for pr in $PRS; do break; gh pr merge \"$pr\" --auto; done\n"
+    )));
+    // A `break` inside a settled `if` inside the loop still runs on every pass.
+    assert!(!arms_auto_merge(&workflow(
+        "          while true\n          do\n            if true; then break; fi\n            gh pr merge \"$PR_URL\" --auto\n          done\n"
+    )));
+    // `break 2` leaves both loops, so the text after it in either body is dead.
+    assert!(!arms_auto_merge(&workflow(
+        "          while true\n          do\n            for f in a b\n            do\n              break 2\n            done\n            gh pr merge \"$PR_URL\" --auto\n          done\n"
+    )));
+    // A count past the nesting depth exits every enclosing loop, exactly as
+    // bash does with it.
+    assert!(!arms_auto_merge(&workflow(
+        "          while true; do break 9; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    // A count this reader cannot evaluate is read as "all of them" -- refusing
+    // more text, the direction this reader is allowed to err in.
+    assert!(!arms_auto_merge(&workflow(
+        "          while true; do break \"$n\"; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // The latch is scoped to the loop: `done` ends it and the shell below is
+    // ordinary shell again.
+    assert!(arms_auto_merge(&workflow(
+        "          while true; do break; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          for f in a b; do continue; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A call *above* the `break` still runs before the loop is left.
+    assert!(arms_auto_merge(&workflow(
+        "          while true\n          do\n            gh pr merge \"$PR_URL\" --auto\n            break\n          done\n"
+    )));
+    // A `break` the shell may skip ends nothing: the call below it is a branch
+    // the shell can take, which is a merge path.
+    assert!(arms_auto_merge(&workflow(
+        "          while true\n          do\n            if [ -z \"$PR_URL\" ]; then break; fi\n            gh pr merge \"$PR_URL\" --auto\n          done\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          for pr in $PRS; do [ -z \"$pr\" ] && break\n            gh pr merge \"$pr\" --auto\n          done\n"
+    )));
+    // `break 2` from a nested loop leaves the *outer* body dead, but the inner
+    // loop's own text above it -- and the shell below the outer `done` -- is not.
+    assert!(arms_auto_merge(&workflow(
+        "          while true\n          do\n            for f in a b\n            do\n              break 2\n            done\n          done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The word has to be the command: `echo break` and `VAR=break` end nothing.
+    assert!(arms_auto_merge(&workflow(
+        "          while true; do echo break; gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    // A `break` in an uncalled function body is not a reached `break`.
+    assert!(arms_auto_merge(&workflow(
+        "          stop() { break; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...and one with no loop around it is the shell's own no-op.
+    assert!(arms_auto_merge(&workflow(
+        "          break\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// An Actions step runs under `bash -e`, so a statically failing command ends
+/// the step exactly as `exit 1` does (PR #93 review, round 12: reachability was
+/// reset at every newline with no account of errexit, so a bare `false`
+/// followed by `gh pr merge "$PR_URL" --auto` satisfied the guard although the
+/// shell is already gone before it reads the `gh` line).
+#[test]
+fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case, in both spellings of the boundary.
+    assert!(!arms_auto_merge(&workflow(
+        "          false\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false; gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A `false` several commands up ends the step just as thoroughly.
+    assert!(!arms_auto_merge(&workflow(
+        "          echo checking\n          false\n          echo unreachable\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The last member of a pipeline is the one whose status errexit reads.
+    assert!(!arms_auto_merge(&workflow(
+        "          echo x | false\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A block the condition settles is entered on every run, so the `false`
+    // inside it is reached on every run too.
+    assert!(!arms_auto_merge(&workflow(
+        "          if true; then false; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // Every errexit exemption bash defines. `&&`/`||` consume the status...
+    assert!(arms_auto_merge(&workflow(
+        "          false && echo skipped\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          grep -q x f || false\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...a non-final pipeline member's status is discarded...
+    assert!(arms_auto_merge(&workflow(
+        "          false | cat\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...a backgrounded command's never reaches errexit at all...
+    assert!(arms_auto_merge(&workflow(
+        "          false &\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...`!` inverts it...
+    assert!(arms_auto_merge(&workflow(
+        "          ! false\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...and a condition is a test, not a command errexit acts on, in every
+    // keyword that takes one.
+    assert!(arms_auto_merge(&workflow(
+        "          if false; then echo x; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          if [ -n \"$PR_URL\" ]\n          then\n            echo x\n          elif false\n          then\n            echo y\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          while false; do echo x; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A status only known at run time settles nothing, whatever it turns out
+    // to be -- this reader must not pretend to know it.
+    assert!(arms_auto_merge(&workflow(
+        "          grep -q needs-human labels\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          [ -n \"$PR_URL\" ]\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A `false` the shell may skip ends nothing either.
+    assert!(arms_auto_merge(&workflow(
+        "          if [ -z \"$PR_URL\" ]; then false; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The word has to be the command: `echo false`, `VAR=false` and a `false`
+    // that takes arguments (so it is some other program) end nothing.
+    assert!(arms_auto_merge(&workflow(
+        "          echo false\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          ACTION=false\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...and one in an uncalled function body is not a reached one.
+    assert!(arms_auto_merge(&workflow(
+        "          bail() { false; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
 }
