@@ -13,17 +13,20 @@ name: Dependabot Auto-Merge
 on: pull_request_target
 
 jobs:
-  # Codex round 5 (ported unchanged): the staleness check reads the PR's timeline (labeled
-  # events) and comments (staleness markers) -- neither endpoint is covered by pull-requests
-  # alone.
+  # This job's ONLY job is the side effect: clear needs-human if it's provably stale for the
+  # current head. It has no meaningful output to pass downstream (Codex P1, manta#191 round 1 --
+  # an earlier version computed `should_merge` here and passed it as a boolean input, leaving a
+  # job-boundary TOCTOU window between that read and credenza's merge mutation). credenza's
+  # reusable workflow now re-checks the LIVE label state itself, immediately before merging (via
+  # `merge_blocking_label` below) -- this job only needs to run, and complete, BEFORE that check
+  # (`needs: check-needs-human` on the auto-merge job below), so a stale label is already cleared
+  # by the time the live check reads it.
   check-needs-human:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       issues: read
-    outputs:
-      should_merge: ${{ steps.check.outputs.should_merge || 'true' }}
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -89,16 +92,13 @@ jobs:
               # Clear the label, not just ignore it (Codex round 5): leaving it attached would let
               # queue-retry-handler.yml's own retry step see this same stale needs-human on this
               # new revision's eventual merge-group failure and refuse to retry it -- silently
-              # stalling a corrected revision after its very first queue attempt.
+              # stalling a corrected revision after its very first queue attempt. Also what makes
+              # credenza's downstream live label re-check see a clean state for this revision.
               echo "::notice::needs-human on PR #$PR is stale (provably tied to an earlier revision, not the current head $current_head_sha12) -- clearing it and allowing auto-merge for the new revision."
               gh api --method DELETE "repos/${REPO}/issues/${PR}/labels/needs-human" >/dev/null 2>&1 || true
-              echo "should_merge=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- standing down without allowing auto-merge."
-              echo "should_merge=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- leaving it attached. credenza's own live re-check will stand down without merging."
             fi
-          else
-            echo "should_merge=true" >> "$GITHUB_OUTPUT"
           fi
 
   auto-merge:
@@ -115,9 +115,12 @@ jobs:
     # plan). Do not enable require_code_owner_review on this repo's ruleset until this PR has
     # merged, the secret is confirmed working end-to-end on a real Dependabot PR, and MAN-209 is
     # closed.
-    uses: HagaleTechnologies/credenza/.github/workflows/dependabot-auto-merge.yml@6d2781a32433e2ebcce577ef16f0546633bd6b4a
+    # Pinned to f25c58c2, not the prior 6d2781a3: pulls in credenza#47's merge_blocking_label fix
+    # (a live re-check immediately before the merge mutation, replacing a caller-computed boolean
+    # that left a job-boundary TOCTOU window open -- Codex P1, manta#191 round 1).
+    uses: HagaleTechnologies/credenza/.github/workflows/dependabot-auto-merge.yml@f25c58c2cee9257cc98c49b77a9ad96d37684ea5
     with:
       base_branch: main
-      should_merge: ${{ needs.check-needs-human.outputs.should_merge == 'true' }}
+      merge_blocking_label: needs-human
     secrets:
       approve_pat: ${{ secrets.DEPENDABOT_APPROVE_PAT }}
