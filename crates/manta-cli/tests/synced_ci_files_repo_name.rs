@@ -173,7 +173,12 @@ fn merge_policy_successor_to_mergify_exists() {
     // reading a step's `run:` without asking whether Actions runs the step at
     // all would still be satisfied by a call inside a step -- or a job -- that
     // an `if: false` parks, whose shell is never handed to a shell (PR #93
-    // review, round 15).
+    // review, round 15); and splitting a command at every unquoted `&`, or
+    // reading a pipeline's status off its last member alone, would still be
+    // satisfied by a call written under `false &>/dev/null` -- whose `&` is a
+    // redirection, not the background operator that would spare that `false`
+    // from errexit -- or under the `false | true` an explicit `shell: bash`
+    // step runs with `-o pipefail` (PR #93 review, round 16).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -189,7 +194,9 @@ fn merge_policy_successor_to_mergify_exists() {
          does naming it only behind a constant gate (`false &&`, the body of \
          `if false`), in the body of a function nothing calls, below an \
          `exit`, below a `break` in the same loop body, or below a bare \
-         `false` the step's own `bash -e` exits on, or writing it in a step \
+         `false` the step's own `bash -e` exits on -- in any spelling of its \
+         redirections, `false &>/dev/null` included -- or below a pipeline \
+         `pipefail` fails in an explicit `shell: bash` step, or writing it in a step \
          (or job) a statically false `if:` parks -- see `arms_auto_merge`). \
          That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
@@ -270,7 +277,14 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    (`shell_is_modelled`). Reading that round again closed the spelling it
 ///    left: an operator needs no space in front of it to be one, so
 ///    `false>/dev/null` is split at the `>` and ends the step too
-///    (`redirection_split`).
+///    (`redirection_split`). Round 16 closed the two ways a *status* could
+///    still be misread: an `&` that belongs to a redirection (`false
+///    &>/dev/null`, `false 2>&1`) is no longer split off as a background
+///    operator that would exempt the `false` from errexit
+///    (`simple_commands`, `REDIRECTION_OPERATORS`), and a pipeline in a step
+///    that names `shell: bash` -- which Actions runs with `-o pipefail` -- now
+///    fails when any member does, so `false | true` ends the step
+///    (`WorkflowShell::pipefail`, `ShellState::pipeline_failed`).
 ///
 /// 5. **The step runs at all.** Everything above reads shell; Actions decides
 ///    separately whether the step is handed to a shell in the first place. A
@@ -304,7 +318,8 @@ fn merge_policy_successor_to_mergify_exists() {
 /// errors point the same way: the guard fails loudly and a human looks, rather
 /// than a definition nobody calls standing in for a merge path.
 fn arms_auto_merge(body: &str) -> bool {
-    simple_commands(&run_shell(body))
+    let shell = run_shell(body);
+    simple_commands(&shell.text, shell.pipefail)
         .iter()
         .any(|command| !command.unreachable && is_gh_auto_merge(&command.words))
 }
@@ -345,12 +360,13 @@ fn is_gh_auto_merge(command: &[String]) -> bool {
 /// exactly as a real shell would, and so does a `<<` this reader cannot find a
 /// delimiter word for. Both make the guard *harder* to satisfy, which is the
 /// direction it has to err in.
-fn run_shell(body: &str) -> String {
+fn run_shell(body: &str) -> WorkflowShellText {
     let mut shell = String::new();
     // Here-documents opened but not yet closed, in the order their bodies
     // follow: `cat <<A <<B` reads A's body first, then B's.
     let mut open_heredocs: Vec<Heredoc> = Vec::new();
-    for line in folded_run_lines(body) {
+    let (lines, pipefail) = folded_run_lines(body);
+    for line in lines {
         if let Some(current) = open_heredocs.first() {
             if current.terminated_by(&line) {
                 open_heredocs.remove(0);
@@ -363,7 +379,17 @@ fn run_shell(body: &str) -> String {
         shell.push('\n');
         open_heredocs.extend(heredocs_opened(executable));
     }
-    shell
+    WorkflowShellText {
+        text: shell,
+        pipefail,
+    }
+}
+
+/// A workflow's whole `run:` shell text, plus how the shell it was written for
+/// treats a failed pipeline member. See `WorkflowShell::pipefail`.
+struct WorkflowShellText {
+    text: String,
+    pipefail: bool,
 }
 
 /// A here-document opened by `<<WORD` and still swallowing lines.
@@ -546,9 +572,16 @@ fn heredoc_delimiter(chars: &mut Peekable<Chars<'_>>, strip_tabs: bool) -> Hered
 /// stdin data bash hands to `cat` (PR #93 review, round 12). Only a line
 /// *folded onto* a previous one is trimmed, because that is what YAML folding
 /// does to it.
-fn folded_run_lines(body: &str) -> Vec<String> {
+///
+/// The `pipefail` flag `run_shell_lines` decided is carried straight through:
+/// folding is YAML's business and says nothing about the interpreter.
+fn folded_run_lines(body: &str) -> (Vec<String>, bool) {
     let mut lines: Vec<String> = Vec::new();
-    for run_line in run_shell_lines(body) {
+    let WorkflowShell {
+        lines: run_lines,
+        pipefail,
+    } = run_shell_lines(body);
+    for run_line in run_lines {
         match lines.last_mut() {
             Some(last) if run_line.folded_onto_previous => {
                 last.push(' ');
@@ -557,7 +590,7 @@ fn folded_run_lines(body: &str) -> Vec<String> {
             _ => lines.push(run_line.text.to_owned()),
         }
     }
-    lines
+    (lines, pipefail)
 }
 
 /// One simple command read out of `run:` shell.
@@ -724,11 +757,17 @@ fn without_redirections<'a>(words: impl Iterator<Item = &'a str>) -> Vec<&'a str
 /// An optional file-descriptor number may precede the operator and belongs to
 /// the redirection rather than to the command -- but only where the digits are
 /// the whole word before it, which is bash's own rule: `2>err` redirects fd 2,
-/// while `log2>err` runs `log2`. `2>&1` and `&>f` cannot reach here whole: `&`
-/// is one of the characters `simple_commands` breaks commands at, so such a
-/// word never arrives whole -- and the boundary it manufactures already exempts
-/// what precedes it from errexit (`Follower::Background`), the permissive
-/// direction this reader was already taking there.
+/// while `log2>err` runs `log2`.
+///
+/// The ampersand spellings (`&>f`, `&>>f`, `2>&1`, `>&2`) are redirections too,
+/// and they reach here whole because `simple_commands` now reads them before it
+/// splits at `&`. Splitting first was not the harmless permissive shortcut the
+/// note here used to claim: `false &>/dev/null` was cut into a `false` the
+/// manufactured `&` boundary then exempted from errexit as a *backgrounded*
+/// command (`Follower::Background`), so the step read as still running and a
+/// `gh pr merge ... --auto` written below it was handed back as a live merge
+/// path -- while the real `bash -e` had already exited on that `false` (PR #93
+/// review, round 16).
 fn redirection_split(word: &str) -> Option<(&str, &str)> {
     let (at, operator) = word.char_indices().find_map(|(at, _)| {
         REDIRECTION_OPERATORS
@@ -747,9 +786,11 @@ fn redirection_split(word: &str) -> Option<(&str, &str)> {
 }
 
 /// The redirection operators, longest spelling first so `<<-` is never read as
-/// a `<<` taking `-` as its delimiter.
-const REDIRECTION_OPERATORS: [&str; 10] =
-    ["<<<", "<<-", "<<", "<&", "<>", "<", ">>", ">|", ">&", ">"];
+/// a `<<` taking `-` as its delimiter, and `&>>` never as an `&>` writing to a
+/// file called `>log`.
+const REDIRECTION_OPERATORS: [&str; 12] = [
+    "&>>", "&>", "<<<", "<<-", "<<", "<&", "<>", "<", ">>", ">|", ">&", ">",
+];
 
 /// One `if`/`while`/`until`/`for`/`case` block enclosing the command being
 /// read, and what the block's own condition settles statically about its body.
@@ -1039,8 +1080,11 @@ enum Follower {
     /// not track which member is last, so it exempts them all -- the permissive
     /// direction, but the only one that cannot mis-read `false && cmd`.
     Conditional,
-    /// `|`: a non-final pipeline member's status is discarded. (The *final*
-    /// member is followed by something else, so it arrives here as `List`.)
+    /// `|`: a non-final pipeline member's status is discarded -- *unless* the
+    /// shell runs with `pipefail`, where any member's failure becomes the
+    /// pipeline's own status and errexit reads it at the pipeline's end. (The
+    /// *final* member is followed by something else, so it arrives here as
+    /// `List`.) See `ShellState::pipefail`.
     Pipe,
     /// `&`: the command runs asynchronously and its status never reaches
     /// errexit at all.
@@ -1055,10 +1099,28 @@ enum Follower {
 /// `is_constant_status` as a bare `false`, because `significant_words` drops
 /// the `elif` that introduces it; `if false`/`while false`/`until false` keep
 /// their keyword at the head and never look like one.
-fn fails_under_errexit(words: &[String], follower: Follower) -> bool {
+///
+/// `pipeline_failed` carries the other way a status this reader can settle
+/// arrives at a `List` boundary: an earlier member of the pipeline this command
+/// ends failed, and under `pipefail` that failure *is* the pipeline's status
+/// however the last member exited. So `false | true` ends a `shell: bash` step
+/// exactly as a bare `false` does -- reading only the final member left it
+/// certifying a workflow whose `gh pr merge ... --auto` the shell is already
+/// gone before it reads (PR #93 review, round 16). See `ShellState::pipefail`.
+fn fails_under_errexit(words: &[String], follower: Follower, pipeline_failed: bool) -> bool {
     if follower != Follower::List {
         return false;
     }
+    pipeline_failed || is_statically_failing(words)
+}
+
+/// Is `words` -- one simple command -- a bare `false` whose status is its own?
+///
+/// Split out of `fails_under_errexit` because a pipeline member's failure has
+/// to be recognised at a `Pipe` boundary, where errexit itself does not act
+/// yet: under `pipefail` it is remembered and read at the pipeline's end
+/// instead (`ShellState::pipeline_failed`).
+fn is_statically_failing(words: &[String]) -> bool {
     if command_head(words) != Some(STATICALLY_FAILING_COMMAND) || !is_constant_status(words) {
         return false;
     }
@@ -1266,8 +1328,16 @@ fn push_simple_command(
     let opens_block = BLOCK_OPENERS.contains(&head);
     let closes_block = BLOCK_CLOSERS.contains(&head);
     // `exit`/`exec` end the shell outright; a bare `false` ends it just as
-    // surely under the `bash -e` an Actions step runs by default.
-    let ends_shell = TERMINATING_COMMANDS.contains(&head) || fails_under_errexit(&words, follower);
+    // surely under the `bash -e` an Actions step runs by default -- and so does
+    // a pipeline any member of which failed, once `pipefail` is on.
+    let ends_shell = TERMINATING_COMMANDS.contains(&head)
+        || fails_under_errexit(&words, follower, state.pipeline_failed);
+    // What this command leaves for the rest of its pipeline, read before
+    // anything below can end the shell: a `Pipe` boundary carries the failure
+    // forward under `pipefail`, and every other boundary ends the pipeline.
+    state.pipeline_failed = follower == Follower::Pipe
+        && state.pipefail
+        && (state.pipeline_failed || is_statically_failing(&words));
     let ends_loop_body = LOOP_CONTROL_COMMANDS.contains(&head);
     // Unconditionally: the scope is a state machine and every command has to
     // pass through it, not just the ones that end up unreachable.
@@ -1343,6 +1413,20 @@ struct ShellState {
     /// -e` an Actions step runs by default -- and never cleared: the shell is
     /// gone, so every command after one is text nothing executes.
     terminated: bool,
+    /// Whether the shell this text was written for runs with `pipefail`, so a
+    /// failed member anywhere in a pipeline is the pipeline's own status.
+    ///
+    /// Actions runs an unqualified `run:` under `bash -e {0}` and a `shell: sh`
+    /// one under `sh -e {0}` -- neither sets `pipefail`, so there
+    /// `false | true` succeeds and the step continues. An explicit `shell:
+    /// bash` is `bash --noprofile --norc -eo pipefail {0}`, where the same
+    /// pipeline fails and errexit ends the step. `run_shell_lines` decides
+    /// which reading applies.
+    pipefail: bool,
+    /// Whether a member of the pipeline currently being read has already
+    /// failed. Set at a `Pipe` boundary under `pipefail`, read by the command
+    /// that ends the pipeline, and cleared by every other boundary.
+    pipeline_failed: bool,
 }
 
 impl ShellState {
@@ -1398,6 +1482,17 @@ impl ShellState {
 /// in whatever token they appear in, which can only ever make a match *harder* to
 /// achieve -- the direction this guard needs to err in.
 ///
+/// Not every `&` is a boundary, though: bash reads `&>`, `&>>`, `2>&1` and
+/// `>&2` as redirection *syntax* of the command they are written on, and the
+/// operator is recognised here before the split. Splitting first manufactured a
+/// background boundary out of `false &>/dev/null`, which then exempted that
+/// `false` from errexit and handed back the dead text under it as a live merge
+/// path (PR #93 review, round 16).
+///
+/// `pipefail` says whether the shell this text was written for turns a failed
+/// pipeline member into the pipeline's own status; it reaches errexit through
+/// `ShellState::pipeline_failed`.
+///
 /// Boundaries are not all alike, and reading them as if they were is what let a
 /// dead branch certify this guard (PR #93 review, round 6). `;`, `&` and a
 /// newline end a command and start a fresh, ungated list; `&&` and `||` end a
@@ -1413,7 +1508,7 @@ impl ShellState {
 /// terminating-command latch tracked by `push_simple_command`, that is every
 /// way this reader knows of for shell text to sit in the file without ever
 /// running.
-fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
+fn simple_commands(shell: &str, pipefail: bool) -> Vec<SimpleCommand> {
     let mut commands: Vec<SimpleCommand> = Vec::new();
     let mut command: Vec<String> = Vec::new();
     // One flag per word of `command`: did any of that word's text come out of
@@ -1429,7 +1524,10 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     let mut gate = Gate::default();
     // The block stack, function scope and termination latch, stepped by every
     // command `push_simple_command` records.
-    let mut state = ShellState::default();
+    let mut state = ShellState {
+        pipefail,
+        ..ShellState::default()
+    };
     let mut chars = shell.chars().peekable();
 
     // Close off the token being built, if any.
@@ -1477,6 +1575,18 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                         token_quoted = true;
                     }
                 },
+                // An `&` written as part of a redirection is syntax of the
+                // command being read, not a boundary after it: `&>`/`&>>` open
+                // one, and an `&` immediately behind a `>` or `<` names a file
+                // descriptor (`2>&1`, `>&2`, `<&0`). Reading them as background
+                // operators cut `false &>/dev/null` into a `false` this reader
+                // then exempted from errexit, so the step read as still running
+                // (PR #93 review, round 16). Anything else keeps its old
+                // meaning: `cmd &` still backgrounds, `a && b` still gates.
+                '&' if chars.peek() == Some(&'>') || (started && token.ends_with(['>', '<'])) => {
+                    token.push(c);
+                    started = true;
+                }
                 ';' | '&' | '|' | '\n' => {
                     end_token!();
                     // `&&` and `||` are two characters, and the only boundaries
@@ -1786,8 +1896,12 @@ fn source_lines(body: &str) -> impl Iterator<Item = &str> {
 /// Anything else this reader cannot recognise is simply not returned, so an
 /// unhandled spelling makes the guard fail loudly rather than pass vacuously;
 /// that is the direction this guard needs to err in.
-fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
+fn run_shell_lines(body: &str) -> WorkflowShell<'_> {
     let mut shell = Vec::new();
+    // Set by any `shell: bash` key in the file, at step level or in a
+    // `defaults: run:` -- see `WorkflowShell::pipefail` for why one key decides
+    // it for the whole file.
+    let mut pipefail = false;
     let mut block: Option<BlockScalar> = None;
     // The indent of the `steps:` key currently in effect, and the column at
     // which the current step's own keys sit. A `run:` counts only at that
@@ -1926,6 +2040,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
         };
         let value = value.trim();
         if name == "shell" {
+            pipefail = pipefail || shell_enables_pipefail(value);
             let modelled = shell_is_modelled(value);
             if Some(key_indent) == step_key_indent {
                 step_shell_is_modelled = modelled;
@@ -1987,7 +2102,36 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
     // A block scalar the file simply ends inside still closes there.
     close_block(block.take(), &mut disabled, &mut shell, step_run_start);
 
-    shell
+    WorkflowShell {
+        lines: shell,
+        pipefail,
+    }
+}
+
+/// Every step's `run:` shell in one workflow, plus how the shell it is handed
+/// to treats a failed pipeline member.
+struct WorkflowShell<'a> {
+    lines: Vec<RunLine<'a>>,
+    /// True when any `shell:` key in the file names bash explicitly, so
+    /// `pipefail` is on: Actions runs `shell: bash` as `bash --noprofile --norc
+    /// -eo pipefail {0}`, while the *absent* field is `bash -e {0}` and
+    /// `shell: sh` is `sh -e {0}` -- neither of those sets it. Under `pipefail`
+    /// a failed member anywhere in a pipeline is the pipeline's own status, so
+    /// `false | true` ends the step; without it only the last member's status
+    /// counts and the step runs on. Reading every step as though `pipefail`
+    /// were off let an explicit-bash step arm this guard with a `gh pr merge
+    /// ... --auto` its own shell is already gone before it reads (PR #93
+    /// review, round 16).
+    ///
+    /// One key decides it for the *whole file* rather than per step, for the
+    /// reason `unmodelled_shell_default` and `Disablement::outer` are file-wide
+    /// too: this reader concatenates every step's `run:` into one shell text
+    /// and has no per-step scope to hang the flag on. That over-reads -- a
+    /// default-shell step's `false | cat` is read under `pipefail` because some
+    /// *other* step named bash -- and over-reading refuses text a human can see
+    /// is live, which costs a loud failure, while under-reading would certify a
+    /// merge path that is not one.
+    pipefail: bool,
 }
 
 /// Finish a block scalar, reading an `if:` verdict out of the content it
@@ -2022,12 +2166,29 @@ fn close_block<'a>(
 /// interpreter drops the run block it governs, so the guard fails loudly and a
 /// human looks -- the direction every other rule in this reader errs in too.
 fn shell_is_modelled(value: &str) -> bool {
+    matches!(shell_name(value), "bash" | "sh")
+}
+
+/// Does this `shell:` value name the one interpreter Actions runs with
+/// `pipefail` on?
+///
+/// `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`; the absent
+/// field (`bash -e {0}`) and `shell: sh` (`sh -e {0}`) are not. GitHub
+/// documents the difference, and `auto-merge-trigger.yml`'s own step comment
+/// relies on it ("this step's default shell has no `pipefail`").
+fn shell_enables_pipefail(value: &str) -> bool {
+    shell_name(value) == "bash"
+}
+
+/// The interpreter named by a `shell:` value, with YAML's inline comment and
+/// either quoting style removed.
+fn shell_name(value: &str) -> &str {
     // YAML's own inline comment (` #`), then either quoting style.
     let value = match value.split_once(" #") {
         Some((head, _)) => head.trim(),
         None => value.trim(),
     };
-    let value = value
+    value
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .or_else(|| {
@@ -2035,8 +2196,7 @@ fn shell_is_modelled(value: &str) -> bool {
                 .strip_prefix('\'')
                 .and_then(|rest| rest.strip_suffix('\''))
         })
-        .unwrap_or(value);
-    matches!(value, "bash" | "sh")
+        .unwrap_or(value)
 }
 
 /// The executable part of `line` -- everything before its first `#`.
@@ -2865,6 +3025,32 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     assert!(!arms_auto_merge(&workflow(
         "          false>/dev/null && gh pr merge \"$PR_URL\" --auto\n"
     )));
+    // ...and including every spelling that writes the operator with an `&` in
+    // it, which this reader used to cut into a command boundary: the `&` of
+    // `&>`/`&>>` and of an fd duplication (`2>&1`, `>&2`) is redirection
+    // syntax, not the background operator, so errexit still sees the `false`
+    // (PR #93 review, round 16).
+    assert!(!arms_auto_merge(&workflow(
+        "          false &>/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false &> /dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false &>>log\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false 2>&1\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false >/dev/null 2>&1\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false>&2\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false &>/dev/null && gh pr merge \"$PR_URL\" --auto\n"
+    )));
     // The same word is not an argument to a *gate* either, so what a redirected
     // constant status settles statically stays settled.
     assert!(!arms_auto_merge(&workflow(
@@ -2886,9 +3072,16 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     assert!(arms_auto_merge(&workflow(
         "          false | cat\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
-    // ...a backgrounded command's never reaches errexit at all...
+    // ...a backgrounded command's never reaches errexit at all -- the real `&`,
+    // which is still a boundary wherever it is not part of a redirection...
     assert!(arms_auto_merge(&workflow(
         "          false &\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          false >/dev/null &\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          false& gh pr merge \"$PR_URL\" --auto\n"
     )));
     // ...`!` inverts it...
     assert!(arms_auto_merge(&workflow(
@@ -2953,6 +3146,71 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     )));
     assert!(arms_auto_merge(&workflow(
         "          log2>err\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// An explicit `shell: bash` step runs under `-o pipefail`, so a failed member
+/// anywhere in a pipeline is the pipeline's own status and errexit ends the
+/// step there -- the property PR #93's review asked for in round 16. Reading
+/// only the pipeline's *last* member let `false | true` certify a step whose
+/// shell is gone before it reaches the `gh` line below.
+#[test]
+fn arms_auto_merge_models_pipefail_for_explicit_bash_steps() {
+    let bash = |shell: &str| {
+        format!("jobs:\n  m:\n    steps:\n      - shell: bash\n        run: |\n{shell}")
+    };
+    let default_shell = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case: under `pipefail` the pipeline fails although its
+    // last member succeeded.
+    assert!(!arms_auto_merge(&bash(
+        "          false | true\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&bash(
+        "          false | cat | wc -l\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A `defaults: run: shell: bash` turns it on for the steps it governs just
+    // as a step's own field does.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    defaults:\n      run:\n        shell: bash\n    steps:\n      - run: |\n          false | true\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // The flag is file-wide, not per step: a step that names bash puts every
+    // pipeline in the file under `pipefail`. That over-reads on purpose -- see
+    // `WorkflowShell::pipefail` -- and over-reading costs a loud failure, which
+    // is the direction this guard errs in everywhere else.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - shell: bash\n        run: echo one\n      - run: |\n          false | cat\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+
+    // --- what must still count --------------------------------------------
+    // Without an explicit bash there is no `pipefail`: Actions runs a bare
+    // `run:` under `bash -e {0}` and `shell: sh` under `sh -e {0}`, where only
+    // the pipeline's last member decides its status.
+    assert!(arms_auto_merge(&default_shell(
+        "          false | true\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - shell: sh\n        run: |\n          false | cat\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // `pipefail` does not make a pipeline out of a `||`, and it does not reach
+    // past the pipeline it belongs to either.
+    assert!(arms_auto_merge(&bash(
+        "          false || true\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&bash(
+        "          grep -q x f | cat\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A pipeline whose failure is consumed -- by `&&`/`||`, by `&`, by `!`, or
+    // by standing where the shell need not reach it -- ends nothing, exactly as
+    // a bare `false` in the same place does.
+    assert!(arms_auto_merge(&bash(
+        "          false | true && echo armed\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&bash(
+        "          false | true &\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&bash(
+        "          if [ -z \"$PR_URL\" ]; then false | true; fi\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
 
