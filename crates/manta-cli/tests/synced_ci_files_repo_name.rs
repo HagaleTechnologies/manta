@@ -149,7 +149,12 @@ fn merge_policy_successor_to_mergify_exists() {
     // only in its `true`/`false` spelling, would still be satisfied by a call
     // a nested group's `}` had freed from an `arm(){ ... }` nothing calls, or
     // by one written below `if :; then exit 0; fi` or
-    // `for f in a b; do exit 0; done` (PR #93 review, round 10).
+    // `for f in a b; do exit 0; done` (PR #93 review, round 10); and reading a
+    // brace off a word without asking where in the command it stands, or
+    // applying a settled `if`'s verdict to every one of its arms, would still
+    // be satisfied by a call a bare `echo }` had freed from that same uncalled
+    // function, or by one written in the `else` of `if true` -- an arm the
+    // shell never executes (PR #93 review, round 11).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -220,7 +225,14 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    opening brace (`arm(){`) now opens the body at depth one, so a nested
 ///    group's `}` no longer ends it early (`opening_braces`), and a block is
 ///    settled by `:` as well as by `true`, and by a `for` over a list of plain
-///    literal words (`constant_condition`, `for_list_is_certain`).
+///    literal words (`constant_condition`, `for_list_is_certain`). Round 11
+///    closed the last spelling of each: `}` is the shell's body-closing
+///    reserved word only in *command position*, so a bare `echo }` no longer
+///    balances a body the way `echo "}"` once did (`FunctionScope::absorb`),
+///    and a settled `if` now inverts its verdict at `elif`/`else` instead of
+///    applying the opener's to the whole block, so the `else` of `if true` is
+///    read as the dead text it is -- and the `else` of `if false` as the branch
+///    the shell takes (`Block::enter_arm`).
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -575,6 +587,90 @@ struct Block {
     /// `gh pr merge "$PR_URL" --auto` classified as a reachable merge path,
     /// although the shell was already gone before it (PR #93 review, round 9).
     body_is_guaranteed: bool,
+    /// True for an `if`, the one block whose body is split into *arms* by
+    /// `elif` and `else`. A `while`/`until`/`for`/`case` body is one region,
+    /// and nothing in it inverts what the opener settled.
+    is_if: bool,
+    /// True once an *earlier* arm of this `if` is certain to run, so every arm
+    /// after it is dead however its own condition reads: the shell has already
+    /// committed to a branch by the time it reaches them.
+    earlier_arm_is_certain: bool,
+    /// True while *every* earlier arm of this `if` is dead, which is what makes
+    /// a closing `else` certain to run. Vacuously true at the opener, since an
+    /// `if` has no arms before its first one.
+    every_earlier_arm_is_dead: bool,
+}
+
+impl Block {
+    /// Step this block onto the arm that `elif`/`else` opens, re-deciding what
+    /// is settled about the text that follows.
+    ///
+    /// The opener's verdict describes the *first* arm only, and applying it to
+    /// the whole block read the `else` of `if true` -- text the shell can never
+    /// reach, since the `then` arm always wins -- as an ordinary live branch.
+    /// A `gh pr merge ... --auto` written there satisfied this guard with no
+    /// executed auto-merge path in the file at all (PR #93 review, round 11).
+    ///
+    /// The inversion is exact in both directions, and each one matters:
+    /// `if true`'s later arms are dead, and `if false`'s `else` is *certain* --
+    /// which is what lets an `exit` written in it end the shell for the text
+    /// below the block, exactly as one in the body of `if true` does.
+    /// `elif` re-reads its own condition, but only while every arm before it is
+    /// dead; once one is merely uncertain, so is everything after it.
+    fn enter_arm(&mut self, introducer: &str, condition: &[&str]) {
+        if !self.is_if {
+            return;
+        }
+        self.earlier_arm_is_certain |= self.body_is_guaranteed;
+        self.every_earlier_arm_is_dead &= self.body_is_dead;
+        let settled = if self.earlier_arm_is_certain {
+            // An earlier branch always wins, so this one never runs.
+            Some(false)
+        } else if self.every_earlier_arm_is_dead {
+            match introducer {
+                // Every condition before it failed statically, so the `else` is
+                // the branch the shell takes.
+                "else" => Some(true),
+                // `elif`: its own condition decides, on the same terms the
+                // opener's did.
+                _ => constant_condition(condition),
+            }
+        } else {
+            // An earlier arm may or may not have been taken, so nothing about
+            // this one is settled.
+            None
+        };
+        (self.body_is_dead, self.body_is_guaranteed) = match settled {
+            Some(true) => (false, true),
+            Some(false) => (true, false),
+            None => (false, false),
+        };
+    }
+}
+
+/// The `elif`/`else` arm this simple command opens, with the condition words
+/// that follow an `elif`, or `None` when it opens no arm at all.
+///
+/// This reader breaks commands at `;`, `&`, `|` and newline only, so an arm's
+/// introducer arrives at the head of the command it introduces (`else`, or
+/// `else gh pr merge ... --auto` written on one line) rather than as a command
+/// of its own -- the same reason `BODY_INTRODUCERS` exists. A brace group's `{`
+/// is skipped ahead of it for the same reason `command_head` skips it.
+fn arm_introducer(words: &[String]) -> Option<(&str, Vec<&str>)> {
+    let mut words = words
+        .iter()
+        .map(String::as_str)
+        .skip_while(|word| *word == "{");
+    let introducer = words.next()?;
+    if introducer != "else" && introducer != "elif" {
+        return None;
+    }
+    // `elif false; then ...` splits at the `;`, so the condition is what is
+    // left of this command -- but stop at a `then` that stayed on it anyway.
+    let condition = words
+        .take_while(|word| !BODY_INTRODUCERS.contains(word))
+        .collect();
+    Some((introducer, condition))
 }
 
 /// What `words` -- a block opener -- settles statically about the body that
@@ -599,10 +695,13 @@ struct Block {
 ///   guaranteed exit; `for f in $LIST` (which may expand to nothing) and
 ///   `for f in *.log` (which may match nothing) are not, and stay skippable.
 ///
-/// `if true` is over-read on purpose, in the direction this guard errs in: an
-/// `exit` in the `else` arm of `if true` never actually runs, but letting it
-/// latch termination anyway only ever refuses *more* text below the block. A
-/// `case` whose subject is a literal that one of its patterns must match is
+/// What this decides is the *first* arm of the block, and nothing more. An
+/// `if` splits its body at `elif`/`else`, and applying the opener's verdict to
+/// every arm read the `else` of `if true` -- which the shell can never reach --
+/// as a live branch, so a `gh pr merge ... --auto` written there certified this
+/// guard with no executed merge path in the file (PR #93 review, round 11).
+/// `Block::enter_arm` steps the verdict onto each later arm; this function only
+/// seeds it. A `case` whose subject is a literal that one of its patterns must match is
 /// the one settled shape still read as skippable: matching shell patterns to
 /// decide it is more machinery than this tripwire should carry, and the error
 /// it leaves is bounded by every other rule here.
@@ -612,6 +711,9 @@ fn block_from_opener(words: &[String]) -> Block {
         return Block {
             body_is_dead: false,
             body_is_guaranteed: false,
+            is_if: false,
+            earlier_arm_is_certain: false,
+            every_earlier_arm_is_dead: true,
         };
     };
     let condition: Vec<&str> = significant.collect();
@@ -630,6 +732,9 @@ fn block_from_opener(words: &[String]) -> Block {
     Block {
         body_is_dead,
         body_is_guaranteed,
+        is_if: head == "if",
+        earlier_arm_is_certain: false,
+        every_earlier_arm_is_dead: true,
     }
 }
 
@@ -745,17 +850,40 @@ impl FunctionScope {
     /// glued brace off the tail of a longer word; a `}` glued to one is
     /// deliberately *not* read, since leaving it uncounted only keeps a body
     /// open for longer -- the direction this reader is allowed to err in.
+    ///
+    /// Quoting is not the only way a brace reaches this reader as *text*, which
+    /// is the last spelling of that leak (PR #93 review, round 11, asking for
+    /// quote provenance "or fail closed on ambiguous brace tokens"). `}` is a
+    /// reserved word only in **command position**; `echo }` passes a bare,
+    /// unquoted, entirely ordinary argument, and counting it closed an uncalled
+    /// function one brace early just as `echo "}"` used to. Only the command's
+    /// own first word is read as a closer now -- which is exactly the rule the
+    /// shell itself applies -- and every other brace token is left uncounted,
+    /// keeping the body open rather than freeing what follows it.
     fn absorb(&mut self, words: &[String], quoted: &[bool]) -> bool {
         let inside = self.open;
         if !self.open && is_function_definition(words) {
             self.open = true;
         }
         if self.open {
+            // Where this command's own first word stands. A `}` is the reserved
+            // word that closes a body only in *command position*; anywhere else
+            // the shell reads it as an ordinary argument, which is what `echo }`
+            // and `printf '%s\n' }` are.
+            let command_position = words
+                .iter()
+                .position(|word| word != "{" && !BODY_INTRODUCERS.contains(&word.as_str()));
             for (idx, word) in words.iter().enumerate() {
                 // Text that came out of quotes or a backslash escape is an
                 // argument, never the shell's own brace. Missing provenance is
                 // read as unquoted, which is how every word behaved before.
                 if quoted.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                if word == "}" && Some(idx) != command_position {
+                    // An argument that happens to be a brace. Leaving it
+                    // uncounted only keeps the body open for longer, which is
+                    // the direction this reader is allowed to err in.
                     continue;
                 }
                 if word == "}" {
@@ -849,6 +977,14 @@ fn push_simple_command(
 ) {
     if words.is_empty() {
         return;
+    }
+    // An `elif`/`else` re-decides what the enclosing `if` settles, before
+    // anything about *this* command is read: it is the first command of the new
+    // arm, not the last of the old one.
+    if let Some((introducer, condition)) = arm_introducer(&words) {
+        if let Some(block) = state.blocks.last_mut() {
+            block.enter_arm(introducer, &condition);
+        }
     }
     let head = command_head(&words).unwrap_or("{");
     let opens_block = BLOCK_OPENERS.contains(&head);
@@ -1549,6 +1685,16 @@ fn arms_auto_merge_rejects_uncalled_function_bodies() {
     assert!(!arms_auto_merge(&workflow(
         "          arm() {\n            echo \\}\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
     )));
+    // Quoting is not the only way a brace arrives as ordinary text: `}` is the
+    // reserved word that closes a body only in *command position*, so a bare
+    // `echo }` passes an argument exactly as `echo "}"` does and must not
+    // balance the body either (PR #93 review, round 11).
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            echo }\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            printf '%s' }\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
     // ...and the same trick with the *opening* brace must not smuggle the call
     // out of the body either.
     assert!(!arms_auto_merge(&workflow(
@@ -1728,6 +1874,74 @@ fn arms_auto_merge_rejects_shell_below_a_terminating_command() {
     // its `exit` runs only when something calls `bail`.
     assert!(arms_auto_merge(&workflow(
         "          bail() { exit 1; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// An `if` whose condition is settled statically splits into arms the shell
+/// can and cannot reach, and the opener settles only the *first* of them (PR
+/// #93 review, round 11: the opener's verdict was applied to the whole block,
+/// so `if true; then ...; else gh pr merge "$PR_URL" --auto; fi` -- an `else`
+/// arm the shell never executes -- was read as a live automated merge path).
+#[test]
+fn arms_auto_merge_rejects_dead_arms_of_a_settled_if() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case: `if true` always takes its `then` arm, so the
+    // `else` below it is text, not a merge path.
+    assert!(!arms_auto_merge(&workflow(
+        "          if true\n          then\n            echo standing down\n          else\n            gh pr merge \"$PR_URL\" --auto --squash\n          fi\n"
+    )));
+    // `:` is `true` under another name here, exactly as it is in the opener.
+    assert!(!arms_auto_merge(&workflow(
+        "          if :; then\n            echo standing down\n          else\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    // Once an arm is certain, every arm after it is dead whatever its own
+    // condition reads -- the shell has already committed to a branch.
+    assert!(!arms_auto_merge(&workflow(
+        "          if true\n          then\n            echo ok\n          elif [ -n \"$PR_URL\" ]\n          then\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          if true\n          then\n            echo ok\n          elif [ -n \"$PR_URL\" ]\n          then\n            echo x\n          else\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    // An `elif` re-reads its own condition, so a constantly false one is dead
+    // on its own terms even where every arm before it failed too.
+    assert!(!arms_auto_merge(&workflow(
+        "          if false\n          then\n            echo x\n          elif false\n          then\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // The mirror image, and the reason the inversion is exact rather than
+    // one-directional: the `else` of `if false` is the branch the shell *takes*.
+    assert!(arms_auto_merge(&workflow(
+        "          if false\n          then\n            echo x\n          else\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    // A real condition settles nothing about either arm -- which is the shape
+    // auto-merge-trigger.yml itself arms from, so refusing it refuses the
+    // working workflow.
+    assert!(arms_auto_merge(&workflow(
+        "          if grep -qxF needs-human labels\n          then\n            echo standing down\n          else\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          if false\n          then\n            echo x\n          elif grep -qxF ready labels\n          then\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    // An `else` belongs to the innermost `if`, not to the settled one around it.
+    assert!(arms_auto_merge(&workflow(
+        "          if true\n          then\n            if grep -q x f\n            then\n              echo x\n            else\n              gh pr merge \"$PR_URL\" --auto\n            fi\n          fi\n"
+    )));
+    // `fi` ends the block: shell below it is unconditional again, whatever the
+    // arms settled.
+    assert!(arms_auto_merge(&workflow(
+        "          if true\n          then\n            echo ok\n          else\n            echo never\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Certainty follows the arm the shell must take: an `exit` in the `else` of
+    // `if false` really does run, so the call below the block is dead...
+    assert!(!arms_auto_merge(&workflow(
+        "          if false\n          then\n            echo x\n          else\n            exit 0\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...while one in the `else` of `if true` ends nothing, because the shell
+    // never reaches it -- so the call below that block is a merge path.
+    assert!(arms_auto_merge(&workflow(
+        "          if true\n          then\n            echo ok\n          else\n            exit 0\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
 
