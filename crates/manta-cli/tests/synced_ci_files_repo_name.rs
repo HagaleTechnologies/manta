@@ -121,9 +121,12 @@ fn merge_policy_successor_to_mergify_exists() {
     // stayed green even with the arming step deleted (PR #93 review); a
     // comment-stripping scan of *every* line would still be satisfied by a step
     // `name:` or an `env:` value carrying the same text (PR #93 review, round
-    // 2); and scanning `run:` shell for two independent substrings would still
-    // be satisfied by `echo "gh pr merge --auto"` or `CMD="gh pr merge --auto"`,
-    // which invoke nothing (PR #93 review, round 3).
+    // 2); scanning `run:` shell for two independent substrings would still be
+    // satisfied by `echo "gh pr merge --auto"` or `CMD="gh pr merge --auto"`,
+    // which invoke nothing (PR #93 review, round 3); and taking *every* `run:`
+    // key as shell would still be satisfied by a mapping merely named `run`
+    // (an `env:` child, a `with:` input, `jobs.<id>.defaults.run`), which
+    // executes nothing either (PR #93 review, round 4).
     assert!(
         arms_auto_merge(&body),
         "{rel} no longer arms auto-merge: no `run:` shell in it *invokes* \
@@ -141,9 +144,12 @@ fn merge_policy_successor_to_mergify_exists() {
 ///
 /// Two conditions, both necessary:
 ///
-/// 1. **Position in the file.** Only `run:` content counts. A header comment, a
-///    step `name:`, an `env:` value or a `with:` input can all carry the exact
-///    command text while the workflow does nothing at all.
+/// 1. **Position in the file.** Only a *step's own* `run:` content counts. A
+///    header comment, a step `name:`, an `env:` value or a `with:` input can
+///    all carry the exact command text while the workflow does nothing at all
+///    -- and so can a mapping whose key happens to be `run` but which is not a
+///    step's `run:` field (`jobs.<id>.defaults.run`, an `env:` child called
+///    `run`). See `run_shell_lines`.
 /// 2. **Position in the command.** Within that shell, `gh` must be the *command
 ///    word* of a simple command, followed by the `pr merge` subcommand path,
 ///    with `--auto` as one of its own argument tokens. Substring matching is not
@@ -276,42 +282,67 @@ fn simple_commands(shell: &str) -> Vec<Vec<String>> {
     commands
 }
 
-/// The shell lines of every `run:` in `body`, in file order.
+/// The shell lines of every *step's* `run:` in `body`, in file order.
 ///
-/// A deliberately small YAML reader rather than a dependency: it handles the
-/// two `run:` spellings Actions allows -- an inline scalar (`run: cmd`) and a
-/// block scalar (`run: |` / `run: >`, whose body is every following line
-/// indented deeper than the `run:` key itself) -- and nothing else. Anything it
-/// cannot recognise is simply not returned, so an unhandled spelling makes the
-/// guard fail loudly rather than pass vacuously; that is the direction this
-/// guard needs to err in.
+/// A deliberately small YAML reader rather than a dependency. Two things have
+/// to be right for a line to count as executable shell:
+///
+/// 1. **The key must be a step's own `run:`** -- a key at the column a step's
+///    keys sit at, inside the `steps:` sequence of a job. A mapping named `run`
+///    anywhere else (`jobs.<id>.defaults.run`, an `env:` child literally called
+///    `run`, a `with:` input of that name) carries no shell at all; matching
+///    every `run:` key by prefix let such a value satisfy the guard while the
+///    real arming step was gone (PR #93 review, round 4).
+/// 2. **The value must be one of the two spellings Actions allows** -- an
+///    inline scalar (`run: cmd`) or a block scalar (`run: |` / `run: >`, whose
+///    body is every following line indented deeper than its first content
+///    line).
+///
+/// Block scalars opened by *other* keys are tracked too, and their content
+/// discarded, so a `description: |` paragraph can never be re-read as keys.
+/// Anything else this reader cannot recognise is simply not returned, so an
+/// unhandled spelling makes the guard fail loudly rather than pass vacuously;
+/// that is the direction this guard needs to err in.
 fn run_shell_lines(body: &str) -> Vec<&str> {
     let mut shell = Vec::new();
-    // `Some(None)` = inside a block scalar whose content indentation is not
-    // pinned yet (no non-blank line seen); `Some(Some(n))` = pinned at column
-    // `n`; `None` = not inside one.
-    let mut block: Option<Option<usize>> = None;
+    // `Some((None, keep))` = inside a block scalar whose content indentation is
+    // not pinned yet (no non-blank line seen); `Some((Some(n), keep))` = pinned
+    // at column `n`; `None` = not inside one. `keep` is true only for a block
+    // opened by a step's own `run:` -- every other block is consumed and
+    // dropped.
+    let mut block: Option<(Option<usize>, bool)> = None;
+    // The indent of the `steps:` key currently in effect, and the column at
+    // which the current step's own keys sit. A `run:` counts only at that
+    // column.
+    let mut steps_indent: Option<usize> = None;
+    let mut step_key_indent: Option<usize> = None;
 
     for line in body.lines() {
         let indent = line.len() - line.trim_start().len();
 
-        if let Some(content_indent) = block {
+        if let Some((content_indent, keep)) = block {
             // A block scalar's indentation is set by its first non-blank line
             // and it ends at the first non-blank line indented less than that.
             // Sibling keys of `run:` sit one level shallower, so this is what
             // keeps a following `name:`/`env:` out of the shell.
             if line.trim().is_empty() {
-                shell.push(line);
+                if keep {
+                    shell.push(line);
+                }
                 continue;
             }
             match content_indent {
                 None => {
-                    block = Some(Some(indent));
-                    shell.push(line);
+                    block = Some((Some(indent), keep));
+                    if keep {
+                        shell.push(line);
+                    }
                     continue;
                 }
                 Some(base) if indent >= base => {
-                    shell.push(line);
+                    if keep {
+                        shell.push(line);
+                    }
                     continue;
                 }
                 Some(_) => block = None,
@@ -319,15 +350,50 @@ fn run_shell_lines(body: &str) -> Vec<&str> {
         }
 
         let trimmed = line.trim_start();
-        // A step is a sequence item, so its first key arrives as `- run: ...`.
-        let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-        let Some(value) = key.strip_prefix("run:") else {
+        // Blank lines and YAML comments carry no key and must not disturb the
+        // step context tracked below.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A step is a sequence item, so its first key arrives as `- run: ...`,
+        // two columns right of the dash. Items may be indented deeper than
+        // their `steps:` key or sit at the same column as it; both spellings
+        // are legal YAML.
+        let item = trimmed.starts_with("- ");
+        if steps_indent.is_some_and(|base| indent < base || (indent == base && !item)) {
+            // Dedented out of the `steps:` sequence entirely.
+            steps_indent = None;
+            step_key_indent = None;
+        }
+
+        let (key, key_indent) = match trimmed.strip_prefix("- ") {
+            Some(rest) => {
+                let key_indent = indent + 2;
+                // A new item directly under `steps:` starts a new step; a
+                // sequence item anywhere else is not a step and has no `run:`.
+                step_key_indent = steps_indent.map(|_| key_indent);
+                (rest, key_indent)
+            }
+            None => (trimmed, indent),
+        };
+
+        if key
+            .strip_prefix("steps:")
+            .is_some_and(|rest| rest.trim().is_empty())
+        {
+            steps_indent = Some(key_indent);
+            step_key_indent = None;
+            continue;
+        }
+
+        let Some((name, value)) = key.split_once(':') else {
             continue;
         };
         let value = value.trim();
-        if value.is_empty() || value.starts_with('|') || value.starts_with('>') {
-            block = Some(None);
-        } else {
+        let is_step_run = name == "run" && Some(key_indent) == step_key_indent;
+        if value.starts_with('|') || value.starts_with('>') {
+            block = Some((None, is_step_run));
+        } else if is_step_run && !value.is_empty() {
             shell.push(value);
         }
     }
@@ -379,6 +445,38 @@ fn arms_auto_merge_counts_run_shell_only() {
     // The block scalar ends where indentation returns to the key's level.
     assert!(!arms_auto_merge(
         "jobs:\n  m:\n    steps:\n      - run: |\n          echo hi\n        name: gh pr merge --auto\n"
+    ));
+}
+
+/// A key spelled `run` is only shell when it is a *step's* `run:` field (PR #93
+/// review, round 4: any `run:` key at any depth was being read as shell, so an
+/// `env:` child named `run` kept the guard green with the arming step deleted).
+#[test]
+fn arms_auto_merge_ignores_run_keys_that_are_not_step_fields() {
+    // An `env:` child literally named `run`, inline and as a block scalar.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - env:\n          run: gh pr merge \"$PR_URL\" --auto --squash\n        uses: actions/checkout@v4\n"
+    ));
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - env:\n          run: |\n            gh pr merge \"$PR_URL\" --auto --squash\n        uses: actions/checkout@v4\n"
+    ));
+    // A `with:` input of that name, handed to an action that may ignore it.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - uses: actions/github-script@v7\n        with:\n          run: gh pr merge \"$PR_URL\" --auto --squash\n"
+    ));
+    // `jobs.<id>.defaults.run`, which configures a shell rather than running one.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    defaults:\n      run: gh pr merge \"$PR_URL\" --auto --squash\n    steps:\n      - uses: actions/checkout@v4\n"
+    ));
+    // Not a step at all: a `run:` under some other sequence.
+    assert!(!arms_auto_merge(
+        "on:\n  workflow_call:\nx:\n  - run: gh pr merge \"$PR_URL\" --auto --squash\n"
+    ));
+
+    // A real step still counts with its items at the `steps:` key's own column,
+    // the other legal YAML sequence indentation.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n    - env:\n        PR_URL: x\n      run: gh pr merge \"$PR_URL\" --auto --squash\n"
     ));
 }
 

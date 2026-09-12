@@ -86,6 +86,28 @@ team UUID, `26e8448d-…`). `.catalyst/config.json`'s `linear.teamKey` and
   accept the new value before manta emits it (or accept both during a
   transition). Not filed from the MAN-25 session, which held no Linear
   credential; recorded here so the inventory is not lost.
+- **Deferred under the review-convergence policy**
+  (`docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`), captured
+  verbatim from PR #93's round-4 Codex review so it is not lost:
+
+  > **Pin the trusted-author gate as well** -- If a future edit removes or
+  > broadens the workflow's job-level author `if:` while leaving the `gh pr
+  > merge --auto` invocation intact, this assertion still passes even though
+  > the shared bypass-capable `CODEX_REVIEW_PAT` would let untrusted PRs merge
+  > without approval. Since the test describes the successor as the
+  > trusted-author admission boundary, it should also verify the two-author
+  > allow-list and the credential used to invoke `gh`.
+
+  Not fixed in MAN-25: `merge_policy_successor_to_mergify_exists` exists to
+  prove merge policy *moved* to `auto-merge-trigger.yml` after #185, not to
+  guard that workflow's trust boundary, and MAN-25 is a comment-rename
+  ticket. Guarding the `if:` allow-list membership and the
+  `secrets.CODEX_REVIEW_PAT` binding is a separate, worthwhile invariant --
+  it belongs with the auto-merge policy ADR
+  (`docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md`), which is what would
+  have to be amended alongside any change to that list. Not filed as a Linear
+  ticket from the MAN-25 session, which held no credential; recorded here so
+  the inventory is not lost.
 - MAN-25: apply the same rename in the upstream `wait-for-codex.yml` /
   `ci.yml` template (canonical copy cited as `credenza`, PR #30) so the next
   manual port carries the new name. Requires access to that repo; tracked
