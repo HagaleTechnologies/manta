@@ -160,7 +160,13 @@ fn merge_policy_successor_to_mergify_exists() {
     // newline with no account of `bash -e` would still be satisfied by a
     // here-document body `EOF   ` had falsely freed, by a call written under a
     // `break` in `while true; do ...; done`, or by one written under a bare
-    // `false` (PR #93 review, round 12).
+    // `false` (PR #93 review, round 12); and counting a redirection as an
+    // argument of the command it is written on, or reading every `run:` block
+    // as bash whatever interpreter its own step names, would still be satisfied
+    // by a call written under `false >/dev/null` -- which `bash -e` exits on
+    // exactly as it does a bare `false` -- or by one written in a
+    // `shell: python` step, whose Python raises before `gh` is ever reached
+    // (PR #93 review, round 14).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -248,7 +254,12 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    nothing (`LOOP_CONTROL_COMMANDS`, `ShellState::end_loop_body`); and a
 ///    bare `false` now ends the step under the `bash -e` an Actions `run:`
 ///    defaults to, with each of bash's own errexit exemptions checked first
-///    (`fails_under_errexit`, `Follower`).
+///    (`fails_under_errexit`, `Follower`). Round 14 closed the two ways a step
+///    could still look like shell it is not: a redirection is syntax rather
+///    than an argument, so `false >/dev/null` ends the step exactly as a bare
+///    `false` does (`without_redirections`), and a step that names its own
+///    interpreter (`shell: python`) is not handed to this bash reader at all
+///    (`shell_is_modelled`).
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -606,13 +617,71 @@ fn command_head(words: &[String]) -> Option<&str> {
 /// Is this whole simple command one of the constant-status builtins, with no
 /// arguments of its own? `false` is; `[ -n "$PR_URL" ]` and `grep -q false f`
 /// are not.
+///
+/// A *redirection* is not an argument. `false >/dev/null` runs the same builtin
+/// to the same fixed status a bare `false` does -- the operator and the file
+/// name it takes are syntax the shell consumes before the command itself ever
+/// starts -- but they reach this reader as ordinary words, so counting them made
+/// the command look like some other program that merely happens to be named
+/// `false`. Neither the errexit latch nor a `&&`/`||` gate then recognised it,
+/// and a `gh pr merge ... --auto` written below one was handed back as a live
+/// merge path (PR #93 review, round 14). `without_redirections` drops them
+/// before the count.
 fn is_constant_status(words: &[String]) -> bool {
-    let mut significant = significant_words(words);
-    significant
-        .next()
-        .is_some_and(|head| CONSTANT_STATUS_COMMANDS.contains(&head))
-        && significant.next().is_none()
+    matches!(
+        without_redirections(significant_words(words)).as_slice(),
+        [head] if CONSTANT_STATUS_COMMANDS.contains(head)
+    )
 }
+
+/// `words` with its redirections removed -- each operator token, plus the word
+/// carrying the target when that target is not glued to the operator
+/// (`> /dev/null` is two words, `>/dev/null` is one).
+///
+/// Over-reading is the safe direction and is taken on purpose: a word this
+/// wrongly drops can only make a command look *more* like a bare
+/// `true`/`false`/`:`, which either ends the step earlier under errexit or kills
+/// a gate's right-hand side -- both of which make the guard harder to satisfy.
+/// Quote provenance is deliberately not consulted for the same reason: `false
+/// ">"` is read as a redirection here, and `false` fails either way.
+fn without_redirections<'a>(words: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut kept = Vec::new();
+    let mut target_pending = false;
+    for word in words {
+        if target_pending {
+            // The file name of a redirection whose operator stood alone.
+            target_pending = false;
+            continue;
+        }
+        match redirection_target(word) {
+            Some(target) => target_pending = target.is_empty(),
+            None => kept.push(word),
+        }
+    }
+    kept
+}
+
+/// The target glued to the redirection operator that `word` opens (`/dev/null`
+/// for `>/dev/null`, empty for a bare `>` or `2>`), or `None` when `word` opens
+/// no redirection at all.
+///
+/// An optional file-descriptor number may precede the operator, which is every
+/// spelling that can reach this reader as one word. `2>&1` and `&>f` cannot:
+/// `&` is one of the characters `simple_commands` breaks commands at, so such a
+/// word never arrives whole -- and the boundary it manufactures already exempts
+/// what precedes it from errexit (`Follower::Background`), the permissive
+/// direction this reader was already taking there.
+fn redirection_target(word: &str) -> Option<&str> {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    REDIRECTION_OPERATORS
+        .iter()
+        .find_map(|op| rest.strip_prefix(op))
+}
+
+/// The redirection operators, longest spelling first so `<<-` is never read as
+/// a `<<` taking `-` as its delimiter.
+const REDIRECTION_OPERATORS: [&str; 10] =
+    ["<<<", "<<-", "<<", "<&", "<>", "<", ">>", ">|", ">&", ">"];
 
 /// One `if`/`while`/`until`/`for`/`case` block enclosing the command being
 /// read, and what the block's own condition settles statically about its body.
@@ -803,7 +872,10 @@ fn block_from_opener(words: &[String]) -> Block {
 /// `[ -n "$PR_URL" ]`, `grep -q false f`, `true && false` -- is a run-time
 /// answer this reader must not pretend to know.
 fn constant_condition(condition: &[&str]) -> Option<bool> {
-    match condition {
+    // A redirection on the condition is syntax, not a word of it: `if false
+    // >/dev/null` settles its body exactly as `if false` does. Same reading, and
+    // same safe direction, as `is_constant_status` -- see `without_redirections`.
+    match without_redirections(condition.iter().copied()).as_slice() {
         ["true"] | [":"] => Some(true),
         ["false"] => Some(false),
         _ => None,
@@ -1477,7 +1549,18 @@ fn source_lines(body: &str) -> impl Iterator<Item = &str> {
 ///    inline scalar (`run: cmd`) or a block scalar (`run: |` / `run: >`, whose
 ///    body is every following line indented deeper than its first content
 ///    line).
-/// 3. **A folded block must be folded.** `>` and `|` delimit the same content
+/// 3. **The step must hand that value to a shell this reader models.** A step
+///    may name its own interpreter (`shell: python`, `shell: pwsh`, a custom
+///    `{0}` template), and its `run:` text is then not shell at all -- reading
+///    it as bash certified this guard for a step whose Python raises before
+///    `gh` is ever invoked (PR #93 review, round 14). The step's sibling
+///    `shell:` field is tracked, in either order relative to the `run:` it
+///    governs, and only `bash`/`sh` (and the absent field, which Actions runs
+///    under `bash -e {0}`) are kept; see `shell_is_modelled`. A `shell:` key
+///    that is *not* a step's own field -- `defaults: run: shell:` at job or
+///    workflow level -- has no scope tracking here, so an unmodelled one drops
+///    every step after it rather than guess which steps it governs.
+/// 4. **A folded block must be folded.** `>` and `|` delimit the same content
 ///    but hand the shell different *lines*: under `>`, the break between two
 ///    lines at the block's own indentation becomes a space. Each returned line
 ///    carries `folded_onto_previous` so `folded_run_lines` can rebuild what the
@@ -1498,6 +1581,18 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
     // column.
     let mut steps_indent: Option<usize> = None;
     let mut step_key_indent: Option<usize> = None;
+    // What the current step's own `shell:` field says about the interpreter its
+    // `run:` text is handed to, and where that step's run lines start in
+    // `shell` -- the field may be written *after* the `run:` it governs, so what
+    // has already been collected for the step has to stay removable.
+    let mut step_shell_is_modelled = true;
+    let mut step_run_start: Option<usize> = None;
+    // Latched by a `shell:` key that is *not* a step's own field -- a
+    // `defaults: run: shell:` at job or workflow level, which governs steps this
+    // reader has no scope tracking for. Never cleared: from that key on, no step
+    // in the file is read as shell, so an unmodelled default makes the guard
+    // fail loudly rather than certify a step whose interpreter it cannot read.
+    let mut unmodelled_shell_default = false;
 
     for line in source_lines(body) {
         let indent = line.len() - line.trim_start().len();
@@ -1577,6 +1672,8 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
             // Dedented out of the `steps:` sequence entirely.
             steps_indent = None;
             step_key_indent = None;
+            step_shell_is_modelled = true;
+            step_run_start = None;
         }
 
         let (key, key_indent) = match trimmed.strip_prefix("- ") {
@@ -1585,6 +1682,11 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                 // A new item directly under `steps:` starts a new step; a
                 // sequence item anywhere else is not a step and has no `run:`.
                 step_key_indent = steps_indent.map(|_| key_indent);
+                // A new step asks the interpreter question again from scratch:
+                // `shell:` is a per-step field, and the run lines it governs are
+                // this step's own.
+                step_shell_is_modelled = true;
+                step_run_start = None;
                 (rest, key_indent)
             }
             None => (trimmed, indent),
@@ -1603,12 +1705,34 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
             continue;
         };
         let value = value.trim();
-        let is_step_run = name == "run" && Some(key_indent) == step_key_indent;
+        if name == "shell" {
+            let modelled = shell_is_modelled(value);
+            if Some(key_indent) == step_key_indent {
+                step_shell_is_modelled = modelled;
+                if !modelled {
+                    // Actions lets the field follow the `run:` it governs, so by
+                    // now that block may already have been collected as shell.
+                    if let Some(start) = step_run_start {
+                        shell.truncate(start);
+                    }
+                }
+            } else if !modelled {
+                unmodelled_shell_default = true;
+            }
+        }
+        // A step's `run:` is shell only if the step actually hands it to a shell.
+        let is_step_run = name == "run"
+            && Some(key_indent) == step_key_indent
+            && step_shell_is_modelled
+            && !unmodelled_shell_default;
         // `>`/`|` may carry chomping and explicit-indentation indicators
         // (`>-`, `|+`, `>2`); those affect trailing newlines, not whether the
         // block folds, so only the first character is read here.
         let folded = value.starts_with('>');
         if folded || value.starts_with('|') {
+            if is_step_run {
+                step_run_start = Some(shell.len());
+            }
             block = Some(BlockScalar {
                 content_indent: None,
                 keep: is_step_run,
@@ -1616,6 +1740,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                 prev_line_foldable: false,
             });
         } else if is_step_run && !value.is_empty() {
+            step_run_start = Some(shell.len());
             shell.push(RunLine {
                 text: value,
                 folded_onto_previous: false,
@@ -1624,6 +1749,41 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
     }
 
     shell
+}
+
+/// Does this `shell:` value name an interpreter whose execution semantics
+/// everything below `simple_commands` actually models?
+///
+/// Only bash and `sh`. An Actions step with no `shell:` runs under `bash -e
+/// {0}`, `shell: bash` under `bash --noprofile --norc -eo pipefail {0}` and
+/// `shell: sh` under `sh -e {0}`: three POSIX-ish shells with errexit on, which
+/// is exactly what this reader's word splitting, quoting, here-documents and
+/// `false`-ends-the-step latch assume. Every other value Actions accepts --
+/// `python`, `pwsh`, `powershell`, `cmd`, or a custom `command ... {0}`
+/// template -- hands the `run:` text to a language this reader cannot read at
+/// all, and reading `gh pr merge "$PR_URL" --auto` out of a Python block
+/// certified this guard for a step that raises a `SyntaxError` long before any
+/// merge is armed (PR #93 review, round 14).
+///
+/// Unrecognised means *not shell*, never "assume bash": an unmodelled
+/// interpreter drops the run block it governs, so the guard fails loudly and a
+/// human looks -- the direction every other rule in this reader errs in too.
+fn shell_is_modelled(value: &str) -> bool {
+    // YAML's own inline comment (` #`), then either quoting style.
+    let value = match value.split_once(" #") {
+        Some((head, _)) => head.trim(),
+        None => value.trim(),
+    };
+    let value = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .unwrap_or(value);
+    matches!(value, "bash" | "sh")
 }
 
 /// The executable part of `line` -- everything before its first `#`.
@@ -2425,6 +2585,26 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     assert!(!arms_auto_merge(&workflow(
         "          if true; then false; fi\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
+    // A redirection is syntax the shell consumes before the command starts, not
+    // an argument that would make this some other program called `false`: every
+    // spelling of one still ends the step (PR #93 review, round 14).
+    assert!(!arms_auto_merge(&workflow(
+        "          false >/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false > /dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false >>log 2>>err\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The same word is not an argument to a *gate* either, so what a redirected
+    // constant status settles statically stays settled.
+    assert!(!arms_auto_merge(&workflow(
+        "          false >/dev/null && gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          if false >/dev/null; then gh pr merge \"$PR_URL\" --auto; fi\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // Every errexit exemption bash defines. `&&`/`||` consume the status...
@@ -2481,4 +2661,75 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     assert!(arms_auto_merge(&workflow(
         "          bail() { false; }\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
+    // Dropping redirections must not promote a real command to a constant one:
+    // only the builtin's own word may be left standing.
+    assert!(arms_auto_merge(&workflow(
+        "          grep -q x f >/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          falsify >/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// A `run:` block is shell only when its step hands it to a shell -- the
+/// property PR #93's review asked for in round 14. A step may name its own
+/// interpreter, and `shell: python` means the block's text is Python: it raises
+/// before any `gh` in it is reached, so reading it as bash certifies a merge
+/// path the workflow does not have.
+#[test]
+fn arms_auto_merge_reads_run_blocks_only_for_modelled_interpreters() {
+    let step = |fields: &str| format!("jobs:\n  m:\n    steps:\n      - name: arm\n{fields}");
+
+    // The review's own case, in both orders -- the field may be written after
+    // the `run:` it governs, which is only known once the block has been read.
+    assert!(!arms_auto_merge(&step(
+        "        shell: python\n        run: |\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        run: |\n          gh pr merge \"$PR_URL\" --auto --squash\n        shell: python\n"
+    )));
+    // Every other interpreter Actions accepts, and an inline `run:` too.
+    assert!(!arms_auto_merge(&step(
+        "        shell: pwsh\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        shell: cmd\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A custom `{0}` template is an interpreter this reader models no better
+    // for being spelled with the word `bash` in it.
+    assert!(!arms_auto_merge(&step(
+        "        shell: python3 {0}\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A `shell:` this reader cannot scope -- `defaults: run: shell:` at job
+    // level -- drops every step after it rather than guess which it governs.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    defaults:\n      run:\n        shell: python\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n"
+    ));
+
+    // --- what must still count --------------------------------------------
+    // The absent field: Actions runs an unqualified `run:` under `bash -e {0}`.
+    assert!(arms_auto_merge(&step(
+        "        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Both modelled interpreters, quoted or not, with or without a comment.
+    assert!(arms_auto_merge(&step(
+        "        shell: bash\n        run: |\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(arms_auto_merge(&step(
+        "        shell: sh\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&step(
+        "        shell: \"bash\"\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&step(
+        "        shell: bash # the Actions default, spelled out\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    defaults:\n      run:\n        shell: bash\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // A *later* step's interpreter is that step's own business: it must not
+    // reach back and disarm a bash step that already ran the call.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n      - shell: python\n        run: print(\"done\")\n"
+    ));
 }
