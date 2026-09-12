@@ -20,15 +20,17 @@ What replaced it:
   `.github/workflows/dependabot-auto-merge.yml`. That workflow's own header
   comment is the authoritative explanation of the boundary; this doc does not
   restate it.
-- `required_approving_review_count` is now **1** (was 0), so the "green CI is
-  the *only* gate" framing in the Decision section below no longer holds
-  literally either — **but it still holds for the two trusted authors above**:
-  `auto-merge-trigger.yml` arms their merges with `CODEX_REVIEW_PAT`, a bypass
-  actor on `manta-review-gate` ("always" mode), and the bypass is evaluated
-  against whoever enables auto-merge, not the PR's author. The review
-  requirement therefore binds only non-bypass merge attempts — anyone else's
-  token, or a manual merge. For `thagale` and `catalyst-cloud-connector[bot]`,
-  that workflow's author allow-list is the human gate, not an approval.
+- `required_approving_review_count` was briefly raised to **1**, on the
+  assumption that `CODEX_REVIEW_PAT` — a bypass actor on `manta-review-gate`
+  ("always" mode) — would let the two trusted authors' merges skip it, since a
+  ruleset bypass is evaluated against whoever *enables* auto-merge rather than
+  against the PR's author. **MAN-217 (`f252d89`) reverted it to 0**: that
+  assumption does not hold for GitHub's *native* auto-merge, which ignores the
+  bypass when deciding whether a PR may be admitted and simply waits for an
+  approval that never comes. So the "green CI is the only gate" framing in the
+  Decision section below holds literally again, and the human gate for
+  `thagale` and `catalyst-cloud-connector[bot]` is the author allow-list in
+  `auto-merge-trigger.yml`'s `if:` — not an approval, and not the bypass.
 
 Recorded here because this doc is the repo's standing merge-policy pointer
 (`CLAUDE.md` cites it by name): left unamended, it keeps telling readers and

@@ -10,17 +10,17 @@ name: Auto-Merge Trigger
 # does that IS the new job-(1) trust boundary. This job carries that
 # boundary forward directly from .mergify.yml's own trusted-author
 # condition (`author = thagale` OR `author = catalyst-cloud-connector[bot]`
-# OR dependabot-with-a-real-approval) -- manta is public with
-# required_approving_review_count now 1 (was 0) but this workflow arms
-# every merge it triggers via CODEX_REVIEW_PAT, a bypass actor on
-# manta-review-gate ("always" mode). That bypass is evaluated against
-# whoever ENABLES auto-merge, not the PR's author -- so without this job's
-# own author check, using a shared bypass-capable credential here would let
-# ANY green PR skip the review requirement entirely, silently recreating
-# the exact zero-review-merge gap this whole redesign exists to close. The
-# ruleset's required_approving_review_count is real defense-in-depth (it
-# still blocks a manual merge attempt, or a different token, by anyone not
-# on this list) but does not replace this check.
+# OR dependabot-with-a-real-approval) -- manta is public and
+# required_approving_review_count is 0. It was briefly 1, on the assumption
+# that CODEX_REVIEW_PAT (a bypass actor on manta-review-gate, "always"
+# mode) would carry this job's merges past it; MAN-217 (f252d89) reverted
+# it to 0 after finding that GitHub's NATIVE auto-merge ignores the bypass
+# when admitting a PR and just waits for an approval that never arrives.
+# So the ruleset asks for no review at all, and this job's author check is
+# not defense-in-depth behind one -- it is the ONLY thing between a green
+# PR and an unattended merge. Drop it and any green PR from any author
+# merges itself, which is the exact zero-review-merge gap this whole
+# redesign exists to close.
 #
 # Dependabot is deliberately NOT handled here (unlike widdershins, which
 # excludes it only via `github.actor != 'dependabot[bot]'`): GitHub
@@ -28,9 +28,9 @@ name: Auto-Merge Trigger
 # CODEX_REVIEW_PAT would be empty on exactly the events that would trigger
 # this job for a Dependabot PR. Its own auto-merge is armed instead by
 # dependabot-auto-merge.yml using GITHUB_TOKEN right after it approves --
-# github-actions[bot] isn't a bypass actor on manta-review-gate, so that
-# arm only actually merges once required_approving_review_count is
-# satisfied by its own approval, no bypass needed.
+# github-actions[bot] needs no bypass on manta-review-gate to do that, and
+# with required_approving_review_count at 0 the approval it leaves is a
+# record of what it checked rather than a gate it has to satisfy.
 on:
   pull_request_target:
     branches: [main]

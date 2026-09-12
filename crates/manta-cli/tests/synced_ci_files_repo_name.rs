@@ -137,15 +137,19 @@ fn merge_policy_successor_to_mergify_exists() {
     // here-document body handed to `cat` on stdin, or a branch behind
     // `false &&` (PR #93 review, round 6); and tracking only the five
     // compound-command keywords would still be satisfied by the body of a
-    // shell function that nothing ever calls (PR #93 review, round 7).
+    // shell function that nothing ever calls (PR #93 review, round 7); and
+    // letting every boundary start a *reachable* command would still be
+    // satisfied by leftover text below an unconditional `exit 0`, which the
+    // shell is already gone before it reads (PR #93 review, round 8).
     assert!(
         arms_auto_merge(&body),
         "{rel} no longer arms auto-merge: no `run:` shell in it *invokes* \
          `gh pr merge ... --auto` as a command (a header comment, a \
          `name:`/`env:` scalar, an `echo` of the command text, an assignment \
          of it to a variable or a here-document body all fail this check, as \
-         does naming it only behind `&&`/`||`, inside an `if`/`for` block, or \
-         in the body of a function -- see `arms_auto_merge`). That call IS the post-#185 \
+         does naming it only behind `&&`/`||`, inside an `if`/`for` block, in \
+         the body of a function, or below an `exit` -- see `arms_auto_merge`). \
+         That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
          losing it silently leaves the repo with no automated merge path at all."
     );
@@ -180,15 +184,19 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    the shell will reach. Lines inside a here-document (`cat <<EOF ... EOF`)
 ///    are *data* on another command's stdin and are never executed at all; a
 ///    command behind `&&`/`||` or inside an `if`/`while`/`until`/`for`/`case`
-///    block runs only if something else went a particular way; and a command
-///    in a function body runs only when something calls that function, which
-///    a `run:` block need never do. Treating every newline and `&&` as an
-///    unconditional boundary let the first two certify a workflow whose real
-///    arming call had been deleted (PR #93 review, round 6), and tracking only
-///    those five block keywords let an uncalled `arm() { ... }` definition do
-///    the same (PR #93 review, round 7). See `run_shell` for the
-///    here-document, `simple_commands` for the operators and keywords, and
-///    `FunctionScope` for the function body.
+///    block runs only if something else went a particular way; a command in a
+///    function body runs only when something calls that function, which a
+///    `run:` block need never do; and a command written below an `exit` the
+///    shell actually reaches never runs at all, because there is no shell left
+///    to read it. Treating every newline and `&&` as an unconditional boundary
+///    let the first two certify a workflow whose real arming call had been
+///    deleted (PR #93 review, round 6), tracking only those five block keywords
+///    let an uncalled `arm() { ... }` definition do the same (round 7), and
+///    resetting reachability at every boundary let `exit 0` with the arming
+///    call still written beneath it do the same again (round 8). See
+///    `run_shell` for the here-document, `simple_commands` for the operators
+///    and keywords, `FunctionScope` for the function body, and
+///    `TERMINATING_COMMANDS` for the `exit`.
 ///
 /// Tokens are compared after quote removal, so `"gh" pr merge --auto` counts
 /// while `echo "gh pr merge --auto"` does not -- in the latter the whole
@@ -439,12 +447,14 @@ struct SimpleCommand {
     /// The command's words, already unquoted.
     words: Vec<String>,
     /// True when the shell may not reach this command at all: it sits after an
-    /// `&&`/`||` operator, inside an `if`/`while`/`until`/`for`/`case` block, or
-    /// inside a function body nothing here need ever call. Such a command is
-    /// text that *may* run, which is not the same thing as a merge path --
-    /// `false && gh pr merge --auto` arms nothing (PR #93 review, round 6), and
-    /// neither does `arm() { gh pr merge --auto; }` with no `arm` after it (PR
-    /// #93 review, round 7).
+    /// `&&`/`||` operator, inside an `if`/`while`/`until`/`for`/`case` block,
+    /// inside a function body nothing here need ever call, or after a command
+    /// that ends the shell outright. Such a command is text that *may* run --
+    /// or, past an `exit`, text that certainly will not -- which is not the
+    /// same thing as a merge path: `false && gh pr merge --auto` arms nothing
+    /// (PR #93 review, round 6), neither does `arm() { gh pr merge --auto; }`
+    /// with no `arm` after it (round 7), and neither does a call written below
+    /// an unconditional `exit 0` (round 8).
     conditional: bool,
 }
 
@@ -456,6 +466,25 @@ const BLOCK_OPENERS: [&str; 5] = ["if", "while", "until", "for", "case"];
 /// `if false<newline>then<newline>gh pr merge --auto<newline>fi` refuse just as
 /// the one-line spelling already did.
 const BLOCK_CLOSERS: [&str; 3] = ["fi", "done", "esac"];
+
+/// Commands that end the shell where they stand, so that nothing written after
+/// one of them is ever reached.
+///
+/// `exit` ends the shell; `exec CMD` replaces it with `CMD` and never returns.
+/// A command boundary past either is still a boundary -- the shell just never
+/// gets there -- so reading the text after it as an unconditional command let
+/// `exit 0` followed by a deleted step's leftover `gh pr merge ... --auto` keep
+/// this guard green with no merge path left (PR #93 review, round 8).
+///
+/// Only a *reached* one counts: `cmd || exit 1`, an `exit` inside an
+/// `if`/`for` block, and one in a function body are all commands the shell may
+/// skip, and none of them ends anything by being written down. Two spellings
+/// are over-read on purpose, both in the direction of refusing more text:
+/// redirection-only `exec >log` (which does *not* replace the shell) and an
+/// `exit` reached only as a member of a pipeline (which ends a subshell, not
+/// this one). Refusing text a human can see is live costs a loud failure;
+/// certifying text the shell never reaches costs the merge path itself.
+const TERMINATING_COMMANDS: [&str; 2] = ["exit", "exec"];
 
 /// Whether the reader is inside a shell *function body* -- text the shell reads
 /// but does not run until something calls the function.
@@ -544,13 +573,16 @@ fn is_function_definition(words: &[String]) -> bool {
 
 /// Record `words` as a simple command, and let a block keyword at its head --
 /// or a function-definition header anywhere in it -- open or close a
-/// conditional region around the commands that follow it.
+/// conditional region around the commands that follow it. A head that ends the
+/// shell (`exit`, `exec`) closes the *rest* of it the same way, by setting
+/// `terminated`.
 fn push_simple_command(
     commands: &mut Vec<SimpleCommand>,
     words: Vec<String>,
     gated: bool,
     block_depth: &mut usize,
     functions: &mut FunctionScope,
+    terminated: &mut bool,
 ) {
     let Some(head) = words.first() else {
         return;
@@ -558,11 +590,15 @@ fn push_simple_command(
     // Unconditionally: the scope is a state machine and every command has to
     // pass through it, not just the ones that end up conditional.
     let in_function_body = functions.absorb(&words);
-    let conditional = gated || *block_depth > 0 || in_function_body;
+    let conditional = gated || *block_depth > 0 || in_function_body || *terminated;
     if BLOCK_OPENERS.contains(&head.as_str()) {
         *block_depth += 1;
     } else if BLOCK_CLOSERS.contains(&head.as_str()) {
         *block_depth = block_depth.saturating_sub(1);
+    } else if !conditional && TERMINATING_COMMANDS.contains(&head.as_str()) {
+        // The `exit` itself runs -- `conditional` above is already decided --
+        // and everything after it does not.
+        *terminated = true;
     }
     commands.push(SimpleCommand { words, conditional });
 }
@@ -582,10 +618,12 @@ fn push_simple_command(
 /// newline end a command and the next one runs regardless; `&&` and `||` end a
 /// command and make the next one *conditional* on how this one exited. A
 /// pipeline's `|` inherits whatever gate the pipeline itself sits behind, so
-/// `false && echo x | gh pr merge --auto` gates the `gh` too. Together with the
-/// block-keyword depth and the function-body scope tracked by
-/// `push_simple_command`, that is every way this reader knows of for shell text
-/// to sit in the file without running.
+/// `false && echo x | gh pr merge --auto` gates the `gh` too. A boundary the
+/// shell never arrives at is not a boundary either: past a reached `exit`, the
+/// text below it is as dead as a branch behind `false &&` (PR #93 review, round
+/// 8). Together with the block-keyword depth, the function-body scope and the
+/// terminating-command latch tracked by `push_simple_command`, that is every
+/// way this reader knows of for shell text to sit in the file without running.
 fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     let mut commands: Vec<SimpleCommand> = Vec::new();
     let mut command: Vec<String> = Vec::new();
@@ -600,6 +638,9 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     // Whether it sits in a function body, which runs only when something calls
     // the function.
     let mut functions = FunctionScope::default();
+    // Set by a reached `exit`/`exec` and never cleared: the shell is gone, so
+    // every command after one is text nothing executes.
+    let mut terminated = false;
     let mut chars = shell.chars().peekable();
 
     // Close off the token being built, if any.
@@ -657,6 +698,7 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                         gated,
                         &mut block_depth,
                         &mut functions,
+                        &mut terminated,
                     );
                     gated = match c {
                         _ if doubled => true,
@@ -687,6 +729,7 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
         gated,
         &mut block_depth,
         &mut functions,
+        &mut terminated,
     );
     commands
 }
@@ -1173,6 +1216,72 @@ fn arms_auto_merge_rejects_uncalled_function_bodies() {
     // is the error this reader is allowed to make.
     assert!(!arms_auto_merge(&workflow(
         "          echo \"()\"\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// Shell written *below* a command that ends the shell is never executed (PR
+/// #93 review, round 8: every newline and `;` reset reachability, so a step
+/// spelled `exit 0` and then `gh pr merge "$PR_URL" --auto` satisfied the guard
+/// while the workflow's real arming call could have been deleted out from
+/// under it).
+#[test]
+fn arms_auto_merge_rejects_shell_below_a_terminating_command() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case, in both spellings of the boundary.
+    assert!(!arms_auto_merge(&workflow(
+        "          exit 0\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          exit 0; gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A bare `exit` (no status) ends the shell just as thoroughly, and so does
+    // an `exit` several commands up.
+    assert!(!arms_auto_merge(&workflow(
+        "          exit\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          echo done\n          exit 0\n          echo unreachable\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // `exec CMD` replaces the shell and never comes back.
+    assert!(!arms_auto_merge(&workflow(
+        "          exec ./merge.sh\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Closing an `if` does not resurrect the shell: the `exit` ran at the top
+    // level before it.
+    assert!(!arms_auto_merge(&workflow(
+        "          exit 0\n          if true\n          then\n            echo x\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // Only an `exit` the shell actually *reaches* ends anything. The `|| exit 1`
+    // idiom is the common one and runs only on failure, so the call below it is
+    // still a merge path.
+    assert!(arms_auto_merge(&workflow(
+        "          gh auth status || exit 1\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          [ -n \"$PR_URL\" ] && exit 0\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // An `exit` inside a block runs only if the block is entered...
+    assert!(arms_auto_merge(&workflow(
+        "          if [ -z \"$PR_URL\" ]\n          then\n            exit 0\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // ...and one in a function body only when something calls the function.
+    assert!(arms_auto_merge(&workflow(
+        "          bail() {\n            exit 1\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The word has to be the command, not an argument of one: `echo exit` and
+    // `VAR=exit` end nothing.
+    assert!(arms_auto_merge(&workflow(
+        "          echo exit 0\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          ACTION=exit\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // An `exit` *after* the invocation unarms nothing -- the call already ran.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto --squash\n          exit 0\n"
     )));
 }
 

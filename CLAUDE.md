@@ -116,14 +116,15 @@ in other clones, branches, or worktrees.
   calls `gh pr merge --auto --squash` for a trusted author, and GitHub's native
   `merge_queue` ruleset rule on `main-protection` performs the merge once the
   required CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green.
-  `main-protection` does require one approving review, but that gate binds only
-  non-bypass merge attempts — **a trusted-author merge does not wait for it**.
-  The workflow arms auto-merge with `CODEX_REVIEW_PAT`, a bypass actor on
-  `manta-review-gate` in "always" mode, and the bypass is evaluated against
-  whoever *enables* auto-merge rather than against the PR's author, so a green
-  PR from `thagale` or `catalyst-cloud-connector[bot]` merges with no human
-  approval at all. The author allow-list in that workflow's `if:` — not a
-  human-review gate — is what stands in front of those merges.
+  `main-protection`'s `required_approving_review_count` is **0** — MAN-217
+  (`f252d89`) reverted it from 1 after finding that a ruleset bypass actor is
+  *not* honoured when GitHub admits a PR to native auto-merge, so an armed PR
+  simply sat unmerged waiting for a review the bypass was supposed to skip.
+  Do not re-document the earlier count-1 + `CODEX_REVIEW_PAT`-bypass model:
+  the ruleset asks for no approval at all, and the author allow-list in
+  `auto-merge-trigger.yml`'s `if:` — not a human-review gate — is the only
+  thing standing in front of a green PR from `thagale` or
+  `catalyst-cloud-connector[bot]`.
 - **There is no `.mergify.yml` in this repo.** The native-merge-queue cutover
   (#185, 2026-09-11) deleted it; no merge path reads it any more. Do not open
   it, do not recreate it, and read every surviving mention of Mergify — in
