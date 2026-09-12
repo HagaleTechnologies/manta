@@ -144,7 +144,12 @@ fn merge_policy_successor_to_mergify_exists() {
     // reading quotes off a word before balancing braces, or treating every
     // block body as skippable, would still be satisfied by a `gh pr merge`
     // an `echo "}"` had falsely freed from its uncalled function, or by one
-    // written below `if true; then exit 0; fi` (PR #93 review, round 9).
+    // written below `if true; then exit 0; fi` (PR #93 review, round 9); and
+    // counting only a *standalone* opening brace, or reading a settled block
+    // only in its `true`/`false` spelling, would still be satisfied by a call
+    // a nested group's `}` had freed from an `arm(){ ... }` nothing calls, or
+    // by one written below `if :; then exit 0; fi` or
+    // `for f in a b; do exit 0; done` (PR #93 review, round 10).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -211,6 +216,11 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    body the condition settles (`if true; then exit 0; fi`) now ends the
 ///    shell for the text below the block, and a quoted brace (`echo "}"`) no
 ///    longer closes a function body -- see `Block` and `FunctionScope::absorb`.
+///    Round 10 closed the residual spelling of each: a header carrying its own
+///    opening brace (`arm(){`) now opens the body at depth one, so a nested
+///    group's `}` no longer ends it early (`opening_braces`), and a block is
+///    settled by `:` as well as by `true`, and by a `for` over a list of plain
+///    literal words (`constant_condition`, `for_list_is_certain`).
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -572,12 +582,30 @@ struct Block {
 ///
 /// Only the constant spellings settle anything: `if false`/`while false`/
 /// `until true` make the body dead, `if true`/`while true`/`until false` make
-/// it certain. A real test command, a `for` list or a `case` subject is a
-/// branch the shell may or may not take, so neither flag is set for it.
+/// it certain. A real test command or a `case` subject is a branch the shell
+/// may or may not take, so neither flag is set for it.
+///
+/// Two spellings of a settled block leaked past the round-9 reading of this,
+/// each one letting an `exit` that really does run be filed as skippable and
+/// so leaving a `gh pr merge ... --auto` written below the block classified as
+/// a live merge path (PR #93 review, round 10):
+///
+/// - `:` is `true` under another name -- `CONSTANT_STATUS_COMMANDS` has always
+///   said so -- but the condition was compared against the literal word
+///   `true`, so `if :; then exit 0; fi` and `while :; do exit 0; done` settled
+///   nothing. `constant_condition` now reads both names.
+/// - A `for` over a list of plain literal words runs its body at least once,
+///   as surely as `while true` does. `for f in a b; do exit 0; done` is a
+///   guaranteed exit; `for f in $LIST` (which may expand to nothing) and
+///   `for f in *.log` (which may match nothing) are not, and stay skippable.
 ///
 /// `if true` is over-read on purpose, in the direction this guard errs in: an
 /// `exit` in the `else` arm of `if true` never actually runs, but letting it
-/// latch termination anyway only ever refuses *more* text below the block.
+/// latch termination anyway only ever refuses *more* text below the block. A
+/// `case` whose subject is a literal that one of its patterns must match is
+/// the one settled shape still read as skippable: matching shell patterns to
+/// decide it is more machinery than this tripwire should carry, and the error
+/// it leaves is bounded by every other rule here.
 fn block_from_opener(words: &[String]) -> Block {
     let mut significant = significant_words(words);
     let Some(head) = significant.next() else {
@@ -588,14 +616,58 @@ fn block_from_opener(words: &[String]) -> Block {
     };
     let condition: Vec<&str> = significant.collect();
     let (body_is_dead, body_is_guaranteed) = match head {
-        "if" | "while" => (condition == ["false"], condition == ["true"]),
-        "until" => (condition == ["true"], condition == ["false"]),
+        "if" | "while" => match constant_condition(&condition) {
+            Some(status) => (!status, status),
+            None => (false, false),
+        },
+        "until" => match constant_condition(&condition) {
+            Some(status) => (status, !status),
+            None => (false, false),
+        },
+        "for" => (false, for_list_is_certain(&condition)),
         _ => (false, false),
     };
     Block {
         body_is_dead,
         body_is_guaranteed,
     }
+}
+
+/// The status a block's condition settles before the shell ever runs, if it
+/// settles one at all.
+///
+/// Only a bare constant-status builtin settles anything: `true` and its other
+/// name `:` are always success, `false` is always failure. Anything else --
+/// `[ -n "$PR_URL" ]`, `grep -q false f`, `true && false` -- is a run-time
+/// answer this reader must not pretend to know.
+fn constant_condition(condition: &[&str]) -> Option<bool> {
+    match condition {
+        ["true"] | [":"] => Some(true),
+        ["false"] => Some(false),
+        _ => None,
+    }
+}
+
+/// Is this `for` header's word list certain to yield at least one iteration,
+/// so that its body runs on every pass through the block?
+///
+/// Only an explicit `in` list of plain literal words is: every word after `in`
+/// must be non-empty, free of `$` (a parameter or command substitution can
+/// expand to nothing, or to nothing but whitespace) and free of the glob
+/// metacharacters `*`, `?` and `[` (a pattern that matches no file leaves the
+/// list empty under the default `nullglob`-off behaviour too, since the word
+/// then survives unexpanded -- but reading that as certain would mean reading
+/// shell pattern semantics, which this tripwire does not). `for f` with no
+/// `in` iterates `"$@"`, which may be empty, and settles nothing either.
+fn for_list_is_certain(condition: &[&str]) -> bool {
+    let Some(in_at) = condition.iter().position(|word| *word == "in") else {
+        return false;
+    };
+    let list = &condition[in_at + 1..];
+    !list.is_empty()
+        && list
+            .iter()
+            .all(|word| !word.is_empty() && !word.contains(['$', '*', '?', '[']))
 }
 
 /// Commands that end the shell where they stand, so that nothing written after
@@ -661,6 +733,18 @@ impl FunctionScope {
     /// apart. An unbalanced body swallows the rest of the shell, which -- as
     /// with an unterminated here-document -- only makes the guard harder to
     /// satisfy.
+    ///
+    /// Quote provenance was only half of that leak. A brace is *usually* a word
+    /// of its own, but a function header may carry the body's opening brace
+    /// glued to its own token -- `arm(){` is one word, not two -- and counting
+    /// only a standalone `{` left such a body sitting at depth zero. The first
+    /// `}` inside it then closed the scope one brace early, exactly as
+    /// `echo "}"` used to: `arm(){ { echo x; }; gh pr merge "$PR_URL" --auto; }`
+    /// handed the arming call back to an unconditional reading with nothing
+    /// calling `arm` (PR #93 review, round 10). `opening_braces` reads that
+    /// glued brace off the tail of a longer word; a `}` glued to one is
+    /// deliberately *not* read, since leaving it uncounted only keeps a body
+    /// open for longer -- the direction this reader is allowed to err in.
     fn absorb(&mut self, words: &[String], quoted: &[bool]) -> bool {
         let inside = self.open;
         if !self.open && is_function_definition(words) {
@@ -674,20 +758,32 @@ impl FunctionScope {
                 if quoted.get(idx).copied().unwrap_or(false) {
                     continue;
                 }
-                match word.as_str() {
-                    "{" => self.brace_depth += 1,
-                    "}" => {
-                        self.brace_depth = self.brace_depth.saturating_sub(1);
-                        if self.brace_depth == 0 {
-                            self.open = false;
-                        }
+                if word == "}" {
+                    self.brace_depth = self.brace_depth.saturating_sub(1);
+                    if self.brace_depth == 0 {
+                        self.open = false;
                     }
-                    _ => {}
+                } else {
+                    self.brace_depth += opening_braces(word);
                 }
             }
         }
         inside || self.open
     }
+}
+
+/// How many body-opening braces an unquoted word carries: one for a bare `{`,
+/// and one for a brace glued to the end of a longer token (`arm(){`, the whole
+/// header of a one-line function definition).
+///
+/// Over-reading is the safe direction, and is taken on purpose: a stray
+/// unquoted `echo x{` inside a body bumps the depth too, so the body simply
+/// never closes and everything below it is refused. Under-reading is the
+/// failure this exists to stop -- a body still at depth zero is closed by the
+/// first `}` it meets, which frees the rest of an uncalled function to be read
+/// as an executed merge path.
+fn opening_braces(word: &str) -> usize {
+    usize::from(word.ends_with('{'))
 }
 
 /// Does this simple command open a function definition?
@@ -1458,6 +1554,20 @@ fn arms_auto_merge_rejects_uncalled_function_bodies() {
     assert!(!arms_auto_merge(&workflow(
         "          arm() {\n            echo \"{\"\n            echo \"}\"\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
     )));
+    // A header carrying the body's opening brace glued to its own word
+    // (`arm(){`) is the other half of the same leak: the body started at depth
+    // zero, so a nested group's perfectly ordinary `}` closed the scope one
+    // brace early and freed the call below it (PR #93 review, round 10). Both
+    // spellings of the body, and the `function` keyword's, have to hold.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm(){\n            { echo x; }\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          arm(){ { echo x; }; gh pr merge \"$PR_URL\" --auto; }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          function arm(){\n            { echo x; }\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // A body that ends is over: shell after the closing brace is ordinary
@@ -1533,6 +1643,28 @@ fn arms_auto_merge_rejects_shell_below_a_terminating_command() {
     assert!(!arms_auto_merge(&workflow(
         "          until false; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
+    // `:` is `true` under another name, and `for` over a list of literal words
+    // iterates at least once -- both settle their body just as `if true` does,
+    // and both were still read as skippable, so the `exit` inside them latched
+    // nothing and the call below stayed a live merge path (PR #93 review,
+    // round 10).
+    assert!(!arms_auto_merge(&workflow(
+        "          if :; then exit 0; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          while :; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The same second name on the dead side: `until :` never enters its body
+    // at all, so a call written inside one arms nothing.
+    assert!(!arms_auto_merge(&workflow(
+        "          until :; do gh pr merge \"$PR_URL\" --auto; done\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          for f in a b; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          for f in only; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // Only an `exit` the shell actually *reaches* ends anything. The `|| exit 1`
@@ -1552,6 +1684,19 @@ fn arms_auto_merge_rejects_shell_below_a_terminating_command() {
     )));
     assert!(arms_auto_merge(&workflow(
         "          for f in $LIST; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A `for` list settles its body only when every word is a plain literal:
+    // an expansion can yield nothing and a glob can match nothing, so neither
+    // guarantees the `exit` inside runs, and the call below them stays a merge
+    // path.
+    assert!(arms_auto_merge(&workflow(
+        "          for f in *.log; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          for f in \"$@\"; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          for f; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
     // Nesting a settled block inside an unsettled one does not settle it.
     assert!(arms_auto_merge(&workflow(
