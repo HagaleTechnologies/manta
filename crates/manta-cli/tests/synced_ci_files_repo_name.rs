@@ -140,7 +140,11 @@ fn merge_policy_successor_to_mergify_exists() {
     // shell function that nothing ever calls (PR #93 review, round 7); and
     // letting every boundary start a *reachable* command would still be
     // satisfied by leftover text below an unconditional `exit 0`, which the
-    // shell is already gone before it reads (PR #93 review, round 8).
+    // shell is already gone before it reads (PR #93 review, round 8); and
+    // reading quotes off a word before balancing braces, or treating every
+    // block body as skippable, would still be satisfied by a `gh pr merge`
+    // an `echo "}"` had falsely freed from its uncalled function, or by one
+    // written below `if true; then exit 0; fi` (PR #93 review, round 9).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -203,7 +207,10 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    written beneath it do the same again (round 8). See `run_shell` for the
 ///    here-document, `simple_commands` for the operators and keywords,
 ///    `FunctionScope` for the function body, and `TERMINATING_COMMANDS` for the
-///    `exit`.
+///    `exit`. Round 9 closed the two ways that last one leaked: an `exit` in a
+///    body the condition settles (`if true; then exit 0; fi`) now ends the
+///    shell for the text below the block, and a quoted brace (`echo "}"`) no
+///    longer closes a function body -- see `Block` and `FunctionScope::absorb`.
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -466,7 +473,8 @@ struct SimpleCommand {
     /// a command is text, not a merge path -- `false && gh pr merge --auto`
     /// arms nothing (PR #93 review, round 6), neither does
     /// `arm() { gh pr merge --auto; }` with no `arm` after it (round 7), and
-    /// neither does a call written below an unconditional `exit 0` (round 8).
+    /// neither does a call written below an unconditional `exit 0` (round 8)
+    /// or below `if true; then exit 0; fi` (round 9).
     ///
     /// A command that merely *may* be skipped is a different thing and is NOT
     /// marked here. `gh pr merge --auto` inside `if ... then ... else ... fi`,
@@ -485,6 +493,28 @@ const BLOCK_OPENERS: [&str; 5] = ["if", "while", "until", "for", "case"];
 /// The keywords that close those blocks.
 const BLOCK_CLOSERS: [&str; 3] = ["fi", "done", "esac"];
 
+/// Words that introduce a compound command's *body* rather than heading a
+/// command of their own.
+///
+/// The shell reads `then`, `else`, `do` and `elif` as syntax, and what follows
+/// one of them on the same line is an ordinary simple command. This reader
+/// breaks commands at `;`, `&`, `|` and newline only, so `if true; then exit 0;
+/// fi` hands it the three words `then exit 0` as one command -- whose head was
+/// `then`, which is no keyword this reader knows, so the `exit` it introduces
+/// went unrecognised and the shell was read as still running below the block
+/// (PR #93 review, round 9).
+const BODY_INTRODUCERS: [&str; 4] = ["then", "else", "elif", "do"];
+
+/// The words of a simple command that carry meaning for this reader: its own
+/// words with the shell's structural tokens dropped -- a brace-group `{` (whose
+/// contents run in this same shell) and the body introducers above.
+fn significant_words(words: &[String]) -> impl Iterator<Item = &str> {
+    words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| *word != "{" && !BODY_INTRODUCERS.contains(word))
+}
+
 /// Builtins whose exit status is fixed before the shell ever runs, so a list
 /// operator applied to one of them decides statically -- not at run time --
 /// whether what follows it executes. `false && CMD` and `true || CMD` are the
@@ -495,43 +525,76 @@ const BLOCK_CLOSERS: [&str; 3] = ["fi", "done", "esac"];
 /// loud failure rather than a wrong certification.
 const CONSTANT_STATUS_COMMANDS: [&str; 3] = ["true", "false", ":"];
 
-/// The word that heads a simple command, read past any leading `{`.
+/// The word that heads a simple command, read past the shell's own structural
+/// tokens.
 ///
 /// A brace group is not a command of its own: the shell runs its contents in
 /// this same shell, so `{ exit 0; }` ends it exactly as a bare `exit 0` does
-/// and `{ if ...` opens a block exactly as a bare `if` does. Only *leading*
-/// braces are skipped; a `}` closing a function body is still `FunctionScope`'s
-/// business, and heads no keyword either way.
+/// and `{ if ...` opens a block exactly as a bare `if` does. `then`, `else`,
+/// `elif` and `do` are skipped for the same reason -- they introduce a body,
+/// and the command they precede is what the shell actually runs. A `}` closing
+/// a function body is still `FunctionScope`'s business, and heads no keyword
+/// either way.
 fn command_head(words: &[String]) -> Option<&str> {
-    words.iter().map(String::as_str).find(|word| *word != "{")
+    significant_words(words).next()
 }
 
 /// Is this whole simple command one of the constant-status builtins, with no
 /// arguments of its own? `false` is; `[ -n "$PR_URL" ]` and `grep -q false f`
 /// are not.
 fn is_constant_status(words: &[String]) -> bool {
-    let mut significant = words.iter().map(String::as_str).filter(|w| *w != "{");
+    let mut significant = significant_words(words);
     significant
         .next()
         .is_some_and(|head| CONSTANT_STATUS_COMMANDS.contains(&head))
         && significant.next().is_none()
 }
 
-/// Does this block opener's condition make the block's body dead text?
+/// One `if`/`while`/`until`/`for`/`case` block enclosing the command being
+/// read, and what the block's own condition settles statically about its body.
+struct Block {
+    /// True when the condition can never hold, so the body is dead text:
+    /// `if false`, `while false`, `until true`.
+    body_is_dead: bool,
+    /// True when the condition always holds, so the body is certain to run at
+    /// least once: `if true`, `while true`, `until false`.
+    ///
+    /// Only a guaranteed body lets an `exit` written inside it end the shell
+    /// for everything *after* the block. Reading every block's body as
+    /// skippable left `if true; then exit 0; fi` followed by
+    /// `gh pr merge "$PR_URL" --auto` classified as a reachable merge path,
+    /// although the shell was already gone before it (PR #93 review, round 9).
+    body_is_guaranteed: bool,
+}
+
+/// What `words` -- a block opener -- settles statically about the body that
+/// follows it.
 ///
-/// Only the constant spellings: `if false`, `while false`, `until true`. A
-/// real test command, a `for` list or a `case` subject is a branch the shell
-/// can take, so its body is a live merge path and this returns false for it.
-fn opens_dead_block(words: &[String]) -> bool {
-    let mut significant = words.iter().map(String::as_str).filter(|w| *w != "{");
+/// Only the constant spellings settle anything: `if false`/`while false`/
+/// `until true` make the body dead, `if true`/`while true`/`until false` make
+/// it certain. A real test command, a `for` list or a `case` subject is a
+/// branch the shell may or may not take, so neither flag is set for it.
+///
+/// `if true` is over-read on purpose, in the direction this guard errs in: an
+/// `exit` in the `else` arm of `if true` never actually runs, but letting it
+/// latch termination anyway only ever refuses *more* text below the block.
+fn block_from_opener(words: &[String]) -> Block {
+    let mut significant = significant_words(words);
     let Some(head) = significant.next() else {
-        return false;
+        return Block {
+            body_is_dead: false,
+            body_is_guaranteed: false,
+        };
     };
     let condition: Vec<&str> = significant.collect();
-    match head {
-        "if" | "while" => condition == ["false"],
-        "until" => condition == ["true"],
-        _ => false,
+    let (body_is_dead, body_is_guaranteed) = match head {
+        "if" | "while" => (condition == ["false"], condition == ["true"]),
+        "until" => (condition == ["true"], condition == ["false"]),
+        _ => (false, false),
+    };
+    Block {
+        body_is_dead,
+        body_is_guaranteed,
     }
 }
 
@@ -586,17 +649,31 @@ impl FunctionScope {
     /// Fold one simple command into the scope, and report whether the shell
     /// reaches that command only by calling a function.
     ///
-    /// Braces are counted as whole words, so `${VAR}` or a `{` inside a quoted
-    /// string never opens or closes a body. An unbalanced body swallows the
-    /// rest of the shell, which -- as with an unterminated here-document --
-    /// only makes the guard harder to satisfy.
-    fn absorb(&mut self, words: &[String]) -> bool {
+    /// Braces are counted as whole words, so `${VAR}` never opens or closes a
+    /// body -- and only *unquoted* words count, because the shell's own brace
+    /// is a syntax token while a quoted or backslash-escaped one is ordinary
+    /// text. Words reach this reader with their quotes already removed, so
+    /// `echo "}"` inside a body was indistinguishable from the body's own
+    /// closing brace: it ended the scope early and re-opened a later
+    /// `gh pr merge ... --auto` in the same uncalled function to an
+    /// unconditional reading (PR #93 review, round 9). `quoted` carries that
+    /// lost provenance alongside the words, one flag per word, so the two stay
+    /// apart. An unbalanced body swallows the rest of the shell, which -- as
+    /// with an unterminated here-document -- only makes the guard harder to
+    /// satisfy.
+    fn absorb(&mut self, words: &[String], quoted: &[bool]) -> bool {
         let inside = self.open;
         if !self.open && is_function_definition(words) {
             self.open = true;
         }
         if self.open {
-            for word in words {
+            for (idx, word) in words.iter().enumerate() {
+                // Text that came out of quotes or a backslash escape is an
+                // argument, never the shell's own brace. Missing provenance is
+                // read as unquoted, which is how every word behaved before.
+                if quoted.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
                 match word.as_str() {
                     "{" => self.brace_depth += 1,
                     "}" => {
@@ -658,16 +735,21 @@ fn is_function_definition(words: &[String]) -> bool {
 ///   `exit`.
 /// - **Is the shell *guaranteed* to reach it on this run?** That is
 ///   `skippable`, and it is only used to decide whether an `exit` here may latch
-///   `terminated` for everything below it. An `exit` inside an `if` block, or
-///   behind `&&`, ends nothing on the runs that skip it, so it must not.
+///   `terminated` for everything below it. An `exit` inside an `if` block whose
+///   condition is a real test, or behind `&&`, ends nothing on the runs that
+///   skip it, so it must not. An `exit` inside a block the condition settles --
+///   `if true`, `while true`, `until false` -- is reached on every run, so it
+///   does (PR #93 review, round 9).
+///
+/// `quoted` runs parallel to `words`, one flag per word, recording which of
+/// them came out of quotes or a backslash escape. Only `FunctionScope::absorb`
+/// needs it, to tell a body-closing `}` from an `echo "}"`.
 fn push_simple_command(
     commands: &mut Vec<SimpleCommand>,
     words: Vec<String>,
-    gated: bool,
-    dead: bool,
-    blocks: &mut Vec<bool>,
-    functions: &mut FunctionScope,
-    terminated: &mut bool,
+    quoted: Vec<bool>,
+    gate: Gate,
+    state: &mut ShellState,
 ) {
     if words.is_empty() {
         return;
@@ -678,20 +760,57 @@ fn push_simple_command(
     let ends_shell = TERMINATING_COMMANDS.contains(&head);
     // Unconditionally: the scope is a state machine and every command has to
     // pass through it, not just the ones that end up unreachable.
-    let in_function_body = functions.absorb(&words);
-    let in_dead_block = blocks.iter().any(|body_is_dead| *body_is_dead);
-    let unreachable = dead || in_dead_block || in_function_body || *terminated;
-    let skippable = unreachable || gated || !blocks.is_empty();
+    let in_function_body = state.functions.absorb(&words, &quoted);
+    let in_dead_block = state.blocks.iter().any(|block| block.body_is_dead);
+    let unreachable = gate.dead || in_dead_block || in_function_body || state.terminated;
+    // A block whose condition is settled is entered on every run, so it does
+    // not make its body skippable; every other block does.
+    let skippable =
+        unreachable || gate.gated || state.blocks.iter().any(|block| !block.body_is_guaranteed);
     if opens_block {
-        blocks.push(opens_dead_block(&words));
+        state.blocks.push(block_from_opener(&words));
     } else if closes_block {
-        blocks.pop();
+        state.blocks.pop();
     } else if !skippable && ends_shell {
         // The `exit` itself runs -- `skippable` above is already decided -- and
         // everything after it does not.
-        *terminated = true;
+        state.terminated = true;
     }
     commands.push(SimpleCommand { words, unreachable });
+}
+
+/// What the boundary *before* a simple command settled about reaching it.
+///
+/// `;`, `&` and a newline settle nothing and reset both flags; `&&` and `||`
+/// make the next command depend on how this one exited, and do so statically
+/// when the left-hand side is a constant-status builtin.
+#[derive(Clone, Copy, Default)]
+struct Gate {
+    /// The shell may skip the command, depending on a status only known at run
+    /// time.
+    gated: bool,
+    /// Stronger: the gate is a constant, so the shell can never reach the
+    /// command at all.
+    dead: bool,
+}
+
+/// The reader state that carries from one simple command to the next.
+///
+/// Bundled rather than passed as five separate `&mut` parameters, which is both
+/// what `clippy::too_many_arguments` asks for and the honest shape: these three
+/// are one state machine, stepped by every command in file order.
+#[derive(Default)]
+struct ShellState {
+    /// The `if`/`while`/`until`/`for`/`case` blocks enclosing the command being
+    /// read, innermost last, each recording what its own condition settles
+    /// about its body.
+    blocks: Vec<Block>,
+    /// Whether that command sits in a function body, which runs only when
+    /// something calls the function.
+    functions: FunctionScope,
+    /// Set by a reached `exit`/`exec` and never cleared: the shell is gone, so
+    /// every command after one is text nothing executes.
+    terminated: bool,
 }
 
 /// Split shell source into simple commands, each a list of unquoted tokens plus
@@ -722,24 +841,20 @@ fn push_simple_command(
 fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     let mut commands: Vec<SimpleCommand> = Vec::new();
     let mut command: Vec<String> = Vec::new();
+    // One flag per word of `command`: did any of that word's text come out of
+    // quotes or a backslash escape? Only the brace bookkeeping in
+    // `FunctionScope::absorb` reads it.
+    let mut quoted: Vec<bool> = Vec::new();
     let mut token = String::new();
+    let mut token_quoted = false;
     let mut started = false;
     let mut quote: Option<char> = None;
-    // Set by `&&`/`||`, cleared by the next `;`, `&` or newline: whether the
-    // command currently being read is one the shell may skip.
-    let mut gated = false;
-    // Same lifetime, stronger claim: the gate it sits behind is a constant, so
-    // the shell can never reach it at all.
-    let mut dead = false;
-    // The `if`/`while`/`until`/`for`/`case` blocks enclosing it, innermost
-    // last, each recording whether its own condition makes its body dead text.
-    let mut blocks: Vec<bool> = Vec::new();
-    // Whether it sits in a function body, which runs only when something calls
-    // the function.
-    let mut functions = FunctionScope::default();
-    // Set by a reached `exit`/`exec` and never cleared: the shell is gone, so
-    // every command after one is text nothing executes.
-    let mut terminated = false;
+    // What the boundary before the command currently being read settled about
+    // reaching it.
+    let mut gate = Gate::default();
+    // The block stack, function scope and termination latch, stepped by every
+    // command `push_simple_command` records.
+    let mut state = ShellState::default();
     let mut chars = shell.chars().peekable();
 
     // Close off the token being built, if any.
@@ -747,6 +862,7 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
         () => {
             if started {
                 command.push(std::mem::take(&mut token));
+                quoted.push(std::mem::take(&mut token_quoted));
                 started = false;
             }
         };
@@ -772,6 +888,7 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                 '\'' | '"' => {
                     quote = Some(c);
                     started = true;
+                    token_quoted = true;
                 }
                 '\\' => match chars.next() {
                     // Line continuation: the newline disappears and the command
@@ -781,6 +898,8 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                     Some(next) => {
                         token.push(next);
                         started = true;
+                        // `\}` is text, exactly as `"}"` is.
+                        token_quoted = true;
                     }
                 },
                 ';' | '&' | '|' | '\n' => {
@@ -797,18 +916,19 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                     push_simple_command(
                         &mut commands,
                         std::mem::take(&mut command),
-                        gated,
-                        dead,
-                        &mut blocks,
-                        &mut functions,
-                        &mut terminated,
+                        std::mem::take(&mut quoted),
+                        gate,
+                        &mut state,
                     );
-                    (gated, dead) = match c {
-                        _ if doubled => (true, dead || constant_status),
+                    gate = match c {
+                        _ if doubled => Gate {
+                            gated: true,
+                            dead: gate.dead || constant_status,
+                        },
                         // A pipeline member shares the pipeline's own gate.
-                        '|' => (gated, dead),
+                        '|' => gate,
                         // `;`, `&` and a newline start an unconditional list.
-                        _ => (false, false),
+                        _ => Gate::default(),
                     };
                 }
                 c if c.is_whitespace() => end_token!(),
@@ -825,16 +945,9 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     // `-D warnings`.
     if started {
         command.push(token);
+        quoted.push(token_quoted);
     }
-    push_simple_command(
-        &mut commands,
-        command,
-        gated,
-        dead,
-        &mut blocks,
-        &mut functions,
-        &mut terminated,
-    );
+    push_simple_command(&mut commands, command, quoted, gate, &mut state);
     commands
 }
 
@@ -1326,6 +1439,25 @@ fn arms_auto_merge_rejects_uncalled_function_bodies() {
     assert!(!arms_auto_merge(&workflow(
         "          arm() {\n            { echo x; }\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
     )));
+    // A *quoted* brace is an argument, not the body's closing brace. Words
+    // reach `FunctionScope::absorb` with their quotes already stripped, so
+    // `echo "}"` used to balance the body early and hand the call below it
+    // back to an unconditional reading (PR #93 review, round 9); all three
+    // spellings of a quoted brace have to stay out of the count.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            echo \"}\"\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            echo '}'\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            echo \\}\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    // ...and the same trick with the *opening* brace must not smuggle the call
+    // out of the body either.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            echo \"{\"\n            echo \"}\"\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // A body that ends is over: shell after the closing brace is ordinary
@@ -1385,6 +1517,22 @@ fn arms_auto_merge_rejects_shell_below_a_terminating_command() {
     assert!(!arms_auto_merge(&workflow(
         "          {\n            exit 0\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
+    // A block whose condition is a constant is entered on every run, so the
+    // `exit` inside it is reached on every run too. Reading every block body as
+    // merely skippable let `if true; then exit 0; fi` leave the call below it
+    // classified as a live merge path (PR #93 review, round 9).
+    assert!(!arms_auto_merge(&workflow(
+        "          if true; then exit 0; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          if true\n          then\n            exit 0\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          while true; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          until false; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // Only an `exit` the shell actually *reaches* ends anything. The `|| exit 1`
@@ -1396,9 +1544,18 @@ fn arms_auto_merge_rejects_shell_below_a_terminating_command() {
     assert!(arms_auto_merge(&workflow(
         "          [ -n \"$PR_URL\" ] && exit 0\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
-    // An `exit` inside a block runs only if the block is entered...
+    // An `exit` inside a block runs only if the block is entered -- and a real
+    // test command, a `for` list or a `case` subject settles nothing, so those
+    // blocks stay skippable and the call below them stays a merge path.
     assert!(arms_auto_merge(&workflow(
         "          if [ -z \"$PR_URL\" ]\n          then\n            exit 0\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          for f in $LIST; do exit 0; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Nesting a settled block inside an unsettled one does not settle it.
+    assert!(arms_auto_merge(&workflow(
+        "          if [ -z \"$PR_URL\" ]\n          then\n            if true; then exit 0; fi\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
     // ...and one in a function body only when something calls the function.
     assert!(arms_auto_merge(&workflow(
