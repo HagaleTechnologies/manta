@@ -64,20 +64,34 @@ jobs:
   audit:
     name: Supply Chain
     needs: changes
+    # `if: always()` (Codex P1, round 1): without it, a `changes` job FAILURE (a bad checkout, a
+    # paths-filter bug, a transient runner problem) makes this job SKIP rather than run at all --
+    # GitHub's default `needs:` gating only proceeds on the needed job's success. This repo's own
+    # wait-for-codex.yml documents that a SKIPPED required check satisfies branch protection, so a
+    # skip here would let a PR merge with no audit ever having run, silently. Running unconditionally
+    # and explicitly failing closed on anything but `changes` succeeding (first step below) turns
+    # that into a loud, correctly-attributed failure instead.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Fail closed if dependency-change detection did not succeed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "::error::'Detect dependency changes' did not succeed (result=${{ needs.changes.result }}) -- failing this required check closed rather than silently skipping the audit."
+          exit 1
+
       - name: Pass trivially (no dependency manifest/lockfile changed)
-        if: needs.changes.outputs.deps != 'true'
+        if: needs.changes.result == 'success' && needs.changes.outputs.deps != 'true'
         run: echo "No Cargo.lock/Cargo.toml change in this diff -- nothing to scan."
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.deps == 'true'
+        if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        if: needs.changes.outputs.deps == 'true'
+        if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
 
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        if: needs.changes.outputs.deps == 'true'
+        if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
