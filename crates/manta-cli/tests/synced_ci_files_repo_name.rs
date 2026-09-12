@@ -294,14 +294,19 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    (`WorkflowShell::pipefail`, `ShellState::pipeline_failed`).
 ///
 /// 5. **Which program the name resolves to.** `gh` in command position is the
-///    GitHub CLI only while nothing in the same shell has defined a *function*
-///    by that name. Bash resolves a command word against its function table
-///    before `$PATH`, so a `run:` block spelling `gh() { echo disabled; }` and
-///    then `gh pr merge "$PR_URL" --auto` executes the stub -- a reachable
-///    command, correctly, but not an invocation of the CLI -- while a check
-///    that reads only the word's basename certified it as the merge path (PR
-///    #93 review, round 17). Function names defined in the text are tracked as
-///    it is read (`ShellState::shadowing_functions`,
+///    GitHub CLI only while nothing in the same shell has taken that name over.
+///    Bash resolves a command word against its function table before `$PATH`,
+///    so a `run:` block spelling `gh() { echo disabled; }` and then `gh pr
+///    merge "$PR_URL" --auto` executes the stub -- a reachable command,
+///    correctly, but not an invocation of the CLI -- while a check that reads
+///    only the word's basename certified it as the merge path (PR #93 review,
+///    round 17). Round 19 closed the other half of the same hole: an *alias*
+///    (`alias gh=echo`, with the `shopt -s expand_aliases` a script needs for
+///    it) shadows a command word just as thoroughly, and is expanded even
+///    earlier -- while the line is still being read -- so `alias gh=echo`
+///    above the same call echoes its arguments and merges nothing
+///    (`aliased_names`). Both kinds of name are tracked as the text is read
+///    (`ShellState::shadowed_names`,
 ///    `defined_function_name`) and a call to one is marked `shadowed`, which
 ///    only ever refuses more text: a name shadowed here may be perfectly
 ///    ordinary in the real shell if the definition sits in a *different* step,
@@ -314,8 +319,9 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    unshadowed -- so the header is now read off `significant_words`, which
 ///    drops exactly those structural tokens, the same words `command_head` is
 ///    read from. Shadowing is deliberately not undone by anything -- `unset -f
-///    gh`, a subshell that ends, `command gh` -- because resolving those is the
-///    same dispatch modelling this reader refuses everywhere else.
+///    gh`, `unalias gh`, a subshell that ends, `command gh` -- because
+///    resolving those is the same dispatch modelling this reader refuses
+///    everywhere else.
 ///
 /// 6. **The step runs at all.** Everything above reads shell; Actions decides
 ///    separately whether the step is handed to a shell in the first place. A
@@ -362,9 +368,9 @@ fn arms_auto_merge(body: &str) -> bool {
 ///
 /// Whether the word `gh` reaches the GitHub CLI at all is a question about the
 /// *shell*, not about this one command, so it is answered where the shell is
-/// read: `SimpleCommand::shadowed` records a command word a function definition
-/// earlier in the text has taken over, and `arms_auto_merge` refuses those
-/// before this predicate is consulted.
+/// read: `SimpleCommand::shadowed` records a command word an earlier function
+/// definition or `alias` in the same text has taken over, and `arms_auto_merge`
+/// refuses those before this predicate is consulted.
 fn is_gh_auto_merge(command: &[String]) -> bool {
     let Some(argv0) = command.first() else {
         return false;
@@ -654,16 +660,17 @@ struct SimpleCommand {
     /// `needs-human` label. Reading "may not run on this invocation" as "never
     /// runs" made this guard refuse the real, working workflow.
     unreachable: bool,
-    /// True when this command's own command word names a *shell function*
-    /// defined earlier in the same shell text. Such a command runs -- it is not
-    /// `unreachable` -- but it runs that function, not the program of the same
-    /// name: bash looks a function up before it ever consults `$PATH`, so
-    /// `gh() { echo disabled; }` followed by `gh pr merge "$PR_URL" --auto`
-    /// invokes the stub and merges nothing, while the basename check in
-    /// `is_gh_auto_merge` read the call as the GitHub CLI's (PR #93 review,
-    /// round 17). Only an unqualified name is shadowable: `/usr/bin/gh` and
-    /// `command gh` reach the program whatever functions exist, and neither
-    /// matches a function name here.
+    /// True when this command's own command word names something the same
+    /// shell text took over earlier -- a *shell function* (`gh() { echo
+    /// disabled; }`) or an *alias* (`alias gh=echo`). Such a command runs -- it
+    /// is not `unreachable` -- but it runs that stub, not the program of the
+    /// same name: bash expands an alias while it is still reading the line and
+    /// looks a function up before it ever consults `$PATH`, so either one
+    /// followed by `gh pr merge "$PR_URL" --auto` merges nothing, while the
+    /// basename check in `is_gh_auto_merge` read the call as the GitHub CLI's
+    /// (PR #93 review, rounds 17 and 19). Only an unqualified name is
+    /// shadowable: `/usr/bin/gh` and `command gh` reach the program whatever
+    /// the tables hold, and neither matches a recorded name here.
     shadowed: bool,
 }
 
@@ -1367,6 +1374,42 @@ fn defined_function_name(words: &[String]) -> Option<&str> {
     None
 }
 
+/// The names an `alias` builtin defines, or an empty list when this command is
+/// no alias definition at all.
+///
+/// The other half of command shadowing, and the one a function table alone left
+/// open: a `run:` block that enables alias expansion and writes `alias gh=echo`
+/// above `gh pr merge "$PR_URL" --auto` runs `echo`, never the GitHub CLI, so
+/// the workflow arms no automated merge while a reader that tracks only
+/// functions still calls that an arming call (PR #93 review, round 19).
+///
+/// `alias` defines by `name=value` words, so that is what is read: everything
+/// after the builtin's own word, with the shell's structural tokens and
+/// redirections already dropped, split at the first `=`. Quoting is not
+/// consulted, since the tokeniser has already removed it -- `alias
+/// gh='echo no'` arrives as the single word `gh=echo no` and names `gh`. An
+/// option (`alias -p`) and a bare name (`alias gh`, which only *prints* the
+/// alias) define nothing and are skipped, which is the only place this reader
+/// is deliberately not strict: neither spelling puts a new name in the alias
+/// table, so treating them as shadows would refuse text on no evidence at all.
+///
+/// What the recorded name then means -- that it shadows unconditionally,
+/// ignoring `expand_aliases`, definition-line timing and the quoting that
+/// really would defeat expansion -- is `ShellState::shadowed_names`' business,
+/// and is documented there.
+fn aliased_names(words: &[String]) -> Vec<&str> {
+    let mut significant = without_redirections(significant_words(words)).into_iter();
+    if significant.next() != Some("alias") {
+        return Vec::new();
+    }
+    significant
+        .filter(|word| !word.starts_with('-'))
+        .filter_map(|word| word.split_once('='))
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// The bare name inside a definition header's own word: `gh(){`, `gh()` and
 /// `gh(` all name `gh`, and a word that is only punctuation names nothing.
 fn header_name(word: &str) -> &str {
@@ -1443,14 +1486,17 @@ fn push_simple_command(
         && (state.pipeline_failed || is_statically_failing(&words));
     let ends_loop_body = LOOP_CONTROL_COMMANDS.contains(&head);
     // Which program this command's own word reaches: a name some earlier
-    // definition took over is a call to that function, whatever program shares
-    // its name. Read before this command's own header can add to the table, so
-    // a definition never shadows itself.
+    // function definition or `alias` took over is a call to that, whatever
+    // program shares its name. Read before this command's own header or alias
+    // can add to the table, so a definition never shadows itself.
     let shadowed = command_head(&words)
-        .is_some_and(|word| state.shadowing_functions.iter().any(|name| name == word));
+        .is_some_and(|word| state.shadowed_names.iter().any(|name| name == word));
     if let Some(name) = defined_function_name(&words).filter(|name| !name.is_empty()) {
-        state.shadowing_functions.push(name.to_owned());
+        state.shadowed_names.push(name.to_owned());
     }
+    state
+        .shadowed_names
+        .extend(aliased_names(&words).into_iter().map(str::to_owned));
     // Unconditionally: the scope is a state machine and every command has to
     // pass through it, not just the ones that end up unreachable.
     let in_function_body = state.functions.absorb(&words, &quoted);
@@ -1525,20 +1571,33 @@ struct ShellState {
     /// Whether that command sits in a function body, which runs only when
     /// something calls the function.
     functions: FunctionScope,
-    /// The names every function-definition header read so far has defined, in
-    /// file order. A command word matching one of them is a call to that
-    /// function, not to the program of the same name -- bash consults its
-    /// function table before `$PATH` -- so `gh() { echo disabled; }` above a
-    /// `gh pr merge "$PR_URL" --auto` leaves the workflow arming nothing (PR
-    /// #93 review, round 17).
+    /// Every name the text read so far has taken over, in file order -- from a
+    /// function-definition header (`gh() { echo disabled; }`) or from an
+    /// `alias` builtin (`alias gh=echo`). A command word matching one of them
+    /// is a call to *that*, not to the program of the same name: bash consults
+    /// its alias table while it is still reading the line and its function
+    /// table before `$PATH`, so either one above a `gh pr merge "$PR_URL"
+    /// --auto` leaves the workflow arming nothing (PR #93 review, rounds 17 and
+    /// 19).
     ///
     /// Names are recorded as the text is read, so a call written *above* the
-    /// definition that shadows it still counts: at that point in a real run the
-    /// function does not exist yet. Everything else about the table errs
+    /// definition that shadows it still counts: at that point in a real run
+    /// neither table holds the name yet. Everything else about the table errs
     /// towards refusing -- a definition inside dead text, inside another
     /// function's body, or in a different step of the same workflow all shadow
-    /// the name here, and nothing ever removes one.
-    shadowing_functions: Vec<String>,
+    /// the name here, and nothing ever removes one (no `unset -f`, no
+    /// `unalias`).
+    ///
+    /// The two kinds are deliberately not told apart, even though bash expands
+    /// them under different rules: an alias reaches the command only in a shell
+    /// that has `shopt -s expand_aliases`, only on a line read *after* the
+    /// definition, and only when the command word was written unquoted, while a
+    /// function needs none of those. Every one of those differences would make
+    /// this reader accept *more* text, and each needs it to resolve dispatch it
+    /// deliberately refuses to resolve, so an alias definition simply shadows
+    /// the name outright -- which can only cost a loud failure a human then
+    /// looks at, never a wrong certification.
+    shadowed_names: Vec<String>,
     /// Set by a reached `exit`/`exec` -- or by a bare `false` under the `bash
     /// -e` an Actions step runs by default -- and never cleared: the shell is
     /// gone, so every command after one is text nothing executes.
@@ -3531,8 +3590,10 @@ fn arms_auto_merge_rejects_calls_shadowed_by_a_shell_function() {
         "          gh()\n          {\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
     // Quoting the command word does not escape the function table: bash strips
-    // the quotes and looks the resulting word up exactly as it does a bare one
-    // (unlike an alias, which quoting *does* defeat). Words reach this reader
+    // the quotes and looks the resulting word up exactly as it does a bare one.
+    // (Quoting *does* defeat an alias in a real shell -- see
+    // `arms_auto_merge_rejects_calls_shadowed_by_an_alias`, which refuses that
+    // spelling anyway rather than model expansion.) Words reach this reader
     // already unquoted, so this holds by construction -- pinned so it stays so.
     assert!(!arms_auto_merge(&workflow(
         "          gh() { echo disabled; }\n          \"gh\" pr merge \"$PR_URL\" --auto\n"
@@ -3603,5 +3664,96 @@ fn arms_auto_merge_rejects_calls_shadowed_by_a_shell_function() {
     )));
     assert!(arms_auto_merge(&workflow(
         "          for i in 1 2; do needs_human() { echo no; }; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// A command word an *alias* has taken over does not reach the program of that
+/// name either (PR #93 review, round 19: a step could enable alias expansion,
+/// define `alias gh=echo`, and then run `gh pr merge "$PR_URL" --auto`, which
+/// bash expands to `echo pr merge "$PR_URL" --auto` -- arguments printed, no
+/// merge armed -- while a reader tracking only shell functions handed the call
+/// back as the GitHub CLI's own).
+#[test]
+fn arms_auto_merge_rejects_calls_shadowed_by_an_alias() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case, with and without the `shopt` a script needs for
+    // bash to expand the alias at all.
+    assert!(!arms_auto_merge(&workflow(
+        "          shopt -s expand_aliases\n          alias gh=echo\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          alias gh=echo\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    // Every spelling of the value, since the tokeniser has already removed the
+    // quotes by the time the name is read: a quoted value, a value carrying
+    // spaces, and a definition sharing its `alias` with other names.
+    assert!(!arms_auto_merge(&workflow(
+        "          alias gh=\"echo disabled\"\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          alias gh='echo disabled'\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          alias ls=ls gh=echo\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          alias -p gh=echo\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The shell's own structural tokens stand in front of a definition sharing
+    // its line with the compound command enclosing it, exactly as they do for a
+    // function header, and the name is read past them the same way.
+    assert!(!arms_auto_merge(&workflow(
+        "          if true; then alias gh=echo; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          { alias gh=echo; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A redirection on the definition is syntax, not a name.
+    assert!(!arms_auto_merge(&workflow(
+        "          alias gh=echo >/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The definition in one step and the call in another, as for functions:
+    // `run_shell` reads the whole workflow's `run:` text as one stream.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: |\n          alias gh=echo\n      - run: |\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // Quoting the command word really does defeat alias expansion in bash, and
+    // a definition really is inert without `expand_aliases` -- both are refused
+    // here regardless, because either exception needs this reader to model when
+    // an alias expands, which is the dispatch resolution it refuses everywhere
+    // else. Refusing a call that might have armed one costs a loud failure a
+    // human then looks at; the opposite costs a merge path that does not exist.
+    assert!(!arms_auto_merge(&workflow(
+        "          alias gh=echo\n          \"gh\" pr merge \"$PR_URL\" --auto\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // An alias by some *other* name shadows nothing.
+    assert!(arms_auto_merge(&workflow(
+        "          alias ll='ls -l'\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A call written *above* the definition is not shadowed: bash expands an
+    // alias only on the lines it reads after the definition.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto\n          alias gh=echo\n"
+    )));
+    // A word that merely mentions a definition is no definition of it.
+    assert!(arms_auto_merge(&workflow(
+        "          echo \"alias gh=echo\"\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // `alias` with nothing to define -- listing the table, or printing one
+    // entry -- puts no new name in it, so it shadows nothing. This is the one
+    // place the reader is not strict, and it is safe: neither spelling is a
+    // definition at all.
+    assert!(arms_auto_merge(&workflow(
+        "          alias -p\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          alias gh\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Some *other* builtin taking a `name=value` argument is not `alias`.
+    assert!(arms_auto_merge(&workflow(
+        "          export gh=echo\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
