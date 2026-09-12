@@ -18,7 +18,9 @@
 //! Scope is those files only -- the generic category phrase "CW skimmer"
 //! stays legal everywhere else (see docs/DECISIONS/2026-09-01-rename-to-manta.md).
 
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
+use std::str::Chars;
 
 /// Workspace root, derived from this crate's manifest dir (`crates/manta-cli`).
 fn repo_root() -> PathBuf {
@@ -126,17 +128,22 @@ fn merge_policy_successor_to_mergify_exists() {
     // which invoke nothing (PR #93 review, round 3); taking *every* `run:` key
     // as shell would still be satisfied by a mapping merely named `run` (an
     // `env:` child, a `with:` input, `jobs.<id>.defaults.run`), which executes
-    // nothing either (PR #93 review, round 4); and reading a *folded* `run: >`
+    // nothing either (PR #93 review, round 4); reading a *folded* `run: >`
     // block as though it were a literal `run: |` one would still be satisfied
     // by a block YAML folds into a single `echo` command, with `gh` and its
-    // flags demoted to words of that `echo` (PR #93 review, round 5).
+    // flags demoted to words of that `echo` (PR #93 review, round 5); and
+    // treating every newline and `&&` as an unconditional command boundary
+    // would still be satisfied by shell text the shell never executes -- a
+    // here-document body handed to `cat` on stdin, or a branch behind
+    // `false &&` (PR #93 review, round 6).
     assert!(
         arms_auto_merge(&body),
         "{rel} no longer arms auto-merge: no `run:` shell in it *invokes* \
          `gh pr merge ... --auto` as a command (a header comment, a \
-         `name:`/`env:` scalar, an `echo` of the command text or an assignment \
-         of it to a variable all fail this check, as does naming it only inside \
-         a conditional -- see `arms_auto_merge`). That call IS the post-#185 \
+         `name:`/`env:` scalar, an `echo` of the command text, an assignment \
+         of it to a variable or a here-document body all fail this check, as \
+         does naming it only behind `&&`/`||` or inside an `if`/`for` block \
+         -- see `arms_auto_merge`). That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
          losing it silently leaves the repo with no automated merge path at all."
     );
@@ -145,7 +152,7 @@ fn merge_policy_successor_to_mergify_exists() {
 /// Does `body` -- a GitHub Actions workflow -- actually *execute* `gh pr merge
 /// ... --auto` from a step's `run:` shell?
 ///
-/// Three conditions, all necessary:
+/// Four conditions, all necessary:
 ///
 /// 1. **Position in the file.** Only a *step's own* `run:` content counts. A
 ///    header comment, a step `name:`, an `env:` value or a `with:` input can
@@ -167,19 +174,30 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    `# gh pr merge --auto` all contain both fragments and arm nothing (PR #93
 ///    review, round 3).
 ///
+/// 4. **Reachability.** A command boundary is not the same thing as a command
+///    the shell will reach. Lines inside a here-document (`cat <<EOF ... EOF`)
+///    are *data* on another command's stdin and are never executed at all, and
+///    a command behind `&&`/`||` or inside an `if`/`while`/`until`/`for`/`case`
+///    block runs only if something else went a particular way. Treating every
+///    newline and `&&` as an unconditional boundary let both of those certify a
+///    workflow whose real arming call had been deleted (PR #93 review, round
+///    6). See `run_shell` for the first and `simple_commands` for the second.
+///
 /// Tokens are compared after quote removal, so `"gh" pr merge --auto` counts
 /// while `echo "gh pr merge --auto"` does not -- in the latter the whole
 /// command text is a single argument token of `echo`.
 ///
-/// Deliberately strict in one more direction: a command word is taken as-is,
-/// so `gh` reached through a shell keyword (`if ...; then gh pr merge --auto;
-/// fi`) is NOT recognised. That is the safe error -- it fails the guard loudly
-/// and asks a human to look, rather than certifying a merge path that a
-/// statically-dead branch could have turned off.
+/// Deliberately strict in one more direction: conditional execution is never
+/// resolved, only refused. `gh` reached through a shell keyword (`if ...; then
+/// gh pr merge --auto; fi`, or the same thing spelled across lines) or gated by
+/// `&&`/`||` (`git fetch && gh pr merge --auto`) is NOT recognised, even where a
+/// human can see the guard is always taken. That is the safe error -- it fails
+/// the guard loudly and asks a human to look, rather than certifying a merge
+/// path that a statically-dead branch could have turned off.
 fn arms_auto_merge(body: &str) -> bool {
     simple_commands(&run_shell(body))
         .iter()
-        .any(|command| is_gh_auto_merge(command))
+        .any(|command| !command.conditional && is_gh_auto_merge(&command.words))
 }
 
 /// Is `command` -- one simple command, already tokenised and unquoted -- an
@@ -198,15 +216,174 @@ fn is_gh_auto_merge(command: &[String]) -> bool {
 }
 
 /// The `run:` shell of `body` -- one *logical* line per line the shell receives,
-/// comment-stripped and with backslash-newline continuations rejoined -- as one
-/// string.
+/// comment-stripped, with here-document bodies removed and with
+/// backslash-newline continuations rejoined -- as one string.
+///
+/// The here-document part is why this works line by line rather than on the
+/// joined text. `cat <<EOF` hands every following line, up to a line holding the
+/// delimiter alone, to `cat` on stdin: that text is *data*, and the shell never
+/// looks at it for commands. Keeping it made a block like
+///
+/// ```sh
+/// cat <<EOF
+/// gh pr merge "$PR_URL" --auto --squash
+/// EOF
+/// ```
+///
+/// satisfy this guard while the workflow arms nothing (PR #93 review, round 6).
+///
+/// A here-document whose delimiter never arrives swallows the rest of the shell,
+/// exactly as a real shell would, and so does a `<<` this reader cannot find a
+/// delimiter word for. Both make the guard *harder* to satisfy, which is the
+/// direction it has to err in.
 fn run_shell(body: &str) -> String {
     let mut shell = String::new();
+    // Here-documents opened but not yet closed, in the order their bodies
+    // follow: `cat <<A <<B` reads A's body first, then B's.
+    let mut open_heredocs: Vec<Heredoc> = Vec::new();
     for line in folded_run_lines(body) {
-        shell.push_str(executable_part(&line));
+        if let Some(current) = open_heredocs.first() {
+            if current.terminated_by(&line) {
+                open_heredocs.remove(0);
+            }
+            // Body line or delimiter line, it is never shell either way.
+            continue;
+        }
+        let executable = executable_part(&line);
+        shell.push_str(executable);
         shell.push('\n');
+        open_heredocs.extend(heredocs_opened(executable));
     }
     shell
+}
+
+/// A here-document opened by `<<WORD` and still swallowing lines.
+struct Heredoc {
+    /// The delimiter word with its quotes removed, or `None` when the `<<`
+    /// operator had no word after it on its own line -- a spelling this reader
+    /// does not model, which then consumes the rest of the shell rather than
+    /// letting text of unknown status be read as commands.
+    delimiter: Option<String>,
+    /// True for `<<-`, the only spelling whose terminator line may be indented
+    /// (with tabs).
+    strip_tabs: bool,
+}
+
+impl Heredoc {
+    /// Does `line` end this here-document?
+    ///
+    /// The terminator is the delimiter alone on its line. Lines arrive here with
+    /// the YAML block's own content indentation already removed but their
+    /// *relative* indentation intact, so an indented `EOF` correctly fails to
+    /// close a plain `<<EOF` -- and correctly does close a `<<-EOF`.
+    fn terminated_by(&self, line: &str) -> bool {
+        let Some(delimiter) = self.delimiter.as_deref() else {
+            return false;
+        };
+        let candidate = if self.strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        candidate.trim_end() == delimiter
+    }
+}
+
+/// The here-documents opened on one shell line, in the order their bodies
+/// follow it.
+///
+/// `cat <<EOF`, `cat << EOF`, `cat <<-EOF`, `cat <<'EOF'` and `cat <<"EOF"` all
+/// open one. `<<<` is a here-*string*: a single-word redirection with no body,
+/// so it opens nothing and must not swallow the lines after it. A `<<` inside
+/// quotes (`echo "<<EOF"`) is not an operator either.
+fn heredocs_opened(line: &str) -> Vec<Heredoc> {
+    let mut opened = Vec::new();
+    let mut chars = line.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    chars.next();
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    chars.next();
+                }
+                '<' => {
+                    if chars.peek() != Some(&'<') {
+                        continue;
+                    }
+                    chars.next();
+                    // `<<<` is a here-string, not a here-document.
+                    if chars.peek() == Some(&'<') {
+                        chars.next();
+                        continue;
+                    }
+                    let strip_tabs = chars.peek() == Some(&'-');
+                    if strip_tabs {
+                        chars.next();
+                    }
+                    opened.push(heredoc_delimiter(&mut chars, strip_tabs));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    opened
+}
+
+/// Read the delimiter word that follows a `<<` operator, consuming it from
+/// `chars`.
+fn heredoc_delimiter(chars: &mut Peekable<Chars<'_>>, strip_tabs: bool) -> Heredoc {
+    while matches!(chars.peek(), Some(' ' | '\t')) {
+        chars.next();
+    }
+
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    while let Some(&c) = chars.peek() {
+        match quote {
+            Some(q) => {
+                chars.next();
+                if c == q {
+                    quote = None;
+                } else {
+                    word.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    chars.next();
+                    quote = Some(c);
+                }
+                '\\' => {
+                    chars.next();
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
+                    }
+                }
+                // The word ends where the shell's own word ends.
+                c if c.is_whitespace() => break,
+                ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+                c => {
+                    chars.next();
+                    word.push(c);
+                }
+            },
+        }
+    }
+
+    Heredoc {
+        delimiter: (!word.is_empty()).then_some(word),
+        strip_tabs,
+    }
 }
 
 /// The step-`run:` lines of `body` after YAML block folding, so each element is
@@ -227,6 +404,13 @@ fn run_shell(body: &str) -> String {
 /// --auto` -- an `echo` of six words, arming nothing. Joining here (rather than
 /// folding inside `run_shell_lines`) also means `executable_part` cuts `#`
 /// comments from the folded line, which is where the shell would see them.
+///
+/// A line that *starts* a shell line keeps its leading whitespace (the block's
+/// own content indentation is already gone; what is left is the indentation the
+/// shell itself sees). `executable_part` trims it back off for tokenising, but
+/// `Heredoc::terminated_by` needs it: an indented `EOF` does not close a plain
+/// `<<EOF`. Only a line *folded onto* a previous one is trimmed, because that is
+/// what YAML folding does to it.
 fn folded_run_lines(body: &str) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for run_line in run_shell_lines(body) {
@@ -235,13 +419,55 @@ fn folded_run_lines(body: &str) -> Vec<String> {
                 last.push(' ');
                 last.push_str(run_line.text.trim());
             }
-            _ => lines.push(run_line.text.trim().to_owned()),
+            _ => lines.push(run_line.text.trim_end().to_owned()),
         }
     }
     lines
 }
 
-/// Split shell source into simple commands, each a list of unquoted tokens.
+/// One simple command read out of `run:` shell.
+struct SimpleCommand {
+    /// The command's words, already unquoted.
+    words: Vec<String>,
+    /// True when the shell may not reach this command at all: it sits after an
+    /// `&&`/`||` operator, or inside an `if`/`while`/`until`/`for`/`case` block.
+    /// Such a command is text that *may* run, which is not the same thing as a
+    /// merge path -- `false && gh pr merge --auto` arms nothing (PR #93 review,
+    /// round 6).
+    conditional: bool,
+}
+
+/// Shell keywords that open a compound command whose body may never run.
+const BLOCK_OPENERS: [&str; 5] = ["if", "while", "until", "for", "case"];
+
+/// The keywords that close those blocks. Between an opener and its closer every
+/// command is conditional, which is what makes the multi-line spelling of
+/// `if false<newline>then<newline>gh pr merge --auto<newline>fi` refuse just as
+/// the one-line spelling already did.
+const BLOCK_CLOSERS: [&str; 3] = ["fi", "done", "esac"];
+
+/// Record `words` as a simple command, and let a block keyword at its head open
+/// or close a conditional region around the commands that follow it.
+fn push_simple_command(
+    commands: &mut Vec<SimpleCommand>,
+    words: Vec<String>,
+    gated: bool,
+    block_depth: &mut usize,
+) {
+    let Some(head) = words.first() else {
+        return;
+    };
+    let conditional = gated || *block_depth > 0;
+    if BLOCK_OPENERS.contains(&head.as_str()) {
+        *block_depth += 1;
+    } else if BLOCK_CLOSERS.contains(&head.as_str()) {
+        *block_depth = block_depth.saturating_sub(1);
+    }
+    commands.push(SimpleCommand { words, conditional });
+}
+
+/// Split shell source into simple commands, each a list of unquoted tokens plus
+/// whether the shell is guaranteed to reach it.
 ///
 /// A deliberately small shell reader rather than a dependency: word splitting on
 /// unquoted whitespace, single/double quote removal, backslash escapes
@@ -249,12 +475,26 @@ fn folded_run_lines(body: &str) -> Vec<String> {
 /// `|` and newline. Constructs it does not model (`$(...)`, `{ ...; }`) are left
 /// in whatever token they appear in, which can only ever make a match *harder* to
 /// achieve -- the direction this guard needs to err in.
-fn simple_commands(shell: &str) -> Vec<Vec<String>> {
-    let mut commands = Vec::new();
+///
+/// Boundaries are not all alike, and reading them as if they were is what let a
+/// dead branch certify this guard (PR #93 review, round 6). `;`, `&` and a
+/// newline end a command and the next one runs regardless; `&&` and `||` end a
+/// command and make the next one *conditional* on how this one exited. A
+/// pipeline's `|` inherits whatever gate the pipeline itself sits behind, so
+/// `false && echo x | gh pr merge --auto` gates the `gh` too. Together with the
+/// block-keyword depth tracked by `push_simple_command`, that is every way this
+/// reader knows of for shell text to sit in the file without running.
+fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
+    let mut commands: Vec<SimpleCommand> = Vec::new();
     let mut command: Vec<String> = Vec::new();
     let mut token = String::new();
     let mut started = false;
     let mut quote: Option<char> = None;
+    // Set by `&&`/`||`, cleared by the next `;`, `&` or newline: whether the
+    // command currently being read is one the shell may skip.
+    let mut gated = false;
+    // How many `if`/`while`/`until`/`for`/`case` blocks enclose it.
+    let mut block_depth: usize = 0;
     let mut chars = shell.chars().peekable();
 
     // Close off the token being built, if any.
@@ -300,9 +540,25 @@ fn simple_commands(shell: &str) -> Vec<Vec<String>> {
                 },
                 ';' | '&' | '|' | '\n' => {
                     end_token!();
-                    if !command.is_empty() {
-                        commands.push(std::mem::take(&mut command));
+                    // `&&` and `||` are two characters, and the only boundaries
+                    // that gate what comes after them.
+                    let doubled = (c == '&' || c == '|') && chars.peek() == Some(&c);
+                    if doubled {
+                        chars.next();
                     }
+                    push_simple_command(
+                        &mut commands,
+                        std::mem::take(&mut command),
+                        gated,
+                        &mut block_depth,
+                    );
+                    gated = match c {
+                        _ if doubled => true,
+                        // A pipeline member shares the pipeline's own gate.
+                        '|' => gated,
+                        // `;`, `&` and a newline start an unconditional list.
+                        _ => false,
+                    };
                 }
                 c if c.is_whitespace() => end_token!(),
                 c => {
@@ -319,9 +575,7 @@ fn simple_commands(shell: &str) -> Vec<Vec<String>> {
     if started {
         command.push(token);
     }
-    if !command.is_empty() {
-        commands.push(command);
-    }
+    push_simple_command(&mut commands, command, gated, &mut block_depth);
     commands
 }
 
@@ -345,6 +599,8 @@ struct BlockScalar {
 /// One physical line of a step's `run:`, plus how YAML joins it to the line
 /// before it.
 struct RunLine<'a> {
+    /// The line as the *shell* receives it: the YAML block's content
+    /// indentation removed, any deeper indentation kept.
     text: &'a str,
     /// True when YAML folds the *preceding* line break into a space instead of
     /// keeping it: a folded (`>`) block with this line and the one before it
@@ -409,7 +665,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                 open.prev_line_foldable = false;
                 if open.keep {
                     shell.push(RunLine {
-                        text: line,
+                        text: "",
                         folded_onto_previous: false,
                     });
                 }
@@ -421,7 +677,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                     open.prev_line_foldable = open.folded;
                     if open.keep {
                         shell.push(RunLine {
-                            text: line,
+                            text: line.get(indent..).unwrap_or(""),
                             folded_onto_previous: false,
                         });
                     }
@@ -438,7 +694,11 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                     open.prev_line_foldable = open.folded && plain;
                     if open.keep {
                         shell.push(RunLine {
-                            text: line,
+                            // The block's own content indentation is YAML's, not
+                            // the shell's: strip exactly that much and no more,
+                            // so `Heredoc::terminated_by` still sees whatever
+                            // indentation the shell would.
+                            text: line.get(base..).unwrap_or(""),
                             folded_onto_previous,
                         });
                     }
@@ -617,6 +877,11 @@ fn arms_auto_merge_requires_an_actual_invocation() {
     assert!(!arms_auto_merge(&workflow(
         "          if false; then gh pr merge \"$PR_URL\" --auto; fi\n"
     )));
+    // Same reason, one operator down: `&&` only *may* reach what follows it.
+    // See `arms_auto_merge_rejects_shell_text_that_never_executes`.
+    assert!(!arms_auto_merge(&workflow(
+        "          echo arming && gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
     // Right words, wrong command: `gh` must head the command and `pr merge`
     // must be its subcommand path, with `--auto` its own token.
     assert!(!arms_auto_merge(&workflow(
@@ -634,13 +899,106 @@ fn arms_auto_merge_requires_an_actual_invocation() {
         "          gh pr merge \"$PR_URL\" \\\n            --auto --squash\n"
     )));
     assert!(arms_auto_merge(&workflow(
-        "          echo arming && gh pr merge \"$PR_URL\" --auto --squash\n"
-    )));
-    assert!(arms_auto_merge(&workflow(
         "          gh pr merge --auto --squash \"$PR_URL\"; echo done\n"
     )));
     assert!(arms_auto_merge(&workflow(
         "          /usr/bin/gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// Text that sits in a `run:` block without the shell ever *executing* it must
+/// not satisfy the guard (PR #93 review, round 6: every newline and `&&` was
+/// read as an unconditional command boundary, so a here-document body and a
+/// statically-dead `false && ...` branch both certified a workflow whose real
+/// arming call could have been deleted).
+#[test]
+fn arms_auto_merge_rejects_shell_text_that_never_executes() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // --- here-document data: stdin for another command, never shell ------
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\n          gh pr merge \"$PR_URL\" --auto --squash\n          EOF\n"
+    )));
+    // The spellings that open one all have to be recognised, or the guard is
+    // only as strict as its least-covered syntax.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat << EOF\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<'EOF'\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<\"EOF\"\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<-EOF\n          gh pr merge \"$PR_URL\" --auto\n          \tEOF\n"
+    )));
+    // A plain `<<EOF` is closed only by an *unindented* delimiter, so an
+    // indented one leaves the here-document open and the rest of the block is
+    // still data -- which is what a real shell does with it too.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\n            EOF\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Redirecting into a file rather than a pipe changes nothing about it.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat > body.txt <<EOF\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+
+    // --- conditional execution -------------------------------------------
+    // The review's own case: the left-hand command decides whether `gh` runs
+    // at all, so this arms nothing.
+    assert!(!arms_auto_merge(&workflow(
+        "          false && gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false || gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    // The gate survives a pipe, because a pipeline runs as a unit.
+    assert!(!arms_auto_merge(&workflow(
+        "          false && echo x | gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The multi-line spelling of the `if`/`then` case the one-line test above
+    // already covers: `then` and `fi` on their own lines used to put `gh` at
+    // the head of its own unconditional command.
+    assert!(!arms_auto_merge(&workflow(
+        "          if false\n          then\n            gh pr merge \"$PR_URL\" --auto\n          fi\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          for pr in $PRS\n          do\n            gh pr merge \"$pr\" --auto\n          done\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // A here-document after a real invocation does not retroactively unarm it,
+    // and its delimiter ends it: shell resumes on the next line.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto --squash\n          cat <<EOF\n          nothing here\n          EOF\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          cat <<EOF\n          nothing here\n          EOF\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The invocation itself may take a here-document on stdin.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto --body-file - <<EOF\n          merged by CI\n          EOF\n"
+    )));
+    // `<<<` is a here-string: one word, no body, so it swallows no lines.
+    assert!(arms_auto_merge(&workflow(
+        "          cat <<<\"gh pr merge --auto\"\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Gating is per-list, not per-block: `;` starts an unconditional one again,
+    // and so does the end of an `if`/`fi`.
+    assert!(arms_auto_merge(&workflow(
+        "          false && echo skipped; gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          if false\n          then\n            echo skipped\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // `gh` first, gate after: the invocation is unconditional, the fallback is
+    // the conditional half.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto --squash || echo failed\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          echo x | gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
 
