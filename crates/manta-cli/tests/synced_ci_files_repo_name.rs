@@ -306,9 +306,16 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    only ever refuses more text: a name shadowed here may be perfectly
 ///    ordinary in the real shell if the definition sits in a *different* step,
 ///    since `run_shell` reads the whole workflow's `run:` text as one stream.
-///    Shadowing is deliberately not undone by anything -- `unset -f gh`, a
-///    subshell that ends, `command gh` -- because resolving those is the same
-///    dispatch modelling this reader refuses everywhere else.
+///    Round 18 closed the spelling that left: commands break at `;`, `&`, `|`
+///    and newline only, so a header sharing a line with the compound command
+///    enclosing it (`{ gh() { echo disabled; }; }`, `if true; then gh() { echo
+///    disabled; }; fi`) reached `defined_function_name` behind the shell's own
+///    `{`/`then`/`else`/`do`, named nothing, and left the call below it
+///    unshadowed -- so the header is now read off `significant_words`, which
+///    drops exactly those structural tokens, the same words `command_head` is
+///    read from. Shadowing is deliberately not undone by anything -- `unset -f
+///    gh`, a subshell that ends, `command gh` -- because resolving those is the
+///    same dispatch modelling this reader refuses everywhere else.
 ///
 /// 6. **The step runs at all.** Everything above reads shell; Actions decides
 ///    separately whether the step is handed to a shell in the first place. A
@@ -1322,12 +1329,28 @@ fn is_function_definition(words: &[String]) -> bool {
 /// empty. That is the safe pair of answers: refusing to name something never
 /// silently un-shadows a real `gh`, because a header that really does define one
 /// spells the name out.
+///
+/// The header is read from the command's `significant_words`, not from its raw
+/// first token, for the same reason `command_head` is: this reader breaks
+/// commands at `;`, `&`, `|` and newline only, so a definition written on the
+/// same line as the compound command that encloses it arrives with the shell's
+/// own structural token still in front of it -- `{ gh() { echo disabled; }; }`
+/// hands over the words `{ gh() { echo disabled`, and `if true; then gh() { echo
+/// disabled; }; fi` hands over `then gh() { echo disabled`. Reading only the
+/// raw first word, those headers named nothing, no shadow was recorded, and the
+/// `gh pr merge "$PR_URL" --auto` written below one -- which bash resolves to
+/// the stub a brace group or a taken branch really did define in this same
+/// shell -- was handed back as the GitHub CLI's own arming call (PR #93 review,
+/// round 18; the multi-line spellings of both were already refused, because
+/// there the header starts its own line).
 fn defined_function_name(words: &[String]) -> Option<&str> {
-    let mut words = words.iter().map(String::as_str);
+    let mut words = significant_words(words);
     let first = words.next()?;
-    // `function name`, `function name()`, `function name {`.
+    // `function name`, `function name()`, `function name {`. The body's opening
+    // brace is not among these words -- `significant_words` drops it -- so a
+    // degenerate `function {` runs out of words here and names nothing.
     if first == "function" {
-        return words.next().filter(|name| *name != "{").map(header_name);
+        return words.next().map(header_name);
     }
     let head = first.strip_suffix('{').unwrap_or(first);
     // `name()`, `name(){`, and the half-tokenised `name(` of `name( ) {`.
@@ -3526,6 +3549,28 @@ fn arms_auto_merge_rejects_calls_shadowed_by_a_shell_function() {
     assert!(!arms_auto_merge(
         "jobs:\n  m:\n    steps:\n      - run: |\n          gh() { echo disabled; }\n      - run: |\n          gh pr merge \"$PR_URL\" --auto\n"
     ));
+    // A header sharing its line with the compound command that encloses it
+    // still defines the name. This reader breaks commands at `;`, `&`, `|` and
+    // newline only, so the shell's own structural token arrives in front of the
+    // header -- and reading only the raw first word left every one-line
+    // spelling below naming nothing, un-shadowing a call bash resolves to the
+    // stub the brace group or the taken branch really did define (PR #93
+    // review, round 18). The multi-line spellings above already refused.
+    assert!(!arms_auto_merge(&workflow(
+        "          { gh() { echo disabled; }; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          if true; then gh() { echo disabled; }; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          if false; then :; else gh() { echo disabled; }; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          for i in 1 2; do gh() { echo disabled; }; done\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          function gh { echo disabled; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // A function by some *other* name shadows nothing -- the real
@@ -3543,5 +3588,20 @@ fn arms_auto_merge_rejects_calls_shadowed_by_a_shell_function() {
     // A word that merely mentions the name is no definition of it.
     assert!(arms_auto_merge(&workflow(
         "          echo \"gh() { echo disabled; }\"\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Reading the header past the shell's structural tokens must not make a
+    // one-line definition of some *other* name shadow `gh`, nor leave the body
+    // it opens hanging open over the arming call below it -- either would refuse
+    // a workflow that arms one, which is the direction that costs a real merge
+    // path. The one-line spellings of the shapes refused above, with the name
+    // changed, all still count.
+    assert!(arms_auto_merge(&workflow(
+        "          { needs_human() { echo no; }; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          if true; then needs_human() { echo no; }; fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          for i in 1 2; do needs_human() { echo no; }; done\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
