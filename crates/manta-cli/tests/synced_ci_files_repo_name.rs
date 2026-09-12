@@ -178,7 +178,12 @@ fn merge_policy_successor_to_mergify_exists() {
     // satisfied by a call written under `false &>/dev/null` -- whose `&` is a
     // redirection, not the background operator that would spare that `false`
     // from errexit -- or under the `false | true` an explicit `shell: bash`
-    // step runs with `-o pipefail` (PR #93 review, round 16).
+    // step runs with `-o pipefail` (PR #93 review, round 16); and reading the
+    // command word as the program it names, without asking whether the shell
+    // has a *function* by that name, would still be satisfied by a step that
+    // writes `gh() { echo disabled; }` and then calls `gh pr merge "$PR_URL"
+    // --auto` -- bash searches its function table before `$PATH`, so that call
+    // reaches the stub and merges nothing (PR #93 review, round 17).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -197,7 +202,9 @@ fn merge_policy_successor_to_mergify_exists() {
          `false` the step's own `bash -e` exits on -- in any spelling of its \
          redirections, `false &>/dev/null` included -- or below a pipeline \
          `pipefail` fails in an explicit `shell: bash` step, or writing it in a step \
-         (or job) a statically false `if:` parks -- see `arms_auto_merge`). \
+         (or job) a statically false `if:` parks, or shadowing the name with a \
+         shell function of its own (`gh() {{ echo disabled; }}`) -- see \
+         `arms_auto_merge`). \
          That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
          losing it silently leaves the repo with no automated merge path at all."
@@ -207,7 +214,7 @@ fn merge_policy_successor_to_mergify_exists() {
 /// Does `body` -- a GitHub Actions workflow -- actually *execute* `gh pr merge
 /// ... --auto` from a step's `run:` shell?
 ///
-/// Five conditions, all necessary:
+/// Six conditions, all necessary:
 ///
 /// 1. **Position in the file.** Only a *step's own* `run:` content counts. A
 ///    header comment, a step `name:`, an `env:` value or a `with:` input can
@@ -286,7 +293,24 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    fails when any member does, so `false | true` ends the step
 ///    (`WorkflowShell::pipefail`, `ShellState::pipeline_failed`).
 ///
-/// 5. **The step runs at all.** Everything above reads shell; Actions decides
+/// 5. **Which program the name resolves to.** `gh` in command position is the
+///    GitHub CLI only while nothing in the same shell has defined a *function*
+///    by that name. Bash resolves a command word against its function table
+///    before `$PATH`, so a `run:` block spelling `gh() { echo disabled; }` and
+///    then `gh pr merge "$PR_URL" --auto` executes the stub -- a reachable
+///    command, correctly, but not an invocation of the CLI -- while a check
+///    that reads only the word's basename certified it as the merge path (PR
+///    #93 review, round 17). Function names defined in the text are tracked as
+///    it is read (`ShellState::shadowing_functions`,
+///    `defined_function_name`) and a call to one is marked `shadowed`, which
+///    only ever refuses more text: a name shadowed here may be perfectly
+///    ordinary in the real shell if the definition sits in a *different* step,
+///    since `run_shell` reads the whole workflow's `run:` text as one stream.
+///    Shadowing is deliberately not undone by anything -- `unset -f gh`, a
+///    subshell that ends, `command gh` -- because resolving those is the same
+///    dispatch modelling this reader refuses everywhere else.
+///
+/// 6. **The step runs at all.** Everything above reads shell; Actions decides
 ///    separately whether the step is handed to a shell in the first place. A
 ///    step -- or the job enclosing it -- carrying a statically false `if:`
 ///    (`if: false`, `if: ${{ false }}`, `if: 0`) is skipped outright, so its
@@ -321,11 +345,19 @@ fn arms_auto_merge(body: &str) -> bool {
     let shell = run_shell(body);
     simple_commands(&shell.text, shell.pipefail)
         .iter()
-        .any(|command| !command.unreachable && is_gh_auto_merge(&command.words))
+        .any(|command| {
+            !command.unreachable && !command.shadowed && is_gh_auto_merge(&command.words)
+        })
 }
 
 /// Is `command` -- one simple command, already tokenised and unquoted -- an
 /// invocation of `gh pr merge ... --auto`?
+///
+/// Whether the word `gh` reaches the GitHub CLI at all is a question about the
+/// *shell*, not about this one command, so it is answered where the shell is
+/// read: `SimpleCommand::shadowed` records a command word a function definition
+/// earlier in the text has taken over, and `arms_auto_merge` refuses those
+/// before this predicate is consulted.
 fn is_gh_auto_merge(command: &[String]) -> bool {
     let Some(argv0) = command.first() else {
         return false;
@@ -615,6 +647,17 @@ struct SimpleCommand {
     /// `needs-human` label. Reading "may not run on this invocation" as "never
     /// runs" made this guard refuse the real, working workflow.
     unreachable: bool,
+    /// True when this command's own command word names a *shell function*
+    /// defined earlier in the same shell text. Such a command runs -- it is not
+    /// `unreachable` -- but it runs that function, not the program of the same
+    /// name: bash looks a function up before it ever consults `$PATH`, so
+    /// `gh() { echo disabled; }` followed by `gh pr merge "$PR_URL" --auto`
+    /// invokes the stub and merges nothing, while the basename check in
+    /// `is_gh_auto_merge` read the call as the GitHub CLI's (PR #93 review,
+    /// round 17). Only an unqualified name is shadowable: `/usr/bin/gh` and
+    /// `command gh` reach the program whatever functions exist, and neither
+    /// matches a function name here.
+    shadowed: bool,
 }
 
 /// Shell keywords that open a compound command whose body runs only on some
@@ -1261,23 +1304,52 @@ fn opening_braces(word: &str) -> usize {
 /// Over-recognising here is harmless -- it can only mark more text
 /// conditional, never less -- so the shapes are matched loosely on purpose.
 fn is_function_definition(words: &[String]) -> bool {
+    defined_function_name(words).is_some()
+}
+
+/// The *name* a function-definition header defines, or `None` when this command
+/// is no definition at all.
+///
+/// Same shapes as `is_function_definition`, which is now this function asked a
+/// coarser question -- one reader, so the two can never drift into disagreeing
+/// about what a header is. The name is what makes a later call to it resolve to
+/// the function rather than to the program of that name, which is why it has to
+/// be pulled out at all (PR #93 review, round 17).
+///
+/// `Some("")` is a header this reader recognises but cannot name -- a degenerate
+/// `function ()`, say. It keeps the definition's *body* conditional exactly as
+/// before while matching no command word, since a shell command word is never
+/// empty. That is the safe pair of answers: refusing to name something never
+/// silently un-shadows a real `gh`, because a header that really does define one
+/// spells the name out.
+fn defined_function_name(words: &[String]) -> Option<&str> {
     let mut words = words.iter().map(String::as_str);
-    let Some(first) = words.next() else {
-        return false;
-    };
+    let first = words.next()?;
     // `function name`, `function name()`, `function name {`.
     if first == "function" {
-        return words.next().is_some_and(|name| name != "{");
+        return words.next().filter(|name| *name != "{").map(header_name);
     }
     let head = first.strip_suffix('{').unwrap_or(first);
     // `name()`, `name(){`, and the half-tokenised `name(` of `name( ) {`.
-    if head.strip_suffix("()").is_some_and(|name| !name.is_empty())
-        || (head.len() > 1 && head.ends_with('('))
-    {
-        return true;
+    if let Some(name) = head.strip_suffix("()").filter(|name| !name.is_empty()) {
+        return Some(name);
+    }
+    if head.len() > 1 && head.ends_with('(') {
+        return Some(&head[..head.len() - 1]);
     }
     // `name ()`, `name () {`, `name (){`.
-    !head.is_empty() && words.next().is_some_and(|next| next.starts_with('('))
+    if !head.is_empty() && words.next().is_some_and(|next| next.starts_with('(')) {
+        return Some(head);
+    }
+    None
+}
+
+/// The bare name inside a definition header's own word: `gh(){`, `gh()` and
+/// `gh(` all name `gh`, and a word that is only punctuation names nothing.
+fn header_name(word: &str) -> &str {
+    let word = word.strip_suffix('{').unwrap_or(word);
+    let word = word.strip_suffix("()").unwrap_or(word);
+    word.strip_suffix('(').unwrap_or(word)
 }
 
 /// Record `words` as a simple command, decide whether the shell can ever reach
@@ -1301,6 +1373,14 @@ fn is_function_definition(words: &[String]) -> bool {
 ///   skip it, so it must not. An `exit` inside a block the condition settles --
 ///   `if true`, `while true`, `until false` -- is reached on every run, so it
 ///   does (PR #93 review, round 9).
+///
+/// A third question is settled here too, and it is about neither reachability
+/// nor skipping: **which program does the command word name?** A word an
+/// earlier definition in this same text turned into a shell function is a call
+/// to that function, since bash searches its function table before `$PATH`.
+/// Such a command is perfectly reachable -- it just is not the program it looks
+/// like -- so it gets its own flag, `SimpleCommand::shadowed`, rather than
+/// being folded into `unreachable` (PR #93 review, round 17).
 ///
 /// `quoted` runs parallel to `words`, one flag per word, recording which of
 /// them came out of quotes or a backslash escape. Only `FunctionScope::absorb`
@@ -1339,6 +1419,15 @@ fn push_simple_command(
         && state.pipefail
         && (state.pipeline_failed || is_statically_failing(&words));
     let ends_loop_body = LOOP_CONTROL_COMMANDS.contains(&head);
+    // Which program this command's own word reaches: a name some earlier
+    // definition took over is a call to that function, whatever program shares
+    // its name. Read before this command's own header can add to the table, so
+    // a definition never shadows itself.
+    let shadowed = command_head(&words)
+        .is_some_and(|word| state.shadowing_functions.iter().any(|name| name == word));
+    if let Some(name) = defined_function_name(&words).filter(|name| !name.is_empty()) {
+        state.shadowing_functions.push(name.to_owned());
+    }
     // Unconditionally: the scope is a state machine and every command has to
     // pass through it, not just the ones that end up unreachable.
     let in_function_body = state.functions.absorb(&words, &quoted);
@@ -1361,7 +1450,11 @@ fn push_simple_command(
     } else if ends_loop_body && !unreachable && !gate.gated {
         state.end_loop_body(loop_control_levels(&words));
     }
-    commands.push(SimpleCommand { words, unreachable });
+    commands.push(SimpleCommand {
+        words,
+        unreachable,
+        shadowed,
+    });
 }
 
 /// How many loops a `break`/`continue` leaves: its optional literal count, or
@@ -1409,6 +1502,20 @@ struct ShellState {
     /// Whether that command sits in a function body, which runs only when
     /// something calls the function.
     functions: FunctionScope,
+    /// The names every function-definition header read so far has defined, in
+    /// file order. A command word matching one of them is a call to that
+    /// function, not to the program of the same name -- bash consults its
+    /// function table before `$PATH` -- so `gh() { echo disabled; }` above a
+    /// `gh pr merge "$PR_URL" --auto` leaves the workflow arming nothing (PR
+    /// #93 review, round 17).
+    ///
+    /// Names are recorded as the text is read, so a call written *above* the
+    /// definition that shadows it still counts: at that point in a real run the
+    /// function does not exist yet. Everything else about the table errs
+    /// towards refusing -- a definition inside dead text, inside another
+    /// function's body, or in a different step of the same workflow all shadow
+    /// the name here, and nothing ever removes one.
+    shadowing_functions: Vec<String>,
     /// Set by a reached `exit`/`exec` -- or by a bare `false` under the `bash
     /// -e` an Actions step runs by default -- and never cleared: the shell is
     /// gone, so every command after one is text nothing executes.
@@ -3365,4 +3472,76 @@ fn arms_auto_merge_rejects_statically_disabled_steps() {
     assert!(arms_auto_merge(
         "jobs:\n  m:\n    steps:\n      - with:\n          if: yes\n        run: gh pr merge \"$PR_URL\" --auto\n"
     ));
+}
+
+/// A command word a shell *function* has taken over does not reach the program
+/// of that name (PR #93 review, round 17: a step could define
+/// `gh() { echo disabled; }` and then run `gh pr merge "$PR_URL" --auto`, whose
+/// basename this guard read as the GitHub CLI's while bash ran the stub and
+/// merged nothing).
+#[test]
+fn arms_auto_merge_rejects_calls_shadowed_by_a_shell_function() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case, and the one-line spelling of it.
+    assert!(!arms_auto_merge(&workflow(
+        "          gh() {\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          gh() { echo disabled; }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Every header spelling defines the name, or the guard is only as strict as
+    // its least-covered syntax -- the same list `is_function_definition` knows.
+    assert!(!arms_auto_merge(&workflow(
+        "          gh () {\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          gh(){\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          function gh {\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          function gh() {\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          gh()\n          {\n            echo disabled\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Quoting the command word does not escape the function table: bash strips
+    // the quotes and looks the resulting word up exactly as it does a bare one
+    // (unlike an alias, which quoting *does* defeat). Words reach this reader
+    // already unquoted, so this holds by construction -- pinned so it stays so.
+    assert!(!arms_auto_merge(&workflow(
+        "          gh() { echo disabled; }\n          \"gh\" pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A definition the shell reaches only on some runs, or never, still shadows
+    // here. Deciding otherwise means modelling when the definition executes,
+    // which is the dispatch resolution this reader refuses everywhere else --
+    // and refusing more text is the direction it is allowed to err in.
+    assert!(!arms_auto_merge(&workflow(
+        "          if [ -n \"$STUB\" ]; then\n            gh() { echo disabled; }\n          fi\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The definition in one step and the call in another: `run_shell` reads the
+    // whole workflow's `run:` text as one stream, so this refuses too.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: |\n          gh() { echo disabled; }\n      - run: |\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+
+    // --- what must still count --------------------------------------------
+    // A function by some *other* name shadows nothing -- the real
+    // auto-merge-trigger.yml defines `needs_human_is_stale` right above its own
+    // arming call, and reading any definition as a shadow would refuse the
+    // working workflow.
+    assert!(arms_auto_merge(&workflow(
+        "          needs_human_is_stale() {\n            echo no\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A call written *above* the definition is not shadowed: at that point in a
+    // real run the function does not exist yet, and the call reaches the CLI.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto\n          gh() { echo disabled; }\n"
+    )));
+    // A word that merely mentions the name is no definition of it.
+    assert!(arms_auto_merge(&workflow(
+        "          echo \"gh() { echo disabled; }\"\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
 }
