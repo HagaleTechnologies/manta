@@ -1,20 +1,32 @@
 name: Dependabot Auto-Merge
 
+# Thin caller (2026-09-12, fleet CI redesign): the needs-human staleness check (`check-needs-human`
+# job below) stays local -- it's specific to THIS repo's queue-retry-handler.yml contract (the
+# exact marker format it posts, and when a hand-off to a human is provably stale vs. still live).
+# Everything else -- fetching Dependabot's metadata, the SHA-pinned approve/merge mutations and
+# their base-retarget re-checks, major-bump labeling -- now lives in credenza's
+# dependabot-auto-merge.yml (a `workflow_call` reusable workflow), which also backs widdershins'
+# own copy (21 rounds of Codex hardening on that exact logic that this repo never had). See that
+# file's header for the full split rationale. `verified` is left at its default (true): this repo
+# has no ecosystem-specific diff-safety verifier yet (that's MAN-209's own broader context) --
+# unchanged from this repo's pre-split behavior of trusting Dependabot's own classification alone.
 on: pull_request_target
 
-permissions:
-  contents: write
-  pull-requests: write
-  # Codex round 5: the needs-human staleness check reads the PR's timeline
-  # (labeled events) and comments (staleness markers) -- neither endpoint
-  # is covered by the pull-requests scope that already suffices for label
-  # reads/writes themselves.
-  issues: read
-
 jobs:
-  auto-merge:
+  # This job's ONLY job is the side effect: clear needs-human if it's provably stale for the
+  # current head. It has no meaningful output to pass downstream (Codex P1, manta#191 round 1 --
+  # an earlier version computed `should_merge` here and passed it as a boolean input, leaving a
+  # job-boundary TOCTOU window between that read and credenza's merge mutation). credenza's
+  # reusable workflow now re-checks the LIVE label state itself, immediately before merging (via
+  # `merge_blocking_label` below) -- this job only needs to run, and complete, BEFORE that check
+  # (`needs: check-needs-human` on the auto-merge job below), so a stale label is already cleared
+  # by the time the live check reads it.
+  check-needs-human:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: read
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -22,91 +34,37 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # dependabot/fetch-metadata outputs are safe (controlled by GitHub, not user input)
-      - name: Auto-approve minor/patch updates
+      # needs-human guard (learned from widdershins auto-merge.yml round 21, applied here
+      # preemptively rather than rediscovered): this workflow triggers on `synchronize` too
+      # (pull_request_target's default types), which fires every time Dependabot itself
+      # rebases/updates the PR against a moved base -- a routine, expected event, not a new human
+      # decision. Without this guard, that rebase would silently re-arm auto-merge on a PR
+      # queue-retry-handler.yml already handed off to a human after its one automatic retry
+      # failed, bypassing that handoff entirely. Only computed for non-major updates -- matches
+      # this repo's pre-split behavior, where the equivalent check never ran for a major bump
+      # either (credenza's reusable workflow labels those for review regardless of this output).
+      - name: Check needs-human staleness
+        id: check
         if: steps.metadata.outputs.update-type != 'version-update:semver-major'
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
-          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
-        run: |
-          gh pr review "$PR_URL" --approve --body "Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES}"
-
-      # Native merge-queue cutover: arms auto-merge here (not in
-      # auto-merge-trigger.yml) because GitHub withholds custom secrets
-      # like CODEX_REVIEW_PAT from Dependabot-actor-triggered runs --
-      # GITHUB_TOKEN is fine here since it's already proven working for
-      # the approve/label steps above. manta-review-gate's
-      # required_approving_review_count is 0 (MAN-217) -- bypass actors
-      # never actually made auto-merge admission respect a nonzero count
-      # anyway (confirmed live: manta#186 sat blocked for 6+ hours despite
-      # an armed bypass-actor request), so this path's real defense is the
-      # approve step immediately above, a genuine positive classification
-      # signal from `dependabot/fetch-metadata`, not the ruleset.
-      #
-      # needs-human guard (learned from widdershins auto-merge.yml round 21,
-      # applied here preemptively rather than rediscovered): this workflow
-      # triggers on `synchronize` too (pull_request_target's default
-      # types), which fires every time Dependabot itself rebases/updates the
-      # PR against a moved base -- a routine, expected event, not a new
-      # human decision. Without this guard, that rebase would silently
-      # re-arm auto-merge on a PR queue-retry-handler.yml already handed
-      # off to a human after its one automatic retry failed, bypassing that
-      # handoff entirely.
-      #
-      # Checked inside the run: block via a fresh API fetch, not in this
-      # step's own `if:` (Codex round 2): `github.event.pull_request.labels`
-      # is a snapshot taken when the webhook fired, not a live read -- if
-      # needs-human gets attached AFTER that snapshot but before this step
-      # actually runs (e.g. `dependabot/fetch-metadata` above ran slowly),
-      # the stale snapshot still reads "no needs-human" and this step would
-      # re-arm auto-merge on a PR that was, by the time it actually acts,
-      # already handed off. A step-level `if:` has no way to re-evaluate
-      # itself against live state right before its `run:` executes; only a
-      # fetch inside the step body can.
-      - name: Enable auto-merge for approved update
-        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Staleness check (Codex round 4, hardened round 5): needs-human is PR-wide with no
-          # automatic clearing mechanism (a human decision by design), but queue-retry-handler.yml
-          # tags every attach with the exact SHA it was for -- without checking that at all, a
-          # fresh Dependabot rebase that resolves the original failure reads the exact same
-          # "needs-human present" state the broken one did, and stays silently stalled forever.
-          #
-          # Round 4's first attempt just asked "does ANY marker name an older sha" -- Codex round
-          # 5 found the gap: a maintainer can remove needs-human and later RE-apply it to pause
-          # the CURRENT head for an unrelated reason (or the marker-post for that reapplication
-          # simply failed, since it's best-effort), and this check would still find the OLD
-          # marker from a prior, already-cleared episode and wrongly treat a live pause as stale.
-          # Provenance is now checked against the label's own most recent application (via the
-          # PR's timeline `labeled` event), not just marker content -- only a marker posted AT OR
-          # AFTER that event can be trusted to describe THIS application. Fail closed (keep
+          # Staleness check (Codex round 4, hardened round 5, ported unchanged): needs-human is
+          # PR-wide with no automatic clearing mechanism (a human decision by design), but
+          # queue-retry-handler.yml tags every attach with the exact SHA it was for -- without
+          # checking that, a fresh Dependabot rebase that resolves the original failure reads the
+          # exact same "needs-human present" state the broken one did, and stays silently stalled
+          # forever. Provenance is checked against the label's own most recent application (via
+          # the PR's timeline `labeled` event), not just marker content -- only a marker posted AT
+          # OR AFTER that event can be trusted to describe THIS application. Fail closed (keep
           # pausing) whenever provenance can't be confirmed: no labeled event, no marker, or a
           # marker older than the most recent labeling.
           needs_human_is_stale() {
             local current_head_sha12="$1"
             local last_labeled_at marker_info marker_created_at recorded_sha12
             local raw
-            # --slurp + flatten (`add`) before selecting the latest event, fetch and filter as
-            # two explicit &&-chained steps rather than `--jq` passed to `gh api` itself (Codex
-            # round 6, corrected round 7): this CLI version rejects `--slurp` combined with
-            # `--jq`/`--template` outright ("the --slurp option is not supported with --jq or
-            # --template") -- round 6's own fix silently failed on every call via the
-            # `2>/dev/null` swallow, always returning empty and therefore always fail-closed
-            # (permanently pausing, never actually detecting staleness) -- the exact same
-            # incompatibility this repo's own ci.yml already hit and documented (its codex-clean
-            # gate, PR #56). Deliberately not a bare `cmd1 | cmd2` pipe either: this step's
-            # default shell has no `pipefail`, so a pipe's exit status reflects only the last
-            # command -- a genuine `gh api` failure could still slip through if `jq` happened to
-            # accept whatever partial/empty output leaked past it, silently masking a real fetch
-            # error the same way the `--slurp`/`--jq` bug did. Two explicit `&&`-chained
-            # assignments preserve `gh api`'s own exit status visibility.
             if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
               last_labeled_at=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-human")] | if length > 0 then (last | .created_at) else "" end' 2>/dev/null)
             else
@@ -131,28 +89,38 @@ jobs:
           if grep -qxF "needs-human" <<< "$current_labels"; then
             current_head_sha12=$(gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq '.headRefOid[0:12]')
             if needs_human_is_stale "$current_head_sha12"; then
-              # Clear the label, not just ignore it (Codex round 5): leaving it attached would
-              # let queue-retry-handler.yml's own retry step see this same stale needs-human on
-              # this new revision's eventual merge-group failure and refuse to retry it --
-              # silently stalling a corrected revision after its very first queue attempt.
-              echo "::notice::needs-human on PR #$PR is stale (provably tied to an earlier revision, not the current head $current_head_sha12) -- clearing it and proceeding to arm auto-merge for the new revision."
+              # Clear the label, not just ignore it (Codex round 5): leaving it attached would let
+              # queue-retry-handler.yml's own retry step see this same stale needs-human on this
+              # new revision's eventual merge-group failure and refuse to retry it -- silently
+              # stalling a corrected revision after its very first queue attempt. Also what makes
+              # credenza's downstream live label re-check see a clean state for this revision.
+              echo "::notice::needs-human on PR #$PR is stale (provably tied to an earlier revision, not the current head $current_head_sha12) -- clearing it and allowing auto-merge for the new revision."
               gh api --method DELETE "repos/${REPO}/issues/${PR}/labels/needs-human" >/dev/null 2>&1 || true
-              gh pr merge "$PR_URL" --auto --squash
             else
-              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- standing down without re-arming auto-merge."
+              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- leaving it attached. credenza's own live re-check will stand down without merging."
             fi
-          else
-            gh pr merge "$PR_URL" --auto --squash
           fi
 
-      - name: Label major updates for review
-        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
-          PREV_VER: ${{ steps.metadata.outputs.previous-version }}
-          NEW_VER: ${{ steps.metadata.outputs.new-version }}
-        run: |
-          gh pr edit "$PR_URL" --add-label "major-update,needs-review"
-          gh pr comment "$PR_URL" --body "Major version bump: ${DEP_NAMES} (${PREV_VER} -> ${NEW_VER}). Requires manual review before merge."
+  auto-merge:
+    needs: check-needs-human
+    if: github.actor == 'dependabot[bot]'
+    # Must grant at least what credenza's reusable job itself declares (contents: write,
+    # pull-requests: write) -- a caller's permissions cap the callee, they don't add to it.
+    permissions:
+      contents: write
+      pull-requests: write
+    # GH_TOKEN is DEPENDABOT_APPROVE_PAT (org-wide secret, Pull requests: Read and write) -- see
+    # MAN-209: this repo's CODEOWNERS (PR #182) requires this before require_code_owner_review can
+    # be enabled here, matching the exact tradeoff widdershins already resolved (Task 2, phase1a
+    # plan). Do not enable require_code_owner_review on this repo's ruleset until this PR has
+    # merged, the secret is confirmed working end-to-end on a real Dependabot PR, and MAN-209 is
+    # closed.
+    # Pinned to f25c58c2, not the prior 6d2781a3: pulls in credenza#47's merge_blocking_label fix
+    # (a live re-check immediately before the merge mutation, replacing a caller-computed boolean
+    # that left a job-boundary TOCTOU window open -- Codex P1, manta#191 round 1).
+    uses: HagaleTechnologies/credenza/.github/workflows/dependabot-auto-merge.yml@f25c58c2cee9257cc98c49b77a9ad96d37684ea5
+    with:
+      base_branch: main
+      merge_blocking_label: needs-human
+    secrets:
+      approve_pat: ${{ secrets.DEPENDABOT_APPROVE_PAT }}
