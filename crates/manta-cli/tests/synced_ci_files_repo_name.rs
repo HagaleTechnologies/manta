@@ -114,36 +114,166 @@ fn merge_policy_successor_to_mergify_exists() {
             path.display()
         )
     });
-    // The shell a step actually executes, not the prose about it and not any
-    // other scalar that happens to quote it: this workflow's header comment
-    // says `gh pr merge --auto` too, so a bare `body.contains(..)` stayed green
-    // even with the arming step deleted (PR #93 review), and a comment-stripping
-    // scan of *every* line would still be satisfied by a step `name:` or an
-    // `env:` value carrying the same text (PR #93 review, round 2).
+    // The shell a step actually executes, and the command that shell actually
+    // runs -- not the prose about it, not another scalar that happens to quote
+    // it, and not a string that merely contains its words. This workflow's
+    // header comment says `gh pr merge --auto` too, so a bare `body.contains(..)`
+    // stayed green even with the arming step deleted (PR #93 review); a
+    // comment-stripping scan of *every* line would still be satisfied by a step
+    // `name:` or an `env:` value carrying the same text (PR #93 review, round
+    // 2); and scanning `run:` shell for two independent substrings would still
+    // be satisfied by `echo "gh pr merge --auto"` or `CMD="gh pr merge --auto"`,
+    // which invoke nothing (PR #93 review, round 3).
     assert!(
         arms_auto_merge(&body),
-        "{rel} no longer arms auto-merge: no `run:` shell in it invokes \
-         `gh pr merge ... --auto` (the header comment mentioning that command \
-         does not count, and neither does a `name:`/`env:` scalar quoting it). \
-         That call IS the post-#185 admission boundary that replaced \
-         .mergify.yml's pull_request_rules; losing it silently leaves the repo \
-         with no automated merge path at all."
+        "{rel} no longer arms auto-merge: no `run:` shell in it *invokes* \
+         `gh pr merge ... --auto` as a command (a header comment, a \
+         `name:`/`env:` scalar, an `echo` of the command text or an assignment \
+         of it to a variable all fail this check, as does naming it only inside \
+         a conditional -- see `arms_auto_merge`). That call IS the post-#185 \
+         admission boundary that replaced .mergify.yml's pull_request_rules; \
+         losing it silently leaves the repo with no automated merge path at all."
     );
 }
 
 /// Does `body` -- a GitHub Actions workflow -- actually *execute* `gh pr merge
 /// ... --auto` from a step's `run:` shell?
 ///
-/// Only `run:` content counts. Every other position in the file is inert with
-/// respect to arming auto-merge: a header comment, a step `name:`, an `env:`
-/// value or a `with:` input can all carry the exact command text while the
-/// workflow does nothing at all, so matching them would let this guard certify
-/// a repo whose merge path is gone.
+/// Two conditions, both necessary:
+///
+/// 1. **Position in the file.** Only `run:` content counts. A header comment, a
+///    step `name:`, an `env:` value or a `with:` input can all carry the exact
+///    command text while the workflow does nothing at all.
+/// 2. **Position in the command.** Within that shell, `gh` must be the *command
+///    word* of a simple command, followed by the `pr merge` subcommand path,
+///    with `--auto` as one of its own argument tokens. Substring matching is not
+///    enough: `echo "gh pr merge --auto"`, `CMD="gh pr merge --auto"` and
+///    `# gh pr merge --auto` all contain both fragments and arm nothing (PR #93
+///    review, round 3).
+///
+/// Tokens are compared after quote removal, so `"gh" pr merge --auto` counts
+/// while `echo "gh pr merge --auto"` does not -- in the latter the whole
+/// command text is a single argument token of `echo`.
+///
+/// Deliberately strict in one more direction: a command word is taken as-is,
+/// so `gh` reached through a shell keyword (`if ...; then gh pr merge --auto;
+/// fi`) is NOT recognised. That is the safe error -- it fails the guard loudly
+/// and asks a human to look, rather than certifying a merge path that a
+/// statically-dead branch could have turned off.
 fn arms_auto_merge(body: &str) -> bool {
-    run_shell_lines(body)
-        .into_iter()
-        .map(executable_part)
-        .any(|code| code.contains("gh pr merge") && code.contains("--auto"))
+    simple_commands(&run_shell(body))
+        .iter()
+        .any(|command| is_gh_auto_merge(command))
+}
+
+/// Is `command` -- one simple command, already tokenised and unquoted -- an
+/// invocation of `gh pr merge ... --auto`?
+fn is_gh_auto_merge(command: &[String]) -> bool {
+    let Some(argv0) = command.first() else {
+        return false;
+    };
+    // `gh`, or any path ending in it (`/usr/bin/gh`).
+    let program = argv0.rsplit('/').next().unwrap_or(argv0);
+    if program != "gh" {
+        return false;
+    }
+    let args: Vec<&str> = command[1..].iter().map(String::as_str).collect();
+    args.first() == Some(&"pr") && args.get(1) == Some(&"merge") && args[2..].contains(&"--auto")
+}
+
+/// The `run:` shell of `body`, comment-stripped and with backslash-newline
+/// continuations rejoined, as one string.
+fn run_shell(body: &str) -> String {
+    let mut shell = String::new();
+    for line in run_shell_lines(body) {
+        shell.push_str(executable_part(line));
+        shell.push('\n');
+    }
+    shell
+}
+
+/// Split shell source into simple commands, each a list of unquoted tokens.
+///
+/// A deliberately small shell reader rather than a dependency: word splitting on
+/// unquoted whitespace, single/double quote removal, backslash escapes
+/// (including line continuation), and command boundaries at unquoted `;`, `&`,
+/// `|` and newline. Constructs it does not model (`$(...)`, `{ ...; }`) are left
+/// in whatever token they appear in, which can only ever make a match *harder* to
+/// achieve -- the direction this guard needs to err in.
+fn simple_commands(shell: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut command: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = shell.chars().peekable();
+
+    // Close off the token being built, if any.
+    macro_rules! end_token {
+        () => {
+            if started {
+                command.push(std::mem::take(&mut token));
+                started = false;
+            }
+        };
+    }
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    // Inside double quotes a backslash only escapes a few
+                    // characters; passing the next one through verbatim is close
+                    // enough for a tripwire and never invents a token.
+                    if let Some(next) = chars.next() {
+                        token.push(next);
+                    }
+                } else {
+                    token.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    started = true;
+                }
+                '\\' => match chars.next() {
+                    // Line continuation: the newline disappears and the command
+                    // continues, so `gh pr merge \<newline>  --auto` is one
+                    // command.
+                    Some('\n') | None => {}
+                    Some(next) => {
+                        token.push(next);
+                        started = true;
+                    }
+                },
+                ';' | '&' | '|' | '\n' => {
+                    end_token!();
+                    if !command.is_empty() {
+                        commands.push(std::mem::take(&mut command));
+                    }
+                }
+                c if c.is_whitespace() => end_token!(),
+                c => {
+                    token.push(c);
+                    started = true;
+                }
+            },
+        }
+    }
+
+    // Not `end_token!()`: this is the last use of `token`/`started`, and the
+    // macro's reset of `started` would be flagged as a dead assignment under
+    // `-D warnings`.
+    if started {
+        command.push(token);
+    }
+    if !command.is_empty() {
+        commands.push(command);
+    }
+    commands
 }
 
 /// The shell lines of every `run:` in `body`, in file order.
@@ -250,4 +380,54 @@ fn arms_auto_merge_counts_run_shell_only() {
     assert!(!arms_auto_merge(
         "jobs:\n  m:\n    steps:\n      - run: |\n          echo hi\n        name: gh pr merge --auto\n"
     ));
+}
+
+/// Inside `run:` shell, the command text must be *the command* -- not an
+/// argument of some other one, and not a string assigned to a variable (PR #93
+/// review, round 3: two independent substring matches were treated as
+/// execution).
+#[test]
+fn arms_auto_merge_requires_an_actual_invocation() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // Named as data, executed by something else (or by nothing at all).
+    assert!(!arms_auto_merge(&workflow(
+        "          echo \"gh pr merge --auto --squash\"\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          CMD=\"gh pr merge $PR_URL --auto --squash\"\n          echo \"$CMD\"\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          printf '%s\\n' 'gh pr merge --auto'\n"
+    )));
+    // Reachable only through a shell keyword: not recognised on purpose, so the
+    // guard fails loudly rather than certifying a branch that may be dead.
+    assert!(!arms_auto_merge(&workflow(
+        "          if false; then gh pr merge \"$PR_URL\" --auto; fi\n"
+    )));
+    // Right words, wrong command: `gh` must head the command and `pr merge`
+    // must be its subcommand path, with `--auto` its own token.
+    assert!(!arms_auto_merge(&workflow(
+        "          gh pr comment \"$PR_URL\" --body 'gh pr merge --auto'\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --squash\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          gh pr merge --auto-x\n"
+    )));
+
+    // Real invocations, in the spellings a workflow plausibly uses.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" \\\n            --auto --squash\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          echo arming && gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge --auto --squash \"$PR_URL\"; echo done\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          /usr/bin/gh pr merge \"$PR_URL\" --auto\n"
+    )));
 }
