@@ -1,0 +1,83 @@
+name: Supply Chain
+
+# Cargo/crates.io equivalent of widdershins' "Supply Chain" required check (fleet CI redesign
+# Phase 2). Governance: see the design proposal this implements,
+# catalyst/thoughts/shared/research/2026-09-09-fleet-ci-redesign/manta-supply-chain-check-proposal.md.
+#
+# WHY THIS RUNS ON EVERY PR/PUSH: the job named "Supply Chain" below is a ruleset-required status
+# check on main. A required check that only ran on some events would leave every other PR stuck
+# at "Expected -- waiting for status" forever, so this workflow always runs; the audit step is
+# gated behind a Cargo.lock/Cargo.toml-changed filter so it only actually does work when a
+# dependency changed.
+#
+# WHAT IT DOES: `rustsec/audit-check` runs `cargo audit` against the checked-out Cargo.lock,
+# scanning every resolved crate against the RustSec advisory database (github.com/RustSec/advisory-db)
+# -- CVEs and known-malicious-crate reports both. Unlike widdershins' `osv-scanner` PR-diff mode,
+# this blocks on ANY advisory present in the current lockfile, not just ones newly introduced by
+# this PR -- cargo-audit has no first-class diff-only mode, and a base-vs-head manual diff is
+# meaningfully more custom logic to get right. Confirmed 2026-09-12 that manta's current Cargo.lock
+# has zero known advisories (`cargo audit` exit 0, 264 crates scanned), so this starts clean; if a
+# PRE-EXISTING advisory blocks an unrelated future PR, allowlist it in `audit.toml`
+# (https://docs.rs/cargo-audit -- an [advisories] ignore list), not by weakening this workflow.
+#
+# THREAT MODEL / KNOWN LIMIT: same as widdershins' equivalent -- this defends against malicious
+# DEPENDENCY CONTENT, not a PR author rewriting this file itself. `pull_request` (not
+# `pull_request_target`) runs the PR's own definition of this workflow, matching every other
+# manta workflow's trust model for this exact reason (a same-repo trusted-author PR can already
+# edit any workflow, including CI itself). Every action below is pinned to a full commit SHA.
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+  # rustsec/audit-check's own README lists checks: write as its "typically used" permission --
+  # without it, the action still fails this job on a real advisory (that's just this step's own
+  # exit code), but degrades its separate check-run/annotation output silently on a same-repo PR.
+  # Granting it avoids that ambiguity rather than relying on the degraded fallback path.
+  checks: write
+
+jobs:
+  changes:
+    name: Detect dependency changes
+    runs-on: ubuntu-latest
+    outputs:
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          base: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          filters: |
+            deps:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/**/Cargo.toml'
+
+  audit:
+    name: Supply Chain
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Pass trivially (no dependency manifest/lockfile changed)
+        if: needs.changes.outputs.deps != 'true'
+        run: echo "No Cargo.lock/Cargo.toml change in this diff -- nothing to scan."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.deps == 'true'
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        if: needs.changes.outputs.deps == 'true'
+
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        if: needs.changes.outputs.deps == 'true'
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
