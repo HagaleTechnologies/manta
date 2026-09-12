@@ -370,7 +370,9 @@ impl Heredoc {
     /// reader as an executed merge path (PR #93 review, round 12). Matching the
     /// delimiter exactly keeps such a block swallowed to its real terminator,
     /// which -- as with an unterminated here-document -- only makes this guard
-    /// harder to satisfy.
+    /// harder to satisfy. Which blanks the line still carries when it gets here
+    /// is `source_lines`' business -- a trailing `\r` is one of them, and
+    /// `str::lines` would have eaten it before this comparison ever ran.
     fn terminated_by(&self, line: &str) -> bool {
         let Some(delimiter) = self.delimiter.as_deref() else {
             return false;
@@ -1434,6 +1436,32 @@ struct RunLine<'a> {
     folded_onto_previous: bool,
 }
 
+/// `body` split into lines the way the *shell* is handed them: on `\n` alone.
+///
+/// `str::lines` would be the obvious call here, and it is wrong for one byte:
+/// it also strips a trailing `\r`, which bash does not. A here-document's
+/// terminator is the delimiter alone on its line, and `\r` is as much a
+/// trailing blank as a space is -- `EOF\r` no more closes `<<EOF` than `EOF `
+/// does. Leaving that `\r` on the line keeps such a block swallowed to its real
+/// terminator instead of handing its body back to the reader as shell (PR #93
+/// review, round 13, generalising the round-12 exact-delimiter fix past the
+/// whitespace `str::lines` was quietly eating first). A file written wholly in
+/// CRLF then has no line this reader can read as a terminator at all, so its
+/// here-documents swallow everything after them and the guard fails loudly --
+/// the direction it has to err in. Every other consumer of these lines
+/// (`executable_part`, the indent and key parsing below) trims before it reads,
+/// so the `\r` reaches only the comparison that needs it.
+fn source_lines(body: &str) -> impl Iterator<Item = &str> {
+    // A final `\n` terminates the last line rather than opening an empty one,
+    // and an empty body has no lines at all -- both are `str::lines`' own
+    // behaviour, which is the only part of it that is right here.
+    let body = body.strip_suffix('\n').unwrap_or(body);
+    (!body.is_empty())
+        .then(|| body.split('\n'))
+        .into_iter()
+        .flatten()
+}
+
 /// The shell lines of every *step's* `run:` in `body`, in file order.
 ///
 /// A deliberately small YAML reader rather than a dependency. Three things have
@@ -1471,7 +1499,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
     let mut steps_indent: Option<usize> = None;
     let mut step_key_indent: Option<usize> = None;
 
-    for line in body.lines() {
+    for line in source_lines(body) {
         let indent = line.len() - line.trim_start().len();
 
         // Set when the open block scalar ends on this line, so the line itself
@@ -2245,6 +2273,19 @@ fn arms_auto_merge_closes_here_documents_only_on_an_exact_delimiter() {
     assert!(!arms_auto_merge(&workflow(
         "          cat <<EOF\n          EOF nope\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
     )));
+    // A carriage return is a trailing blank too, and the one that got past the
+    // comparison above for free: `str::lines` strips it, bash does not, so
+    // `EOF\r` left this here-document open and the `gh` line under it was read
+    // as shell (PR #93 review, round 13 -- see `source_lines`).
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\n          EOF\r\n          gh pr merge \"$PR_URL\" --auto\n          EOF\n"
+    )));
+    // The same line ending throughout, which is what a CRLF-checked-out file
+    // actually looks like: no line here is a terminator bash would accept, so
+    // the here-document swallows the rest and nothing is certified.
+    assert!(!arms_auto_merge(&workflow(
+        "          cat <<EOF\r\n          EOF\r\n          gh pr merge \"$PR_URL\" --auto\r\n          EOF\r\n"
+    )));
 
     // --- what must still count --------------------------------------------
     // The exact delimiter still closes it, and shell resumes on the next line.
@@ -2253,6 +2294,12 @@ fn arms_auto_merge_closes_here_documents_only_on_an_exact_delimiter() {
     )));
     assert!(arms_auto_merge(&workflow(
         "          cat <<-EOF\n          nothing here\n          \tEOF\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Keeping `\r` on the line narrows nothing outside a delimiter comparison:
+    // an ordinary command still reads as one, because `executable_part` trims
+    // the line before it is tokenised.
+    assert!(arms_auto_merge(&workflow(
+        "          gh pr merge \"$PR_URL\" --auto --squash\r\n"
     )));
 }
 
