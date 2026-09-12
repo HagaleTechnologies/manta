@@ -166,7 +166,10 @@ fn merge_policy_successor_to_mergify_exists() {
     // by a call written under `false >/dev/null` -- which `bash -e` exits on
     // exactly as it does a bare `false` -- or by one written in a
     // `shell: python` step, whose Python raises before `gh` is ever reached
-    // (PR #93 review, round 14).
+    // (PR #93 review, round 14); and reading that redirection only where a
+    // space sets it apart from the command would still be satisfied by a call
+    // written under `false>/dev/null`, which bash splits at the operator and
+    // runs as the same builtin (PR #93 review, round 14, second reading).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -259,7 +262,10 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    than an argument, so `false >/dev/null` ends the step exactly as a bare
 ///    `false` does (`without_redirections`), and a step that names its own
 ///    interpreter (`shell: python`) is not handed to this bash reader at all
-///    (`shell_is_modelled`).
+///    (`shell_is_modelled`). Reading that round again closed the spelling it
+///    left: an operator needs no space in front of it to be one, so
+///    `false>/dev/null` is split at the `>` and ends the step too
+///    (`redirection_split`).
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -610,8 +616,18 @@ const CONSTANT_STATUS_COMMANDS: [&str; 3] = ["true", "false", ":"];
 /// and the command they precede is what the shell actually runs. A `}` closing
 /// a function body is still `FunctionScope`'s business, and heads no keyword
 /// either way.
+///
+/// A redirection is syntax the shell consumes before the command starts, so it
+/// heads nothing and ends the word it is written on: `>log false` and
+/// `false>/dev/null` both head the builtin `false`, exactly as a bare `false`
+/// does. Reading the raw first word instead left the glued spelling heading a
+/// command called `false>/dev/null`, which no rule here recognises -- so the
+/// errexit latch skipped it and a `gh pr merge ... --auto` written below it
+/// still counted (PR #93 review, round 14, second reading).
 fn command_head(words: &[String]) -> Option<&str> {
-    significant_words(words).next()
+    without_redirections(significant_words(words))
+        .into_iter()
+        .next()
 }
 
 /// Is this whole simple command one of the constant-status builtins, with no
@@ -626,7 +642,9 @@ fn command_head(words: &[String]) -> Option<&str> {
 /// `false`. Neither the errexit latch nor a `&&`/`||` gate then recognised it,
 /// and a `gh pr merge ... --auto` written below one was handed back as a live
 /// merge path (PR #93 review, round 14). `without_redirections` drops them
-/// before the count.
+/// before the count -- in every spelling, including the one glued straight onto
+/// the builtin's own word (`false>/dev/null`), which bash splits at the
+/// operator exactly as it splits the spaced form (`redirection_split`).
 fn is_constant_status(words: &[String]) -> bool {
     matches!(
         without_redirections(significant_words(words)).as_slice(),
@@ -634,9 +652,11 @@ fn is_constant_status(words: &[String]) -> bool {
     )
 }
 
-/// `words` with its redirections removed -- each operator token, plus the word
-/// carrying the target when that target is not glued to the operator
-/// (`> /dev/null` is two words, `>/dev/null` is one).
+/// `words` with its redirections removed -- each operator token and whatever
+/// target is glued behind it, plus the following word when the target is not
+/// glued (`> /dev/null` is two words, `>/dev/null` is one), and the command
+/// text a redirection is glued *onto* is handed back without it
+/// (`false>/dev/null` is one word carrying both).
 ///
 /// Over-reading is the safe direction and is taken on purpose: a word this
 /// wrongly drops can only make a command look *more* like a bare
@@ -653,29 +673,60 @@ fn without_redirections<'a>(words: impl Iterator<Item = &'a str>) -> Vec<&'a str
             target_pending = false;
             continue;
         }
-        match redirection_target(word) {
-            Some(target) => target_pending = target.is_empty(),
+        match redirection_split(word) {
+            Some((command_part, target)) => {
+                // What was written before the operator is still a command --
+                // the `false` of `false>/dev/null` -- unless the word was
+                // nothing but the redirection itself.
+                if !command_part.is_empty() {
+                    kept.push(command_part);
+                }
+                target_pending = target.is_empty();
+            }
             None => kept.push(word),
         }
     }
     kept
 }
 
-/// The target glued to the redirection operator that `word` opens (`/dev/null`
-/// for `>/dev/null`, empty for a bare `>` or `2>`), or `None` when `word` opens
-/// no redirection at all.
+/// `word` split at the redirection written in it: the command text standing
+/// before the operator (empty when the word is nothing but the redirection),
+/// and the target glued behind it (`/dev/null` for `>/dev/null`, empty for a
+/// bare `>` or `2>`, whose target is the next word). `None` when the word
+/// carries no redirection at all.
 ///
-/// An optional file-descriptor number may precede the operator, which is every
-/// spelling that can reach this reader as one word. `2>&1` and `&>f` cannot:
-/// `&` is one of the characters `simple_commands` breaks commands at, so such a
+/// A redirection operator is not a word character. Bash ends the word it is
+/// written on the moment it reads one, so `false>/dev/null` is the builtin
+/// `false` with its output redirected, exactly as `false >/dev/null` is.
+/// Recognising the operator only at the *start* of a word caught the spaced
+/// spelling and missed the glued one, which was read as some program named
+/// `false>/dev/null`: errexit never latched on it, and a `gh pr merge ...
+/// --auto` written below it was handed back as a live merge path (PR #93
+/// review, round 14, second reading).
+///
+/// An optional file-descriptor number may precede the operator and belongs to
+/// the redirection rather than to the command -- but only where the digits are
+/// the whole word before it, which is bash's own rule: `2>err` redirects fd 2,
+/// while `log2>err` runs `log2`. `2>&1` and `&>f` cannot reach here whole: `&`
+/// is one of the characters `simple_commands` breaks commands at, so such a
 /// word never arrives whole -- and the boundary it manufactures already exempts
 /// what precedes it from errexit (`Follower::Background`), the permissive
 /// direction this reader was already taking there.
-fn redirection_target(word: &str) -> Option<&str> {
-    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
-    REDIRECTION_OPERATORS
-        .iter()
-        .find_map(|op| rest.strip_prefix(op))
+fn redirection_split(word: &str) -> Option<(&str, &str)> {
+    let (at, operator) = word.char_indices().find_map(|(at, _)| {
+        REDIRECTION_OPERATORS
+            .iter()
+            .find(|operator| word[at..].starts_with(**operator))
+            .map(|operator| (at, *operator))
+    })?;
+    let before = &word[..at];
+    let command_part = if !before.is_empty() && before.bytes().all(|b| b.is_ascii_digit()) {
+        // A file-descriptor number, not a command of its own.
+        ""
+    } else {
+        before
+    };
+    Some((command_part, &word[at + operator.len()..]))
 }
 
 /// The redirection operators, longest spelling first so `<<-` is never read as
@@ -2597,6 +2648,21 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     assert!(!arms_auto_merge(&workflow(
         "          false >>log 2>>err\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
+    // ...including the spelling with no space in front of the operator, which
+    // bash splits at the `>` exactly as it splits the spaced one (PR #93
+    // review, round 14, second reading).
+    assert!(!arms_auto_merge(&workflow(
+        "          false>/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false>>log\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false>/dev/null 2>>err\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          false>/dev/null && gh pr merge \"$PR_URL\" --auto\n"
+    )));
     // The same word is not an argument to a *gate* either, so what a redirected
     // constant status settles statically stays settled.
     assert!(!arms_auto_merge(&workflow(
@@ -2668,6 +2734,23 @@ fn arms_auto_merge_rejects_shell_below_a_statically_failing_command() {
     )));
     assert!(arms_auto_merge(&workflow(
         "          falsify >/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Splitting a word at its operator must not promote one either: what stands
+    // in front of the `>` is the command, and only the builtin's own word is a
+    // constant status. A leading file-descriptor number is the redirection's
+    // (`2>err`), but digits glued to a command name are that name's (`log2>err`
+    // runs `log2`).
+    assert!(arms_auto_merge(&workflow(
+        "          falsify>/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          grep -q x f>/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          echo false>/dev/null\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&workflow(
+        "          log2>err\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
 
