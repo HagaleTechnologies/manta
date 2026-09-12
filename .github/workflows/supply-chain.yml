@@ -60,6 +60,11 @@ jobs:
               - 'Cargo.lock'
               - 'Cargo.toml'
               - 'crates/**/Cargo.toml'
+              # An audit.toml-only PR (the documented remediation for allowlisting a
+              # false-positive advisory) previously took the trivial-pass path -- a typo'd or
+              # ineffective exemption could land unexercised against the current lockfile, since
+              # green PRs auto-merge here (Codex P2, round 2).
+              - 'audit.toml'
 
   audit:
     name: Supply Chain
