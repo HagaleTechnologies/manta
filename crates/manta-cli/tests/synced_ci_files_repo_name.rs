@@ -169,7 +169,11 @@ fn merge_policy_successor_to_mergify_exists() {
     // (PR #93 review, round 14); and reading that redirection only where a
     // space sets it apart from the command would still be satisfied by a call
     // written under `false>/dev/null`, which bash splits at the operator and
-    // runs as the same builtin (PR #93 review, round 14, second reading).
+    // runs as the same builtin (PR #93 review, round 14, second reading); and
+    // reading a step's `run:` without asking whether Actions runs the step at
+    // all would still be satisfied by a call inside a step -- or a job -- that
+    // an `if: false` parks, whose shell is never handed to a shell (PR #93
+    // review, round 15).
     //
     // The reachability rules those rounds built up ask whether the shell *can*
     // reach the call, not whether it is guaranteed to: this workflow arms from
@@ -185,7 +189,8 @@ fn merge_policy_successor_to_mergify_exists() {
          does naming it only behind a constant gate (`false &&`, the body of \
          `if false`), in the body of a function nothing calls, below an \
          `exit`, below a `break` in the same loop body, or below a bare \
-         `false` the step's own `bash -e` exits on -- see `arms_auto_merge`). \
+         `false` the step's own `bash -e` exits on, or writing it in a step \
+         (or job) a statically false `if:` parks -- see `arms_auto_merge`). \
          That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
          losing it silently leaves the repo with no automated merge path at all."
@@ -195,7 +200,7 @@ fn merge_policy_successor_to_mergify_exists() {
 /// Does `body` -- a GitHub Actions workflow -- actually *execute* `gh pr merge
 /// ... --auto` from a step's `run:` shell?
 ///
-/// Four conditions, all necessary:
+/// Five conditions, all necessary:
 ///
 /// 1. **Position in the file.** Only a *step's own* `run:` content counts. A
 ///    header comment, a step `name:`, an `env:` value or a `with:` input can
@@ -266,6 +271,18 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    left: an operator needs no space in front of it to be one, so
 ///    `false>/dev/null` is split at the `>` and ends the step too
 ///    (`redirection_split`).
+///
+/// 5. **The step runs at all.** Everything above reads shell; Actions decides
+///    separately whether the step is handed to a shell in the first place. A
+///    step -- or the job enclosing it -- carrying a statically false `if:`
+///    (`if: false`, `if: ${{ false }}`, `if: 0`) is skipped outright, so its
+///    `run:` text arms nothing however that text reads. Checking only the field
+///    position, the interpreter and the shell-default latch left such a step
+///    certifying a successor workflow with no executable auto-merge path (PR
+///    #93 review, round 15). See `condition_is_statically_false`, and note that
+///    only a *statically* false condition counts: an expression over real
+///    context is a branch the workflow can take, and this file's own job
+///    condition is one.
 ///
 ///    What this does *not* refuse is a call the shell merely may not reach on a
 ///    given run. `gh pr merge --auto` inside `if ... else ... fi`, inside a
@@ -1542,6 +1559,32 @@ struct BlockScalar {
     /// True when the previous content line was non-blank and sat exactly at
     /// `content_indent` -- the only kind of line a following one may fold onto.
     prev_line_foldable: bool,
+    /// Set when the block is the value of an `if:` key rather than of a `run:`
+    /// one, naming the scope that condition governs. `if: |` and `if: >` are
+    /// both legal, and `auto-merge-trigger.yml`'s own job condition is written
+    /// that way, so a block-scalar condition has to be read rather than
+    /// discarded like every other non-`run:` block.
+    condition: Option<ConditionScope>,
+    /// The condition's content, gathered while the block is open and read by
+    /// `record_condition` when it closes. Empty for every other block.
+    text: String,
+}
+
+impl BlockScalar {
+    /// Gather one content line of an `if:` block scalar. Both spellings of the
+    /// block hand Actions the same expression once whitespace is normalised --
+    /// `|` keeps the breaks, `>` folds them to spaces, and an expression is
+    /// whitespace-insensitive either way -- so the lines are joined by spaces
+    /// whichever it is. Nothing is gathered for a block that is not an `if:`.
+    fn gather_condition(&mut self, line: &str) {
+        if self.condition.is_none() {
+            return;
+        }
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        self.text.push_str(line.trim());
+    }
 }
 
 /// One physical line of a step's `run:`, plus how YAML joins it to the line
@@ -1557,6 +1600,116 @@ struct RunLine<'a> {
     /// line, and preserves every break inside a literal (`|`) block, so all of
     /// those stay separate shell lines.
     folded_onto_previous: bool,
+}
+
+/// Which steps' `run:` an `if:` key governs.
+#[derive(Clone, Copy, PartialEq)]
+enum ConditionScope {
+    /// The current step's own `if:` -- a key at the column that step's keys sit
+    /// at. It governs exactly that step.
+    Step,
+    /// An `if:` that is not a step's own field. In a workflow that is a *job*
+    /// condition, and a job that never runs runs none of its steps.
+    Outer,
+}
+
+/// Which `run:` blocks a statically false `if:` has taken out of play.
+#[derive(Default)]
+struct Disablement {
+    /// True once the current step's own `if:` cannot hold. Cleared with the
+    /// step, like `shell:`: the field is per-step and so is its verdict.
+    step: bool,
+    /// True once an `if:` *outside* a step's own keys cannot hold. Never
+    /// cleared, for exactly the reason `unmodelled_shell_default` is not: this
+    /// reader tracks step scope but not job scope, so from such a key on it
+    /// refuses every step rather than guess which ones the condition covered.
+    /// Over-refusing costs a loud failure; guessing costs a wrong
+    /// certification.
+    outer: bool,
+}
+
+/// Record what an `if:` settles about the `run:` text around it.
+///
+/// A step GitHub Actions skips executes nothing, so its `run:` block is not a
+/// merge path however the shell in it reads. Checking only the field position,
+/// the interpreter and the shell-default latch left `if: false` on the arming
+/// step -- or on its enclosing job -- handing that dead text back as a live
+/// `gh pr merge ... --auto` call, so the guard would have stayed green on a
+/// successor workflow with no executable auto-merge path at all (PR #93
+/// review, round 15).
+///
+/// Only a *statically* false condition counts (see
+/// `condition_is_statically_false`); an expression over real context is a
+/// branch the workflow can take, and refusing those would refuse the working
+/// file, whose `auto-merge-trigger.yml` job condition is exactly such an
+/// expression.
+fn record_condition<'a>(
+    scope: ConditionScope,
+    text: &str,
+    disabled: &mut Disablement,
+    shell: &mut Vec<RunLine<'a>>,
+    step_run_start: Option<usize>,
+) {
+    if !condition_is_statically_false(text) {
+        return;
+    }
+    match scope {
+        ConditionScope::Step => disabled.step = true,
+        ConditionScope::Outer => disabled.outer = true,
+    }
+    // Actions lets the field follow the `run:` it governs, so by now that
+    // block may already have been collected as shell -- the same ordering
+    // `shell:` has to undo.
+    if let Some(start) = step_run_start {
+        shell.truncate(start);
+    }
+}
+
+/// Is this `if:` value false before the workflow ever runs, whatever the event
+/// that triggered it?
+///
+/// Actions evaluates an `if:` value as an expression whether or not it is
+/// wrapped in `${{ }}`, so `if: false` and `if: ${{ false }}` are the same
+/// disabled step; a YAML-quoted scalar is still that expression, so `if:
+/// 'false'` is the boolean literal and not the truthy string; and the values
+/// Actions casts to false -- `0` and the empty string -- disable a step just as
+/// the literal does.
+///
+/// Nothing else is read. An expression this cannot evaluate (`github.actor ==
+/// 'x'`, `!true`, a `${{ }}` with text around it) is left alone as a branch the
+/// workflow may well take: refusing those would refuse the real
+/// `auto-merge-trigger.yml`, whose job condition is such an expression. The one
+/// place this deliberately over-reads is quoting *inside* an expression --
+/// `${{ 'false' }}` is a truthy string to Actions and dead text here -- which
+/// costs a loud failure rather than a wrong certification, the direction this
+/// guard errs in everywhere else.
+fn condition_is_statically_false(value: &str) -> bool {
+    // YAML's own inline comment (` #`), as `shell_is_modelled` reads it.
+    let value = match value.split_once(" #") {
+        Some((head, _)) => head.trim(),
+        None => value.trim(),
+    };
+    if value.is_empty() {
+        // No scalar on the key's own line: the value is elsewhere (a block
+        // scalar, a nested node) and nothing is settled here.
+        return false;
+    }
+    let inner = value
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .map_or(value, str::trim);
+    let unquoted = inner
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .or_else(|| {
+            inner
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .map_or(inner, str::trim);
+    // `unquoted` is empty only where the scalar was a quoted empty string --
+    // the unquoted empty value returned above already.
+    unquoted.is_empty() || unquoted.eq_ignore_ascii_case("false") || unquoted == "0"
 }
 
 /// `body` split into lines the way the *shell* is handed them: on `\n` alone.
@@ -1611,6 +1764,15 @@ fn source_lines(body: &str) -> impl Iterator<Item = &str> {
 ///    that is *not* a step's own field -- `defaults: run: shell:` at job or
 ///    workflow level -- has no scope tracking here, so an unmodelled one drops
 ///    every step after it rather than guess which steps it governs.
+/// 5. **The step must be one Actions runs.** A step's own `if:`, and any `if:`
+///    outside a step's keys (a job's, most often), are read for a *statically*
+///    false condition -- `if: false` and the spellings around it -- and the
+///    `run:` they govern is then not executable text at all. A step's own field
+///    is tracked in either order relative to its `run:`, exactly as `shell:`
+///    is; an `if:` this reader cannot scope drops every step after it rather
+///    than guess which ones it covered. Block-scalar conditions are read too,
+///    since that is how the real `auto-merge-trigger.yml` writes its job's.
+///    See `record_condition` and `condition_is_statically_false`.
 /// 4. **A folded block must be folded.** `>` and `|` delimit the same content
 ///    but hand the shell different *lines*: under `>`, the break between two
 ///    lines at the block's own indentation becomes a space. Each returned line
@@ -1644,6 +1806,9 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
     // in the file is read as shell, so an unmodelled default makes the guard
     // fail loudly rather than certify a step whose interpreter it cannot read.
     let mut unmodelled_shell_default = false;
+    // What a statically false `if:` has already ruled out -- the current step,
+    // or (from an `if:` this reader cannot scope) every step after it.
+    let mut disabled = Disablement::default();
 
     for line in source_lines(body) {
         let indent = line.len() - line.trim_start().len();
@@ -1678,6 +1843,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                             folded_onto_previous: false,
                         });
                     }
+                    open.gather_condition(line);
                     continue;
                 }
                 Some(base) if indent >= base => {
@@ -1699,13 +1865,14 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                             folded_onto_previous,
                         });
                     }
+                    open.gather_condition(line);
                     continue;
                 }
                 Some(_) => block_ended = true,
             }
         }
         if block_ended {
-            block = None;
+            close_block(block.take(), &mut disabled, &mut shell, step_run_start);
         }
 
         let trimmed = line.trim_start();
@@ -1725,6 +1892,7 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
             step_key_indent = None;
             step_shell_is_modelled = true;
             step_run_start = None;
+            disabled.step = false;
         }
 
         let (key, key_indent) = match trimmed.strip_prefix("- ") {
@@ -1735,9 +1903,10 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                 step_key_indent = steps_indent.map(|_| key_indent);
                 // A new step asks the interpreter question again from scratch:
                 // `shell:` is a per-step field, and the run lines it governs are
-                // this step's own.
+                // this step's own. So is `if:`.
                 step_shell_is_modelled = true;
                 step_run_start = None;
+                disabled.step = false;
                 (rest, key_indent)
             }
             None => (trimmed, indent),
@@ -1771,11 +1940,26 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                 unmodelled_shell_default = true;
             }
         }
-        // A step's `run:` is shell only if the step actually hands it to a shell.
+        let condition_scope = (name == "if").then(|| {
+            if Some(key_indent) == step_key_indent {
+                ConditionScope::Step
+            } else {
+                ConditionScope::Outer
+            }
+        });
+        if let Some(scope) = condition_scope {
+            // An inline condition is settled here; a block-scalar one is read
+            // when its block closes, below.
+            record_condition(scope, value, &mut disabled, &mut shell, step_run_start);
+        }
+        // A step's `run:` is shell only if the step actually hands it to a
+        // shell, and only if the workflow can reach the step at all.
         let is_step_run = name == "run"
             && Some(key_indent) == step_key_indent
             && step_shell_is_modelled
-            && !unmodelled_shell_default;
+            && !unmodelled_shell_default
+            && !disabled.step
+            && !disabled.outer;
         // `>`/`|` may carry chomping and explicit-indentation indicators
         // (`>-`, `|+`, `>2`); those affect trailing newlines, not whether the
         // block folds, so only the first character is read here.
@@ -1789,6 +1973,8 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
                 keep: is_step_run,
                 folded,
                 prev_line_foldable: false,
+                condition: condition_scope,
+                text: String::new(),
             });
         } else if is_step_run && !value.is_empty() {
             step_run_start = Some(shell.len());
@@ -1798,8 +1984,24 @@ fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
             });
         }
     }
+    // A block scalar the file simply ends inside still closes there.
+    close_block(block.take(), &mut disabled, &mut shell, step_run_start);
 
     shell
+}
+
+/// Finish a block scalar, reading an `if:` verdict out of the content it
+/// gathered. Every other block's content was already dropped as it arrived.
+fn close_block<'a>(
+    block: Option<BlockScalar>,
+    disabled: &mut Disablement,
+    shell: &mut Vec<RunLine<'a>>,
+    step_run_start: Option<usize>,
+) {
+    let Some(finished) = block else { return };
+    if let Some(scope) = finished.condition {
+        record_condition(scope, &finished.text, disabled, shell, step_run_start);
+    }
 }
 
 /// Does this `shell:` value name an interpreter whose execution semantics
@@ -2814,5 +3016,95 @@ fn arms_auto_merge_reads_run_blocks_only_for_modelled_interpreters() {
     // reach back and disarm a bash step that already ran the call.
     assert!(arms_auto_merge(
         "jobs:\n  m:\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n      - shell: python\n        run: print(\"done\")\n"
+    ));
+}
+
+/// A step Actions never runs arms nothing -- the property PR #93's review asked
+/// for in round 15. `if: false` on the arming step, or on the job that encloses
+/// it, skips the command outright; reading the `run:` text anyway certifies a
+/// successor workflow with no executable auto-merge path at all.
+#[test]
+fn arms_auto_merge_rejects_statically_disabled_steps() {
+    let step = |fields: &str| format!("jobs:\n  m:\n    steps:\n      - name: arm\n{fields}");
+    let job = |condition: &str| {
+        format!("jobs:\n  m:\n{condition}    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n")
+    };
+
+    // The review's own case, in both orders -- Actions lets `if:` follow the
+    // `run:` it governs, exactly as `shell:` may.
+    assert!(!arms_auto_merge(&step(
+        "        if: false\n        run: |\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        run: |\n          gh pr merge \"$PR_URL\" --auto --squash\n        if: false\n"
+    )));
+    // Every spelling of the same condition: wrapped in `${{ }}`, quoted (a
+    // quoted scalar is still the expression Actions evaluates), commented, and
+    // in the two other values Actions casts to false.
+    assert!(!arms_auto_merge(&step(
+        "        if: ${{ false }}\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        if: 'false'\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        if: false # parked until MAN-999\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        if: 0\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(!arms_auto_merge(&step(
+        "        if: ''\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // The enclosing job's condition, which skips every step in it.
+    assert!(!arms_auto_merge(&job("    if: false\n")));
+    assert!(!arms_auto_merge(&job("    if: ${{ false }}\n")));
+    // ...including the block-scalar spelling the real auto-merge-trigger.yml
+    // writes its own job condition in.
+    assert!(!arms_auto_merge(&job("    if: |\n      false\n")));
+    assert!(!arms_auto_merge(&job("    if: >-\n      false\n")));
+    // A step's own `if:` written as a block scalar, too.
+    assert!(!arms_auto_merge(&step(
+        "        if: |\n          false\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A block-scalar condition the file simply ends inside still closes.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n        if: |\n          false\n"
+    ));
+
+    // --- what must still count --------------------------------------------
+    // The absent field, and a condition that holds.
+    assert!(arms_auto_merge(&step(
+        "        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    assert!(arms_auto_merge(&step(
+        "        if: true\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // An expression over real context is a branch the workflow can take, not
+    // dead text -- refusing these would refuse the real auto-merge-trigger.yml,
+    // whose job condition is exactly such an expression, written as a block
+    // scalar and mentioning `false` inside it.
+    assert!(arms_auto_merge(&job(
+        "    if: github.event.pull_request.user.login == 'thagale'\n"
+    )));
+    assert!(arms_auto_merge(&job(
+        "    if: |\n      github.event.pull_request.draft == false &&\n      github.event.action != 'edited'\n"
+    )));
+    assert!(arms_auto_merge(&step(
+        "        if: ${{ github.actor != 'dependabot[bot]' }}\n        run: gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // A disabled step is that step's own business: it must not reach back and
+    // disarm a live step that already ran the call, nor forward past its own.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: gh pr merge \"$PR_URL\" --auto\n      - if: false\n        run: echo parked\n"
+    ));
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - if: false\n        run: echo parked\n      - run: gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // A mapping merely *named* `if` that is not a condition at all -- a `with:`
+    // input, an `env:` value -- is scoped as an outer one, so it is read only
+    // where it is statically false; a truthy one settles nothing.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - with:\n          if: yes\n        run: gh pr merge \"$PR_URL\" --auto\n"
     ));
 }
