@@ -1,0 +1,82 @@
+# manta example configuration -- every key, at its real built-in default.
+#
+# Copy this file to wherever you point `manta listen --server-config <path>`:
+# /etc/manta/manta.toml under the shipped systemd unit
+# (packaging/systemd/manta.service), or a path of your choosing under
+# launchd / Docker Compose.
+#
+# A key that is COMMENTED OUT below is already at the default shown next to
+# it: uncommenting it exactly as written changes nothing. `station_callsign`
+# is the only key with no default, and the only line you must edit.
+#
+# NOT configurable from this file yet: input/source selection
+# (--device / --source / --kiwi-* / --hpsdr-* / --soapy-*), --dial-freq-hz,
+# the allow/block/notch lists, and detector/decode tuning. Those are CLI
+# flags only today, which is why each shipped service unit still carries
+# source flags on its command line. `[input]`, `[spot]`, `[detector]` and
+# `[decode]` tables WOULD parse here without error and then do nothing at
+# all, so they are deliberately left out rather than shown as silent no-ops
+# (tracked as MAN-74).
+
+[server]
+
+# The spotter's own callsign: the telnet `DX de <call>-#:` identity and the
+# JSON stream's `deCall`. REQUIRED -- there is no default. Checked at load
+# time against manta's own callsign grammar (3-7 alphanumerics, at least one
+# digit and one letter, ending in a letter, plus an optional /P /QRP /MM /AM
+# /M /<digit> suffix), so a malformed value stops the daemon at startup
+# instead of being interpolated into every spot line.
+station_callsign = "N0CALL"
+
+# Address the telnet, JSON/WebSocket and metrics listeners bind to.
+# "0.0.0.0" is every IPv4 interface -- read docs/RUNBOOKS/network-exposure.md
+# before exposing any of these ports to an untrusted network.
+# bind_addr = "0.0.0.0"
+
+# The three listener ports. Under Docker Compose these are the CONTAINER-side
+# ports the shipped docker-compose.yml publishes: changing one here without
+# changing the container side of the matching `ports:` entry leaves that
+# service unreachable from the host (docker-compose.yml says so at its
+# `ports:` block).
+#
+# RBN-format DX cluster telnet port.
+# telnet_port = 7300
+
+# JSON Lines / WebSocket spot stream port (one listener serves both).
+# json_port = 7301
+
+# Prometheus metrics port (GET /metrics).
+# metrics_port = 7302
+
+# Per-source-IP concurrent-connection quotas. Omitted (as here) means the
+# built-in default shown. `0` disables the per-IP cap for that listener,
+# leaving only its own total-connection ceiling -- which is what you want
+# when a reverse proxy fronts a listener and every client arrives with the
+# proxy's IP (docs/RUNBOOKS/network-exposure.md).
+# telnet_max_connections_per_ip = 16
+# json_max_connections_per_ip = 16
+# metrics_max_connections_per_ip = 8
+
+# Per-source-IP AGGREGATE rate budgets -- separate knobs from the
+# connection quotas above. `0` disables the per-IP aggregate cap (each
+# individual connection's own budget still applies).
+# telnet_max_commands_per_ip = 30
+# json_max_pings_per_ip = 10
+
+# Outbound RBN uplink: zero or more [[rbn_uplink]] blocks. With no block at
+# all -- the shipped state of this file -- the uplink is off entirely.
+# Uncomment and edit to forward manta's spots to an RBN collection endpoint.
+#
+# `enabled`, `target_host` and `target_port` have no defaults: inside a
+# block that exists at all, they must be set.
+#
+# `dry_run` defaults to false, i.e. spots really are transmitted. Set it to
+# true explicitly while you validate connectivity and login -- the
+# connection and login still happen, but no spot line reaches the wire.
+#
+# [[rbn_uplink]]
+# enabled = true
+# target_host = "telnet.reversebeacon.net"
+# target_port = 7000
+# login_callsign = "N0CALL"
+# dry_run = false

@@ -100,6 +100,31 @@ platform/feature combination the release matrix doesn't cover — the
 binaries since it needs the SoapySDR system library) still works exactly
 as before, and is what the rest of this Quickstart assumes:
 
+## Running unattended
+
+`manta` is a daemon, and the repo ships the files that make it behave like
+one so you do not have to write them — every release archive carries them
+next to the binary, at these same relative paths, so the prebuilt-binary
+path above needs no clone:
+
+- [`manta.example.toml`](manta.example.toml) — every config key, at its real
+  built-in default. Copy it, set `station_callsign`, and it starts as-is.
+- [`packaging/systemd/manta.service`](packaging/systemd/manta.service) — Linux
+- [`packaging/launchd/com.hagaletechnologies.manta.plist`](packaging/launchd/com.hagaletechnologies.manta.plist) — macOS
+- [`docker-compose.yml`](docker-compose.yml) — anywhere Docker runs
+
+Running it *inside* the unpacked archive, as above, is fine by hand — but
+the systemd unit and the launchd plist both execute the absolute path
+`/usr/local/bin/manta`, and neither service manager searches `PATH`, so on
+Linux and macOS alike the first install step is copying the unpacked binary
+there (`sudo install -m 0755 ./manta /usr/local/bin/manta`). The
+per-platform install blocks linked below open with exactly that command; a
+unit bootstrapped without it loads without error and then fails on every
+spawn.
+
+Install steps, how to swap the source, and how to stop manta cleanly on each
+platform: [`packaging/README.md`](packaging/README.md).
+
 ## Quickstart
 
 Requires Rust 1.85 or newer, and a `git` executable on `PATH`. Git is a
