@@ -10,17 +10,23 @@ name: Auto-Merge Trigger
 # does that IS the new job-(1) trust boundary. This job carries that
 # boundary forward directly from .mergify.yml's own trusted-author
 # condition (`author = thagale` OR `author = catalyst-cloud-connector[bot]`
-# OR dependabot-with-a-real-approval) -- manta is public with
-# required_approving_review_count now 1 (was 0) but this workflow arms
-# every merge it triggers via CODEX_REVIEW_PAT, a bypass actor on
-# manta-review-gate ("always" mode). That bypass is evaluated against
-# whoever ENABLES auto-merge, not the PR's author -- so without this job's
-# own author check, using a shared bypass-capable credential here would let
-# ANY green PR skip the review requirement entirely, silently recreating
-# the exact zero-review-merge gap this whole redesign exists to close. The
-# ruleset's required_approving_review_count is real defense-in-depth (it
-# still blocks a manual merge attempt, or a different token, by anyone not
-# on this list) but does not replace this check.
+# OR dependabot-with-a-real-approval).
+#
+# manta-review-gate's `required_approving_review_count` is 0 (MAN-217,
+# reverted from an initial value of 1): bypass_actors were meant to let
+# thagale/catalyst-cloud-connector[bot] skip the review requirement while
+# everyone else still needed it, but bypass_actors only ever apply to an
+# explicit admin-style merge action, never to automatic auto-merge/queue
+# admission -- a real PR (manta#186) sat blocked for 6+ hours with
+# auto-merge armed as a bypass actor and never entered the queue; only a
+# manual `gh pr merge --admin` worked. Auto-merge is deliberately designed
+# to never cut corners, so there's no way to make a required-review count
+# actually get bypassed through it. With the count back at 0, this job's
+# own author check below is the ENTIRE admission gate, not defense-in-depth
+# alongside a working ruleset backstop -- without it, using this shared
+# CODEX_REVIEW_PAT credential unconditionally would let any green PR merge
+# with zero human review, the exact gap this whole redesign exists to
+# close. See docs/DECISIONS/2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md.
 #
 # Dependabot is deliberately NOT handled here (unlike widdershins, which
 # excludes it only via `github.actor != 'dependabot[bot]'`): GitHub
@@ -28,9 +34,9 @@ name: Auto-Merge Trigger
 # CODEX_REVIEW_PAT would be empty on exactly the events that would trigger
 # this job for a Dependabot PR. Its own auto-merge is armed instead by
 # dependabot-auto-merge.yml using GITHUB_TOKEN right after it approves --
-# github-actions[bot] isn't a bypass actor on manta-review-gate, so that
-# arm only actually merges once required_approving_review_count is
-# satisfied by its own approval, no bypass needed.
+# that approval is real, human-designed defense-in-depth for the Dependabot
+# path specifically (a positive classification signal, not a rubber stamp),
+# independent of the ruleset's review-count setting either way.
 on:
   pull_request_target:
     branches: [main]
@@ -79,11 +85,12 @@ jobs:
     steps:
       # CODEX_REVIEW_PAT, not GITHUB_TOKEN: a merge attributed to
       # GITHUB_TOKEN suppresses downstream push-triggered events (GitHub's
-      # anti-recursion guard), and -- separately, the reason it must be
-      # THIS specific credential -- only a bypass actor's own token causes
-      # the eventual auto-merge to skip manta-review-gate's required
-      # review, which is the whole point for this job's two trusted
-      # authors (see header comment).
+      # anti-recursion guard). Reusing this credential here (rather than
+      # provisioning a separate one) is just convenience now that
+      # manta-review-gate's required_approving_review_count is back at 0
+      # (MAN-217) -- there's no review requirement left for a bypass-actor
+      # token to skip, so this job's OWN author check above (see header
+      # comment) is what actually keeps this from arming any green PR.
       #
       # needs-human is checked here, inside the run: block via a fresh API
       # fetch, not in this job's own `if:` (same class of finding Codex
