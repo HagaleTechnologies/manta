@@ -12,21 +12,26 @@ name: Auto-Merge Trigger
 # condition (`author = thagale` OR `author = catalyst-cloud-connector[bot]`
 # OR dependabot-with-a-real-approval).
 #
-# manta-review-gate's `required_approving_review_count` is 0 (MAN-217,
-# reverted from an initial value of 1): bypass_actors were meant to let
-# thagale/catalyst-cloud-connector[bot] skip the review requirement while
-# everyone else still needed it, but bypass_actors only ever apply to an
-# explicit admin-style merge action, never to automatic auto-merge/queue
-# admission -- a real PR (manta#186) sat blocked for 6+ hours with
-# auto-merge armed as a bypass actor and never entered the queue; only a
-# manual `gh pr merge --admin` worked. Auto-merge is deliberately designed
-# to never cut corners, so there's no way to make a required-review count
-# actually get bypassed through it. With the count back at 0, this job's
-# own author check below is the ENTIRE admission gate, not defense-in-depth
-# alongside a working ruleset backstop -- without it, using this shared
-# CODEX_REVIEW_PAT credential unconditionally would let any green PR merge
-# with zero human review, the exact gap this whole redesign exists to
-# close. See docs/DECISIONS/2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md.
+# manta is public, and manta-review-gate's `required_approving_review_count`
+# is 0 (MAN-217, reverted from an initial value of 1). That 1 rested on the
+# assumption that the ruleset's bypass_actors -- CODEX_REVIEW_PAT ("always"
+# mode), the credential this job arms with, plus thagale and
+# catalyst-cloud-connector[bot] -- would carry a trusted author's merge past
+# the review requirement while everyone else still needed it. bypass_actors
+# only ever apply to an explicit admin-style merge action, never to
+# automatic auto-merge/queue admission: a real PR (manta#186) sat blocked
+# for 6+ hours with auto-merge armed as a bypass actor and never entered the
+# queue; only a manual `gh pr merge --admin` worked. Auto-merge is
+# deliberately designed to never cut corners, so there is no way to make a
+# required-review count actually get bypassed through it -- it just waits
+# for an approval that never arrives. With the count back at 0 the ruleset
+# asks for no review at all, so this job's own author check below is not
+# defense-in-depth behind one: it is the ENTIRE admission gate, the ONLY
+# thing between a green PR and an unattended merge. Drop it and using this
+# shared CODEX_REVIEW_PAT credential unconditionally would let any green PR
+# from any author merge itself with zero human review, the exact gap this
+# whole redesign exists to close. See
+# docs/DECISIONS/2026-09-12-man217-native-queue-admission-ignores-bypass-actors.md.
 #
 # Dependabot is deliberately NOT handled here (unlike widdershins, which
 # excludes it only via `github.actor != 'dependabot[bot]'`): GitHub
@@ -34,9 +39,12 @@ name: Auto-Merge Trigger
 # CODEX_REVIEW_PAT would be empty on exactly the events that would trigger
 # this job for a Dependabot PR. Its own auto-merge is armed instead by
 # dependabot-auto-merge.yml using GITHUB_TOKEN right after it approves --
-# that approval is real, human-designed defense-in-depth for the Dependabot
-# path specifically (a positive classification signal, not a rubber stamp),
-# independent of the ruleset's review-count setting either way.
+# github-actions[bot] needs no bypass on manta-review-gate to do that, and
+# with required_approving_review_count at 0 the approval it leaves is a
+# record of what it checked rather than a gate it has to satisfy -- real,
+# human-designed defense-in-depth for the Dependabot path specifically (a
+# positive classification signal, not a rubber stamp), independent of the
+# ruleset's review-count setting either way.
 on:
   pull_request_target:
     branches: [main]

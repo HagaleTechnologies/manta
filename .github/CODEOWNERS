@@ -6,8 +6,13 @@
 # A policy change needs human review here even when an agent authors the PR -- this file cannot
 # list an agent identity as an owner.
 
+# No /.mergify.yml entry: the native-merge-queue cutover (#185) deleted that file outright. Its
+# replacement, .github/workflows/auto-merge-trigger.yml, carries the same trusted-author boundary
+# and is already owned by the /.github/ rule above, so the policy boundary is unchanged. The entry
+# is removed rather than left dangling because a CODEOWNERS path that matches nothing still reads
+# as a live, Mergify-governed repo to anything that walks this file -- which is what sent MAN-25's
+# merge phase to open a .mergify.yml that no longer exists.
 /.github/            @thagale
-/.mergify.yml        @thagale
 
 # cargo build/test resolves exactly this dependency graph -- an unowned edit to any crate's OWN
 # Cargo.toml (not just the workspace root) can change a direct dependency's installed version

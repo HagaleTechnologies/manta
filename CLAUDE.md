@@ -112,10 +112,33 @@ in other clones, branches, or worktrees.
   PR before finishing. Unpushed work is invisible work.
 - **Main moves only by PR merge.**
 - **Auto-merge is on, repo-wide** (overrides the global "Tony merges"
-  default for this repo specifically): every PR gets `gh pr merge --auto
-  --squash` right after opening; GitHub merges it unattended once required
-  CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green. See
-  docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md.
+  default for this repo specifically): `.github/workflows/auto-merge-trigger.yml`
+  calls `gh pr merge --auto --squash` for a trusted author, and GitHub's native
+  `merge_queue` ruleset rule on `main-protection` performs the merge once the
+  required CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green.
+  `main-protection`'s `required_approving_review_count` is **0** — MAN-217
+  (`f252d89`) reverted it from 1 after finding that a ruleset bypass actor is
+  *not* honoured when GitHub admits a PR to native auto-merge, so an armed PR
+  simply sat unmerged waiting for a review the bypass was supposed to skip.
+  Do not re-document the earlier count-1 + `CODEX_REVIEW_PAT`-bypass model:
+  the ruleset asks for no approval at all, and the author allow-list in
+  `auto-merge-trigger.yml`'s `if:` — not a human-review gate — is the only
+  thing standing in front of a green PR from `thagale` or
+  `catalyst-cloud-connector[bot]`.
+- **There is no `.mergify.yml` in this repo.** The native-merge-queue cutover
+  (#185, 2026-09-11) deleted it; no merge path reads it any more. Do not open
+  it, do not recreate it, and read every surviving mention of Mergify — in
+  `.github/CODEOWNERS`, in `docs/DECISIONS/`, in an older PR description — as
+  historical. Following one of those stale pointers to the deleted file is what
+  failed MAN-25's merge phase (`could not read .mergify.yml`, ENOENT). Merge
+  policy lives in docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md — its
+  2026-09-11 amendment is at the top and supersedes everything below it.
+  This paragraph is prose; the enforceable form of it is
+  `crates/manta-cli/tests/synced_ci_files_repo_name.rs`
+  (`retired_mergify_config_is_not_resurrected` /
+  `merge_policy_successor_to_mergify_exists`), which runs in the required
+  `cargo test --workspace` leg. Trust the test, not a doc paragraph, when the
+  two ever disagree.
 
 ## Code review convergence
 
