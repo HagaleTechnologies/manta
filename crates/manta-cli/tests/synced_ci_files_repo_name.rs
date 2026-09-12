@@ -123,10 +123,13 @@ fn merge_policy_successor_to_mergify_exists() {
     // `name:` or an `env:` value carrying the same text (PR #93 review, round
     // 2); scanning `run:` shell for two independent substrings would still be
     // satisfied by `echo "gh pr merge --auto"` or `CMD="gh pr merge --auto"`,
-    // which invoke nothing (PR #93 review, round 3); and taking *every* `run:`
-    // key as shell would still be satisfied by a mapping merely named `run`
-    // (an `env:` child, a `with:` input, `jobs.<id>.defaults.run`), which
-    // executes nothing either (PR #93 review, round 4).
+    // which invoke nothing (PR #93 review, round 3); taking *every* `run:` key
+    // as shell would still be satisfied by a mapping merely named `run` (an
+    // `env:` child, a `with:` input, `jobs.<id>.defaults.run`), which executes
+    // nothing either (PR #93 review, round 4); and reading a *folded* `run: >`
+    // block as though it were a literal `run: |` one would still be satisfied
+    // by a block YAML folds into a single `echo` command, with `gh` and its
+    // flags demoted to words of that `echo` (PR #93 review, round 5).
     assert!(
         arms_auto_merge(&body),
         "{rel} no longer arms auto-merge: no `run:` shell in it *invokes* \
@@ -142,7 +145,7 @@ fn merge_policy_successor_to_mergify_exists() {
 /// Does `body` -- a GitHub Actions workflow -- actually *execute* `gh pr merge
 /// ... --auto` from a step's `run:` shell?
 ///
-/// Two conditions, both necessary:
+/// Three conditions, all necessary:
 ///
 /// 1. **Position in the file.** Only a *step's own* `run:` content counts. A
 ///    header comment, a step `name:`, an `env:` value or a `with:` input can
@@ -150,7 +153,14 @@ fn merge_policy_successor_to_mergify_exists() {
 ///    -- and so can a mapping whose key happens to be `run` but which is not a
 ///    step's `run:` field (`jobs.<id>.defaults.run`, an `env:` child called
 ///    `run`). See `run_shell_lines`.
-/// 2. **Position in the command.** Within that shell, `gh` must be the *command
+/// 2. **Line structure as YAML defines it.** A literal block (`run: |`) hands
+///    the shell every line break; a *folded* block (`run: >`) folds the break
+///    between two plain lines into a single space. So `echo disabled` followed
+///    by `gh pr merge ... --auto` is two commands under `|` and *one* `echo`
+///    command under `>`. Reading the second as the first would certify a
+///    workflow that invokes nothing (PR #93 review, round 5). See
+///    `folded_run_lines`.
+/// 3. **Position in the command.** Within that shell, `gh` must be the *command
 ///    word* of a simple command, followed by the `pr merge` subcommand path,
 ///    with `--auto` as one of its own argument tokens. Substring matching is not
 ///    enough: `echo "gh pr merge --auto"`, `CMD="gh pr merge --auto"` and
@@ -187,15 +197,48 @@ fn is_gh_auto_merge(command: &[String]) -> bool {
     args.first() == Some(&"pr") && args.get(1) == Some(&"merge") && args[2..].contains(&"--auto")
 }
 
-/// The `run:` shell of `body`, comment-stripped and with backslash-newline
-/// continuations rejoined, as one string.
+/// The `run:` shell of `body` -- one *logical* line per line the shell receives,
+/// comment-stripped and with backslash-newline continuations rejoined -- as one
+/// string.
 fn run_shell(body: &str) -> String {
     let mut shell = String::new();
-    for line in run_shell_lines(body) {
-        shell.push_str(executable_part(line));
+    for line in folded_run_lines(body) {
+        shell.push_str(executable_part(&line));
         shell.push('\n');
     }
     shell
+}
+
+/// The step-`run:` lines of `body` after YAML block folding, so each element is
+/// one line *as the shell receives it*.
+///
+/// This is the whole difference between the two block-scalar spellings Actions
+/// allows. A literal block (`run: |`) preserves every line break, so each
+/// physical line is its own shell line. A folded block (`run: >`) replaces the
+/// break between two plain content lines with a single space, so
+///
+/// ```yaml
+/// run: >
+///   echo disabled
+///   gh pr merge "$PR_URL" --auto
+/// ```
+///
+/// reaches the shell as the single command `echo disabled gh pr merge "$PR_URL"
+/// --auto` -- an `echo` of six words, arming nothing. Joining here (rather than
+/// folding inside `run_shell_lines`) also means `executable_part` cuts `#`
+/// comments from the folded line, which is where the shell would see them.
+fn folded_run_lines(body: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for run_line in run_shell_lines(body) {
+        match lines.last_mut() {
+            Some(last) if run_line.folded_onto_previous => {
+                last.push(' ');
+                last.push_str(run_line.text.trim());
+            }
+            _ => lines.push(run_line.text.trim().to_owned()),
+        }
+    }
+    lines
 }
 
 /// Split shell source into simple commands, each a list of unquoted tokens.
@@ -282,9 +325,39 @@ fn simple_commands(shell: &str) -> Vec<Vec<String>> {
     commands
 }
 
+/// A block scalar (`|` or `>`) that is currently open, and what to do with the
+/// content lines it swallows.
+struct BlockScalar {
+    /// Content indentation, pinned by the block's first non-blank line.
+    content_indent: Option<usize>,
+    /// True only for a block opened by a step's own `run:`; every other block's
+    /// content is consumed and dropped.
+    keep: bool,
+    /// True for a *folded* block (`>`), where YAML turns the break between two
+    /// plain content lines into a single space. False for a literal one (`|`),
+    /// which keeps every break.
+    folded: bool,
+    /// True when the previous content line was non-blank and sat exactly at
+    /// `content_indent` -- the only kind of line a following one may fold onto.
+    prev_line_foldable: bool,
+}
+
+/// One physical line of a step's `run:`, plus how YAML joins it to the line
+/// before it.
+struct RunLine<'a> {
+    text: &'a str,
+    /// True when YAML folds the *preceding* line break into a space instead of
+    /// keeping it: a folded (`>`) block with this line and the one before it
+    /// both non-blank and sitting at the block's own content indentation. YAML
+    /// preserves the break beside a blank line and beside a *more-indented*
+    /// line, and preserves every break inside a literal (`|`) block, so all of
+    /// those stay separate shell lines.
+    folded_onto_previous: bool,
+}
+
 /// The shell lines of every *step's* `run:` in `body`, in file order.
 ///
-/// A deliberately small YAML reader rather than a dependency. Two things have
+/// A deliberately small YAML reader rather than a dependency. Three things have
 /// to be right for a line to count as executable shell:
 ///
 /// 1. **The key must be a step's own `run:`** -- a key at the column a step's
@@ -297,20 +370,22 @@ fn simple_commands(shell: &str) -> Vec<Vec<String>> {
 ///    inline scalar (`run: cmd`) or a block scalar (`run: |` / `run: >`, whose
 ///    body is every following line indented deeper than its first content
 ///    line).
+/// 3. **A folded block must be folded.** `>` and `|` delimit the same content
+///    but hand the shell different *lines*: under `>`, the break between two
+///    lines at the block's own indentation becomes a space. Each returned line
+///    carries `folded_onto_previous` so `folded_run_lines` can rebuild what the
+///    shell actually sees; treating `>` like `|` manufactured a command boundary
+///    the shell never gets, which let a folded block that only ever runs `echo`
+///    certify an auto-merge call (PR #93 review, round 5).
 ///
 /// Block scalars opened by *other* keys are tracked too, and their content
 /// discarded, so a `description: |` paragraph can never be re-read as keys.
 /// Anything else this reader cannot recognise is simply not returned, so an
 /// unhandled spelling makes the guard fail loudly rather than pass vacuously;
 /// that is the direction this guard needs to err in.
-fn run_shell_lines(body: &str) -> Vec<&str> {
+fn run_shell_lines(body: &str) -> Vec<RunLine<'_>> {
     let mut shell = Vec::new();
-    // `Some((None, keep))` = inside a block scalar whose content indentation is
-    // not pinned yet (no non-blank line seen); `Some((Some(n), keep))` = pinned
-    // at column `n`; `None` = not inside one. `keep` is true only for a block
-    // opened by a step's own `run:` -- every other block is consumed and
-    // dropped.
-    let mut block: Option<(Option<usize>, bool)> = None;
+    let mut block: Option<BlockScalar> = None;
     // The indent of the `steps:` key currently in effect, and the column at
     // which the current step's own keys sit. A `run:` counts only at that
     // column.
@@ -320,33 +395,60 @@ fn run_shell_lines(body: &str) -> Vec<&str> {
     for line in body.lines() {
         let indent = line.len() - line.trim_start().len();
 
-        if let Some((content_indent, keep)) = block {
+        // Set when the open block scalar ends on this line, so the line itself
+        // still falls through to the key handling below.
+        let mut block_ended = false;
+        if let Some(open) = block.as_mut() {
             // A block scalar's indentation is set by its first non-blank line
             // and it ends at the first non-blank line indented less than that.
             // Sibling keys of `run:` sit one level shallower, so this is what
             // keeps a following `name:`/`env:` out of the shell.
             if line.trim().is_empty() {
-                if keep {
-                    shell.push(line);
+                // A blank line is a break YAML always preserves, in either
+                // flavour of block.
+                open.prev_line_foldable = false;
+                if open.keep {
+                    shell.push(RunLine {
+                        text: line,
+                        folded_onto_previous: false,
+                    });
                 }
                 continue;
             }
-            match content_indent {
+            match open.content_indent {
                 None => {
-                    block = Some((Some(indent), keep));
-                    if keep {
-                        shell.push(line);
+                    open.content_indent = Some(indent);
+                    open.prev_line_foldable = open.folded;
+                    if open.keep {
+                        shell.push(RunLine {
+                            text: line,
+                            folded_onto_previous: false,
+                        });
                     }
                     continue;
                 }
                 Some(base) if indent >= base => {
-                    if keep {
-                        shell.push(line);
+                    // Only a line at the block's own indentation folds. A
+                    // *more-indented* line keeps the breaks on both sides of it
+                    // -- that is how a folded scalar carries a pre-formatted
+                    // chunk -- so it starts a fresh shell line and the next
+                    // plain line cannot fold onto it either.
+                    let plain = indent == base;
+                    let folded_onto_previous = open.folded && plain && open.prev_line_foldable;
+                    open.prev_line_foldable = open.folded && plain;
+                    if open.keep {
+                        shell.push(RunLine {
+                            text: line,
+                            folded_onto_previous,
+                        });
                     }
                     continue;
                 }
-                Some(_) => block = None,
+                Some(_) => block_ended = true,
             }
+        }
+        if block_ended {
+            block = None;
         }
 
         let trimmed = line.trim_start();
@@ -391,10 +493,22 @@ fn run_shell_lines(body: &str) -> Vec<&str> {
         };
         let value = value.trim();
         let is_step_run = name == "run" && Some(key_indent) == step_key_indent;
-        if value.starts_with('|') || value.starts_with('>') {
-            block = Some((None, is_step_run));
+        // `>`/`|` may carry chomping and explicit-indentation indicators
+        // (`>-`, `|+`, `>2`); those affect trailing newlines, not whether the
+        // block folds, so only the first character is read here.
+        let folded = value.starts_with('>');
+        if folded || value.starts_with('|') {
+            block = Some(BlockScalar {
+                content_indent: None,
+                keep: is_step_run,
+                folded,
+                prev_line_foldable: false,
+            });
         } else if is_step_run && !value.is_empty() {
-            shell.push(value);
+            shell.push(RunLine {
+                text: value,
+                folded_onto_previous: false,
+            });
         }
     }
 
@@ -528,4 +642,58 @@ fn arms_auto_merge_requires_an_actual_invocation() {
     assert!(arms_auto_merge(&workflow(
         "          /usr/bin/gh pr merge \"$PR_URL\" --auto\n"
     )));
+}
+
+/// A folded block scalar (`run: >`) must be folded the way YAML folds it before
+/// its content is read as shell (PR #93 review, round 5: `>` was accepted but
+/// processed exactly like `|`, so a folded block whose lines join into a single
+/// `echo` command was certified as an auto-merge invocation).
+#[test]
+fn arms_auto_merge_folds_folded_block_scalars() {
+    // The review's own case. YAML joins these two lines with a space, so the
+    // shell runs `echo disabled gh pr merge "$PR_URL" --auto` -- one `echo`,
+    // with `gh` and its flags as mere arguments, and no `gh` invocation at all.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >\n          echo disabled\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // Chomping indicators belong to the header, not the content, so `>-` folds
+    // exactly the same way.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >-\n          echo disabled\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    // The very same lines under `|` are two commands, the second of which does
+    // arm auto-merge -- the contrast the previous revision could not draw.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: |\n          echo disabled\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+
+    // Folding cuts both ways: an invocation split across plain lines of a
+    // folded block is one real command once YAML is through with it.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >\n          gh pr merge \"$PR_URL\"\n          --auto --squash\n"
+    ));
+    // A single-line folded block has no break to fold.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >\n          gh pr merge \"$PR_URL\" --auto --squash\n"
+    ));
+
+    // Breaks YAML *preserves* inside a folded block are still breaks, so the
+    // `gh` line is its own command in both of these: beside a blank line, and
+    // on a line indented deeper than the block's own content indentation.
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >\n          echo disabled\n\n          gh pr merge \"$PR_URL\" --auto\n"
+    ));
+    assert!(arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >\n          echo disabled\n            gh pr merge \"$PR_URL\" --auto\n"
+    ));
+
+    // Folding does not widen what counts as shell: a folded block under a key
+    // that is not a step's `run:` is still dropped, and the block still ends
+    // where indentation returns to the key's level.
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - env:\n          run: >\n            gh pr merge \"$PR_URL\" --auto\n        uses: actions/checkout@v4\n"
+    ));
+    assert!(!arms_auto_merge(
+        "jobs:\n  m:\n    steps:\n      - run: >\n          echo hi\n        name: gh pr merge --auto\n"
+    ));
 }
