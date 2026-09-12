@@ -135,15 +135,17 @@ fn merge_policy_successor_to_mergify_exists() {
     // treating every newline and `&&` as an unconditional command boundary
     // would still be satisfied by shell text the shell never executes -- a
     // here-document body handed to `cat` on stdin, or a branch behind
-    // `false &&` (PR #93 review, round 6).
+    // `false &&` (PR #93 review, round 6); and tracking only the five
+    // compound-command keywords would still be satisfied by the body of a
+    // shell function that nothing ever calls (PR #93 review, round 7).
     assert!(
         arms_auto_merge(&body),
         "{rel} no longer arms auto-merge: no `run:` shell in it *invokes* \
          `gh pr merge ... --auto` as a command (a header comment, a \
          `name:`/`env:` scalar, an `echo` of the command text, an assignment \
          of it to a variable or a here-document body all fail this check, as \
-         does naming it only behind `&&`/`||` or inside an `if`/`for` block \
-         -- see `arms_auto_merge`). That call IS the post-#185 \
+         does naming it only behind `&&`/`||`, inside an `if`/`for` block, or \
+         in the body of a function -- see `arms_auto_merge`). That call IS the post-#185 \
          admission boundary that replaced .mergify.yml's pull_request_rules; \
          losing it silently leaves the repo with no automated merge path at all."
     );
@@ -176,24 +178,31 @@ fn merge_policy_successor_to_mergify_exists() {
 ///
 /// 4. **Reachability.** A command boundary is not the same thing as a command
 ///    the shell will reach. Lines inside a here-document (`cat <<EOF ... EOF`)
-///    are *data* on another command's stdin and are never executed at all, and
-///    a command behind `&&`/`||` or inside an `if`/`while`/`until`/`for`/`case`
-///    block runs only if something else went a particular way. Treating every
-///    newline and `&&` as an unconditional boundary let both of those certify a
-///    workflow whose real arming call had been deleted (PR #93 review, round
-///    6). See `run_shell` for the first and `simple_commands` for the second.
+///    are *data* on another command's stdin and are never executed at all; a
+///    command behind `&&`/`||` or inside an `if`/`while`/`until`/`for`/`case`
+///    block runs only if something else went a particular way; and a command
+///    in a function body runs only when something calls that function, which
+///    a `run:` block need never do. Treating every newline and `&&` as an
+///    unconditional boundary let the first two certify a workflow whose real
+///    arming call had been deleted (PR #93 review, round 6), and tracking only
+///    those five block keywords let an uncalled `arm() { ... }` definition do
+///    the same (PR #93 review, round 7). See `run_shell` for the
+///    here-document, `simple_commands` for the operators and keywords, and
+///    `FunctionScope` for the function body.
 ///
 /// Tokens are compared after quote removal, so `"gh" pr merge --auto` counts
 /// while `echo "gh pr merge --auto"` does not -- in the latter the whole
 /// command text is a single argument token of `echo`.
 ///
-/// Deliberately strict in one more direction: conditional execution is never
+/// Deliberately strict in one more direction: deferred execution is never
 /// resolved, only refused. `gh` reached through a shell keyword (`if ...; then
-/// gh pr merge --auto; fi`, or the same thing spelled across lines) or gated by
-/// `&&`/`||` (`git fetch && gh pr merge --auto`) is NOT recognised, even where a
-/// human can see the guard is always taken. That is the safe error -- it fails
-/// the guard loudly and asks a human to look, rather than certifying a merge
-/// path that a statically-dead branch could have turned off.
+/// gh pr merge --auto; fi`, or the same thing spelled across lines), gated by
+/// `&&`/`||` (`git fetch && gh pr merge --auto`), or wrapped in a function
+/// (`arm() { gh pr merge --auto; }` plus a real `arm` call) is NOT recognised,
+/// even where a human can see the guard is always taken or the call is plainly
+/// there. That is the safe error -- it fails the guard loudly and asks a human
+/// to look, rather than certifying a merge path that a statically-dead branch,
+/// or a definition nobody calls, could have turned off.
 fn arms_auto_merge(body: &str) -> bool {
     simple_commands(&run_shell(body))
         .iter()
@@ -430,10 +439,12 @@ struct SimpleCommand {
     /// The command's words, already unquoted.
     words: Vec<String>,
     /// True when the shell may not reach this command at all: it sits after an
-    /// `&&`/`||` operator, or inside an `if`/`while`/`until`/`for`/`case` block.
-    /// Such a command is text that *may* run, which is not the same thing as a
-    /// merge path -- `false && gh pr merge --auto` arms nothing (PR #93 review,
-    /// round 6).
+    /// `&&`/`||` operator, inside an `if`/`while`/`until`/`for`/`case` block, or
+    /// inside a function body nothing here need ever call. Such a command is
+    /// text that *may* run, which is not the same thing as a merge path --
+    /// `false && gh pr merge --auto` arms nothing (PR #93 review, round 6), and
+    /// neither does `arm() { gh pr merge --auto; }` with no `arm` after it (PR
+    /// #93 review, round 7).
     conditional: bool,
 }
 
@@ -446,18 +457,108 @@ const BLOCK_OPENERS: [&str; 5] = ["if", "while", "until", "for", "case"];
 /// the one-line spelling already did.
 const BLOCK_CLOSERS: [&str; 3] = ["fi", "done", "esac"];
 
-/// Record `words` as a simple command, and let a block keyword at its head open
-/// or close a conditional region around the commands that follow it.
+/// Whether the reader is inside a shell *function body* -- text the shell reads
+/// but does not run until something calls the function.
+///
+/// A definition is not an invocation. `arm() { gh pr merge "$PR_URL" --auto; }`
+/// describes a merge path; only a later `arm` takes one. The block keywords
+/// above are the only compound commands this reader tracked, so a workflow
+/// keeping such a definition while its single real call was deleted satisfied
+/// the guard with no automated merge path left at all (PR #93 review, round 7).
+///
+/// Calls are deliberately not resolved: a `gh pr merge --auto` reachable only
+/// through a function is simply not recognised, even where the call is plainly
+/// there. That is the same refusal this reader already makes for `&&` and
+/// `if` -- fail the guard loudly and ask a human to look, rather than model
+/// function dispatch badly and certify a merge path that is not one.
+#[derive(Default)]
+struct FunctionScope {
+    /// True from a definition header (`name()`, `name ()`, `function name`)
+    /// until its body's braces balance again.
+    open: bool,
+    /// Unclosed `{` words seen since that header. A body whose opening brace
+    /// sits on the *next* line leaves this at zero for one command, which is
+    /// why `open` is tracked separately rather than inferred from it.
+    brace_depth: usize,
+}
+
+impl FunctionScope {
+    /// Fold one simple command into the scope, and report whether the shell
+    /// reaches that command only by calling a function.
+    ///
+    /// Braces are counted as whole words, so `${VAR}` or a `{` inside a quoted
+    /// string never opens or closes a body. An unbalanced body swallows the
+    /// rest of the shell, which -- as with an unterminated here-document --
+    /// only makes the guard harder to satisfy.
+    fn absorb(&mut self, words: &[String]) -> bool {
+        let inside = self.open;
+        if !self.open && is_function_definition(words) {
+            self.open = true;
+        }
+        if self.open {
+            for word in words {
+                match word.as_str() {
+                    "{" => self.brace_depth += 1,
+                    "}" => {
+                        self.brace_depth = self.brace_depth.saturating_sub(1);
+                        if self.brace_depth == 0 {
+                            self.open = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        inside || self.open
+    }
+}
+
+/// Does this simple command open a function definition?
+///
+/// Every spelling POSIX and bash allow for the header: `name()`, `name ()`,
+/// `name () {`, `name(){`, and the `function` keyword with or without the
+/// parentheses. A brace on the same word is stripped first, since this reader
+/// does not treat `{` as a token separator.
+///
+/// Over-recognising here is harmless -- it can only mark more text
+/// conditional, never less -- so the shapes are matched loosely on purpose.
+fn is_function_definition(words: &[String]) -> bool {
+    let mut words = words.iter().map(String::as_str);
+    let Some(first) = words.next() else {
+        return false;
+    };
+    // `function name`, `function name()`, `function name {`.
+    if first == "function" {
+        return words.next().is_some_and(|name| name != "{");
+    }
+    let head = first.strip_suffix('{').unwrap_or(first);
+    // `name()`, `name(){`, and the half-tokenised `name(` of `name( ) {`.
+    if head.strip_suffix("()").is_some_and(|name| !name.is_empty())
+        || (head.len() > 1 && head.ends_with('('))
+    {
+        return true;
+    }
+    // `name ()`, `name () {`, `name (){`.
+    !head.is_empty() && words.next().is_some_and(|next| next.starts_with('('))
+}
+
+/// Record `words` as a simple command, and let a block keyword at its head --
+/// or a function-definition header anywhere in it -- open or close a
+/// conditional region around the commands that follow it.
 fn push_simple_command(
     commands: &mut Vec<SimpleCommand>,
     words: Vec<String>,
     gated: bool,
     block_depth: &mut usize,
+    functions: &mut FunctionScope,
 ) {
     let Some(head) = words.first() else {
         return;
     };
-    let conditional = gated || *block_depth > 0;
+    // Unconditionally: the scope is a state machine and every command has to
+    // pass through it, not just the ones that end up conditional.
+    let in_function_body = functions.absorb(&words);
+    let conditional = gated || *block_depth > 0 || in_function_body;
     if BLOCK_OPENERS.contains(&head.as_str()) {
         *block_depth += 1;
     } else if BLOCK_CLOSERS.contains(&head.as_str()) {
@@ -482,8 +583,9 @@ fn push_simple_command(
 /// command and make the next one *conditional* on how this one exited. A
 /// pipeline's `|` inherits whatever gate the pipeline itself sits behind, so
 /// `false && echo x | gh pr merge --auto` gates the `gh` too. Together with the
-/// block-keyword depth tracked by `push_simple_command`, that is every way this
-/// reader knows of for shell text to sit in the file without running.
+/// block-keyword depth and the function-body scope tracked by
+/// `push_simple_command`, that is every way this reader knows of for shell text
+/// to sit in the file without running.
 fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     let mut commands: Vec<SimpleCommand> = Vec::new();
     let mut command: Vec<String> = Vec::new();
@@ -495,6 +597,9 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     let mut gated = false;
     // How many `if`/`while`/`until`/`for`/`case` blocks enclose it.
     let mut block_depth: usize = 0;
+    // Whether it sits in a function body, which runs only when something calls
+    // the function.
+    let mut functions = FunctionScope::default();
     let mut chars = shell.chars().peekable();
 
     // Close off the token being built, if any.
@@ -551,6 +656,7 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
                         std::mem::take(&mut command),
                         gated,
                         &mut block_depth,
+                        &mut functions,
                     );
                     gated = match c {
                         _ if doubled => true,
@@ -575,7 +681,13 @@ fn simple_commands(shell: &str) -> Vec<SimpleCommand> {
     if started {
         command.push(token);
     }
-    push_simple_command(&mut commands, command, gated, &mut block_depth);
+    push_simple_command(
+        &mut commands,
+        command,
+        gated,
+        &mut block_depth,
+        &mut functions,
+    );
     commands
 }
 
@@ -999,6 +1111,68 @@ fn arms_auto_merge_rejects_shell_text_that_never_executes() {
     )));
     assert!(arms_auto_merge(&workflow(
         "          echo x | gh pr merge \"$PR_URL\" --auto\n"
+    )));
+}
+
+/// A shell *function definition* is not an invocation (PR #93 review, round 7:
+/// the reader tracked only `if`/`while`/`until`/`for`/`case`, so `arm() { gh pr
+/// merge "$PR_URL" --auto; }` satisfied the guard with the one real `arm` call
+/// deleted and no automated merge path left).
+#[test]
+fn arms_auto_merge_rejects_uncalled_function_bodies() {
+    let workflow = |shell: &str| format!("jobs:\n  m:\n    steps:\n      - run: |\n{shell}");
+
+    // The review's own case: a definition, and nothing that calls it.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            gh pr merge \"$PR_URL\" --auto --squash\n          }\n"
+    )));
+    // The call is not resolved even when it is right there -- refusing is the
+    // safe error, and it is what makes the definition above refuse at all.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            gh pr merge \"$PR_URL\" --auto\n          }\n          arm\n"
+    )));
+    // Every header spelling has to be recognised, or the guard is only as
+    // strict as its least-covered syntax.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm () {\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          arm(){\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          function arm {\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          function arm() {\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    // The brace on its own line, which leaves the body's depth at zero for one
+    // command.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm()\n          {\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+    // One-line, and with a nested brace group inside -- the inner `}` must not
+    // end the body early and re-open the file to an unconditional reading.
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() { gh pr merge \"$PR_URL\" --auto; }\n"
+    )));
+    assert!(!arms_auto_merge(&workflow(
+        "          arm() {\n            { echo x; }\n            gh pr merge \"$PR_URL\" --auto\n          }\n"
+    )));
+
+    // --- what must still count --------------------------------------------
+    // A body that ends is over: shell after the closing brace is ordinary
+    // unconditional shell again.
+    assert!(arms_auto_merge(&workflow(
+        "          arm() {\n            echo nothing\n          }\n          gh pr merge \"$PR_URL\" --auto\n"
+    )));
+    // Over-recognition is the deliberate direction, pinned here rather than
+    // left to chance: tokens reach `is_function_definition` already unquoted,
+    // so `echo "()"` is indistinguishable from the `arm ()` header above and
+    // opens a body that never closes. That costs a false *refusal* of the
+    // arming call below it -- the guard fails loudly and a human looks, which
+    // is the error this reader is allowed to make.
+    assert!(!arms_auto_merge(&workflow(
+        "          echo \"()\"\n          gh pr merge \"$PR_URL\" --auto\n"
     )));
 }
 
