@@ -29,12 +29,14 @@ name: Queue Retry Handler
 # fire here, for any of them, ever.
 on:
   workflow_run:
-    # Only CI ("Wait for Codex Review" is a deliberate pass-through on
-    # merge_group -- it never re-reviews a synthetic integration commit,
-    # so it structurally can't fail there; manta has no equivalent to
-    # widdershins' "Supply Chain" required check yet, see the fleet
-    # redesign ledger's open item on that).
-    workflows: ['CI']
+    # CI and Supply Chain (manta#190) -- "Wait for Codex Review" is a deliberate pass-through on
+    # merge_group (it never re-reviews a synthetic integration commit, so it structurally can't
+    # fail there) and is intentionally excluded. Supply Chain added here (Codex P1, manta#190
+    # round 1) BEFORE it's wired as a required check itself -- once main-protection's
+    # required_status_checks lists it, a merge-group failure there disarms auto-merge exactly
+    # like a CI failure does, and this handler needs to already be listening or that failure gets
+    # neither an automatic retry nor a needs-human handoff, leaving the PR silently open.
+    workflows: ['CI', 'Supply Chain']
     types: [completed]
 
 permissions:
