@@ -107,6 +107,16 @@ pub struct Metrics {
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
+    /// Monotonic count of batches the decode pipeline has processed, bumped
+    /// once per pipeline batch by the daemon wiring layer (MAN-122 review
+    /// round 2). Its VALUE is meaningless to an operator; what matters is
+    /// that it keeps moving -- a status line that reports `tracks=N` off a
+    /// stale gauge while the synchronous decode loop is wedged (a blocked
+    /// `IqSource::read` after an audio device stops delivering callbacks,
+    /// say) claims the daemon is decoding when it is not. Deliberately not
+    /// exported in the Prometheus text: it is a liveness edge, not a figure
+    /// worth graphing.
+    pipeline_batches: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
     /// counters. Engine/input-owned figures, injected by the daemon wiring
@@ -253,6 +263,42 @@ impl Metrics {
     /// module doc) -- `manta-server` has no track manager of its own.
     pub fn set_active_tracks(&self, count: u64) {
         self.active_tracks.store(count, Ordering::Relaxed);
+    }
+
+    /// Live-state getters for MAN-122's periodic status line. `Metrics` is
+    /// already the daemon's one shared, synchronously-readable handle on live
+    /// state (every subsystem holds an `Arc` clone of it), so the status task
+    /// reads it directly instead of parsing `render_prometheus_text()` back
+    /// out of a String.
+    pub fn spots_total(&self) -> u64 {
+        self.spots_total.load(Ordering::Relaxed)
+    }
+
+    pub fn active_tracks(&self) -> u64 {
+        self.active_tracks.load(Ordering::Relaxed)
+    }
+
+    /// One decode batch finished. Called by the daemon wiring layer from
+    /// `manta_engine::listen_with_observers`'s per-batch `on_tracks` observer -- see
+    /// `pipeline_batches`.
+    pub fn record_pipeline_batch(&self) {
+        self.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pipeline_batches(&self) -> u64 {
+        self.pipeline_batches.load(Ordering::Relaxed)
+    }
+
+    pub fn telnet_clients(&self) -> i64 {
+        self.telnet_clients.load(Ordering::Relaxed)
+    }
+
+    pub fn json_clients(&self) -> i64 {
+        self.json_clients.load(Ordering::Relaxed)
+    }
+
+    pub fn ws_clients(&self) -> i64 {
+        self.ws_clients.load(Ordering::Relaxed)
     }
 
     pub fn set_source_health(&self, source: &str, healthy: bool) {
@@ -913,5 +959,38 @@ mod tests {
         // A itself drops -- now nothing is connected.
         m.mark_uplink_disconnected();
         assert!(!m.uplink_connected());
+    }
+
+    // MAN-122: the periodic status line reads these getters directly
+    // instead of parsing render_prometheus_text() back out of a String.
+    #[test]
+    fn live_state_getters_read_back_what_the_recorders_wrote() {
+        let m = Metrics::new();
+        m.record_spot();
+        m.record_spot();
+        m.set_active_tracks(4);
+        m.inc_telnet_clients();
+        m.inc_json_clients();
+        m.inc_ws_clients();
+        m.dec_ws_clients();
+        assert_eq!(m.spots_total(), 2);
+        assert_eq!(m.active_tracks(), 4);
+        assert_eq!(
+            (m.telnet_clients(), m.json_clients(), m.ws_clients()),
+            (1, 1, 0)
+        );
+    }
+
+    // MAN-122 review round 2: the status line's stall detection compares
+    // this counter against its own previous sample, so the only property
+    // that matters is that it advances once per recorded batch and never
+    // goes backwards.
+    #[test]
+    fn the_pipeline_batch_counter_advances_once_per_batch() {
+        let m = Metrics::new();
+        assert_eq!(m.pipeline_batches(), 0);
+        m.record_pipeline_batch();
+        m.record_pipeline_batch();
+        assert_eq!(m.pipeline_batches(), 2);
     }
 }
