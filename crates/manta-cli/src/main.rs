@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "manta",
+    // Without an explicit bin_name, clap falls back to the runtime argv[0]
+    // for "Usage: ..." lines -- on Windows that's "manta.exe" (the actual
+    // executable filename), not "manta". Pin it so help/usage text (and
+    // tests that assert against it, e.g. crates/manta-cli/tests/cli.rs) is
+    // identical across platforms.
+    bin_name = "manta",
     version,
     about = "Open-source wideband CW skimmer: every CW signal in an SDR passband, decoded at once, emitted as RBN-compatible spots"
 )]
@@ -3281,7 +3287,13 @@ mod tests {
         // spot-delivery time instead of a clean error at startup.
         let f = write_temp_file(b"pre-epoch mtime fixture");
         let pre_epoch = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
-        std::fs::File::open(f.path())
+        // Windows requires FILE_WRITE_ATTRIBUTES on the handle to call
+        // SetFileTime; a read-only `File::open` handle (as used previously)
+        // fails with PermissionDenied there regardless of the target time
+        // value -- open with write access instead.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(f.path())
             .unwrap()
             .set_modified(pre_epoch)
             .expect("this platform must support setting mtime for the test to be meaningful");
