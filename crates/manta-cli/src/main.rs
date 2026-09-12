@@ -1421,29 +1421,31 @@ fn load_decode_config_file(
         );
     }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
-    // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
-    // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
-    // with NaN makes every comparison false (Legacy silently emits nothing
-    // at all, no error, no panic); a non-positive or inverted hysteresis
-    // band (hyst_up <= hyst_down) breaks the open/close asymmetry
-    // hysteresis exists for; `flush_gap_dits <= 0` forces an instant/
-    // premature word flush on every hop. Validate all of them here too,
-    // for the same reason as every check above: this is the one place a
-    // `[decode]` table from disk enters the process.
-    if !cfg.demod.hyst_up.is_finite() || !cfg.demod.hyst_down.is_finite() {
+    // fields have the same class of gap -- `hyst_frac` reaching
+    // `Demod::decision_band`'s `hyst_frac * (e_hi - lo)` with NaN makes
+    // every keying comparison false (Legacy silently emits nothing at all,
+    // no error, no panic); a non-positive or too-wide band (hyst_frac <= 0
+    // collapses the band to a single point, no hysteresis at all;
+    // hyst_frac >= 0.5 pushes the band's outer edges to or past the rails
+    // themselves) breaks the open/close asymmetry hysteresis exists for
+    // (MAN-103 replaced the multiplicative `hyst_up`/`hyst_down` pair with
+    // this single additive fraction; see `envelope.rs`'s
+    // `DemodConfig::hyst_frac` doc comment); `flush_gap_dits <= 0` forces
+    // an instant/premature word flush on every hop. Validate all of them
+    // here too, for the same reason as every check above: this is the one
+    // place a `[decode]` table from disk enters the process.
+    if !cfg.demod.hyst_frac.is_finite() {
         bail!(
-            "[decode] hyst_up/hyst_down must be finite in {} (got hyst_up={}, hyst_down={})",
+            "[decode] hyst_frac must be finite in {} (got {})",
             path.display(),
-            cfg.demod.hyst_up,
-            cfg.demod.hyst_down
+            cfg.demod.hyst_frac
         );
     }
-    if cfg.demod.hyst_down <= 0.0 || cfg.demod.hyst_up <= cfg.demod.hyst_down {
+    if cfg.demod.hyst_frac <= 0.0 || cfg.demod.hyst_frac >= 0.5 {
         bail!(
-            "[decode] hyst_up must be > hyst_down > 0 in {} (got hyst_up={}, hyst_down={})",
+            "[decode] hyst_frac must be > 0.0 and < 0.5 in {} (got {})",
             path.display(),
-            cfg.demod.hyst_up,
-            cfg.demod.hyst_down
+            cfg.demod.hyst_frac
         );
     }
     if !cfg.demod.debounce_ms.is_finite() || cfg.demod.debounce_ms <= 0.0 {
@@ -3121,15 +3123,17 @@ mod tests {
     fn load_decode_config_file_rejects_nan_hysteresis() {
         // Codex review, PR #161 round 4: NaN makes every `Demod::step`
         // comparison false, silently disabling Legacy's decode entirely.
-        let f = write_temp_file(b"[decode]\nhyst_up = nan\n");
+        let f = write_temp_file(b"[decode]\nhyst_frac = nan\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
     #[test]
-    fn load_decode_config_file_rejects_inverted_hysteresis() {
-        let f = write_temp_file(b"[decode]\nhyst_up = 0.5\nhyst_down = 0.8\n");
+    fn load_decode_config_file_rejects_out_of_range_hysteresis() {
+        // hyst_frac >= 0.5 pushes the band's outer edges to or past the
+        // rails; <= 0.0 collapses it to a single point (no hysteresis).
+        let f = write_temp_file(b"[decode]\nhyst_frac = 0.5\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
-        let f = write_temp_file(b"[decode]\nhyst_down = -1.0\n");
+        let f = write_temp_file(b"[decode]\nhyst_frac = -1.0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 

@@ -143,16 +143,13 @@ impl TrackDecoder {
         let noise = NoiseTracker::new(cfg.noise.clone());
         let edge = EdgeDemod::new(cfg.demod.debounce_ms);
         let hsmm = HsmmDecoder::new(cfg.hsmm.clone());
-        // SPEC v2 §0 (Task 5, timing.rs Step 6): EdgeLegacy/Hsmm use the
-        // SPEC-nominal char-gap threshold; Legacy keeps its documented 1.6
-        // deviation (envelope-overshoot correction, timing.rs's
+        // SPEC v2 §0 (Task 5, timing.rs Step 6) used to split EdgeLegacy/
+        // Hsmm onto the SPEC-nominal char-gap threshold while Legacy kept a
+        // lowered 1.6 deviation to compensate for Demod's envelope
+        // overshoot. MAN-103 fixed that overshoot at its source, so all
+        // three engines now share the same nominal threshold (timing.rs's
         // CHAR_GAP_DITS doc comment).
-        let gaps = match cfg.engine {
-            Engine::Legacy => GapClassifier::new(),
-            Engine::EdgeLegacy | Engine::Hsmm => {
-                GapClassifier::new_with(crate::timing::CHAR_GAP_DITS_NOMINAL)
-            }
-        };
+        let gaps = GapClassifier::new();
         TrackDecoder {
             track_id,
             cfg,
@@ -675,7 +672,11 @@ impl TrackDecoder {
                 return;
             }
             match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
-                GapClass::InterElement => {}
+                GapClass::InterElement => {
+                    if live {
+                        self.tracker.on_element_gap(dur_ms);
+                    }
+                }
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
@@ -707,6 +708,10 @@ impl TrackDecoder {
             let gap_ms = hops as f32 * HOP_MS as f32;
             let flush_dits = self.gaps.flush_threshold_dits(self.cfg.flush_gap_dits);
             if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
+                // This gap never reaches `classify` (it's resolved here,
+                // by the safety net) -- fold it into the Farnsworth
+                // long-gap statistics directly (MAN-103 D8).
+                self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
                 // drained space itself is not separately gap-classified —
