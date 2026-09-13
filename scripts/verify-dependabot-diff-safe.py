@@ -336,50 +336,70 @@ def compare_requirements(base_req, head_req):
     return None
 
 
-def requirement_floor(req):
-    """The lower bound any comparator in `req` could accept -- (floor, is_exclusive).
+def requirement_is_satisfied_by(req, version_str):
+    """True if the concrete resolved version `version_str` satisfies every AND'd comparator in
+    the Cargo requirement string `req` -- a full comparator-satisfaction predicate, not just a
+    floor check.
 
-    `floor` is the MAXIMUM of every individual comparator's own floor, since comma-separated
-    pieces are always AND'd (never OR'd) in Cargo's grammar, so the effective bound is set by the
-    strictest one. `is_exclusive` is True when a strict `>` comparator controls that bound (the
-    version must be STRICTLY greater than `floor`, not merely equal to it) -- Codex P1, manta#194
-    round 9: an earlier version of this function returned the floor value alone, treating every
-    comparator as an inclusive `>=` bound. `demo = ">1.0.4"` -> `">1.0.5"` while Cargo.lock
-    retains "1.0.5" passed silently: 1.0.5 is NOT below 1.0.5, so the inclusive check saw no
-    problem, but ">1.0.5" itself requires STRICTLY more than 1.0.5 -- the locked version doesn't
-    actually satisfy it. When multiple comparators tie at the same maximum floor value, the bound
-    is exclusive if ANY of them is a strict `>` (AND'd -- the strictest constraint wins). A pure
-    ceiling comparator (LT/LE) contributes no floor of its own. Returns None if `req` fails to
-    parse -- never raises.
+    Consolidates three rounds of narrow, ad-hoc approximations in
+    check_manifest_lockfile_consistency into one correctly-designed predicate, built entirely
+    from primitives already tested across rounds 3-9 (floor_tuple, caret_ceiling_component,
+    version_sort_key -- the SAME bucket logic check_lockfile_diff's own major/0.x-boundary check
+    already relies on): round 8's first cut checked only the FLOOR (missing that a strict `>`
+    excludes its own floor value -- fixed in round 9), and neither ever handled a dependency with
+    MULTIPLE simultaneous lockfile candidates (a real diamond dependency, e.g. manta's own
+    rand_core 0.9.5 AND 0.10.1 coexisting today) -- those names were skipped wholesale as
+    "ambiguous," so raising a requirement while the wrong stale candidate remained locked passed
+    unnoticed (Codex P1, manta#194 round 10). Rather than patch that skip with a fourth special
+    case, this replaces the floor-only approximation outright: the caller now checks whether ANY
+    of a name's lockfile candidates satisfies the full requirement, which is also the exact fix
+    Codex asked for ("filter candidates by the declared requirement... reject when none
+    satisfies it").
 
-    Deliberately narrow: this extracts the LOWER bound only, not full requirement satisfaction
-    (it says nothing about whether some version is too HIGH for a caret/tilde ceiling, or about
-    an unmatched EXACT pin). That's enough for check_manifest_lockfile_consistency's one job --
-    confirming a resolved version actually satisfies what the manifest now requires on the low
-    end -- without adding a whole new comparator-satisfaction evaluator (this file's biggest
-    source of subtle bugs across rounds 3-9) just to cover the one direction Dependabot can
-    actually make go wrong.
+    Returns False (never raises) if `req` fails to parse -- fails toward "does not satisfy".
     """
     try:
         comparators = parse_requirement(req)
     except VerifyError:
-        return None
-    contributions = []  # (floor_tuple, is_exclusive)
+        return False
+    v_major, v_minor, v_patch, v_pre = _parse_bare_version(version_str)
+    v_key = version_sort_key(v_major, v_minor, v_patch, v_pre)
     for comparator in comparators:
-        kind, major, _minor, _patch, pre = comparator
-        if kind in (LT, LE):
-            continue
-        if kind == WILDCARD and major is None:
-            # Bare "*" -- Cargo Book: `* := >=0.0.0`. floor_tuple would pass `major=None`
-            # straight into version_sort_key otherwise, which only None-guards minor/patch.
-            contributions.append((version_sort_key(0, 0, 0, pre), False))
+        kind, major, minor, _patch, _pre = comparator
+        if kind == LT:
+            if v_key >= floor_tuple(comparator):
+                return False
+        elif kind == LE:
+            if v_key > floor_tuple(comparator):
+                return False
+        elif kind == GT:
+            if v_key <= floor_tuple(comparator):
+                return False
+        elif kind == GE:
+            if v_key < floor_tuple(comparator):
+                return False
+        elif kind == EXACT:
+            if v_key != floor_tuple(comparator):
+                return False
+        elif kind == CARET:
+            if v_key < floor_tuple(comparator):
+                return False
+            v_as_caret = (CARET, v_major, v_minor, v_patch, v_pre)
+            if caret_ceiling_component(v_as_caret) != caret_ceiling_component(comparator):
+                return False
+        elif kind == TILDE:
+            if v_key < floor_tuple(comparator):
+                return False
+            if v_major != major or (minor is not None and v_minor != minor):
+                return False
+        elif kind == WILDCARD:
+            if major is not None and v_major != major:
+                return False
+            if minor is not None and v_minor != minor:
+                return False
         else:
-            contributions.append((floor_tuple(comparator), kind == GT))
-    if not contributions:
-        return version_sort_key(0, 0, 0, None), False
-    max_floor = max(floor for floor, _ in contributions)
-    is_exclusive = any(excl for floor, excl in contributions if floor == max_floor)
-    return max_floor, is_exclusive
+            return False
+    return True
 
 
 def collect_dependency_declarations(pkg_toml):
@@ -841,23 +861,24 @@ def _version_tuple(version_str):
 
 def check_manifest_lockfile_consistency(head_tomls, head_lock):
     """Confirm the HEAD lockfile actually satisfies the HEAD manifest's own requirements (Codex
-    P1, manta#194 round 8, Finding J).
+    P1, manta#194 round 8, Finding J; refined rounds 9-10).
 
     compare_requirements only ever sees an EDIT to a requirement string; check_lockfile_diff only
-    ever sees an EDIT to a lockfile entry. A manifest floor raised beyond an already-unchanged
-    locked version -- e.g. `demo = "1.0"` -> `"1.1"` while Cargo.lock retains "1.0.5" -- triggers
-    neither: compare_requirements sees a non-major bump and passes it, and check_lockfile_diff
-    sees no diff at all for "demo" (its lockfile entry didn't change). The verifier previously
-    reported SAFE without ever confirming the head lock and head manifest are mutually
-    consistent, which the head lock genuinely fails here (1.0.5 doesn't satisfy >=1.1.0).
+    ever sees an EDIT to a lockfile entry. A manifest requirement raised beyond an already-
+    unchanged locked version -- e.g. `demo = "1.0"` -> `"1.1"` while Cargo.lock retains "1.0.5" --
+    triggers neither: compare_requirements sees a non-major bump and passes it, and
+    check_lockfile_diff sees no diff at all for "demo" (its lockfile entry didn't change). The
+    verifier previously reported SAFE without ever confirming the head lock and head manifest are
+    mutually consistent, which the head lock genuinely fails here (1.0.5 doesn't satisfy 1.1).
 
-    Checks every HEAD-declared version-kind dependency against requirement_floor's floor value,
-    not just ones whose requirement changed -- this is a validity check on the resulting state,
-    not a diff (matching Codex's own suggested remedy: validate the combined manifest/lock
-    state). Skips a name with zero or more-than-one lockfile candidates (no entry -- e.g. a
-    path-only dep with a version field for informational purposes, or an ambiguous diamond) --
-    out of scope for this floor check, same conservative-skip bias as check_lockfile_diff's own
-    len()!=1 branch.
+    Checks every HEAD-declared version-kind dependency against ALL of its lockfile candidates via
+    requirement_is_satisfied_by, not just ones whose requirement changed -- this is a validity
+    check on the resulting state, not a diff (matching Codex's own suggested remedy: validate the
+    combined manifest/lock state). A name is only flagged when NONE of its candidates satisfy the
+    requirement -- e.g. manta's own real rand_core 0.9.5-and-0.10.1 diamond is fine as long as
+    0.10.1 itself satisfies whatever rand_core's own requirement currently is; round 8/9 skipped
+    any name with more than one candidate outright, which is exactly what let a genuine
+    inconsistency hide behind an unrelated coexisting version (round 10, Finding L).
     """
     reasons = []
     pkgs_by_name = _index_pkgs_by_name(parse_lockfile_packages(head_lock))
@@ -868,25 +889,15 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
             if kind != "version":
                 continue
             req, _rest = detail
-            floor_result = requirement_floor(req)
-            if floor_result is None:
-                continue
-            floor, is_exclusive = floor_result
             candidates = pkgs_by_name.get(dep_name, [])
-            if len(candidates) != 1:
+            versions = sorted({key[2] for key in candidates if key[2] is not None})
+            if not versions:
                 continue
-            _name, _kind, version, _source = candidates[0]
-            if version is None:
-                continue
-            locked = _version_tuple(version)
-            # Codex P1, manta#194 round 9: a strict `>` bound requires STRICTLY more than the
-            # floor -- `locked == floor` alone still fails it, not just `locked < floor`.
-            violates = locked <= floor if is_exclusive else locked < floor
-            if violates:
+            if not any(requirement_is_satisfied_by(req, version) for version in versions):
                 reasons.append(
-                    f'"{path}" {table_name}.{dep_name} requires "{req}" but Cargo.lock resolves '
-                    f"it to {version}, which does not satisfy that requirement's lower bound -- "
-                    "the head lock does not satisfy the head manifest"
+                    f'"{path}" {table_name}.{dep_name} requires "{req}" but no Cargo.lock entry '
+                    f"for it ({', '.join(versions)}) satisfies that requirement -- the head lock "
+                    "does not satisfy the head manifest"
                 )
     return reasons
 

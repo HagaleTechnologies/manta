@@ -1021,43 +1021,53 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
         self.assertIn("dependencies", reasons[0])
 
 
-class RequirementFloorTests(unittest.TestCase):
-    def test_caret_floor_is_the_bare_version_and_inclusive(self):
-        self.assertEqual(
-            v.requirement_floor("1.1"), (v.version_sort_key(1, 1, 0, None), False)
-        )
+class RequirementIsSatisfiedByTests(unittest.TestCase):
+    """Codex P1, manta#194 round 10: replaces the floor-only approximation (rounds 8-9) with a
+    full comparator-satisfaction predicate, built from primitives already tested elsewhere in
+    this file (floor_tuple, caret_ceiling_component, version_sort_key).
+    """
 
-    def test_bare_wildcard_floor_is_zero_and_inclusive(self):
-        self.assertEqual(v.requirement_floor("*"), (v.version_sort_key(0, 0, 0, None), False))
+    def test_caret_within_floor_is_satisfied(self):
+        self.assertTrue(v.requirement_is_satisfied_by("1.1", "1.1.0"))
+        self.assertTrue(v.requirement_is_satisfied_by("1.1", "1.9.9"))
 
-    def test_explicit_range_floor_ignores_the_ceiling_comparator(self):
-        self.assertEqual(
-            v.requirement_floor(">=1.2.3, <2.0.0"), (v.version_sort_key(1, 2, 3, None), False)
-        )
+    def test_caret_below_floor_is_not_satisfied(self):
+        self.assertFalse(v.requirement_is_satisfied_by("1.1", "1.0.5"))
 
-    def test_pure_ceiling_only_requirement_floor_is_zero(self):
-        self.assertEqual(v.requirement_floor("<2.0.0"), (v.version_sort_key(0, 0, 0, None), False))
+    def test_caret_crossing_major_is_not_satisfied(self):
+        self.assertFalse(v.requirement_is_satisfied_by("^1.2.3", "2.0.0"))
 
-    def test_unparseable_requirement_returns_none(self):
-        self.assertIsNone(v.requirement_floor("not a version"))
+    def test_zero_x_caret_minor_mismatch_is_not_satisfied(self):
+        self.assertFalse(v.requirement_is_satisfied_by("0.10", "0.9.5"))
+        self.assertTrue(v.requirement_is_satisfied_by("0.10", "0.10.1"))
 
-    def test_strict_gt_floor_is_exclusive(self):
-        self.assertEqual(
-            v.requirement_floor(">1.0.5"), (v.version_sort_key(1, 0, 5, None), True)
-        )
+    def test_strict_gt_excludes_its_own_floor(self):
+        self.assertFalse(v.requirement_is_satisfied_by(">1.0.5", "1.0.5"))
+        self.assertTrue(v.requirement_is_satisfied_by(">1.0.5", "1.0.6"))
 
-    def test_gt_and_ge_tied_at_same_floor_is_exclusive(self):
-        # AND'd: the stricter of two comparators tied at the same floor value wins.
-        self.assertEqual(
-            v.requirement_floor(">1.0.5, >=1.0.5"), (v.version_sort_key(1, 0, 5, None), True)
-        )
+    def test_ge_includes_its_own_floor(self):
+        self.assertTrue(v.requirement_is_satisfied_by(">=1.0.5", "1.0.5"))
 
-    def test_gt_below_a_higher_ge_floor_is_inclusive(self):
-        # The GE comparator sets the higher (controlling) floor, so its inclusive bound wins --
-        # the GT comparator's own strictness is irrelevant once it's not the tightest constraint.
-        self.assertEqual(
-            v.requirement_floor(">1.0.0, >=2.0.0"), (v.version_sort_key(2, 0, 0, None), False)
-        )
+    def test_exact_requires_an_exact_match(self):
+        self.assertTrue(v.requirement_is_satisfied_by("=1.2.3", "1.2.3"))
+        self.assertFalse(v.requirement_is_satisfied_by("=1.2.3", "1.2.4"))
+
+    def test_explicit_range_respects_its_ceiling(self):
+        self.assertTrue(v.requirement_is_satisfied_by(">=1.2.3, <2.0.0", "1.9.9"))
+        self.assertFalse(v.requirement_is_satisfied_by(">=1.2.3, <2.0.0", "2.0.0"))
+        self.assertFalse(v.requirement_is_satisfied_by(">=1.2.3, <2.0.0", "1.2.2"))
+
+    def test_tilde_respects_its_minor_ceiling(self):
+        self.assertTrue(v.requirement_is_satisfied_by("~1.3.0", "1.3.9"))
+        self.assertFalse(v.requirement_is_satisfied_by("~1.3.0", "1.4.0"))
+
+    def test_wildcard_respects_its_prefix(self):
+        self.assertTrue(v.requirement_is_satisfied_by("1.*", "1.9.9"))
+        self.assertFalse(v.requirement_is_satisfied_by("1.*", "2.0.0"))
+        self.assertTrue(v.requirement_is_satisfied_by("*", "9.9.9"))
+
+    def test_unparseable_requirement_is_not_satisfied(self):
+        self.assertFalse(v.requirement_is_satisfied_by("not a version", "1.0.0"))
 
 
 class ManifestLockfileConsistencyTests(unittest.TestCase):
@@ -1101,8 +1111,10 @@ class ManifestLockfileConsistencyTests(unittest.TestCase):
         head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.1"}}}
         self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, {"package": []}), [])
 
-    def test_ambiguous_diamond_is_out_of_scope(self):
-        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.1"}}}
+    def test_diamond_where_one_candidate_satisfies_is_safe(self):
+        # A real diamond dependency: two coexisting versions is fine as long as at least one of
+        # them actually satisfies this declaration's own requirement.
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.5"}}}
         lock = {
             "package": [
                 {
@@ -1120,6 +1132,32 @@ class ManifestLockfileConsistencyTests(unittest.TestCase):
             ]
         }
         self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+    def test_diamond_where_no_candidate_satisfies_is_flagged(self):
+        # Codex P1, manta#194 round 10, Finding L -- the exact reproduction shape: manta's own
+        # real rand_core 0.9.5-and-0.10.1 diamond, with the requirement raised to something
+        # NEITHER coexisting candidate satisfies. Rounds 8-9 skipped this name outright as
+        # "ambiguous" and never caught it.
+        head_tomls = {"Cargo.toml": {"dependencies": {"rand_core": "0.10.2"}}}
+        lock = {
+            "package": [
+                {
+                    "name": "rand_core",
+                    "version": "0.9.5",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "rand_core",
+                    "version": "0.10.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bbb",
+                },
+            ]
+        }
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, lock)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("does not satisfy the head manifest", reasons[0])
 
     def test_strict_gt_bound_equal_to_locked_version_is_flagged(self):
         # Codex P1, manta#194 round 9: `demo = ">1.0.5"` requires STRICTLY more than 1.0.5 --
