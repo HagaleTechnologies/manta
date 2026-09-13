@@ -18,6 +18,7 @@ Usage: verify-dependabot-diff-safe.py <base_ref> <head_ref>
 Run from a checkout of the manta repo; exits 0 (SAFE) or 1 (NOT SAFE), matching widdershins'
 script's exit-code contract exactly, for a caller workflow to key off via steps.verify.outcome.
 """
+import copy
 import re
 import subprocess
 import sys
@@ -121,10 +122,11 @@ def normalize_dependency(value):
 def parse_requirement(req):
     """Parse a Cargo version-requirement string into an ordered list of comparators.
 
-    Each comparator is (kind, major, minor, patch) with minor/patch possibly None (Cargo allows
-    partial versions like "1" or "1.2"). Comma-separated pieces are ALWAYS AND'd in Cargo's own
-    grammar -- there is no OR syntax at all, unlike npm's "||" -- so this is just a flat list, no
-    OR-alternatives to track (https://doc.rust-lang.org/cargo/reference/resolver.html).
+    Each comparator is (kind, major, minor, patch, pre) with minor/patch/pre possibly None
+    (Cargo allows partial versions like "1" or "1.2", and a prerelease suffix is optional).
+    Comma-separated pieces are ALWAYS AND'd in Cargo's own grammar -- there is no OR syntax at
+    all, unlike npm's "||" -- so this is just a flat list, no OR-alternatives to track
+    (https://doc.rust-lang.org/cargo/reference/resolver.html).
     """
     pieces = [p.strip() for p in req.split(",") if p.strip()]
     if not pieces:
@@ -143,24 +145,61 @@ def parse_comparator(piece, full_req):
     if not m:
         raise VerifyError(f'could not parse version-requirement piece "{piece}" in "{full_req}"')
     op = m.group("op")
+    pre = m.group("pre")
     major_raw = m.group("major")
-    if major_raw == "*" or m.group("minor") == "*" or m.group("patch") == "*":
-        return (WILDCARD, None, None, None)
+    minor_raw = m.group("minor")
+    patch_raw = m.group("patch")
+    if major_raw == "*":
+        # Bare "*" -- Cargo Book: `* := >=0.0.0`, no ceiling at all. No numeric prefix survives a
+        # wildcard at this position (there can't be one).
+        return (WILDCARD, None, None, None, pre)
     major = int(major_raw)
-    minor = int(m.group("minor")) if m.group("minor") is not None else None
-    patch = int(m.group("patch")) if m.group("patch") is not None else None
+    if minor_raw == "*":
+        # "N.*" -- Cargo Book: `1.* := >=1.0.0, <2.0.0` (Codex P1, manta#194 round 2: an earlier
+        # version collapsed EVERY wildcard shape to (WILDCARD, None, None, None), discarding the
+        # numeric prefix entirely and skipping comparison outright -- "1.*" -> "2.*" reported
+        # safe despite crossing a major boundary). Preserves major so compare_requirements can
+        # apply the same major-boundary check every other kind gets.
+        return (WILDCARD, major, None, None, pre)
+    minor = int(minor_raw) if minor_raw is not None else None
+    if patch_raw == "*":
+        # "N.M.*" -- Cargo Book: `1.2.* := >=1.2.0, <1.3.0`.
+        return (WILDCARD, major, minor, None, pre)
+    patch = int(patch_raw) if patch_raw is not None else None
     kind_by_op = {"=": EXACT, ">": GT, ">=": GE, "<": LT, "<=": LE, "~": TILDE, "^": CARET}
     # No operator prefix at all is Cargo's own default, and it is caret -- NOT exact like npm's
     # bare default -- confirmed against the Cargo Book: `bar = "1.2.3"` means `^1.2.3`, and this
     # extends to caret's own 0.x special-casing (`"0.2.3"` behaves like `^0.2.3`, i.e.
     # >=0.2.3,<0.3.0; `"0.0.3"` behaves like `^0.0.3`, i.e. >=0.0.3,<0.0.4).
     kind = kind_by_op.get(op, CARET)
-    return (kind, major, minor, patch)
+    return (kind, major, minor, patch, pre)
+
+
+def _prerelease_sort_key(pre):
+    """A sortable key for ONE dot-separated SemVer prerelease string, per SemVer 2.0.0 section 11:
+    numeric identifiers compare numerically and always sort BEFORE alphanumeric ones at the same
+    position; a prerelease with more identifiers is greater than an otherwise-equal, shorter one
+    (Python tuple comparison already gives us that for free once each identifier is comparable).
+    """
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in pre.split("."))
+
+
+def version_sort_key(major, minor, patch, pre):
+    """A fully-ordered sort key for one (major, minor, patch, pre) version, including SemVer's
+    prerelease-precedence rule: a plain release is ALWAYS greater than any prerelease of the
+    same major.minor.patch (Codex P1, manta#194 round 2: the previous floor_tuple ignored `pre`
+    entirely, so "=1.0.0" -> "=1.0.0-alpha" -- a real downgrade per SemVer precedence -- compared
+    as unchanged and passed the downgrade check).
+    """
+    base = (major, minor if minor is not None else 0, patch if patch is not None else 0)
+    if pre is None:
+        return (base, 1, ())
+    return (base, 0, _prerelease_sort_key(pre))
 
 
 def floor_tuple(comparator):
-    _kind, major, minor, patch = comparator
-    return (major, minor if minor is not None else 0, patch if patch is not None else 0)
+    _kind, major, minor, patch, pre = comparator
+    return version_sort_key(major, minor, patch, pre)
 
 
 def caret_ceiling_component(comparator):
@@ -171,7 +210,7 @@ def caret_ceiling_component(comparator):
     Any change to that specific component is a ceiling change; changes to components to its
     right are pure floor movement within the same ceiling.
     """
-    _kind, major, minor, patch = comparator
+    _kind, major, minor, patch, _pre = comparator
     if major != 0:
         return major
     if minor is None or minor != 0:
@@ -205,8 +244,27 @@ def compare_requirements(base_req, head_req):
             )
 
         if base_kind == WILDCARD:
-            # "*" admits everything already; nothing to compare, and nothing more permissive to
-            # widen into.
+            if base_cmp[1] is None:
+                # Bare "*" -- >=0.0.0, no ceiling at all; nothing more permissive to widen into.
+                continue
+            if base_cmp[2] is None:
+                # "N.*" -- >=N.0.0, <(N+1).0.0 (Cargo's own literal formula -- no 0.x
+                # special-casing the way caret has; confirmed against the Cargo Book's own
+                # `1.* := >=1.0.0, <2.0.0` template, which doesn't vary by N).
+                if base_cmp[1] != head_cmp[1]:
+                    return (
+                        f'wildcard requirement crossed its own major-version boundary '
+                        f'("{base_req}" -> "{head_req}") -- this is a major bump, not a safe '
+                        "auto-approvable version change"
+                    )
+                continue
+            # "N.M.*" -- >=N.M.0, <N.(M+1).0.
+            if base_cmp[1] != head_cmp[1] or base_cmp[2] != head_cmp[2]:
+                return (
+                    f'wildcard requirement crossed its own minor-version boundary '
+                    f'("{base_req}" -> "{head_req}") -- this is not a safe auto-approvable '
+                    "version change"
+                )
             continue
 
         if base_kind in (LT, LE):
@@ -293,11 +351,48 @@ def collect_dependency_declarations(pkg_toml):
     return out
 
 
+def strip_dependency_tables(pkg_toml):
+    """A deep copy of a parsed Cargo.toml with every table this verifier inspects removed.
+
+    Leaves everything else -- [features], [profile.*], [patch.*], [package] metadata, and so on
+    -- for the caller to compare byte-for-byte against the other side of the diff (Codex P1,
+    manta#194 round 2): check_manifest_diff/collect_dependency_declarations only ever validate
+    the dependency tables they enumerate, so a change anywhere ELSE in the manifest -- e.g. a
+    new `[patch.crates-io]` entry, which can redirect a dependency's resolution without ever
+    touching that dependency's own `[dependencies]` entry at all -- previously produced no
+    reason whatsoever. `main()` rejects any diff where this residual structure differs.
+    """
+    stripped = copy.deepcopy(pkg_toml)
+    for table_name in DEPENDENCY_TABLES:
+        stripped.pop(table_name, None)
+    if "workspace" in stripped:
+        stripped["workspace"] = {
+            k: v for k, v in stripped["workspace"].items() if k != "dependencies"
+        }
+    if "target" in stripped:
+        filtered_targets = {}
+        for selector, tables in stripped["target"].items():
+            remaining = {k: v for k, v in tables.items() if k not in DEPENDENCY_TABLES}
+            if remaining:
+                filtered_targets[selector] = remaining
+        if filtered_targets:
+            stripped["target"] = filtered_targets
+        else:
+            stripped.pop("target", None)
+    return stripped
+
+
 def check_manifest_diff(path, base_toml, head_toml):
     """Compare one Cargo.toml's dependency declarations between base and head.
 
     Returns a list of reason strings (empty if the diff at this path is entirely safe).
     """
+    if strip_dependency_tables(base_toml) != strip_dependency_tables(head_toml):
+        return [
+            f'"{path}" changed outside its dependency declarations (e.g. [features], '
+            "[profile.*], [patch.*], or [package] metadata) -- not a plain version-requirement "
+            "bump"
+        ]
     base_decls = collect_dependency_declarations(base_toml)
     head_decls = collect_dependency_declarations(head_toml)
     reasons = []
@@ -397,39 +492,52 @@ def check_lockfile_diff(base_lock, head_lock):
     removed = set(base_pkgs) - set(head_pkgs)
     added = set(head_pkgs) - set(base_pkgs)
 
-    # Group removed/added entries by (name, kind) to match up "old version of X removed, new
-    # version of X added" pairs -- the common Dependabot-bump shape -- from genuinely new/removed
-    # dependencies, which aren't this verifier's concern (see check_manifest_diff).
-    def by_name_kind(keys):
+    # Group removed/added entries by NAME ALONE -- not (name, kind) (Codex P1, manta#194 round
+    # 2): a same-name registry-to-git swap produces one removed (name, "registry", old_version)
+    # key and one added (name, "git", new_version) key. Grouping by (name, kind) put those in
+    # two DIFFERENT buckets that never got matched to each other -- the removed entry's bucket
+    # had no added peer and was silently skipped (a stale comment here claimed this was "caught
+    # by the registry<->git checks below," but no such check existed). Grouping by name alone
+    # puts both in the SAME bucket, where the kind mismatch is directly visible and rejected.
+    def by_name(keys):
         grouped = {}
         for name, kind, version in keys:
-            grouped.setdefault((name, kind), []).append(version)
+            grouped.setdefault(name, []).append((kind, version))
         return grouped
 
-    removed_grouped = by_name_kind(removed)
-    added_grouped = by_name_kind(added)
+    removed_grouped = by_name(removed)
+    added_grouped = by_name(added)
 
-    for name_kind, removed_versions in removed_grouped.items():
-        name, kind = name_kind
-        added_versions = added_grouped.pop(name_kind, [])
-        if not added_versions:
-            # A version of this package disappeared with no same-(name,kind) replacement --
-            # could be a legitimate dependency removal (out of scope, deferred) or a kind swap
-            # already caught by the registry<->git checks below via the OTHER grouping.
+    for name, removed_entries in removed_grouped.items():
+        added_entries = added_grouped.pop(name, [])
+        if not added_entries:
+            # Disappeared with no same-name replacement at all -- a legitimate dependency
+            # removal, out of scope for this verifier (a real removal is visible at the
+            # manifest level too, where check_manifest_diff already routes it to human review).
             continue
-        if len(removed_versions) != 1 or len(added_versions) != 1:
+        if len(removed_entries) != 1 or len(added_entries) != 1:
+            # Also the (safe-direction) outcome for two independent major-version-lines of the
+            # same crate (e.g. serde v1 and v2 both present via a diamond dependency) both
+            # bumping in the same diff -- routes to human review rather than risk conflating
+            # them, same tradeoff this check already made before this fix.
             reasons.append(
-                f'Cargo.lock package "{name}" ({kind}) changed in a way with more than one '
-                "version added/removed at once -- not a simple version bump"
+                f'Cargo.lock package "{name}" changed in a way with more than one version '
+                "added/removed at once -- not a simple version bump"
             )
             continue
-        old_v, new_v = removed_versions[0], added_versions[0]
+        (old_kind, old_v), (new_kind, new_v) = removed_entries[0], added_entries[0]
+        if old_kind != new_kind:
+            reasons.append(
+                f'Cargo.lock package "{name}" changed source kind ({old_kind} -> {new_kind}) -- '
+                "not a plain version bump"
+            )
+            continue
         if new_v is not None and old_v is not None and _version_tuple(new_v) < _version_tuple(old_v):
             reasons.append(
-                f'Cargo.lock package "{name}" ({kind}) downgraded ({old_v} -> {new_v})'
+                f'Cargo.lock package "{name}" ({old_kind}) downgraded ({old_v} -> {new_v})'
             )
 
-    # Any (name, kind) that only ever appears in `added` (never matched to a `removed` peer) is a
+    # Any name that only ever appears in `added` (never matched to a `removed` peer) is a
     # brand-new dependency in the lockfile -- e.g. a fresh transitive pulled in by a manifest
     # bump. Not this verifier's concern per se (the manifest-level check already validated the
     # manifest-visible requirement change); Cargo itself already validated the lockfile's own
@@ -440,14 +548,28 @@ def check_lockfile_diff(base_lock, head_lock):
 
 
 def _version_tuple(version_str):
-    parts = version_str.split(".")
-    out = []
+    """A fully-ordered sort key for a resolved Cargo.lock `version` string (real SemVer 2.0.0
+    syntax, not a Cargo requirement) -- major.minor.patch[-prerelease][+build].
+
+    Build metadata never affects ordering (discarded outright, per SemVer 2.0.0 section 10) and
+    is stripped before splitting off the prerelease. Delegates to version_sort_key for the
+    prerelease-precedence rule (Codex P1, manta#194 round 2: the previous version ignored the
+    prerelease suffix entirely, so a Cargo.lock entry going from "1.0.0" to "1.0.0-alpha" -- a
+    real downgrade per SemVer precedence -- compared as unchanged and passed the downgrade
+    check).
+    """
+    without_build = version_str.split("+", 1)[0]
+    core, _, pre = without_build.partition("-")
+    pre = pre or None
+    parts = core.split(".")
+    nums = []
     for p in parts[:3]:
         digits = re.match(r"\d+", p)
-        out.append(int(digits.group()) if digits else 0)
-    while len(out) < 3:
-        out.append(0)
-    return tuple(out)
+        nums.append(int(digits.group()) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    major, minor, patch = nums
+    return version_sort_key(major, minor, patch, pre)
 
 
 def check_diff_scope(base_ref, head_ref, allowed_paths):

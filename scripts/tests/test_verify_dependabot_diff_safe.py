@@ -404,5 +404,115 @@ class ExactAndLowerBoundMajorBoundaryTests(unittest.TestCase):
         self.assertIsNone(reason)
 
 
+class WildcardPrefixPreservedTests(unittest.TestCase):
+    def test_major_only_wildcard_crossing_major_is_unsafe(self):
+        self.assertIsNotNone(v.compare_requirements("1.*", "2.*"))
+
+    def test_major_only_wildcard_unchanged_is_safe(self):
+        self.assertIsNone(v.compare_requirements("1.*", "1.*"))
+
+    def test_major_minor_wildcard_crossing_minor_is_unsafe(self):
+        self.assertIsNotNone(v.compare_requirements("1.2.*", "1.3.*"))
+
+    def test_major_minor_wildcard_unchanged_is_safe(self):
+        self.assertIsNone(v.compare_requirements("1.2.*", "1.2.*"))
+
+    def test_bare_wildcard_is_always_safe(self):
+        self.assertIsNone(v.compare_requirements("*", "*"))
+
+
+class PrereleasePrecedenceTests(unittest.TestCase):
+    def test_release_to_prerelease_is_a_downgrade(self):
+        self.assertIsNotNone(v.compare_requirements("=1.0.0", "=1.0.0-alpha"))
+
+    def test_prerelease_to_release_is_an_increase(self):
+        self.assertIsNone(v.compare_requirements("=1.0.0-alpha", "=1.0.0"))
+
+    def test_prerelease_to_higher_prerelease_is_safe(self):
+        self.assertIsNone(v.compare_requirements("=1.0.0-alpha", "=1.0.0-beta"))
+
+    def test_prerelease_to_lower_prerelease_is_a_downgrade(self):
+        self.assertIsNotNone(v.compare_requirements("=1.0.0-beta", "=1.0.0-alpha"))
+
+    def test_numeric_prerelease_identifiers_compare_numerically(self):
+        self.assertIsNone(v.compare_requirements("=1.0.0-alpha.1", "=1.0.0-alpha.2"))
+        self.assertIsNotNone(v.compare_requirements("=1.0.0-alpha.2", "=1.0.0-alpha.1"))
+
+    def test_lockfile_prerelease_downgrade_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.0-alpha",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bbb",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("downgraded", reasons[0])
+
+
+class WholeManifestScopeTests(unittest.TestCase):
+    def test_change_outside_dependency_tables_is_flagged(self):
+        base = {"dependencies": {"serde": "1.0.200"}, "profile": {"release": {"opt-level": 3}}}
+        head = {"dependencies": {"serde": "1.0.200"}, "profile": {"release": {"opt-level": 0}}}
+        reasons = v.check_manifest_diff("Cargo.toml", base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("outside its dependency declarations", reasons[0])
+
+    def test_new_patch_table_is_flagged(self):
+        base = {"dependencies": {"serde": "1.0.200"}}
+        head = {
+            "dependencies": {"serde": "1.0.200"},
+            "patch": {"crates-io": {"serde": {"git": "https://malicious.example/serde.git"}}},
+        }
+        reasons = v.check_manifest_diff("Cargo.toml", base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("outside its dependency declarations", reasons[0])
+
+    def test_safe_bump_with_no_other_changes_is_unaffected(self):
+        base = {"dependencies": {"serde": "1.0.200"}, "package": {"name": "manta-cli"}}
+        head = {"dependencies": {"serde": "1.0.210"}, "package": {"name": "manta-cli"}}
+        self.assertEqual(v.check_manifest_diff("Cargo.toml", base, head), [])
+
+
+class LockfileSourceKindSwapTests(unittest.TestCase):
+    def test_registry_to_git_swap_same_name_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.200",
+                    "source": "git+https://malicious.example/serde.git?rev=deadbeef#deadbeef",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("changed source kind", reasons[0])
+
+
 if __name__ == "__main__":
     unittest.main()
