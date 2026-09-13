@@ -1,18 +1,94 @@
 name: Dependabot Auto-Merge
 
-# Thin caller (2026-09-12, fleet CI redesign): the needs-human staleness check (`check-needs-human`
-# job below) stays local -- it's specific to THIS repo's queue-retry-handler.yml contract (the
-# exact marker format it posts, and when a hand-off to a human is provably stale vs. still live).
-# Everything else -- fetching Dependabot's metadata, the SHA-pinned approve/merge mutations and
-# their base-retarget re-checks, major-bump labeling -- now lives in credenza's
-# dependabot-auto-merge.yml (a `workflow_call` reusable workflow), which also backs widdershins'
-# own copy (21 rounds of Codex hardening on that exact logic that this repo never had). See that
-# file's header for the full split rationale. `verified` is left at its default (true): this repo
-# has no ecosystem-specific diff-safety verifier yet (that's MAN-209's own broader context) --
-# unchanged from this repo's pre-split behavior of trusting Dependabot's own classification alone.
+# Thin caller (2026-09-12, fleet CI redesign): the needs-human staleness check
+# (`check-needs-human` job below) and the Cargo diff-safety verifier (`verify` job, MAN-218) stay
+# local -- both are specific to this repo's own ecosystem/contract (queue-retry-handler.yml's
+# exact marker format; Cargo.toml/Cargo.lock's own structure). Everything else -- fetching
+# Dependabot's metadata, the SHA-pinned approve/merge mutations and their base-retarget
+# re-checks, major-bump labeling -- lives in credenza's dependabot-auto-merge.yml (a
+# `workflow_call` reusable workflow), which also backs widdershins' own copy (21 rounds of Codex
+# hardening on that exact logic that this repo never had). See that file's header for the full
+# split rationale.
 on: pull_request_target
 
 jobs:
+  # Cargo analog of widdershins' own `verify` job (MAN-218): re-derives the actual
+  # dependency-version diff from Cargo.toml/Cargo.lock, independent of Dependabot's own
+  # self-reported update-type classification, before `auto-merge` uses a code-owner-identity
+  # credential to approve the PR. Python (stdlib-only, no pip install needed for TOML parsing --
+  # tomllib is 3.11+ stdlib) rather than widdershins' Node.js: this repo has no existing Node
+  # tooling at all, while it already has stdlib-only Python scripts (confidence-separation.py,
+  # score-against-rbn.py) -- matches that established convention rather than introducing a new
+  # language's toolchain. See scripts/verify-dependabot-diff-safe.py's own header for the fuller
+  # reasoning, including why this was NOT written in Rust (no local Rust toolchain to compile/test
+  # it against during development) or Node (would need a package.json+package-lock.json this repo
+  # has never had, purely to reuse comparator logic that Cargo's own simpler, OR-free requirement
+  # grammar doesn't actually need).
+  verify:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      safe: ${{ steps.verify.outputs.safe || 'true' }}
+      reason: ${{ steps.verify.outputs.reason || '' }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Check out the trusted BASE branch, never the PR's own tree (Codex P1, widdershins#421
+      # round 2, applied here preemptively): the verifier's own threat model includes a
+      # compromised Dependabot identity/commit, not just an unforgeable actor -- checking out and
+      # running the PR's own tree would let a compromised commit replace the verifier itself with
+      # one that always reports SAFE. No `ref:` override -- actions/checkout defaults to the
+      # workflow's own trusted context, which for `pull_request_target` is the base branch.
+      # `fetch-depth: 0` so `origin/main` has real history for the verifier to diff against.
+      - name: Check out the trusted base branch (never the PR's own tree)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      # Fetch the PR's head as a git OBJECT only -- never checked out as a working tree, same
+      # trust boundary as the checkout above.
+      - name: Fetch the PR's head commit (as an object, not a checkout)
+        run: git fetch origin ${{ github.event.pull_request.head.sha }}
+
+      # Runs the TRUSTED (base-branch) copy of the verifier against the PR's head SHA as an
+      # explicit argument -- never `HEAD` itself, which after the checkout above is the base
+      # branch, not the PR. Random per-run heredoc delimiter (Codex P1, widdershins#423 round 2,
+      # applied here preemptively): a fixed delimiter would be a real injection vector, since the
+      # verifier's own NOT SAFE messages interpolate raw requirement strings straight from
+      # Cargo.toml on the PR head, which its own threat model already treats as
+      # attacker-controlled.
+      - name: Verify Dependabot diff is a safe Cargo dependency-version bump
+        id: verify
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        run: |
+          set +e
+          output=$(python3 scripts/verify-dependabot-diff-safe.py origin/main ${{ github.event.pull_request.head.sha }} 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            delim="VERIFY_REASON_EOF_$(openssl rand -hex 16)"
+            {
+              echo "reason<<${delim}"
+              echo "$output"
+              echo "${delim}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
   # This job's ONLY job is the side effect: clear needs-human if it's provably stale for the
   # current head. It has no meaningful output to pass downstream (Codex P1, manta#191 round 1 --
   # an earlier version computed `should_merge` here and passed it as a boolean input, leaving a
@@ -102,19 +178,16 @@ jobs:
           fi
 
   auto-merge:
-    needs: check-needs-human
+    needs: [verify, check-needs-human]
     if: github.actor == 'dependabot[bot]'
     # Must grant at least what credenza's reusable job itself declares (contents: write,
     # pull-requests: write) -- a caller's permissions cap the callee, they don't add to it.
     permissions:
       contents: write
       pull-requests: write
-    # GH_TOKEN is DEPENDABOT_APPROVE_PAT (org-wide secret, Pull requests: Read and write) -- see
-    # MAN-209: this repo's CODEOWNERS (PR #182) requires this before require_code_owner_review can
-    # be enabled here, matching the exact tradeoff widdershins already resolved (Task 2, phase1a
-    # plan). Do not enable require_code_owner_review on this repo's ruleset until this PR has
-    # merged, the secret is confirmed working end-to-end on a real Dependabot PR, and MAN-209 is
-    # closed.
+    # GH_TOKEN is DEPENDABOT_APPROVE_PAT (org-wide secret, Pull requests: Read and write) --
+    # MAN-209 (CODEOWNERS requiring this before require_code_owner_review could be enabled here)
+    # is closed; require_code_owner_review is live on manta-review-gate as of 2026-09-12.
     # Pinned to f25c58c2, not the prior 6d2781a3: pulls in credenza#47's merge_blocking_label fix
     # (a live re-check immediately before the merge mutation, replacing a caller-computed boolean
     # that left a job-boundary TOCTOU window open -- Codex P1, manta#191 round 1).
@@ -122,5 +195,10 @@ jobs:
     with:
       base_branch: main
       merge_blocking_label: needs-human
+      # MAN-218: previously left at the default (true), trusting Dependabot's own classification
+      # alone. Now fed by the `verify` job's own re-derivation of the actual Cargo.toml/Cargo.lock
+      # diff.
+      verified: ${{ needs.verify.outputs.safe == 'true' }}
+      verify_failure_reason: ${{ needs.verify.outputs.reason }}
     secrets:
       approve_pat: ${{ secrets.DEPENDABOT_APPROVE_PAT }}
