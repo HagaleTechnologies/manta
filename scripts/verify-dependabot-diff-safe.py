@@ -393,7 +393,7 @@ def requirement_is_satisfied_by(req, version_str):
     v_major, v_minor, v_patch, v_pre = _parse_bare_version(version_str)
     v_key = version_sort_key(v_major, v_minor, v_patch, v_pre)
     for comparator in comparators:
-        kind, major, minor, patch, _pre = comparator
+        kind, major, minor, patch, cmp_pre = comparator
         if kind == LT:
             if v_key >= floor_tuple(comparator):
                 return False
@@ -415,6 +415,18 @@ def requirement_is_satisfied_by(req, version_str):
             # MAN-220 -- resolved here as a direct consequence of the same verified boundary
             # helper Finding Z needed, not a separate fix).
             if _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch) != "eq":
+                return False
+            # Exact prerelease-string equality (Codex P1, manta#194 round 21, Finding AE):
+            # confirmed against the real `semver` crate's matches_exact (src/eval.rs, fetched
+            # round 17) -- an EXACT comparator ALWAYS requires `ver.pre == cmp.pre`, regardless
+            # of major/minor/patch matching. This is a HARD requirement for EXACT specifically,
+            # not the looser prerelease-precedence ordering this file deliberately doesn't model
+            # for GT/LT (round 17's documented scope limit) -- `=1.2.3-alpha` must reject both
+            # `1.2.3-beta` (a different prerelease) and plain `1.2.3` (no prerelease at all),
+            # neither of which the eligibility rule above (Finding Q) catches on its own: Finding
+            # Q only ever EXCLUDES a prerelease version, it never requires a STABLE version to be
+            # excluded from an exact-prerelease requirement.
+            if v_pre != cmp_pre:
                 return False
         elif kind == CARET:
             if v_key < floor_tuple(comparator):

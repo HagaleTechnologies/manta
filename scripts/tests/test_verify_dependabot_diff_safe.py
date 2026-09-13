@@ -1933,6 +1933,24 @@ class RequirementOmittedComponentBoundaryTests(unittest.TestCase):
         self.assertTrue(v.requirement_is_satisfied_by("<=1.2.3", "1.2.3"))
         self.assertFalse(v.requirement_is_satisfied_by("<=1.2.3", "1.2.4"))
 
+    def test_exact_prerelease_requires_matching_identifier(self):
+        # Codex P1, manta#194 round 21, Finding AE -- confirmed against the real semver crate's
+        # matches_exact (src/eval.rs): an EXACT comparator ALWAYS requires the prerelease
+        # identifier to match exactly, regardless of major.minor.patch. A different prerelease
+        # ("beta" vs the requirement's "alpha") must be rejected, matching Codex's exact
+        # reproduction.
+        self.assertFalse(v.requirement_is_satisfied_by("=1.2.3-beta", "1.2.3-alpha"))
+        self.assertTrue(v.requirement_is_satisfied_by("=1.2.3-alpha", "1.2.3-alpha"))
+
+    def test_exact_prerelease_rejects_the_stable_release(self):
+        # A stable release must NOT satisfy an exact-prerelease requirement -- Finding Q's
+        # eligibility rule alone doesn't catch this (it only ever excludes a prerelease VERSION,
+        # never requires excluding a STABLE one from a prerelease requirement).
+        self.assertFalse(v.requirement_is_satisfied_by("=1.2.3-alpha", "1.2.3"))
+
+    def test_exact_without_a_prerelease_still_matches_a_stable_release(self):
+        self.assertTrue(v.requirement_is_satisfied_by("=1.2.3", "1.2.3"))
+
 
 class LockfileWorkspaceReplacementTests(unittest.TestCase):
     """Codex P1, manta#194 round 18, Finding AA: a workspace member's lockfile-recorded version
