@@ -2180,6 +2180,81 @@ class ManifestLockfileConsistencyEdgePrecisionTests(unittest.TestCase):
         self.assertIn("does not satisfy that requirement", reasons[0])
 
 
+class ManifestLockfileConsistencyRenameAmbiguityTests(unittest.TestCase):
+    """Codex P1, manta#194 round 24, Finding AI: two renamed dependencies (`package = "foo"`) on
+    the same declaring package resolving to DIFFERENT versions produce 2+ same-name edges in
+    that package's own Cargo.lock `dependencies` list. `specific_resolved_version` couldn't tell
+    which edge belongs to which alias -- returning "the first match" for both let a reordered
+    lockfile make one alias's raised requirement pass against the OTHER alias's edge, while its
+    own real (possibly stale) edge was never examined by any check.
+    """
+
+    def _lock(self, consumer_a_deps):
+        return {
+            "package": [
+                {
+                    "name": "consumer_a",
+                    "version": "1.0.0",
+                    "dependencies": consumer_a_deps,
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "foo",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                },
+            ]
+        }
+
+    def _head_tomls(self):
+        return {
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {
+                    "foo_v1": {"package": "foo", "version": "1"},
+                    "foo_v2": {"package": "foo", "version": "2"},
+                },
+            }
+        }
+
+    def test_two_renamed_aliases_with_ambiguous_edges_fail_closed_for_both(self):
+        # The exact exploit shape: the edge satisfying foo_v2's raised requirement is listed
+        # FIRST, ahead of foo_v1's -- before the fix, both declarations' specific_resolved_version
+        # calls short-circuited on this same first match, silently passing both regardless of
+        # which alias's real edge was actually stale.
+        lock = self._lock(["foo 2.0.0", "foo 1.0.0"])
+        reasons = v.check_manifest_lockfile_consistency(self._head_tomls(), lock)
+        self.assertEqual(len(reasons), 2)
+        joined = " ".join(reasons)
+        self.assertIn("foo_v1", joined)
+        self.assertIn("foo_v2", joined)
+        for r in reasons:
+            self.assertIn("cannot be mapped to a specific edge", r)
+
+    def test_order_does_not_change_the_ambiguity_verdict(self):
+        # Same ambiguity regardless of which edge happens to be listed first.
+        lock = self._lock(["foo 1.0.0", "foo 2.0.0"])
+        reasons = v.check_manifest_lockfile_consistency(self._head_tomls(), lock)
+        self.assertEqual(len(reasons), 2)
+
+    def test_single_alias_to_a_renamed_dependency_is_unaffected(self):
+        # Only one alias in this manifest -- one edge, unambiguous, existing precision behavior.
+        head_tomls = {
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {"foo_v1": {"package": "foo", "version": "1"}},
+            }
+        }
+        lock = self._lock(["foo 1.0.0"])
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+
 class LockfileReplacementChecksumTests(unittest.TestCase):
     """Codex P1, manta#194 round 23, Finding AG: a matched removed/added replacement pair's own
     dependencies edges are validated, but nothing checks the new entry's `checksum` field --
@@ -2257,6 +2332,143 @@ class LockfileReplacementChecksumTests(unittest.TestCase):
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
+
+class LockfileAddedEntryChecksumTests(unittest.TestCase):
+    """Codex P1, manta#194 round 24, Finding AH: round 23's checksum check only covers the
+    matched removed/added REPLACEMENT-pair loop, which pops a same-name pair out of
+    `added_grouped` before the reachability loop ever sees it. An added entry with no same-name
+    removed peer at all -- e.g. a transitive edge retargeted from a retained OLDER version to a
+    brand-new SIBLING version of the same crate (a diamond gaining a second instance, not a
+    replacement) -- reaches only the reachability loop, which checked reachability but never
+    checksum.
+    """
+
+    def _base(self):
+        return {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["foo", "bar"]},
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+
+    def test_reachable_added_registry_entry_missing_checksum_is_flagged(self):
+        # foo bumps 1.0.0 -> 1.0.1 and retargets its own "bar" edge to a brand-new sibling
+        # version (bar 2.0.0), while the original bar 1.0.0 stays retained (root still depends on
+        # it directly) -- bar 2.0.0 has no same-name removed peer, so it never passes through the
+        # matched-pair checksum check round 23 added; it's reachable only via foo's new edge.
+        head = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["foo", "bar 1.0.0"]},
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar 2.0.0"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+                {
+                    "name": "bar",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    # no checksum -- reachable (via foo's retargeted edge), but unverifiable
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(self._base(), head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("bar", reasons[0])
+        self.assertIn("checksum", reasons[0])
+        self.assertIn("2.0.0", reasons[0])
+
+    def test_reachable_added_registry_entry_with_checksum_is_safe(self):
+        head = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["foo", "bar 1.0.0"]},
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar 2.0.0"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+                {
+                    "name": "bar",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar2",
+                },
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(self._base(), head), [])
+
+    def test_reachable_added_git_entry_without_checksum_is_unaffected(self):
+        # Same retargeted-edge shape, but both bar instances are git-sourced (same repo/branch,
+        # different pinned commits) -- git entries have no checksum concept, so this must stay
+        # SAFE even with no checksum field on the newly added instance.
+        base = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["foo", "bar"]},
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/bar.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["foo", "bar 1.0.0"]},
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar 2.0.0"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/bar.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+                {
+                    "name": "bar",
+                    "version": "2.0.0",
+                    "source": "git+https://good.example/bar.git?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                },
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
 
 if __name__ == "__main__":
     unittest.main()

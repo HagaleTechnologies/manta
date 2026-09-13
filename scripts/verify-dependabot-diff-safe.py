@@ -1042,13 +1042,31 @@ def check_lockfile_diff(base_lock, head_lock):
     head_reachable = _reachable_lockfile_identities(head_pkgs, head_by_name, trusted_roots)
     for added_name, added_entries in added_grouped.items():
         for kind, version, source in added_entries:
-            if (added_name, kind, version, source) in head_reachable:
+            if (added_name, kind, version, source) not in head_reachable:
+                reasons.append(
+                    f'Cargo.lock package "{added_name}" ({kind}, {version}) was added but is '
+                    "not reachable from any workspace member via a real dependency edge -- "
+                    "not verifiable as a safe consequence of the rest of the dependency-graph "
+                    "change"
+                )
                 continue
-            reasons.append(
-                f'Cargo.lock package "{added_name}" ({kind}, {version}) was added but is not '
-                "reachable from any workspace member via a real dependency edge -- not "
-                "verifiable as a safe consequence of the rest of the dependency-graph change"
-            )
+            # Checksum presence on an ADDED registry entry (Codex P1, manta#194 round 24,
+            # Finding AH): round 23's checksum check only covers the matched removed/added
+            # REPLACEMENT-pair loop above, which pops a same-name pair out of `added_grouped`
+            # before this loop ever sees it. An added entry with no same-name removed peer at
+            # all -- e.g. a transitive edge retargeted from a retained older version to a
+            # brand-new sibling version of the same registry crate (a diamond gaining a second
+            # instance, not a replacement) -- reaches only THIS loop, which checked reachability
+            # but never checksum. The same reasoning applies regardless of whether the entry
+            # replaced something or is wholly new: Cargo always records a checksum for a real
+            # registry package.
+            new_entry = head_pkgs[(added_name, kind, version, source)]
+            if kind == "registry" and not new_entry.get("checksum"):
+                reasons.append(
+                    f'Cargo.lock package "{added_name}" (registry) has no checksum recorded '
+                    f"for its added version ({version}) -- not verifiable as a safe, "
+                    "registry-validated version bump"
+                )
 
     # Retained entries -- same (name, kind, version, source) key present in BOTH base and head --
     # are invisible to the removed/added set difference above (Codex P1, manta#194 round 3,
@@ -1189,6 +1207,10 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
         if "package" in toml and "name" in toml.get("package", {})
     }
 
+    # Sentinel for `specific_resolved_version`'s ambiguous-edge case -- see its docstring
+    # (Codex P1, manta#194 round 24, Finding AI).
+    _AMBIGUOUS_SPECIFIC_EDGE = object()
+
     def declaring_entry_for(path):
         name = package_name_by_path.get(path)
         if name is None:
@@ -1205,17 +1227,43 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
         return head_pkgs[candidates[0]] if len(candidates) == 1 else None
 
     def specific_resolved_version(entry, lockfile_name):
-        """The exact version `entry`'s own `dependencies` edge to `lockfile_name` resolves to,
-        or None if no such edge is recorded or it can't be resolved unambiguously."""
+        """The exact version `entry`'s own `dependencies` edge to `lockfile_name` resolves to;
+        None if no such edge is recorded, or `_AMBIGUOUS_SPECIFIC_EDGE` if 2+ distinct edges to
+        `lockfile_name` exist on this same declaring entry (Codex P1, manta#194 round 24, Finding
+        AI). A renamed dependency (`package = "foo"`) lets ONE declaring package hold multiple
+        aliases to the SAME crate name resolving to DIFFERENT versions -- e.g. `foo_v1 = {
+        package = "foo", version = "1" }` and `foo_v2 = { package = "foo", version = "2" }` in
+        the same Cargo.toml. Cargo.lock's `dependencies` array has no way to record which alias
+        each edge belongs to (it's a flat list of resolved crate identities, not keyed by TOML
+        alias), so matching "the first same-name ref" for EVERY alias querying that name isn't a
+        heuristic that's merely imprecise -- it's structurally unable to tell which edge belongs
+        to which declaration. A reordered lockfile can put the edge that satisfies one alias's
+        raised requirement FIRST, so both that alias AND the other alias's query short-circuit on
+        it -- the other alias's own real (possibly stale) edge, sitting later in the list, is
+        never examined by any check. Fail closed instead of guessing.
+        """
         if entry is None:
             return None
-        for ref in entry.get("dependencies", []):
-            if ref.split(" ", 1)[0] == lockfile_name:
-                resolved = _resolve_dependency_ref(ref, pkgs_by_name.get(lockfile_name, []))
-                return resolved[2] if resolved is not None else None
-        return None
+        matches = [
+            ref for ref in entry.get("dependencies", []) if ref.split(" ", 1)[0] == lockfile_name
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            return _AMBIGUOUS_SPECIFIC_EDGE
+        resolved = _resolve_dependency_ref(matches[0], pkgs_by_name.get(lockfile_name, []))
+        return resolved[2] if resolved is not None else None
 
     def check_against_requirement(path, table_name, dep_name, req, lockfile_name, version):
+        if version is _AMBIGUOUS_SPECIFIC_EDGE:
+            reasons.append(
+                f'"{path}" {table_name}.{dep_name} (package = "{lockfile_name}") has 2+ '
+                f'distinct Cargo.lock dependency-list edges to "{lockfile_name}" on its own '
+                "declaring package -- Cargo.lock records no alias attribution, so this "
+                "declaration cannot be mapped to a specific edge and its requirement cannot "
+                "be verified"
+            )
+            return
         if version is not None:
             if not requirement_is_satisfied_by(req, version):
                 reasons.append(
