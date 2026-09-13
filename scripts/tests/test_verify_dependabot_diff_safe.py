@@ -1934,5 +1934,74 @@ class RequirementOmittedComponentBoundaryTests(unittest.TestCase):
         self.assertFalse(v.requirement_is_satisfied_by("<=1.2.3", "1.2.4"))
 
 
+class LockfileWorkspaceReplacementTests(unittest.TestCase):
+    """Codex P1, manta#194 round 18, Finding AA: a workspace member's lockfile-recorded version
+    comes from that member's own Cargo.toml, never from a registry or git source -- Dependabot
+    never legitimately changes it, and none of the registry/git-oriented downgrade/source-
+    identity/major-boundary machinery is meaningful for it.
+    """
+
+    def test_workspace_member_version_replacement_is_flagged(self):
+        base = {"package": [{"name": "member", "version": "1.0.0"}]}
+        head = {"package": [{"name": "member", "version": "1.0.1"}]}
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("workspace package", reasons[0])
+        self.assertIn("member", reasons[0])
+
+    def test_unchanged_workspace_member_is_safe(self):
+        pkg = {"package": [{"name": "member", "version": "1.0.0"}]}
+        self.assertEqual(v.check_lockfile_diff(pkg, pkg), [])
+
+
+class LockfileFabricatedWorkspaceIdentityTests(unittest.TestCase):
+    """Codex P1, manta#194 round 18, Finding AB -- the exact reproduction: a second, fabricated
+    `[[package]]` sharing a real workspace member's NAME but a different (fabricated) version --
+    round 17's name-only root check let this vouch for an attached evil subgraph even though it
+    is a completely different, newly-added identity.
+    """
+
+    def test_fabricated_same_name_different_version_root_does_not_vouch(self):
+        real_root = {"name": "real-root", "version": "1.0.0", "dependencies": ["foo"]}
+        base = {
+            "package": [
+                real_root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                real_root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "real-root",
+                    "version": "999.0.0",
+                    "dependencies": ["evil"],
+                },
+                {
+                    "name": "evil",
+                    "version": "1.0.0",
+                    "source": "registry+https://malicious.example/fake-index",
+                    "checksum": "evil1",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        joined = " ".join(reasons)
+        self.assertIn("999.0.0", joined)
+        self.assertIn("evil", joined)
+        self.assertIn("not reachable", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

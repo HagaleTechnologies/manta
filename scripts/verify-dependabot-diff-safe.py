@@ -849,6 +849,21 @@ def check_lockfile_diff(base_lock, head_lock):
                 "not a plain version bump"
             )
             continue
+        # Workspace-member replacement (Codex P1, manta#194 round 18, Finding AA): a workspace
+        # member's lockfile-recorded version is never something Dependabot legitimately touches
+        # -- it comes from that member's own Cargo.toml `[package] version`, not any registry or
+        # git source, so none of the downgrade/source-identity/major-boundary machinery below
+        # (all built around an externally-fetched dependency) is meaningful for it at all. A
+        # matched removed/added pair with kind=="workspace" is a LOCAL package's own version
+        # changing in the lockfile with no external verification possible -- unconditionally
+        # out of scope for what this verifier can safely wave through.
+        if old_kind == "workspace":
+            reasons.append(
+                f'Cargo.lock workspace package "{name}" changed its resolved version '
+                f"({old_v} -> {new_v}) -- not something Dependabot legitimately produces, not "
+                "verifiable as safe"
+            )
+            continue
         # Source identity check (Codex P1, manta#194 round 4): `old_kind == new_kind` alone
         # treats any two "git" (or "registry") sources as equivalent regardless of which URL/ref
         # they actually name, so a same-kind source swap riding along with a version bump (e.g.
@@ -961,14 +976,20 @@ def check_lockfile_diff(base_lock, head_lock):
     # referencing cycle of added-only entries (`evil-a -> evil-b -> evil-a`) trivially defeats --
     # both names occur in SOME dependencies list, but neither is reachable from a real root.
     # _reachable_lockfile_identities replaces name-occurrence with actual graph reachability.
-    # Roots are restricted to workspace-kind names that already existed in BASE (Codex P1,
-    # manta#194 round 17, Finding Y) -- a genuinely new workspace member would already be
-    # rejected by check_diff_scope (its Cargo.toml path isn't in this verifier's fixed
-    # manifest_paths), so this loses no real coverage, and it means a freshly-fabricated
-    # source-less "root" added in this very diff can no longer vouch for anything.
-    pre_existing_workspace_names = {key[0] for key in base_pkgs if key[1] == "workspace"}
+    # Roots are restricted to workspace-kind FULL IDENTITIES that already existed in BASE
+    # (Codex P1, manta#194 round 17, Finding Y; tightened round 18, Finding AB) -- a genuinely
+    # new workspace member would already be rejected by check_diff_scope (its Cargo.toml path
+    # isn't in this verifier's fixed manifest_paths), so this loses no real coverage. Round 17's
+    # first cut matched by NAME alone, which Finding AB defeated: a second, fabricated entry
+    # sharing a real workspace member's NAME but a different (fabricated) version -- e.g.
+    # "real-root" retained at 1.0.0 alongside an ADDED "real-root" at a fabricated 999.0.0 --
+    # still qualified as a trusted root under a name-only check. Matching the FULL (name, kind,
+    # version, source) key means only a genuinely UNCHANGED workspace member (also required by
+    # Finding AA's sibling fix, which rejects any workspace-kind version change outright) can
+    # vouch for anything.
+    pre_existing_workspace_keys = {key for key in base_pkgs if key[1] == "workspace"}
     trusted_roots = [
-        key for key in head_pkgs if key[1] == "workspace" and key[0] in pre_existing_workspace_names
+        key for key in head_pkgs if key[1] == "workspace" and key in pre_existing_workspace_keys
     ]
     head_reachable = _reachable_lockfile_identities(head_pkgs, head_by_name, trusted_roots)
     for added_name, added_entries in added_grouped.items():
