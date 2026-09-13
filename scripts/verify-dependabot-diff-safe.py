@@ -745,7 +745,16 @@ def check_lockfile_diff(base_lock, head_lock):
         # follows (no downgrade, no boundary crossed) with zero independent evidence the swap is
         # legitimate. Reject it outright rather than trust a self-reported version that didn't
         # even change.
-        if old_kind == "git" and old_source != new_source and old_v == new_v:
+        # Codex P1, manta#194 round 12, Finding N: comparing `old_v == new_v` as raw STRINGS
+        # missed that SemVer 2.0.0 build metadata (a trailing `+...`) never affects version
+        # identity/precedence -- "1.2.3+old" and "1.2.3+new" are the SAME version, but compare
+        # unequal as strings, so a malicious commit swap reporting a cosmetically different build
+        # tag would have slipped past the very check round 11 added to catch exactly this.
+        # _parse_bare_version already strips build metadata (used everywhere else in this file
+        # for exactly that reason) -- compare through it instead of the raw string.
+        old_bare = _parse_bare_version(old_v) if old_v is not None else None
+        new_bare = _parse_bare_version(new_v) if new_v is not None else None
+        if old_kind == "git" and old_source != new_source and old_bare == new_bare:
             reasons.append(
                 f'Cargo.lock package "{name}" (git) changed its pinned commit '
                 f"({old_source} -> {new_source}) while reporting the SAME version ({old_v}) -- "
@@ -776,6 +785,35 @@ def check_lockfile_diff(base_lock, head_lock):
                 f'Cargo.lock package "{name}" ({old_kind}) crossed a major/0.x boundary in its '
                 f"resolved version ({old_v} -> {new_v}) -- a permissive manifest requirement can "
                 "mask this, so it is checked independently here"
+            )
+        # Dependency-edge validation on a REPLACEMENT entry (Codex P1, manta#194 round 12,
+        # Finding O): none of the checks above ever look at the NEW entry's own `dependencies`
+        # field -- only the retained-entries loop below does that, which by definition never runs
+        # for a matched removed/added pair (its key, by definition, changed). A version bump can
+        # ride along with an edge redirected to a brand-new, otherwise-unvalidated dependency with
+        # no reason ever raised.
+        #
+        # Compares by bare NAME SET here, not the full resolved-identity comparison the retained-
+        # entries loop uses (round 8) -- found empirically while verifying this fix against
+        # manta's real history, not from a Codex comment: a MATCHED REPLACEMENT entry's own
+        # version already changed and passed the downgrade/major-boundary checks above, meaning
+        # some real difference in content is already accepted as the normal cost of a version
+        # bump. A published crate legitimately shifting which version of an EXISTING transitive
+        # dependency it needs between its own two releases is routine, not suspicious -- manta's
+        # own real commit fb1c7f3 hit exactly this (clap_derive 4.6.1 -> 4.6.4 shifted its own
+        # `syn` edge from a 2.x instance to a newly-available 3.x one, entirely legitimately) and
+        # would have been rejected by full identity comparison. What IS suspicious, and what
+        # Codex's own reproduction actually demonstrates, is a WHOLLY NEW dependency NAME
+        # appearing that this package never referenced before (its own bar -> evil example) --
+        # that's what the name-set comparison below still catches.
+        old_entry = base_pkgs[(name, old_kind, old_v, old_source)]
+        new_entry = head_pkgs[(name, new_kind, new_v, new_source)]
+        old_dep_names = {ref.split(" ", 1)[0] for ref in old_entry.get("dependencies", [])}
+        new_dep_names = {ref.split(" ", 1)[0] for ref in new_entry.get("dependencies", [])}
+        if old_dep_names != new_dep_names:
+            reasons.append(
+                f'Cargo.lock package "{name}" ({old_kind}) changed its dependencies alongside '
+                f"its version bump ({old_v} -> {new_v}) -- not a plain version bump"
             )
 
     # Any name that only ever appears in `added` (never matched to a `removed` peer) is a

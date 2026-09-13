@@ -725,6 +725,33 @@ class LockfileSourceIdentityOnBumpTests(unittest.TestCase):
         self.assertEqual(len(reasons), 1)
         self.assertIn("SAME version", reasons[0])
 
+    def test_git_commit_swap_disguised_by_build_metadata_is_flagged(self):
+        # Codex P1, manta#194 round 12, Finding N: round 11's `old_v == new_v` raw-string
+        # comparison missed that SemVer build metadata never affects version identity --
+        # "1.2.3+old" and "1.2.3+new" ARE the same version, but compare unequal as strings,
+        # letting a commit swap disguised by a cosmetic build-tag change slip past.
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3+old",
+                    "source": "git+https://good.example/repo?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3+new",
+                    "source": "git+https://good.example/repo?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("SAME version", reasons[0])
+
     def test_registry_url_swap_alongside_version_bump_is_flagged(self):
         base = {
             "package": [
@@ -1235,6 +1262,97 @@ class ManifestLockfileConsistencyEndToEndTests(unittest.TestCase):
              mock.patch.object(v, "WORKSPACE_MEMBERS", []):
             exit_code = v.main("base", "head")
         self.assertEqual(exit_code, 1)
+
+
+class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
+    """Codex P1, manta#194 round 12, Finding O: the matched removed/added branch never looked at
+    the NEW entry's own `dependencies` field -- only the retained-entries loop does that, which
+    by definition never runs for a matched pair (its key changed). A version bump could ride
+    along with an edge redirected to a brand-new, otherwise-unvalidated dependency.
+    """
+
+    def test_dependencies_change_alongside_a_version_bump_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["evil"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+                {
+                    "name": "evil",
+                    "version": "1.0.0",
+                    "source": "registry+https://malicious.example/fake-index",
+                    "checksum": "evil1",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("foo", reasons[0])
+        self.assertIn("dependencies", reasons[0])
+
+    def test_unchanged_dependencies_alongside_a_version_bump_is_safe(self):
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
 
 
 if __name__ == "__main__":
