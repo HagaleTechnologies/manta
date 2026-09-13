@@ -696,6 +696,35 @@ class LockfileSourceIdentityOnBumpTests(unittest.TestCase):
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
+    def test_git_commit_swap_at_the_same_version_is_flagged(self):
+        # Codex P1, manta#194 round 11 -- the exact reproduction: only the commit fragment
+        # changes, same branch/tag URL, same self-reported version. Unlike the "advancing"
+        # case above, there is zero independent evidence (no version change, no source-identity
+        # change) that this swap is a legitimate update rather than a malicious commit
+        # substitution -- the version field is entirely self-reported by the pinned commit's own
+        # Cargo.toml, so it carries no safety signal on its own.
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "source": "git+https://good.example/repo?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "source": "git+https://good.example/repo?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("SAME version", reasons[0])
+
     def test_registry_url_swap_alongside_version_bump_is_flagged(self):
         base = {
             "package": [

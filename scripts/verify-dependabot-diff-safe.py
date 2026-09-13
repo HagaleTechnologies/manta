@@ -734,6 +734,24 @@ def check_lockfile_diff(base_lock, head_lock):
                 f"({old_identity} -> {new_identity}) -- not a verified version bump"
             )
             continue
+        # Same-version git commit swap (Codex P1, manta#194 round 11): _source_identity
+        # deliberately strips a git source's `#<sha>` fragment so an ordinary branch/tag-pinned
+        # bump (a new commit, a version bump reported by that commit's own Cargo.toml) doesn't
+        # get rejected as a "source identity change." But a git dependency's `version` field is
+        # entirely SELF-reported by the pinned commit's own Cargo.toml -- unlike a registry
+        # crate, nothing polices it, so it carries none of the safety signal the downgrade/
+        # major-boundary checks below assume. A malicious commit swap on the SAME branch/tag,
+        # crafted to report the SAME version string as before, sails through every check that
+        # follows (no downgrade, no boundary crossed) with zero independent evidence the swap is
+        # legitimate. Reject it outright rather than trust a self-reported version that didn't
+        # even change.
+        if old_kind == "git" and old_source != new_source and old_v == new_v:
+            reasons.append(
+                f'Cargo.lock package "{name}" (git) changed its pinned commit '
+                f"({old_source} -> {new_source}) while reporting the SAME version ({old_v}) -- "
+                "not independently verifiable as a safe update"
+            )
+            continue
         if new_v is None or old_v is None:
             continue
         if _version_tuple(new_v) < _version_tuple(old_v):
