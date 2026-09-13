@@ -1509,5 +1509,57 @@ class ManifestLockfileConsistencyRenameTests(unittest.TestCase):
         )
 
 
+class ManifestLockfileConsistencySourceKindTests(unittest.TestCase):
+    """Codex P1, manta#194 round 14, Finding S: candidates were filtered by name (and, since
+    round 10, checked for satisfaction) but never by SOURCE KIND -- an unrelated same-named git-
+    sourced entry could satisfy a plain registry version declaration whose own stale registry
+    entry didn't.
+    """
+
+    def test_unrelated_git_entry_does_not_mask_a_stale_registry_entry(self):
+        # Codex's exact reproduction: `foo = "1.0"` -> `"1.1"`, the registry entry stays stale at
+        # 1.0, and an unrelated git-sourced "foo 1.1" (pulled in by something else entirely)
+        # coexists. The git entry must not be allowed to satisfy the registry declaration.
+        head_tomls = {"Cargo.toml": {"dependencies": {"foo": "1.1"}}}
+        lock = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "foo",
+                    "version": "1.1.0",
+                    "source": "git+https://unrelated.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+            ]
+        }
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, lock)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("foo", reasons[0])
+        self.assertIn("does not satisfy the head manifest", reasons[0])
+
+    def test_matching_registry_entry_still_satisfies_alongside_an_unrelated_git_entry(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"foo": "1.1"}}}
+        lock = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.1.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "foo",
+                    "version": "1.5.0",
+                    "source": "git+https://unrelated.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+            ]
+        }
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+
 if __name__ == "__main__":
     unittest.main()

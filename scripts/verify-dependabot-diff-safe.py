@@ -1010,7 +1010,17 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
                 continue
             req, rest = detail
             lockfile_name = rest.get("package", dep_name)
-            candidates = pkgs_by_name.get(lockfile_name, [])
+            # Restrict candidates to a source KIND consistent with a bare version-requirement
+            # declaration -- "registry" (crates.io or an alternate registry override) or
+            # "unknown" (a non-git/registry source prefix this file doesn't further classify),
+            # never "git" or "workspace" (Codex P1, manta#194 round 14): filtering by name alone
+            # let an UNRELATED same-named git-sourced diamond entry's version satisfy a plain
+            # registry declaration whose own (stale) registry entry didn't -- e.g. `foo = "1.0"`
+            # -> `"1.1"` with a stale registry `foo 1.0` retained alongside a coincidentally
+            # same-named `foo 1.1` git entry pulled in by something else entirely.
+            candidates = [
+                key for key in pkgs_by_name.get(lockfile_name, []) if key[1] in ("registry", "unknown")
+            ]
             versions = sorted({key[2] for key in candidates if key[2] is not None})
             if not versions:
                 continue
