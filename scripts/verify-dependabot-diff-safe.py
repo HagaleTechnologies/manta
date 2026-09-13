@@ -40,14 +40,14 @@ WORKSPACE_MEMBERS = [
 
 DEPENDENCY_TABLES = ["dependencies", "dev-dependencies", "build-dependencies"]
 
-# Cargo requirement comparator kinds. CARET/TILDE/EXACT/WILDCARD are floor-derived (their own
-# ceiling, if any, is a mechanical function of the floor -- see floor_derived below); GT/GE are
-# explicit lower bounds with no derived ceiling of their own; LT/LE are explicit, independently-
-# editable ceiling data a compromised bump could widen.
+# Cargo requirement comparator kinds. LT/LE are explicit, independently-editable ceiling data a
+# compromised bump could widen and so must stay byte-identical; every other kind (CARET, TILDE,
+# EXACT, GT, GE, WILDCARD) carries only a floor, and is checked against a major-version-boundary
+# rule in compare_requirements (CARET/TILDE have their own kind-specific rule; EXACT/GT/GE share
+# a generic one; WILDCARD admits everything already).
 CARET, TILDE, EXACT, GT, GE, LT, LE, WILDCARD = (
     "caret", "tilde", "exact", "gt", "ge", "lt", "le", "wildcard",
 )
-FLOOR_DERIVED = {CARET, TILDE, EXACT, WILDCARD}
 
 
 class VerifyError(Exception):
@@ -82,23 +82,25 @@ def normalize_dependency(value):
 
     A dependency can be declared as a bare string ("1.2.3") or an inline table
     ({ version = "1.2.3", features = [...] }, { git = "...", ... }, { path = "..." },
-    { workspace = true }, ...). Returns a tuple (kind, detail) where kind identifies which of
-    those shapes this is, and detail is the version-requirement string when kind is "version" or
-    the full raw table for every other kind (never discarded -- check_manifest_diff needs the
-    complete value to detect a same-kind change, e.g. a git dependency's rev/tag/branch pin,
-    not just a kind change) -- everything needed to detect a SOURCE change (kind changes)
-    separately from a version-requirement change (kind stays "version", requirement changes).
+    { workspace = true }, ...). Returns a tuple (kind, detail):
+      - kind "version": detail is (requirement_string, rest) where rest is every OTHER key in the
+        table (features, default-features, optional, package, registry, ...), or {} for a bare
+        string. `rest` must be preserved and compared byte-for-byte by check_manifest_diff (Codex
+        P1, manta#194 round 1): an earlier version discarded everything but the requirement
+        string, so a head that added a feature, flipped `optional`, renamed via `package`
+        (Cargo's own alias mechanism -- pointing an unchanged key at a DIFFERENT actual crate,
+        directly analogous to npm's alias-swap attacks), or added a `registry` override while
+        still bumping the version safely would have been silently waved through as a plain
+        version bump.
+      - every other kind: detail is the full raw table (never discarded -- check_manifest_diff
+        needs the complete value to detect a same-kind change, e.g. a git dependency's rev/tag/
+        branch pin, not just a kind change).
+    Everything needed to detect a SOURCE change (kind changes) separately from a
+    version-requirement change (kind stays "version", requirement or rest changes).
     """
     if isinstance(value, str):
-        return ("version", value)
+        return ("version", (value, {}))
     if isinstance(value, dict):
-        # For every non-"version" kind, the second element is the FULL raw table (not discarded)
-        # -- check_manifest_diff compares normalized tuples with `!=` to decide whether a
-        # same-kind declaration actually changed, so a git dependency's rev/tag/branch pin (for
-        # example) must stay visible here. An earlier version of this function returned `None`
-        # for these, which made a rev change on an unchanged-kind git dependency invisible to
-        # that comparison -- a real gap, not just a missed hardening opportunity: it would have
-        # silently waved through a malicious rev swap.
         if "git" in value:
             return ("git", value)
         if "path" in value:
@@ -106,7 +108,8 @@ def normalize_dependency(value):
         if value.get("workspace") is True:
             return ("workspace", value)
         if "version" in value:
-            return ("version", value["version"])
+            rest = {k: v for k, v in value.items() if k != "version"}
+            return ("version", (value["version"], rest))
         # registry override with no explicit version (rare, but not a version-requirement
         # change we can safely characterize) -- treat as its own opaque kind.
         return ("registry-only", value)
@@ -224,32 +227,44 @@ def compare_requirements(base_req, head_req):
                 "downgrade is never a safe auto-approvable bump"
             )
 
-        if base_kind in FLOOR_DERIVED and base_kind in (CARET, TILDE):
-            # The ceiling is a MECHANICAL FUNCTION of the floor for caret/tilde (matching the
-            # exact reasoning widdershins#421 rounds 19-21 converged on for npm's ^/~) -- but
-            # unlike npm, Cargo's grammar keeps caret/tilde as a single comparator with the
-            # bound components directly on it, so there is no separate desugared ceiling
-            # comparator to compare: the ceiling-bounding component itself (see
-            # caret_ceiling_component/tilde) must be unchanged, which IS the check that a caret
-            # bump stays within its own major (or 0.x-adjusted) boundary and a tilde bump stays
-            # within its own minor.
-            if base_kind == CARET:
-                if caret_ceiling_component(base_cmp) != caret_ceiling_component(head_cmp):
-                    return (
-                        f'caret requirement crossed its own major-version boundary '
-                        f'("{base_req}" -> "{head_req}") -- this is a major bump, not a safe '
-                        "auto-approvable version change"
-                    )
-            elif base_kind == TILDE:
-                if base_cmp[1] != head_cmp[1] or base_cmp[2] != head_cmp[2]:
-                    return (
-                        f'tilde requirement crossed its own minor-version boundary '
-                        f'("{base_req}" -> "{head_req}") -- this is not a safe auto-approvable '
-                        "version change"
-                    )
-        # EXACT: any floor change at all is, by definition, a new pinned version -- already
-        # covered by the downgrade check above; no separate ceiling exists to widen.
-        # GT/GE: an explicit lower bound has no derived ceiling of its own to protect.
+        if base_kind == CARET:
+            # The ceiling is a MECHANICAL FUNCTION of the floor for caret (matching the exact
+            # reasoning widdershins#421 rounds 19-21 converged on for npm's ^) -- but unlike npm,
+            # Cargo's grammar keeps caret as a single comparator with the bound components
+            # directly on it, so there is no separate desugared ceiling comparator to compare:
+            # the ceiling-bounding component itself (see caret_ceiling_component) must be
+            # unchanged, which IS the check that a caret bump stays within its own major (or
+            # 0.x-adjusted) boundary.
+            if caret_ceiling_component(base_cmp) != caret_ceiling_component(head_cmp):
+                return (
+                    f'caret requirement crossed its own major-version boundary '
+                    f'("{base_req}" -> "{head_req}") -- this is a major bump, not a safe '
+                    "auto-approvable version change"
+                )
+        elif base_kind == TILDE:
+            if base_cmp[1] != head_cmp[1] or base_cmp[2] != head_cmp[2]:
+                return (
+                    f'tilde requirement crossed its own minor-version boundary '
+                    f'("{base_req}" -> "{head_req}") -- this is not a safe auto-approvable '
+                    "version change"
+                )
+        else:
+            # EXACT/GT/GE (Codex P1-by-substance, manta#194 round 1): these have no explicit
+            # ceiling comparator of their own, but that doesn't mean any floor increase is safe
+            # regardless of size -- `=1.2.3` -> `=2.0.0` or `>=1.2.3` -> `>=2.0.0` both passed
+            # the downgrade check above with no further scrutiny, silently accepting a major
+            # bump this verifier exists specifically to catch (Dependabot's own update-type
+            # classification is the thing this whole verifier distrusts, so a compromised/wrong
+            # classification here would sail straight through). Reuse the same leading-
+            # significant-component check caret already uses -- the concept of "does this cross
+            # a major boundary" is identical regardless of which comparator kind is carrying the
+            # floor.
+            if caret_ceiling_component(base_cmp) != caret_ceiling_component(head_cmp):
+                return (
+                    f'{base_kind} requirement crossed a major-version boundary '
+                    f'("{base_req}" -> "{head_req}") -- this is a major bump, not a safe '
+                    "auto-approvable version change"
+                )
 
     return None
 
@@ -263,6 +278,18 @@ def collect_dependency_declarations(pkg_toml):
     workspace = pkg_toml.get("workspace", {})
     for name, value in workspace.get("dependencies", {}).items():
         out[("workspace.dependencies", name)] = normalize_dependency(value)
+    # `[target.'cfg(...)'.dependencies]` (and its dev-/build- siblings) is a real, currently-used
+    # shape in this repo (Codex P1, manta#194 round 1: windows-sys under
+    # crates/manta-engine/Cargo.toml's `[target.'cfg(windows)'.dependencies]`) -- ignoring it
+    # entirely meant a dependency declared ONLY under a target selector could bump across a major
+    # boundary with no reason ever raised. Keyed by (target.<selector>.<table>, name) so a
+    # dependency moving between selectors, or between a target table and a top-level one, shows
+    # up as an add+remove (routed to human review by the existing added/removed handling) rather
+    # than silently comparing across two different scopes.
+    for selector, tables in pkg_toml.get("target", {}).items():
+        for table_name in DEPENDENCY_TABLES:
+            for name, value in tables.get(table_name, {}).items():
+                out[(f"target.{selector}.{table_name}", name)] = normalize_dependency(value)
     return out
 
 
@@ -286,8 +313,8 @@ def check_manifest_diff(path, base_toml, head_toml):
                 f'"{path}" {table_name}.{dep_name} was added or removed -- not a version bump'
             )
             continue
-        base_kind, base_req = base_decl
-        head_kind, head_req = head_decl
+        base_kind, base_detail = base_decl
+        head_kind, head_detail = head_decl
         if base_kind != head_kind:
             reasons.append(
                 f'"{path}" {table_name}.{dep_name} changed declaration kind '
@@ -304,6 +331,20 @@ def check_manifest_diff(path, base_toml, head_toml):
                     f'"{path}" {table_name}.{dep_name} changed its {base_kind} declaration -- '
                     "not a plain version-requirement bump"
                 )
+            continue
+        base_req, base_rest = base_detail
+        head_req, head_rest = head_detail
+        if base_rest != head_rest:
+            # Codex P1, manta#194 round 1: features/default-features/optional/package/registry
+            # (everything in an inline version-table besides the version string itself) must
+            # stay byte-identical -- `package` in particular is Cargo's own alias mechanism
+            # (this key stays the same, but the crate it resolves to changes), directly
+            # analogous to npm's alias-swap attacks this verifier's widdershins counterpart
+            # already defends against.
+            reasons.append(
+                f'"{path}" {table_name}.{dep_name} changed a non-version field '
+                f"({base_rest} -> {head_rest}) -- not a plain version-requirement bump"
+            )
             continue
         if base_req == head_req:
             continue
@@ -409,10 +450,42 @@ def _version_tuple(version_str):
     return tuple(out)
 
 
+def check_diff_scope(base_ref, head_ref, allowed_paths):
+    """Reject any diff that touches a path outside `allowed_paths` (Codex P1, manta#194 round 1).
+
+    Every other check in this file only ever inspects the enumerated Cargo.toml/Cargo.lock paths
+    -- reporting SAFE never meant "the whole diff is safe," only "the files I looked at changed
+    safely." A compromised Dependabot commit could add arbitrary Rust source or workflow changes
+    alongside an acceptable dependency bump and this verifier would never even look at them.
+    Confirmed reproducible: running this verifier from this very PR's own parent commit to this
+    commit (which changes only .github/workflows/ and scripts/, no Cargo.toml/Cargo.lock at all)
+    returned SAFE before this check existed.
+    """
+    result = subprocess.run(
+        ["git", "diff", "--name-only", base_ref, head_ref],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return [f"could not compute the full diff between {base_ref} and {head_ref}"]
+    changed = [line for line in result.stdout.splitlines() if line]
+    out_of_scope = [path for path in changed if path not in allowed_paths]
+    if out_of_scope:
+        listed = ", ".join(f'"{p}"' for p in out_of_scope)
+        return [
+            f"the diff touches {listed}, outside the enumerated Cargo.toml/Cargo.lock paths -- "
+            "not confined to a dependency-version bump"
+        ]
+    return []
+
+
 def main(base_ref, head_ref):
     reasons = []
 
     manifest_paths = ["Cargo.toml"] + [f"{m}/Cargo.toml" for m in WORKSPACE_MEMBERS]
+    reasons.extend(
+        check_diff_scope(base_ref, head_ref, set(manifest_paths) | {"Cargo.lock"})
+    )
+
     for path in manifest_paths:
         base_text = git_show(base_ref, path)
         head_text = git_show(head_ref, path)

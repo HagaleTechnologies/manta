@@ -98,12 +98,12 @@ class CompareRequirementsTests(unittest.TestCase):
 
 class NormalizeDependencyTests(unittest.TestCase):
     def test_bare_string_is_version_kind(self):
-        self.assertEqual(v.normalize_dependency("1.2.3"), ("version", "1.2.3"))
+        self.assertEqual(v.normalize_dependency("1.2.3"), ("version", ("1.2.3", {})))
 
     def test_version_table_is_version_kind(self):
         self.assertEqual(
             v.normalize_dependency({"version": "1.2.3", "features": ["derive"]}),
-            ("version", "1.2.3"),
+            ("version", ("1.2.3", {"features": ["derive"]})),
         )
 
     def test_git_table_is_git_kind(self):
@@ -271,6 +271,7 @@ class MainEndToEndTests(unittest.TestCase):
             return files.get(path)
 
         with mock.patch.object(v, "git_show", side_effect=fake_git_show), \
+             mock.patch.object(v, "check_diff_scope", return_value=[]), \
              mock.patch.object(v, "WORKSPACE_MEMBERS", []):
             exit_code = v.main("base", "head")
         self.assertEqual(exit_code, 0)
@@ -299,9 +300,108 @@ class MainEndToEndTests(unittest.TestCase):
             return files.get(path)
 
         with mock.patch.object(v, "git_show", side_effect=fake_git_show), \
+             mock.patch.object(v, "check_diff_scope", return_value=[]), \
              mock.patch.object(v, "WORKSPACE_MEMBERS", []):
             exit_code = v.main("base", "head")
         self.assertEqual(exit_code, 1)
+
+
+class CheckDiffScopeTests(unittest.TestCase):
+    def _run(self, changed_files, allowed_paths):
+        fake_result = mock.Mock(returncode=0, stdout="\n".join(changed_files) + "\n")
+        with mock.patch.object(v.subprocess, "run", return_value=fake_result):
+            return v.check_diff_scope("base", "head", allowed_paths)
+
+    def test_diff_confined_to_allowed_paths_is_safe(self):
+        reasons = self._run(["Cargo.toml", "Cargo.lock"], {"Cargo.toml", "Cargo.lock"})
+        self.assertEqual(reasons, [])
+
+    def test_diff_touching_an_extra_file_is_flagged(self):
+        # The exact reproduction Codex gave: a diff that touches only workflow/script files (no
+        # Cargo.toml/Cargo.lock change at all) must not be reported safe just because none of the
+        # files THIS verifier inspects happen to differ.
+        reasons = self._run(
+            [".github/workflows/dependabot-auto-merge.yml", "scripts/verify-dependabot-diff-safe.py"],
+            {"Cargo.toml", "Cargo.lock"},
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("outside the enumerated", reasons[0])
+
+    def test_diff_mixing_allowed_and_extra_files_is_flagged(self):
+        reasons = self._run(
+            ["Cargo.toml", "Cargo.lock", "crates/manta-cli/src/main.rs"],
+            {"Cargo.toml", "Cargo.lock"},
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("main.rs", reasons[0])
+
+
+class TargetSpecificDependencyTests(unittest.TestCase):
+    def test_target_dependency_table_is_collected(self):
+        pkg_toml = {
+            "target": {
+                "cfg(windows)": {"dependencies": {"windows-sys": "0.59"}},
+            }
+        }
+        decls = v.collect_dependency_declarations(pkg_toml)
+        self.assertIn(("target.cfg(windows).dependencies", "windows-sys"), decls)
+
+    def test_target_dependency_major_bump_is_flagged(self):
+        base = {"target": {"cfg(windows)": {"dependencies": {"windows-sys": "0.59"}}}}
+        head = {"target": {"cfg(windows)": {"dependencies": {"windows-sys": "0.60"}}}}
+        reasons = v.check_manifest_diff("Cargo.toml", base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("major", reasons[0])
+
+    def test_target_dependency_patch_bump_is_safe(self):
+        base = {"target": {"cfg(windows)": {"dependencies": {"windows-sys": "0.59.1"}}}}
+        head = {"target": {"cfg(windows)": {"dependencies": {"windows-sys": "0.59.2"}}}}
+        self.assertEqual(v.check_manifest_diff("Cargo.toml", base, head), [])
+
+
+class NonVersionFieldPreservedTests(unittest.TestCase):
+    def test_added_feature_alongside_safe_version_bump_is_flagged(self):
+        base = {"dependencies": {"serde": {"version": "1.0.200", "features": ["derive"]}}}
+        head = {
+            "dependencies": {
+                "serde": {"version": "1.0.210", "features": ["derive", "rc"]}
+            }
+        }
+        reasons = v.check_manifest_diff("Cargo.toml", base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("non-version field", reasons[0])
+
+    def test_package_rename_alongside_safe_version_bump_is_flagged(self):
+        # Cargo's own alias mechanism: the dependency key stays the same, but `package` points it
+        # at a DIFFERENT actual crate -- directly analogous to npm's alias-swap attacks.
+        base = {"dependencies": {"compat": {"package": "real-crate", "version": "1.0.0"}}}
+        head = {"dependencies": {"compat": {"package": "malicious-crate", "version": "1.0.1"}}}
+        reasons = v.check_manifest_diff("Cargo.toml", base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("non-version field", reasons[0])
+
+    def test_unchanged_non_version_fields_with_safe_bump_is_safe(self):
+        base = {"dependencies": {"serde": {"version": "1.0.200", "features": ["derive"]}}}
+        head = {"dependencies": {"serde": {"version": "1.0.210", "features": ["derive"]}}}
+        self.assertEqual(v.check_manifest_diff("Cargo.toml", base, head), [])
+
+
+class ExactAndLowerBoundMajorBoundaryTests(unittest.TestCase):
+    def test_exact_major_bump_is_unsafe(self):
+        reason = v.compare_requirements("=1.2.3", "=2.0.0")
+        self.assertIsNotNone(reason)
+
+    def test_ge_major_bump_is_unsafe(self):
+        reason = v.compare_requirements(">=1.2.3", ">=2.0.0")
+        self.assertIsNotNone(reason)
+
+    def test_gt_zero_x_minor_crossing_is_unsafe(self):
+        reason = v.compare_requirements(">0.2.3", ">0.3.0")
+        self.assertIsNotNone(reason)
+
+    def test_ge_patch_bump_within_major_is_safe(self):
+        reason = v.compare_requirements(">=1.2.3", ">=1.9.0")
+        self.assertIsNone(reason)
 
 
 if __name__ == "__main__":
