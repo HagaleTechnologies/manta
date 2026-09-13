@@ -222,26 +222,30 @@ class CheckLockfileDiffTests(unittest.TestCase):
         head = {"package": [{"name": "manta-cli", "version": "0.1.0"}]}
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
-    def test_referenced_added_transitive_is_not_flagged_as_unreferenced(self):
+    def test_referenced_added_transitive_is_not_flagged_as_unreachable(self):
         # A real Cargo.lock never carries an addition nothing references (Cargo's own
         # `generate-lockfile` wouldn't produce one) -- serde_core is added and immediately
         # referenced by serde's own (now-changed) dependencies list, exactly as the real
-        # serde/serde_core split looks in practice. Finding U's "unreferenced" check must not
-        # fire on serde_core; whether serde's own dependencies-list change is separately flagged
-        # (Finding I's retained-entry check, since serde's version here is unchanged) is a
-        # different, orthogonal concern this test doesn't assert on either way.
+        # serde/serde_core split looks in practice, with serde itself reachable from a workspace
+        # root. Finding U/X's reachability check must not fire on serde_core; whether serde's own
+        # dependencies-list change is separately flagged (Finding I's retained-entry check, since
+        # serde's version here is unchanged) is a different, orthogonal concern this test doesn't
+        # assert on either way.
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["serde"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "serde",
                     "version": "1.0.200",
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
-                }
+                },
             ]
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "serde",
                     "version": "1.0.200",
@@ -258,7 +262,7 @@ class CheckLockfileDiffTests(unittest.TestCase):
             ]
         }
         reasons = v.check_lockfile_diff(base, head)
-        self.assertFalse(any("not referenced" in r for r in reasons))
+        self.assertFalse(any("not reachable" in r for r in reasons))
 
 
 class MainEndToEndTests(unittest.TestCase):
@@ -1031,8 +1035,10 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
         # RETAINED, not removed) while consumer_b's edge is retargeted to a newly ADDED foo 2.0.0
         # (added with no matching removal, since foo 1.0.0 is still needed elsewhere -- so the
         # major-boundary check on matched removed/added pairs never runs for it either).
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["consumer_a", "consumer_b"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
@@ -1057,6 +1063,7 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
@@ -1286,8 +1293,10 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
     """
 
     def test_dependencies_change_alongside_a_version_bump_is_flagged(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
@@ -1305,6 +1314,7 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.1",
@@ -1373,8 +1383,10 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
         # changes from a registry-sourced instance to a newly-added git-sourced instance of the
         # SAME name and version. Round 12's bare-name-set comparison saw {"bar"} == {"bar"} and
         # missed this entirely, since the name itself never changed.
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
@@ -1392,6 +1404,7 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.1",
@@ -1421,8 +1434,10 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
         # The clap_derive/syn case (round 12) restated as a diamond: foo's edge to "bar" shifts
         # from bar 1.0.0 to a newly-available bar 2.0.0 of the SAME kind/source -- both syn
         # instances coexist in head, same as clap_derive's real syn 2.x/3.x transition.
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
@@ -1440,6 +1455,7 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.1",
@@ -1628,18 +1644,21 @@ class LockfileUnreferencedAdditionTests(unittest.TestCase):
     """
 
     def test_wholly_unreferenced_addition_is_flagged(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "foo1",
-                }
+                },
             ]
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.1",
@@ -1657,21 +1676,24 @@ class LockfileUnreferencedAdditionTests(unittest.TestCase):
         reasons = v.check_lockfile_diff(base, head)
         self.assertEqual(len(reasons), 1)
         self.assertIn("orphan", reasons[0])
-        self.assertIn("not referenced", reasons[0])
+        self.assertIn("not reachable", reasons[0])
 
-    def test_referenced_addition_is_not_flagged_as_unreferenced(self):
+    def test_referenced_addition_is_not_flagged_as_unreachable(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
         base = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.0",
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "foo1",
-                }
+                },
             ]
         }
         head = {
             "package": [
+                root,
                 {
                     "name": "foo",
                     "version": "1.0.1",
@@ -1688,7 +1710,103 @@ class LockfileUnreferencedAdditionTests(unittest.TestCase):
             ]
         }
         reasons = v.check_lockfile_diff(base, head)
-        self.assertFalse(any("not referenced" in r for r in reasons))
+        self.assertFalse(any("not reachable" in r for r in reasons))
+
+
+class LockfileDisconnectedCycleTests(unittest.TestCase):
+    """Codex P1, manta#194 round 16, Finding X -- the exact reproduction: two added-only
+    entries referencing only EACH OTHER (`evil-a -> evil-b -> evil-a`), disconnected from every
+    real workspace root. Round 15's name-occurrence check saw both names mentioned in some
+    dependencies list and flagged neither.
+    """
+
+    def test_disconnected_referencing_cycle_is_flagged(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
+        base = {
+            "package": [
+                root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "evil-a",
+                    "version": "1.0.0",
+                    "source": "registry+https://malicious.example/fake-index",
+                    "checksum": "evila1",
+                    "dependencies": ["evil-b"],
+                },
+                {
+                    "name": "evil-b",
+                    "version": "1.0.0",
+                    "source": "registry+https://malicious.example/fake-index",
+                    "checksum": "evilb1",
+                    "dependencies": ["evil-a"],
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 2)
+        joined = " ".join(reasons)
+        self.assertIn("evil-a", joined)
+        self.assertIn("evil-b", joined)
+        for r in reasons:
+            self.assertIn("not reachable", r)
+
+    def test_cycle_reachable_from_a_real_root_is_not_flagged(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
+        base = {
+            "package": [
+                root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                root,
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["real-a"],
+                },
+                {
+                    "name": "real-a",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "reala1",
+                    "dependencies": ["real-b"],
+                },
+                {
+                    "name": "real-b",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "realb1",
+                    "dependencies": ["real-a"],
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertFalse(any("not reachable" in r for r in reasons))
 
 
 if __name__ == "__main__":

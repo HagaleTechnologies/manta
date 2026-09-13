@@ -698,6 +698,43 @@ def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
     return resolved
 
 
+def _reachable_lockfile_identities(pkgs, pkgs_by_name):
+    """BFS the full (name, kind, version, source) identities reachable from every workspace-kind
+    root package (a workspace member's own [[package]] entry, source=None) via real
+    `dependencies` edges.
+
+    Codex P1, manta#194 round 16, Finding X: round 15's Finding U checked mere NAME occurrence
+    anywhere in the head lockfile's dependency lists, which a disconnected, self-referencing
+    cycle of added-only entries can trivially satisfy for itself -- two brand-new packages each
+    "referencing" only each other (`evil-a -> evil-b -> evil-a`) both appear in some
+    `dependencies` list, but NEITHER is reachable from any real workspace root. This replaces
+    that name-occurrence check with actual graph reachability, which a disconnected subgraph
+    fails regardless of how it references itself.
+
+    An unresolvable ref (ambiguous among 2+ same-name candidates, or naming nothing at all)
+    conservatively marks EVERY same-name candidate as reachable rather than silently dropping a
+    real edge -- consistent with this file's existing bias to fail toward "don't flag" on
+    genuine ambiguity, not toward missing a real connection.
+    """
+    roots = [key for key in pkgs if key[1] == "workspace"]
+    reachable = set(roots)
+    frontier = list(roots)
+    while frontier:
+        next_frontier = []
+        for key in frontier:
+            for ref in pkgs[key].get("dependencies", []):
+                name = ref.split(" ", 1)[0]
+                candidates = pkgs_by_name.get(name, [])
+                target = _resolve_dependency_ref(ref, candidates)
+                targets = [target] if target is not None else candidates
+                for t in targets:
+                    if t not in reachable:
+                        reachable.add(t)
+                        next_frontier.append(t)
+        frontier = next_frontier
+    return reachable
+
+
 def check_lockfile_diff(base_lock, head_lock):
     """Compare Cargo.lock's [[package]] entries between base and head.
 
@@ -877,25 +914,23 @@ def check_lockfile_diff(base_lock, head_lock):
     # ordinarily a fresh transitive pulled in by a manifest bump, and not this verifier's concern
     # per se (Cargo itself already validated the lockfile's own internal consistency via `cargo
     # generate-lockfile`/`cargo update` when it produced this diff). But Codex P1, manta#194
-    # round 15, Finding U: an added entry that NOTHING in the head lockfile's own dependency graph
-    # references at all is not explainable as a consequence of anything else in the diff -- Cargo
-    # itself would never add such an orphaned package via a normal update, so its presence here
-    # is unverifiable. Checked by bare NAME (not exact identity) against every OTHER head entry's
-    # `dependencies` list, deliberately erring toward NOT flagging when the name is referenced by
-    # anything at all, even ambiguously -- this is a narrow "wholly unreferenced" check, not a
-    # full graph-reachability validation.
-    referenced_names = set()
-    for entry in head_pkgs.values():
-        for ref in entry.get("dependencies", []):
-            referenced_names.add(ref.split(" ", 1)[0])
+    # round 15, Finding U (refined round 16, Finding X): an added entry unreachable from every
+    # workspace member via a real dependency edge is not explainable as a consequence of anything
+    # else in the diff -- Cargo itself would never add such an orphaned package via a normal
+    # update, so its presence here is unverifiable. Round 15's first cut checked mere NAME
+    # occurrence anywhere in the lockfile's dependency lists, which a disconnected, self-
+    # referencing cycle of added-only entries (`evil-a -> evil-b -> evil-a`) trivially defeats --
+    # both names occur in SOME dependencies list, but neither is reachable from a real root.
+    # _reachable_lockfile_identities replaces name-occurrence with actual graph reachability.
+    head_reachable = _reachable_lockfile_identities(head_pkgs, head_by_name)
     for added_name, added_entries in added_grouped.items():
-        if added_name in referenced_names:
-            continue
-        for kind, version, _source in added_entries:
+        for kind, version, source in added_entries:
+            if (added_name, kind, version, source) in head_reachable:
+                continue
             reasons.append(
                 f'Cargo.lock package "{added_name}" ({kind}, {version}) was added but is not '
-                "referenced by any dependency edge in the head lockfile -- not verifiable as a "
-                "safe consequence of the rest of the dependency-graph change"
+                "reachable from any workspace member via a real dependency edge -- not "
+                "verifiable as a safe consequence of the rest of the dependency-graph change"
             )
 
     # Retained entries -- same (name, kind, version, source) key present in BOTH base and head --
