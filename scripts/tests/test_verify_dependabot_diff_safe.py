@@ -1809,5 +1809,130 @@ class LockfileDisconnectedCycleTests(unittest.TestCase):
         self.assertFalse(any("not reachable" in r for r in reasons))
 
 
+class LockfileFakeRootTests(unittest.TestCase):
+    """Codex P1, manta#194 round 17, Finding Y -- the exact reproduction: a brand-new, source-
+    less `[[package]]` entry (added in this very diff) masquerading as a workspace root,
+    vouching for an attached evil subgraph. Round 16's fix trusted every kind=="workspace"
+    entry regardless of whether it pre-existed.
+    """
+
+    def test_fabricated_root_does_not_vouch_for_its_subgraph(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo"]}
+        base = {
+            "package": [
+                root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                root,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "fake-root",
+                    "version": "0.1.0",
+                    "dependencies": ["evil"],
+                },
+                {
+                    "name": "evil",
+                    "version": "1.0.0",
+                    "source": "registry+https://malicious.example/fake-index",
+                    "checksum": "evil1",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 2)
+        joined = " ".join(reasons)
+        self.assertIn("fake-root", joined)
+        self.assertIn("evil", joined)
+        for r in reasons:
+            self.assertIn("not reachable", r)
+
+    def test_pre_existing_workspace_member_still_vouches_for_its_subgraph(self):
+        root = {"name": "root", "version": "0.1.0", "dependencies": ["foo", "member"]}
+        member = {"name": "member", "version": "0.1.0"}
+        base = {
+            "package": [
+                root,
+                member,
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                root,
+                {
+                    "name": "member",
+                    "version": "0.1.0",
+                    "dependencies": ["real-dep"],
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "real-dep",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "rd1",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertFalse(any("not reachable" in r for r in reasons))
+
+
+class RequirementOmittedComponentBoundaryTests(unittest.TestCase):
+    """Codex P1, manta#194 round 17, Finding Z, plus a second bug the same verified fix also
+    closes: Cargo's own omitted-component semantics for `>`/`<=`/`=` are not "zero-fill to 0" --
+    confirmed against the real `semver` crate's src/eval.rs, the crate Cargo itself uses.
+    """
+
+    def test_strict_gt_with_omitted_patch_excludes_the_whole_line(self):
+        # Codex's exact reproduction: `>1.2` must reject 1.2.1 (and all of 1.2.x), not just
+        # values <= a zero-filled 1.2.0.
+        self.assertFalse(v.requirement_is_satisfied_by(">1.2", "1.2.1"))
+        self.assertFalse(v.requirement_is_satisfied_by(">1.2", "1.2.0"))
+        self.assertTrue(v.requirement_is_satisfied_by(">1.2", "1.3.0"))
+
+    def test_le_with_omitted_patch_includes_the_whole_line(self):
+        # Found while implementing Finding Z's fix, not from a separate Codex comment: `<=1.2`
+        # must ACCEPT all of 1.2.x, which the previous zero-filled-floor comparison rejected for
+        # anything above 1.2.0.
+        self.assertTrue(v.requirement_is_satisfied_by("<=1.2", "1.2.1"))
+        self.assertTrue(v.requirement_is_satisfied_by("<=1.2", "1.2.0"))
+        self.assertFalse(v.requirement_is_satisfied_by("<=1.2", "1.3.0"))
+
+    def test_exact_with_omitted_patch_matches_the_whole_line(self):
+        # This is MAN-220's Finding W, resolved as a side effect of the same verified boundary
+        # helper Finding Z needed.
+        self.assertTrue(v.requirement_is_satisfied_by("=1.2", "1.2.5"))
+        self.assertFalse(v.requirement_is_satisfied_by("=1.2", "1.3.0"))
+
+    def test_fully_specified_comparators_are_unaffected(self):
+        self.assertFalse(v.requirement_is_satisfied_by(">1.2.3", "1.2.3"))
+        self.assertTrue(v.requirement_is_satisfied_by(">1.2.3", "1.2.4"))
+        self.assertTrue(v.requirement_is_satisfied_by("<=1.2.3", "1.2.3"))
+        self.assertFalse(v.requirement_is_satisfied_by("<=1.2.3", "1.2.4"))
+
+
 if __name__ == "__main__":
     unittest.main()

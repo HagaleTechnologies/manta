@@ -336,6 +336,34 @@ def compare_requirements(base_req, head_req):
     return None
 
 
+def _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch):
+    """Where (v_major, v_minor, v_patch) sits relative to a GT/GE/LT/LE/EXACT comparator's own
+    (possibly partial) major/minor/patch: "gt", "lt", or "eq" (matching that specified prefix,
+    with any omitted trailing component unconstrained).
+
+    A direct port of the actual `semver` crate's matches_greater/matches_less/matches_exact
+    (confirmed against dtolnay/semver's src/eval.rs, the crate Cargo itself uses) -- Codex P1,
+    manta#194 round 17, Finding Z, plus a second bug this port also happens to fix: Cargo's own
+    omitted-component semantics for `>`/`<=` are NOT simply "zero-fill the omitted component to
+    0" the way this file's earlier `floor_tuple`-based approximation assumed. `>1.2` (omitted
+    patch) excludes the ENTIRE 1.2.x line -- equivalent to `>=1.3.0`, not `>1.2.0` -- while
+    `<=1.2` INCLUDES the entire 1.2.x line -- equivalent to `<1.3.0`, not `<=1.2.0`. The two
+    operators are not symmetric once a component is omitted, which is exactly why a single
+    zero-filled floor value can't represent both correctly.
+    """
+    if v_major != major:
+        return "gt" if v_major > major else "lt"
+    if minor is None:
+        return "eq"
+    if v_minor != minor:
+        return "gt" if v_minor > minor else "lt"
+    if patch is None:
+        return "eq"
+    if v_patch != patch:
+        return "gt" if v_patch > patch else "lt"
+    return "eq"
+
+
 def requirement_is_satisfied_by(req, version_str):
     """True if the concrete resolved version `version_str` satisfies every AND'd comparator in
     the Cargo requirement string `req` -- a full comparator-satisfaction predicate, not just a
@@ -365,21 +393,28 @@ def requirement_is_satisfied_by(req, version_str):
     v_major, v_minor, v_patch, v_pre = _parse_bare_version(version_str)
     v_key = version_sort_key(v_major, v_minor, v_patch, v_pre)
     for comparator in comparators:
-        kind, major, minor, _patch, _pre = comparator
+        kind, major, minor, patch, _pre = comparator
         if kind == LT:
             if v_key >= floor_tuple(comparator):
                 return False
         elif kind == LE:
-            if v_key > floor_tuple(comparator):
+            # Omitted-component-aware (Finding Z's fix also covers LE): `<=1.2` includes the
+            # WHOLE 1.2.x line, which a zero-filled floor comparison would reject for 1.2.1+.
+            if _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch) == "gt":
                 return False
         elif kind == GT:
-            if v_key <= floor_tuple(comparator):
+            # Omitted-component-aware (Codex P1, manta#194 round 17, Finding Z): `>1.2` excludes
+            # the WHOLE 1.2.x line, which a zero-filled floor comparison would wrongly accept.
+            if _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch) != "gt":
                 return False
         elif kind == GE:
             if v_key < floor_tuple(comparator):
                 return False
         elif kind == EXACT:
-            if v_key != floor_tuple(comparator):
+            # Omitted-component-aware: `=1.2` matches any 1.2.x (this is Finding W, ticketed as
+            # MAN-220 -- resolved here as a direct consequence of the same verified boundary
+            # helper Finding Z needed, not a separate fix).
+            if _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch) != "eq":
                 return False
         elif kind == CARET:
             if v_key < floor_tuple(comparator):
@@ -698,9 +733,8 @@ def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
     return resolved
 
 
-def _reachable_lockfile_identities(pkgs, pkgs_by_name):
-    """BFS the full (name, kind, version, source) identities reachable from every workspace-kind
-    root package (a workspace member's own [[package]] entry, source=None) via real
+def _reachable_lockfile_identities(pkgs, pkgs_by_name, roots):
+    """BFS the full (name, kind, version, source) identities reachable from `roots` via real
     `dependencies` edges.
 
     Codex P1, manta#194 round 16, Finding X: round 15's Finding U checked mere NAME occurrence
@@ -711,12 +745,17 @@ def _reachable_lockfile_identities(pkgs, pkgs_by_name):
     that name-occurrence check with actual graph reachability, which a disconnected subgraph
     fails regardless of how it references itself.
 
+    `roots` is supplied by the caller rather than derived here from mere kind=="workspace"
+    (Codex P1, manta#194 round 17, Finding Y): trusting every source-less entry as an
+    independent root let a freshly-fabricated "fake-root" (also added in the very same diff,
+    with no real workspace manifest behind it) vouch for an attached evil subgraph. The caller
+    restricts roots to workspace-kind identities that already existed in BASE.
+
     An unresolvable ref (ambiguous among 2+ same-name candidates, or naming nothing at all)
     conservatively marks EVERY same-name candidate as reachable rather than silently dropping a
     real edge -- consistent with this file's existing bias to fail toward "don't flag" on
     genuine ambiguity, not toward missing a real connection.
     """
-    roots = [key for key in pkgs if key[1] == "workspace"]
     reachable = set(roots)
     frontier = list(roots)
     while frontier:
@@ -922,7 +961,16 @@ def check_lockfile_diff(base_lock, head_lock):
     # referencing cycle of added-only entries (`evil-a -> evil-b -> evil-a`) trivially defeats --
     # both names occur in SOME dependencies list, but neither is reachable from a real root.
     # _reachable_lockfile_identities replaces name-occurrence with actual graph reachability.
-    head_reachable = _reachable_lockfile_identities(head_pkgs, head_by_name)
+    # Roots are restricted to workspace-kind names that already existed in BASE (Codex P1,
+    # manta#194 round 17, Finding Y) -- a genuinely new workspace member would already be
+    # rejected by check_diff_scope (its Cargo.toml path isn't in this verifier's fixed
+    # manifest_paths), so this loses no real coverage, and it means a freshly-fabricated
+    # source-less "root" added in this very diff can no longer vouch for anything.
+    pre_existing_workspace_names = {key[0] for key in base_pkgs if key[1] == "workspace"}
+    trusted_roots = [
+        key for key in head_pkgs if key[1] == "workspace" and key[0] in pre_existing_workspace_names
+    ]
+    head_reachable = _reachable_lockfile_identities(head_pkgs, head_by_name, trusted_roots)
     for added_name, added_entries in added_grouped.items():
         for kind, version, source in added_entries:
             if (added_name, kind, version, source) in head_reachable:
