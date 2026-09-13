@@ -2536,7 +2536,7 @@ class LockfileReplacementGitCommitSwapTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "bar1",
                     "dependencies": [
-                        "foo git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        "foo 1.0.0 (git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
                     ],
                 },
                 {
@@ -2557,7 +2557,7 @@ class LockfileReplacementGitCommitSwapTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "bar2",
                     "dependencies": [
-                        "foo git+https://good.example/foo.git?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        "foo 1.0.0 (git+https://good.example/foo.git?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
                     ],
                 },
                 {
@@ -2587,7 +2587,7 @@ class LockfileReplacementGitCommitSwapTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "bar2",
                     "dependencies": [
-                        "foo git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        "foo 1.0.0 (git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
                     ],
                 },
                 {
