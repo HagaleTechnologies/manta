@@ -42,6 +42,15 @@ class CompareRequirementsTests(unittest.TestCase):
     def test_caret_zero_zero_x_crossing_patch_is_unsafe(self):
         self.assert_unsafe("0.0.3", "0.0.4")
 
+    def test_caret_cross_position_ceiling_collision_is_unsafe(self):
+        # Codex P1, manta#194 round 6: 0.2.3's ceiling is its MINOR component (value 2); 2.0.0's
+        # ceiling is its MAJOR component (also value 2). Comparing bare values alone made these
+        # collide and read as an unchanged ceiling -- a full major bump passing as safe.
+        self.assert_unsafe("0.2.3", "2.0.0")
+
+    def test_exact_cross_position_ceiling_collision_is_unsafe(self):
+        self.assert_unsafe("=0.2.3", "=2.0.0")
+
     def test_unchanged_requirement_is_safe(self):
         self.assert_safe("0.0.3", "0.0.3")
 
@@ -549,6 +558,13 @@ class LockfileMajorBoundaryOnIncreaseTests(unittest.TestCase):
 
     def test_zero_x_patch_increase_within_same_minor_is_safe(self):
         self.assertEqual(v.check_lockfile_diff(self._pkg("0.2.3"), self._pkg("0.2.9")), [])
+
+    def test_cross_position_ceiling_collision_is_flagged(self):
+        # Codex P1, manta#194 round 6: 0.2.3's ceiling is its minor (2); 2.0.0's ceiling is its
+        # major (also 2) -- this exact resolved-version jump is what the round-6 fix targets.
+        reasons = v.check_lockfile_diff(self._pkg("0.2.3"), self._pkg("2.0.0"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("major/0.x boundary", reasons[0])
 
 
 class LockfileRetainedEntryTests(unittest.TestCase):

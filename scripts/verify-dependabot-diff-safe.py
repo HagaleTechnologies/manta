@@ -203,19 +203,28 @@ def floor_tuple(comparator):
 
 
 def caret_ceiling_component(comparator):
-    """The single component whose value bounds a caret comparator's ceiling.
+    """The (position, value) pair identifying a caret comparator's ceiling: WHICH component
+    bounds it, and that component's value.
 
     Cargo's own special-casing: the ceiling tracks the LEFTMOST significant (non-major-zero)
     component -- major normally, but minor for a 0.x major, and patch for a 0.0.x major/minor.
     Any change to that specific component is a ceiling change; changes to components to its
     right are pure floor movement within the same ceiling.
+
+    Returning the bare numeric value alone, with no record of WHICH position it came from
+    (Codex P1, manta#194 round 6), let two comparators whose ceilings sit at DIFFERENT positions
+    collide on the same number: 0.2.3's ceiling is its minor (2), 2.0.0's ceiling is its major
+    (2) -- both returned plain `2`, so every caller comparing them with `!=` (compare_requirements'
+    CARET and EXACT/GT/GE branches, and check_lockfile_diff's resolved-version boundary check)
+    read "0.2.3 -> 2.0.0" as unchanged and silently approved a full major bump. The position tag
+    (0=major, 1=minor, 2=patch) makes a cross-position pair always compare unequal.
     """
     _kind, major, minor, patch, _pre = comparator
     if major != 0:
-        return major
+        return (0, major)
     if minor is None or minor != 0:
-        return minor
-    return patch
+        return (1, minor)
+    return (2, patch)
 
 
 def compare_requirements(base_req, head_req):
