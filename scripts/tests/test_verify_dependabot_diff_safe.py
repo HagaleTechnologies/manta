@@ -856,6 +856,19 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
     fb1c7f3 (a plain clap patch bump) hit this on ~10 unrelated proc-macro crates.
     """
 
+    def _syn_entry(self):
+        # A real Cargo.lock always carries an entry for every crate named in a `dependencies`
+        # list -- these tests must include it so _resolve_dependency_ref has something to
+        # resolve "syn"/"syn 2.0.118" against (an earlier version of these fixtures omitted it,
+        # which made every ref silently unresolvable and passed these tests for the wrong
+        # reason -- caught while implementing round 8's Finding I fix).
+        return {
+            "name": "syn",
+            "version": "2.0.118",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "checksum": "syn-checksum",
+        }
+
     def test_disambiguation_suffix_appearing_is_safe(self):
         base = {
             "package": [
@@ -865,7 +878,8 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
                     "dependencies": ["proc-macro2", "quote", "syn"],
-                }
+                },
+                self._syn_entry(),
             ]
         }
         head = {
@@ -876,7 +890,8 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
                     "dependencies": ["proc-macro2", "quote", "syn 2.0.118"],
-                }
+                },
+                self._syn_entry(),
             ]
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
@@ -890,7 +905,8 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
                     "dependencies": ["proc-macro2", "quote", "syn 2.0.118"],
-                }
+                },
+                self._syn_entry(),
             ]
         }
         head = {
@@ -901,14 +917,16 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
                     "dependencies": ["proc-macro2", "quote", "syn"],
-                }
+                },
+                self._syn_entry(),
             ]
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
     def test_actual_dependency_name_addition_alongside_disambiguation_noise_is_flagged(self):
-        # Confirms normalizing to bare names doesn't mask an actual add/remove riding along with
-        # unrelated disambiguation churn.
+        # Confirms tolerating disambiguation-suffix churn doesn't mask an actual add/remove
+        # riding along with it -- `syn`'s own identity is unchanged and correctly tolerated, but
+        # `malicious-crate` is a genuinely new edge with no resolution at all.
         base = {
             "package": [
                 {
@@ -917,7 +935,8 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
                     "dependencies": ["proc-macro2", "quote", "syn"],
-                }
+                },
+                self._syn_entry(),
             ]
         }
         head = {
@@ -928,12 +947,187 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
                     "dependencies": ["proc-macro2", "quote", "syn 2.0.118", "malicious-crate"],
-                }
+                },
+                self._syn_entry(),
             ]
         }
         reasons = v.check_lockfile_diff(base, head)
         self.assertEqual(len(reasons), 1)
         self.assertIn("dependencies", reasons[0])
+
+    def test_edge_retargeted_to_newly_added_major_version_is_flagged(self):
+        # Codex P1, manta#194 round 8, Finding I -- the exact reproduction: a diamond dependency
+        # where consumer_a keeps depending on foo 1.0.0 (so foo 1.0.0's own [[package]] entry is
+        # RETAINED, not removed) while consumer_b's edge is retargeted to a newly ADDED foo 2.0.0
+        # (added with no matching removal, since foo 1.0.0 is still needed elsewhere -- so the
+        # major-boundary check on matched removed/added pairs never runs for it either).
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "consumer_a",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "ca",
+                    "dependencies": ["foo 1.0.0"],
+                },
+                {
+                    "name": "consumer_b",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "cb",
+                    "dependencies": ["foo 1.0.0"],
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "foo",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                },
+                {
+                    "name": "consumer_a",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "ca",
+                    "dependencies": ["foo 1.0.0"],
+                },
+                {
+                    "name": "consumer_b",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "cb",
+                    "dependencies": ["foo 2.0.0"],
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("consumer_b", reasons[0])
+        self.assertIn("dependencies", reasons[0])
+
+
+class RequirementFloorTests(unittest.TestCase):
+    def test_caret_floor_is_the_bare_version(self):
+        self.assertEqual(v.requirement_floor("1.1"), v.version_sort_key(1, 1, 0, None))
+
+    def test_bare_wildcard_floor_is_zero(self):
+        self.assertEqual(v.requirement_floor("*"), v.version_sort_key(0, 0, 0, None))
+
+    def test_explicit_range_floor_ignores_the_ceiling_comparator(self):
+        self.assertEqual(
+            v.requirement_floor(">=1.2.3, <2.0.0"), v.version_sort_key(1, 2, 3, None)
+        )
+
+    def test_pure_ceiling_only_requirement_floor_is_zero(self):
+        self.assertEqual(v.requirement_floor("<2.0.0"), v.version_sort_key(0, 0, 0, None))
+
+    def test_unparseable_requirement_returns_none(self):
+        self.assertIsNone(v.requirement_floor("not a version"))
+
+
+class ManifestLockfileConsistencyTests(unittest.TestCase):
+    """Codex P1, manta#194 round 8, Finding J: a manifest floor raised beyond an already-
+    unchanged locked version triggers neither compare_requirements (sees a non-major bump) nor
+    check_lockfile_diff (the lockfile entry didn't change at all) -- this check validates the
+    HEAD manifest/lock combination directly, independent of what changed in the diff.
+    """
+
+    def _lock(self, version):
+        return {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": version,
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+
+    def test_floor_raised_beyond_stale_locked_version_is_flagged(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.1"}}}
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, self._lock("1.0.5"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("does not satisfy the head manifest", reasons[0])
+
+    def test_locked_version_satisfying_the_raised_floor_is_safe(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.1"}}}
+        self.assertEqual(
+            v.check_manifest_lockfile_consistency(head_tomls, self._lock("1.1.0")), []
+        )
+
+    def test_unchanged_requirement_with_satisfying_lock_is_safe(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.0"}}}
+        self.assertEqual(
+            v.check_manifest_lockfile_consistency(head_tomls, self._lock("1.0.5")), []
+        )
+
+    def test_no_lockfile_entry_is_out_of_scope(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.1"}}}
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, {"package": []}), [])
+
+    def test_ambiguous_diamond_is_out_of_scope(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": "1.1"}}}
+        lock = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.0.5",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "demo",
+                    "version": "1.5.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bbb",
+                },
+            ]
+        }
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+
+class ManifestLockfileConsistencyEndToEndTests(unittest.TestCase):
+    def test_stale_lock_against_raised_floor_fails_end_to_end(self):
+        base_files = {
+            "Cargo.toml": '[workspace]\nmembers = []\n\n[workspace.dependencies]\ndemo = "1.0"\n',
+            "Cargo.lock": (
+                "[[package]]\n"
+                'name = "demo"\n'
+                'version = "1.0.5"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                'checksum = "aaa"\n'
+            ),
+        }
+        head_files = {
+            "Cargo.toml": '[workspace]\nmembers = []\n\n[workspace.dependencies]\ndemo = "1.1"\n',
+            "Cargo.lock": base_files["Cargo.lock"],
+        }
+
+        def fake_git_show(ref, path):
+            files = base_files if ref == "base" else head_files
+            return files.get(path)
+
+        with mock.patch.object(v, "git_show", side_effect=fake_git_show), \
+             mock.patch.object(v, "check_diff_scope", return_value=[]), \
+             mock.patch.object(v, "WORKSPACE_MEMBERS", []):
+            exit_code = v.main("base", "head")
+        self.assertEqual(exit_code, 1)
 
 
 if __name__ == "__main__":

@@ -336,6 +336,40 @@ def compare_requirements(base_req, head_req):
     return None
 
 
+def requirement_floor(req):
+    """The lowest version any comparator in `req` could accept -- the MAXIMUM of every individual
+    comparator's own floor, since comma-separated pieces are always AND'd (never OR'd) in Cargo's
+    grammar, so the effective floor is bounded by the strictest one. A pure ceiling comparator
+    (LT/LE) contributes no floor of its own. Returns a version_sort_key-comparable tuple, or None
+    if `req` fails to parse -- never raises.
+
+    Deliberately narrow: this extracts the floor ONLY, not full requirement satisfaction (it says
+    nothing about whether some version is too HIGH for a caret/tilde ceiling, or about an
+    unmatched EXACT pin). That's enough for check_manifest_lockfile_consistency's one job --
+    confirming a resolved version isn't BELOW what the manifest now requires -- without adding a
+    whole new comparator-satisfaction evaluator (this file's biggest source of subtle bugs across
+    rounds 3-8) just to cover the one direction Dependabot can actually make go wrong.
+    """
+    try:
+        comparators = parse_requirement(req)
+    except VerifyError:
+        return None
+    floors = []
+    for comparator in comparators:
+        kind, major, _minor, _patch, pre = comparator
+        if kind in (LT, LE):
+            continue
+        if kind == WILDCARD and major is None:
+            # Bare "*" -- Cargo Book: `* := >=0.0.0`. floor_tuple would pass `major=None`
+            # straight into version_sort_key otherwise, which only None-guards minor/patch.
+            floors.append(version_sort_key(0, 0, 0, pre))
+        else:
+            floors.append(floor_tuple(comparator))
+    if not floors:
+        return version_sort_key(0, 0, 0, None)
+    return max(floors)
+
+
 def collect_dependency_declarations(pkg_toml):
     """Flatten every dependency table in a parsed Cargo.toml into {name: normalized value}."""
     out = {}
@@ -511,6 +545,76 @@ def _source_identity(kind, source):
     return source
 
 
+def _index_pkgs_by_name(pkgs):
+    """{name: [full (name, kind, version, source) keys]} for one side of a parsed Cargo.lock."""
+    out = {}
+    for key in pkgs:
+        out.setdefault(key[0], []).append(key)
+    return out
+
+
+def _resolve_dependency_ref(ref, candidates):
+    """Resolve one `dependencies` list entry ("name", "name version", or "name version (source)")
+    to the exact (name, kind, version, source) key it points to, among `candidates` (every key on
+    this same side of the diff sharing that name). Returns None if resolution is ambiguous or
+    impossible -- callers must treat None as "could not confirm unchanged," never as "unchanged."
+
+    Cargo's own lockfile encoding (confirmed against cargo's resolver/encode.rs and the Cargo
+    Book): version/source are appended ONLY to disambiguate multiple resolved instances of a name
+    elsewhere in the graph. A crate name can't contain a space, so splitting on the first one is
+    exact.
+    """
+    name, _, rest = ref.partition(" ")
+    if not rest:
+        return candidates[0] if len(candidates) == 1 else None
+    if rest.endswith(")") and " (" in rest:
+        version_part, _, source_part = rest.partition(" (")
+        source_part = source_part[:-1]
+    else:
+        version_part, source_part = rest, None
+    matches = [
+        key
+        for key in candidates
+        if key[2] == version_part and (source_part is None or key[3] == source_part)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolved_dependency_identities(deps, own_by_name, other_by_name):
+    """Resolve a `dependencies` list to the set of identities it references, for comparison
+    against the SAME package's dependency list on the other side of the diff.
+
+    For a name that never has more than one simultaneous candidate on EITHER side (`own_by_name`
+    or `other_by_name`), resolves to the bare NAME alone regardless of version/source (Codex P1,
+    manta#194 round 8, fixing a regression this round's own first cut introduced -- caught while
+    re-verifying against manta's real Dependabot history, not from a Codex comment): when a
+    name's sole resolved instance simply bumps version between base and head (the ordinary case,
+    e.g. skimmer-cli's edge to "clap" when clap itself bumps), that instance's own version-level
+    safety is ALREADY independently verified via clap's own [[package]] entry checks elsewhere in
+    check_lockfile_diff -- resolving the edge to its full identity re-flagged it as "changed" on
+    every such bump, which is pure noise, not a coverage gap.
+
+    Only when a name has 2+ simultaneous candidates on EITHER side (round 8, Finding I's actual
+    diamond-dependency scenario) does this fall through to full identity resolution, since only
+    then can an edge meaningfully be redirected between two coexisting versions with no
+    accompanying removed+added pair to catch it. An unresolvable ref in that case (ambiguous, or
+    naming a crate with no matching [[package]] entry at all) falls back to a sentinel keyed on
+    its own raw text -- two unresolvable refs only compare equal if their raw text is identical,
+    so this never silently treats a real change as unchanged, it only ever fails toward "flag it."
+    """
+    resolved = set()
+    for ref in deps:
+        name = ref.split(" ", 1)[0]
+        own_candidates = own_by_name.get(name, [])
+        other_candidates = other_by_name.get(name, [])
+        if len(own_candidates) <= 1 and len(other_candidates) <= 1:
+            resolved.add(name)
+            continue
+        key = _resolve_dependency_ref(ref, own_candidates)
+        resolved.add(key if key is not None else ("__unresolved__", ref))
+    return resolved
+
+
 def check_lockfile_diff(base_lock, head_lock):
     """Compare Cargo.lock's [[package]] entries between base and head.
 
@@ -523,6 +627,8 @@ def check_lockfile_diff(base_lock, head_lock):
     """
     base_pkgs = parse_lockfile_packages(base_lock)
     head_pkgs = parse_lockfile_packages(head_lock)
+    base_by_name = _index_pkgs_by_name(base_pkgs)
+    head_by_name = _index_pkgs_by_name(head_pkgs)
     reasons = []
 
     removed = set(base_pkgs) - set(head_pkgs)
@@ -650,21 +756,34 @@ def check_lockfile_diff(base_lock, head_lock):
         # that depends on it between "syn" and "syn 2.0.118" with no actual change to what code
         # runs -- manta's own real bump commit fb1c7f3 (clap 4.6.1 -> 4.6.4, otherwise a plain
         # patch bump) hit exactly this on ~10 unrelated proc-macro crates and would have been
-        # rejected outright by a byte-for-byte comparison. Comparing by bare crate NAME (add/
-        # remove sensitive) rather than the full disambiguated string is not a coverage gap: an
-        # actual version/source change behind a disambiguated reference is independently caught
-        # via that dependency's OWN [[package]] entry checks above -- this field only re-derives
-        # information already tracked elsewhere, so normalizing it here doesn't hide anything.
+        # rejected outright by a byte-for-byte comparison.
+        #
+        # Comparing by bare crate NAME ALONE (round 7's first attempt) was itself a real gap
+        # (Codex P1, manta#194 round 8, Finding I): when two versions of the same crate coexist
+        # (a diamond dependency), a retained entry's edge changing from "foo 1.0.0" to a newly
+        # ADDED "foo 2.0.0" -- while another consumer keeps "foo 1.0.0", so foo 1.0.0's own
+        # [[package]] entry is RETAINED, not removed -- collapsed both refs to the bare name
+        # "foo" and read as unchanged; the new "foo 2.0.0" entry, added with no matching removal,
+        # is separately out of scope (see the comment above this loop). A real major-version or
+        # source transition on that one edge passed unnoticed. Resolving each ref to the exact
+        # package identity it points to (via _resolved_dependency_identities) closes this: "syn"
+        # and "syn 2.0.118" still resolve to the SAME single syn entry when only one exists (the
+        # benign case above), but "foo 1.0.0" and "foo 2.0.0" resolve to two DIFFERENT entries
+        # when both exist, so the edge change is correctly visible.
         base_fields = dict(base_entry)
         head_fields = dict(head_entry)
-        base_dep_names = {ref.split(" ", 1)[0] for ref in base_fields.pop("dependencies", [])}
-        head_dep_names = {ref.split(" ", 1)[0] for ref in head_fields.pop("dependencies", [])}
+        base_dep_ids = _resolved_dependency_identities(
+            base_fields.pop("dependencies", []), base_by_name, head_by_name
+        )
+        head_dep_ids = _resolved_dependency_identities(
+            head_fields.pop("dependencies", []), head_by_name, base_by_name
+        )
         changed_fields = sorted(
             f
             for f in set(base_fields) | set(head_fields)
             if base_fields.get(f) != head_fields.get(f)
         )
-        if base_dep_names != head_dep_names:
+        if base_dep_ids != head_dep_ids:
             changed_fields.append("dependencies")
         if changed_fields:
             name, kind, version, _source = key
@@ -708,6 +827,53 @@ def _version_tuple(version_str):
     return version_sort_key(major, minor, patch, pre)
 
 
+def check_manifest_lockfile_consistency(head_tomls, head_lock):
+    """Confirm the HEAD lockfile actually satisfies the HEAD manifest's own requirements (Codex
+    P1, manta#194 round 8, Finding J).
+
+    compare_requirements only ever sees an EDIT to a requirement string; check_lockfile_diff only
+    ever sees an EDIT to a lockfile entry. A manifest floor raised beyond an already-unchanged
+    locked version -- e.g. `demo = "1.0"` -> `"1.1"` while Cargo.lock retains "1.0.5" -- triggers
+    neither: compare_requirements sees a non-major bump and passes it, and check_lockfile_diff
+    sees no diff at all for "demo" (its lockfile entry didn't change). The verifier previously
+    reported SAFE without ever confirming the head lock and head manifest are mutually
+    consistent, which the head lock genuinely fails here (1.0.5 doesn't satisfy >=1.1.0).
+
+    Checks every HEAD-declared version-kind dependency against requirement_floor's floor value,
+    not just ones whose requirement changed -- this is a validity check on the resulting state,
+    not a diff (matching Codex's own suggested remedy: validate the combined manifest/lock
+    state). Skips a name with zero or more-than-one lockfile candidates (no entry -- e.g. a
+    path-only dep with a version field for informational purposes, or an ambiguous diamond) --
+    out of scope for this floor check, same conservative-skip bias as check_lockfile_diff's own
+    len()!=1 branch.
+    """
+    reasons = []
+    pkgs_by_name = _index_pkgs_by_name(parse_lockfile_packages(head_lock))
+    for path, head_toml in head_tomls.items():
+        for (table_name, dep_name), (kind, detail) in collect_dependency_declarations(
+            head_toml
+        ).items():
+            if kind != "version":
+                continue
+            req, _rest = detail
+            floor = requirement_floor(req)
+            if floor is None:
+                continue
+            candidates = pkgs_by_name.get(dep_name, [])
+            if len(candidates) != 1:
+                continue
+            _name, _kind, version, _source = candidates[0]
+            if version is None:
+                continue
+            if _version_tuple(version) < floor:
+                reasons.append(
+                    f'"{path}" {table_name}.{dep_name} requires "{req}" but Cargo.lock resolves '
+                    f"it to {version}, which is below that requirement's floor -- the head lock "
+                    "does not satisfy the head manifest"
+                )
+    return reasons
+
+
 def check_diff_scope(base_ref, head_ref, allowed_paths):
     """Reject any diff that touches a path outside `allowed_paths` (Codex P1, manta#194 round 1).
 
@@ -744,6 +910,7 @@ def main(base_ref, head_ref):
         check_diff_scope(base_ref, head_ref, set(manifest_paths) | {"Cargo.lock"})
     )
 
+    head_tomls = {}
     for path in manifest_paths:
         base_text = git_show(base_ref, path)
         head_text = git_show(head_ref, path)
@@ -758,6 +925,7 @@ def main(base_ref, head_ref):
         except tomllib.TOMLDecodeError as e:
             reasons.append(f'"{path}" could not be parsed as TOML: {e}')
             continue
+        head_tomls[path] = head_toml
         reasons.extend(check_manifest_diff(path, base_toml, head_toml))
 
     base_lock_text = git_show(base_ref, "Cargo.lock")
@@ -772,6 +940,7 @@ def main(base_ref, head_ref):
             reasons.append(f'"Cargo.lock" could not be parsed as TOML: {e}')
         else:
             reasons.extend(check_lockfile_diff(base_lock, head_lock))
+            reasons.extend(check_manifest_lockfile_consistency(head_tomls, head_lock))
 
     if reasons:
         sys.stderr.write("NOT SAFE:\n" + "\n".join(f"  - {r}" for r in reasons) + "\n")
