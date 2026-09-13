@@ -998,6 +998,18 @@ def check_lockfile_diff(base_lock, head_lock):
                 f'Cargo.lock package "{name}" ({old_kind}) changed its dependencies alongside '
                 f"its version bump ({old_v} -> {new_v}) -- not a plain version bump"
             )
+        # Checksum presence on a REPLACEMENT registry entry (Codex P1, manta#194 round 23,
+        # Finding AG): Cargo always records a `checksum` for a real registry package (it's how
+        # Cargo verifies the downloaded crate matches what crates.io actually published) --
+        # nothing above ever looks at this field on the NEW entry, only its dependency edges. A
+        # hand-crafted lockfile diff omitting it entirely (exactly what a normal `cargo update`
+        # would never produce) passed every existing check with no reason raised. Git/path/
+        # workspace entries have no checksum concept at all, so this only applies to "registry".
+        if new_kind == "registry" and not new_entry.get("checksum"):
+            reasons.append(
+                f'Cargo.lock package "{name}" (registry) has no checksum recorded for its new '
+                f"version ({new_v}) -- not verifiable as a safe, registry-validated version bump"
+            )
 
     # A name that only ever appears in `added` (never matched to a `removed` peer, and never
     # popped from `added_grouped` by the loop above) is a brand-new dependency in the lockfile --

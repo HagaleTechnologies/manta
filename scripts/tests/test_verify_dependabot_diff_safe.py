@@ -2180,5 +2180,83 @@ class ManifestLockfileConsistencyEdgePrecisionTests(unittest.TestCase):
         self.assertIn("does not satisfy that requirement", reasons[0])
 
 
+class LockfileReplacementChecksumTests(unittest.TestCase):
+    """Codex P1, manta#194 round 23, Finding AG: a matched removed/added replacement pair's own
+    dependencies edges are validated, but nothing checks the new entry's `checksum` field --
+    Cargo always records one for a real registry package, so its absence is exactly what a
+    hand-crafted lockfile diff (never a real `cargo update`) would produce.
+    """
+
+    def test_replacement_registry_entry_missing_checksum_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("foo", reasons[0])
+        self.assertIn("checksum", reasons[0])
+
+    def test_replacement_registry_entry_with_checksum_is_safe(self):
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                }
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+    def test_replacement_git_entry_without_checksum_is_unaffected(self):
+        # git dependencies have no checksum concept at all -- this check must not fire for them.
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "git+https://good.example/foo.git?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                }
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+
 if __name__ == "__main__":
     unittest.main()
