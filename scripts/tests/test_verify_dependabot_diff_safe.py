@@ -775,5 +775,166 @@ class LockfileCollidingIdentityTests(unittest.TestCase):
         self.assertIn("dependencies", reasons[0])
 
 
+class LockfileUnmatchedRemovalTests(unittest.TestCase):
+    """Codex P1, manta#194 round 7: a transitive package disappearing from Cargo.lock with no
+    same-name replacement was previously treated as always-safe, on the theory that "a real
+    removal is visible at the manifest level too" -- true only for a DIRECTLY declared
+    dependency. A transitive dependency has no manifest declaration for check_manifest_diff to
+    ever see, so an unmatched transitive removal reached neither check and was silently accepted.
+    """
+
+    def test_unmatched_transitive_removal_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "serde_core",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bbb",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("removed with no same-name replacement", reasons[0])
+
+    def test_unrelated_added_transitive_with_no_removal_is_still_unaffected(self):
+        # A brand-new dependency appearing (never matched to a removed peer) stays out of scope
+        # -- only a REMOVAL with no replacement is now flagged; an ADDITION with none is not.
+        base = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "serde_core",
+                    "version": "1.0.200",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bbb",
+                },
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+
+class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
+    """Found empirically while verifying round 7's fix against manta's real Dependabot history
+    (not a Codex comment): Cargo's own lockfile encoding writes a `dependencies` entry as "name",
+    "name version", or "name version (source)", appending version/source ONLY to disambiguate
+    multiple resolved instances of that name elsewhere in the graph. An unrelated bump shifting
+    how many versions of some OTHER crate exist can flip every entry that depends on it between
+    "name" and "name X.Y.Z" with no actual change to what code runs -- manta's own commit
+    fb1c7f3 (a plain clap patch bump) hit this on ~10 unrelated proc-macro crates.
+    """
+
+    def test_disambiguation_suffix_appearing_is_safe(self):
+        base = {
+            "package": [
+                {
+                    "name": "serde_derive",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["proc-macro2", "quote", "syn"],
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde_derive",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["proc-macro2", "quote", "syn 2.0.118"],
+                }
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+    def test_disambiguation_suffix_disappearing_is_safe(self):
+        base = {
+            "package": [
+                {
+                    "name": "serde_derive",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["proc-macro2", "quote", "syn 2.0.118"],
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde_derive",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["proc-macro2", "quote", "syn"],
+                }
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+    def test_actual_dependency_name_addition_alongside_disambiguation_noise_is_flagged(self):
+        # Confirms normalizing to bare names doesn't mask an actual add/remove riding along with
+        # unrelated disambiguation churn.
+        base = {
+            "package": [
+                {
+                    "name": "serde_derive",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["proc-macro2", "quote", "syn"],
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "serde_derive",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["proc-macro2", "quote", "syn 2.0.118", "malicious-crate"],
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("dependencies", reasons[0])
+
+
 if __name__ == "__main__":
     unittest.main()

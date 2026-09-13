@@ -547,9 +547,22 @@ def check_lockfile_diff(base_lock, head_lock):
     for name, removed_entries in removed_grouped.items():
         added_entries = added_grouped.pop(name, [])
         if not added_entries:
-            # Disappeared with no same-name replacement at all -- a legitimate dependency
-            # removal, out of scope for this verifier (a real removal is visible at the
-            # manifest level too, where check_manifest_diff already routes it to human review).
+            # Disappeared with no same-name replacement at all (Codex P1, manta#194 round 7):
+            # this was PREVIOUSLY treated as an out-of-scope legitimate removal on the theory
+            # that "a real removal is visible at the manifest level too" -- true for a DIRECTLY
+            # declared dependency, but false for a TRANSITIVE one, which has no manifest
+            # declaration for check_manifest_diff to ever see. An unmatched transitive removal
+            # therefore reached neither check at all and was silently accepted. This verifier has
+            # no independent way to confirm a disappearance is a legitimate consequence of the
+            # rest of the dependency graph changing (that requires actually re-resolving the
+            # graph, which is exactly what this Python/tomllib-only verifier deliberately does
+            # NOT attempt) versus an unexplained drop riding along with the diff -- so, matching
+            # this file's existing bias elsewhere (see the len()!=1 branch just below), route it
+            # to human review rather than assume it's safe.
+            reasons.append(
+                f'Cargo.lock package "{name}" was removed with no same-name replacement -- not '
+                "verifiable as a safe consequence of the rest of the dependency-graph change"
+            )
             continue
         if len(removed_entries) != 1 or len(added_entries) != 1:
             # Also the (safe-direction) outcome for two independent major-version-lines of the
@@ -627,13 +640,34 @@ def check_lockfile_diff(base_lock, head_lock):
     for key in set(base_pkgs) & set(head_pkgs):
         base_entry = base_pkgs[key]
         head_entry = head_pkgs[key]
-        if base_entry != head_entry:
+        # `dependencies` needs its own comparison, not byte equality (found empirically while
+        # verifying round 7's fix against manta's real Dependabot history, not from a Codex
+        # comment): Cargo's own lockfile encoding writes each entry as "name", "name version", or
+        # "name version (source)" -- appending version/source ONLY when needed to disambiguate
+        # multiple resolved instances of that name elsewhere in the graph (confirmed against
+        # cargo's resolver/encode.rs and the Cargo Book). A completely unrelated bump that shifts
+        # how many versions of some OTHER crate (e.g. `syn`) are present can flip every entry
+        # that depends on it between "syn" and "syn 2.0.118" with no actual change to what code
+        # runs -- manta's own real bump commit fb1c7f3 (clap 4.6.1 -> 4.6.4, otherwise a plain
+        # patch bump) hit exactly this on ~10 unrelated proc-macro crates and would have been
+        # rejected outright by a byte-for-byte comparison. Comparing by bare crate NAME (add/
+        # remove sensitive) rather than the full disambiguated string is not a coverage gap: an
+        # actual version/source change behind a disambiguated reference is independently caught
+        # via that dependency's OWN [[package]] entry checks above -- this field only re-derives
+        # information already tracked elsewhere, so normalizing it here doesn't hide anything.
+        base_fields = dict(base_entry)
+        head_fields = dict(head_entry)
+        base_dep_names = {ref.split(" ", 1)[0] for ref in base_fields.pop("dependencies", [])}
+        head_dep_names = {ref.split(" ", 1)[0] for ref in head_fields.pop("dependencies", [])}
+        changed_fields = sorted(
+            f
+            for f in set(base_fields) | set(head_fields)
+            if base_fields.get(f) != head_fields.get(f)
+        )
+        if base_dep_names != head_dep_names:
+            changed_fields.append("dependencies")
+        if changed_fields:
             name, kind, version, _source = key
-            changed_fields = sorted(
-                f
-                for f in set(base_entry) | set(head_entry)
-                if base_entry.get(f) != head_entry.get(f)
-            )
             reasons.append(
                 f'Cargo.lock package "{name}" ({kind}, {version}) has an unchanged name/kind/'
                 f"version/source but its {', '.join(changed_fields)} field(s) changed -- not a "
