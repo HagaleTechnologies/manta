@@ -1096,7 +1096,8 @@ def _version_tuple(version_str):
 
 def check_manifest_lockfile_consistency(head_tomls, head_lock):
     """Confirm the HEAD lockfile actually satisfies the HEAD manifest's own requirements (Codex
-    P1, manta#194 round 8, Finding J; refined rounds 9-10).
+    P1, manta#194 round 8, Finding J; refined rounds 9-10, 13-15; edge-precision added round 19,
+    Finding AC).
 
     compare_requirements only ever sees an EDIT to a requirement string; check_lockfile_diff only
     ever sees an EDIT to a lockfile entry. A manifest requirement raised beyond an already-
@@ -1106,71 +1107,113 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
     verifier previously reported SAFE without ever confirming the head lock and head manifest are
     mutually consistent, which the head lock genuinely fails here (1.0.5 doesn't satisfy 1.1).
 
-    Checks every HEAD-declared version-kind dependency against ALL of its lockfile candidates via
-    requirement_is_satisfied_by, not just ones whose requirement changed -- this is a validity
-    check on the resulting state, not a diff (matching Codex's own suggested remedy: validate the
-    combined manifest/lock state). A name is only flagged when NONE of its candidates satisfy the
-    requirement -- e.g. manta's own real rand_core 0.9.5-and-0.10.1 diamond is fine as long as
-    0.10.1 itself satisfies whatever rand_core's own requirement currently is; round 8/9 skipped
-    any name with more than one candidate outright, which is exactly what let a genuine
-    inconsistency hide behind an unrelated coexisting version (round 10, Finding L).
+    Resolves the SPECIFIC lockfile edge the declaring package's own [[package]] entry uses
+    (Codex P1, manta#194 round 19, Finding AC), rather than accepting whether ANY same-named
+    candidate satisfies the requirement (rounds 10-15's design): in a diamond where `foo` exists
+    at both 1.0.0 (used by an unrelated consumer) and 1.1.0, raising a DIRECT dependency's own
+    requirement to "1.1" while that package's own edge is still stale at 1.0.0 previously passed,
+    since 1.1.0 existed SOMEWHERE and satisfied the requirement even though it had nothing to do
+    with this specific declaration. The declaring package is identified via its own `[package]
+    name` in the same manifest path; a `{ workspace = true }` entry (most of manta's own real
+    dependency declarations) is resolved against the INHERITING member's own edge, checked
+    against ROOT's requirement string for that name (the requirement and the edge that must
+    satisfy it live in two different files for an inherited dependency).
+
+    Falls back to the round 10-15 "any candidate satisfies" approximation whenever the specific
+    edge can't be identified this precisely (the declaring package couldn't be found unambiguously
+    in Cargo.lock, or its own `dependencies` list doesn't record an edge under this exact name) --
+    a strictly weaker check than the edge-precise one above, kept as a floor rather than silently
+    passing when precision isn't available.
 
     Looks up lockfile candidates by the declared `package` rename field when present, falling
-    back to the dependency's own key otherwise (Codex P1, manta#194 round 13, Finding R): Cargo's
-    rename mechanism (`alias = { package = "foo", version = "1.1" }`) declares the dependency
-    under key "alias" but Cargo.lock records the ACTUAL crate under its real name "foo" -- looking
-    up "alias" in the lockfile finds nothing, so every renamed dependency's requirement silently
-    skipped this whole check (the `if not versions: continue` guard below, meant for a genuinely
-    out-of-scope path/workspace-only dep, was quietly absorbing every rename too).
+    back to the dependency's own key otherwise (Codex P1, manta#194 round 13, Finding R). Restricts
+    "any candidate" fallback candidates to source kind "registry"/"unknown" (round 14, Finding S)
+    and fails closed on 2+ distinct registry sources among them (round 15, Finding T) -- see each
+    finding's own commit for the full reasoning; both still apply to the fallback path.
     """
     reasons = []
-    pkgs_by_name = _index_pkgs_by_name(parse_lockfile_packages(head_lock))
-    for path, head_toml in head_tomls.items():
-        for (table_name, dep_name), (kind, detail) in collect_dependency_declarations(
-            head_toml
-        ).items():
-            if kind != "version":
-                continue
-            req, rest = detail
-            lockfile_name = rest.get("package", dep_name)
-            # Restrict candidates to a source KIND consistent with a bare version-requirement
-            # declaration -- "registry" (crates.io or an alternate registry override) or
-            # "unknown" (a non-git/registry source prefix this file doesn't further classify),
-            # never "git" or "workspace" (Codex P1, manta#194 round 14): filtering by name alone
-            # let an UNRELATED same-named git-sourced diamond entry's version satisfy a plain
-            # registry declaration whose own (stale) registry entry didn't -- e.g. `foo = "1.0"`
-            # -> `"1.1"` with a stale registry `foo 1.0` retained alongside a coincidentally
-            # same-named `foo 1.1` git entry pulled in by something else entirely.
-            candidates = [
-                key for key in pkgs_by_name.get(lockfile_name, []) if key[1] in ("registry", "unknown")
-            ]
-            # Fail closed on 2+ DISTINCT registry sources among the candidates (Codex P1,
-            # manta#194 round 15, Finding T): round 14's kind filter excludes git/workspace, but
-            # "registry" alone doesn't distinguish crates.io from a NAMED alternate registry
-            # (`{ registry = "private" }`) -- resolving a registry NAME to its actual index URL
-            # would need this repo's `.cargo/config.toml`, which this verifier doesn't read. A
-            # stale private-registry `foo 1.0` could otherwise be masked by an unrelated
-            # crates.io `foo 1.1` of the same name. Two distinct registry sources for the same
-            # name is rare for a genuine single-registry project (manta's own real Cargo.lock has
-            # none) -- when it happens, this verifier can't safely tell a legitimate multi-
-            # registry setup apart from the exact attack Codex describes, so it doesn't guess.
-            registry_sources = {key[3] for key in candidates}
-            if len(registry_sources) > 1:
+    head_pkgs = parse_lockfile_packages(head_lock)
+    pkgs_by_name = _index_pkgs_by_name(head_pkgs)
+
+    package_name_by_path = {
+        path: toml["package"]["name"]
+        for path, toml in head_tomls.items()
+        if "package" in toml and "name" in toml.get("package", {})
+    }
+
+    def declaring_entry_for(path):
+        name = package_name_by_path.get(path)
+        if name is None:
+            return None
+        candidates = pkgs_by_name.get(name, [])
+        return head_pkgs[candidates[0]] if len(candidates) == 1 else None
+
+    def specific_resolved_version(entry, lockfile_name):
+        """The exact version `entry`'s own `dependencies` edge to `lockfile_name` resolves to,
+        or None if no such edge is recorded or it can't be resolved unambiguously."""
+        if entry is None:
+            return None
+        for ref in entry.get("dependencies", []):
+            if ref.split(" ", 1)[0] == lockfile_name:
+                resolved = _resolve_dependency_ref(ref, pkgs_by_name.get(lockfile_name, []))
+                return resolved[2] if resolved is not None else None
+        return None
+
+    def check_against_requirement(path, table_name, dep_name, req, lockfile_name, version):
+        if version is not None:
+            if not requirement_is_satisfied_by(req, version):
                 reasons.append(
-                    f'"{path}" {table_name}.{dep_name} has {len(registry_sources)} distinct '
-                    "registry sources among its Cargo.lock candidates -- cannot verify which one "
-                    "the manifest's own declaration resolves to"
+                    f'"{path}" {table_name}.{dep_name} requires "{req}" but its own resolved '
+                    f"Cargo.lock entry ({version}) does not satisfy that requirement"
                 )
-                continue
-            versions = sorted({key[2] for key in candidates if key[2] is not None})
-            if not versions:
-                continue
-            if not any(requirement_is_satisfied_by(req, version) for version in versions):
-                reasons.append(
-                    f'"{path}" {table_name}.{dep_name} requires "{req}" but no Cargo.lock entry '
-                    f"for it ({', '.join(versions)}) satisfies that requirement -- the head lock "
-                    "does not satisfy the head manifest"
-                )
+            return
+        # Fallback: round 14's kind filter ("registry"/"unknown", never "git"/"workspace") plus
+        # round 15's fail-closed-on-multi-registry check, both still needed here.
+        candidates = [
+            key for key in pkgs_by_name.get(lockfile_name, []) if key[1] in ("registry", "unknown")
+        ]
+        registry_sources = {key[3] for key in candidates}
+        if len(registry_sources) > 1:
+            reasons.append(
+                f'"{path}" {table_name}.{dep_name} has {len(registry_sources)} distinct '
+                "registry sources among its Cargo.lock candidates -- cannot verify which one "
+                "the manifest's own declaration resolves to"
+            )
+            return
+        versions = sorted({key[2] for key in candidates if key[2] is not None})
+        if not versions:
+            return
+        if not any(requirement_is_satisfied_by(req, v) for v in versions):
+            reasons.append(
+                f'"{path}" {table_name}.{dep_name} requires "{req}" but no Cargo.lock entry '
+                f"for it ({', '.join(versions)}) satisfies that requirement -- the head lock "
+                "does not satisfy the head manifest"
+            )
+
+    declarations_by_path = {
+        path: collect_dependency_declarations(toml) for path, toml in head_tomls.items()
+    }
+    root_declarations = declarations_by_path.get("Cargo.toml", {})
+
+    for path, declarations in declarations_by_path.items():
+        declaring_entry = declaring_entry_for(path)
+        for (table_name, dep_name), (kind, detail) in declarations.items():
+            if kind == "version":
+                req, rest = detail
+                lockfile_name = rest.get("package", dep_name)
+                version = specific_resolved_version(declaring_entry, lockfile_name)
+                check_against_requirement(path, table_name, dep_name, req, lockfile_name, version)
+            elif kind == "workspace" and path != "Cargo.toml":
+                # This member inherits dep_name from root's [workspace.dependencies] -- the
+                # requirement string lives in ROOT's own declaration, but the edge that must
+                # satisfy it belongs to THIS member specifically.
+                root_decl = root_declarations.get(("workspace.dependencies", dep_name))
+                if root_decl is None or root_decl[0] != "version":
+                    continue
+                req, rest = root_decl[1]
+                lockfile_name = rest.get("package", dep_name)
+                version = specific_resolved_version(declaring_entry, lockfile_name)
+                check_against_requirement(path, table_name, dep_name, req, lockfile_name, version)
     return reasons
 
 

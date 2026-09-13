@@ -2003,5 +2003,110 @@ class LockfileFabricatedWorkspaceIdentityTests(unittest.TestCase):
         self.assertIn("not reachable", joined)
 
 
+class ManifestLockfileConsistencyEdgePrecisionTests(unittest.TestCase):
+    """Codex P1, manta#194 round 19, Finding AC -- the exact reproduction: a diamond where the
+    DECLARING package's own lockfile edge is stale, while an unrelated consumer's edge to the
+    same name is fresh. Rounds 10-15's "any candidate satisfies" design accepted this because
+    SOME candidate satisfied the requirement, even though it had nothing to do with this
+    specific declaration.
+    """
+
+    def _lock_with_two_foo_versions_and_consumers(self, consumer_a_foo_ref):
+        return {
+            "package": [
+                {
+                    "name": "consumer_a",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "ca1",
+                    "dependencies": [consumer_a_foo_ref],
+                },
+                {
+                    "name": "consumer_b",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "cb1",
+                    "dependencies": ["foo 1.1.0"],
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                },
+                {
+                    "name": "foo",
+                    "version": "1.1.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                },
+            ]
+        }
+
+    def test_declaring_packages_own_stale_edge_is_flagged(self):
+        head_tomls = {
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {"foo": "1.1"},
+            }
+        }
+        lock = self._lock_with_two_foo_versions_and_consumers("foo 1.0.0")
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, lock)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("consumer_a", reasons[0])
+        self.assertIn("does not satisfy that requirement", reasons[0])
+
+    def test_declaring_packages_own_fresh_edge_is_safe(self):
+        head_tomls = {
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {"foo": "1.1"},
+            }
+        }
+        lock = self._lock_with_two_foo_versions_and_consumers("foo 1.1.0")
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+    def test_workspace_inherited_dependency_uses_the_inheriting_members_own_edge(self):
+        # Most of manta's own real dependencies are declared this way: the requirement lives in
+        # root's [workspace.dependencies], but each member's OWN edge is what must satisfy it.
+        head_tomls = {
+            "Cargo.toml": {"workspace": {"dependencies": {"foo": "1.1"}}},
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {"foo": {"workspace": True}},
+            },
+        }
+        lock = self._lock_with_two_foo_versions_and_consumers("foo 1.0.0")
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, lock)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("consumer_a", reasons[0])
+
+    def test_workspace_inherited_dependency_with_fresh_edge_is_safe(self):
+        head_tomls = {
+            "Cargo.toml": {"workspace": {"dependencies": {"foo": "1.1"}}},
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {"foo": {"workspace": True}},
+            },
+        }
+        lock = self._lock_with_two_foo_versions_and_consumers("foo 1.1.0")
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+    def test_unresolvable_declaring_package_falls_back_to_any_candidate(self):
+        # The declaring package itself can't be found unambiguously in Cargo.lock (no matching
+        # [[package]] entry) -- falls back to the round 10-15 approximation rather than silently
+        # passing.
+        head_tomls = {
+            "crates/unknown/Cargo.toml": {
+                "package": {"name": "unknown-crate"},
+                "dependencies": {"foo": "1.1"},
+            }
+        }
+        lock = self._lock_with_two_foo_versions_and_consumers("foo 1.0.0")
+        # foo 1.1.0 exists somewhere and satisfies "1.1" -- the fallback accepts it since the
+        # declaring package ("unknown-crate") has no lockfile entry to resolve precisely against.
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+
 if __name__ == "__main__":
     unittest.main()
