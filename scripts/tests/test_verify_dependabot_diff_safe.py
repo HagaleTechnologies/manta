@@ -2427,8 +2427,11 @@ class LockfileAddedEntryChecksumTests(unittest.TestCase):
 
     def test_reachable_added_git_entry_without_checksum_is_unaffected(self):
         # Same retargeted-edge shape, but both bar instances are git-sourced (same repo/branch,
-        # different pinned commits) -- git entries have no checksum concept, so this must stay
-        # SAFE even with no checksum field on the newly added instance.
+        # different pinned commits). This fixture's foo now legitimately trips the round-27 fix
+        # too (a matched pair's own edge retargeting between two git commits is real content
+        # under review, not tolerated the way a registry version retarget is) -- expected and
+        # unrelated to checksums. The point here is narrower: git entries have no checksum
+        # concept, so nothing about this diff must ever be flagged FOR A MISSING CHECKSUM.
         base = {
             "package": [
                 {"name": "root", "version": "0.1.0", "dependencies": ["foo", "bar"]},
@@ -2468,7 +2471,7 @@ class LockfileAddedEntryChecksumTests(unittest.TestCase):
                 },
             ]
         }
-        self.assertEqual(v.check_lockfile_diff(base, head), [])
+        self.assertFalse(any("checksum" in r for r in v.check_lockfile_diff(base, head)))
 
 
 class LockfileResidualStructureTests(unittest.TestCase):
@@ -2510,6 +2513,137 @@ class LockfileResidualStructureTests(unittest.TestCase):
         head = {
             **self._base(),
             "package": [{**base["package"][0], "version": "1.0.1", "checksum": "foo2"}],
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+
+class LockfileReplacementGitCommitSwapTests(unittest.TestCase):
+    """Codex P1, manta#194 round 27, Finding AL -- the exact reproduction: a matched
+    removed/added replacement pair (bar's own patch bump) whose edge to `foo` retargets from
+    `foo 1.0.0 (git+...#aaaa)` to a newly added `foo 1.0.0 (git+...#bbbb)`, while another consumer
+    keeps `foo`'s OLD commit retained. `_resolved_dependency_source_identities` used to strip the
+    git commit fragment via `_source_identity`, so both edges resolved to the identical (foo, git,
+    "git+.../foo.git?branch=main") identity and the retarget was invisible.
+    """
+
+    def _base(self):
+        return {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["bar"]},
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                    "dependencies": [
+                        "foo 1.0.0 (git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+                    ],
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+            ]
+        }
+
+    def test_replacement_pairs_git_commit_retarget_is_flagged(self):
+        head = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["bar"]},
+                {
+                    "name": "bar",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar2",
+                    "dependencies": [
+                        "foo 1.0.0 (git+https://good.example/foo.git?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
+                    ],
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/foo.git?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(self._base(), head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("bar", reasons[0])
+        self.assertIn("changed its dependencies", reasons[0])
+
+    def test_replacement_pairs_unchanged_git_commit_is_safe(self):
+        head = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["bar"]},
+                {
+                    "name": "bar",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar2",
+                    "dependencies": [
+                        "foo 1.0.0 (git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+                    ],
+                },
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "git+https://good.example/foo.git?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(self._base(), head), [])
+
+    def test_replacement_pairs_registry_version_retarget_still_tolerated(self):
+        # Round 12's original tolerance (fb1c7f3's clap_derive/syn shift) must survive: a
+        # REGISTRY-sourced edge retargeting to a new sibling VERSION of the same registry crate
+        # is still safe -- only git commit identity got stricter, not registry version tolerance.
+        base = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["bar"]},
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                    "dependencies": ["syn 2.0.0"],
+                },
+                {
+                    "name": "syn",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "syn1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {"name": "root", "version": "0.1.0", "dependencies": ["bar"]},
+                {
+                    "name": "bar",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar2",
+                    "dependencies": ["syn 3.0.0"],
+                },
+                {
+                    "name": "syn",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "syn1",
+                },
+                {
+                    "name": "syn",
+                    "version": "3.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "syn2",
+                },
+            ]
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 

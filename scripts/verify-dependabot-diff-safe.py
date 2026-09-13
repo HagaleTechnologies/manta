@@ -782,7 +782,20 @@ def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
             resolved.add(("__unresolved__", ref))
         else:
             _rname, rkind, _rversion, rsource = key
-            resolved.add((name, rkind, _source_identity(rkind, rsource)))
+            # Codex P1, manta#194 round 27, Finding AL: the RAW source string, not
+            # `_source_identity`'s sha-stripped one. `_source_identity` exists for the top-level
+            # "is this the same remote, not a swapped host/path" check on the package being
+            # DIRECTLY bumped (line ~930 below) -- there, dropping a git dependency's own trailing
+            # `#<sha>` is correct, since a normal bump changes exactly its own pinned commit (the
+            # separate same-version-git-swap guard, Findings M/N, independently catches an
+            # unexplained same-version commit change on THAT package). But this function compares
+            # a MATCHED-PAIR's edges to OTHER packages, and stripping the sha here meant any two
+            # git refs to the same repo+branch compared equal regardless of which commit they
+            # pinned -- so a diamond-shaped retarget (one consumer's edge moves from foo@aaaa to a
+            # newly added foo@bbbb, while another consumer keeps foo@aaaa retained, so the
+            # top-level same-version-git-swap guard never runs on foo at all) was invisible.
+            # Registry sources are unaffected: `_source_identity` is already a no-op for them.
+            resolved.add((name, rkind, rsource))
     return resolved
 
 
