@@ -475,6 +475,26 @@ def parse_lockfile_packages(lock_toml):
     return out
 
 
+def _source_identity(kind, source):
+    """The part of a lockfile entry's `source` string that identifies WHERE it comes from,
+    excluding the part a legitimate version bump is expected to change.
+
+    Registry sources never embed a version -- the whole string IS the identity, so any change at
+    all is a source swap (Codex P1, manta#194 round 4: comparing only `kind` treated any two
+    "registry" sources, or any two "git" sources, as equivalent regardless of which actual URL/ref
+    they named). Git sources embed the resolved commit as a trailing `#<sha>` fragment, which is
+    exactly what changes on a normal Dependabot bump (a new commit on the same pinned
+    branch/tag/rev) -- everything BEFORE that fragment (host, path, and any branch/tag/rev query
+    parameters) is the identity that must stay fixed.
+    """
+    if source is None:
+        return None
+    if kind == "git":
+        base_part, _, _ = source.rpartition("#")
+        return base_part or source
+    return source
+
+
 def check_lockfile_diff(base_lock, head_lock):
     """Compare Cargo.lock's [[package]] entries between base and head.
 
@@ -530,6 +550,24 @@ def check_lockfile_diff(base_lock, head_lock):
             reasons.append(
                 f'Cargo.lock package "{name}" changed source kind ({old_kind} -> {new_kind}) -- '
                 "not a plain version bump"
+            )
+            continue
+        # Source identity check (Codex P1, manta#194 round 4): the retained-entry comparison
+        # below only ever runs when (name, kind, version) stays IDENTICAL -- once the version
+        # (and therefore the dict key) changes, as it does on every legitimate bump, this pair
+        # never reaches that check at all. `old_kind == new_kind` alone treats any two "git" (or
+        # "registry") sources as equivalent regardless of which URL/ref they actually name, so a
+        # same-kind source swap riding along with a version bump (e.g. a git dependency's URL
+        # silently changed to a different host) passed unnoticed.
+        old_entry = base_pkgs[(name, old_kind, old_v)]
+        new_entry = head_pkgs[(name, new_kind, new_v)]
+        old_identity = _source_identity(old_kind, old_entry.get("source"))
+        new_identity = _source_identity(new_kind, new_entry.get("source"))
+        if old_identity != new_identity:
+            reasons.append(
+                f'Cargo.lock package "{name}" ({old_kind}) changed source identity '
+                f"({old_identity} -> {new_identity}) alongside its version bump -- not a plain "
+                "version bump"
             )
             continue
         if new_v is None or old_v is None:

@@ -623,5 +623,84 @@ class LockfileRetainedEntryTests(unittest.TestCase):
         self.assertEqual(v.check_lockfile_diff(pkg, pkg), [])
 
 
+class LockfileSourceIdentityOnBumpTests(unittest.TestCase):
+    """Codex P1, manta#194 round 4: a same-kind source swap riding along with a version bump
+    changes the (name, kind, version) dict key, so it's invisible to the retained-entry check
+    (round 3, Finding F) -- `old_kind == new_kind` alone treated any two git/registry sources as
+    equivalent regardless of which URL/ref they actually named.
+    """
+
+    def test_git_url_swap_alongside_version_bump_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "source": "git+https://good.example/repo?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.4",
+                    "source": "git+https://evil.example/repo?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("source identity", reasons[0])
+
+    def test_git_rev_advancing_on_same_url_is_safe(self):
+        # A normal Dependabot bump for a branch-pinned git dependency: same URL/branch, a newer
+        # commit sha. Only the part after the `#` fragment changes.
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "source": "git+https://good.example/repo?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.4",
+                    "source": "git+https://good.example/repo?branch=main#cccccccccccccccccccccccccccccccccccccccc",
+                }
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+    def test_registry_url_swap_alongside_version_bump_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.0.1",
+                    "source": "registry+https://evil.example/fake-index",
+                    "checksum": "bbb",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("source identity", reasons[0])
+
+
 if __name__ == "__main__":
     unittest.main()
