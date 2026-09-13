@@ -222,7 +222,14 @@ class CheckLockfileDiffTests(unittest.TestCase):
         head = {"package": [{"name": "manta-cli", "version": "0.1.0"}]}
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
-    def test_unrelated_added_transitive_produces_no_reasons(self):
+    def test_referenced_added_transitive_is_not_flagged_as_unreferenced(self):
+        # A real Cargo.lock never carries an addition nothing references (Cargo's own
+        # `generate-lockfile` wouldn't produce one) -- serde_core is added and immediately
+        # referenced by serde's own (now-changed) dependencies list, exactly as the real
+        # serde/serde_core split looks in practice. Finding U's "unreferenced" check must not
+        # fire on serde_core; whether serde's own dependencies-list change is separately flagged
+        # (Finding I's retained-entry check, since serde's version here is unchanged) is a
+        # different, orthogonal concern this test doesn't assert on either way.
         base = {
             "package": [
                 {
@@ -240,6 +247,7 @@ class CheckLockfileDiffTests(unittest.TestCase):
                     "version": "1.0.200",
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
+                    "dependencies": ["serde_core"],
                 },
                 {
                     "name": "serde_core",
@@ -249,7 +257,8 @@ class CheckLockfileDiffTests(unittest.TestCase):
                 },
             ]
         }
-        self.assertEqual(v.check_lockfile_diff(base, head), [])
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertFalse(any("not referenced" in r for r in reasons))
 
 
 class MainEndToEndTests(unittest.TestCase):
@@ -870,9 +879,12 @@ class LockfileUnmatchedRemovalTests(unittest.TestCase):
         self.assertEqual(len(reasons), 1)
         self.assertIn("removed with no same-name replacement", reasons[0])
 
-    def test_unrelated_added_transitive_with_no_removal_is_still_unaffected(self):
-        # A brand-new dependency appearing (never matched to a removed peer) stays out of scope
-        # -- only a REMOVAL with no replacement is now flagged; an ADDITION with none is not.
+    def test_referenced_added_transitive_with_no_removal_triggers_no_removal_reason(self):
+        # A brand-new, REFERENCED dependency appearing (never matched to a removed peer) does
+        # not trigger the unmatched-REMOVAL check this test class covers (round 7) -- that check
+        # is one-directional by design. Whether a different, orthogonal check (Finding I/O's
+        # dependencies-edge validation, or round 15's Finding U for an unreferenced addition)
+        # has something to say about the addition itself is not this test's concern.
         base = {
             "package": [
                 {
@@ -890,6 +902,7 @@ class LockfileUnmatchedRemovalTests(unittest.TestCase):
                     "version": "1.0.200",
                     "source": "registry+https://github.com/rust-lang/crates.io-index",
                     "checksum": "aaa",
+                    "dependencies": ["serde_core"],
                 },
                 {
                     "name": "serde_core",
@@ -899,7 +912,8 @@ class LockfileUnmatchedRemovalTests(unittest.TestCase):
                 },
             ]
         }
-        self.assertEqual(v.check_lockfile_diff(base, head), [])
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertFalse(any("removed with no same-name replacement" in r for r in reasons))
 
 
 class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
@@ -1559,6 +1573,122 @@ class ManifestLockfileConsistencySourceKindTests(unittest.TestCase):
             ]
         }
         self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+
+class ManifestLockfileConsistencyRegistryIdentityTests(unittest.TestCase):
+    """Codex P1, manta#194 round 15, Finding T: round 14's kind filter excludes git/workspace but
+    doesn't distinguish two DIFFERENT registry sources for the same name -- a stale private-
+    registry entry could be masked by an unrelated crates.io entry of the same name/version.
+    """
+
+    def test_two_distinct_registry_sources_fail_closed(self):
+        # Codex's exact reproduction: a private-registry declaration whose own entry is stale,
+        # masked by an unrelated crates.io entry of the same name.
+        head_tomls = {"Cargo.toml": {"dependencies": {"foo": {"version": "1.1", "registry": "private"}}}}
+        lock = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://my-private-registry.example/index",
+                    "checksum": "aaa",
+                },
+                {
+                    "name": "foo",
+                    "version": "1.1.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bbb",
+                },
+            ]
+        }
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, lock)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("distinct", reasons[0])
+
+    def test_single_registry_source_is_unaffected(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"foo": "1.1"}}}
+        lock = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.1.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+
+class LockfileUnreferencedAdditionTests(unittest.TestCase):
+    """Codex P1, manta#194 round 15, Finding U: an added-only [[package]] entry that NOTHING in
+    the head lockfile's own dependency graph references at all is not explainable as a
+    consequence of anything else in the diff -- Cargo would never produce such an orphaned
+    package via a normal update.
+    """
+
+    def test_wholly_unreferenced_addition_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                },
+                {
+                    "name": "orphan",
+                    "version": "1.0.0",
+                    "source": "registry+https://malicious.example/fake-index",
+                    "checksum": "orphan1",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("orphan", reasons[0])
+        self.assertIn("not referenced", reasons[0])
+
+    def test_referenced_addition_is_not_flagged_as_unreferenced(self):
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertFalse(any("not referenced" in r for r in reasons))
 
 
 if __name__ == "__main__":

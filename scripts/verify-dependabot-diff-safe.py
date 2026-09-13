@@ -872,12 +872,31 @@ def check_lockfile_diff(base_lock, head_lock):
                 f"its version bump ({old_v} -> {new_v}) -- not a plain version bump"
             )
 
-    # Any name that only ever appears in `added` (never matched to a `removed` peer) is a
-    # brand-new dependency in the lockfile -- e.g. a fresh transitive pulled in by a manifest
-    # bump. Not this verifier's concern per se (the manifest-level check already validated the
-    # manifest-visible requirement change); Cargo itself already validated the lockfile's own
-    # internal consistency via `cargo generate-lockfile`/`cargo update`, which is not something
-    # this verifier re-derives from scratch.
+    # A name that only ever appears in `added` (never matched to a `removed` peer, and never
+    # popped from `added_grouped` by the loop above) is a brand-new dependency in the lockfile --
+    # ordinarily a fresh transitive pulled in by a manifest bump, and not this verifier's concern
+    # per se (Cargo itself already validated the lockfile's own internal consistency via `cargo
+    # generate-lockfile`/`cargo update` when it produced this diff). But Codex P1, manta#194
+    # round 15, Finding U: an added entry that NOTHING in the head lockfile's own dependency graph
+    # references at all is not explainable as a consequence of anything else in the diff -- Cargo
+    # itself would never add such an orphaned package via a normal update, so its presence here
+    # is unverifiable. Checked by bare NAME (not exact identity) against every OTHER head entry's
+    # `dependencies` list, deliberately erring toward NOT flagging when the name is referenced by
+    # anything at all, even ambiguously -- this is a narrow "wholly unreferenced" check, not a
+    # full graph-reachability validation.
+    referenced_names = set()
+    for entry in head_pkgs.values():
+        for ref in entry.get("dependencies", []):
+            referenced_names.add(ref.split(" ", 1)[0])
+    for added_name, added_entries in added_grouped.items():
+        if added_name in referenced_names:
+            continue
+        for kind, version, _source in added_entries:
+            reasons.append(
+                f'Cargo.lock package "{added_name}" ({kind}, {version}) was added but is not '
+                "referenced by any dependency edge in the head lockfile -- not verifiable as a "
+                "safe consequence of the rest of the dependency-graph change"
+            )
 
     # Retained entries -- same (name, kind, version, source) key present in BOTH base and head --
     # are invisible to the removed/added set difference above (Codex P1, manta#194 round 3,
@@ -1021,6 +1040,24 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
             candidates = [
                 key for key in pkgs_by_name.get(lockfile_name, []) if key[1] in ("registry", "unknown")
             ]
+            # Fail closed on 2+ DISTINCT registry sources among the candidates (Codex P1,
+            # manta#194 round 15, Finding T): round 14's kind filter excludes git/workspace, but
+            # "registry" alone doesn't distinguish crates.io from a NAMED alternate registry
+            # (`{ registry = "private" }`) -- resolving a registry NAME to its actual index URL
+            # would need this repo's `.cargo/config.toml`, which this verifier doesn't read. A
+            # stale private-registry `foo 1.0` could otherwise be masked by an unrelated
+            # crates.io `foo 1.1` of the same name. Two distinct registry sources for the same
+            # name is rare for a genuine single-registry project (manta's own real Cargo.lock has
+            # none) -- when it happens, this verifier can't safely tell a legitimate multi-
+            # registry setup apart from the exact attack Codex describes, so it doesn't guess.
+            registry_sources = {key[3] for key in candidates}
+            if len(registry_sources) > 1:
+                reasons.append(
+                    f'"{path}" {table_name}.{dep_name} has {len(registry_sources)} distinct '
+                    "registry sources among its Cargo.lock candidates -- cannot verify which one "
+                    "the manifest's own declaration resolves to"
+                )
+                continue
             versions = sorted({key[2] for key in candidates if key[2] is not None})
             if not versions:
                 continue
