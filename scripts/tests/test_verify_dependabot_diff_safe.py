@@ -559,6 +559,11 @@ class LockfileRetainedEntryTests(unittest.TestCase):
     """
 
     def test_git_rev_swap_with_unchanged_version_is_flagged(self):
+        # Since round 5 folded the raw `source` string into parse_lockfile_packages's key, this
+        # rev swap changes the key itself -- it now surfaces as a removed+added pair caught by
+        # the source-identity check, not as a same-key retained-entry field change. Kept as its
+        # own regression case (distinct from the round-4 tests below) because the VERSION here
+        # stays identical, only the source does.
         base = {
             "package": [
                 {
@@ -579,8 +584,7 @@ class LockfileRetainedEntryTests(unittest.TestCase):
         }
         reasons = v.check_lockfile_diff(base, head)
         self.assertEqual(len(reasons), 1)
-        self.assertIn("unchanged name/kind/version", reasons[0])
-        self.assertIn("source", reasons[0])
+        self.assertIn("source identity", reasons[0])
 
     def test_retained_dependencies_list_change_is_flagged(self):
         base = {
@@ -700,6 +704,59 @@ class LockfileSourceIdentityOnBumpTests(unittest.TestCase):
         reasons = v.check_lockfile_diff(base, head)
         self.assertEqual(len(reasons), 1)
         self.assertIn("source identity", reasons[0])
+
+
+class LockfileCollidingIdentityTests(unittest.TestCase):
+    """Codex P1, manta#194 round 5: a diamond dependency can legitimately pull in the same name
+    and version from two DIFFERENT sources of the same broad kind (e.g. two git URLs) -- each
+    gets its own [[package]] entry. Keying parse_lockfile_packages by (name, kind, version) alone
+    (rounds 1-4) collided those two entries onto one dict key, silently dropping one during
+    parsing -- before ANY check below ever ran on it.
+    """
+
+    def _two_git_entries(self, second_source):
+        return {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "source": "git+https://good-a.example/repo?branch=main#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                },
+                {
+                    "name": "demo",
+                    "version": "1.2.3",
+                    "source": second_source,
+                },
+            ]
+        }
+
+    def test_both_colliding_entries_are_preserved_when_unchanged(self):
+        pkg = self._two_git_entries(
+            "git+https://good-b.example/repo?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+        self.assertEqual(len(v.parse_lockfile_packages(pkg)), 2)
+        self.assertEqual(v.check_lockfile_diff(pkg, pkg), [])
+
+    def test_source_swap_on_the_second_colliding_entry_is_flagged(self):
+        base = self._two_git_entries(
+            "git+https://good-b.example/repo?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+        head = self._two_git_entries(
+            "git+https://evil.example/repo?branch=main#cccccccccccccccccccccccccccccccccccccccc"
+        )
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("source identity", reasons[0])
+
+    def test_dependencies_change_on_the_second_colliding_entry_is_flagged(self):
+        second_source = "git+https://good-b.example/repo?branch=main#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        base = self._two_git_entries(second_source)
+        base["package"][1]["dependencies"] = ["serde"]
+        head = self._two_git_entries(second_source)
+        head["package"][1]["dependencies"] = ["serde", "libc"]
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("dependencies", reasons[0])
 
 
 if __name__ == "__main__":

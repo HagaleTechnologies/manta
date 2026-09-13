@@ -450,14 +450,21 @@ def check_manifest_diff(path, base_toml, head_toml):
 
 
 def parse_lockfile_packages(lock_toml):
-    """Return {(name, source_kind): entry} for every [[package]] in a parsed Cargo.lock.
+    """Return {(name, source_kind, version, source): entry} for every [[package]] in a parsed
+    Cargo.lock.
 
-    source_kind is one of "workspace" (no source field -- a local workspace member),
-    "registry", or "git", derived from the entry's own `source` field. Keyed by (name,
-    source_kind) rather than name alone since Cargo.lock CAN carry two same-named packages at
-    different major versions (each gets its own [[package]] entry) -- source_kind in the key
-    keeps a registry-vs-git identity swap visible as two different keys disappearing/appearing
-    rather than one key's fields silently changing.
+    Keyed by the package's FULL identity -- name, source_kind, version, AND the raw `source`
+    string itself (Codex P1, manta#194 round 5): Cargo's own uniqueness invariant for a
+    [[package]] entry is name+version+source together, not name+kind+version. A diamond
+    dependency can legitimately pull in the SAME name and version from two different sources of
+    the same broad kind (e.g. two different git URLs) -- each gets its own [[package]] entry.
+    Keying on (name, kind, version) alone made those two entries collide on the same dict key, so
+    Python's plain assignment silently dropped one of them during parsing -- it never reached any
+    check below, however careful, because it was discarded before any of them ran. Including the
+    full source string in the key means two colliding entries always land on distinct keys, so
+    neither is lost; a change to only ONE of them then surfaces normally as a removed+added pair
+    (caught by the source-identity check below) or, if the source string itself stays byte-for-
+    byte identical, as a retained-entry field change (checksum/dependencies).
     """
     out = {}
     for entry in lock_toml.get("package", []):
@@ -471,7 +478,7 @@ def parse_lockfile_packages(lock_toml):
             kind = "git"
         else:
             kind = "unknown"
-        out[(name, kind, entry.get("version"))] = entry
+        out[(name, kind, entry.get("version"), source)] = entry
     return out
 
 
@@ -521,8 +528,8 @@ def check_lockfile_diff(base_lock, head_lock):
     # puts both in the SAME bucket, where the kind mismatch is directly visible and rejected.
     def by_name(keys):
         grouped = {}
-        for name, kind, version in keys:
-            grouped.setdefault(name, []).append((kind, version))
+        for name, kind, version, source in keys:
+            grouped.setdefault(name, []).append((kind, version, source))
         return grouped
 
     removed_grouped = by_name(removed)
@@ -545,29 +552,26 @@ def check_lockfile_diff(base_lock, head_lock):
                 "added/removed at once -- not a simple version bump"
             )
             continue
-        (old_kind, old_v), (new_kind, new_v) = removed_entries[0], added_entries[0]
+        (old_kind, old_v, old_source), (new_kind, new_v, new_source) = (
+            removed_entries[0],
+            added_entries[0],
+        )
         if old_kind != new_kind:
             reasons.append(
                 f'Cargo.lock package "{name}" changed source kind ({old_kind} -> {new_kind}) -- '
                 "not a plain version bump"
             )
             continue
-        # Source identity check (Codex P1, manta#194 round 4): the retained-entry comparison
-        # below only ever runs when (name, kind, version) stays IDENTICAL -- once the version
-        # (and therefore the dict key) changes, as it does on every legitimate bump, this pair
-        # never reaches that check at all. `old_kind == new_kind` alone treats any two "git" (or
-        # "registry") sources as equivalent regardless of which URL/ref they actually name, so a
-        # same-kind source swap riding along with a version bump (e.g. a git dependency's URL
-        # silently changed to a different host) passed unnoticed.
-        old_entry = base_pkgs[(name, old_kind, old_v)]
-        new_entry = head_pkgs[(name, new_kind, new_v)]
-        old_identity = _source_identity(old_kind, old_entry.get("source"))
-        new_identity = _source_identity(new_kind, new_entry.get("source"))
+        # Source identity check (Codex P1, manta#194 round 4): `old_kind == new_kind` alone
+        # treats any two "git" (or "registry") sources as equivalent regardless of which URL/ref
+        # they actually name, so a same-kind source swap riding along with a version bump (e.g.
+        # a git dependency's URL silently changed to a different host) passed unnoticed.
+        old_identity = _source_identity(old_kind, old_source)
+        new_identity = _source_identity(new_kind, new_source)
         if old_identity != new_identity:
             reasons.append(
                 f'Cargo.lock package "{name}" ({old_kind}) changed source identity '
-                f"({old_identity} -> {new_identity}) alongside its version bump -- not a plain "
-                "version bump"
+                f"({old_identity} -> {new_identity}) -- not a verified version bump"
             )
             continue
         if new_v is None or old_v is None:
@@ -603,18 +607,19 @@ def check_lockfile_diff(base_lock, head_lock):
     # internal consistency via `cargo generate-lockfile`/`cargo update`, which is not something
     # this verifier re-derives from scratch.
 
-    # Retained entries -- same (name, kind, version) key present in BOTH base and head -- are
-    # invisible to the removed/added set difference above (Codex P1, manta#194 round 3, Finding
-    # F): a git dependency's lockfile `version` field comes from the pinned crate's OWN
-    # Cargo.toml at that commit, not from the git ref/rev itself, so a rev swap to a different
-    # (e.g. malicious) commit can easily leave name/kind/version all unchanged while `source`
-    # (the actual pinned rev) or `dependencies` (that commit's own dependency list) changes
-    # underneath it. Compare the full entry dicts for every retained key.
+    # Retained entries -- same (name, kind, version, source) key present in BOTH base and head --
+    # are invisible to the removed/added set difference above (Codex P1, manta#194 round 3,
+    # Finding F). Since round 5's fix folded the raw `source` string into the key itself, a
+    # retained key now also means `source` stayed byte-for-byte identical -- what's left that can
+    # still differ underneath an identical key is `checksum`/`dependencies` (a git rev swap now
+    # surfaces earlier, as a removed+added pair the source-identity check above catches, because
+    # a rev change changes `source` and therefore the key). Compare the full entry dicts for
+    # every retained key regardless.
     for key in set(base_pkgs) & set(head_pkgs):
         base_entry = base_pkgs[key]
         head_entry = head_pkgs[key]
         if base_entry != head_entry:
-            name, kind, version = key
+            name, kind, version, _source = key
             changed_fields = sorted(
                 f
                 for f in set(base_entry) | set(head_entry)
@@ -622,8 +627,8 @@ def check_lockfile_diff(base_lock, head_lock):
             )
             reasons.append(
                 f'Cargo.lock package "{name}" ({kind}, {version}) has an unchanged name/kind/'
-                f"version but its {', '.join(changed_fields)} field(s) changed -- not a verified "
-                "version bump"
+                f"version/source but its {', '.join(changed_fields)} field(s) changed -- not a "
+                "verified version bump"
             )
 
     return reasons
