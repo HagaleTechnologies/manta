@@ -399,6 +399,22 @@ def requirement_is_satisfied_by(req, version_str):
                 return False
         else:
             return False
+    if v_pre is not None:
+        # Cargo's prerelease ELIGIBILITY rule (Codex P1, manta#194 round 13, Finding Q) -- a
+        # policy Cargo layers ON TOP of SemVer, distinct from the numeric precedence comparisons
+        # above (which already correctly rank a prerelease below its own release, per SemVer
+        # 2.0.0 section 11 -- the same version_sort_key logic used throughout this file). SemVer
+        # precedence alone would let "1.1.0-alpha" satisfy ">=1.0.0" (1.1.0-alpha ranks above
+        # 1.0.0), but Cargo EXCLUDES a prerelease unless the requirement itself explicitly opts
+        # in by naming a comparator with the exact SAME major.minor.patch that also carries a
+        # prerelease tag -- ">=1.1.0-alpha" would opt in for 1.1.0's own prereleases, but plain
+        # ">=1.0.0" never does, for any prerelease of any version.
+        opted_in = any(
+            c[1] == v_major and c[2] == v_minor and c[3] == v_patch and c[4] is not None
+            for c in comparators
+        )
+        if not opted_in:
+            return False
     return True
 
 
@@ -647,6 +663,41 @@ def _resolved_dependency_identities(deps, own_by_name, other_by_name):
     return resolved
 
 
+def _resolved_dependency_source_identities(deps, own_by_name, other_by_name):
+    """Like _resolved_dependency_identities, but resolves each edge to (name, kind,
+    source_identity) rather than the full (name, kind, version, source) key -- used for a
+    MATCHED REPLACEMENT entry's own dependencies field (round 12/13), where the full-identity
+    comparison is too strict: it flagged manta's own real fb1c7f3 commit, where clap_derive
+    legitimately shifted which VERSION of its existing `syn` dependency it needs between its own
+    two published releases (round 12). Dropping version from the comparison tolerates that
+    ordinary crate evolution while still catching a KIND or SOURCE swap on the same name (Codex
+    P1, manta#194 round 13, Finding P: an edge redirected from a registry-sourced "bar" to a
+    newly added git-sourced "bar" of the same name and version -- round 12's bare-name-only
+    comparison couldn't see this at all, since the name never changed).
+
+    Same ambiguity-aware fallback as _resolved_dependency_identities: a name with at most one
+    simultaneous candidate on either side resolves to its bare name (no coverage loss, since
+    kind/source can't meaningfully "swap" without either an old entry disappearing -- caught by
+    the kind/source-identity checks on that name's own matched pair -- or a genuine diamond
+    appearing, which is exactly the >1-candidate case this falls through to below).
+    """
+    resolved = set()
+    for ref in deps:
+        name = ref.split(" ", 1)[0]
+        own_candidates = own_by_name.get(name, [])
+        other_candidates = other_by_name.get(name, [])
+        if len(own_candidates) <= 1 and len(other_candidates) <= 1:
+            resolved.add(name)
+            continue
+        key = _resolve_dependency_ref(ref, own_candidates)
+        if key is None:
+            resolved.add(("__unresolved__", ref))
+        else:
+            _rname, rkind, _rversion, rsource = key
+            resolved.add((name, rkind, _source_identity(rkind, rsource)))
+    return resolved
+
+
 def check_lockfile_diff(base_lock, head_lock):
     """Compare Cargo.lock's [[package]] entries between base and head.
 
@@ -787,30 +838,35 @@ def check_lockfile_diff(base_lock, head_lock):
                 "mask this, so it is checked independently here"
             )
         # Dependency-edge validation on a REPLACEMENT entry (Codex P1, manta#194 round 12,
-        # Finding O): none of the checks above ever look at the NEW entry's own `dependencies`
-        # field -- only the retained-entries loop below does that, which by definition never runs
-        # for a matched removed/added pair (its key, by definition, changed). A version bump can
-        # ride along with an edge redirected to a brand-new, otherwise-unvalidated dependency with
-        # no reason ever raised.
+        # Finding O; refined round 13, Finding P): none of the checks above ever look at the NEW
+        # entry's own `dependencies` field -- only the retained-entries loop below does that,
+        # which by definition never runs for a matched removed/added pair (its key, by
+        # definition, changed). A version bump can ride along with an edge redirected to a
+        # brand-new, or differently-sourced, otherwise-unvalidated dependency with no reason ever
+        # raised.
         #
-        # Compares by bare NAME SET here, not the full resolved-identity comparison the retained-
-        # entries loop uses (round 8) -- found empirically while verifying this fix against
-        # manta's real history, not from a Codex comment: a MATCHED REPLACEMENT entry's own
-        # version already changed and passed the downgrade/major-boundary checks above, meaning
-        # some real difference in content is already accepted as the normal cost of a version
-        # bump. A published crate legitimately shifting which version of an EXISTING transitive
+        # Compares by (name, kind, source_identity) here via
+        # _resolved_dependency_source_identities -- NOT the full (name, kind, version, source)
+        # identity the retained-entries loop uses for round 8's Finding I, and NOT bare name
+        # alone either (round 12's first cut, which round 13's Finding P showed missed a kind/
+        # source swap: "bar" registry -> "bar" git keeps the same name, so a bare-name set
+        # comparison saw no change at all). Dropping VERSION specifically (unlike Finding I's
+        # comparison) tolerates a version-only retarget: a MATCHED REPLACEMENT entry's own
+        # version already changed and passed the downgrade/major-boundary checks above, and a
+        # published crate legitimately shifting which version of an EXISTING same-kind/source
         # dependency it needs between its own two releases is routine, not suspicious -- manta's
         # own real commit fb1c7f3 hit exactly this (clap_derive 4.6.1 -> 4.6.4 shifted its own
-        # `syn` edge from a 2.x instance to a newly-available 3.x one, entirely legitimately) and
-        # would have been rejected by full identity comparison. What IS suspicious, and what
-        # Codex's own reproduction actually demonstrates, is a WHOLLY NEW dependency NAME
-        # appearing that this package never referenced before (its own bar -> evil example) --
-        # that's what the name-set comparison below still catches.
+        # `syn` edge from a 2.x instance to a newly-available 3.x one, both registry-sourced) and
+        # would have been wrongly rejected by full identity comparison.
         old_entry = base_pkgs[(name, old_kind, old_v, old_source)]
         new_entry = head_pkgs[(name, new_kind, new_v, new_source)]
-        old_dep_names = {ref.split(" ", 1)[0] for ref in old_entry.get("dependencies", [])}
-        new_dep_names = {ref.split(" ", 1)[0] for ref in new_entry.get("dependencies", [])}
-        if old_dep_names != new_dep_names:
+        old_dep_ids = _resolved_dependency_source_identities(
+            old_entry.get("dependencies", []), base_by_name, head_by_name
+        )
+        new_dep_ids = _resolved_dependency_source_identities(
+            new_entry.get("dependencies", []), head_by_name, base_by_name
+        )
+        if old_dep_ids != new_dep_ids:
             reasons.append(
                 f'Cargo.lock package "{name}" ({old_kind}) changed its dependencies alongside '
                 f"its version bump ({old_v} -> {new_v}) -- not a plain version bump"
@@ -935,6 +991,14 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
     0.10.1 itself satisfies whatever rand_core's own requirement currently is; round 8/9 skipped
     any name with more than one candidate outright, which is exactly what let a genuine
     inconsistency hide behind an unrelated coexisting version (round 10, Finding L).
+
+    Looks up lockfile candidates by the declared `package` rename field when present, falling
+    back to the dependency's own key otherwise (Codex P1, manta#194 round 13, Finding R): Cargo's
+    rename mechanism (`alias = { package = "foo", version = "1.1" }`) declares the dependency
+    under key "alias" but Cargo.lock records the ACTUAL crate under its real name "foo" -- looking
+    up "alias" in the lockfile finds nothing, so every renamed dependency's requirement silently
+    skipped this whole check (the `if not versions: continue` guard below, meant for a genuinely
+    out-of-scope path/workspace-only dep, was quietly absorbing every rename too).
     """
     reasons = []
     pkgs_by_name = _index_pkgs_by_name(parse_lockfile_packages(head_lock))
@@ -944,8 +1008,9 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
         ).items():
             if kind != "version":
                 continue
-            req, _rest = detail
-            candidates = pkgs_by_name.get(dep_name, [])
+            req, rest = detail
+            lockfile_name = rest.get("package", dep_name)
+            candidates = pkgs_by_name.get(lockfile_name, [])
             versions = sorted({key[2] for key in candidates if key[2] is not None})
             if not versions:
                 continue

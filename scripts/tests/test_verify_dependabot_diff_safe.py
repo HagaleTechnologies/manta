@@ -1354,6 +1354,160 @@ class LockfileReplacementEntryDependencyEdgeTests(unittest.TestCase):
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
+    def test_edge_kind_swap_at_same_name_and_version_is_flagged(self):
+        # Codex P1, manta#194 round 13, Finding P -- the exact reproduction: foo's edge to "bar"
+        # changes from a registry-sourced instance to a newly-added git-sourced instance of the
+        # SAME name and version. Round 12's bare-name-set comparison saw {"bar"} == {"bar"} and
+        # missed this entirely, since the name itself never changed.
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                    "dependencies": ["bar 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar 1.0.0 (git+https://malicious.example/bar.git?rev=deadbeef#deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "git+https://malicious.example/bar.git?rev=deadbeef#deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                },
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("foo", reasons[0])
+        self.assertIn("dependencies", reasons[0])
+
+    def test_edge_version_only_retarget_within_a_diamond_is_safe(self):
+        # The clap_derive/syn case (round 12) restated as a diamond: foo's edge to "bar" shifts
+        # from bar 1.0.0 to a newly-available bar 2.0.0 of the SAME kind/source -- both syn
+        # instances coexist in head, same as clap_derive's real syn 2.x/3.x transition.
+        base = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                    "dependencies": ["bar"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.1",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo2",
+                    "dependencies": ["bar 2.0.0"],
+                },
+                {
+                    "name": "bar",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar1",
+                },
+                {
+                    "name": "bar",
+                    "version": "2.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "bar2",
+                },
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+
+class RequirementPrereleaseEligibilityTests(unittest.TestCase):
+    """Codex P1, manta#194 round 13, Finding Q: Cargo excludes a prerelease from satisfying a
+    requirement unless the requirement itself explicitly opts in with a same-major.minor.patch
+    prerelease comparator -- a policy layered on top of (not replaced by) SemVer precedence.
+    """
+
+    def test_unopted_prerelease_above_the_floor_is_not_satisfied(self):
+        self.assertFalse(v.requirement_is_satisfied_by(">=1.0.0", "1.1.0-alpha"))
+
+    def test_opted_in_prerelease_at_the_same_base_version_is_satisfied(self):
+        self.assertTrue(v.requirement_is_satisfied_by(">=1.1.0-alpha", "1.1.0-alpha.2"))
+
+    def test_stable_version_is_unaffected_by_the_eligibility_rule(self):
+        self.assertTrue(v.requirement_is_satisfied_by(">=1.0.0", "1.1.0"))
+
+    def test_prerelease_of_a_different_base_version_still_excluded_even_if_caret_matches(self):
+        # ^1.0.0's floor is 1.0.0 and ceiling is <2.0.0 -- 1.1.0-alpha's numeric precedence falls
+        # inside that range, but no comparator names 1.1.0 with a prerelease, so it's still
+        # excluded.
+        self.assertFalse(v.requirement_is_satisfied_by("^1.0.0", "1.1.0-alpha"))
+
+
+class ManifestLockfileConsistencyRenameTests(unittest.TestCase):
+    """Codex P1, manta#194 round 13, Finding R: Cargo's rename mechanism
+    (`alias = { package = "foo", version = "1.1" }`) declares under key "alias" but Cargo.lock
+    records the actual crate under its real name "foo" -- looking up "alias" in the lockfile
+    silently found nothing and skipped the whole check for every renamed dependency.
+    """
+
+    def _lock(self, name, version):
+        return {
+            "package": [
+                {
+                    "name": name,
+                    "version": version,
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+
+    def test_renamed_dependency_is_resolved_via_its_package_name(self):
+        head_tomls = {
+            "Cargo.toml": {"dependencies": {"alias": {"package": "foo", "version": "1.1"}}}
+        }
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, self._lock("foo", "1.0.5"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("alias", reasons[0])
+        self.assertIn("does not satisfy the head manifest", reasons[0])
+
+    def test_renamed_dependency_satisfying_its_requirement_is_safe(self):
+        head_tomls = {
+            "Cargo.toml": {"dependencies": {"alias": {"package": "foo", "version": "1.1"}}}
+        }
+        self.assertEqual(
+            v.check_manifest_lockfile_consistency(head_tomls, self._lock("foo", "1.1.0")), []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
