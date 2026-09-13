@@ -1022,22 +1022,42 @@ class LockfileDependencyDisambiguationSuffixTests(unittest.TestCase):
 
 
 class RequirementFloorTests(unittest.TestCase):
-    def test_caret_floor_is_the_bare_version(self):
-        self.assertEqual(v.requirement_floor("1.1"), v.version_sort_key(1, 1, 0, None))
+    def test_caret_floor_is_the_bare_version_and_inclusive(self):
+        self.assertEqual(
+            v.requirement_floor("1.1"), (v.version_sort_key(1, 1, 0, None), False)
+        )
 
-    def test_bare_wildcard_floor_is_zero(self):
-        self.assertEqual(v.requirement_floor("*"), v.version_sort_key(0, 0, 0, None))
+    def test_bare_wildcard_floor_is_zero_and_inclusive(self):
+        self.assertEqual(v.requirement_floor("*"), (v.version_sort_key(0, 0, 0, None), False))
 
     def test_explicit_range_floor_ignores_the_ceiling_comparator(self):
         self.assertEqual(
-            v.requirement_floor(">=1.2.3, <2.0.0"), v.version_sort_key(1, 2, 3, None)
+            v.requirement_floor(">=1.2.3, <2.0.0"), (v.version_sort_key(1, 2, 3, None), False)
         )
 
     def test_pure_ceiling_only_requirement_floor_is_zero(self):
-        self.assertEqual(v.requirement_floor("<2.0.0"), v.version_sort_key(0, 0, 0, None))
+        self.assertEqual(v.requirement_floor("<2.0.0"), (v.version_sort_key(0, 0, 0, None), False))
 
     def test_unparseable_requirement_returns_none(self):
         self.assertIsNone(v.requirement_floor("not a version"))
+
+    def test_strict_gt_floor_is_exclusive(self):
+        self.assertEqual(
+            v.requirement_floor(">1.0.5"), (v.version_sort_key(1, 0, 5, None), True)
+        )
+
+    def test_gt_and_ge_tied_at_same_floor_is_exclusive(self):
+        # AND'd: the stricter of two comparators tied at the same floor value wins.
+        self.assertEqual(
+            v.requirement_floor(">1.0.5, >=1.0.5"), (v.version_sort_key(1, 0, 5, None), True)
+        )
+
+    def test_gt_below_a_higher_ge_floor_is_inclusive(self):
+        # The GE comparator sets the higher (controlling) floor, so its inclusive bound wins --
+        # the GT comparator's own strictness is irrelevant once it's not the tightest constraint.
+        self.assertEqual(
+            v.requirement_floor(">1.0.0, >=2.0.0"), (v.version_sort_key(2, 0, 0, None), False)
+        )
 
 
 class ManifestLockfileConsistencyTests(unittest.TestCase):
@@ -1100,6 +1120,26 @@ class ManifestLockfileConsistencyTests(unittest.TestCase):
             ]
         }
         self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+    def test_strict_gt_bound_equal_to_locked_version_is_flagged(self):
+        # Codex P1, manta#194 round 9: `demo = ">1.0.5"` requires STRICTLY more than 1.0.5 --
+        # a locked "1.0.5" does not satisfy it, even though it isn't BELOW the floor value.
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": ">1.0.5"}}}
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, self._lock("1.0.5"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("does not satisfy the head manifest", reasons[0])
+
+    def test_strict_gt_bound_below_locked_version_is_safe(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": ">1.0.5"}}}
+        self.assertEqual(
+            v.check_manifest_lockfile_consistency(head_tomls, self._lock("1.0.6")), []
+        )
+
+    def test_inclusive_ge_bound_equal_to_locked_version_is_safe(self):
+        head_tomls = {"Cargo.toml": {"dependencies": {"demo": ">=1.0.5"}}}
+        self.assertEqual(
+            v.check_manifest_lockfile_consistency(head_tomls, self._lock("1.0.5")), []
+        )
 
 
 class ManifestLockfileConsistencyEndToEndTests(unittest.TestCase):

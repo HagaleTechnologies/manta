@@ -337,24 +337,34 @@ def compare_requirements(base_req, head_req):
 
 
 def requirement_floor(req):
-    """The lowest version any comparator in `req` could accept -- the MAXIMUM of every individual
-    comparator's own floor, since comma-separated pieces are always AND'd (never OR'd) in Cargo's
-    grammar, so the effective floor is bounded by the strictest one. A pure ceiling comparator
-    (LT/LE) contributes no floor of its own. Returns a version_sort_key-comparable tuple, or None
-    if `req` fails to parse -- never raises.
+    """The lower bound any comparator in `req` could accept -- (floor, is_exclusive).
 
-    Deliberately narrow: this extracts the floor ONLY, not full requirement satisfaction (it says
-    nothing about whether some version is too HIGH for a caret/tilde ceiling, or about an
-    unmatched EXACT pin). That's enough for check_manifest_lockfile_consistency's one job --
-    confirming a resolved version isn't BELOW what the manifest now requires -- without adding a
-    whole new comparator-satisfaction evaluator (this file's biggest source of subtle bugs across
-    rounds 3-8) just to cover the one direction Dependabot can actually make go wrong.
+    `floor` is the MAXIMUM of every individual comparator's own floor, since comma-separated
+    pieces are always AND'd (never OR'd) in Cargo's grammar, so the effective bound is set by the
+    strictest one. `is_exclusive` is True when a strict `>` comparator controls that bound (the
+    version must be STRICTLY greater than `floor`, not merely equal to it) -- Codex P1, manta#194
+    round 9: an earlier version of this function returned the floor value alone, treating every
+    comparator as an inclusive `>=` bound. `demo = ">1.0.4"` -> `">1.0.5"` while Cargo.lock
+    retains "1.0.5" passed silently: 1.0.5 is NOT below 1.0.5, so the inclusive check saw no
+    problem, but ">1.0.5" itself requires STRICTLY more than 1.0.5 -- the locked version doesn't
+    actually satisfy it. When multiple comparators tie at the same maximum floor value, the bound
+    is exclusive if ANY of them is a strict `>` (AND'd -- the strictest constraint wins). A pure
+    ceiling comparator (LT/LE) contributes no floor of its own. Returns None if `req` fails to
+    parse -- never raises.
+
+    Deliberately narrow: this extracts the LOWER bound only, not full requirement satisfaction
+    (it says nothing about whether some version is too HIGH for a caret/tilde ceiling, or about
+    an unmatched EXACT pin). That's enough for check_manifest_lockfile_consistency's one job --
+    confirming a resolved version actually satisfies what the manifest now requires on the low
+    end -- without adding a whole new comparator-satisfaction evaluator (this file's biggest
+    source of subtle bugs across rounds 3-9) just to cover the one direction Dependabot can
+    actually make go wrong.
     """
     try:
         comparators = parse_requirement(req)
     except VerifyError:
         return None
-    floors = []
+    contributions = []  # (floor_tuple, is_exclusive)
     for comparator in comparators:
         kind, major, _minor, _patch, pre = comparator
         if kind in (LT, LE):
@@ -362,12 +372,14 @@ def requirement_floor(req):
         if kind == WILDCARD and major is None:
             # Bare "*" -- Cargo Book: `* := >=0.0.0`. floor_tuple would pass `major=None`
             # straight into version_sort_key otherwise, which only None-guards minor/patch.
-            floors.append(version_sort_key(0, 0, 0, pre))
+            contributions.append((version_sort_key(0, 0, 0, pre), False))
         else:
-            floors.append(floor_tuple(comparator))
-    if not floors:
-        return version_sort_key(0, 0, 0, None)
-    return max(floors)
+            contributions.append((floor_tuple(comparator), kind == GT))
+    if not contributions:
+        return version_sort_key(0, 0, 0, None), False
+    max_floor = max(floor for floor, _ in contributions)
+    is_exclusive = any(excl for floor, excl in contributions if floor == max_floor)
+    return max_floor, is_exclusive
 
 
 def collect_dependency_declarations(pkg_toml):
@@ -856,20 +868,25 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
             if kind != "version":
                 continue
             req, _rest = detail
-            floor = requirement_floor(req)
-            if floor is None:
+            floor_result = requirement_floor(req)
+            if floor_result is None:
                 continue
+            floor, is_exclusive = floor_result
             candidates = pkgs_by_name.get(dep_name, [])
             if len(candidates) != 1:
                 continue
             _name, _kind, version, _source = candidates[0]
             if version is None:
                 continue
-            if _version_tuple(version) < floor:
+            locked = _version_tuple(version)
+            # Codex P1, manta#194 round 9: a strict `>` bound requires STRICTLY more than the
+            # floor -- `locked == floor` alone still fails it, not just `locked < floor`.
+            violates = locked <= floor if is_exclusive else locked < floor
+            if violates:
                 reasons.append(
                     f'"{path}" {table_name}.{dep_name} requires "{req}" but Cargo.lock resolves '
-                    f"it to {version}, which is below that requirement's floor -- the head lock "
-                    "does not satisfy the head manifest"
+                    f"it to {version}, which does not satisfy that requirement's lower bound -- "
+                    "the head lock does not satisfy the head manifest"
                 )
     return reasons
 
