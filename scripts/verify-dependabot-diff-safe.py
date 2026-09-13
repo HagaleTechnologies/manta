@@ -532,9 +532,30 @@ def check_lockfile_diff(base_lock, head_lock):
                 "not a plain version bump"
             )
             continue
-        if new_v is not None and old_v is not None and _version_tuple(new_v) < _version_tuple(old_v):
+        if new_v is None or old_v is None:
+            continue
+        if _version_tuple(new_v) < _version_tuple(old_v):
             reasons.append(
                 f'Cargo.lock package "{name}" ({old_kind}) downgraded ({old_v} -> {new_v})'
+            )
+            continue
+        # Major/0.x-boundary check on the RESOLVED version itself (Codex P1, manta#194 round 3,
+        # Finding E): the manifest-level check (compare_requirements) only ever sees an edit to
+        # the manifest's OWN requirement string -- when that requirement is already maximally
+        # permissive (e.g. `demo = "*"`), a resolved-version jump from 1.x to 2.x reaches this
+        # point with no manifest edit at all to catch it, and the downgrade check above passes it
+        # (it's an increase, not a downgrade). Reuses the same ceiling rule compare_requirements
+        # applies to a manifest-level caret requirement, applied here to synthetic caret
+        # comparators built from the two resolved versions.
+        old_major, old_minor, old_patch, old_pre = _parse_bare_version(old_v)
+        new_major, new_minor, new_patch, new_pre = _parse_bare_version(new_v)
+        old_ceiling = caret_ceiling_component((CARET, old_major, old_minor, old_patch, old_pre))
+        new_ceiling = caret_ceiling_component((CARET, new_major, new_minor, new_patch, new_pre))
+        if old_ceiling != new_ceiling:
+            reasons.append(
+                f'Cargo.lock package "{name}" ({old_kind}) crossed a major/0.x boundary in its '
+                f"resolved version ({old_v} -> {new_v}) -- a permissive manifest requirement can "
+                "mask this, so it is checked independently here"
             )
 
     # Any name that only ever appears in `added` (never matched to a `removed` peer) is a
@@ -544,19 +565,36 @@ def check_lockfile_diff(base_lock, head_lock):
     # internal consistency via `cargo generate-lockfile`/`cargo update`, which is not something
     # this verifier re-derives from scratch.
 
+    # Retained entries -- same (name, kind, version) key present in BOTH base and head -- are
+    # invisible to the removed/added set difference above (Codex P1, manta#194 round 3, Finding
+    # F): a git dependency's lockfile `version` field comes from the pinned crate's OWN
+    # Cargo.toml at that commit, not from the git ref/rev itself, so a rev swap to a different
+    # (e.g. malicious) commit can easily leave name/kind/version all unchanged while `source`
+    # (the actual pinned rev) or `dependencies` (that commit's own dependency list) changes
+    # underneath it. Compare the full entry dicts for every retained key.
+    for key in set(base_pkgs) & set(head_pkgs):
+        base_entry = base_pkgs[key]
+        head_entry = head_pkgs[key]
+        if base_entry != head_entry:
+            name, kind, version = key
+            changed_fields = sorted(
+                f
+                for f in set(base_entry) | set(head_entry)
+                if base_entry.get(f) != head_entry.get(f)
+            )
+            reasons.append(
+                f'Cargo.lock package "{name}" ({kind}, {version}) has an unchanged name/kind/'
+                f"version but its {', '.join(changed_fields)} field(s) changed -- not a verified "
+                "version bump"
+            )
+
     return reasons
 
 
-def _version_tuple(version_str):
-    """A fully-ordered sort key for a resolved Cargo.lock `version` string (real SemVer 2.0.0
-    syntax, not a Cargo requirement) -- major.minor.patch[-prerelease][+build].
-
-    Build metadata never affects ordering (discarded outright, per SemVer 2.0.0 section 10) and
-    is stripped before splitting off the prerelease. Delegates to version_sort_key for the
-    prerelease-precedence rule (Codex P1, manta#194 round 2: the previous version ignored the
-    prerelease suffix entirely, so a Cargo.lock entry going from "1.0.0" to "1.0.0-alpha" -- a
-    real downgrade per SemVer precedence -- compared as unchanged and passed the downgrade
-    check).
+def _parse_bare_version(version_str):
+    """Parse major/minor/patch/pre out of a resolved Cargo.lock `version` string (real SemVer
+    2.0.0 syntax, not a Cargo requirement). Build metadata is discarded outright (per SemVer
+    2.0.0 section 10, it never affects ordering or a major-boundary determination).
     """
     without_build = version_str.split("+", 1)[0]
     core, _, pre = without_build.partition("-")
@@ -569,6 +607,18 @@ def _version_tuple(version_str):
     while len(nums) < 3:
         nums.append(0)
     major, minor, patch = nums
+    return major, minor, patch, pre
+
+
+def _version_tuple(version_str):
+    """A fully-ordered sort key for a resolved Cargo.lock `version` string.
+
+    Delegates to version_sort_key for the prerelease-precedence rule (Codex P1, manta#194 round
+    2: an earlier version ignored the prerelease suffix entirely, so a Cargo.lock entry going
+    from "1.0.0" to "1.0.0-alpha" -- a real downgrade per SemVer precedence -- compared as
+    unchanged and passed the downgrade check).
+    """
+    major, minor, patch, pre = _parse_bare_version(version_str)
     return version_sort_key(major, minor, patch, pre)
 
 

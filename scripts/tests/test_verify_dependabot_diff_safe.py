@@ -514,5 +514,114 @@ class LockfileSourceKindSwapTests(unittest.TestCase):
         self.assertIn("changed source kind", reasons[0])
 
 
+class LockfileMajorBoundaryOnIncreaseTests(unittest.TestCase):
+    """Codex P1, manta#194 round 3, Finding E: the resolved version's own major/0.x boundary is
+    checked independently of the manifest, since a permissive manifest requirement (e.g. "*")
+    leaves the manifest-level check with nothing to compare.
+    """
+
+    def _pkg(self, version):
+        return {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": version,
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+
+    def test_major_version_increase_is_flagged(self):
+        reasons = v.check_lockfile_diff(self._pkg("1.2.3"), self._pkg("2.0.0"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("major/0.x boundary", reasons[0])
+
+    def test_zero_x_minor_increase_is_flagged(self):
+        # Cargo treats a 0.x minor bump as breaking -- same ceiling rule as a manifest-level
+        # caret requirement.
+        reasons = v.check_lockfile_diff(self._pkg("0.2.3"), self._pkg("0.3.0"))
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("major/0.x boundary", reasons[0])
+
+    def test_minor_and_patch_increase_within_same_major_is_safe(self):
+        self.assertEqual(v.check_lockfile_diff(self._pkg("1.2.3"), self._pkg("1.9.9")), [])
+
+    def test_zero_x_patch_increase_within_same_minor_is_safe(self):
+        self.assertEqual(v.check_lockfile_diff(self._pkg("0.2.3"), self._pkg("0.2.9")), [])
+
+
+class LockfileRetainedEntryTests(unittest.TestCase):
+    """Codex P1, manta#194 round 3, Finding F: a package retained under an identical
+    (name, kind, version) key is invisible to the removed/added set difference -- e.g. a git
+    dependency's `version` field comes from the pinned crate's own Cargo.toml at that commit,
+    not the git rev itself, so a rev swap can leave name/kind/version all unchanged.
+    """
+
+    def test_git_rev_swap_with_unchanged_version_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "0.1.0",
+                    "source": "git+https://example.com/demo.git?rev=aaaaaaa#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "0.1.0",
+                    "source": "git+https://malicious.example/demo.git?rev=bbbbbbb#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("unchanged name/kind/version", reasons[0])
+        self.assertIn("source", reasons[0])
+
+    def test_retained_dependencies_list_change_is_flagged(self):
+        base = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["serde"],
+                }
+            ]
+        }
+        head = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                    "dependencies": ["serde", "libc"],
+                }
+            ]
+        }
+        reasons = v.check_lockfile_diff(base, head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("dependencies", reasons[0])
+
+    def test_fully_unchanged_retained_entry_is_safe(self):
+        pkg = {
+            "package": [
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "aaa",
+                }
+            ]
+        }
+        self.assertEqual(v.check_lockfile_diff(pkg, pkg), [])
+
+
 if __name__ == "__main__":
     unittest.main()
