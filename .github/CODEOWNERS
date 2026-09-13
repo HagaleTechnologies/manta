@@ -42,7 +42,29 @@ Cargo.toml           @thagale
 /AGENTS.md           @thagale
 /CLAUDE.md           @thagale
 
-/docs/DECISIONS/     @thagale
+# docs/DECISIONS/ used to be owned as a whole directory: AGENTS.md treats specific decision docs
+# as normative policy (the implementation-pin docs, the PR auto-merge policy, the review-
+# convergence policy, etc.), so an unowned edit to one of those specific files is the same
+# self-referential-policy bypass already closed for AGENTS.md/CLAUDE.md -- just laundered through
+# a referenced doc. Per-ticket decision docs (the rest of this directory) carry no such weight and
+# don't need owner review to land -- blanket ownership here was blocking every routine ticket PR
+# from merging without @thagale, since nearly every ticket writes one.
+#
+# Narrowed 2026-09-12 to just the files AGENTS.md actually defers to as policy. If a future edit
+# to AGENTS.md starts treating a new docs/DECISIONS/ file as normative, add it here explicitly --
+# this list does not follow AGENTS.md automatically.
+/docs/DECISIONS/2026-07-11-m0-implementation-pins.md       @thagale
+/docs/DECISIONS/2026-07-17-m1-implementation-pins.md       @thagale
+/docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md       @thagale
+/docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md      @thagale
+/docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md  @thagale
+/docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md    @thagale
+/docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md        @thagale
+/docs/DECISIONS/2026-07-25-m2-soapysdr-input-pins.md       @thagale
+/docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md         @thagale
+/docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md @thagale
+/docs/DECISIONS/2026-09-06-broad-review-decisions.md       @thagale
+/docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md   @thagale
 
 # Dockerfile is what release-publish.yml actually builds and pushes to GHCR -- an unowned edit
 # here can change the published release image's contents with no corresponding review of
