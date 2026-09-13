@@ -2470,5 +2470,49 @@ class LockfileAddedEntryChecksumTests(unittest.TestCase):
         }
         self.assertEqual(v.check_lockfile_diff(base, head), [])
 
+
+class LockfileResidualStructureTests(unittest.TestCase):
+    """Codex P1, manta#194 round 25, Finding AJ: every check in this file only ever inspects
+    `[[package]]` entries. Cargo.lock's OTHER top-level keys -- the lockfile format `version`
+    and the legacy `[metadata]` table -- were completely invisible, so a diff that changed ONLY
+    one of them reported no reason at all, even though Cargo itself silently accepts either
+    change and neither is a dependency-version bump.
+    """
+
+    def _base(self):
+        return {
+            "version": 4,
+            "package": [
+                {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "foo1",
+                }
+            ],
+        }
+
+    def test_lockfile_format_version_change_is_flagged(self):
+        head = {**self._base(), "version": 3}
+        reasons = v.check_lockfile_diff(self._base(), head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("Cargo.lock", reasons[0])
+        self.assertIn("outside its [[package]] entries", reasons[0])
+
+    def test_added_metadata_table_is_flagged(self):
+        head = {**self._base(), "metadata": {"checksum foo 1.0.0": "aaa"}}
+        reasons = v.check_lockfile_diff(self._base(), head)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("outside its [[package]] entries", reasons[0])
+
+    def test_unchanged_residual_structure_is_safe(self):
+        base = self._base()
+        head = {
+            **self._base(),
+            "package": [{**base["package"][0], "version": "1.0.1", "checksum": "foo2"}],
+        }
+        self.assertEqual(v.check_lockfile_diff(base, head), [])
+
+
 if __name__ == "__main__":
     unittest.main()

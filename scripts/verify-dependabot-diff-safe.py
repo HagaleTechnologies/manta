@@ -644,6 +644,23 @@ def parse_lockfile_packages(lock_toml):
     return out
 
 
+def strip_lockfile_packages(lock_toml):
+    """A deep copy of a parsed Cargo.lock with the `package` array removed.
+
+    `parse_lockfile_packages` and everything downstream of it in `check_lockfile_diff` only ever
+    inspects `[[package]]` entries. Cargo.lock's OTHER top-level keys -- `version` (the lockfile
+    format version, currently 3 or 4) and the legacy `[metadata]` table -- were completely
+    invisible to every check in this file (Codex P1, manta#194 round 25, Finding AJ): a diff that
+    changes ONLY one of them (e.g. downgrading `version = 4` to `3`, or adding/editing
+    `[metadata]`) reported no reason at all, even though Cargo itself accepts either change
+    silently and neither is a dependency-version change -- exactly the residual-structure gap
+    `check_manifest_diff`'s own `strip_dependency_tables` already closes on the manifest side.
+    """
+    stripped = copy.deepcopy(lock_toml)
+    stripped.pop("package", None)
+    return stripped
+
+
 def _source_identity(kind, source):
     """The part of a lockfile entry's `source` string that identifies WHERE it comes from,
     excluding the part a legitimate version bump is expected to change.
@@ -820,11 +837,17 @@ def check_lockfile_diff(base_lock, head_lock):
     (name, kind, version) key removed, a new one with a HIGHER version and the SAME kind added)
     or something this verifier defers to human review.
     """
+    reasons = []
+    if strip_lockfile_packages(base_lock) != strip_lockfile_packages(head_lock):
+        reasons.append(
+            '"Cargo.lock" changed outside its [[package]] entries (e.g. the lockfile format '
+            '"version" or a [metadata] table) -- not a plain dependency-version bump'
+        )
+
     base_pkgs = parse_lockfile_packages(base_lock)
     head_pkgs = parse_lockfile_packages(head_lock)
     base_by_name = _index_pkgs_by_name(base_pkgs)
     head_by_name = _index_pkgs_by_name(head_pkgs)
-    reasons = []
 
     removed = set(base_pkgs) - set(head_pkgs)
     added = set(head_pkgs) - set(base_pkgs)
