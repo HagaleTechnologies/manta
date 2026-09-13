@@ -400,13 +400,37 @@ def requirement_is_satisfied_by(req, version_str):
         elif kind == LE:
             # Omitted-component-aware (Finding Z's fix also covers LE): `<=1.2` includes the
             # WHOLE 1.2.x line, which a zero-filled floor comparison would reject for 1.2.1+.
-            if _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch) == "gt":
+            boundary = _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch)
+            if boundary == "gt":
                 return False
+            # Prerelease PRECEDENCE, not just presence (Codex P1, manta#194 round 22, Finding
+            # AF) -- confirmed against the real semver crate's matches_less, which falls through
+            # to `ver.pre < cmp.pre` when major.minor.patch all match exactly: `<=1.2.3-alpha`
+            # must reject "1.2.3-beta" (higher SemVer precedence than alpha) and reject stable
+            # "1.2.3" (always higher precedence than any prerelease of the same version) -- both
+            # numerically equal the comparator's own boundary. Only when patch is fully specified
+            # (not Finding Z's omitted-patch wildcard, where "eq" means "any patch" rather than a
+            # single point to compare precedence against).
+            if boundary == "eq" and patch is not None:
+                cmp_key = version_sort_key(major, minor, patch, cmp_pre)
+                if v_key > cmp_key:
+                    return False
         elif kind == GT:
             # Omitted-component-aware (Codex P1, manta#194 round 17, Finding Z): `>1.2` excludes
             # the WHOLE 1.2.x line, which a zero-filled floor comparison would wrongly accept.
-            if _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch) != "gt":
-                return False
+            boundary = _comparator_boundary(v_major, v_minor, v_patch, major, minor, patch)
+            if boundary != "gt":
+                # Prerelease PRECEDENCE (found while implementing Finding AF's fix for LE, not a
+                # separate Codex comment -- the real semver crate's matches_greater has the exact
+                # same structure in the opposite direction: `ver.pre > cmp.pre` when
+                # major.minor.patch all match). `>1.2.3-alpha` must ACCEPT "1.2.3-beta" (higher
+                # precedence) and ACCEPT stable "1.2.3" (always higher precedence) -- boundary
+                # alone reads both as merely "eq" and would otherwise wrongly reject them.
+                if not (boundary == "eq" and patch is not None):
+                    return False
+                cmp_key = version_sort_key(major, minor, patch, cmp_pre)
+                if v_key <= cmp_key:
+                    return False
         elif kind == GE:
             if v_key < floor_tuple(comparator):
                 return False

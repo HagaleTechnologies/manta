@@ -1951,6 +1951,32 @@ class RequirementOmittedComponentBoundaryTests(unittest.TestCase):
     def test_exact_without_a_prerelease_still_matches_a_stable_release(self):
         self.assertTrue(v.requirement_is_satisfied_by("=1.2.3", "1.2.3"))
 
+    def test_le_rejects_a_higher_precedence_prerelease_at_the_same_boundary(self):
+        # Codex P1, manta#194 round 22, Finding AF -- confirmed against the real semver crate's
+        # matches_less: `<=1.2.3-alpha` must reject "1.2.3-beta" (higher SemVer precedence) and
+        # reject stable "1.2.3" (always higher precedence than any prerelease), even though both
+        # numerically equal the comparator's own major.minor.patch.
+        self.assertFalse(v.requirement_is_satisfied_by("<=1.2.3-alpha", "1.2.3-beta"))
+        self.assertFalse(v.requirement_is_satisfied_by("<=1.2.3-alpha", "1.2.3"))
+        self.assertTrue(v.requirement_is_satisfied_by("<=1.2.3-alpha", "1.2.3-alpha"))
+        self.assertTrue(v.requirement_is_satisfied_by("<=1.2.3-beta", "1.2.3-alpha"))
+
+    def test_gt_accepts_a_higher_precedence_prerelease_at_the_same_boundary(self):
+        # Found while implementing Finding AF's fix, not a separate Codex comment: the real
+        # semver crate's matches_greater has the exact same structure in reverse. `>1.2.3-alpha`
+        # must ACCEPT "1.2.3-beta" and ACCEPT stable "1.2.3", both higher precedence than alpha.
+        self.assertTrue(v.requirement_is_satisfied_by(">1.2.3-alpha", "1.2.3-beta"))
+        self.assertTrue(v.requirement_is_satisfied_by(">1.2.3-alpha", "1.2.3"))
+        self.assertFalse(v.requirement_is_satisfied_by(">1.2.3-alpha", "1.2.3-alpha"))
+        self.assertFalse(v.requirement_is_satisfied_by(">1.2.3-beta", "1.2.3-alpha"))
+
+    def test_le_and_gt_omitted_patch_tolerance_is_unaffected(self):
+        # Finding Z's omitted-component tolerance must survive this round's prerelease-precedence
+        # addition -- "eq" for an omitted patch means "any patch," not a single point to compare
+        # precedence against.
+        self.assertTrue(v.requirement_is_satisfied_by("<=1.2", "1.2.9"))
+        self.assertFalse(v.requirement_is_satisfied_by(">1.2", "1.2.9"))
+
 
 class LockfileWorkspaceReplacementTests(unittest.TestCase):
     """Codex P1, manta#194 round 18, Finding AA: a workspace member's lockfile-recorded version
