@@ -149,6 +149,19 @@ jobs:
   docker-publish:
     needs: build
     runs-on: ubuntu-latest
+    # MAN-66: closes the residual risk this file's own header comment documents -- a same-repo PR
+    # could still add a `pull_request:` trigger to this file within its own diff and reach
+    # `packages: write` before review, since GitHub evaluates a same-repo PR's ENTIRE workflow
+    # file (including this job) from the PR's own head ref, not the base branch. `ghcr-publish`'s
+    # deployment branch/tag policy allows only the `v*` tag pattern this job's own `on:` block
+    # already publishes from -- a PR branch ref never matches, so this job can't obtain
+    # `packages: write` (or run at all) on a PR-triggered ref regardless of what trigger the PR's
+    # diff adds. Enforced by GitHub's platform itself, not expressible in or overridable by
+    # workflow YAML a PR controls. Tag-only restriction, no required reviewers: a real release
+    # publish only ever happens from a `v*` tag (push or workflow_dispatch targeting one), so
+    # there's no legitimate case this would block, and it needs no manual approval click on every
+    # real release.
+    environment: ghcr-publish
     permissions:
       contents: read
       packages: write
