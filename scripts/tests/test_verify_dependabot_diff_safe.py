@@ -2012,13 +2012,14 @@ class ManifestLockfileConsistencyEdgePrecisionTests(unittest.TestCase):
     """
 
     def _lock_with_two_foo_versions_and_consumers(self, consumer_a_foo_ref):
+        # consumer_a is the DECLARING package under test -- it must be a real workspace member
+        # (no `source` field, kind=="workspace") to match head_tomls declaring it via its own
+        # [package] name, exactly as manta's own real workspace members are structured.
         return {
             "package": [
                 {
                     "name": "consumer_a",
                     "version": "1.0.0",
-                    "source": "registry+https://github.com/rust-lang/crates.io-index",
-                    "checksum": "ca1",
                     "dependencies": [consumer_a_foo_ref],
                 },
                 {
@@ -2106,6 +2107,33 @@ class ManifestLockfileConsistencyEdgePrecisionTests(unittest.TestCase):
         # foo 1.1.0 exists somewhere and satisfies "1.1" -- the fallback accepts it since the
         # declaring package ("unknown-crate") has no lockfile entry to resolve precisely against.
         self.assertEqual(v.check_manifest_lockfile_consistency(head_tomls, lock), [])
+
+    def test_name_collision_with_an_external_package_still_resolves_the_workspace_entry(self):
+        # Codex P1, manta#194 round 20, Finding AD -- the exact reproduction: an unrelated
+        # registry/git package shares the SAME NAME as the declaring workspace member
+        # ("consumer_a"). Cargo package identity is (name, version, source), not name alone, so
+        # this can legitimately coexist. Before this fix, `len(candidates) > 1` (the workspace
+        # entry plus the same-named external one) discarded the otherwise-unambiguous workspace
+        # entry and fell back to the any-candidate approximation for every declaration in this
+        # manifest, undoing round 19's precision fix entirely.
+        head_tomls = {
+            "crates/consumer_a/Cargo.toml": {
+                "package": {"name": "consumer_a"},
+                "dependencies": {"foo": "1.1"},
+            }
+        }
+        lock = self._lock_with_two_foo_versions_and_consumers("foo 1.0.0")
+        lock["package"].append(
+            {
+                "name": "consumer_a",
+                "version": "9.9.9",
+                "source": "registry+https://github.com/rust-lang/crates.io-index",
+                "checksum": "external-consumer-a",
+            }
+        )
+        reasons = v.check_manifest_lockfile_consistency(head_tomls, lock)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("does not satisfy that requirement", reasons[0])
 
 
 if __name__ == "__main__":

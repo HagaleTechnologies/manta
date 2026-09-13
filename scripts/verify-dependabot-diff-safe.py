@@ -1145,7 +1145,15 @@ def check_manifest_lockfile_consistency(head_tomls, head_lock):
         name = package_name_by_path.get(path)
         if name is None:
             return None
-        candidates = pkgs_by_name.get(name, [])
+        # Filtered to kind=="workspace" (Codex P1, manta#194 round 20, Finding AD): a manifest
+        # PATH we're iterating is, by construction, always a workspace member's own Cargo.toml
+        # -- its [[package]] entry is always kind=="workspace". Cargo package identity is
+        # (name, version, source), not name alone, so an unrelated registry or git package can
+        # legitimately share the same NAME as a workspace member; without this filter, that
+        # coincidence made `len(candidates) > 1` and fell back to the (weaker) any-candidate
+        # approximation for every one of this member's own declarations, silently undoing round
+        # 19's edge-precision fix whenever it happened.
+        candidates = [key for key in pkgs_by_name.get(name, []) if key[1] == "workspace"]
         return head_pkgs[candidates[0]] if len(candidates) == 1 else None
 
     def specific_resolved_version(entry, lockfile_name):
