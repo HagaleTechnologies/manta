@@ -11,7 +11,7 @@ pub enum Element {
 
 /// Prosigns emitted as text tokens in the JSON stream, dropped from
 /// telnet-facing text. SPEC §4.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Prosign {
     Ar,
     Sk,
@@ -35,7 +35,7 @@ impl Prosign {
 }
 
 /// A decoded tree node's payload: a plain character or a prosign. SPEC §4.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Glyph {
     Char(char),
     Prosign(Prosign),

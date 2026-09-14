@@ -45,6 +45,10 @@ fn listen_emits_a_spot_via_on_spot() {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (samples, _texts) =
         render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();

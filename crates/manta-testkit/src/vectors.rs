@@ -20,6 +20,18 @@ pub struct VectorSpec {
     pub center_freq_hz: f64,
     pub noise_seed: u64,
     pub signals: Vec<SignalSpec>,
+    /// Scene-wide raised-cosine rise/fall, silently overriding every
+    /// signal's own `SignalSpec::rise_ms` at render time
+    /// (`render`/`render_v9_drift`) -- there is currently no way to give
+    /// two signals in the same vector different edge shapes; a future
+    /// vector needing that must call `render_scene` directly instead of
+    /// going through `VectorSpec`. SPEC v2 §8.2 VR4 ("hard-edges", 0.5 ms).
+    /// 5.0 ms (standard) for every vector before VR4. `render`/
+    /// `render_v9_drift` each carry a `debug_assert!` that every signal's
+    /// `rise_ms` already matches this field, as a safety net against this
+    /// override silently discarding a per-signal value someone set by
+    /// mistake.
+    pub rise_ms: f64,
 }
 
 /// SPEC §7 V1 "clean-20": 20 WPM, +20 dB, offset +12.34 kHz, W1AW,
@@ -41,7 +53,12 @@ pub fn v1() -> VectorSpec {
             qsb: None,
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -66,7 +83,12 @@ pub fn v2() -> VectorSpec {
             qsb: None,
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -91,7 +113,12 @@ pub fn v3() -> VectorSpec {
             qsb: None,
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -113,7 +140,12 @@ pub fn v6() -> VectorSpec {
             qsb: Some(QsbSine { rate_hz: 0.2 }),
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -138,7 +170,12 @@ pub fn v4() -> VectorSpec {
                 seed: 0x5663,
             }),
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -163,7 +200,12 @@ pub fn v5() -> VectorSpec {
                 seed: 0x5635,
             }),
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -205,6 +247,10 @@ pub fn v7() -> VectorSpec {
                 qsb: None,
                 watterson: None,
                 char_wpm: None,
+                weight: 3.0,
+                char_gap_units: 3.0,
+                word_gap_units: 7.0,
+                rise_ms: 5.0,
             },
             SignalSpec {
                 text: "CQ CQ DE N2BB N2BB K".into(),
@@ -216,8 +262,13 @@ pub fn v7() -> VectorSpec {
                 qsb: None,
                 watterson: None,
                 char_wpm: None,
+                weight: 3.0,
+                char_gap_units: 3.0,
+                word_gap_units: 7.0,
+                rise_ms: 5.0,
             },
         ],
+        rise_ms: 5.0,
     }
 }
 
@@ -248,7 +299,12 @@ pub fn v9() -> VectorSpec {
             qsb: None,
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -275,7 +331,12 @@ pub fn v10() -> VectorSpec {
             qsb: None,
             watterson: None,
             char_wpm: Some(25.0),
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         }],
+        rise_ms: 5.0,
     }
 }
 
@@ -319,6 +380,10 @@ fn pileup_scene(name: &'static str, watterson: Option<WattersonPreset>) -> Vecto
                 seed: BASE_SEED ^ 0xA5A5_0000 ^ (i as u64 + 1),
             }),
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         })
         .collect();
 
@@ -329,6 +394,7 @@ fn pileup_scene(name: &'static str, watterson: Option<WattersonPreset>) -> Vecto
         center_freq_hz: 14_000_000.0,
         noise_seed: BASE_SEED,
         signals,
+        rise_ms: 5.0,
     }
 }
 
@@ -342,6 +408,226 @@ pub fn v8w() -> VectorSpec {
     pileup_scene("v8w", Some(WattersonPreset::Poor))
 }
 
+/// SPEC v2 §8.2 "real-conditions" vectors (VR1-VR8): conditions the
+/// original V1-V10 vectors never exercised (contest speed, deep keying,
+/// hard transmitter edges, co-channel occupancy, non-standard weighting,
+/// tight Farnsworth-free spacing) -- the gap that let the real-signal
+/// timing defect motivating this redesign go undetected. All: 120 s,
+/// 96 kHz, 14 MHz center, text `CQ TEST <CALL> <CALL> TEST` unless stated
+/// (SPEC v2 §8.2 preamble).
+///
+/// Shared shape for the single-signal vectors (VR1-VR4, VR6, VR7): +12.34
+/// kHz offset, standard 3:1/3/7 keyer timing and 5 ms edges unless the
+/// caller overrides a field afterward. VR5 (co-channel pair) builds its own
+/// `VectorSpec` directly below.
+fn single(
+    name: &'static str,
+    wpm: f32,
+    snr_2500_db: f32,
+    text: &str,
+    noise_seed: u64,
+    jitter: Option<Jitter>,
+) -> VectorSpec {
+    VectorSpec {
+        name,
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed,
+        signals: vec![SignalSpec {
+            text: text.to_string(),
+            loop_text: true,
+            wpm,
+            offset_hz: 12_340.0,
+            snr_2500_db,
+            jitter,
+            qsb: None,
+            watterson: None,
+            char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
+        }],
+        rise_ms: 5.0,
+    }
+}
+
+/// SPEC v2 §8.2 VR1 "contest-40": 40 WPM, +30 dB, W5AU, AWGN + 8% jitter.
+/// Pass: char >= 95%; WPM 40 +/- 2; word boundaries >= 95%.
+pub fn vr1() -> VectorSpec {
+    single(
+        "vr1",
+        40.0,
+        30.0,
+        "CQ TEST W5AU W5AU TEST",
+        0x5652_0001,
+        Some(Jitter {
+            sigma: 0.08,
+            seed: 1,
+        }),
+    )
+}
+
+/// SPEC v2 §8.2 VR2 "contest-45": 45 WPM, +30 dB, K5TR, AWGN + 8% jitter.
+/// Pass: char >= 90%; WPM 45 +/- 3.
+pub fn vr2() -> VectorSpec {
+    single(
+        "vr2",
+        45.0,
+        30.0,
+        "CQ TEST K5TR K5TR TEST",
+        0x5652_0002,
+        Some(Jitter {
+            sigma: 0.08,
+            seed: 2,
+        }),
+    )
+}
+
+/// SPEC v2 §8.2 VR3 "deep-keying": 30 WPM, +45 dB (~60 dB in channel),
+/// N5ZZ, AWGN. Pass: char >= 98%; measured dit within +/-10% of 40 ms.
+pub fn vr3() -> VectorSpec {
+    single(
+        "vr3",
+        30.0,
+        45.0,
+        "CQ TEST N5ZZ N5ZZ TEST",
+        0x5652_0003,
+        None,
+    )
+}
+
+/// SPEC v2 §8.2 VR4 "hard-edges": 32 WPM, +25 dB, 0.5 ms rise (click
+/// sidebands), G3ABC, AWGN. Pass: char >= 90%.
+pub fn vr4() -> VectorSpec {
+    let mut v = single(
+        "vr4",
+        32.0,
+        25.0,
+        "CQ TEST G3ABC G3ABC TEST",
+        0x5652_0004,
+        None,
+    );
+    v.rise_ms = 0.5;
+    v.signals[0].rise_ms = 0.5;
+    v
+}
+
+/// SPEC v2 §8.2 VR5 "co-channel": two independently-keyed signals 30 Hz
+/// apart -- well within one 93.75 Hz channelizer bin -- a genuine
+/// co-channel occupancy test. A: 30 WPM +25 dB @ +10.000 kHz, "CQ TEST W1AA
+/// W1AA TEST". B: 24 WPM +15 dB @ +10.030 kHz, "CQ TEST W2BB W2BB TEST".
+/// Pass criteria (signal A only, per SPEC v2 §8.2): char >= 90%; 0 bogus
+/// callsigns.
+pub fn vr5() -> VectorSpec {
+    VectorSpec {
+        name: "vr5",
+        fs: 96_000.0,
+        duration_s: 120.0,
+        center_freq_hz: 14_000_000.0,
+        noise_seed: 0x5652_0005,
+        signals: vec![
+            SignalSpec {
+                text: "CQ TEST W1AA W1AA TEST".into(),
+                loop_text: true,
+                wpm: 30.0,
+                offset_hz: 10_000.0,
+                snr_2500_db: 25.0,
+                jitter: None,
+                qsb: None,
+                watterson: None,
+                char_wpm: None,
+                weight: 3.0,
+                char_gap_units: 3.0,
+                word_gap_units: 7.0,
+                rise_ms: 5.0,
+            },
+            SignalSpec {
+                text: "CQ TEST W2BB W2BB TEST".into(),
+                loop_text: true,
+                wpm: 24.0,
+                offset_hz: 10_030.0,
+                snr_2500_db: 15.0,
+                jitter: None,
+                qsb: None,
+                watterson: None,
+                char_wpm: None,
+                weight: 3.0,
+                char_gap_units: 3.0,
+                word_gap_units: 7.0,
+                rise_ms: 5.0,
+            },
+        ],
+        rise_ms: 5.0,
+    }
+}
+
+/// SPEC v2 §8.2 VR6 "weighting": 28 WPM, +20 dB, F6XYZ, AWGN, at two
+/// non-standard dah:dit weights (2.6 and 3.4) exercising a classical
+/// decoder's 3:1-tuned thresholds under real operator "weighting". `vr6a`
+/// and `vr6b` share this scene, differing only in `weight`. Pass (both):
+/// char >= 95%.
+fn vr6(name: &'static str, weight: f32, noise_seed: u64) -> VectorSpec {
+    let mut v = single(
+        name,
+        28.0,
+        20.0,
+        "CQ TEST F6XYZ F6XYZ TEST",
+        noise_seed,
+        None,
+    );
+    v.signals[0].weight = weight;
+    v
+}
+
+/// VR6a: dah:dit 2.6.
+pub fn vr6a() -> VectorSpec {
+    vr6("vr6a", 2.6, 0x5652_0006)
+}
+
+/// VR6b: dah:dit 3.4.
+pub fn vr6b() -> VectorSpec {
+    vr6("vr6b", 3.4, 0x5652_0007)
+}
+
+/// SPEC v2 §8.2 VR7 "tight-spacing": 35 WPM, +20 dB, JA1ZZZ, AWGN, tight
+/// (Farnsworth-free) spacing -- 2.5-dit character gaps and 5.0-dit word
+/// gaps, vs. standard Morse's 3.0/7.0. Pass: word boundaries >= 90%; char
+/// >= 95%.
+pub fn vr7() -> VectorSpec {
+    let mut v = single(
+        "vr7",
+        35.0,
+        20.0,
+        "CQ TEST JA1ZZZ JA1ZZZ TEST",
+        0x5652_0008,
+        None,
+    );
+    v.signals[0].char_gap_units = 2.5;
+    v.signals[0].word_gap_units = 5.0;
+    v
+}
+
+/// SPEC v2 §8.2 VR8 "qsb-fast": 30 WPM, +10 dB, DL9ABC, Watterson
+/// CCIR-poor fading (same `WattersonFade` construction V5/V8w use -- see
+/// `v5`/`pileup_scene` above). Pass: char >= 85%.
+pub fn vr8() -> VectorSpec {
+    let mut v = single(
+        "vr8",
+        30.0,
+        10.0,
+        "CQ TEST DL9ABC DL9ABC TEST",
+        0x5652_0009,
+        None,
+    );
+    v.signals[0].watterson = Some(WattersonFade {
+        preset: WattersonPreset::Poor,
+        seed: 0x5652_0009,
+    });
+    v
+}
+
 /// A rendered vector: samples, ground-truth keyed text per signal, expected
 /// spot frequency. SPEC §7.
 pub struct RenderedVector {
@@ -350,14 +636,30 @@ pub struct RenderedVector {
     pub expected_freq_hz: f64,
 }
 
-/// Render a VectorSpec to samples + ground truth. SPEC §7.
+/// Render a VectorSpec to samples + ground truth. SPEC §7. `spec.rise_ms`
+/// overrides every signal's own `SignalSpec::rise_ms` (SPEC v2 §8.2 VR4).
 pub fn render(spec: &VectorSpec) -> Result<RenderedVector> {
-    let (samples, keyed_texts) = render_scene(
-        &spec.signals,
-        spec.fs,
-        spec.duration_s,
-        Some(spec.noise_seed),
-    )?;
+    for s in &spec.signals {
+        debug_assert!(
+            s.rise_ms == spec.rise_ms,
+            "SignalSpec.rise_ms ({}) differs from VectorSpec.rise_ms ({}) -- \
+             the vector-level value silently wins; if you need true \
+             per-signal edge shapes, use render_scene directly instead of \
+             VectorSpec::render()",
+            s.rise_ms,
+            spec.rise_ms
+        );
+    }
+    let signals: Vec<SignalSpec> = spec
+        .signals
+        .iter()
+        .map(|s| SignalSpec {
+            rise_ms: spec.rise_ms,
+            ..s.clone()
+        })
+        .collect();
+    let (samples, keyed_texts) =
+        render_scene(&signals, spec.fs, spec.duration_s, Some(spec.noise_seed))?;
     Ok(RenderedVector {
         samples,
         keyed_texts,
@@ -373,6 +675,15 @@ pub fn render_v9_drift(spec: &VectorSpec) -> Result<RenderedVector> {
     const DRIFT_HZ_PER_MIN: f64 = 50.0;
     const STEP_S: f64 = 2.0;
     let sig = &spec.signals[0];
+    debug_assert!(
+        sig.rise_ms == spec.rise_ms,
+        "SignalSpec.rise_ms ({}) differs from VectorSpec.rise_ms ({}) -- \
+         the vector-level value silently wins; if you need true per-signal \
+         edge shapes, use render_scene directly instead of \
+         VectorSpec::render_v9_drift()",
+        sig.rise_ms,
+        spec.rise_ms
+    );
     let n_steps = (spec.duration_s / STEP_S).round() as usize;
     let mut samples = Vec::new();
     let mut keyed_text = String::new();
@@ -381,6 +692,7 @@ pub fn render_v9_drift(spec: &VectorSpec) -> Result<RenderedVector> {
         let offset_hz = sig.offset_hz + DRIFT_HZ_PER_MIN * t_start_s / 60.0;
         let step_sig = SignalSpec {
             offset_hz,
+            rise_ms: spec.rise_ms,
             ..sig.clone()
         };
         // Each step keys a fresh loop from t=0 (a small, deliberate
