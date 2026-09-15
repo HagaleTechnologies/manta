@@ -146,7 +146,7 @@ JSON/WebSocket stream, TOML config, the metrics endpoint, and the
 outbound RBN uplink are all shipped and tested. Remaining M3 sub-projects:
 the RBN parity benchmark (needs ≥ 2 h of recorded contest-weekend IQ with
 RBN reference spots -- a data dependency not yet resolved) and the
-7-day unattended soak below.
+7-day unattended soak in the accept-when list above.
 
 **RBN admission** is pre-1.0 work, not deferred: the near-term path is a
 Skimmer-Server-compatible handshake so existing aggregators can accept a

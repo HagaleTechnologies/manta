@@ -439,22 +439,14 @@ validation (MAN-28). Dedupe (step 5) still applies.
   own yet (decode-pipeline internals, not the network-facing surface
   MAN-59 scoped to), and `manta --status` hitting a local control socket
   for live stats is similarly not yet implemented. Prometheus text
-<<<<<<< HEAD
-  endpoint (compiled in unconditionally, no feature flag): input overruns, active tracks, evictions,
-  decode rate, spots/min, per-stage queue depths, spot confidence
-  histogram — also aspirational for several of these fields; the
-  currently-implemented subset is `manta_spots_total`,
-  `manta_spots_dropped_lagged_total`,
-=======
-  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
-  doc was stale — no Cargo `metrics` feature has ever existed; the
-  endpoint is unconditionally compiled and served whenever
+  endpoint (compiled in unconditionally, no feature flag — the "(feature
+  `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
+  `metrics` feature has ever existed; the endpoint is served whenever
   `--config` is set — `--server-config` is MAN-77's deprecated alias of
-  that flag): active tracks, evictions, decode rate,
+  that flag): input overruns, active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
->>>>>>> e836da6d1c72011598602308f898e8574a5a4b00
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the

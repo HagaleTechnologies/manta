@@ -55,8 +55,12 @@ fn workspace_members() -> Vec<String> {
 
 // ---- Scenario 3: the crate count is accurate everywhere ----
 
-/// Every crate in the workspace must appear in ARCHITECTURE.md's tree.
-/// `manta-soak-harness` was missing for the whole of M2/M3.
+/// Every crate in the workspace must be named somewhere in ARCHITECTURE.md
+/// (the assertion searches the whole document, not only the crate tree --
+/// a crate dropped from the tree but still named in prose passes here, and
+/// that is deliberate: prose mentions are a legitimate home for a crate the
+/// tree does not draw). `manta-soak-harness` was named nowhere at all for
+/// the whole of M2/M3.
 #[test]
 fn architecture_lists_every_workspace_crate() {
     let arch = doc("ARCHITECTURE.md");
@@ -114,7 +118,7 @@ fn every_doc_states_the_real_crate_count() {
 #[test]
 fn readme_inputs_table_covers_every_shipped_input() {
     let readme = doc("README.md");
-    let inputs = section(&readme, "Inputs");
+    let inputs = squash_whitespace(section(&readme, "Inputs"));
     for needle in [
         "WAV file",
         "--device",
@@ -136,12 +140,15 @@ fn readme_inputs_table_covers_every_shipped_input() {
 #[test]
 fn readme_outputs_describes_shipped_servers() {
     let readme = doc("README.md");
-    let outputs = section(&readme, "Outputs");
+    // Squashed like the ROADMAP guard below: a reflow that split one of
+    // these phrases across two lines would otherwise disable the assertion
+    // silently instead of reporting real drift.
+    let outputs = squash_whitespace(section(&readme, "Outputs"));
     assert!(
         !outputs.contains("in progress"),
         "README Outputs still calls a shipped server \"in progress\""
     );
-    for needle in ["7300", "7301", "7302", "uplink", "--server-config"] {
+    for needle in ["7300", "7301", "7302", "uplink", "--config"] {
         assert!(
             outputs.contains(needle),
             "README Outputs never mentions `{needle}`"
@@ -153,7 +160,7 @@ fn readme_outputs_describes_shipped_servers() {
 #[test]
 fn readme_status_does_not_promise_shipped_work() {
     let readme = doc("README.md");
-    let status = section(&readme, "Status");
+    let status = squash_whitespace(section(&readme, "Status"));
     for stale in ["the telnet and JSON spot servers", "TOML config, metrics"] {
         assert!(
             !status.contains(stale),
@@ -168,7 +175,7 @@ fn readme_status_does_not_promise_shipped_work() {
 #[test]
 fn readme_quickstart_only_uses_default_build_flags() {
     let readme = doc("README.md");
-    let quickstart = section(&readme, "60-second demo");
+    let quickstart = squash_whitespace(section(&readme, "60-second demo"));
     for gated in ["--soapy-driver", "--soapy-freq", "--soapy-rate"] {
         assert!(
             !quickstart.contains(gated),
@@ -185,7 +192,7 @@ fn readme_quickstart_only_uses_default_build_flags() {
 #[test]
 fn roadmap_does_not_defer_rbn_admission() {
     let roadmap = doc("ROADMAP.md");
-    let post = section(&roadmap, "Post-1.0 candidates");
+    let post = squash_whitespace(section(&roadmap, "Post-1.0 candidates"));
     assert!(
         !post.contains("RBN operators"),
         "ROADMAP still defers RBN-operator admission to post-1.0"
