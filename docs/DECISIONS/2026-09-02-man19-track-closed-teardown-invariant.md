@@ -11,11 +11,24 @@ closes — any `CloseReason` (`Unconfirmed`/`HangExpired`/`Silent`/`Merged`/
 still-open at end-of-stream via `TrackManager::finish()`.
 
 Any consumer that keeps per-`track_id` state — today, `manta-spot`'s
-`Validator::tracks` and `RepetitionGate::seen` — **must** free that state
-on `TrackClosed`. `TrackManager::next_id` never reuses a `track_id`
+`Validator::tracks` — **must** free that state on `TrackClosed`.
+`TrackManager::next_id` never reuses a `track_id`
 (`manta-engine::track::TrackManager::spawn`), so a per-`track_id` map with
 no eviction signal grows without bound for the life of the process under
 any workload with sustained track churn.
+
+**[SUPERSEDED, MAN-166, Codex review PR #152 round 10]** `RepetitionGate`
+is no longer per-`track_id` state and this invariant no longer applies to
+it: MAN-166 found that freeing repetition memory on every `TrackClosed`
+defeated the gate's own 90s repetition window the instant a real signal's
+track churned (a fresh `track_id` on every `CloseReason::HangExpired`
+reopen), so `RepetitionGate::seen` was rekeyed by frequency bucket instead
+and switched to purely time-based forgetting (`RepetitionGate::sweep`,
+called periodically, not tied to any single track's lifecycle). See
+`docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md` and
+`crates/manta-spot/src/gate.rs`'s own header comment for the current
+design; the "Implementation" section below describing `forget_track` is
+historical only.
 
 A track that closes *without* ever emitting a real event (a CANDIDATE that
 never gets promoted, e.g. `CloseReason::Unconfirmed`) is explicitly
@@ -49,12 +62,16 @@ heavy 40m CW pileup scene — confirmed both empirically and in source
   `has_emitted` is true; `process_hops` turns those into `TrackClosed`
   events. `finish()` does the same for whatever is still open when the
   stream ends, then clears `self.tracks`.
-- `manta-spot::Validator::ingest`'s `TrackClosed` arm: `self.tracks.remove(track_id)`
-  + `self.gate.forget_track(*track_id)`.
-- `manta-spot::gate::RepetitionGate::forget_track`: removes every
-  `(track_id, *)` key via a `BTreeMap::range` scan (O(log n + k), not a
-  full-map `retain` per close — matters at the churn volume that exposed
-  this bug in the first place).
+- `manta-spot::Validator::ingest`'s `TrackClosed` arm (historical --
+  **superseded, see above**): originally `self.tracks.remove(track_id)` +
+  `self.gate.forget_track(*track_id)`. As of MAN-166, only
+  `self.tracks.remove(track_id)` remains here; `RepetitionGate` is swept
+  periodically instead (`Validator::maybe_sweep`), independent of any
+  single track closing.
+- `manta-spot::gate::RepetitionGate::forget_track` (historical --
+  **removed, see above**): removed every `(track_id, *)` key via a
+  `BTreeMap::range` scan. Replaced by `RepetitionGate::sweep`, which prunes
+  by elapsed time instead of track identity.
 
 ## Future producers/consumers must preserve this
 

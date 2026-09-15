@@ -48,6 +48,16 @@ been run against the real network — nobody should point it at a real RBN targe
 operator guide in MAN-148) should tell operators to set `dry_run = true` explicitly today, and this
 default is itself worth revisiting to fail safe.
 
+**Resolved 2026-09-06 (MAN-159):** the last sentence above is now done --
+`default_dry_run()` returns `true`, so an `[[rbn_uplink]]` block that omits
+`dry_run` connects and logs in but transmits nothing, and `uplink::serve`
+logs the mode per target at startup. D2's recommendation that documentation
+"tell operators to set `dry_run = true` explicitly" is therefore obsolete
+and was never written into README; README instead documents the safe
+default and how to opt out of it. The substantive part of D2 stands
+unchanged: nobody should point the uplink at a real RBN target until MAN-90
+confirms what that target accepts.
+
 ### D3 — Wire SNR convention: dual-referenced
 
 Telnet and the RBN uplink report SNR in the 500 Hz reference bandwidth RBN/CW Skimmer use (so manta

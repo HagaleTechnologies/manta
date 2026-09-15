@@ -97,6 +97,30 @@ pub async fn serve(
     if !config.enabled {
         return;
     }
+    // MAN-159: dry-run is the default, so say so once per target at
+    // startup -- a safe default nobody can see is only half a fix. The
+    // asymmetry in level is deliberate: the safe state is `info`, the
+    // "this really is going out to a live target" state is `warn` so it
+    // stands out in an operator's log. Per-target rather than one global
+    // line in `main.rs`, because `dry_run` is a per-`[[rbn_uplink]]`
+    // field and `start_spot_server` spawns one `serve` task per entry.
+    // Goes through `tracing` (stderr, see `main.rs`'s subscriber setup)
+    // so it can never interleave with `--json` spot output on stdout.
+    if config.dry_run {
+        tracing::info!(
+            target_host = %config.target_host,
+            target_port = config.target_port,
+            "uplink: dry_run is ON (the default) -- connecting and logging in, \
+             but NOT transmitting spots. Set `dry_run = false` in this \
+             [[rbn_uplink]] block to transmit for real."
+        );
+    } else {
+        tracing::warn!(
+            target_host = %config.target_host,
+            target_port = config.target_port,
+            "uplink: dry_run = false -- transmitting real spots to this target."
+        );
+    }
     let login_callsign = config
         .effective_login_callsign(&station_callsign)
         .to_string();

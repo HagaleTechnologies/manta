@@ -79,3 +79,46 @@ fn v1_passes_end_to_end_from_wav() {
     let wpm = report["wpm"].as_f64().unwrap();
     assert!((wpm - 20.0).abs() < 3.0, "wpm {wpm}");
 }
+
+/// SPEC v2 §8.4 Task 12: V1 with `--engine hsmm`. Checks only CER < 0.02
+/// and freq err <= 10 Hz -- unlike the legacy copy above, this does NOT
+/// re-check the single-track invariant or the non-gated "free bonus" WPM
+/// check (already failing on CER; no point expanding assertion scope on
+/// a known-failing, `#[ignore]`d test). Measured 2026-09-09 as part of
+/// the stage-2 gate -- see
+/// docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md for the numbers.
+#[test]
+#[ignore = "stage-2 gate, un-ignored by Task 12 only if measured passing"]
+fn v1_passes_end_to_end_with_hsmm_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = manta_testkit::vectors::v1();
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["decode", "--json", "--engine", "hsmm"])
+        .arg(dir.path().join("v1.wav"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let decoded = report["text"].as_str().unwrap();
+    let cer_val = manta_testkit::cer::cer(&manifest.keyed_texts[0], decoded);
+    assert!(
+        cer_val < 0.02,
+        "V1/hsmm char accuracy must be >= 98 % (CER < 0.02), got CER {cer_val:.4}\nexpected: {}\ndecoded:  {}",
+        manifest.keyed_texts[0],
+        decoded
+    );
+    let freq = report["freq_hz"].as_f64().unwrap();
+    assert!(
+        (freq - manifest.expected_freq_hz).abs() <= 10.0,
+        "freq {} expected {} (err {})",
+        freq,
+        manifest.expected_freq_hz,
+        (freq - manifest.expected_freq_hz).abs()
+    );
+}

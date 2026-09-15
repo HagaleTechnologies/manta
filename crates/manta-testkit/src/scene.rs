@@ -21,6 +21,28 @@ pub struct SignalSpec {
     /// SPEC §7 V10 Farnsworth: character speed, if different from `wpm`
     /// (the effective/word speed). `None` for every existing vector.
     pub char_wpm: Option<f32>,
+    /// Dah:dit ratio, threaded into `KeyerSpec::weight`. SPEC v2 §8.2 VR6.
+    /// 3.0 (standard Morse) for every vector before VR6.
+    pub weight: f32,
+    /// Inter-character gap in dit units, threaded into
+    /// `KeyerSpec::char_gap_units`. SPEC v2 §8.2 VR7. 3.0 (standard) for
+    /// every vector before VR7.
+    pub char_gap_units: f32,
+    /// Inter-word gap in dit units, threaded into
+    /// `KeyerSpec::word_gap_units`. SPEC v2 §8.2 VR7. 7.0 (standard) for
+    /// every vector before VR7.
+    pub word_gap_units: f32,
+    /// Raised-cosine rise/fall for this signal's keying, threaded into
+    /// `KeyerSpec::rise_ms`. SPEC v2 §8.2 VR4 (0.5 ms "hard edges"). 5.0 ms
+    /// (standard) for every vector before VR4.
+    ///
+    /// This is a true per-signal knob only for callers that build
+    /// `SignalSpec`s and call `render_scene` directly. A signal reached via
+    /// `VectorSpec::render()`/`render_v9_drift()` has this value silently
+    /// overridden by `VectorSpec::rise_ms` (see that field's doc comment) --
+    /// there is currently no way to give two signals in the same
+    /// `VectorSpec`-based vector different edge shapes.
+    pub rise_ms: f64,
 }
 
 /// Sinusoidal QSB envelope multiplier applied on top of the keyed envelope.
@@ -60,8 +82,11 @@ pub fn render_scene(
         let spec = KeyerSpec {
             wpm: sig.wpm,
             char_wpm: sig.char_wpm,
-            rise_ms: 5.0,
+            rise_ms: sig.rise_ms,
             jitter: sig.jitter,
+            weight: sig.weight,
+            char_gap_units: sig.char_gap_units,
+            word_gap_units: sig.word_gap_units,
         };
         let (env, text) = if sig.loop_text {
             key_text_loop(&sig.text, &spec, fs, duration_s)?
@@ -168,6 +193,10 @@ mod tests {
             qsb: None,
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         };
         let (clean, _) = render_scene(std::slice::from_ref(&sig), fs, 10.0, None).unwrap();
         let (noisy_only, _) = render_scene(&[], fs, 10.0, Some(1)).unwrap();
@@ -204,6 +233,10 @@ mod tests {
             qsb: None,
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         };
         let a = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
         let b = render_scene(std::slice::from_ref(&sig), 96_000.0, 3.0, Some(2)).unwrap();
@@ -232,6 +265,10 @@ mod tests {
             qsb: Some(QsbSine { rate_hz: 0.2 }),
             watterson: None,
             char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
         };
         let (samples, _) = render_scene(std::slice::from_ref(&sig), fs, 5.0, None).unwrap();
         let global_peak = samples.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
