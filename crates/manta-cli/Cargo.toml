@@ -40,8 +40,5 @@ serde_json = { workspace = true }
 manta-dsp = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
-<<<<<<< HEAD
 regex = { workspace = true }
-=======
 sha2 = { workspace = true }
->>>>>>> 6223b3f961024ebd9af348f1d92e7072be71a8e0

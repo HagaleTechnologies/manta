@@ -122,7 +122,7 @@ manta decode /tmp/v1/v1.wav
 
 # Run as a daemon: telnet cluster (:7300), JSON Lines/WebSocket (:7301),
 # metrics, and any configured RBN uplinks, all from one config file
-manta run --config manta.toml --kiwi-host kiwi.example.org --kiwi-freq 7030000
+manta run --config manta.toml --kiwi-host kiwi.example.org --kiwi-freq-hz 7030000
 
 # `listen` is an alias of `run`, kept for ad hoc audio and dev testing.
 
