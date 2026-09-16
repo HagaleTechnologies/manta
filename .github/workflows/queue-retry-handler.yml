@@ -47,12 +47,13 @@ permissions:
 jobs:
   handle-merge-group-failure:
     # Only merge-group-triggered CI runs that didn't succeed. Includes
-    # `cancelled`: manta's own ci.yml concurrency group keys merge_group/push
-    # runs on github.run_id (never a shared PR-number group), so a sibling
+    # `cancelled`: manta's own ci-full.yml (HAG-46: was ci.yml before the event-driven Codex
+    # reflector split -- workflow-level name "CI" unchanged) concurrency group keys
+    # merge_group/push runs on github.run_id (never a shared PR-number group), so a sibling
     # run can't cancel this one structurally -- but an external cancel
     # (manual, a repo-wide event) still disarms auto-merge exactly the same
     # way a real test failure does, so it's handled identically here. Also
-    # includes `timed_out`: ci.yml's test/test-soapy/test-hpsdr jobs carry
+    # includes `timed_out`: ci-full.yml's test/test-soapy/test-hpsdr jobs carry
     # no explicit `timeout-minutes` of their own, so a genuinely hung run
     # (a wedged runner, a decoder stuck against real hardware) reaches
     # GitHub Actions' own platform-default job timeout rather than any
