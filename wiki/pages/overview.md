@@ -17,9 +17,9 @@ links:
   - decode-chain
   - coppa-reuse
 ---
-manta is an open-source, cross-platform, wideband multi-signal CW skimmer (Rust) that consumes wideband IQ from commodity SDRs, decodes every CW signal in the passband concurrently, validates callsigns, and emits RBN-compatible spots — an open replacement for the single closed-source Windows program the Reverse Beacon Network depends on. It is **design-phase**: ARCHITECTURE, ROADMAP, and `docs/SPEC-decode-core.md` are frozen; no implementation has started. Read the specs first — the design decisions are already made.
+manta is an open-source, cross-platform, wideband multi-signal CW skimmer (Rust) that consumes wideband IQ from commodity SDRs, decodes every CW signal in the passband concurrently, validates callsigns, and emits RBN-compatible spots — an open replacement for the single closed-source Windows program the Reverse Beacon Network depends on. Implementation is well underway; see README.md's Status section for what has shipped. Read the specs first — the design decisions are already made.
 
-## Where things live (planned 8-crate workspace)
+## Where things live (nine-crate workspace)
 
 The workspace layout and dependency graph are normative in ARCHITECTURE §2 — do not restate the crate table here; the pointers below map crates to wiki pages.
 
@@ -29,6 +29,7 @@ The workspace layout and dependency graph are normative in ARCHITECTURE §2 — 
 - `crates/manta-server/` — telnet cluster + JSON/WebSocket. See [[spot-output-contract]].
 - `crates/manta-engine/` — track lifecycle, decoder pool orchestration.
 - `crates/manta-input/`, `manta-testkit/`, `manta-cli/` — IQ sources, synthetic/golden harness, binary.
+- `crates/manta-soak-harness/` — 24h soak measurement harness (ROADMAP M2 gate), not shipped in the manta binary.
 - `docs/SPEC-decode-core.md` — normative constants, equations, config keys, golden vectors. The wiki points here, never restates.
 
 ## Start here
