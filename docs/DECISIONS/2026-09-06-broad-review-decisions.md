@@ -169,8 +169,14 @@ dev/test tools, unaffected.
 design documentation) moves to a clearly-labeled, still-public archive directory (e.g.
 `docs/archive/plans/`) with a provenance note — not to `thoughts/`, which is reserved for a different
 purpose and shouldn't be mixed with this (MAN-150). `.catalyst/config.json` stops being tracked. The
-Claude co-author commit trailer gets fixed at the squash-merge/Mergify template level so it stops
-recurring. **A specific commit count is deliberately not pinned here**: roughly two-thirds of the
+Claude co-author commit trailer gets fixed at the squash-merge template level so it stops
+recurring -- that template was Mergify's when this decision was written, but #185 retired Mergify
+here, so the knob to change is now the *repository-level* squash-commit defaults,
+`squash_merge_commit_title` and `squash_merge_commit_message` (Settings -> General -> Pull
+Requests, or `PATCH /repos/{owner}/{repo}`), which the merge queue's squash merges inherit. The
+native `merge_queue` rule on the `main-protection` ruleset is **not** where this lives: that rule
+selects the merge method (and queue sizing/timeouts), and has no parameter for the generated
+commit's title or body. There is no `.mergify.yml` to open for this either. **A specific commit count is deliberately not pinned here**: roughly two-thirds of the
 commits carrying any `Co-authored-by` trailer name Claude specifically (the rest are legitimate
 `dependabot[bot]` and Tony Hagale attribution, unrelated to the standing no-trailer policy this
 decision is about), but the exact counts drift with ordinary repo activity — including every commit
