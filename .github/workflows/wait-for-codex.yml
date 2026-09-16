@@ -270,8 +270,20 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr-context.outputs.pr }}
         run: |
-          comment=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
-            --jq '[.[] | select(.body == "@codex review")] | sort_by(.created_at) | last')
+          # --paginate --slurp, not bare --paginate (Codex P2, manta PR #200 review round 2): a
+          # single 100-item page can miss the actual latest "@codex review" request on a PR with
+          # more comments than that, selecting a stale older one instead -- its stale timestamp
+          # then misclassifies findings raised between the two requests as "new in the current
+          # clean round", failing the check for no real reason. `gh api --paginate` alone streams
+          # each page as its OWN separate top-level JSON array ("Each page is a separate JSON
+          # array or object" -- gh api --help); combined with --jq, the filter runs once PER
+          # PAGE, not once over the combined set, so `sort_by(.created_at) | last` would only
+          # ever compare requests within a single page. --slurp wraps every page into one outer
+          # array first -- but gh CLI rejects --slurp combined with --jq outright ("the --slurp
+          # option is not supported with --jq or --template"), so fetch (slurp) and filter (real
+          # jq) are two explicit, piped steps here instead of one combined --jq call.
+          comment=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/comments?per_page=100" \
+            | jq '[.[][] | select(.body == "@codex review")] | sort_by(.created_at) | last')
           if [ "$comment" = "null" ] || [ -z "$comment" ]; then
             echo "::warning::No '@codex review' request comment found on PR #$PR -- this event may predate the event-driven migration, or the request step failed. Falling back to 30 minutes ago as RUN_STARTED."
             echo "run_started=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
