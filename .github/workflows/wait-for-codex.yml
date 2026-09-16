@@ -185,7 +185,17 @@ jobs:
           gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" >/dev/null
 
       - name: Dispatch full CI (pass-through success -- no Codex round to wait on)
-        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success'
+        # Excludes the Dependabot case (Codex review, PR #200 round 1, P1): GitHub withholds
+        # ALL custom Actions secrets from a Dependabot-actor-triggered run, so CODEX_REVIEW_PAT
+        # is empty here on exactly the revisions that would need it, and GITHUB_TOKEN is
+        # rejected outright for the workflow_dispatch endpoint regardless -- there is no
+        # credential available to make this call for a Dependabot PR. ci-full.yml's own
+        # `pull_request` trigger (scoped to `github.actor == 'dependabot[bot]'`, see that
+        # file's header) runs test/test-soapy/test-hpsdr natively for this case instead, with
+        # no dispatch or PAT needed at all -- the check-run this job already created above
+        # (conclusion=success) is a compatibility artifact only; the REAL required checks
+        # ("test (ubuntu-latest)"/"test (macos-latest)") come from that native run.
+        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success' && steps.create-check.outputs.is_dependabot != 'true'
         env:
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
@@ -565,17 +575,24 @@ jobs:
       - name: Update the check-run
         if: always() && steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-          # DISPATCH_TOKEN is required for the workflow_dispatch POST below only: GitHub
-          # rejects that specific endpoint outright when authenticated with the built-in
-          # GITHUB_TOKEN ("Resource not accessible by integration", 403), regardless of this
-          # job's own declared `actions: write` permission. The check-run PATCH calls
-          # above/below this still use github.token fine (checks: write is honored there).
-          DISPATCH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # PAT, not github.token, for EVERY call in this step, including the PATCHes (not just
+          # the workflow_dispatch POST) -- self-caught live on manta PR #200's own first real
+          # round: github.token 403'd patching a check-run this job's OWN workflow run didn't
+          # create ("Check run status and conclusions can only be updated internally by GitHub
+          # Actions"), even with this file's workflow-level `checks: write` granted -- the
+          # check-run was created by codex-review-request, a DIFFERENT prior run, and GitHub
+          # restricts cross-run check-run mutation via the ephemeral per-run GITHUB_TOKEN. A
+          # real-user PAT has no such restriction (same reasoning as RESOLVE_TOKEN above, and
+          # the workflow_dispatch POST's own pre-existing PAT requirement).
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           OUTCOME: ${{ steps.compute-verdict.outcome }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::CODEX_REVIEW_PAT not set -- cannot update the check-run or dispatch ci-full.yml for $HEAD_SHA."
+            exit 1
+          fi
           check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
             --jq '.check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)") | .id' | head -1)
           if [ -z "$check_id" ]; then
@@ -587,12 +604,8 @@ jobs:
           if [ "$OUTCOME" = "success" ]; then
             gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="success"
             [ -n "$wait_check_id" ] && gh api -X PATCH "repos/$REPO/check-runs/$wait_check_id" -f status="completed" -f conclusion="success"
-            if [ -z "$DISPATCH_TOKEN" ]; then
-              echo "::error::CODEX_REVIEW_PAT not set -- cannot dispatch ci-full.yml (github.token is rejected outright for workflow_dispatch by GitHub itself). The check-run above is already marked success, but CI will never run for $HEAD_SHA without a manual dispatch."
-              exit 1
-            fi
-            default_branch=$(GH_TOKEN="$DISPATCH_TOKEN" gh api "repos/$REPO" --jq '.default_branch')
-            GH_TOKEN="$DISPATCH_TOKEN" gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
+            default_branch=$(gh api "repos/$REPO" --jq '.default_branch')
+            gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
               -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA"
           else
             gh api -X PATCH "repos/$REPO/check-runs/$check_id" \

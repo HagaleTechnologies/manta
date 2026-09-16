@@ -4,16 +4,26 @@ name: CI
 # queue-retry-handler.yml's `workflows: ['CI', 'Supply Chain']` needs no update). The former
 # inline `codex-clean` job (a self-contained poll-for-label gate -- manta is PUBLIC and cannot
 # `uses:` credenza's private codex-clean-gate.yml, confirmed live on manta PR #199, the
-# Dependabot-auto-merge revert this same constraint broke) is gone entirely, along with
-# `pull_request` as a trigger here -- `test`/`test-soapy`/`test-hpsdr` never ran directly on
-# `pull_request` even before this migration (they were gated behind `codex-clean`'s `needs:`),
-# and now there's no job left in this file to run on that event at all.
+# Dependabot-auto-merge revert this same constraint broke) is gone entirely.
 #
 # wait-for-codex.yml (also self-contained, no `uses:` -- same public-repo constraint applies to
 # the new mechanism as the old one) now posts "@codex review" and reacts to Codex's own
 # review/comment event directly, then dispatches THIS file via workflow_dispatch once a
 # revision is confirmed clean -- no more polling for a label from either side.
+#
+# `pull_request` IS still a trigger here (Codex review, PR #200 round 1, P1), scoped narrowly to
+# the one case that structurally needs it: GitHub withholds ALL custom Actions secrets from a
+# Dependabot-actor-triggered run, on every event type including pull_request_target (see
+# auto-merge-trigger.yml's own identical note) -- so wait-for-codex.yml's pass-through dispatch
+# for an excluded Dependabot PR has no CODEX_REVIEW_PAT available to call the workflow_dispatch
+# API (which GITHUB_TOKEN is rejected for outright, regardless of permissions), and with no
+# `pull_request` trigger left here at all, a Dependabot PR would NEVER get its required test
+# checks created -- permanently unmergeable. `test`/`test-soapy`/`test-hpsdr` below gate this
+# native trigger to `github.actor == 'dependabot[bot]'` only, so an ordinary human PR still goes
+# exclusively through the workflow_dispatch path (no double-run).
 on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
     inputs:
       head_sha:
@@ -95,7 +105,11 @@ jobs:
   # workflow_dispatch'd once wait-for-codex.yml's codex-review-response job has already
   # confirmed Codex is clean for this revision (or it's a merge_group/push run with no PR
   # review context at all), so there is no mid-review-loop skip state left to account for here.
+  # `pull_request` events are gated to Dependabot only (Codex review, PR #200 round 1, P1) --
+  # see this file's own `on:` block comment. A human-authored pull_request push never reaches
+  # this job via that trigger; only via workflow_dispatch, once Codex confirms clean.
   test:
+    if: github.event_name != 'pull_request' || github.actor == 'dependabot[bot]'
     strategy:
       fail-fast: false
       matrix:
@@ -140,7 +154,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+  # Same Dependabot-only pull_request gate as `test` above -- not itself a required check, but
+  # matches this job's own pre-migration behavior (ran for a Dependabot PR too, gated only by
+  # codex-clean's tolerant skip) rather than silently dropping coverage for a Dependabot bump
+  # touching soapy-feature code.
   test-soapy:
+    if: github.event_name != 'pull_request' || github.actor == 'dependabot[bot]'
     strategy:
       fail-fast: false
       matrix:
@@ -161,7 +180,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy
+  # Same Dependabot-only pull_request gate as `test` above -- see that job's own comment.
   test-hpsdr:
+    if: github.event_name != 'pull_request' || github.actor == 'dependabot[bot]'
     strategy:
       fail-fast: false
       matrix:
