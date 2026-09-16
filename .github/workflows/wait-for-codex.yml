@@ -107,6 +107,12 @@ jobs:
           # `github.actor != 'dependabot[bot]'` job-level exclusion).
           IS_EXCLUDED_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          # Stamped onto the check-run's external_id below so codex-review-response can later
+          # tell a genuine `synchronize` (a real new commit) apart from `reopened`/
+          # `ready_for_review` (same head, no code change) -- see that job's own IS_GENUINE_SYNC
+          # comment for why `github.run_attempt == 1` alone can't make this distinction (Codex
+          # P1, manta PR #200 round 8).
+          PRODUCER_ACTION: ${{ github.event.action }}
         run: |
           set -o pipefail
           # Bootstrap not applicable here (see this job's own header comment) -- pass-through
@@ -146,6 +152,7 @@ jobs:
               -f head_sha="$HEAD_SHA" \
               -f status="completed" \
               -f conclusion="$conclusion" \
+              -f external_id="$PRODUCER_ACTION" \
               --jq '.id')
             gh api -X POST "repos/$REPO/check-runs" \
               -f name="Wait for Codex Review" \
@@ -158,6 +165,7 @@ jobs:
               -f name="Codex review clean (gate before expensive downstream jobs)" \
               -f head_sha="$HEAD_SHA" \
               -f status="in_progress" \
+              -f external_id="$PRODUCER_ACTION" \
               --jq '.id')
             gh api -X POST "repos/$REPO/check-runs" \
               -f name="Wait for Codex Review" \
@@ -381,7 +389,7 @@ jobs:
               def reviewed_commit_prefix: try (.body | capture("[Rr]eviewed commit:?\\**\\s*`(?<c>[0-9a-f]{7,40})`").c) catch null;
               def is_codex_bot: . == "chatgpt-codex-connector" or . == "chatgpt-codex-connector[bot]";
               .data.repository.pullRequest as $p
-              | ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)]) as $fresh_comments
+              | ([$p.comments.nodes[] | select((.author.login | is_codex_bot) and .createdAt >= $since)]) as $fresh_comments
               | {
                   comments: ([$fresh_comments[] | select(.body | is_error_shaped | not)] | length),
                   comment_head_tied: ([$fresh_comments[]
@@ -396,7 +404,7 @@ jobs:
                   # bash single-quoted string, so an apostrophe here terminates it early and
                   # corrupts everything after (confirmed live, this exact fix, round 3).
                   error_head_tied: ([$fresh_comments[] | select(.body | is_error_shaped) | select(.body | contains($sha))] | length),
-                  reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
+                  reviews: ([$p.reviews.nodes[] | select((.author.login | is_codex_bot) and .commit.oid==$sha and .submittedAt >= $since)] | length),
                   thumbsup: ([$p.reactions.nodes[] | select(.user.login | is_codex_bot) | select(.createdAt >= $since)] | length),
                   comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login | is_codex_bot) | select(.createdAt >= $since)] | length)
                 }'); then
@@ -428,6 +436,26 @@ jobs:
             echo "responded=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Determine whether the producer request was a genuine synchronize
+        id: producer-action
+        if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
+        run: |
+          # codex-review-request stamps the triggering pull_request_target action (opened/
+          # ready_for_review/synchronize/reopened) onto this check-run's external_id (Codex P1,
+          # manta PR #200 round 8) -- github.run_attempt == 1 alone can't tell a genuine new
+          # commit apart from a same-head reopened/ready_for_review re-trigger, since run_attempt
+          # is 1 for the FIRST attempt of either kind. --paginate --slurp: this endpoint returns
+          # an object per page (see deploy.yml's own identical note in widdershins/vanity), and
+          # gh api rejects --slurp combined with --jq.
+          action=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            | jq -r '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | sort_by(.started_at) | last | .external_id // ""')
+          echo "Producer action for $HEAD_SHA: '${action:-<none>}'"
+          echo "is_genuine_sync=$([ "$action" = "synchronize" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Compute the verdict and auto-resolve eligible threads
         id: compute-verdict
         if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true'
@@ -438,7 +466,7 @@ jobs:
           PR: ${{ steps.pr-context.outputs.pr }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           RUN_STARTED: ${{ steps.request-comment.outputs.run_started }}
-          IS_GENUINE_SYNC: ${{ github.run_attempt == 1 }}
+          IS_GENUINE_SYNC: ${{ steps.producer-action.outputs.is_genuine_sync }}
         run: |
           set -o pipefail
           # Re-check the PR's LIVE head immediately before mutating anything (Codex P1, manta
