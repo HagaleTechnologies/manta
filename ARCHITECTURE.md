@@ -209,13 +209,19 @@ Per track, operating on the ~375 Hz complex channel stream:
    block AGC is not used) → smoothed magnitude.
    (A separate tone-finder stage is unnecessary here — the PFB already did the
    frequency selection.)
-2. **Keying detection**: dual-rail noise/signal EMA estimators → adaptive
-   threshold at their geometric mean → key-down/key-up decisions with hysteresis
-   and minimum-duration debounce (the same keying-decision approach as dit,
-   simplified).
+2. **Keying detection**: dual-rail noise/signal EMA estimators → key-down/
+   key-up decisions from an additive band about the rails' linear-amplitude
+   midpoint (SPEC §3.2/§3.3; superseding the geometric mean this section
+   originally described — a geometric-mean threshold sits closer to the
+   noise rail as apparent keying depth grows, biasing every measured mark
+   long, worse at higher SNR and near a channel edge; see
+   `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`) → debounce.
 3. **Speed tracking**: online 2-means clustering of mark durations into
-   {dit, dah}; WPM = 1200/dit_ms, tracked with EMA. Handles 10–40+ WPM and drift;
-   Farnsworth spacing tolerated by decoupling inter-element and inter-word gap
+   {dit, dah}; WPM = 1200/dit_estimate_ms (a symmetric mark/gap period
+   estimate, SPEC §4.1a — not dit_ms directly, which stays uncorrected for
+   the classification/likelihood consumers that want it), tracked with EMA.
+   Handles 10–40+ WPM and drift; Farnsworth spacing tolerated by decoupling
+   inter-element and inter-word gap
    thresholds (dit's speed-detector lesson).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over

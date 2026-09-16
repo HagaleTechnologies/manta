@@ -71,25 +71,52 @@ fn text_strategy() -> impl Strategy<Value = String> {
         )
 }
 
+/// One text -> envelope -> decoder round trip. Returns `(keyed, decoded)`.
+fn roundtrip(text: &str, wpm: f32) -> (String, String) {
+    let (env, keyed) = key_text(text, &KeyerSpec::new(wpm), 375.0).unwrap();
+    let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+    let mut events = Vec::new();
+    for (i, &a) in env.iter().enumerate() {
+        events.extend(dec.push_envelope(a, i as u64 * 256));
+    }
+    // Trailing silence: enough for the 7-dit flush AND to guarantee the
+    // demod's 375-hop init window fills even for the shortest texts
+    // (a 2-char word at 40 WPM is only ~170 hops of envelope).
+    let tail = (8.0 * 1200.0 / wpm * 0.375) as usize + 450;
+    for i in 0..tail {
+        events.extend(dec.push_envelope(0.0, (env.len() + i) as u64 * 256));
+    }
+    events.extend(dec.finish());
+    (keyed, events_to_text(&events))
+}
+
+/// MAN-103 regression, pinned deterministically. `clean_envelope_roundtrip`
+/// below is an unseeded 64-case proptest, so the case it shrank to during
+/// MAN-103's validation (`"GQH AA"` at 39.95 WPM decoding as `"GQH A A"`)
+/// only reproduced about one run in five. The mechanism: at the top of the
+/// supported speed range a plain *element* gap measures a little over one
+/// dit, and the Farnsworth long-gap floor (`FARNS_LONG_U`,
+/// `crates/manta-decode/src/timing.rs`) admitted it into the long-gap
+/// clusters, dragging the word threshold down until real inter-character
+/// gaps classified as inter-word. Any speed near 40 WPM with adjacent
+/// repeated characters exercises it.
+#[test]
+fn high_wpm_element_gap_does_not_force_a_word_break() {
+    for &wpm in &[38.0f32, 39.952156, 40.0] {
+        let (keyed, decoded) = roundtrip("GQH AA", wpm);
+        assert_eq!(
+            cer(&keyed, &decoded),
+            0.0,
+            "at {wpm} WPM: keyed {keyed:?} decoded {decoded:?}"
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
     #[test]
     fn clean_envelope_roundtrip(text in text_strategy(), wpm in 10.0f32..=40.0) {
-        let (env, keyed) = key_text(&text, &KeyerSpec::new(wpm), 375.0).unwrap();
-        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
-        let mut events = Vec::new();
-        for (i, &a) in env.iter().enumerate() {
-            events.extend(dec.push_envelope(a, i as u64 * 256));
-        }
-        // Trailing silence: enough for the 7-dit flush AND to guarantee the
-        // demod's 375-hop init window fills even for the shortest texts
-        // (a 2-char word at 40 WPM is only ~170 hops of envelope).
-        let tail = (8.0 * 1200.0 / wpm * 0.375) as usize + 450;
-        for i in 0..tail {
-            events.extend(dec.push_envelope(0.0, (env.len() + i) as u64 * 256));
-        }
-        events.extend(dec.finish());
-        let decoded = events_to_text(&events);
+        let (keyed, decoded) = roundtrip(&text, wpm);
         prop_assert_eq!(cer(&keyed, &decoded), 0.0, "keyed {:?} decoded {:?}", keyed, decoded);
     }
 }
