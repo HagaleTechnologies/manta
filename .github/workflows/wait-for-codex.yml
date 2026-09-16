@@ -370,6 +370,13 @@ jobs:
             }' -f owner="$owner" -f name="$name" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
             2>/tmp/poll-err.log \
             | jq --arg since "$SINCE" --arg sha "$HEAD_SHA" '
+              # error_head_tied (Codex P2, manta PR #200 review round 3, restored from the
+              # pre-migration inline poller): fails the gate immediately on a Codex-reported
+              # error tied to this exact revision (quota/auth/workspace/ref-not-found) instead
+              # of leaving the check in_progress until the org-wide timeout-scan backstop --
+              # see reference_manta_one_report_per_hop_delay_compensation_impossible-adjacent
+              # incident on pancetta#362, 2026-09-09, where this exact error repeated twice 71
+              # minutes apart for the same SHA under the old poller.
               def is_error_shaped: test("(you exceeded your current quota|quota exceeded|rate limit reached|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect|something went wrong)"; "i");
               def reviewed_commit_prefix: try (.body | capture("[Rr]eviewed commit:?\\**\\s*`(?<c>[0-9a-f]{7,40})`").c) catch null;
               def is_codex_bot: . == "chatgpt-codex-connector" or . == "chatgpt-codex-connector[bot]";
@@ -382,6 +389,13 @@ jobs:
                     | select((reviewed_commit_prefix // "") as $c | $c != "" and ($sha | startswith($c)))
                   ] | length),
                   error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
+                  # error_head_tied: an error-shaped comment whose body contains this exact
+                  # HEAD_SHA verbatim (a ref-not-found error embeds the full SHA) -- as tightly
+                  # scoped to "this request" as comment_head_tied is for a success. NOTE: no
+                  # apostrophes in ANY comment inside this jq program -- the whole block is one
+                  # bash single-quoted string, so an apostrophe here terminates it early and
+                  # corrupts everything after (confirmed live, this exact fix, round 3).
+                  error_head_tied: ([$fresh_comments[] | select(.body | is_error_shaped) | select(.body | contains($sha))] | length),
                   reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                   thumbsup: ([$p.reactions.nodes[] | select(.user.login | is_codex_bot) | select(.createdAt >= $since)] | length),
                   comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login | is_codex_bot) | select(.createdAt >= $since)] | length)
@@ -392,9 +406,23 @@ jobs:
           reviews=$(echo "$poll" | jq '.reviews')
           comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
           comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
+          error_head_tied=$(echo "$poll" | jq '.error_head_tied')
           if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
             echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup comment_head_tied=$comment_head_tied"
             echo "responded=true" >> "$GITHUB_OUTPUT"
+          elif [ "$error_head_tied" -gt 0 ]; then
+            # Deliberately NOT responded=true -- compute-verdict has no real review data to
+            # process for an error signal (there's nothing to auto-resolve or apply the clean
+            # label against). error_tied is its own output, checked separately by "Update the
+            # check-run" below to fail the check directly, bypassing compute-verdict entirely.
+            # Fail fast rather than leave the check in_progress until the org-wide 15min
+            # timeout-scan backstop catches it -- Codex reported an error tied to THIS exact
+            # revision (a ref-not-found, quota, or auth failure), which will not resolve itself
+            # by waiting (HagaleTechnologies/pancetta#362, 2026-09-09: this exact error repeated
+            # twice 71 minutes apart for the same SHA under the old poller).
+            echo "::error::Codex reported an error for this exact revision ($HEAD_SHA) instead of reviewing it -- failing now. Re-run this check once the underlying Codex issue is resolved."
+            echo "responded=false" >> "$GITHUB_OUTPUT"
+            echo "error_tied=true" >> "$GITHUB_OUTPUT"
           else
             echo "No tied Codex signal found for $HEAD_SHA in this event -- leaving the check in_progress for the next event or the timeout backstop."
             echo "responded=false" >> "$GITHUB_OUTPUT"
@@ -413,6 +441,22 @@ jobs:
           IS_GENUINE_SYNC: ${{ github.run_attempt == 1 }}
         run: |
           set -o pipefail
+          # Re-check the PR's LIVE head immediately before mutating anything (Codex P1, manta
+          # PR #200 review round 3): "Resolve PR context" captured HEAD_SHA once, at the start
+          # of this run -- if a push lands afterward, this response run is NOT cancelled (a
+          # synchronize event's own request-job concurrency group is separate from this
+          # response job's), so without this recheck, a late response could resolve a thread or
+          # apply codex-clean against the SUPERSEDED head using a review Codex never actually
+          # performed against the new revision. `stale=true` here means "no-op, a fresh
+          # request/response cycle for the new head owns this PR now" -- exactly the same
+          # contract steps.head-check.outputs.stale already has for the pull_request_review
+          # path; "Update the check-run" below is skipped for the same reason.
+          live_head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || echo "")
+          if [ -n "$live_head_sha" ] && [ "$live_head_sha" != "$HEAD_SHA" ]; then
+            echo "::notice::PR #$PR's live head ($live_head_sha) no longer matches this response's head ($HEAD_SHA) -- skipping as superseded, a fresh cycle for the new head owns this PR now."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           apply_clean_label() {
             local label="codex-clean:${HEAD_SHA:0:12}"
             for _ in 1 2 3; do
@@ -585,7 +629,17 @@ jobs:
           done
 
       - name: Update the check-run
-        if: always() && steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true'
+        # Also runs for a tied-error verdict (Codex P2, manta PR #200 review round 3) --
+        # compute-verdict itself only runs for a real `responded=true` signal (nothing to
+        # auto-resolve for an error), so this step's own OUTCOME below is forced to "failure"
+        # directly for that case instead of reading compute-verdict's (unset) outcome. Skipped
+        # entirely when compute-verdict found itself superseded (its own `stale` output, see
+        # that step's own comment) -- there is nothing to relay for a response run whose head
+        # a fresh push already moved past.
+        if: >-
+          always() && steps.head-check.outputs.stale != 'true' &&
+          steps.compute-verdict.outputs.stale != 'true' &&
+          (steps.verdict.outputs.responded == 'true' || steps.verdict.outputs.error_tied == 'true')
         env:
           # PAT, not github.token, for EVERY call in this step, including the PATCHes (not just
           # the workflow_dispatch POST) -- self-caught live on manta PR #200's own first real
@@ -605,10 +659,20 @@ jobs:
             echo "::error::CODEX_REVIEW_PAT not set -- cannot update the check-run or dispatch ci-full.yml for $HEAD_SHA."
             exit 1
           fi
+          # .status == "in_progress" (Codex P2, manta PR #200 review round 3): without this, a
+          # SECOND qualifying Codex event for the same request (e.g. a review followed moments
+          # later by a thumbsup reaction on the same comment) finds the check-run this step's
+          # OWN earlier run already completed, and dispatches ci-full.yml a second time -- the
+          # identical SHA joins the same concurrency group and can cancel the first, already-
+          # healthy run right after it created the required test check-runs, replacing it with
+          # an unnecessary rerun that may itself fail or be cancelled. Restricting to
+          # in_progress means a second event for an already-finalized check finds nothing here
+          # and no-ops via the warning branch below, exactly like "already completed by a prior
+          # event" already did for the request-job-not-run-yet case.
           check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '.check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)") | .id' | head -1)
+            --jq '.check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)" and .status == "in_progress") | .id' | head -1)
           if [ -z "$check_id" ]; then
-            echo "::warning::No matching check-run found for $HEAD_SHA -- nothing to update (it may have already been completed by a prior event, or the request job hasn't created it yet)."
+            echo "::warning::No matching in_progress check-run found for $HEAD_SHA -- nothing to update (it may have already been completed by a prior event, or the request job hasn't created it yet)."
             exit 0
           fi
           wait_check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
