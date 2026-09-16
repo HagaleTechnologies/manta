@@ -1,42 +1,29 @@
 name: Release
 
-# MAN-21: builds and validates the release binaries + Docker image for
-# every committed platform, from `pull_request` (path-filtered, build-only
-# validation), `workflow_dispatch` (manual re-run), or a real `v*` tag
-# push (also validated here, redundantly with release-publish.yml, purely
-# for CI hygiene -- harmless, never publishes anything).
+# MAN-21: builds and validates the release binaries + Docker image for every committed
+# platform, from `workflow_dispatch` (manual re-run) or a real `v*` tag push.
 #
-# This file NEVER publishes anything and NEVER requests write permissions
-# anywhere -- deliberately, so it's safe to also trigger on `pull_request`
-# without a PR being able to reach any credential by editing it (PR #78
-# review round 6). The actual publish path (Docker push to GHCR, GitHub
-# Release creation) lives in release-publish.yml, which has NO
-# `pull_request` trigger at all -- see that file's own header comment for
-# why splitting the trigger SET, not just the job, matters here.
+# HAG-47: `pull_request` DROPPED as a trigger (2026-09-09 fleet CI redesign report, week-1
+# stop-the-bleed list -- flagged then, never actually done until now). This was wasted
+# PR-time build cost with no corresponding requirement: none of this file's jobs (`build`,
+# `docker-build`) are required status checks (confirmed via `gh api
+# repos/HagaleTechnologies/manta/rulesets` -- required checks are `test (macos-latest)`,
+# `test (ubuntu-latest)`, `Wait for Codex Review`, `Supply Chain`), and no other workflow in
+# this repo depends on a PR-triggered run of this one. Release artifacts are only ever
+# consumed from a tag push; a PR touching release.yml/release-publish.yml/Dockerfile/etc. now
+# gets no build here at all until it's tagged.
+#
+# This file NEVER publishes anything and NEVER requests write permissions anywhere --
+# deliberately, a leftover invariant from when this file also ran on `pull_request` without a
+# PR being able to reach any credential by editing it (PR #78 review round 6); left in place
+# since it's still true and still cheap insurance. The actual publish path (Docker push to
+# GHCR, GitHub Release creation) lives in release-publish.yml, which never had a
+# `pull_request` trigger at all -- see that file's own header comment.
 
 on:
   push:
     tags:
       - 'v*'
-  pull_request:
-    paths:
-      - '.github/workflows/release.yml'
-      - '.github/workflows/release-publish.yml'
-      - 'Dockerfile'
-      - 'Cross.toml'
-      - '.dockerignore'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      # MAN-36 (PR #99 review): `rust-toolchain.toml` selects the compiler
-      # every leg below builds with -- the Windows/macOS runners via their
-      # `dtolnay/rust-toolchain` step, the `cross` legs via `rustc --print
-      # sysroot`, and the Docker builder stage via rustup inside the image.
-      # The documented bump procedure opens a PR touching ONLY that file, so
-      # without it listed here none of those legs would validate the new
-      # compiler and a target-specific regression would stay hidden until a
-      # `v*` tag is pushed.
-      - 'rust-toolchain.toml'
   workflow_dispatch: {}
 
 env:
