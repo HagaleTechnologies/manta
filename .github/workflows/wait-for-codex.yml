@@ -325,16 +325,22 @@ jobs:
                 }
               }
             }' -f owner="$owner" -f name="$name" -F pr="$PR")
+          # is_codex_bot (Codex P1, PR #200 round 9): matches both login forms GitHub reports
+          # for this bot -- see compute-verdict's own identical def and comment for the full
+          # rationale (this step runs in a separate bash invocation, so that def isn't in scope
+          # here and has to be repeated).
           echo "$response" | jq --arg since "$SINCE" '
+            def is_codex_bot: . == "chatgpt-codex-connector" or . == "chatgpt-codex-connector[bot]";
             [.data.repository.pullRequest.reviewThreads.nodes[]
               | select(.isResolved == false)
               | select(.comments.nodes[0].createdAt < $since)
-              | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions"))
+              | select([.comments.nodes[].author.login] | all(is_codex_bot or . == "github-actions"))
               | .id]' > /tmp/baseline-pure.json
           echo "$response" | jq --arg since "$SINCE" '
+            def is_codex_bot: . == "chatgpt-codex-connector" or . == "chatgpt-codex-connector[bot]";
             [.data.repository.pullRequest.reviewThreads.nodes[]
               | select(.isResolved == false)
-              | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+              | select(.comments.nodes[0].author.login | is_codex_bot)
               | select(.comments.nodes[0].createdAt < $since)
               | .id]' > /tmp/baseline-initiated.json
           {
@@ -524,10 +530,19 @@ jobs:
               }
             }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
             | jq --argjson baseline "$baseline" --argjson baselineInitiated "$baseline_initiated" --arg since "$RUN_STARTED" '
-              def ignorable_author: . == "chatgpt-codex-connector" or . == "github-actions";
-              def codex_initiated: (.comments.nodes[0].author.login == "chatgpt-codex-connector");
+              # Codex P1, PR #200 round 9: the same admitted-login gap as the poll query is_codex_bot
+              # fix from round 8 -- this jq program runs in a separate step/bash
+              # invocation, so that fix def is not in scope here and has to be repeated. A
+              # response from chatgpt-codex-connector[bot] (vs the bare login) failed every one
+              # of these three predicates, so its threads never counted as codex_initiated
+              # (new_count/restated_count stayed 0, letting the gate report clean and dispatch
+              # CI despite real unresolved findings) and were never excluded by
+              # ignorable_author/restated_by_codex either.
+              def is_codex_bot: . == "chatgpt-codex-connector" or . == "chatgpt-codex-connector[bot]";
+              def ignorable_author: (. | is_codex_bot) or . == "github-actions";
+              def codex_initiated: (.comments.nodes[0].author.login | is_codex_bot);
               def restated_by_codex:
-                [.comments.nodes[] | select(.author.login == "chatgpt-codex-connector" and .createdAt >= $since)] | length > 0;
+                [.comments.nodes[] | select((.author.login | is_codex_bot) and .createdAt >= $since)] | length > 0;
               .data.repository.pullRequest.reviewThreads.nodes as $nodes
               | ($nodes
                   | map(select(.isResolved == false)
