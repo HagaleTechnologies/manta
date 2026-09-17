@@ -1096,3 +1096,103 @@ fn hpsdr_host_conflicts_with_kiwi_host() {
         "expected a clap conflict error, got: {stderr}"
     );
 }
+
+/// MAN-44: `manta status` against an address nothing is listening on must
+/// fail cleanly with exit code 2 ("couldn't ask", distinct from exit 1
+/// "asked, unhealthy") and a plain, non-panicking message naming the
+/// address -- not hang, and not a backtrace.
+///
+/// CI remediate finding: the previous version bound a listener, dropped it
+/// immediately, then spawned the `manta` binary as a SEPARATE PROCESS to
+/// connect to the now-freed port -- unlike every other "nothing is
+/// listening" test in this workspace (e.g. `uplink.rs`'s
+/// `connect_first_reachable_errors_when_every_address_fails`), which
+/// reconnect in-process microseconds after the drop, process spawn (fork/
+/// exec, dynamic-linker startup, tokio runtime init) can easily take tens
+/// of milliseconds -- long enough for an unrelated concurrently-running
+/// test elsewhere in this same `cargo test` invocation to bind that exact
+/// ephemeral port before this subprocess ever dials it, especially on a
+/// host with a narrower ephemeral port range (observed: this was flaky
+/// specifically on `macos-latest`, never on `ubuntu-latest`, across
+/// `test`/`test-soapy`/`test-hpsdr` -- all three share this file, none
+/// share a root cause that would be feature- or OS-conditional otherwise).
+/// Keeping the listener alive but never calling `.accept()` on it removes
+/// the race entirely: the kernel completes the TCP handshake into the
+/// unconsumed backlog, so `manta status` connects successfully, then
+/// blocks reading a response that will never come, and reliably fails via
+/// `--timeout-secs` instead -- exit code 2 and an address-naming message
+/// either way, per `fetch_status`'s `timed out talking to {addr}` path.
+#[test]
+fn status_against_a_dead_address_fails_with_exit_code_two_and_a_plain_message() {
+    // Bound but never `.accept()`-ed: connects fine at the TCP level, then
+    // nothing ever answers, so `manta status` times out rather than racing
+    // a freed port against unrelated concurrent tests (see doc comment).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let out = manta()
+        .args(["status", "--addr", &addr.to_string(), "--timeout-secs", "2"])
+        .output()
+        .unwrap();
+    drop(listener);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&addr.to_string()),
+        "expected the dead address in the error message, got: {stderr}"
+    );
+}
+
+/// MAN-44 CR-A regression: an invalid `--addr` must exit 2 ("couldn't
+/// ask"), not 1 -- exit 1 is the documented "reached the daemon, uplink is
+/// unhealthy" code (`docs/RUNBOOKS/uplink-health.md`), and a typo'd
+/// address must not be indistinguishable from a genuinely degraded uplink.
+#[test]
+fn status_with_an_invalid_addr_fails_with_exit_code_two_not_one() {
+    let out = manta()
+        .args(["status", "--addr", "not-an-addr"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// MAN-44 CR-A regression: an unreadable `--server-config` must exit 2, not
+/// 1, for the same reason -- this used to `?`-propagate out of `main` and
+/// exit 1, colliding with the "unhealthy uplink" code.
+///
+/// Both spellings are exercised: `--server-config` is the deprecated
+/// alias operators already have in their runbooks and cron jobs, and
+/// `--config` is the canonical flag `warn_deprecations` tells them to
+/// switch to. Before the Codex review fix (PR #95) the second one did not
+/// exist on `status`, so the deprecation notice named a flag clap
+/// rejected -- and this test would have failed with clap's exit 2-shaped
+/// usage error for the wrong reason, hence the message assertion.
+#[test]
+fn status_with_a_missing_server_config_fails_with_exit_code_two_not_one() {
+    for spelling in ["--server-config", "--config"] {
+        let out = manta()
+            .args(["status", spelling, "/nonexistent/manta.toml"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`manta status {spelling}` stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("manta status:") && stderr.contains("/nonexistent/manta.toml"),
+            "`manta status {spelling}` must fail reading the config, not on clap usage: {stderr}"
+        );
+    }
+}
