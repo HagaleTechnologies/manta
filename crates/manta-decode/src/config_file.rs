@@ -24,15 +24,20 @@
 //! `HsmmConfig::u_min`/`u_max`, `DemodConfig::tau_hi_init_ms`) to those
 //! runtime structs themselves. `demod`/`beam: BeamConfig`/
 //! `DecodeConfig::flush_gap_dits` ARE exposed, carrying SPEC v1 §9's
-//! pre-existing `timing_sigma`/`beam_width`/`debounce_ms`/`hyst_up`/
-//! `hyst_down`/`tau_lo_ms`/`tau_hi_bounds_ms`/`flush_gap_dits` keys (Codex
-//! review, PR #161, two rounds -- `deny_unknown_fields` had silently
-//! rejected any config file still using them, contradicting v2 §7's
-//! "additive over v1" claim. Round 1 only caught 5 of v1 §9's 12 keys;
-//! round 2 caught 3 more that have a real, simple backing field.
-//! `char_gap_dits`/`word_gap_dits`/`mu_ratio_bounds`/`cluster_alpha` are
-//! still not exposed -- see `DecodeConfigToml`'s own doc comment on why
-//! those four are a real fast-follow, not a config-plumbing fix).
+//! pre-existing `timing_sigma`/`beam_width`/`debounce_ms`/`hyst_frac`/
+//! `tau_lo_ms`/`tau_hi_bounds_ms`/`flush_gap_dits` keys (Codex review, PR
+//! #161, two rounds -- `deny_unknown_fields` had silently rejected any
+//! config file still using them, contradicting v2 §7's "additive over v1"
+//! claim. Round 1 only caught 5 of v1 §9's 12 keys; round 2 caught 3 more
+//! that have a real, simple backing field. `hyst_frac` replaces v1's
+//! `hyst_up`/`hyst_down` pair (MAN-103 changed the keying decision from a
+//! multiplicative geometric-mean threshold to an additive band about the
+//! linear-amplitude midpoint -- the two old keys have no equivalent under
+//! the new model, so there is no value in accepting-but-ignoring them; no
+//! shipped config file used them). `char_gap_dits`/`word_gap_dits`/
+//! `mu_ratio_bounds`/`cluster_alpha` are still not exposed -- see
+//! `DecodeConfigToml`'s own doc comment on why those four are a real
+//! fast-follow, not a config-plumbing fix).
 //!
 //! `engine = "hsmm"` parses here without complaint. As of Task 11,
 //! `manta-cli`'s `parse_engine` no longer gates `--engine hsmm` either --
@@ -121,11 +126,8 @@ fn default_beam_width() -> usize {
 fn default_debounce_ms() -> f64 {
     DemodConfig::default().debounce_ms
 }
-fn default_hyst_up() -> f32 {
-    DemodConfig::default().hyst_up
-}
-fn default_hyst_down() -> f32 {
-    DemodConfig::default().hyst_down
+fn default_hyst_frac() -> f32 {
+    DemodConfig::default().hyst_frac
 }
 fn default_tau_lo_ms() -> f64 {
     DemodConfig::default().tau_lo_ms
@@ -193,10 +195,8 @@ pub struct DecodeConfigToml {
     pub beam_width: usize,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: f64,
-    #[serde(default = "default_hyst_up")]
-    pub hyst_up: f32,
-    #[serde(default = "default_hyst_down")]
-    pub hyst_down: f32,
+    #[serde(default = "default_hyst_frac")]
+    pub hyst_frac: f32,
     #[serde(default = "default_tau_lo_ms")]
     pub tau_lo_ms: f64,
     #[serde(default = "default_tau_hi_bounds_ms")]
@@ -208,9 +208,6 @@ pub struct DecodeConfigToml {
     // are hardcoded constants in `crates/manta-decode/src/timing.rs`
     // (`CHAR_GAP_DITS`/`WORD_GAP_DITS`/`RATIO_MIN`+`RATIO_MAX`/
     // `CLUSTER_ALPHA`), not fields on any `DecodeConfig`-reachable struct.
-    // `char_gap_dits` additionally has deliberate per-engine deviation
-    // logic (see `timing.rs`'s own doc comment on `CHAR_GAP_DITS` vs
-    // `CHAR_GAP_DITS_NOMINAL`) that a naive TOML passthrough could break.
     // Making these four genuinely configurable is real engineering in
     // `manta-decode`'s core timing/gap-classification logic, not a config-
     // plumbing fix -- tracked as a fast-follow rather than attempted here
@@ -240,8 +237,7 @@ impl Default for DecodeConfigToml {
             timing_sigma: default_timing_sigma(),
             beam_width: default_beam_width(),
             debounce_ms: default_debounce_ms(),
-            hyst_up: default_hyst_up(),
-            hyst_down: default_hyst_down(),
+            hyst_frac: default_hyst_frac(),
             tau_lo_ms: default_tau_lo_ms(),
             tau_hi_bounds_ms: default_tau_hi_bounds_ms(),
             flush_gap_dits: default_flush_gap_dits(),
@@ -252,7 +248,8 @@ impl Default for DecodeConfigToml {
 impl DecodeConfigToml {
     /// Builds a real `DecodeConfig` from this table. `demod`/`beam`/
     /// `flush_gap_dits` carry SPEC v1 §9's pre-existing keys (Codex review,
-    /// PR #161 -- v2 §7's keys are additive over v1, not a replacement).
+    /// PR #161 -- v2 §7's keys are additive over v1, not a replacement;
+    /// `hyst_frac` is MAN-103's replacement for v1's `hyst_up`/`hyst_down`).
     /// Every field neither spec exposes (`evidence.tau_a_ms`/`u_init_hops`,
     /// `noise.tau_ms`, `hsmm.u_min`/`u_max`, `demod.tau_hi_init_ms`) is
     /// left at `DecodeConfig::default()`'s value.
@@ -260,8 +257,7 @@ impl DecodeConfigToml {
         DecodeConfig {
             engine: self.engine,
             demod: DemodConfig {
-                hyst_up: self.hyst_up,
-                hyst_down: self.hyst_down,
+                hyst_frac: self.hyst_frac,
                 debounce_ms: self.debounce_ms,
                 tau_lo_ms: self.tau_lo_ms,
                 tau_hi_bounds_ms: (self.tau_hi_bounds_ms[0], self.tau_hi_bounds_ms[1]),
@@ -402,15 +398,16 @@ mod tests {
         // round 2 added the 3 more that have a real, simple backing field
         // (`char_gap_dits`/`word_gap_dits`/`mu_ratio_bounds`/
         // `cluster_alpha` remain unexposed -- see `DecodeConfigToml`'s doc
-        // comment).
+        // comment). `hyst_frac` is MAN-103's replacement for v1's
+        // `hyst_up`/`hyst_down` (no equivalent under the new additive-band
+        // keying model, so the old pair is not accepted here).
         let file: DecodeConfigFile = toml::from_str(
             r#"
             [decode]
             timing_sigma = 0.30
             beam_width = 6
             debounce_ms = 15.0
-            hyst_up = 1.3
-            hyst_down = 0.75
+            hyst_frac = 0.2
             tau_lo_ms = 450.0
             tau_hi_bounds_ms = [120.0, 380.0]
             flush_gap_dits = 9.0
@@ -421,8 +418,7 @@ mod tests {
             timing_sigma: 0.30,
             beam_width: 6,
             debounce_ms: 15.0,
-            hyst_up: 1.3,
-            hyst_down: 0.75,
+            hyst_frac: 0.2,
             tau_lo_ms: 450.0,
             tau_hi_bounds_ms: [120.0, 380.0],
             flush_gap_dits: 9.0,
@@ -434,8 +430,7 @@ mod tests {
         assert_eq!(cfg.beam.sigma, 0.30);
         assert_eq!(cfg.beam.width, 6);
         assert_eq!(cfg.demod.debounce_ms, 15.0);
-        assert_eq!(cfg.demod.hyst_up, 1.3);
-        assert_eq!(cfg.demod.hyst_down, 0.75);
+        assert_eq!(cfg.demod.hyst_frac, 0.2);
         assert_eq!(cfg.demod.tau_lo_ms, 450.0);
         assert_eq!(cfg.demod.tau_hi_bounds_ms, (120.0, 380.0));
         assert_eq!(cfg.flush_gap_dits, 9.0);
