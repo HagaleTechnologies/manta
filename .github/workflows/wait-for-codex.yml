@@ -486,7 +486,18 @@ jobs:
           # contract steps.head-check.outputs.stale already has for the pull_request_review
           # path; "Update the check-run" below is skipped for the same reason.
           live_head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || echo "")
-          if [ -n "$live_head_sha" ] && [ "$live_head_sha" != "$HEAD_SHA" ]; then
+          # Codex P1, round 13: an empty live_head_sha (the API call itself failed -- rate
+          # limit, transient 5xx, network blip) used to fall through this `if` entirely (its
+          # `-n` guard reads false), letting this response proceed as if the live head still
+          # matched -- exactly the unreviewed-mutation risk this recheck exists to close, just
+          # reached via a failed lookup instead of a genuinely stale one. Fail closed: an empty
+          # result is treated the same as a confirmed-stale one, not as "no information."
+          if [ -z "$live_head_sha" ]; then
+            echo "::warning::Could not confirm PR #$PR's live head (API call failed) -- refusing to proceed rather than risk mutating against a possibly-superseded revision. Will retry on the next qualifying event."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$live_head_sha" != "$HEAD_SHA" ]; then
             echo "::notice::PR #$PR's live head ($live_head_sha) no longer matches this response's head ($HEAD_SHA) -- skipping as superseded, a fresh cycle for the new head owns this PR now."
             echo "stale=true" >> "$GITHUB_OUTPUT"
             exit 0
