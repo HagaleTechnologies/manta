@@ -215,3 +215,58 @@ fn roadmap_m3_does_not_list_shipped_server_as_remaining() {
         "ROADMAP M3 still lists `manta-server` as a remaining sub-project"
     );
 }
+
+// ---- Runnable-demo hygiene: no unmarked placeholder receivers ----
+
+/// Lines inside ```-fenced blocks, so prose and table cells (which name
+/// `--kiwi-host` without an argument) are not mistaken for commands.
+fn fenced_lines(md: &str) -> Vec<&str> {
+    let mut inside = false;
+    let mut out = Vec::new();
+    for line in md.lines() {
+        if line.trim_start().starts_with("```") {
+            inside = !inside;
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// A command a newcomer is invited to copy must not carry a hostname that
+/// can never resolve to a receiver. The demo shipped `--kiwi-host
+/// kiwi.example.org` -- reserved by RFC 2606, so the advertised
+/// hardware-free live path dead-ends on a connection error with nothing in
+/// the README saying the host was yours to supply. Every `--kiwi-host`
+/// argument in a copyable block must be an angle-bracket placeholder, and
+/// the demo must point at somewhere real receivers are listed.
+#[test]
+fn readme_kiwi_commands_use_a_marked_placeholder_host() {
+    let readme = doc("README.md");
+    for line in fenced_lines(&readme) {
+        let mut toks = line.split_whitespace();
+        while let Some(tok) = toks.next() {
+            if tok != "--kiwi-host" {
+                continue;
+            }
+            let host = toks
+                .next()
+                .unwrap_or_else(|| panic!("`--kiwi-host` with no argument in: {line}"));
+            assert!(
+                host.starts_with('<') && host.ends_with('>'),
+                "README command uses `--kiwi-host {host}`; a copyable command needs an \
+                 explicit `<placeholder>` the reader must replace, not a host that \
+                 cannot connect"
+            );
+        }
+    }
+
+    let demo = squash_whitespace(section(&readme, "60-second demo"));
+    assert!(
+        demo.contains("kiwisdr.com/public") || demo.contains("rx.linkfanel.net"),
+        "60-second demo names a KiwiSDR placeholder but points nowhere the reader \
+         can find a real public receiver"
+    );
+}

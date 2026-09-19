@@ -119,10 +119,14 @@ manta decode /tmp/v1/v1.wav
 ```
 
 Then point it at a real signal — a public KiwiSDR needs no hardware of
-your own:
+your own. `<your-kiwi-host>` is a placeholder: pick a receiver that covers
+the band you want from the public KiwiSDR directory at
+<https://kiwisdr.com/public/> (or the map at <http://rx.linkfanel.net/>)
+and substitute its hostname and port — there is no default receiver and
+the command will not connect until you do:
 
 ```sh
-manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
+manta listen --kiwi-host <your-kiwi-host> --kiwi-freq 7030000
 ```
 
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
@@ -148,7 +152,7 @@ metrics_port = 7302
 ```
 
 ```sh
-manta run --config server.toml --kiwi-host kiwi.example.org --kiwi-freq 7030000
+manta run --config server.toml --kiwi-host <your-kiwi-host> --kiwi-freq 7030000
 telnet localhost 7300          # DX de … lines
 nc localhost 7301              # one JSON object per spot
 curl -s localhost:7302/metrics # Prometheus text
@@ -169,7 +173,7 @@ before you widen it, read
 | --- | --- | --- |
 | IQ / audio WAV file | `decode`, `listen --source` | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio, or raw complex IQ at any rate with `--source-iq`) |
 | Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
-| KiwiSDR over the network | `listen --kiwi-host` | Working |
+| KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
 
