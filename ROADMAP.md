@@ -144,9 +144,17 @@ both emitting real `Spot`s -- see
 `manta-server` has also landed: the telnet cluster server, the
 JSON/WebSocket stream, TOML config, the metrics endpoint, and the
 outbound RBN uplink are all shipped and tested. Remaining M3 sub-projects:
-the RBN parity benchmark (needs ≥ 2 h of recorded contest-weekend IQ with
-RBN reference spots -- a data dependency not yet resolved) and the
-7-day unattended soak in the accept-when list above.
+just the RBN parity benchmark (needs ≥ 2 h of recorded contest-weekend IQ
+with RBN reference spots -- a data dependency not yet resolved).
+
+**Shipped sub-projects are not acceptance, and M3's acceptance is wholly
+open**: all four accept-when gates above are still unmet -- the parity
+benchmark itself, the 7-day unattended soak, cqdx ingesting the JSON
+stream, and the stock DX-cluster client (`telnet`, N1MM) session against a
+running node. That last one is *not* discharged by the servers' automated
+acceptance suites: those drive scripted TCP clients, which exercise the
+wire format but say nothing about how a real contest logger behaves
+against it.
 
 **RBN admission** is pre-1.0 work, not deferred: the near-term path is a
 Skimmer-Server-compatible handshake so existing aggregators can accept a

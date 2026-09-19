@@ -67,8 +67,11 @@ cargo install --path crates/manta-cli --features hpsdr
 That puts a `manta` binary in Cargo's bin directory (`~/.cargo/bin`
 unless you moved `CARGO_HOME`), which a standard Rust install already has
 on `PATH` — every command below assumes a bare `manta` resolves. To build
-without installing, `cargo build --release -p manta-cli` leaves the
-binary at `target/release/manta`; run that path instead.
+without installing, `cargo build --release -p manta-cli --features hpsdr`
+leaves the binary at `target/release/manta`; run that path instead. Carry
+the `--features hpsdr` across: drop it and the binary has no `--hpsdr-host`
+flag at all, so it no longer matches the install above or the HPSDR row in
+the Inputs table below.
 
 A binary and a Docker image publish automatically, for every platform,
 from the first tag:
@@ -123,10 +126,13 @@ your own. `<your-kiwi-host>` is a placeholder: pick a receiver that covers
 the band you want from the public KiwiSDR directory at
 <https://kiwisdr.com/public/> (or the map at <http://rx.linkfanel.net/>)
 and substitute its hostname and port — there is no default receiver and
-the command will not connect until you do:
+the command will not connect until you do. `--kiwi-port` defaults to 8073,
+the standard KiwiSDR port; a receiver the directory lists on any other port
+needs it spelled out, so it is a placeholder here too and you can drop the
+flag entirely when yours is on 8073:
 
 ```sh
-manta listen --kiwi-host <your-kiwi-host> --kiwi-freq 7030000
+manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
 ```
 
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
@@ -152,7 +158,8 @@ metrics_port = 7302
 ```
 
 ```sh
-manta run --config server.toml --kiwi-host <your-kiwi-host> --kiwi-freq 7030000
+manta run --config server.toml --kiwi-host <your-kiwi-host> \
+    --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
 telnet localhost 7300          # DX de … lines
 nc localhost 7301              # one JSON object per spot
 curl -s localhost:7302/metrics # Prometheus text

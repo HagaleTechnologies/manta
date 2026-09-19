@@ -270,3 +270,107 @@ fn readme_kiwi_commands_use_a_marked_placeholder_host() {
          can find a real public receiver"
     );
 }
+
+// ---- Review round 1 (PR #142): the documented commands must stay coherent ----
+
+/// Fenced lines with shell line-continuations joined, so a command split
+/// across two lines with a trailing `\` is still inspected as one command.
+fn fenced_commands(md: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in fenced_lines(md) {
+        let trimmed = line.trim_end();
+        if let Some(head) = trimmed.strip_suffix('\\') {
+            pending.push_str(head);
+            pending.push(' ');
+            continue;
+        }
+        pending.push_str(trimmed);
+        out.push(std::mem::take(&mut pending));
+    }
+    if !pending.is_empty() {
+        out.push(pending);
+    }
+    out
+}
+
+/// Every documented way of building the CLI must produce the same binary the
+/// rest of the README describes. `manta-cli` declares no default features and
+/// gates `--hpsdr-host` behind `hpsdr`, so a build command without
+/// `--features hpsdr` yields a binary that rejects the input flag the
+/// Installation notes and the Inputs table both advertise.
+#[test]
+fn readme_build_commands_keep_the_hpsdr_feature() {
+    let readme = doc("README.md");
+    for line in readme.lines() {
+        if !line.contains("manta-cli") {
+            continue;
+        }
+        if !(line.contains("cargo build") || line.contains("cargo install")) {
+            continue;
+        }
+        assert!(
+            line.contains("--features hpsdr"),
+            "README builds manta-cli without `--features hpsdr`, so the binary has no \
+             `--hpsdr-host` flag: {line}"
+        );
+    }
+}
+
+/// The Kiwi prose tells the reader to substitute the receiver's hostname
+/// *and port*, and `--kiwi-port` defaults to 8073 in silence -- so a command
+/// that offers only a host placeholder cannot reach a receiver on any other
+/// port. Both copyable Kiwi commands need a marked port placeholder too.
+#[test]
+fn readme_kiwi_commands_offer_a_marked_placeholder_port() {
+    let readme = doc("README.md");
+    for cmd in fenced_commands(&readme) {
+        if !cmd.contains("--kiwi-host") {
+            continue;
+        }
+        let mut toks = cmd.split_whitespace();
+        let mut port = None;
+        while let Some(tok) = toks.next() {
+            if tok == "--kiwi-port" {
+                port = toks.next();
+            }
+        }
+        let port = port.unwrap_or_else(|| {
+            panic!(
+                "README Kiwi command has no `--kiwi-port`, so it silently uses the 8073 \
+                 default the surrounding prose tells the reader to replace: {cmd}"
+            )
+        });
+        assert!(
+            port.starts_with('<') && port.ends_with('>'),
+            "README command uses `--kiwi-port {port}`; the reader must be shown a \
+             `<placeholder>` to replace, not a fixed port"
+        );
+    }
+}
+
+/// M3's remaining-work prose must not quote a subset of the accept-when list.
+/// It previously named the 7-day soak but not the stock-DX-cluster-client
+/// session, which this branch's own verification notes leave open -- making
+/// M3 read as closer to acceptance than it is.
+#[test]
+fn roadmap_m3_remaining_work_names_every_open_acceptance_gate() {
+    let roadmap = doc("ROADMAP.md");
+    let m3 = squash_whitespace(section(&roadmap, "M3"));
+    let idx = m3
+        .find("Remaining M3 sub-projects")
+        .expect("M3 remaining-work sentence");
+    let remaining = &m3[idx..];
+    for gate in [
+        "parity benchmark",
+        "7-day unattended soak",
+        "cqdx",
+        "stock DX-cluster client",
+    ] {
+        assert!(
+            remaining.contains(gate),
+            "ROADMAP M3's remaining-work prose never mentions the open accept-when gate \
+             `{gate}`"
+        );
+    }
+}
