@@ -374,3 +374,47 @@ fn roadmap_m3_remaining_work_names_every_open_acceptance_gate() {
         );
     }
 }
+
+/// `--source-iq` only changes how the WAV's samples are *interpreted*; it is
+/// not a resampler. `Channelizer::new` rejects any rate whose `fs / 93.75`
+/// is not a power of two (`crates/manta-dsp/src/channelizer.rs`), and
+/// `--capture-rate-hz` only decimates by a power of two into another table
+/// rate (`manta_dsp::decimate::Decimator::new`) -- so a 100 or 250 kS/s
+/// recording cannot be replayed at all, by either route. The README must
+/// therefore not promise IQ replay "at any rate", and must name the table
+/// constraint wherever it describes IQ replay.
+#[test]
+fn readme_does_not_promise_iq_replay_at_any_rate() {
+    let readme = squash_whitespace(&doc("README.md"));
+    assert!(
+        !readme.contains("at any rate"),
+        "README promises IQ file replay `at any rate`, but the channelizer only accepts \
+         rates where fs/93.75 is a power of two and --capture-rate-hz only decimates by a \
+         power of two -- a 100 kS/s recording is rejected outright"
+    );
+    assert!(
+        readme.contains("fs / 93.75"),
+        "README never states the channelizer's supported-rate rule (fs / 93.75 a power of \
+         two), so a reader with an off-table recording has nothing to check their file \
+         against"
+    );
+    // Each place the rule is stated must also spell out the rates it admits
+    // -- the rule alone ("a power of two") makes the reader do the
+    // arithmetic before they can tell whether their own recording is
+    // replayable.
+    for (i, _) in readme.match_indices("fs / 93.75") {
+        let window = &readme[i..readme.len().min(i + 400)];
+        for rate in ["48", "96", "192", "384"] {
+            assert!(
+                window.contains(rate),
+                "README states the fs / 93.75 rule without naming the supported table \
+                 rate {rate} kS/s near it: {window}"
+            );
+        }
+        assert!(
+            window.contains("kS/s"),
+            "README states the fs / 93.75 rule without units on the rates it admits: \
+             {window}"
+        );
+    }
+}
