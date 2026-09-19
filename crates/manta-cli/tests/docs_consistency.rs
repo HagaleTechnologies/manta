@@ -476,3 +476,55 @@ fn readme_does_not_promise_iq_replay_at_any_rate() {
         );
     }
 }
+
+// ---- Review round 2 (PR #142): the wiki's freshness stamp must not lag ----
+
+/// `wiki/pages/overview.md` carries a `verified: {commit, date}` frontmatter
+/// stamp that readers use to judge how stale the page is. This branch
+/// rewrote the page's body (nine-crate layout, "implementation is well
+/// underway" replacing "no implementation has started") while the stamp
+/// still pointed at `e68b106` / `2026-07-07` -- a revision predating every
+/// one of those claims, so the metadata vouched for content that did not
+/// exist when it was written. The in-repo precedent for a substantive
+/// correction is to refresh the stamp with the change
+/// (`wiki/pages/detector-tracks.md`, `wiki/pages/spot-validation.md`).
+#[test]
+fn wiki_overview_verified_stamp_is_not_the_pre_rewrite_one() {
+    let page = doc("wiki/pages/overview.md");
+    let front = page
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---").map(|(f, _)| f))
+        .expect("overview.md frontmatter block");
+
+    let field = |key: &str| -> String {
+        front
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+            .unwrap_or_else(|| panic!("overview.md frontmatter has no `{key}` field"))
+    };
+
+    // The body claims this branch introduced; if they are present the stamp
+    // must have moved with them.
+    let claims = ["nine-crate", "Implementation is well underway"];
+    for claim in claims {
+        assert!(
+            page.contains(claim),
+            "overview.md no longer claims `{claim}`; this test pins the stamp to those \
+             claims and needs updating with them"
+        );
+    }
+
+    let (commit, date) = (field("commit:"), field("date:"));
+    assert_ne!(
+        (commit.as_str(), date.as_str()),
+        ("e68b106", "2026-07-07"),
+        "overview.md still stamps `verified: e68b106 / 2026-07-07`, which predates the \
+         nine-crate and shipped-status claims now on the page: refresh \
+         `verified.commit`/`verified.date` whenever the body is substantively corrected"
+    );
+    assert!(
+        date.as_str() >= "2026-09-05",
+        "overview.md's `verified.date` ({date}) predates the 2026-09-05 broad review that \
+         found the page's claims stale, so the stamp cannot be vouching for the current body"
+    );
+}
