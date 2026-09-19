@@ -423,6 +423,16 @@ fn readme_does_not_promise_iq_replay_at_any_rate() {
          rates where fs/93.75 is a power of two and --capture-rate-hz only decimates by a \
          power of two -- a 100 kS/s recording is rejected outright"
     );
+    // ...nor may it frame the rates it *does* name as the closed set. The
+    // rule admits every `fs` with `fs / 93.75` a power of two, which is
+    // unbounded in both directions (24 kS/s and 1536 kS/s both construct);
+    // "any other rate is rejected" reads to a reader holding one of the
+    // unlisted-but-valid rates as a flat no.
+    assert!(
+        !readme.contains("at any other rate"),
+        "README calls every rate outside its own example list rejected, but the list is \
+         not the whole set -- 24 kS/s is admitted and unlisted in SPEC §1.1's table"
+    );
     assert!(
         readme.contains("fs / 93.75"),
         "README never states the channelizer's supported-rate rule (fs / 93.75 a power of \
@@ -433,9 +443,13 @@ fn readme_does_not_promise_iq_replay_at_any_rate() {
     // -- the rule alone ("a power of two") makes the reader do the
     // arithmetic before they can tell whether their own recording is
     // replayable.
-    // 48 kS/s is the audio-passband rate SPEC §1.1 names in prose rather than
-    // in the table; the rest come from the table itself.
-    let mut admitted = vec![48];
+    // 24 and 48 kS/s are admitted rates SPEC §1.1's *table* leaves out: 48
+    // kS/s is the audio-passband rate the section names in prose, and 24 kS/s
+    // is the decimated rate `crates/manta-cli/tests/cli.rs`'s
+    // `capture_rate_hz_that_divides_evenly_decimates_and_still_decodes`
+    // already decodes end-to-end (24000 / 93.75 = 256, a power of two). The
+    // rest come from the table itself.
+    let mut admitted = vec![24, 48];
     admitted.extend(spec_table_rates_ks());
     admitted.dedup();
     for ks in &admitted {
