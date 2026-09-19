@@ -5,6 +5,7 @@
 //! counts and a two-milestone-stale description of the output layer. Each
 //! test below pins one claim a first-time visitor reads.
 
+use manta_dsp::channelizer::Channelizer;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -375,6 +376,36 @@ fn roadmap_m3_remaining_work_names_every_open_acceptance_gate() {
     }
 }
 
+/// The input rates of the normative rate table in `docs/SPEC-decode-core.md`
+/// §1.1, in kS/s (`96`, `192`, `384`, `768`). The README's supported-rate
+/// list must name every one of them: a rate the SPEC admits but the README
+/// omits reads to a visitor as "your recording is unsupported" when the
+/// channelizer would in fact have accepted it.
+fn spec_table_rates_ks() -> Vec<u32> {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let start = spec.find("### 1.1 Dimensions").expect("SPEC §1.1 heading");
+    let body = &spec[start..];
+    let end = body[1..]
+        .find("\n### ")
+        .map(|i| i + 1)
+        .unwrap_or(body.len());
+    let mut rates = Vec::new();
+    for line in body[..end].lines() {
+        let Some(cell) = line.strip_prefix('|').and_then(|l| l.split('|').next()) else {
+            continue;
+        };
+        let digits: String = cell.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(hz) = digits.parse::<u32>() {
+            rates.push(hz / 1000);
+        }
+    }
+    assert!(
+        rates.contains(&768),
+        "SPEC §1.1 table parsed as {rates:?}; expected it to name 768 kS/s"
+    );
+    rates
+}
+
 /// `--source-iq` only changes how the WAV's samples are *interpreted*; it is
 /// not a resampler. `Channelizer::new` rejects any rate whose `fs / 93.75`
 /// is not a power of two (`crates/manta-dsp/src/channelizer.rs`), and
@@ -402,13 +433,26 @@ fn readme_does_not_promise_iq_replay_at_any_rate() {
     // -- the rule alone ("a power of two") makes the reader do the
     // arithmetic before they can tell whether their own recording is
     // replayable.
+    // 48 kS/s is the audio-passband rate SPEC §1.1 names in prose rather than
+    // in the table; the rest come from the table itself.
+    let mut admitted = vec![48];
+    admitted.extend(spec_table_rates_ks());
+    admitted.dedup();
+    for ks in &admitted {
+        let fs = f64::from(*ks) * 1000.0;
+        assert!(
+            Channelizer::new(fs, 14_000_000.0).is_ok(),
+            "this test claims the README must advertise {ks} kS/s, but \
+             Channelizer::new rejects it"
+        );
+    }
     for (i, _) in readme.match_indices("fs / 93.75") {
         let window = &readme[i..readme.len().min(i + 400)];
-        for rate in ["48", "96", "192", "384"] {
+        for ks in &admitted {
             assert!(
-                window.contains(rate),
+                window.contains(&ks.to_string()),
                 "README states the fs / 93.75 rule without naming the supported table \
-                 rate {rate} kS/s near it: {window}"
+                 rate {ks} kS/s near it: {window}"
             );
         }
         assert!(

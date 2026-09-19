@@ -137,10 +137,10 @@ manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-fr
 
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
 WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
-only at its table rates — `fs / 93.75` Hz a power of two, so 48, 96, 192 or
-384 kS/s — and `--source-iq` only changes how the WAV is interpreted, so a
-recording at any other rate (100 or 250 kS/s, say) is rejected with
-`unsupported sample rate …: fs/93.75 must be a power of two`.
+only at its table rates — `fs / 93.75` Hz a power of two, so 48, 96, 192,
+384 or 768 kS/s — and `--source-iq` only changes how the WAV is
+interpreted, so a recording at any other rate (100 or 250 kS/s, say) is
+rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an
@@ -186,7 +186,7 @@ before you widen it, read
 
 | Source | How | Status |
 | --- | --- | --- |
-| IQ / audio WAV file | `decode`, `listen --source` | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio, or raw complex IQ with `--source-iq`). IQ is never resampled: the rate must be one the channelizer supports (`fs / 93.75` a power of two — 48, 96, 192, 384 kS/s), and `--capture-rate-hz` only decimates from one of those to a lower one |
+| IQ / audio WAV file | `decode`, `listen --source` | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio, or raw complex IQ with `--source-iq`). IQ is never resampled: the rate must be one the channelizer supports (`fs / 93.75` a power of two — 48, 96, 192, 384, 768 kS/s), and `--capture-rate-hz` only decimates from one of those to a lower one |
 | Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
