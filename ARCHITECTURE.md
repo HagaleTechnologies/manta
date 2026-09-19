@@ -50,25 +50,28 @@ allow).
 manta/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── manta-input          # IQ sources: SoapySDR, KiwiSDR client, file, audio
+│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, file, audio
 │   ├── manta-dsp            # PFB channelizer, noise-floor estimation, envelope
 │   ├── manta-decode         # CW keying state machine, timing, Morse decode
 │   ├── manta-spot           # callsign validation, CQ/DE parse, dedupe, scoring
 │   ├── manta-server         # telnet cluster server + JSON/WebSocket stream
 │   ├── manta-engine         # orchestration: track lifecycle, decoder pool
 │   ├── manta-testkit        # synthetic CW generator, golden-IQ harness
-│   └── manta-cli            # `manta` binary: daemon + subcommands
+│   ├── manta-cli            # `manta` binary: daemon + subcommands
+│   └── manta-soak-harness   # 24h soak measurement harness (ROADMAP M2 gate),
+│                             # not shipped in the manta binary
 ```
 
 Dependency graph (arrows = depends on):
 
 ```
 manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp
-                     │        ├──▶ manta-dsp ──────▶ coppa-dsp
-                     │        ├──▶ manta-decode
-                     │        └──▶ manta-spot ──────▶ manta-decode
-                     └──▶ manta-server
+        │            │        ├──▶ manta-dsp ──────▶ coppa-dsp
+        │            │        ├──▶ manta-decode
+        │            │        └──▶ manta-spot ──────▶ manta-decode
+        └──────────────────▶ manta-server
 manta-testkit ──▶ manta-dsp, manta-decode, coppa-channel
+manta-soak-harness ──▶ manta-dsp, manta-input, manta-engine, manta-testkit
 ```
 
 M1 added `manta-input → manta-dsp` (the shared Hilbert transformer, used
@@ -436,11 +439,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
   own yet (decode-pipeline internals, not the network-facing surface
   MAN-59 scoped to), and `manta --status` hitting a local control socket
   for live stats is similarly not yet implemented. Prometheus text
-  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
-  doc was stale — no Cargo `metrics` feature has ever existed; the
-  endpoint is unconditionally compiled and served whenever
+  endpoint (compiled in unconditionally, no feature flag — the "(feature
+  `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
+  `metrics` feature has ever existed; the endpoint is served whenever
   `--config` is set — `--server-config` is MAN-77's deprecated alias of
-  that flag): active tracks, evictions, decode rate,
+  that flag): input overruns, active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
