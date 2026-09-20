@@ -82,6 +82,17 @@ jobs:
     steps:
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
+        # Codex review, manta PR #202 round 1, P1: skipped for a dependabot[bot]-triggered run
+        # -- GitHub withholds ALL custom Actions secrets from a Dependabot-actor-triggered run
+        # (confirmed pre-existing fact in this same file, see "Dispatch full CI"'s own comment
+        # below), so HAGALE_AGENT_APP_PRIVATE_KEY would be empty here on exactly the revisions
+        # that need the dependabot pass-through, failing this step before create-check could
+        # ever reach its IS_EXCLUDED_DEPENDABOT success path -- since the renamed Codex check is
+        # required, every Dependabot PR would stay permanently blocked despite its native CI.
+        # create-check's own GH_TOKEN falls back to github.token below when this step is
+        # skipped, which is sufficient for a same-run POST (the only thing the dependabot
+        # pass-through path needs).
+        if: github.actor != 'dependabot[bot]'
         # Checks API create/update endpoints only accept a GitHub App token -- github.token
         # (Actions' own installation token) can create a check-run within its own run but is
         # rejected for updating one a DIFFERENT run created ("Check run status and conclusions
@@ -125,8 +136,12 @@ jobs:
           # hagale-agent's minted installation token (see the "Mint a hagale-agent..." step
           # above) for every check-run write -- github.token cannot update a check-run a
           # different run created, and no PAT can write to the Checks API at all, ever (create
-          # or update). HAG-74, credenza#71.
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # or update). HAG-74, credenza#71. Falls back to github.token when the mint step was
+          # skipped (dependabot[bot] actor, see that step's own comment) -- sufficient here
+          # since the dependabot path only ever does a same-run POST, which github.token can do
+          # fine; it's cross-run mutation that token can't do, and dependabot never reaches
+          # that path (no @codex review request is ever posted for it).
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean }}
