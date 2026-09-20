@@ -69,8 +69,21 @@ jobs:
   # here, since this IS the producer file, inline, with no caller/callee split to bootstrap.
   # The moment this PR merges, every subsequent PR's pull_request_target run executes this
   # exact logic directly; there is no intermediate "not ready yet" state to detect.
+  # Codex review, manta PR #202 round 2, P1: this job's own `name:` must NOT be the literal
+  # required-check string, for the same reason wait-for-codex-merge-group-passthrough's own
+  # `name:` isn't (see that job's own comment for the full CQD-336 rationale) -- GitHub
+  # auto-generates a native check-run under a job's own display name on EVERY run of this
+  # workflow, not just ones where the job is skipped: on a genuine pull_request_target run
+  # (this job's `if:` true), that native check-run and the one create-check's own `-f name=`
+  # step manages via the raw Checks API would BOTH exist under the identical name on the same
+  # head SHA; on every other trigger (pull_request_review/issue_comment/merge_group, `if:`
+  # false), it's the usual `skipped`-ghost collision. Either way, two check-run objects sharing
+  # one name is exactly the ambiguous state GitHub's required-status rollup can resolve
+  # non-deterministically. This bug predates HAG-74 (the job was already named this in the
+  # pre-migration file) but only became load-bearing once the ruleset started requiring this
+  # exact name instead of the separately-produced "Wait for Codex Review".
   codex-review-request:
-    name: Codex review clean (gate before expensive downstream jobs)
+    name: 'Codex review clean: request'
     if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
