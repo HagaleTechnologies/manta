@@ -20,14 +20,22 @@
 </p>
 
 `manta` is a headless daemon written in Rust. It takes wideband IQ from a
-commodity SDR, a KiwiSDR over the network, or a WAV file, channelizes the
-whole passband with a polyphase filterbank, runs an independent CW decoder on
-every signal it finds, validates the callsigns, and emits spots. Output is the
-standard `DX de` cluster format over telnet plus a JSON Lines stream, so
-existing aggregators (including the Reverse Beacon Network) and modern
-consumers (such as [cqdx](https://cqdx.app)) can ingest it without changes.
+commodity SDR, an OpenHPSDR/Hermes device, a KiwiSDR over the network, or a
+WAV file, channelizes the whole passband with a polyphase filterbank, runs an
+independent CW decoder on every signal it finds, validates the callsigns, and
+emits spots. Output is the standard `DX de` cluster format over telnet plus a
+JSON Lines / WebSocket stream, so existing aggregators (including the Reverse
+Beacon Network) and modern consumers (such as [cqdx](https://cqdx.app)) can
+ingest it without changes.
 
-No GUI. CLI, a config file, and metrics.
+No GUI. CLI, a TOML config file, and Prometheus metrics.
+
+```console
+$ telnet manta.example.org 7300
+login: W1XYZ
+de W5AU-# >
+DX de W5AU-#:  14000.7  W1AW     CW   7 dB  20 WPM  CQ  1533Z
+```
 
 ## Why
 
@@ -40,115 +48,152 @@ with documented, testable algorithms.
 
 ## Installation
 
-No Rust toolchain, no cloning the source. Pick one:
-
-**Download a prebuilt binary** from the [Releases
-page](https://github.com/HagaleTechnologies/manta/releases) — macOS
-(Intel or Apple Silicon), Windows, or Linux (x86_64 or arm64, including
-Raspberry Pi OS 64-bit). Unpack the archive and run the `manta` binary
-inside it. **Linux binaries need `libasound2` installed** (audio input is
-an unconditional dependency, even if you only ever use file, KiwiSDR, or
-HPSDR input) — `sudo apt install libasound2` on Debian/Ubuntu/Raspberry Pi
-OS, or the equivalent ALSA runtime package on other distros; without it
-the binary fails to start.
-
-**Or run the Docker image** (works anywhere Docker does, `linux/amd64` and
-`linux/arm64`):
-
-```sh
-docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
-```
-
-When running as a long-lived server (not `--help`), stop it with
-`docker stop -t 60 <container>` — Docker's own default 10-second grace
-period before SIGKILL is far shorter than manta's supported graceful-
-shutdown window. The daemon's own internal cutoff is
-`SHUTDOWN_DRAIN_DEADLINE`, **50s** as of MAN-45's per-client drain work
-(up to a 20s in-flight write to a stalled client, plus that client's own
-20s backlog drain, plus slack for task scheduling); the **60s** above is
-the caller-side grace period recommended on top of it, so the daemon
-always reaches its own cutoff first. A shorter timeout SIGKILLs the
-daemon mid-drain, before it can either deliver the remaining backlog or
-record what it abandoned on `manta_spots_dropped_write_failed_total` —
-the series each handler's drain loop charges when its per-client
-deadline expires. (`manta_spots_dropped_shutdown_total` is the separate
-series for a client still in its pre-login/handshake phase: no write
-failed or timed out, and none of that client's queued spots had been
-offered for delivery yet. It does NOT mean the connection performed no
-writes — the telnet login-read and banner branches are reached only
-after the `login: ` prompt went out successfully, and the WS-accept
-branch can fire once `accept_async_with_config` has already put part of
-the 101 response on the wire. It is not where graceful-drain loss shows
-up.)
-Either way, a SIGKILL is the silent truncation those counters exist to
-prevent. Use the same 60s value for
-`--stop-timeout` on `docker run`, `stop_grace_period` on Compose, and
-`terminationGracePeriodSeconds` on Kubernetes.
-
-Both are built by [`.github/workflows/release-publish.yml`](.github/workflows/release-publish.yml)
-directly from each tagged release's commit — every published binary
-traces to a specific, auditable source revision. (If the image above
-returns an authorization error, the GHCR package needs its one-time
-"make public" step in GitHub's package settings after the first real
-release — see MAN-65. Windows binaries need the [Visual C++
-Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
-installed if it isn't already.)
-
-**Building from source** (if you're developing manta itself, or need a
-platform/feature combination the release matrix doesn't cover — the
-`soapy` feature below, for instance, isn't in the official release
-binaries since it needs the SoapySDR system library) still works exactly
-as before, and is what the rest of this Quickstart assumes:
-
-## Quickstart
-
-Requires Rust 1.85 or newer, and a `git` executable on `PATH`. Git is a
-build-time requirement, not just a way to clone this repo: manta depends on
+There is no tagged release yet, so there is no prebuilt binary or Docker
+image to pull — build from source. You need Rust 1.85+ and a `git`
+executable on `PATH`. Git is a build-time requirement, not just a way to
+clone this repo: manta depends on
 [`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git
 dependency, and `.cargo/config.toml` sets `[net] git-fetch-with-cli = true`
 so cargo fetches it through the `git` binary rather than its built-in
-libgit2 transport (which intermittently fails to resolve a bare pinned rev
-on a cold cache). Without git on `PATH` the build fails at the fetch step,
-before compiling anything. Neither Rust nor git is needed to *run* the
-released binaries or the Docker image above.
+libgit2 transport. Without git on `PATH` the build fails at the fetch step,
+before compiling anything.
 
 ```sh
-# Build
-cargo build --release -p manta-cli
-
-# Decode a synthetic golden vector from a file (deterministic, no hardware)
-manta gen v1 --out /tmp/v1
-manta decode /tmp/v1/v1.wav
-
-# Run as a daemon: telnet cluster (:7300), JSON Lines/WebSocket (:7301),
-# metrics, and any configured RBN uplinks, all from one config file
-manta run --config manta.toml --kiwi-host kiwi.example.org --kiwi-freq 7030000
-
-# `listen` is an alias of `run`, kept for ad hoc audio and dev testing.
-
-# Copy live CW from a public KiwiSDR on 40 m
-manta listen --kiwi-host kiwi.example.org --kiwi-freq 7030000
-
-# Copy from a local SDR via SoapySDR (build with --features soapy)
-manta listen --soapy-driver driver=rtlsdr --soapy-freq 7030000 --soapy-rate 240000
-
-# Copy from the default audio input (rig audio passband, 48 kHz)
-manta listen
-
-# Any of the above as JSON Lines instead of text
-manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
+git clone https://github.com/HagaleTechnologies/manta
+cd manta
+cargo install --path crates/manta-cli --features hpsdr
 ```
 
+That puts a `manta` binary in Cargo's bin directory (`~/.cargo/bin`
+unless you moved `CARGO_HOME`), which a standard Rust install already has
+on `PATH` — every command below assumes a bare `manta` resolves. To build
+without installing, `cargo build --release -p manta-cli --features hpsdr`
+leaves the binary at `target/release/manta`; run that path instead. Carry
+the `--features hpsdr` across: drop it and the binary has no `--hpsdr-host`
+flag at all, so it no longer matches the install above or the HPSDR row in
+the Inputs table below.
+
+A binary and a Docker image publish automatically, for every platform,
+from the first tag:
+
+```sh
+# once a release exists:
+docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
+```
+
+**Notes:**
+- Building on Linux compiles the ALSA bindings (audio input is an
+  unconditional dependency, even if you only ever use file, KiwiSDR, or
+  HPSDR input), so the build host needs the ALSA development headers and
+  `pkg-config` — `sudo apt install libasound2-dev pkg-config` on
+  Debian/Ubuntu/Raspberry Pi OS, or the equivalent `alsa-lib` devel
+  package elsewhere. A machine that only *runs* a binary built elsewhere
+  needs just the ALSA runtime library (`libasound2`, `libasound2t64` on
+  Debian 13).
+- Stop a long-running container with `docker stop -t 60 <container>`.
+  Docker's own default 10-second grace period before SIGKILL is far
+  shorter than manta's graceful-shutdown window: the daemon's internal
+  cutoff (`SHUTDOWN_DRAIN_DEADLINE`) is 50 s, so 60 s on the caller side
+  lets the daemon always reach its own cutoff first and record what it
+  abandoned on `manta_spots_dropped_write_failed_total` instead of being
+  truncated silently. Use the same 60 s for `--stop-timeout` on `docker
+  run`, `stop_grace_period` on Compose, and `terminationGracePeriodSeconds`
+  on Kubernetes.
+- Input backends are cargo features, and a build that did not ask for
+  one has no flags for it — `--hpsdr-host` / `--soapy-driver` fail with
+  `error: unexpected argument` on a build without them. `hpsdr`
+  (OpenHPSDR/Hermes) has no native dependency, which is why the install
+  line above turns it on. `soapy` (RTL-SDR, Airspy, SDRplay, HackRF via
+  SoapySDR) needs the native SoapySDR system library installed first;
+  once you have it, add it: `--features hpsdr,soapy`.
+- Windows binaries need the [Visual C++
+  Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+  installed if it isn't already.
+
+## 60-second demo
+
+No SDR, no radio. With `manta` on `PATH` from the install above, generate
+a synthetic golden vector and decode it:
+
+```sh
+manta gen v1 --out /tmp/v1              # 120 s of synthetic CW, 20 WPM, +20 dB
+manta decode /tmp/v1/v1.wav
+# CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ …
+```
+
+Then point it at a real signal — a public KiwiSDR needs no hardware of
+your own. `<your-kiwi-host>` is a placeholder: pick a receiver that covers
+the band you want from the public KiwiSDR directory at
+<https://kiwisdr.com/public/> (or the map at <http://rx.linkfanel.net/>)
+and substitute its hostname and port — there is no default receiver and
+the command will not connect until you do. `--kiwi-port` defaults to 8073,
+the standard KiwiSDR port; a receiver the directory lists on any other port
+needs it spelled out, so it is a placeholder here too and you can drop the
+flag entirely when yours is on 8073:
+
+```sh
+manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+```
+
+File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
+WAV with `--source-iq`. IQ replay is not resampled: the channelizer runs
+only at its table rates — any rate whose `fs / 93.75` is a power of two,
+which among the rates recorders commonly produce means 24, 48, 96, 192,
+384 and 768 kS/s — and `--source-iq` only changes how the WAV is
+interpreted, so a recording at an off-table rate (100 or 250 kS/s, say) is
+rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
+That list is examples, not the whole set: divide your own rate by 93.75,
+and it replays if the answer is a power of two of at least 4.
+`--capture-rate-hz` decimates by a power of two into a *lower* table rate
+(`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
+narrower passband); it is not a general resampler and cannot rescue an
+off-table recording. Replay runs faster than realtime, so the hardware-free
+path above stops at `decode`; a paced replay that can drive the servers
+below is being worked on.
+
 `manta --help` lists every subcommand and flag.
+
+## Run it as a node
+
+`run --config` starts the DX cluster telnet server, the JSON/WebSocket
+stream, and the metrics endpoint alongside the decoder:
+
+```toml
+# server.toml
+[server]
+station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:` and JSON `deCall`
+bind_addr = "127.0.0.1"     # 0.0.0.0 to accept remote clients
+telnet_port = 7300
+json_port   = 7301
+metrics_port = 7302
+```
+
+```sh
+manta run --config server.toml --kiwi-host <your-kiwi-host> \
+    --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+telnet localhost 7300          # DX de … lines
+nc localhost 7301              # one JSON object per spot
+curl -s localhost:7302/metrics # Prometheus text
+```
+
+Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
+block. `dry_run` defaults to `true`, so an uplink connects and logs in but
+transmits nothing until you set it to `false` deliberately.
+
+`bind_addr` has no loopback default — omit it and all three servers bind
+`0.0.0.0`, every interface. The example above pins `127.0.0.1` on purpose;
+before you widen it, read
+[docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
 
 ## Inputs
 
 | Source | How | Status |
 | --- | --- | --- |
-| IQ / audio WAV file | `decode`, `listen --source` | Working |
+| IQ / audio WAV file | `decode`, `listen --source` | Working (`decode` takes IQ; `listen --source` takes 48 kHz mono audio, or raw complex IQ with `--source-iq`). IQ is never resampled: the rate must be one the channelizer supports (`fs / 93.75` a power of two — commonly 24, 48, 96, 192, 384, 768 kS/s, but the rule decides, not that list), and `--capture-rate-hz` only decimates from one of those to a lower one |
 | Sound card (rig audio passband) | `listen --device` | Working, 48 kHz input only |
-| KiwiSDR over the network | `listen --kiwi-host` | Working |
-| RTL-SDR, Airspy, SDRplay, HackRF, and anything else SoapySDR drives | `listen --soapy-driver`, feature `soapy` | Working, needs hardware soak |
+| KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
+| OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
+| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
 
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
@@ -156,10 +201,29 @@ enforced by criterion benches.
 
 ## Outputs
 
-- Decoded text or JSON Lines on stdout today.
-- RBN-format `DX de` spots over the DX cluster telnet protocol (port 7300)
-  and a JSON Lines / WebSocket stream (port 7301): in progress, see
-  [ROADMAP.md](ROADMAP.md) milestone M3.
+All four ship today. `manta run --config <file>` starts the telnet
+server, the JSON/WebSocket stream and the metrics endpoint together; the
+outbound uplink starts alongside them only if that config also carries at
+least one `[[rbn_uplink]]` block.
+
+- **DX cluster telnet server** (`:7300`) — standard login prompt and
+  RBN-format `DX de` lines, with enough command grammar (`sh/dx`,
+  `set/dx/filter`) for stock clients. This is the RBN/aggregator
+  compatibility surface.
+- **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
+  object per line; a raw TCP client and a WebSocket client share the
+  port. This is the [cqdx](https://cqdx.app) ingest surface.
+- **Outbound RBN uplink** — forwards validated spots to an upstream
+  collector in the same `DX de` wire format, with reconnect and multiple
+  simultaneous targets. Working against a collector; **not yet validated
+  against RBN's live ingest**.
+- **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
+  source-health counters. Some gauges are still placeholders;
+  ARCHITECTURE §8 says which.
+
+`decode` and `listen` also print decoded text or `--json` events on
+stdout. That output is a debugging aid, not a stable interface — the
+servers above are.
 
 The decode path is deterministic: the same file in produces byte-identical
 spot logs out. That is a hard requirement, and CI enforces it with golden
@@ -191,30 +255,34 @@ which mode each target is in at startup.
 
 ## Status
 
-Pre-1.0. What exists and what does not:
+Pre-1.0, and pre-first-release. What is true today:
 
-- **Done:** single-signal decode from files and live audio (M1); the full
-  wideband pipeline of polyphase channelizer, detector, track manager, and
-  decoder pool, with SoapySDR and KiwiSDR inputs (M2 sub-projects); callsign
-  validation, CQ/DE parsing, cty.dat and SCP cross-checks, dedupe, wired into
-  the engine (M3, in part).
-- **Open acceptance gates:** the Raspberry Pi 4 CPU-budget measurement and a
-  24 h live-SDR soak both need physical hardware.
-- **Next:** the telnet and JSON spot servers, TOML config, metrics, and an RBN
-  parity benchmark on recorded contest IQ.
-- **Known limits:** the classical decoder loses copy under heavy HF fading on
-  a few golden vectors (issues #25 and #28). Closing that gap is the M4 ML
-  fusion stage, gated on beating the classical baseline under simulated
-  fading. The outbound RBN uplink is unverified against a real RBN ingest and
-  ships dry-run by default until that verification lands.
+- **Shipped:** the full wideband pipeline — polyphase channelizer,
+  noise-floor detector, track manager, decoder pool — with five input
+  sources, callsign validation (cty.dat, SCP, CQ/DE parsing, dedupe), and
+  all four output surfaces above.
+- **Not yet measured:** the RBN parity benchmark (recall vs. RBN on
+  recorded contest IQ), the Raspberry Pi 4 CPU budget, and a 24-hour
+  live-SDR soak. The first needs reference data; the other two need
+  physical hardware. The CPU budget's desktop leg *has* been measured and
+  currently reads as a **fail** — ≈0.53x–0.58x realtime against a <0.5x
+  budget, pending a clean rerun on a quiet machine ([ROADMAP.md](ROADMAP.md) M2).
+- **Known limits:** the classical decoder loses copy under heavy HF
+  fading on several golden vectors, and at low SNR the validator still
+  admits occasional bogus callsigns from noise. Closing the fading gap is
+  classical-DSP work in flight, with ML fusion behind it at M4. The
+  outbound RBN uplink is unverified against a real RBN ingest and ships
+  dry-run by default until that verification lands.
 - **Decode engine:** `decode.engine` defaults to `legacy`. A rewritten
-  `hsmm` engine (MAN-166 decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
+  `hsmm` engine (decode-core-v2, `docs/SPEC-decode-core-v2.md`) is
   implemented and reachable via `--engine hsmm`, but its stage-2
   measurement gate (`docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md`)
-  came back FAIL 2026-09-09: real B2/K5TR oracle recall roughly doubles
+  came back FAIL on 2026-09-09: real B2/K5TR oracle recall roughly doubles
   over `legacy` (`as_word` 27%→56%, `framed` 13%→32%) but falls short of
   the 60%/40% bar, and most VR/V golden vectors still fail. Not yet a
   default-engine candidate.
+- **No tagged release yet**, so the container image above is empty until
+  the first tag.
 
 [ROADMAP.md](ROADMAP.md) has the milestone breakdown with acceptance
 criteria.
@@ -240,16 +308,21 @@ criteria.
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): the seven-crate workspace, data flow,
-  and the channelizer, decoder, validation, and output design.
-- [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md): the
-  implementation-level algorithm spec. Channelizer constants, noise-floor
-  estimator, track state machine, decoder equations, confidence formulas,
-  determinism rules, golden vectors, and the config-key table.
-- [ROADMAP.md](ROADMAP.md): milestones M0 to M4 with acceptance criteria.
-- [docs/DECISIONS/](docs/DECISIONS/): dated design decisions and
-  implementation pins.
-- [wiki/INDEX.md](wiki/INDEX.md): accumulated gotchas and cross-references.
+**Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+(exposing the servers safely) · the "Run it as a node" section above ·
+`manta <subcommand> --help` for every flag.
+
+**Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
+workspace, data flow, and the channelizer, decoder, validation and output
+design · [docs/DECISIONS/](docs/DECISIONS/) — dated design decisions and
+implementation pins · [wiki/INDEX.md](wiki/INDEX.md) — accumulated
+gotchas.
+
+**Algorithms and research:** [docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) —
+channelizer constants, noise-floor estimator, track state machine,
+decoder equations, confidence formulas, determinism rules, golden
+vectors, config-key table · [ROADMAP.md](ROADMAP.md) — milestones M0 to
+M4 with acceptance criteria.
 
 ## Related projects
 
