@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Log rotation for the manta LaunchAgent (MAN-75).
+
+  launchd's StandardOutPath/StandardErrorPath are a plain append to one
+  ordinary file: launchd has no size cap, no rotation, and no equivalent of
+  journald's own limits, and manta's console stream is per decoded
+  character, so a 24/7 receiver grows com.hagaletechnologies.manta's log
+  without bound until the disk fills. macOS ships no rotation policy for a
+  per-user LaunchAgent log either (newsyslog only rotates what
+  /etc/newsyslog.conf and /etc/newsyslog.d list, and it cannot rotate a
+  file whose only writer is holding the descriptor open, which is exactly
+  the case here). This companion agent is that policy.
+
+  It truncates IN PLACE, keeping the tail, rather than renaming: the
+  descriptor launchd handed manta at spawn time stays valid for the whole
+  process lifetime, so a renamed file would keep growing while the
+  freshly created one stayed empty until manta next restarted. launchd
+  opens that path in append mode, so manta's next write lands at the new
+  end of file; even on a build that did not, the truncation still frees
+  the blocks (the file simply becomes sparse), which is the property that
+  bounds disk usage.
+
+  Install: replace YOUR_USERNAME below (two places, the same account whose
+  Library holds the log), then
+
+      cp packaging/launchd/com.hagaletechnologies.manta-logrotate.plist \
+         ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.hagaletechnologies.manta-logrotate.plist
+
+  See packaging/README.md. Rotate at a different size by editing cap and
+  keep in the script below (bytes).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hagaletechnologies.manta-logrotate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -u
+log=/Users/YOUR_USERNAME/Library/Logs/manta.log
+cap=33554432
+keep=8388608
+[ -f "$log" ] || exit 0
+size=$(stat -f%z "$log") || exit 0
+[ "$size" -gt "$cap" ] || exit 0
+tmp=/Users/YOUR_USERNAME/Library/Logs/manta.log.rotating
+tail -c "$keep" "$log" > "$tmp" || exit 1
+cat "$tmp" > "$log"
+rm -f "$tmp"
+</string>
+    </array>
+
+    <!--
+      Hourly. At manta's console verbosity an hour cannot add anything
+      close to the 32 MiB cap, so the log stays inside cap plus one hour of
+      output at all times. A rotation run that finds the file under the cap
+      exits 0 immediately and costs nothing.
+
+      RunAtLoad as well, so installing this agent on a machine whose log
+      has ALREADY grown does not wait an hour to reclaim the space.
+    -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Periodic job, not a service: launchd must not treat each clean exit
+      as a crash to relaunch.
+    -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/manta-logrotate.err</string>
+</dict>
+</plist>
