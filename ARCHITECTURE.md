@@ -434,11 +434,25 @@ validation (MAN-28). Dedupe (step 5) still applies.
   record to reconstruct an abuse incident after the fact. Still
   aspirational: `manta-input`/`manta-engine` carry no logging of their
   own yet (decode-pipeline internals, not the network-facing surface
-  MAN-59 scoped to), and `manta --status` hitting a local control socket
-  for live stats is similarly not yet implemented. Prometheus text
-  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
-  doc was stale — no Cargo `metrics` feature has ever existed; the
-  endpoint is unconditionally compiled and served whenever
+  MAN-59 scoped to). **`manta status` implemented** (2026-09-04, MAN-44,
+  `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`): reads a
+  JSON `StatusDoc` (`crates/manta-server/src/status.rs`) served on
+  `GET /status` by the same metrics listener that already served
+  `GET /metrics` — deliberately NOT the local-control-socket design this
+  section previously sketched as unimplemented; the ADR records why a
+  Unix-only control socket was evaluated and not taken. Reports daemon
+  uptime, spot/client counts, and — the ticket's actual scope — **per-target
+  RBN uplink health**: each configured `[[rbn_uplink]]` target's own
+  connected/sent/suppressed/reconnect counts plus a derived
+  `connected`/`flapping`/`down`/`disabled` verdict from a windowed
+  reconnect rate (`RECONNECT_WINDOW`/`FLAPPING_RECONNECTS` in
+  `metrics.rs`), so a stuck reconnect loop reads as unhealthy even while
+  technically connected at the instant it's checked. Exit code doubles as
+  a cron/Nagios check. Inherits `/metrics`'s unauthenticated,
+  `0.0.0.0`-by-default exposure posture (`docs/RUNBOOKS/network-exposure.md`).
+  Prometheus text endpoint (the "(feature `metrics`)" phrasing in older
+  revisions of this doc was stale — no Cargo `metrics` feature has ever
+  existed; the endpoint is unconditionally compiled and served whenever
   `--config` is set — `--server-config` is MAN-77's deprecated alias of
   that flag): active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
@@ -472,8 +486,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
   or `/AM` designator that places it outside any DXCC entity),
   `manta_active_tracks`, per-protocol client-connected gauges,
-  `manta_source_health`, the uplink counters, and (MAN-56, landed
-  2026-09-04) `manta_input_dropped_packets_total`/
+  `manta_source_health`, the uplink counters, (MAN-44) per-target
+  `manta_uplink_target_*` series, and (MAN-56, landed 2026-09-04)
+  `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
   (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
   per-stage queue depths, decode rate, spots/min, spot-confidence

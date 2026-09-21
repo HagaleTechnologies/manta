@@ -5,13 +5,20 @@ designed to be internet-reachable with no authentication, matching the DX
 cluster/RBN ecosystem's own long-standing convention (ARCHITECTURE.md §7).
 The Prometheus metrics endpoint is different: it's operationally useful, not
 part of that public-facing contract, and carries no authentication either.
+**`GET /status`** (MAN-44, the JSON document `manta status` reads) is served
+by that same metrics listener and shares its exact exposure posture —
+everything below about `/metrics` applies to `/status` too. `/status`
+additionally lists every configured RBN uplink target's `host:port` — public
+infrastructure by nature (it's who your daemon forwards spots to), but
+enumerable by anyone who can reach the port, same as `/metrics`'s existing
+`manta_source_health` labels already are.
 
 By default all three bind to `[server].bind_addr`, which defaults to
 `0.0.0.0` — every configured port is reachable from any network that can
-route to the host, metrics included.
+route to the host, metrics (and status) included.
 
-**If you don't want `/metrics` reachable outside your own network**, the
-only safe option today is:
+**If you don't want `/metrics`/`/status` reachable outside your own
+network**, the only safe option today is:
 
 - **Firewall the metrics port** (`[server].metrics_port`) directly — e.g.
   an iptables/nftables rule, or a cloud security-group rule, restricting
