@@ -893,6 +893,7 @@ dependencies = [
  "manta-spot",
  "manta-testkit",
  "num-complex",
+ "regex",
  "serde_json",
  "sha2",
  "tempfile",
