@@ -38,7 +38,8 @@ on:
     types: [submitted]
   issue_comment:
     types: [created]
-  # Fleet CI redesign, native merge-queue cutover: "Wait for Codex Review" is a required check,
+  # Fleet CI redesign, native merge-queue cutover: "Codex review clean (gate before expensive
+  # downstream jobs)" is a required check (HAG-74: was "Wait for Codex Review" pre-migration),
   # so a merge_group entry needs it to report on its own synthetic SHA or the entry sits
   # pending until check_response_timeout_minutes and gets dequeued. No re-review is meaningful
   # here (the constituent PR already passed a real Codex round during its own PR phase; there's
@@ -68,8 +69,21 @@ jobs:
   # here, since this IS the producer file, inline, with no caller/callee split to bootstrap.
   # The moment this PR merges, every subsequent PR's pull_request_target run executes this
   # exact logic directly; there is no intermediate "not ready yet" state to detect.
+  # Codex review, manta PR #202 round 2, P1: this job's own `name:` must NOT be the literal
+  # required-check string, for the same reason wait-for-codex-merge-group-passthrough's own
+  # `name:` isn't (see that job's own comment for the full CQD-336 rationale) -- GitHub
+  # auto-generates a native check-run under a job's own display name on EVERY run of this
+  # workflow, not just ones where the job is skipped: on a genuine pull_request_target run
+  # (this job's `if:` true), that native check-run and the one create-check's own `-f name=`
+  # step manages via the raw Checks API would BOTH exist under the identical name on the same
+  # head SHA; on every other trigger (pull_request_review/issue_comment/merge_group, `if:`
+  # false), it's the usual `skipped`-ghost collision. Either way, two check-run objects sharing
+  # one name is exactly the ambiguous state GitHub's required-status rollup can resolve
+  # non-deterministically. This bug predates HAG-74 (the job was already named this in the
+  # pre-migration file) but only became load-bearing once the ruleset started requiring this
+  # exact name instead of the separately-produced "Wait for Codex Review".
   codex-review-request:
-    name: Codex review clean (gate before expensive downstream jobs)
+    name: 'Codex review clean: request'
     if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -79,6 +93,39 @@ jobs:
     outputs:
       check_run_id: ${{ steps.create-check.outputs.check_run_id }}
     steps:
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        # Codex review, manta PR #202 round 1, P1: skipped for a dependabot[bot]-triggered run
+        # -- GitHub withholds ALL custom Actions secrets from a Dependabot-actor-triggered run
+        # (confirmed pre-existing fact in this same file, see "Dispatch full CI"'s own comment
+        # below), so HAGALE_AGENT_APP_PRIVATE_KEY would be empty here on exactly the revisions
+        # that need the dependabot pass-through, failing this step before create-check could
+        # ever reach its IS_EXCLUDED_DEPENDABOT success path -- since the renamed Codex check is
+        # required, every Dependabot PR would stay permanently blocked despite its native CI.
+        # create-check's own GH_TOKEN falls back to github.token below when this step is
+        # skipped, which is sufficient for a same-run POST (the only thing the dependabot
+        # pass-through path needs).
+        if: github.actor != 'dependabot[bot]'
+        # Checks API create/update endpoints only accept a GitHub App token -- github.token
+        # (Actions' own installation token) can create a check-run within its own run but is
+        # rejected for updating one a DIFFERENT run created ("Check run status and conclusions
+        # can only be updated internally by GitHub Actions", HTTP 403); a plain PAT is rejected
+        # outright for BOTH create and update ("You must authenticate via a GitHub App", HTTP
+        # 403 -- see GitHub's REST docs for POST /repos/{owner}/{repo}/check-runs). Confirmed
+        # live on vanity#395/#396/#398 (2026-09-19/20): every attempt using github.token or
+        # codex_review_pat for a cross-run check-run write failed with one of these two errors.
+        # hagale-agent (App ID 4696353) mints a genuine installation token here, scoped to just
+        # this repo, which is not subject to either restriction. HAG-74: hand-ported from
+        # credenza#71 (487064f9) -- see that commit's identical step in codex-review-request.yml
+        # for the full history; manta inlines this pattern rather than calling credenza's
+        # reusable workflow because it's PUBLIC while credenza is PRIVATE.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Self-heal — does the codex-clean label already exist for this exact head?
         id: existing-label
         env:
@@ -99,7 +146,15 @@ jobs:
       - name: Create the codex-clean check-run
         id: create-check
         env:
-          GH_TOKEN: ${{ github.token }}
+          # hagale-agent's minted installation token (see the "Mint a hagale-agent..." step
+          # above) for every check-run write -- github.token cannot update a check-run a
+          # different run created, and no PAT can write to the Checks API at all, ever (create
+          # or update). HAG-74, credenza#71. Falls back to github.token when the mint step was
+          # skipped (dependabot[bot] actor, see that step's own comment) -- sufficient here
+          # since the dependabot path only ever does a same-run POST, which github.token can do
+          # fine; it's cross-run mutation that token can't do, and dependabot never reaches
+          # that path (no @codex review request is ever posted for it).
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean }}
@@ -141,11 +196,18 @@ jobs:
             conclusion=""
           fi
 
-          # Also create "Wait for Codex Review" alongside "Codex review clean..." -- main-
-          # protection's required_status_checks hardcodes that literal check name (a holdover
-          # from the pre-event-driven design's own aggregator job of the same name). This job
-          # never produces that name otherwise, which would leave EVERY PR permanently unable
-          # to merge once this migration lands, not just this one.
+          # "Wait for Codex Review" is deliberately NOT produced here (removed HAG-74,
+          # credenza#71, 2026-09-20): it used to be created alongside "Codex review clean..."
+          # because this repo's own branch ruleset hardcoded that literal name as a required
+          # status check -- a holdover from the pre-event-driven design's native fan-in job of
+          # the same name. Pre-HAG-74, that name collided with this repo's own native
+          # wait-for-codex-merge-group-passthrough job below, which used to be named "Wait for
+          # Codex Review" too ("You must authenticate via a GitHub App", the SAME misleading
+          # error text the actual auth-type bug produces, which is what hid this as a distinct
+          # problem for a while on credenza's consuming repos). This repo's ruleset now requires
+          # "Codex review clean..." directly instead (a name this job uniquely owns, so it can
+          # never collide), and that merge-group-passthrough job's own `name:` was renamed away
+          # from the literal required-check string too (see its own comment for why).
           if [ -n "$conclusion" ]; then
             check_id=$(gh api -X POST "repos/$REPO/check-runs" \
               -f name="Codex review clean (gate before expensive downstream jobs)" \
@@ -154,11 +216,6 @@ jobs:
               -f conclusion="$conclusion" \
               -f external_id="$PRODUCER_ACTION" \
               --jq '.id')
-            gh api -X POST "repos/$REPO/check-runs" \
-              -f name="Wait for Codex Review" \
-              -f head_sha="$HEAD_SHA" \
-              -f status="completed" \
-              -f conclusion="$conclusion" >/dev/null
             echo "Created completed check-run ($conclusion) for $HEAD_SHA -- no wait needed."
           else
             check_id=$(gh api -X POST "repos/$REPO/check-runs" \
@@ -167,10 +224,6 @@ jobs:
               -f status="in_progress" \
               -f external_id="$PRODUCER_ACTION" \
               --jq '.id')
-            gh api -X POST "repos/$REPO/check-runs" \
-              -f name="Wait for Codex Review" \
-              -f head_sha="$HEAD_SHA" \
-              -f status="in_progress" >/dev/null
             echo "Created in_progress check-run for $HEAD_SHA -- codex-review-response will complete it once Codex responds."
           fi
           {
@@ -246,6 +299,22 @@ jobs:
       # sequentially instead of cancelling costs nothing.
       cancel-in-progress: false
     steps:
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        # Checks API create/update endpoints only accept a GitHub App token -- this job's own
+        # PATCH of the check-run codex-review-request's (separate) run created is inherently
+        # cross-run, which github.token is rejected for ("Check run status and conclusions can
+        # only be updated internally by GitHub Actions", HTTP 403); a plain PAT is rejected
+        # outright for the Checks API entirely ("You must authenticate via a GitHub App", HTTP
+        # 403). Confirmed live on vanity#395/#396/#398 (2026-09-19/20). HAG-74: hand-ported from
+        # credenza#71 -- see codex-review-request's identical step above for the full history.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Resolve PR context
         id: pr-context
         env:
@@ -695,24 +764,24 @@ jobs:
           steps.compute-verdict.outputs.stale != 'true' &&
           (steps.verdict.outputs.responded == 'true' || steps.verdict.outputs.error_tied == 'true')
         env:
-          # PAT, not github.token, for EVERY call in this step, including the PATCHes (not just
-          # the workflow_dispatch POST) -- self-caught live on manta PR #200's own first real
-          # round: github.token 403'd patching a check-run this job's OWN workflow run didn't
-          # create ("Check run status and conclusions can only be updated internally by GitHub
-          # Actions"), even with this file's workflow-level `checks: write` granted -- the
-          # check-run was created by codex-review-request, a DIFFERENT prior run, and GitHub
-          # restricts cross-run check-run mutation via the ephemeral per-run GITHUB_TOKEN. A
-          # real-user PAT has no such restriction (same reasoning as RESOLVE_TOKEN above, and
-          # the workflow_dispatch POST's own pre-existing PAT requirement).
-          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # hagale-agent's minted installation token (see the "Mint a hagale-agent..." step
+          # above) for the check-run PATCH -- this step's PATCH is inherently cross-run (this
+          # workflow is a DIFFERENT run than codex-review-request's, which is the one that
+          # created the check-run), which neither github.token nor a plain PAT can do. HAG-74,
+          # credenza#71.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # DISPATCH_TOKEN is separately required for the workflow_dispatch POST only: that
+          # endpoint rejects github.token outright ("Resource not accessible by integration"),
+          # and hagale-agent's own installation token can't substitute -- its `actions`
+          # permission is read-only (Checks was the only permission added for this fix;
+          # broadening `actions` to write was deliberately out of scope, since a
+          # dispatch-capable App token is a materially bigger blast radius than a Checks-only
+          # one). CODEX_REVIEW_PAT remains the right tool for this one call.
+          DISPATCH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           OUTCOME: ${{ steps.compute-verdict.outcome }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::CODEX_REVIEW_PAT not set -- cannot update the check-run or dispatch ci-full.yml for $HEAD_SHA."
-            exit 1
-          fi
           # .status == "in_progress" (Codex P2, manta PR #200 review round 3): without this, a
           # SECOND qualifying Codex event for the same request (e.g. a review followed moments
           # later by a thumbsup reaction on the same comment) finds the check-run this step's
@@ -729,31 +798,48 @@ jobs:
             echo "::warning::No matching in_progress check-run found for $HEAD_SHA -- nothing to update (it may have already been completed by a prior event, or the request job hasn't created it yet)."
             exit 0
           fi
-          wait_check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '.check_runs[] | select(.name == "Wait for Codex Review" and .status == "in_progress") | .id' | head -1)
           if [ "$OUTCOME" = "success" ]; then
             gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="success"
-            [ -n "$wait_check_id" ] && gh api -X PATCH "repos/$REPO/check-runs/$wait_check_id" -f status="completed" -f conclusion="success"
-            default_branch=$(gh api "repos/$REPO" --jq '.default_branch')
-            gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
+            # Dispatch against the repo's DEFAULT branch, never the PR's own head branch -- a
+            # same-repo PR could otherwise replace ci-full.yml with an immediate-success job (or
+            # run arbitrary steps with this caller's secrets).
+            if [ -z "$DISPATCH_TOKEN" ]; then
+              echo "::error::CODEX_REVIEW_PAT not set -- cannot dispatch ci-full.yml (github.token is rejected outright for workflow_dispatch by GitHub itself, and hagale-agent's own token lacks actions:write, so there is no fallback). The check-run above is already marked success, but CI will never run for $HEAD_SHA without a manual dispatch."
+              exit 1
+            fi
+            default_branch=$(GH_TOKEN="$DISPATCH_TOKEN" gh api "repos/$REPO" --jq '.default_branch')
+            GH_TOKEN="$DISPATCH_TOKEN" gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
               -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA"
           else
             gh api -X PATCH "repos/$REPO/check-runs/$check_id" \
               -f status="completed" -f conclusion="failure" \
               -f output[title]="Codex raised new concerns" \
               -f output[summary]="See this job's log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review."
-            [ -n "$wait_check_id" ] && gh api -X PATCH "repos/$REPO/check-runs/$wait_check_id" \
-              -f status="completed" -f conclusion="failure" \
-              -f output[title]="Codex raised new concerns" \
-              -f output[summary]="See the \"Codex review clean...\" check's log for details."
           fi
 
   # Native pass-through for merge-group evaluation -- unchanged in spirit from the pre-migration
   # version of this file, just its own job now (matching cqdx/widdershins/vanity's identical
   # convention) instead of a step gated inside a single combined job. GITHUB_TOKEN (not
-  # CODEX_REVIEW_PAT): this only creates a repo-local check-run, not a PR mutation.
+  # CODEX_REVIEW_PAT or the hagale-agent token): this only creates a repo-local check-run
+  # within its own run, not a cross-run PR mutation, so it's exempt from the Checks API
+  # restrictions the other jobs in this file exist to work around.
+  #
+  # HAG-74: the check-run this job produces (`-f name=` below) is now "Codex review clean
+  # (gate before expensive downstream jobs)", matching credenza#71's rename of the required
+  # check -- this repo's own ruleset no longer requires "Wait for Codex Review" at all once
+  # retargeted, so a merge_group entry would otherwise sit pending forever with no job left
+  # producing the check it's actually gated on.
+  #
+  # This job's own `name:` deliberately does NOT match that literal string, mirroring cqdx's
+  # own CQD-336 lesson: GitHub Actions auto-generates a `skipped` check-run for every named job
+  # on every run where its `if:` is false, which is almost every run here (`if:
+  # github.event_name == 'merge_group'`). A job named exactly the required-check string would
+  # spray a ghost `skipped` check-run under that name on every
+  # pull_request_target/pull_request_review/issue_comment run, colliding with the one real
+  # check-run codex-review-request/codex-review-response manage via the raw Checks API --
+  # confirmed live on cqdx PR #446/CQD-181.
   wait-for-codex-merge-group-passthrough:
-    name: Wait for Codex Review
+    name: 'Codex review clean: merge-group pass-through'
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -767,10 +853,10 @@ jobs:
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
           gh api -X POST "repos/${REPO}/check-runs" \
-            -f name="Wait for Codex Review" \
+            -f name="Codex review clean (gate before expensive downstream jobs)" \
             -f head_sha="$HEAD_SHA" \
             -f status="completed" \
             -f conclusion="success" \
             -f output[title]="Merge-group pass-through" \
-            -f output[summary]="The constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit." \
+            -f output[summary]="The constituent PR already passed a real Codex review during its own PR phase; nothing further to review on this synthetic integration commit." \
             >/dev/null
