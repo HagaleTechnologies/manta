@@ -1,0 +1,30 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+
+[project]
+linear_team = "MAN"
+
+# Mirrors .github/workflows/ci-full.yml and rust-toolchain.toml. CI builds and
+# tests with no environment variables, so none are declared. The soapy and
+# hpsdr feature legs (extra SDR system packages) are not part of verify.
+
+[[environment.toolchains]]
+name = "rust"
+version = "1.98.1"
+
+[[environment.system_packages]]
+name = "libasound2-dev"
+
+[[environment.setup]]
+name = "fetch-dependencies"
+run = ["cargo", "fetch", "--locked"]
+cache_key_files = ["Cargo.lock"]
+
+[[environment.verify]]
+name = "check-format"
+run = ["cargo", "fmt", "--all", "--check"]
+timeout_seconds = 300
+
+[[environment.verify]]
+name = "test-workspace"
+run = ["cargo", "test", "--workspace"]
+timeout_seconds = 3300
