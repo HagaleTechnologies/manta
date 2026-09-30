@@ -1,0 +1,101 @@
+# manta as an unattended systemd service (MAN-75).
+#
+#   sudo install -m 0755 ./manta /usr/local/bin/manta
+#   sudo install -d -m 0755 /etc/manta
+#   sudo install -m 0644 manta.example.toml /etc/manta/manta.toml
+#   sudo "$EDITOR" /etc/manta/manta.toml          # set station_callsign
+#   sudo install -m 0644 packaging/systemd/manta.service \
+#        /etc/systemd/system/manta.service
+#   sudo "$EDITOR" /etc/systemd/system/manta.service   # set ExecStart's source
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now manta
+#   journalctl -u manta -f
+#
+# /etc/manta/manta.toml is installed mode 0644 (world-readable) on purpose:
+# under DynamicUser=yes the service runs as a fresh, transient UID on every
+# start, so the config must be readable by "anyone" for the service to read
+# it at all. Do not put a secret in it. --kiwi-password, if you need one,
+# belongs in ExecStart, where it is visible to `systemctl cat` and `ps` --
+# use a password-free public receiver, or an EnvironmentFile= with mode
+# 0600, if that matters to you.
+
+[Unit]
+Description=manta wideband multi-signal CW skimmer
+Documentation=https://github.com/HagaleTechnologies/manta
+After=network-online.target
+Wants=network-online.target
+
+# Deliberately no start-rate limit: a 24/7 skimmer should keep retrying
+# through a long receiver or network outage rather than latching into
+# `failed`. The cost is that a genuinely broken config also restarts
+# forever -- `journalctl -u manta` is where you see it. Note that manta
+# opens the SOURCE before it parses --server-config, so with an
+# unreachable network source a config error is not reported until the
+# source connects.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# EDIT THIS. Source selection has no TOML equivalent yet (MAN-74), so the
+# input still lives on the command line even though the servers are
+# configured in /etc/manta/manta.toml.
+#
+# The KiwiSDR source shown here is present in EVERY manta build -- release
+# binary, Docker image, or a plain `cargo build` -- with no feature flag,
+# and needs no local device permissions, which is what makes it work
+# unchanged under DynamicUser=yes. Alternatives:
+#
+#   Rig audio (sound card):  --device "USB Audio" --dial-freq-hz 14000000
+#     ALSO requires uncommenting SupplementaryGroups=audio below: a
+#     DynamicUser= UID is in no static group, so without it the service
+#     cannot open /dev/snd/*.
+#   HPSDR / Hermes-Lite 2:   --hpsdr-host 192.0.2.10 --hpsdr-freq 14050000 \
+#                            --hpsdr-rate 192000
+#     Release binaries and the Docker image are built --features hpsdr;
+#     a from-source build needs `--features hpsdr` too.
+#   SoapySDR (RTL-SDR etc.): --soapy-driver driver=rtlsdr --soapy-freq ... \
+#                            --soapy-rate ...
+#     NOT in the release binaries; build from source --features soapy, and
+#     add the device's own udev group to SupplementaryGroups=.
+ExecStart=/usr/local/bin/manta listen \
+    --server-config /etc/manta/manta.toml \
+    --kiwi-host kiwi.example.org \
+    --kiwi-freq 14050000
+
+# manta registers a shutdown handler for SIGINT only -- `ctrlc` is built
+# without its optional `termination` feature, so SIGTERM is not handled at
+# all and the kernel's default disposition kills the process outright
+# (measured on this repo's own tree: SIGINT -> exit 0, SIGTERM -> exit 143,
+# no drain, no log line). systemd sends SIGTERM by default, so retarget it,
+# exactly as the repo's Dockerfile already does with STOPSIGNAL SIGINT.
+# Remove this line once manta handles SIGTERM itself.
+KillSignal=SIGINT
+
+# manta's own drain budget is 25 s for in-flight client writes plus a 2 s
+# hard runtime cutoff = 27 s worst case (SHUTDOWN_DRAIN_DEADLINE,
+# crates/manta-cli/src/main.rs). 30 s leaves margin before systemd
+# escalates to SIGKILL and truncates a slow client's final spot.
+TimeoutStopSec=30
+
+# A skimmer is meant to stay up. Restart on any exit, including a clean
+# one (e.g. the source ending).
+Restart=always
+RestartSec=5
+
+# Runs as a fresh transient UID/GID with no home, no static account to
+# create, and PrivateTmp=/ProtectSystem=strict/ProtectHome=read-only/
+# NoNewPrivileges implied.
+DynamicUser=yes
+
+# Creates and bind-mounts /etc/manta into the service's namespace. The
+# service only ever reads the file.
+ConfigurationDirectory=manta
+
+# Required ONLY for the rig-audio (--device) source: a DynamicUser= UID
+# belongs to no static group, so it cannot open ALSA's group-owned
+# /dev/snd/* without this.
+# SupplementaryGroups=audio
+
+[Install]
+WantedBy=multi-user.target

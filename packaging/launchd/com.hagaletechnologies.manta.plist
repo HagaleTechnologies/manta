@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  manta as an unattended macOS LaunchAgent (MAN-75).
+  Install steps, the choice of LaunchAgent over LaunchDaemon, and a known
+  SIGTERM limitation with no plist-level workaround: see packaging/README.md.
+
+  launchd does NOT expand a tilde or $HOME here. Replace YOUR_USERNAME
+  (three places) and YOUR_KIWI_HOST before loading this file.
+
+  ProgramArguments below is an absolute path, and launchd does not search
+  PATH: the macOS install steps in packaging/README.md copy the extracted
+  release binary to /usr/local/bin/manta first, exactly as the Linux ones
+  do. Bootstrapping this job without that step loads it successfully and
+  then fails on every spawn attempt.
+
+  (XML forbids a double hyphen inside a comment, so flag names are spelled
+  out in packaging/README.md rather than here.)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hagaletechnologies.manta</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/manta</string>
+        <string>listen</string>
+        <string>--server-config</string>
+        <string>/Users/YOUR_USERNAME/Library/Application Support/manta/manta.toml</string>
+        <string>--kiwi-host</string>
+        <string>YOUR_KIWI_HOST</string>
+        <string>--kiwi-freq</string>
+        <string>14050000</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Conditional KeepAlive, deliberately NOT an unconditional true.
+      launchd stops a job with SIGTERM and has no KillSignal equivalent,
+      and manta handles only SIGINT, so the one clean stop available is to
+      signal SIGINT and let the process drain. Under an unconditional
+      KeepAlive launchd relaunches manta the instant that drained process
+      exits, and the bootout that follows then kills the REPLACEMENT with
+      the same unhandled SIGTERM: the clean stop is not clean.
+
+      SuccessfulExit false means "keep it alive only if the last exit
+      FAILED", so a SIGINT drain (exit 0) stays down and bootout has
+      nothing left to kill, while a crash, a non zero exit, or a kill by
+      signal is still relaunched. Trade off against the systemd unit's
+      Restart=always: an exit 0 for some other reason (the source ending,
+      say) is read as intentional here too and is NOT relaunched.
+
+      Once manta handles SIGTERM itself, this dict can go back to a plain
+      true and stopping becomes a bare bootout. See packaging/README.md.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/manta.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/manta.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
