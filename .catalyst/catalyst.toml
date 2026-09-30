@@ -20,6 +20,11 @@ run = ["cargo", "fetch", "--locked"]
 cache_key_files = ["Cargo.lock"]
 
 [[environment.verify]]
+name = "check-toolchain-pin"
+run = ["bash", "scripts/check-rust-toolchain-pin.sh"]
+timeout_seconds = 300
+
+[[environment.verify]]
 name = "check-format"
 run = ["cargo", "fmt", "--all", "--check"]
 timeout_seconds = 300
