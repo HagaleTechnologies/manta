@@ -25,6 +25,11 @@ run = ["cargo", "fmt", "--all", "--check"]
 timeout_seconds = 300
 
 [[environment.verify]]
+name = "clippy"
+run = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+timeout_seconds = 3000
+
+[[environment.verify]]
 name = "test-workspace"
 run = ["cargo", "test", "--workspace"]
 timeout_seconds = 3300
