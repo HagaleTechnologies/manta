@@ -137,6 +137,10 @@ manta listen
 
 # Any of the above as JSON Lines instead of text
 manta listen --json --kiwi-host kiwi.example.org --kiwi-freq 7030000
+
+# Check a running daemon's health at a glance (spot counts, RBN uplink
+# connection/reconnect state per target) instead of reading its logs
+manta status --config manta.toml
 ```
 
 `manta --help` lists every subcommand and flag.
