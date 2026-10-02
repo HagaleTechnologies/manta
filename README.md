@@ -168,9 +168,16 @@ json_port   = 7301
 metrics_port = 7302
 ```
 
+Start the server in one terminal. It runs in the foreground until you stop it:
+
 ```sh
 manta run --config server.toml --kiwi-host <your-kiwi-host> \
     --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+```
+
+Then probe it from a second terminal:
+
+```sh
 telnet localhost 7300          # DX de … lines
 nc localhost 7301              # one JSON object per spot
 curl -s localhost:7302/metrics # Prometheus text
