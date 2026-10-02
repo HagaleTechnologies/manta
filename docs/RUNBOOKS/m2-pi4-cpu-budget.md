@@ -175,6 +175,18 @@ the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
 
+**Before you run either block**, record which arm64 packages the host
+already has, so a rollback can remove only what this procedure adds and
+never anything that predates it (a blanket `apt autoremove` is
+system-wide and would not respect that):
+
+```
+dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$' | sort \
+  > ~/arm64-before.txt || true
+```
+
+(An empty file is fine: it means the host had no arm64 packages.)
+
 Ubuntu and Debian need different apt setup here. Check which one your host
 is *before* running anything below, and run only the matching block. Running
 the **Ubuntu** block on a **Debian** host is not the hazard it might look
@@ -202,55 +214,51 @@ below don't apply to it. Running the Debian block on Ubuntu *after* the
 Ubuntu block has already fixed the sources is harmless -- its commands just
 re-run against sources that are already correct.
 
-If you mis-ran the Ubuntu block and need to roll back: `sudo mv
-<file>.man47.bak <file>` for whichever of `/etc/apt/sources.list` or
-`/etc/apt/sources.list.d/ubuntu.sources` has a `.man47.bak` next to it --
-this block's own backup suffix, distinct from a plain `.bak` some other
-tool may have left there before you ever ran this block. Don't restore a
-plain `.bak` you can't confirm this block created; if no `.man47.bak`
-exists next to the file, this block never backed that file up (either it
-never touched it, or an earlier run already consumed the one-time backup
-slot -- see the notes below), and there is nothing of this block's to
-restore there. Then `sudo rm -f
-/etc/apt/sources.list.d/ubuntu-ports-arm64.sources
-/etc/apt/sources.list.d/ubuntu-ports-arm64.list`.
+## Rolling back Option B
 
-Removing the arm64 architecture flag itself, `sudo dpkg
---remove-architecture arm64`, is a separate step, and after a *successful*
-Option B run it will **refuse**: dpkg won't drop an architecture while any
-package is still registered for it, and a successful run leaves
-`libasound2-dev:arm64` installed along with whatever it pulled in as
-dependencies (e.g. `libasound2t64:arm64`, `libc6:arm64`), registered as
-*automatically* installed since apt resolved them, not you. Purge the one
-package Option B actually named, then let `apt autoremove` drop the
-auto-installed dependency closure that came along with it -- this removes
-only what this block's own `apt install` line added, not every arm64
-package the host happens to have. A blanket `dpkg-query -W
--f='${Package}:${Architecture}\n' | grep ':arm64$'` purge would also
-remove any arm64 package some *other* project on this host installed
-before you ever ran this block, which is not this block's to take:
-```
-sudo apt purge libasound2-dev:arm64
-sudo apt autoremove
-sudo dpkg --remove-architecture arm64
-```
-If the last command still refuses, something else on the host is
-registered for arm64 -- `dpkg-query -W -f='${Package}:${Architecture}\n'
-| grep ':arm64$'` lists what, so you can judge by hand whether it's yours
-to remove; don't purge that list wholesale. Only do any of this if you
-actually want arm64 gone -- after a *successful* Option B run, it's
-harmless to leave the architecture and its packages in place if you expect
-to cross-build again, since apt still has a working ports source backing
-it.
+Do these in order. The order matters: once arm64 is enabled with no
+valid index, `apt update` fails, and dpkg will not drop an architecture
+while any package is still registered for it.
 
-That harmlessness does **not** carry over to the file-rollback path above.
-If you restored `.man47.bak` and deleted the ports source file, the default
-sources no longer carry an arm64 index at all, so leaving the architecture
-flag registered is not harmless -- every subsequent `apt update` hits the
-same `binary-arm64/Packages 404` / exit-100 failure this block exists to
-avoid. In that case also run `sudo dpkg --remove-architecture arm64`; it
-won't refuse, since the rollback path's `apt update` never succeeded and no
-arm64 package was ever actually installed.
+1. **Remove the arm64 packages this run added, and only those.** Skip
+   this step if the install never ran (`apt update` failed, so no arm64
+   package was installed). Otherwise compare against the snapshot you
+   took before running, review the list, then purge it. Do not use
+   `apt autoremove` here: it removes every unused auto-installed package
+   on the host, including ones that predate this procedure.
+   ```
+   dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$' | sort \
+     > /tmp/arm64-now.txt
+   comm -13 ~/arm64-before.txt /tmp/arm64-now.txt        # review first
+   comm -13 ~/arm64-before.txt /tmp/arm64-now.txt | xargs -r sudo apt purge
+   ```
+   If you did not take the snapshot, do not guess: list the arm64
+   packages with `dpkg-query -W -f='${Package}:${Architecture}\n' |
+   grep ':arm64$'` and remove by hand only what you recognise as this
+   run's (`libasound2-dev:arm64` and the dependencies it pulled in).
+2. **Restore the sources.** `sudo mv <file>.man47.bak <file>` for
+   whichever of `/etc/apt/sources.list` or
+   `/etc/apt/sources.list.d/ubuntu.sources` has a `.man47.bak` next to
+   it -- this block's own backup suffix, distinct from a plain `.bak`
+   some other tool may have left. Do not restore a plain `.bak` you
+   cannot confirm this block created. If no `.man47.bak` exists, this
+   block never backed that file up and there is nothing of its to
+   restore. Then `sudo rm -f
+   /etc/apt/sources.list.d/ubuntu-ports-arm64.sources
+   /etc/apt/sources.list.d/ubuntu-ports-arm64.list`.
+3. **Drop the architecture:** `sudo dpkg --remove-architecture arm64`.
+   If it refuses, something is still registered for arm64: the
+   `dpkg-query` command in step 1 lists what, so judge by hand whether
+   it is yours to remove, and do not purge that list wholesale.
+4. **Confirm:** `sudo apt update` should now succeed.
+
+If you expect to cross-build again, a *successful* Option B run can
+simply be left in place: apt still has a working ports source backing
+the arm64 packages. Rolling back is only for when you want arm64 gone.
+Doing step 2 without step 1 and step 3 is the one unsafe combination: it
+leaves arm64 enabled with no index, and every later `apt update` fails
+with the same `binary-arm64/Packages 404` / exit-100 error this block
+exists to avoid.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
 (archive.ubuntu.com / security.ubuntu.com) don't carry an arm64 index at
