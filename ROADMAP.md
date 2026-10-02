@@ -140,11 +140,26 @@ repetition gate, dedupe) is complete as a standalone crate -- see
 -decode-core.md §7.1 (V11-V15). It is now wired into `manta-engine`'s
 batch (`decode_samples`/`decode_wav`) and streaming (`listen`) pipelines,
 both emitting real `Spot`s -- see
-`docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`. Remaining
-M3 sub-projects: `manta-server` (telnet + JSON/WebSocket output, TOML
-config, metrics), and the RBN parity benchmark (needs ≥ 2 h of recorded
-contest-weekend IQ with RBN reference spots -- a data dependency not yet
-resolved).
+`docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`.
+`manta-server` has also landed: the telnet cluster server, the
+JSON/WebSocket stream, TOML config, the metrics endpoint, and the
+outbound RBN uplink are all shipped and tested. Remaining M3 sub-projects:
+just the RBN parity benchmark (needs ≥ 2 h of recorded contest-weekend IQ
+with RBN reference spots -- a data dependency not yet resolved).
+
+**Shipped sub-projects are not acceptance, and M3's acceptance is wholly
+open**: all four accept-when gates above are still unmet -- the parity
+benchmark itself, the 7-day unattended soak, cqdx ingesting the JSON
+stream, and the stock DX-cluster client (`telnet`, N1MM) session against a
+running node. That last one is *not* discharged by the servers' automated
+acceptance suites: those drive scripted TCP clients, which exercise the
+wire format but say nothing about how a real contest logger behaves
+against it.
+
+**RBN admission** is pre-1.0 work, not deferred: the near-term path is a
+Skimmer-Server-compatible handshake so existing aggregators can accept a
+manta node, with direct-uplink admission negotiated from a position of
+having live nodes.
 
 ## M4 — ML decoder stage (research-dependent)
 
@@ -163,6 +178,5 @@ confidence weighting. ONNX/candle inference, feature-gated.
 
 - RTTY/FT4-adjacent modes on the same channelizer.
 - Multi-SDR single-daemon orchestration.
-- Upstream conversation with RBN operators about accepting manta nodes.
 - Spot quality feedback loop: cqdx-side confirmation (same call spotted by other
   nodes) fed back to tune validation thresholds.
