@@ -101,7 +101,7 @@ versioned deps.
 
 ## 3. Input layer (`manta-input`)
 
-One trait, four implementations:
+One trait, five implementations:
 
 ```
 trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
@@ -111,6 +111,11 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
   native SoapySDR library (CI, contributors without hardware).
+- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, feature-gated `hpsdr`):
+  Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images. Pure UDP/std with
+  no native-library dependency; the gate mirrors `soapy`. The wire facts are
+  spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
+  confirmed against live hardware.
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.
