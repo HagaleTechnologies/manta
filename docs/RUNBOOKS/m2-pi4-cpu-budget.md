@@ -175,17 +175,33 @@ the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
 
-**Before you run either block**, record which arm64 packages the host
-already has, so a rollback can remove only what this procedure adds and
-never anything that predates it (a blanket `apt autoremove` is
-system-wide and would not respect that):
+**Before you run either block**, record the host's original apt state
+**once**, so a rollback can undo only what this procedure added and never
+anything that predates it (a blanket `apt autoremove` is system-wide and
+would not respect that). The file is never overwritten, so running this
+again after Option B has run cannot replace the original state with the
+state this procedure produced:
 
 ```
-dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$' | sort \
-  > ~/arm64-before.txt || true
+if [ ! -e ~/arm64-baseline.txt ]; then
+  {
+    if dpkg --print-foreign-architectures | grep -qx arm64
+    then echo "arch=yes"; else echo "arch=no"; fi
+    for f in ubuntu-ports-arm64.sources ubuntu-ports-arm64.list; do
+      if [ -e "/etc/apt/sources.list.d/$f" ]
+      then echo "$f=yes"; else echo "$f=no"; fi
+    done
+  } > ~/arm64-baseline.txt
+  dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$' | sort \
+    > ~/arm64-before.txt || true
+fi
+cat ~/arm64-baseline.txt
 ```
 
-(An empty file is fine: it means the host had no arm64 packages.)
+(`arch=yes` means arm64 was already enabled, `=yes` on a ports file means
+it already existed, and an empty `~/arm64-before.txt` means the host had
+no arm64 packages. The Ubuntu block below refuses to run without this
+file.)
 
 Ubuntu and Debian need different apt setup here. Check which one your host
 is *before* running anything below, and run only the matching block. Running
@@ -243,13 +259,21 @@ while any package is still registered for it.
    some other tool may have left. Do not restore a plain `.bak` you
    cannot confirm this block created. If no `.man47.bak` exists, this
    block never backed that file up and there is nothing of its to
-   restore. Then `sudo rm -f
-   /etc/apt/sources.list.d/ubuntu-ports-arm64.sources
-   /etc/apt/sources.list.d/ubuntu-ports-arm64.list`.
-3. **Drop the architecture:** `sudo dpkg --remove-architecture arm64`.
-   If it refuses, something is still registered for arm64: the
-   `dpkg-query` command in step 1 lists what, so judge by hand whether
-   it is yours to remove, and do not purge that list wholesale.
+   restore. Then handle the two ports source files by what
+   `~/arm64-baseline.txt` says: if `<name>=yes` (it existed before this
+   procedure), restore it with `sudo mv <name>.man47.bak <name>`; if
+   `<name>=no`, remove it with `sudo rm -f <name>`. The files are
+   `/etc/apt/sources.list.d/ubuntu-ports-arm64.sources` and
+   `/etc/apt/sources.list.d/ubuntu-ports-arm64.list`.
+3. **Drop the architecture only if this run added it.** If
+   `~/arm64-baseline.txt` says `arch=no`, run
+   `sudo dpkg --remove-architecture arm64`. If it says `arch=yes`, arm64
+   was already enabled before this procedure: leave it enabled (removing
+   it would not restore your original state, and dpkg will refuse while
+   the packages that predate this run remain). If a `arch=no` removal
+   refuses, something is still registered for arm64: the `dpkg-query`
+   command in step 1 lists what, so judge by hand whether it is yours
+   to remove, and do not purge that list wholesale.
 4. **Confirm:** `sudo apt update` should now succeed.
 
 If you expect to cross-build again, a *successful* Option B run can
@@ -279,7 +303,13 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
      *) false ;;
    esac; then
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-  if [ -z "$codename" ]; then
+  if [ ! -e ~/arm64-baseline.txt ]; then
+    echo "ERROR: ~/arm64-baseline.txt is missing. Take the baseline" \
+         "snapshot (the step above this block) first, so a rollback" \
+         "knows what this host looked like; nothing below has been" \
+         "touched." >&2
+    false
+  elif [ -z "$codename" ]; then
     echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on" \
          "this ID=ubuntu host -- refusing to write an arm64 ports" \
          "source with an empty Suites field, which breaks apt" \
@@ -330,6 +360,15 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
         fi
         printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null
       fi
+      # A ports source file that already existed before this procedure is
+      # kept once as .man47.bak rather than silently truncated (the
+      # baseline says whether it pre-existed, so a rerun never backs up
+      # this block's own earlier output).
+      ports=/etc/apt/sources.list.d/ubuntu-ports-arm64.sources
+      if grep -qx 'ubuntu-ports-arm64.sources=yes' ~/arm64-baseline.txt \
+         && [ ! -e "$ports.man47.bak" ]; then
+        sudo cp -- "$ports" "$ports.man47.bak"
+      fi
       sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
 Types: deb
 URIs: http://ports.ubuntu.com/ubuntu-ports
@@ -352,6 +391,11 @@ EOF
       else
         sudo sed -i.man47.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
           /etc/apt/sources.list
+      fi
+      ports=/etc/apt/sources.list.d/ubuntu-ports-arm64.list
+      if grep -qx 'ubuntu-ports-arm64.list=yes' ~/arm64-baseline.txt \
+         && [ ! -e "$ports.man47.bak" ]; then
+        sudo cp -- "$ports" "$ports.man47.bak"
       fi
       sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
