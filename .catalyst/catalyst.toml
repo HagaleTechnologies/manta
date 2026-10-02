@@ -1,0 +1,50 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+
+[project]
+linear_team = "MAN"
+
+# Mirrors .github/workflows/ci-full.yml and rust-toolchain.toml. CI builds and
+# tests with no environment variables, so none are declared. The soapy feature
+# leg (extra SDR system packages) is not part of verify; hpsdr needs none.
+
+[[environment.toolchains]]
+name = "rust"
+version = "1.98.1"
+
+[[environment.system_packages]]
+name = "libasound2-dev"
+
+[[environment.setup]]
+name = "fetch-dependencies"
+run = ["cargo", "fetch", "--locked"]
+cache_key_files = ["Cargo.lock"]
+
+[[environment.verify]]
+name = "check-toolchain-pin"
+run = ["bash", "scripts/check-rust-toolchain-pin.sh"]
+timeout_seconds = 300
+
+[[environment.verify]]
+name = "check-format"
+run = ["cargo", "fmt", "--all", "--check"]
+timeout_seconds = 300
+
+[[environment.verify]]
+name = "clippy"
+run = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+timeout_seconds = 3000
+
+[[environment.verify]]
+name = "clippy-hpsdr"
+run = ["cargo", "clippy", "-p", "manta-input", "-p", "manta-cli", "--all-targets", "--features", "hpsdr", "--", "-D", "warnings"]
+timeout_seconds = 3000
+
+[[environment.verify]]
+name = "test-hpsdr"
+run = ["cargo", "test", "-p", "manta-input", "-p", "manta-cli", "--features", "hpsdr"]
+timeout_seconds = 3000
+
+[[environment.verify]]
+name = "test-workspace"
+run = ["cargo", "test", "--workspace"]
+timeout_seconds = 3300
