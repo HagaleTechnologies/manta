@@ -10,14 +10,14 @@ sources:
   - ROADMAP.md
   - CLAUDE.md
 verified:
-  commit: 3136edc
-  date: 2026-09-19
+  commit: 23b0dd0
+  date: 2026-10-02
 links:
   - pfb-channelizer
   - decode-chain
   - coppa-reuse
 ---
-manta is an open-source, cross-platform, wideband multi-signal CW skimmer (Rust) that consumes wideband IQ from commodity SDRs, decodes every CW signal in the passband concurrently, validates callsigns, and emits RBN-compatible spots — an open replacement for the single closed-source Windows program the Reverse Beacon Network depends on. Implementation is well underway; see README.md's Status section for what has shipped. Read the specs first — the design decisions are already made.
+manta is an open-source, cross-platform, wideband multi-signal CW skimmer (Rust) that consumes wideband IQ from commodity SDRs, decodes every CW signal in the passband concurrently, validates callsigns, and emits RBN-compatible spots — a second, independent implementation alongside CW Skimmer Server, for the Linux/ARM/headless platforms it has no native build for. Implementation is well underway; see README.md's Status section for what has shipped. Read the specs first — the design decisions are already made.
 
 ## Where things live (nine-crate workspace)
 

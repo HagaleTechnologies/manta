@@ -1,9 +1,9 @@
 # manta
 
 Open-source, cross-platform, wideband multi-signal CW skimmer in Rust. Decodes
-every CW signal across an SDR passband and emits RBN-compatible spots — an open
-alternative to the single closed-source Windows program the Reverse Beacon
-Network currently depends on.
+every CW signal across an SDR passband and emits RBN-compatible spots — a
+second, independent implementation alongside CW Skimmer Server, for the
+Linux/ARM/headless platforms it has no native build for.
 
 ## Status
 
