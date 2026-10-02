@@ -32,8 +32,27 @@ static BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bV\s+V\s+V\s+([A-Z0-9/]{3,15})\b").unwrap());
 static DE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bDE\s+([A-Z0-9/]{3,15})\b").unwrap());
-static CQ_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bCQ\b").unwrap());
-static DE_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDE\b").unwrap());
+/// A bare `CQ`/`DE` framing token. The token must be a COMPLETE decoded word
+/// in the joined window -- start-of-text or whitespace on both sides -- not
+/// merely a `\b` word/non-word transition: `/` and `-` are themselves
+/// non-word characters, so a plain `\bDE\b`/`\bCQ\b` also matched the two
+/// letters glued inside ONE decoded word ("NOISE/DE W1AW T", "-CQ W1AW T").
+/// That made the power-step guard below suppress -- and `Validator`
+/// permanently burn -- a valid beacon occurrence on the strength of a garble
+/// containing no framing token at all (MAN-48, deferred from Codex review on
+/// PR #65, round 9). Same fix shape `POWER_STEP_BEACON_RE`'s trailing `T`
+/// already carries from round 2.
+///
+/// The boundary is CONSUMED, not looked behind -- the `regex` crate has no
+/// look-around. That widens a match by at most one space per side, which
+/// cannot pull an extra word into a caller's overlap test: the widened bound
+/// lands exactly ON the neighbouring word's own span boundary, and both
+/// overlap tests in `Validator` are strict (`start < range.end && range.start
+/// < end`).
+static CQ_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|\s)CQ(?:\s|$)").unwrap());
+static DE_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|\s)DE(?:\s|$)").unwrap());
 static CQ_CALL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bCQ(?:\s+TEST)?\s+([A-Z0-9/]{3,15})\b").unwrap());
 static UP_RE: LazyLock<Regex> =
@@ -67,6 +86,11 @@ fn parse_named_pattern(text: &str) -> Option<(String, SpotType, Range<usize>)> {
     }
     if let Some(caps) = DE_RE.captures(text) {
         let de_match = caps.get(0).unwrap();
+        // The CQ token's range may include the separator space on either
+        // side (CQ_TOKEN_RE consumes its boundary; see its own docs) -- the
+        // union below is only ever used as a word-overlap range, and a bound
+        // sitting exactly on a neighbouring word's boundary is excluded by
+        // that test's strict comparison, so no extra word is pulled in.
         if let Some(cq_match) = CQ_TOKEN_RE.find(text) {
             let start = de_match.start().min(cq_match.start());
             let end = de_match.end().max(cq_match.end());
@@ -414,6 +438,65 @@ mod tests {
             vec![("K5ARH".to_string(), 6..13, 6..11)]
         );
         assert!(!power_step_framing_is_unresolved("K5ARH T"));
+    }
+
+    #[test]
+    fn cq_de_guard_requires_a_complete_decoded_word() {
+        // MAN-48 (deferred from Codex review on PR #65, round 9): `\b` is only a
+        // word/non-word transition, and `/`/`-` are themselves non-word
+        // characters -- so `\bDE\b`/`\bCQ\b` also matched the two letters glued
+        // inside ONE decoded word. A garbled "NOISE/DE" or "-CQ" is not the bare
+        // framing token this guard is documented to look for, and suppressing on
+        // it burns (permanently loses) a valid beacon occurrence. Same fix shape
+        // POWER_STEP_BEACON_RE's trailing `T` already carries (round 2).
+        assert!(!power_step_framing_is_unresolved("NOISE/DE W1AW T"));
+        assert!(!power_step_framing_is_unresolved("-CQ W1AW T"));
+        assert!(!power_step_framing_is_unresolved("K5ARH/QRP CQX W1AW T"));
+
+        // A genuine bare token still suppresses, in every window position --
+        // leading, middle, and trailing (the trailing case is what the `(?:\s|$)`
+        // end-anchor buys; a plain `\s` would miss it).
+        assert!(power_step_framing_is_unresolved("CQ DX K5ARH T"));
+        assert!(power_step_framing_is_unresolved("W1AW DE K5ARH T"));
+        assert!(power_step_framing_is_unresolved("K5ARH T DE"));
+        assert!(power_step_framing_is_unresolved("K5ARH T CQ"));
+    }
+
+    #[test]
+    fn a_cq_de_token_glued_to_punctuation_no_longer_suppresses_the_fallback() {
+        // The end-to-end consequence of the guard fix at the `parse` layer.
+        // "DE/NOISE"/"CQ/NOISE" are used rather than the finding's own
+        // "NOISE/DE"/"-CQ" because DE_RE (`\bDE\s+<call>`) and CQ_CALL_RE
+        // (`\bCQ...\s+<call>`) ALSO match those two, contributing a named
+        // candidate that would muddy what this test is asserting. Trailing
+        // punctuation breaks the named patterns' required `\s+` while still
+        // tripping the old `\b`-based guard -- so this isolates the guard.
+        assert_eq!(
+            parse_types("DE/NOISE W1AW T"),
+            vec![("W1AW".to_string(), SpotType::Beacon)]
+        );
+        assert_eq!(
+            parse_types("CQ/NOISE W1AW T"),
+            vec![("W1AW".to_string(), SpotType::Beacon)]
+        );
+    }
+
+    #[test]
+    fn de_call_is_not_reclassified_to_cq_by_a_glued_cq_substring() {
+        // CQ_TOKEN_RE is shared with parse_named_pattern's De->Cq
+        // reclassification (the "CQ CQ DE <call>" shape). A `CQ` glued inside one
+        // decoded word is not a framing token for THAT purpose either, so the
+        // fix deliberately applies to both call sites -- pinned here so the
+        // shared-static decision is a tested choice, not an accident (MAN-48).
+        assert_eq!(
+            parse_types("DE K5ARH NOISE/CQ"),
+            vec![("K5ARH".to_string(), SpotType::De)]
+        );
+        // ...while a genuine bare CQ still reclassifies, as before.
+        assert_eq!(
+            parse_types("CQ CQ DE K5ARH K5ARH K"),
+            vec![("K5ARH".to_string(), SpotType::Cq)]
+        );
     }
 
     #[test]

@@ -23,23 +23,27 @@ name: Release Publish
 # event can invoke this file, because GitHub only evaluates a workflow
 # file's jobs for event types that file's OWN `on:` block declares.
 #
-# Residual risk, NOT fully closed by this split alone, requires a human
-# decision rather than another automated fix: a sufficiently motivated
-# same-repository contributor (one who already has write access to this
-# repo -- not an anonymous fork contributor, who remains fully blocked by
-# GitHub's own fork-token restriction regardless of any of this) could
-# still ADD a `pull_request:` trigger to THIS file within their own PR's
-# diff, and per the same head-ref-evaluation rule above, that addition
-# would take effect for their own PR's event. The fully robust GitHub-
-# native closure for that is a protected Environment (repo Settings ->
-# Environments -> required reviewers) gating the `packages: write` job --
-# environment protection rules are enforced by GitHub's platform itself,
-# not expressible in or overridable by the workflow YAML a PR controls.
-# Deliberately NOT configured by this PR: creating/configuring a
-# protected environment is a standing repo-security-configuration
-# decision, not a code change, and outside what should be done
-# unsupervised. Filed as MAN-66, flagged to Tony directly -- not silently
-# worked around.
+# Residual risk (MAN-66), Tony's explicit call 2026-09-12: ACCEPTED, not fully closed.
+# `docker-publish-release` below is gated behind the `ghcr-publish` environment (deployment policy
+# restricted to the `v*` tag pattern this job already publishes from, no required reviewers --
+# see that job's own comment). But a same-repository contributor who already has write access
+# could still, within their own PR's diff, add a `pull_request:` trigger to this file AND delete
+# or rename the `environment:` line on the same job (Codex P1, manta#193 round 1) -- the gate
+# lives in the exact file the attacker already controls. Closing that fully would mean moving the
+# publish credential off GITHUB_TOKEN entirely onto a dedicated environment-scoped PAT (GitHub's
+# repo-level default-workflow-permissions setting is a FALLBACK for workflows that don't declare
+# `permissions:`, not an enforced ceiling -- an explicit `permissions: packages: write` still
+# overrides it regardless of the repo default, confirmed via GitHub's own docs before concluding
+# this). Deliberately NOT built: at the trust level this requires (an already write-access-holding
+# identity going rogue), publishing a rogue image is one of the LESS damaging things available to
+# it -- the same identity could already exfiltrate any other repo secret via a new job, or (for the
+# two installed integrations that are also ruleset bypass actors) skip code review entirely. Not
+# worth this file's own complexity to harden one narrow downstream symptom of that broader
+# question. No human collaborators exist on this repo today besides Tony; several GitHub App
+# installations (claude, chatgpt-codex-connector, mergify, catalyst-cloud-connector, linear-code,
+# semgrep-code-hagaletechnologies) hold the necessary contents:write/workflows:write scope
+# org-wide -- worth an actual permissions audit of those if this risk class matters more later,
+# not a redesign of this one file.
 
 on:
   push:
@@ -146,8 +150,76 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  docker-publish:
+  # Split into two mutually-exclusive jobs (Codex P2, manta#193 round 1): the original single
+  # job's `environment: ghcr-publish` blocked EVERY run on a non-`v*` ref, including the
+  # legitimate `workflow_dispatch` "test push" path this file's own comments describe (targeting
+  # any branch, pushing a uniquely-tagged image, never `:latest`). That dispatch path isn't
+  # reachable by an attacker's own automatic PR-triggered run at all -- it requires a deliberate,
+  # separate manual trigger by someone who already has write access -- so gating it added no real
+  # protection against the threat model MAN-66 describes while breaking a real, supported use
+  # case. Only the real `push: tags: v*` path is gated now.
+  docker-publish-release:
     needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # MAN-66 (accepted risk, see this file's header comment for the full reasoning): gates the
+    # real release-publish path behind `ghcr-publish`'s tag-only deployment policy -- a PR branch
+    # ref never matches `v*`, so this job can't run (or obtain `packages: write`) on a
+    # PR-triggered ref regardless of what trigger a PR's diff adds, UNLESS that same diff also
+    # strips this `environment:` line, which round 1 confirmed isn't fully closed here.
+    environment: ghcr-publish
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Determine version, image, and tag list
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # OCI/Docker repository paths must be lowercase; github.repository
+          # is case-preserving ("HagaleTechnologies/manta") and buildx
+          # rejects a mixed-case tag outright.
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<RELEASE_TAGS_EOF"
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:latest"
+            echo "RELEASE_TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.version.outputs.tags }}
+
+  # Ungated, deliberately: this only ever runs from a manual `workflow_dispatch` (any ref) --
+  # never automatically from a PR event -- so it isn't reachable by the threat model MAN-66
+  # describes, and gating it behind `ghcr-publish`'s tag-only policy would incorrectly block the
+  # dry-build (`publish=false`, any ref) and test-push (`publish=true`, targeting a branch) paths
+  # this job exists to support.
+  docker-build-dispatch:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -163,43 +235,24 @@ jobs:
         id: version
         shell: bash
         run: |
-          # Gated on the EVENT being a real push, not merely on
-          # github.ref_type == 'tag' -- ref_type is ALSO 'tag' for
-          # `gh workflow run release-publish.yml --ref <existing-tag>
-          # -f publish=true`, a workflow_dispatch run targeting an
-          # existing tag, not a push.
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="dispatch-${{ github.run_id }}"
-          fi
+          VERSION="dispatch-${{ github.run_id }}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # OCI/Docker repository paths must be lowercase; github.repository
-          # is case-preserving ("HagaleTechnologies/manta") and buildx
-          # rejects a mixed-case tag outright.
           IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-          # `:latest` is reserved for real tag pushes only -- a
-          # workflow_dispatch run with publish=true can target any
-          # branch, not just a release, and README's `docker run
-          # ghcr.io/.../manta:latest` install command must always trace
-          # to a real tagged release, not a manual test build that
-          # happened to also push. The dispatch-<run_id> tag is still
-          # pushed on a dispatch publish, for testing that path
-          # specifically -- just never `:latest`.
+          # `:latest` is reserved for real tag pushes only (docker-publish-release) -- a
+          # workflow_dispatch run with publish=true can target any branch, not just a release,
+          # and README's `docker run ghcr.io/.../manta:latest` install command must always trace
+          # to a real tagged release, not a manual test build that happened to also push.
           {
             echo "tags<<RELEASE_TAGS_EOF"
             echo "$IMAGE:$VERSION"
-            if [[ "${{ github.event_name }}" == "push" ]]; then
-              echo "$IMAGE:latest"
-            fi
             echo "RELEASE_TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        if: github.event_name == 'push' || inputs.publish
+        if: inputs.publish
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
@@ -210,11 +263,11 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' || inputs.publish == true }}
+          push: ${{ inputs.publish == true }}
           tags: ${{ steps.version.outputs.tags }}
 
   release:
-    needs: [build, docker-publish]
+    needs: [build, docker-publish-release]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
