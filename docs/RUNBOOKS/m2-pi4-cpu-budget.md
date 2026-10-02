@@ -175,12 +175,12 @@ the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
 
-**Before you run either block**, record the host's original apt state
-**once**, so a rollback can undo only what this procedure added and never
-anything that predates it (a blanket `apt autoremove` is system-wide and
-would not respect that). The file is never overwritten, so running this
-again after Option B has run cannot replace the original state with the
-state this procedure produced:
+**Before you run either block**, record the host's original apt
+*configuration* **once**, so a rollback can undo only what this procedure
+changed and never anything that predates it. The file is never
+overwritten while it exists, so running this again after Option B has run
+cannot replace the original state with the state this procedure produced
+(a completed rollback deletes it, see the last rollback step):
 
 ```
 if [ ! -e ~/arm64-baseline.txt ]; then
@@ -192,16 +192,14 @@ if [ ! -e ~/arm64-baseline.txt ]; then
       then echo "$f=yes"; else echo "$f=no"; fi
     done
   } > ~/arm64-baseline.txt
-  dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$' | sort \
-    > ~/arm64-before.txt || true
 fi
 cat ~/arm64-baseline.txt
 ```
 
-(`arch=yes` means arm64 was already enabled, `=yes` on a ports file means
-it already existed, and an empty `~/arm64-before.txt` means the host had
-no arm64 packages. The Ubuntu block below refuses to run without this
-file.)
+(`arch=yes` means arm64 was already enabled, and `=yes` on a ports file
+means it already existed. The Ubuntu block below refuses to run without
+this file. Packages need no snapshot: apt's own log records what each run
+installed, see rollback step 1.)
 
 Ubuntu and Debian need different apt setup here. Check which one your host
 is *before* running anything below, and run only the matching block. Running
@@ -236,22 +234,31 @@ Do these in order. The order matters: once arm64 is enabled with no
 valid index, `apt update` fails, and dpkg will not drop an architecture
 while any package is still registered for it.
 
-1. **Remove the arm64 packages this run added, and only those.** Skip
-   this step if the install never ran (`apt update` failed, so no arm64
-   package was installed). Otherwise compare against the snapshot you
-   took before running, review the list, then purge it. Do not use
-   `apt autoremove` here: it removes every unused auto-installed package
-   on the host, including ones that predate this procedure.
+1. **Remove the packages Option B installed, and only those.** Skip this
+   step if the install never ran (`apt update` failed, so nothing was
+   installed). Apt records every run in `/var/log/apt/history.log`, and
+   an entry's `Install:` line lists only packages that were *not*
+   installed before that run: it includes native packages such as
+   `pkg-config` and `gcc-aarch64-linux-gnu` and every auto-installed
+   dependency, and by construction it excludes anything the host already
+   had. Print the list for the most recent Option B install and read it
+   first (use `zgrep` on `history.log.*.gz` if the log has rotated):
    ```
-   dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$' | sort \
-     > /tmp/arm64-now.txt
-   comm -13 ~/arm64-before.txt /tmp/arm64-now.txt        # review first
-   comm -13 ~/arm64-before.txt /tmp/arm64-now.txt | xargs -r sudo apt purge
+   awk -v RS= -v ORS='\n\n' \
+     '/Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: /' \
+     /var/log/apt/history.log | grep '^Install:' | tail -1 \
+     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g'
    ```
-   If you did not take the snapshot, do not guess: list the arm64
-   packages with `dpkg-query -W -f='${Package}:${Architecture}\n' |
-   grep ':arm64$'` and remove by hand only what you recognise as this
-   run's (`libasound2-dev:arm64` and the dependencies it pulled in).
+   If the list is what you expect, purge exactly it:
+   ```
+   awk -v RS= -v ORS='\n\n' \
+     '/Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: /' \
+     /var/log/apt/history.log | grep '^Install:' | tail -1 \
+     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | xargs -r sudo apt purge
+   ```
+   Do not use `apt autoremove` here: it removes every unused
+   auto-installed package on the host, including ones that predate this
+   procedure.
 2. **Restore the sources.** `sudo mv <file>.man47.bak <file>` for
    whichever of `/etc/apt/sources.list` or
    `/etc/apt/sources.list.d/ubuntu.sources` has a `.man47.bak` next to
@@ -271,10 +278,13 @@ while any package is still registered for it.
    was already enabled before this procedure: leave it enabled (removing
    it would not restore your original state, and dpkg will refuse while
    the packages that predate this run remain). If a `arch=no` removal
-   refuses, something is still registered for arm64: the `dpkg-query`
-   command in step 1 lists what, so judge by hand whether it is yours
-   to remove, and do not purge that list wholesale.
+   refuses, something is still registered for arm64: `dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$'` lists
+   what, so judge by hand whether it is yours to remove, and do not
+   purge that list wholesale.
 4. **Confirm:** `sudo apt update` should now succeed.
+5. **Reset.** Once the rollback is complete, delete the snapshot so the
+   next independent Option B run records its own starting state:
+   `rm -f ~/arm64-baseline.txt`.
 
 If you expect to cross-build again, a *successful* Option B run can
 simply be left in place: apt still has a working ports source backing
