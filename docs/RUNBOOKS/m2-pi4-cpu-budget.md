@@ -413,8 +413,8 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main
 EOF
     fi
-    sudo apt update
-    sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+    sudo apt update && \
+      sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
   fi
 else
   if case " $(. /etc/os-release && printf '%s' "$ID_LIKE") " in
@@ -447,8 +447,8 @@ real hazard runs the other direction, running the **Debian** block below on
 **Ubuntu**, which is exactly what the intro above warns against:
 ```
 sudo dpkg --add-architecture arm64
-sudo apt update
-sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+sudo apt update && \
+  sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
 ```
 
 Either host, once packages are installed:
