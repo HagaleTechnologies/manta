@@ -189,6 +189,7 @@ if [ ! -e ~/arm64-baseline.txt ] && [ -n "$stale" ]; then
        "-- inspect them, then restore or delete each one before starting." >&2
 elif [ ! -e ~/arm64-baseline.txt ]; then
   {
+    echo "started=$(date '+%Y-%m-%d  %H:%M:%S')"
     if dpkg --print-foreign-architectures | grep -qx arm64
     then echo "arch=yes"; else echo "arch=no"; fi
     for f in ubuntu-ports-arm64.sources ubuntu-ports-arm64.list; do
@@ -247,21 +248,33 @@ while any package is still registered for it.
    installed before that run: it includes native packages such as
    `pkg-config` and `gcc-aarch64-linux-gnu` and every auto-installed
    dependency, and by construction it excludes anything the host already
-   had. Print the combined list from every Option B install entry (a rerun
+   had. Print the combined list from every Option B install entry since your
+   baseline was taken (entries from before it belong to an earlier,
+   already finished transaction and must not be touched; a rerun
    after some packages were removed adds a second entry holding only
    that run's delta, so the newest entry alone is not enough) and read
    it first (use `zgrep` on `history.log.*.gz` if the log has rotated):
    ```
-   awk -v RS= -v ORS='\n\n' \
-     '/Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: /' \
-     /var/log/apt/history.log | grep '^Install:' \
+   since=$(sed -n 's/^started=//p' ~/arm64-baseline.txt)
+   awk -v RS= -v ORS='\n\n' -v since="$since" '
+     /Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: / {
+       if (match($0, /Start-Date: [0-9-]+  [0-9:]+/)) {
+         d = substr($0, RSTART + 12, RLENGTH - 12)
+         if (d >= since) print
+       }
+     }' /var/log/apt/history.log | grep '^Install:' \
      | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | tr ' ' '\n' | sort -u
    ```
    If the list is what you expect, purge exactly it:
    ```
-   awk -v RS= -v ORS='\n\n' \
-     '/Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: /' \
-     /var/log/apt/history.log | grep '^Install:' \
+   since=$(sed -n 's/^started=//p' ~/arm64-baseline.txt)
+   awk -v RS= -v ORS='\n\n' -v since="$since" '
+     /Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: / {
+       if (match($0, /Start-Date: [0-9-]+  [0-9:]+/)) {
+         d = substr($0, RSTART + 12, RLENGTH - 12)
+         if (d >= since) print
+       }
+     }' /var/log/apt/history.log | grep '^Install:' \
      | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | tr ' ' '\n' | sort -u \
      | xargs -r sudo apt purge
    ```
