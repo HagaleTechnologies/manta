@@ -183,7 +183,11 @@ cannot replace the original state with the state this procedure produced
 (a completed rollback deletes it, see the last rollback step):
 
 ```
-if [ ! -e ~/arm64-baseline.txt ]; then
+stale=$(ls /etc/apt/sources.list.man47.bak /etc/apt/sources.list.d/*.man47.bak 2>/dev/null)
+if [ ! -e ~/arm64-baseline.txt ] && [ -n "$stale" ]; then
+  echo "ERROR: leftover backup(s) from an earlier attempt: $stale" \
+       "-- inspect them, then restore or delete each one before starting." >&2
+elif [ ! -e ~/arm64-baseline.txt ]; then
   {
     if dpkg --print-foreign-architectures | grep -qx arm64
     then echo "arch=yes"; else echo "arch=no"; fi
@@ -196,8 +200,10 @@ fi
 cat ~/arm64-baseline.txt
 ```
 
-(`arch=yes` means arm64 was already enabled, and `=yes` on a ports file
-means it already existed. The Ubuntu block below refuses to run without
+(It refuses to start if a `.man47.bak` from an earlier attempt exists, so
+any `.man47.bak` found later was made by this transaction. `arch=yes`
+means arm64 was already enabled, and `=yes` on a ports file means it
+already existed. The Ubuntu block below refuses to run without
 this file. Packages need no snapshot: apt's own log records what each run
 installed, see rollback step 1.)
 
@@ -241,20 +247,23 @@ while any package is still registered for it.
    installed before that run: it includes native packages such as
    `pkg-config` and `gcc-aarch64-linux-gnu` and every auto-installed
    dependency, and by construction it excludes anything the host already
-   had. Print the list for the most recent Option B install and read it
-   first (use `zgrep` on `history.log.*.gz` if the log has rotated):
+   had. Print the combined list from every Option B install entry (a rerun
+   after some packages were removed adds a second entry holding only
+   that run's delta, so the newest entry alone is not enough) and read
+   it first (use `zgrep` on `history.log.*.gz` if the log has rotated):
    ```
    awk -v RS= -v ORS='\n\n' \
      '/Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: /' \
-     /var/log/apt/history.log | grep '^Install:' | tail -1 \
-     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g'
+     /var/log/apt/history.log | grep '^Install:' \
+     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | tr ' ' '\n' | sort -u
    ```
    If the list is what you expect, purge exactly it:
    ```
    awk -v RS= -v ORS='\n\n' \
      '/Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: /' \
-     /var/log/apt/history.log | grep '^Install:' | tail -1 \
-     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | xargs -r sudo apt purge
+     /var/log/apt/history.log | grep '^Install:' \
+     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | tr ' ' '\n' | sort -u \
+     | xargs -r sudo apt purge
    ```
    Do not use `apt autoremove` here: it removes every unused
    auto-installed package on the host, including ones that predate this
