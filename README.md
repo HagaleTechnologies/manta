@@ -313,8 +313,7 @@ criteria.
 - Not a cluster network. `manta` is a spot source, not an aggregator.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary, not a
-  stack of programs to sequence-launch — though it can sit behind a stock
-  RBN Aggregator like any other skimmer.
+  stack of programs to sequence-launch.
 - No CW Skimmer-style dual MME/WDM soundcard configuration surface, and no
   CAT/rig control to align a narrowband receiver with the channelizer.
   `manta` does ingest a local audio device (`listen`/`listen --device`,
