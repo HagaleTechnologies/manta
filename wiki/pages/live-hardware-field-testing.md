@@ -206,7 +206,8 @@ frequency-locked WWV signal both before and after further changes (-58 to
 tested bins) — weak, but clearly present, not absent. **The fix that
 actually resolved this rig's detection gap was physical**: reseating all
 antenna/feedline connections and adding a common-mode choke cut broadband
-RMS noise by ~13.5 dB (no antenna disconnection was involved) and
+RMS noise by ~13.5 dB (whether any connection was loose or disconnected
+beforehand is not recorded; the source only says all were reseated) and
 immediately produced the session's first fully validated real spot
 (`WI9Q`, a verified-real US callsign, confidence 0.43-0.54, real SNR,
 plausible WPM — matching none of the known artifact signatures above) —
@@ -285,7 +286,10 @@ same doc's follow-up section.
 
 **The `sdrplay_apiService` daemon can wedge mid-session** (root-owned
 LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
-enumeration (`SoapySDRUtil --find`/`--probe`) keeps working, but stream
+enumeration (`SoapySDRUtil --find`/`--probe`) kept working in the first
+occurrences (in the later 90-minute soak, enumeration itself also failed
+once with "No devices found!", so a failed `--find` can be this same
+failure), but stream
 `activate()` starts failing (`sdrplay_api_Fail`/`sdrplay_api_
 ServiceNotResponding`) consistently across every gain value, not just
 one. No client-side fix is known (a check for other processes holding the
