@@ -224,12 +224,18 @@ package is still registered for it:
 2. **Sources.** The Ubuntu block backs up a default sources file once, as
    `<file>.man47.bak`, before editing it, and writes
    `/etc/apt/sources.list.d/ubuntu-ports-arm64.sources` (or `.list` on
-   older releases). It refuses to run if one of those ports files already
-   exists, so a ports file it wrote did not exist before. Compare
-   `diff <file>.man47.bak <file>`: restore the backup only if nothing else
-   has edited that file since, otherwise remove just the
+   older releases). The block keeps a ports file that already references
+   `ports.ubuntu.com` (from an interrupted earlier run or your own), so
+   the file's presence does not prove this run wrote it. Remove it only
+   if you know it was created by this runbook (check its mtime against
+   `history.log`, or whether you had a ports source before); a file you
+   customised stays. A `<file>.man47.bak` that predates your current run
+   is from an earlier run: the block never overwrites it, so it may be
+   stale. Compare `diff <file>.man47.bak <file>`: restore the backup only
+   if nothing else has edited that file since, otherwise remove just the
    `Architectures-Remove: arm64` lines (or the `[arch-=arm64]` prefixes)
-   by hand. Then remove the ports file the block wrote.
+   by hand. Delete each `.man47.bak` once you are done, so a later
+   independent run starts from a fresh backup instead of a stale one.
 3. **The architecture.** `dpkg --print-foreign-architectures` shows
    whether arm64 is enabled. Remove it only if you were not using arm64
    before this runbook: `sudo dpkg --remove-architecture arm64` (it
