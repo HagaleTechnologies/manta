@@ -194,16 +194,16 @@ captures a fresh WAV+JSON sidecar via manta's own `SoapySdrIqSource` for
 this kind of check; `crates/manta-engine/examples/man171_power_map.rs`
 does the raw-power-vs-floor comparison itself.
 
-**Correction, same day, possibly a different receiver or environment** (the
-cited decision record doesn't identify the hardware, only that the earlier
-run was a separate session): don't treat "no
-distinguishable WWV carrier" as proof of total antenna disconnection
-without checking relative to a proper noise floor, not just eyeballing
-it — a from-scratch single-bin correlation against WWV's exact carrier
-frequency, run on this session's actual RSP1B, found a real, reproducible,
-frequency-locked WWV signal both before and after further changes (-58 to
--54 dB relative to broadband RMS, consistently the strongest of several
-tested bins) — weak, but clearly present, not absent. **The fix that
+**Correction, same day, unresolved**: don't treat "no distinguishable WWV
+carrier" as proof of total antenna disconnection without checking relative
+to a proper noise floor — a from-scratch single-bin correlation at
+10.000000 MHz on this session's RSP1B found a reproducible,
+frequency-locked bin (-58 to -54 dB relative to broadband RMS, the
+strongest of several tested bins). But 10 MHz is an exact 8 kHz multiple,
+and a known absolute-frequency-locked birdie sits at those, so this does
+not yet show a real WWV carrier, and it says nothing about whether the
+earlier run used different hardware (the cited record doesn't identify
+it). **The fix that
 actually resolved this rig's detection gap was physical**: reseating all
 antenna/feedline connections and adding a common-mode choke cut broadband
 RMS noise by ~13.5 dB (whether any connection was loose or disconnected

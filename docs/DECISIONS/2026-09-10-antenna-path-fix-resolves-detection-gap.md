@@ -29,26 +29,34 @@ identity to tell it apart from this rig).
    minutes, cross-checked against a live RBN telnet capture over the
    identical window.
 
-## Result 1: PR #174's "no antenna signal at all" claim does not hold on this hardware
+## Result 1: a bin at 10.000000 MHz stands out, but that does not yet separate WWV from the known 8 kHz birdie
 
 Pre-fix WWV check (two runs): WWV's exact carrier bin measured -57.9 dB
 and -54.1 dB relative to broadband RMS, consistently and reproducibly the
 strongest of five tested bins (arbitrary control offsets ranged -58 to
--79 dB). This is a real, present, frequency-locked signal -- not "no
-antenna signal at all." PR #174 almost certainly tested a different
-physical rig; its finding doesn't describe this dev box's actual RF path.
+-79 dB). This is a reproducible, frequency-locked bin, but it is **not**
+established to be WWV: 10.000000 MHz is exactly the 1,250th multiple of
+8 kHz, and `2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md`
+(lines ~96-103, ~148-168) documents a persistent absolute-frequency-locked
+birdie at every 8 kHz multiple, with this bin's isolated-bin signature. A
+comparison against four arbitrary offsets cannot tell the two apart. So
+this result neither confirms nor refutes PR #174's "no antenna signal at
+all" claim, and it says nothing about whether PR #174 used different
+hardware. Telling WWV from the comb needs a modulation/sideband or
+equivalent test (tracked in MAN-225).
 
-That said, WWV at only 10-20 dB above the broadband noise floor is weak
-for what should be one of the strongest, most trivially-received signals
-in North America (commonly S9+ on any functioning antenna) -- consistent
-with a real, degraded-but-not-dead antenna path. This was the actionable
-signal that motivated the physical fix below.
+If the bin were WWV, being only 10-20 dB above the broadband noise floor
+would be weak for one of the strongest signals in North America (commonly
+S9+ on any functioning antenna), consistent with a degraded antenna path.
+That was the motivation for the physical fix below, but see the caveat
+above: the premise is unproven.
 
-## Result 2: the physical fix measurably cut broadband noise without changing WWV's own strength
+## Result 2: the physical fix measurably cut broadband noise
 
-Post-fix WWV check, same method: WWV's own relative prominence is
-essentially unchanged (-54.0 dB) -- expected, since a common-mode choke
-can't make WWV itself stronger. But **total broadband RMS power dropped
+Post-fix check of the same bin, same method: its relative prominence is
+essentially unchanged (-54.0 dB; with broadband RMS down, the absolute
+power of that bin fell too, so this does not show the signal itself was
+unchanged). **Total broadband RMS power dropped
 by roughly 13.5 dB** (avg_rms 0.195-0.196 pre-fix -> 0.041 post-fix, a
 ~4.7x reduction) -- consistent with a common-mode choke suppressing
 common-mode RFI/noise pickup on the feedline shield, exactly the
