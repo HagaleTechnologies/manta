@@ -68,8 +68,8 @@ window) shows a real interior optimum, not "lower is always better":
 
 At `gain=0` (max sensitivity, min attenuation) the front end is plausibly
 overloaded/desensitized by broadband energy across the busy antenna and
-192 kHz passband -- worse than 40, not better. But every value from 10-40
-tested strictly *worse* than the one below it as attenuation increased,
+192 kHz passband -- worse than 40, not better. But `chars_decoded` fell at every step from 10 to 40 as attenuation
+increased (peak SNR did not: it peaked at 20, 6.52 dB, above 10's 2.43 dB),
 and `gain=40`'s own peak SNR (3.81 dB) and char count (1138) are both
 well below `gain=20`'s (6.52 dB, 5008 chars). The real optimum for this
 antenna/band/time appears to sit around 10-20, not 40 -- and every prior
@@ -128,7 +128,9 @@ window either, so that in-CW-segment cluster isn't confirmed real either.
 A wider frequency search (+/-3 kHz, ruling out simple LO/calibration
 drift) still found nothing. Also notable: the passband-edge artifact's
 *share* of total track activity got worse at the better gain (~55% of
-all `TrackMeta` events in this run vs. 28-35% at `gain=40`) -- less
+all `TrackMeta` events in this run; the 28-35% at `gain=40` was computed
+from `TrackPromoted` events, so the two figures are not directly
+comparable and the direction is indicative only) -- less
 attenuation lets more energy through everywhere, including whatever's
 driving the edge-channel artifact.
 

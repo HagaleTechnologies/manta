@@ -46,7 +46,7 @@ those for the full evidence and reasoning.
   yourself:
   ```bash
   manta listen --json --soapy-driver "driver=sdrplay" \
-      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain 40 \
+      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain 20 \
       > out.jsonl 2>err.log &
   PID=$!
   sleep 1800        # or whatever window you want
@@ -243,5 +243,8 @@ ServiceNotResponding`) consistently across every gain value, not just
 one. No client-side fix resolves this (confirmed: no process was holding
 the device per `lsof`) — it needs `sudo launchctl kickstart -k
 system/com.sdrplay.service` (or a service restart), a privileged action.
+If activation still fails after the restart, a physical USB unplug/replug of
+the RSP1B was what actually cleared it
+(`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`, follow-up section).
 If a run that worked minutes ago suddenly can't `activateStream()` at
 all, check this before assuming it's gain- or code-related.

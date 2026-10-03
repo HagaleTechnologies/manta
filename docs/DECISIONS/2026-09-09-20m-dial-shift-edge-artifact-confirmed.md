@@ -1,4 +1,4 @@
-# Dial-shift test confirms a passband-edge track-promotion artifact on 20m; the interior 20m cluster is real (RTTY), not artifact
+# Dial-shift test confirms a passband-edge track-promotion artifact on 20m; the interior 20m cluster is not the same artifact (likely RTTY/digital, unconfirmed)
 
 Follow-up to `docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md`
 and the open passband-edge/interior-cluster question from
