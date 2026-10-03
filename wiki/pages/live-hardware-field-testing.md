@@ -284,7 +284,8 @@ channelizer power plus a local WWV check and concluded the detector/DSP
 side is ruled out, so treat the RF path as the working explanation. See the
 same doc's follow-up section.
 
-**The `sdrplay_apiService` daemon can wedge mid-session** (root-owned
+**The SDRplay stream can stop activating mid-session, apparently with the
+`sdrplay_apiService` daemon wedged** (cause not established; root-owned
 LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
 enumeration (`SoapySDRUtil --find`/`--probe`) kept working in the first
 occurrences (in the later 90-minute soak, enumeration itself also failed
@@ -300,8 +301,9 @@ the RSP1B was what actually cleared it
 (`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`, follow-up section).
 If a run that worked minutes ago suddenly can't `activateStream()` at
 all, check this before assuming it's gain- or code-related.
-**The SDRplay API service itself is unreliable under sustained ~192 kS/s
-streaming** — confirmed four separate times in one session
+**SDRplay stream/device failures recur under sustained ~192 kS/s
+streaming** (root cause not established: service, USB/device path or
+manta-side are all still open) — seen four separate times in one session
 (`sdrplay_api_ServiceNotResponding` / `sdrplay_api_Fail`), sometimes
 requiring a privileged restart (`sudo launchctl kickstart -k
 system/com.sdrplay.service`) plus a physical USB replug, sometimes
