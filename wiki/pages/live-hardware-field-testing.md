@@ -9,6 +9,8 @@ sources:
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
   - docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md
   - docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md
+  - docs/DECISIONS/2026-09-09-20m-dial-shift-edge-artifact-confirmed.md
+  - docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md
 verified:
   commit: 5b22b62
   date: 2026-09-10
@@ -44,7 +46,7 @@ those for the full evidence and reasoning.
   yourself:
   ```bash
   manta listen --json --soapy-driver "driver=sdrplay" \
-      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain 40 \
+      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain <gain> \
       > out.jsonl 2>err.log &
   PID=$!
   sleep 1800        # or whatever window you want
@@ -105,6 +107,22 @@ signal, not a detection/spot-generation bug) — see
 `docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md` Finding 2
 for the full original reasoning; treat the interior-passband clusters as
 a separate, still-untracked question until proven otherwise.
+
+**Update, confirmed on 20m** (`2026-09-09-20m-dial-shift-edge-artifact-
+confirmed.md`): a two-run dial-shift test (+30 kHz between runs) nails
+down both halves of this. **Both passband edges are a real detector/
+channelizer artifact** — `TrackPromoted` rate spikes ~3 kHz in from each
+true edge of the tuned passband in both runs, tracking the edge as it
+moves, and none of these edge tracks ever confirmed a spot. Together they
+were 28-35% of all promoted tracks in that session — a real cost even
+though they don't produce false spots. Separately, **an interior cluster
+around 14075 kHz did NOT move with the dial** — same absolute frequency
+both times — so it's not the same artifact; it's inside the US 20m RTTY/
+data segment (14070-14095 kHz) and is more likely a real continuous
+digital-mode signal whose keying trips the CW detector into promoting
+tracks that never validate (not confirmed against a live waterfall). Root
+cause of the edge artifact itself is still open (PFB edge-channel
+behavior is the leading suspect).
 
 **`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
 track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
@@ -192,3 +210,49 @@ outright). Also: a single `ErrorCode::Overflow` on a live USB stream used
 to kill the whole session outright — fixed in `crates/manta-input/src/
 soapy.rs` (#146, 2026-09-09) with its own bounded retry, so this is no
 longer something you need to work around.
+
+**`--soapy-gain` is a gain-*reduction* (attenuation) scale on this
+driver, not a gain scale — bigger number means less sensitive, not
+more** (`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`). `0` is
+maximum sensitivity, `48` is minimum. Every fixed-gain field session through
+2026-09-09 used `--soapy-gain 40`, which pins the IF stage at its
+absolute maximum attenuation (`IFGR=59`, the top of its whole `[20,59]`
+range) — chosen only to avoid the top-of-range activation failure above,
+never checked against actual sensitivity. A live sweep found chars-
+decoded markedly higher at `gain=10-20` than at `40`, and peak SNR higher
+at `gain=20` only (`gain=10`'s 2.43 dB was below `40`'s 3.81 dB)
+(`gain=0` is worse than `40`, though — the front end likely overloads on
+this busy an antenna at max sensitivity, so it's not simply "always use
+the minimum"). **Do not keep using `40` by default; sweep gain per session instead
+of assuming an optimum.** The sweep's better peak SNR at `gain=10-20` is
+provisional: the follow-up below found it came with artifact clusters and
+still no activity at real CW targets, so no gain is established as best
+until a locally present real signal or raw-IQ dynamic-range measurement is
+compared across gains.
+
+**Confirmed real but NOT a full fix**: a same-session follow-up capture
+at `gain=15` against live RBN found peak SNR much improved (18.65 dB vs.
+`gain=40`'s 3.81 dB) but **still zero track activity within ±3 kHz of 6
+specific real, multi-skimmer-confirmed RBN spots** in the same window.
+The gain bug is real and worth fixing, but it is not the (or not the
+whole) explanation for "almost no real CW heard" — something else, most
+plausibly the physical antenna/feedline path specifically feeding the
+RSP1B, was the open question at that point. The later
+`2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md` measured raw
+channelizer power plus a local WWV check and concluded the detector/DSP
+side is ruled out, so treat the RF path as the working explanation. See the
+same doc's follow-up section.
+
+**The `sdrplay_apiService` daemon can wedge mid-session** (root-owned
+LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
+enumeration (`SoapySDRUtil --find`/`--probe`) keeps working, but stream
+`activate()` starts failing (`sdrplay_api_Fail`/`sdrplay_api_
+ServiceNotResponding`) consistently across every gain value, not just
+one. No client-side fix is known (a check for other processes holding the
+device was not performed) — it needs `sudo launchctl kickstart -k
+system/com.sdrplay.service` (or a service restart), a privileged action.
+If activation still fails after the restart, a physical USB unplug/replug of
+the RSP1B was what actually cleared it
+(`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`, follow-up section).
+If a run that worked minutes ago suddenly can't `activateStream()` at
+all, check this before assuming it's gain- or code-related.
