@@ -57,7 +57,9 @@ repo's own empirical data, not quoted from those threads.
 ## But minimum attenuation isn't automatically best either
 
 A live 60s `manta doctor` sweep on 20m (14030 kHz, same antenna/time
-window) shows a real interior optimum, not "lower is always better":
+window) shows an apparent interior peak (provisional -- see the follow-up below: the
+improved peak SNR coincided with artifact clusters, not confirmed CW), not
+"lower is always better":
 
 | gain | chars_decoded | snr_db_max | verdict |
 |---|---|---|---|
@@ -72,12 +74,12 @@ overloaded/desensitized by broadband energy across the busy antenna and
 192 kHz passband -- worse than 40, not better. But `chars_decoded` fell at every step from 10 to 40 as attenuation
 increased (peak SNR did not: it peaked at 20, 6.52 dB, above 10's 2.43 dB),
 and `gain=40`'s own peak SNR (3.81 dB) and char count (1138) are both
-well below `gain=20`'s (6.52 dB, 5008 chars). The real optimum for this
-antenna/band/time appears to sit around 10-20, not 40 -- and every prior
+well below `gain=20`'s (6.52 dB, 5008 chars). The best-looking region for this
+antenna/band/time is around 10-20 rather than 40, provisionally -- and every prior
 field session's data should be read with this in mind: **the "almost no
 real CW heard" finding across all three prior live-hardware sessions may
-be substantially explained by running the receiver 20-30 dB more
-attenuated than optimal, not by propagation, antenna, or a manta decoder
+be partly explained by running the receiver 20-30 dB more
+attenuated than the better-looking settings, not by propagation, antenna, or a manta decoder
 bug.** No confirmed `Spot` was produced in any of these short 60s sweeps
 at any gain value, so this reframes rather than closes the open question
 from `2026-09-09-20m-dial-shift-edge-artifact-confirmed.md` (why 4/5
