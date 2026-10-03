@@ -46,7 +46,7 @@ those for the full evidence and reasoning.
   yourself:
   ```bash
   manta listen --json --soapy-driver "driver=sdrplay" \
-      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain 20 \
+      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain <gain> \
       > out.jsonl 2>err.log &
   PID=$!
   sleep 1800        # or whatever window you want
@@ -222,8 +222,12 @@ never checked against actual sensitivity. A live sweep found chars-
 decoded and peak SNR both markedly better at `gain=10-20` than at `40`
 (`gain=0` is worse than `40`, though — the front end likely overloads on
 this busy an antenna at max sensitivity, so it's not simply "always use
-the minimum"). **Start future sessions around `gain=15-20` and sweep
-narrower from there, not `40`.**
+the minimum"). **Do not keep using `40` by default; sweep gain per session instead
+of assuming an optimum.** The sweep's better peak SNR at `gain=10-20` is
+provisional: the follow-up below found it came with artifact clusters and
+still no activity at real CW targets, so no gain is established as best
+until a locally present real signal or raw-IQ dynamic-range measurement is
+compared across gains.
 
 **Confirmed real but NOT a full fix**: a same-session follow-up capture
 at `gain=15` against live RBN found peak SNR much improved (18.65 dB vs.
