@@ -96,7 +96,8 @@ corrupt/empty result.
 
 ## Recommendation
 
-**For any future unattended/long-duration live-hardware session**: use
+**For ordinary unattended/long-duration data collection** (not the M2
+acceptance soak -- see the exception below): use
 short, independent capture cycles (this session used ~22 min) rather than
 one long-running capture, specifically because of this service's
 demonstrated unreliability under sustained load. A single long capture
@@ -105,6 +106,12 @@ an automatic retry-on-device-not-found loop with a short backoff to the
 capture tooling itself (not done here -- this session's cycling was
 external shell scripting, not a manta code change) so an unattended run
 doesn't need a human to notice a skipped cycle.
+
+**Exception: the M2 acceptance soak.** `ROADMAP.md` requires 24 uninterrupted
+hours with no crash. Cycling every ~22 minutes would tolerate stream/service
+failures and reset the process state that soak is meant to exercise, so it
+must not be cycled. Surviving that run depends on the service-reliability
+problem being mitigated or fixed first, not worked around by restarts.
 
 The underlying SDRplay service reliability issue itself (why it crashes
 under sustained ~192 kS/s streaming, and why it sometimes self-recovers

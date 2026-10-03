@@ -186,7 +186,9 @@ and no amount of detector tuning will fix it. A synchronized 40m capture
 on one physical rig showed RBN-confirmed signals up to 61 dB reading
 ≤1.5 dB above ambient in raw channelizer power, with WWV (10.000 MHz —
 about as strong and reliable as HF gets) showing no distinguishable
-carrier either — that rig's antenna was disconnected/misconfigured.
+carrier either — the most likely explanation was a disconnected or
+misconfigured antenna on that rig (the source record recommends a physical
+check; it does not record one as done).
 `crates/manta-input/examples/iq_probe.rs` (build with `--features soapy`)
 captures a fresh WAV+JSON sidecar via manta's own `SoapySdrIqSource` for
 this kind of check; `crates/manta-engine/examples/man171_power_map.rs`
@@ -301,10 +303,11 @@ requiring a privileged restart (`sudo launchctl kickstart -k
 system/com.sdrplay.service`) plus a physical USB replug, sometimes
 self-recovering within a minute or two with no intervention at all — both
 behaviors observed, so treat it as genuinely intermittent, not "wedged
-until a human fixes it." **For any unattended/long-duration capture, run
+until a human fixes it." **For ordinary unattended/long-duration data collection, run
 short independent cycles (e.g. ~20-25 min) rather than one long capture**
 — a single long run has no resilience against a mid-run crash and can
 lose the whole session; cycling means one crash only costs that cycle.
 Check device enumeration (`SoapySDRUtil --find`) before each cycle starts
 so a skipped cycle is detected rather than silently producing an empty
-result.
+result. Do not cycle the M2 acceptance soak: `ROADMAP.md` requires 24
+uninterrupted hours with no crash, and restarts would defeat it.
