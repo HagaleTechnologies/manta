@@ -219,7 +219,8 @@ maximum sensitivity, `48` is minimum. Every fixed-gain field session through
 absolute maximum attenuation (`IFGR=59`, the top of its whole `[20,59]`
 range) — chosen only to avoid the top-of-range activation failure above,
 never checked against actual sensitivity. A live sweep found chars-
-decoded and peak SNR both markedly better at `gain=10-20` than at `40`
+decoded markedly higher at `gain=10-20` than at `40`, and peak SNR higher
+at `gain=20` only (`gain=10`'s 2.43 dB was below `40`'s 3.81 dB)
 (`gain=0` is worse than `40`, though — the front end likely overloads on
 this busy an antenna at max sensitivity, so it's not simply "always use
 the minimum"). **Do not keep using `40` by default; sweep gain per session instead
