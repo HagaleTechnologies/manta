@@ -216,8 +216,9 @@ weak-but-present is a real, different failure mode from absent, and
 common-mode noise on the feedline is a real, different fix from
 reconnecting a cable.
 
-**Confirmed at scale, same day**: a 90-minute unattended 4-cycle soak
-post-fix produced 22 confirmed spots, 13 (59%) matching the real-catch
+**Confirmed at scale, same day**: a 90-minute wall-clock unattended 4-cycle soak
+(about 38 minutes of actual streaming, estimated from event counts; not
+90 minutes of live-SDR evidence) post-fix produced 22 confirmed spots, 13 (59%) matching the real-catch
 signature (`Cq`/`De` type, confidence 0.22-0.43) and 9 (41%) matching the
 known Beacon-exemption residual gap above. Several real-looking calls
 repeated across independent cycles (`W3RJ` 4x, `KC4X` 4x); cross-checked
@@ -294,7 +295,7 @@ the RSP1B was what actually cleared it
 If a run that worked minutes ago suddenly can't `activateStream()` at
 all, check this before assuming it's gain- or code-related.
 **The SDRplay API service itself is unreliable under sustained ~192 kS/s
-streaming** — confirmed three separate times in one session
+streaming** — confirmed four separate times in one session
 (`sdrplay_api_ServiceNotResponding` / `sdrplay_api_Fail`), sometimes
 requiring a privileged restart (`sudo launchctl kickstart -k
 system/com.sdrplay.service`) plus a physical USB replug, sometimes
