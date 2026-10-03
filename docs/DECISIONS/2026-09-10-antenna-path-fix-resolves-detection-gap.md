@@ -7,8 +7,10 @@ Follow-up to the whole 2026-09-09/09-10 live-hardware investigation thread
 issues #166, #167, #171) and directly to PR #174's independent repro
 attempt, which reached the opposite conclusion from #171 (RF-path, not
 manta code) using a WWV null-signal test on what its own PR description
-suggests was a different physical machine (a `claude.ai/code/session_...`
-cloud session, not this dev box).
+suggests may have been a different machine or environment (a
+`claude.ai/code/session_...` cloud session identifies an execution session,
+not the physical receiver; that record does not capture enough hardware
+identity to tell it apart from this rig).
 
 ## Method
 

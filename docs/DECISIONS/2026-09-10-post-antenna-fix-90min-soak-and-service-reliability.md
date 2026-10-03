@@ -37,7 +37,9 @@ gap all session:
   **KC4X four times** -- both at consistent frequencies.
 - **9 spots (41%) match the known residual-artifact signature**:
   `Beacon` type, confidence 0.14-0.18 -- the small, accepted gap from PR
-  #154 (`docs/DECISIONS/...`, tracked in issue #163/#173). Four of these
+  #154 (`docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md`
+  and `docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md`,
+  tracked in issue #163/#173). Four of these
   in cycle 1 were near-identical garbled callsigns (AU1UN/VU1UN/EU1US/
   EU1UN) all at the same ~14100.0xx kHz frequency -- almost certainly one
   recurring noise source, not four real DX stations.
