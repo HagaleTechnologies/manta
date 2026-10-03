@@ -262,14 +262,20 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
      *) false ;;
    esac; then
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-  if [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
-     || [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ]; then
-    echo "ERROR: an arm64 ports source file already exists" \
-         "(/etc/apt/sources.list.d/ubuntu-ports-arm64.*). If Option B" \
-         "already ran on this host, you are done. Otherwise review that" \
-         "file by hand and merge in the ports.ubuntu.com arm64 entries" \
-         "you need rather than overwriting it; nothing below has been" \
-         "touched." >&2
+  # A ports source file that already points at ports.ubuntu.com (one this
+  # block wrote on an interrupted earlier run, or one you customised) is kept
+  # as-is, so a rerun resumes at apt update/install without overwriting it.
+  # Only a ports file that does NOT reference ports.ubuntu.com is refused.
+  if { [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
+       && ! grep -qs 'ports.ubuntu.com' \
+            /etc/apt/sources.list.d/ubuntu-ports-arm64.sources; } \
+     || { [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ] \
+          && ! grep -qs 'ports.ubuntu.com' \
+               /etc/apt/sources.list.d/ubuntu-ports-arm64.list; }; then
+    echo "ERROR: /etc/apt/sources.list.d/ubuntu-ports-arm64.* exists but" \
+         "does not reference ports.ubuntu.com. Review it by hand and merge" \
+         "in the ports.ubuntu.com arm64 entries you need rather than" \
+         "overwriting it; nothing below has been touched." >&2
     false
   elif [ -z "$codename" ]; then
     echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on" \
@@ -322,7 +328,8 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
         fi
         printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null
       fi
-      sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
+      [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
+        || sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
 Types: deb
 URIs: http://ports.ubuntu.com/ubuntu-ports
 Suites: ${codename} ${codename}-updates ${codename}-security
@@ -345,7 +352,8 @@ EOF
         sudo sed -i.man47.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
           /etc/apt/sources.list
       fi
-      sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
+      [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ] \
+        || sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main
