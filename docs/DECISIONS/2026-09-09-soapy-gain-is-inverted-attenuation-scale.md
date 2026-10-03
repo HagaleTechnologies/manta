@@ -1,13 +1,14 @@
-# `--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior field session used a heavily-attenuated setting
+# `--soapy-gain` on this RSP1B is a gain-*reduction* (attenuation) scale, not a gain scale -- every prior fixed-gain field session used a heavily-attenuated setting
 
 Triggered by Tony's suspicion that the RSP1B itself, not the antenna or
 propagation, might be misconfigured: the same antenna hears FT8 very
 strongly (a different receiver, an FTdx10), but every manta field session
 to date has heard almost no real CW. All three prior live sessions
-(`2026-09-08-first-live-rsp1b-run.md`,
+(`2026-09-08-first-live-rsp1b-run.md` -- which also had AGC runs, whose
+gain state this record does not establish --
 `2026-09-09-overnight-40m-soapy-field-test.md`,
 `2026-09-09-post-pr154-20m-daytime-validation.md`, plus tonight's earlier
-captures) used `--soapy-gain 40`. This session checked, for the first
+captures) used `--soapy-gain 40` in their fixed-gain captures. This session checked, for the first
 time, what that value actually does to the hardware's real gain stages
 rather than just whether the stream activates.
 
@@ -92,8 +93,9 @@ subsequent longer capture attempt at the previously-good `gain=10`
 started failing the same way (`sdrplay_api_Fail`) -- consistently, not
 transiently, across three retries. Device *enumeration*
 (`SoapySDRUtil --find`/`--probe`) continues to succeed throughout; only
-stream *activation* fails. No client process is holding the device open
-(`lsof -c sdrplay_apiService` empty). This points at the root-owned
+stream *activation* fails. `lsof -c sdrplay_apiService` was empty, but that selects files of the
+service process itself, so it does not show whether another client held the
+device; a proper holder check was not done. This points at the root-owned
 `sdrplay_apiService` LaunchDaemon (`/Library/SDRplayAPI/3.15.1/bin/
 sdrplay_apiService`, `com.sdrplay.service.plist`) itself being wedged,
 requiring a privileged restart (`sudo launchctl kickstart -k

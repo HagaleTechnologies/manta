@@ -214,7 +214,7 @@ longer something you need to work around.
 **`--soapy-gain` is a gain-*reduction* (attenuation) scale on this
 driver, not a gain scale — bigger number means less sensitive, not
 more** (`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`). `0` is
-maximum sensitivity, `48` is minimum. Every field session through
+maximum sensitivity, `48` is minimum. Every fixed-gain field session through
 2026-09-09 used `--soapy-gain 40`, which pins the IF stage at its
 absolute maximum attenuation (`IFGR=59`, the top of its whole `[20,59]`
 range) — chosen only to avoid the top-of-range activation failure above,
@@ -236,16 +236,19 @@ specific real, multi-skimmer-confirmed RBN spots** in the same window.
 The gain bug is real and worth fixing, but it is not the (or not the
 whole) explanation for "almost no real CW heard" — something else, most
 plausibly the physical antenna/feedline path specifically feeding the
-RSP1B, or a detector/DSP issue that only shows up on real narrowband CW,
-is still the live open question. See the same doc's follow-up section.
+RSP1B, was the open question at that point. The later
+`2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md` measured raw
+channelizer power plus a local WWV check and concluded the detector/DSP
+side is ruled out, so treat the RF path as the working explanation. See the
+same doc's follow-up section.
 
 **The `sdrplay_apiService` daemon can wedge mid-session** (root-owned
 LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
 enumeration (`SoapySDRUtil --find`/`--probe`) keeps working, but stream
 `activate()` starts failing (`sdrplay_api_Fail`/`sdrplay_api_
 ServiceNotResponding`) consistently across every gain value, not just
-one. No client-side fix resolves this (confirmed: no process was holding
-the device per `lsof`) — it needs `sudo launchctl kickstart -k
+one. No client-side fix is known (a check for other processes holding the
+device was not performed) — it needs `sudo launchctl kickstart -k
 system/com.sdrplay.service` (or a service restart), a privileged action.
 If activation still fails after the restart, a physical USB unplug/replug of
 the RSP1B was what actually cleared it
