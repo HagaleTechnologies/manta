@@ -192,7 +192,9 @@ captures a fresh WAV+JSON sidecar via manta's own `SoapySdrIqSource` for
 this kind of check; `crates/manta-engine/examples/man171_power_map.rs`
 does the raw-power-vs-floor comparison itself.
 
-**Correction, same day, different physical RSP1B**: don't treat "no
+**Correction, same day, possibly a different receiver or environment** (the
+cited decision record doesn't identify the hardware, only that the earlier
+run was a separate session): don't treat "no
 distinguishable WWV carrier" as proof of total antenna disconnection
 without checking relative to a proper noise floor, not just eyeballing
 it — a from-scratch single-bin correlation against WWV's exact carrier

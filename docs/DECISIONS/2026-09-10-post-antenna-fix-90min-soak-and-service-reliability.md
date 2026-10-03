@@ -1,12 +1,20 @@
-# Post-antenna-fix 90-minute unattended soak: real detection confirmed at scale; SDRplay service reliability is a real, recurring operational problem
+# Post-antenna-fix 90-minute (wall-clock) unattended soak: real detection confirmed at scale; SDRplay service reliability is a real, recurring operational problem
 
 Follow-up to `docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md`.
 That doc confirmed the antenna/feedline fix (reseated connections + common-
 mode choke) resolved the mid-band detection gap with a single 5-minute
 capture (3 confirmed spots, one verified real callsign). This session ran
-a longer, unattended 4-cycle soak (nominally 22 min/cycle, ~90 min total)
-on 20m to see whether that result holds up at scale, and surfaced a
+a longer, unattended 4-cycle soak (nominally 22 min/cycle, ~90 min wall
+clock) on 20m to see whether that result holds up at scale, and surfaced a
 second, independent problem along the way.
+
+**Actual streaming time was much shorter than 90 minutes.** Only cycle 1
+ran its full 22 minutes; cycle 2 ended early, cycle 3 captured nothing and
+cycle 4 was the shortest (event counts in Result 2). Scaling those counts
+against cycle 1's 180,151 events (22 min) gives roughly 22 + 14 + 0 + 2.5,
+about 38 minutes of streaming -- an estimate that assumes a constant event
+rate, not a measured duration. Do not credit this run as 90 minutes toward
+the still-open live-SDR soak evidence.
 
 ## Method
 
@@ -65,9 +73,10 @@ Of 4 planned cycles:
   (`sdrplay_api_ServiceNotResponding`) partway through -- shortest cycle
   of all (20,651 events).
 
-This is the third time this exact failure has occurred in one session
-(see `docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`'s
-"Blocked mid-session" section for the first two occurrences). Unlike
+This is the fourth occurrence of this exact failure in one session: two
+earlier ones (see `docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`'s
+"Blocked mid-session" section) plus two in this soak (cycle 2, and cycle 4
+after the self-recovery). Unlike
 those earlier occurrences, this time the service **partially
 self-recovered on its own** between cycle 3's failure and cycle 4's
 successful start -- no privileged restart or physical USB replug was
