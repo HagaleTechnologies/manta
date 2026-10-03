@@ -175,39 +175,6 @@ the build host.
 
 **Option B — native cross-linker package + explicit Cargo linker config:**
 
-**Before you run either block**, record the host's original apt
-*configuration* **once**, so a rollback can undo only what this procedure
-changed and never anything that predates it. The file is never
-overwritten while it exists, so running this again after Option B has run
-cannot replace the original state with the state this procedure produced
-(a completed rollback deletes it, see the last rollback step):
-
-```
-stale=$(ls /etc/apt/sources.list.man47.bak /etc/apt/sources.list.d/*.man47.bak 2>/dev/null)
-if [ ! -e ~/arm64-baseline.txt ] && [ -n "$stale" ]; then
-  echo "ERROR: leftover backup(s) from an earlier attempt: $stale" \
-       "-- inspect them, then restore or delete each one before starting." >&2
-elif [ ! -e ~/arm64-baseline.txt ]; then
-  {
-    echo "started=$(date '+%Y-%m-%d  %H:%M:%S')"
-    if dpkg --print-foreign-architectures | grep -qx arm64
-    then echo "arch=yes"; else echo "arch=no"; fi
-    for f in ubuntu-ports-arm64.sources ubuntu-ports-arm64.list; do
-      if [ -e "/etc/apt/sources.list.d/$f" ]
-      then echo "$f=yes"; else echo "$f=no"; fi
-    done
-  } > ~/arm64-baseline.txt
-fi
-cat ~/arm64-baseline.txt
-```
-
-(It refuses to start if a `.man47.bak` from an earlier attempt exists, so
-any `.man47.bak` found later was made by this transaction. `arch=yes`
-means arm64 was already enabled, and `=yes` on a ports file means it
-already existed. The Ubuntu block below refuses to run without
-this file. Packages need no snapshot: apt's own log records what each run
-installed, see rollback step 1.)
-
 Ubuntu and Debian need different apt setup here. Check which one your host
 is *before* running anything below, and run only the matching block. Running
 the **Ubuntu** block on a **Debian** host is not the hazard it might look
@@ -230,91 +197,51 @@ host keeps failing until you either run the Ubuntu block, or undo just the
 architecture flag with `sudo dpkg --remove-architecture arm64` -- the
 Debian block's `apt update` never succeeded, so no arm64 package was ever
 actually installed and the removal isn't refused; there is no `.man47.bak`
-or ports source file to restore for this case, so the file-rollback steps
-below don't apply to it. Running the Debian block on Ubuntu *after* the
+or ports source file to restore for this case, so the "Sources" step of
+"Undoing Option B" below doesn't apply to it. Running the Debian block on Ubuntu *after* the
 Ubuntu block has already fixed the sources is harmless -- its commands just
 re-run against sources that are already correct.
 
-## Rolling back Option B
+## Undoing Option B (manual)
 
-Do these in order. The order matters: once arm64 is enabled with no
-valid index, `apt update` fails, and dpkg will not drop an architecture
-while any package is still registered for it.
+This runbook does not automate a rollback: undoing apt changes safely
+depends on what else changed on your host since, so review each piece
+before touching it. Option B changes exactly three things. Undo them in
+this order, because once arm64 is enabled without a valid index
+`apt update` fails, and dpkg will not drop an architecture while any
+package is still registered for it:
 
-1. **Remove the packages Option B installed, and only those.** Skip this
-   step if the install never ran (`apt update` failed, so nothing was
-   installed). Apt records every run in `/var/log/apt/history.log`, and
-   an entry's `Install:` line lists only packages that were *not*
-   installed before that run: it includes native packages such as
-   `pkg-config` and `gcc-aarch64-linux-gnu` and every auto-installed
-   dependency, and by construction it excludes anything the host already
-   had. Print the combined list from every Option B install entry since your
-   baseline was taken (entries from before it belong to an earlier,
-   already finished transaction and must not be touched; a rerun
-   after some packages were removed adds a second entry holding only
-   that run's delta, so the newest entry alone is not enough) and read
-   it first (use `zgrep` on `history.log.*.gz` if the log has rotated):
-   ```
-   since=$(sed -n 's/^started=//p' ~/arm64-baseline.txt)
-   awk -v RS= -v ORS='\n\n' -v since="$since" '
-     /Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: / {
-       if (match($0, /Start-Date: [0-9-]+  [0-9:]+/)) {
-         d = substr($0, RSTART + 12, RLENGTH - 12)
-         if (d >= since) print
-       }
-     }' /var/log/apt/history.log | grep '^Install:' \
-     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | tr ' ' '\n' | sort -u
-   ```
-   If the list is what you expect, purge exactly it:
-   ```
-   since=$(sed -n 's/^started=//p' ~/arm64-baseline.txt)
-   awk -v RS= -v ORS='\n\n' -v since="$since" '
-     /Commandline: apt install [^\n]*libasound2-dev:arm64/ && /\nInstall: / {
-       if (match($0, /Start-Date: [0-9-]+  [0-9:]+/)) {
-         d = substr($0, RSTART + 12, RLENGTH - 12)
-         if (d >= since) print
-       }
-     }' /var/log/apt/history.log | grep '^Install:' \
-     | sed 's/^Install: //; s/ ([^)]*)//g; s/, / /g' | tr ' ' '\n' | sort -u \
-     | xargs -r sudo apt purge
-   ```
-   Do not use `apt autoremove` here: it removes every unused
+1. **Packages.** `/var/log/apt/history.log` records every apt run (use
+   `zgrep` on `history.log.*.gz` if it has rotated). Find the entry whose
+   `Commandline:` is the `apt install gcc-aarch64-linux-gnu
+   libasound2-dev:arm64 pkg-config` from this runbook. Its `Install:` line
+   lists only packages that were *not* installed before that run,
+   including native ones such as `pkg-config` and auto-installed
+   dependencies. Review that list, then `sudo apt purge` the packages you
+   want gone. Do not use `apt autoremove`: it removes every unused
    auto-installed package on the host, including ones that predate this
-   procedure.
-2. **Restore the sources.** `sudo mv <file>.man47.bak <file>` for
-   whichever of `/etc/apt/sources.list` or
-   `/etc/apt/sources.list.d/ubuntu.sources` has a `.man47.bak` next to
-   it -- this block's own backup suffix, distinct from a plain `.bak`
-   some other tool may have left. Do not restore a plain `.bak` you
-   cannot confirm this block created. If no `.man47.bak` exists, this
-   block never backed that file up and there is nothing of its to
-   restore. Then handle the two ports source files by what
-   `~/arm64-baseline.txt` says: if `<name>=yes` (it existed before this
-   procedure), restore it with `sudo mv <name>.man47.bak <name>`; if
-   `<name>=no`, remove it with `sudo rm -f <name>`. The files are
-   `/etc/apt/sources.list.d/ubuntu-ports-arm64.sources` and
-   `/etc/apt/sources.list.d/ubuntu-ports-arm64.list`.
-3. **Drop the architecture only if this run added it.** If
-   `~/arm64-baseline.txt` says `arch=no`, run
-   `sudo dpkg --remove-architecture arm64`. If it says `arch=yes`, arm64
-   was already enabled before this procedure: leave it enabled (removing
-   it would not restore your original state, and dpkg will refuse while
-   the packages that predate this run remain). If a `arch=no` removal
-   refuses, something is still registered for arm64: `dpkg-query -W -f='${Package}:${Architecture}\n' | grep ':arm64$'` lists
-   what, so judge by hand whether it is yours to remove, and do not
-   purge that list wholesale.
-4. **Confirm:** `sudo apt update` should now succeed.
-5. **Reset.** Once the rollback is complete, delete the snapshot so the
-   next independent Option B run records its own starting state:
-   `rm -f ~/arm64-baseline.txt`.
+   runbook.
+2. **Sources.** The Ubuntu block backs up a default sources file once, as
+   `<file>.man47.bak`, before editing it, and writes
+   `/etc/apt/sources.list.d/ubuntu-ports-arm64.sources` (or `.list` on
+   older releases). It refuses to run if one of those ports files already
+   exists, so a ports file it wrote did not exist before. Compare
+   `diff <file>.man47.bak <file>`: restore the backup only if nothing else
+   has edited that file since, otherwise remove just the
+   `Architectures-Remove: arm64` lines (or the `[arch-=arm64]` prefixes)
+   by hand. Then remove the ports file the block wrote.
+3. **The architecture.** `dpkg --print-foreign-architectures` shows
+   whether arm64 is enabled. Remove it only if you were not using arm64
+   before this runbook: `sudo dpkg --remove-architecture arm64` (it
+   refuses while any arm64 package remains, which tells you step 1 is not
+   finished). Then `sudo apt update` should succeed.
 
-If you expect to cross-build again, a *successful* Option B run can
-simply be left in place: apt still has a working ports source backing
-the arm64 packages. Rolling back is only for when you want arm64 gone.
-Doing step 2 without step 1 and step 3 is the one unsafe combination: it
-leaves arm64 enabled with no index, and every later `apt update` fails
-with the same `binary-arm64/Packages 404` / exit-100 error this block
-exists to avoid.
+If you expect to cross-build again, leave a *successful* Option B run in
+place: apt still has a working ports source backing the arm64 packages.
+Rolling back is only for when you want arm64 gone. Skipping step 1 and
+step 3 after doing step 2 is the one unsafe combination: it leaves arm64
+enabled with no index, and every later `apt update` fails with the same
+`binary-arm64/Packages 404` / exit-100 error this section exists to avoid.
 
 **Ubuntu build host** -- Unlike Debian, Ubuntu's default mirrors
 (archive.ubuntu.com / security.ubuntu.com) don't carry an arm64 index at
@@ -335,10 +262,13 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
      *) false ;;
    esac; then
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-  if [ ! -e ~/arm64-baseline.txt ]; then
-    echo "ERROR: ~/arm64-baseline.txt is missing. Take the baseline" \
-         "snapshot (the step above this block) first, so a rollback" \
-         "knows what this host looked like; nothing below has been" \
+  if [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
+     || [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ]; then
+    echo "ERROR: an arm64 ports source file already exists" \
+         "(/etc/apt/sources.list.d/ubuntu-ports-arm64.*). If Option B" \
+         "already ran on this host, you are done. Otherwise review that" \
+         "file by hand and merge in the ports.ubuntu.com arm64 entries" \
+         "you need rather than overwriting it; nothing below has been" \
          "touched." >&2
     false
   elif [ -z "$codename" ]; then
@@ -392,15 +322,6 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
         fi
         printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null
       fi
-      # A ports source file that already existed before this procedure is
-      # kept once as .man47.bak rather than silently truncated (the
-      # baseline says whether it pre-existed, so a rerun never backs up
-      # this block's own earlier output).
-      ports=/etc/apt/sources.list.d/ubuntu-ports-arm64.sources
-      if grep -qx 'ubuntu-ports-arm64.sources=yes' ~/arm64-baseline.txt \
-         && [ ! -e "$ports.man47.bak" ]; then
-        sudo cp -- "$ports" "$ports.man47.bak"
-      fi
       sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
 Types: deb
 URIs: http://ports.ubuntu.com/ubuntu-ports
@@ -423,11 +344,6 @@ EOF
       else
         sudo sed -i.man47.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
           /etc/apt/sources.list
-      fi
-      ports=/etc/apt/sources.list.d/ubuntu-ports-arm64.list
-      if grep -qx 'ubuntu-ports-arm64.list=yes' ~/arm64-baseline.txt \
-         && [ ! -e "$ports.man47.bak" ]; then
-        sudo cp -- "$ports" "$ports.man47.bak"
       fi
       sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
 deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
