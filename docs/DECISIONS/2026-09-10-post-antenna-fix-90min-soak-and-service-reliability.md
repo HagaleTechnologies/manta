@@ -1,4 +1,4 @@
-# Post-antenna-fix 90-minute (wall-clock) unattended soak: real detection confirmed at scale; SDRplay service reliability is a real, recurring operational problem
+# Post-antenna-fix 90-minute (wall-clock) unattended soak: real detection confirmed at scale; SDRplay stream/device failures are a real, recurring operational problem
 
 Follow-up to `docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md`.
 That doc confirmed the antenna/feedline fix (reseated connections + common-
@@ -60,7 +60,7 @@ currently-registered US callsign via QRZ.com and QRZCQ.
 the antenna/feedline fix produces real, externally-verifiable detections
 repeatably, not as a one-off.
 
-## Result 2 (new): the SDRplay API service crashed twice more during this soak, disrupting half the test
+## Result 2 (new): the SDRplay stream failed twice more during this soak, disrupting half the test
 
 Of 4 planned cycles:
 - Cycle 1: completed cleanly, full duration.
@@ -115,9 +115,14 @@ failures and reset the process state that soak is meant to exercise, so it
 must not be cycled. Surviving that run depends on the service-reliability
 problem being mitigated or fixed first, not worked around by restarts.
 
-The underlying SDRplay service reliability issue itself (why it crashes
-under sustained ~192 kS/s streaming, and why it sometimes self-recovers
-and sometimes doesn't) is outside this repo's control -- it's SDRplay's
-own API service, not manta code -- but is worth tracking as a known
-operational hazard for anyone running unattended live-hardware sessions
-with this hardware.
+The root cause of these failures is not established. The observations are
+stream-activation and enumeration failures (`sdrplay_api_ServiceNotResponding`,
+"No devices found!"). This soak recorded no daemon-status or service-log
+check, and the earlier record
+(`docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`)
+says a proper client-holder check was not done and that activation kept
+failing after a service restart until the USB device was replugged. The
+cause could be the SDRplay API service, the USB/device path, or something
+on the manta side; none of those has been ruled out. It is worth tracking as
+a known operational hazard for anyone running unattended live-hardware
+sessions with this hardware.
