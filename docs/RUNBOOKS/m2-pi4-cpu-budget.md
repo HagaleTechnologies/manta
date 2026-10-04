@@ -224,9 +224,10 @@ package is still registered for it:
 2. **Sources.** The Ubuntu block backs up a default sources file once, as
    `<file>.man47.bak`, before editing it, and writes
    `/etc/apt/sources.list.d/ubuntu-ports-arm64.sources` (or `.list` on
-   older releases). The block keeps a ports file that already has an active
-   `ports.ubuntu.com` entry (from an interrupted earlier run or your own), so
-   the file's presence does not prove this run wrote it. Remove it only
+   older releases). The block keeps a ports file only if it is byte-identical to what
+   the block itself writes (an interrupted or completed earlier run), and
+   refuses any other; so an identical file may pre-date this run, and its
+   presence does not prove this run wrote it. Remove it only
    if you know it was created by this runbook (check its mtime against
    `history.log`, or whether you had a ports source before); a file you
    customised stays. A `<file>.man47.bak` that predates your current run
@@ -268,35 +269,32 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
      *) false ;;
    esac; then
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-  # A ports source file with an ACTIVE ports.ubuntu.com entry (one this block
-  # wrote on an interrupted earlier run, or one you customised) is kept as-is,
-  # so a rerun resumes at apt update/install without overwriting it. A file
-  # that merely mentions the URL in a comment, or a deb822 stanza with
-  # `Enabled: no`, is NOT active and is refused like any other unknown file.
-  ports_active_sources() {  # deb822: some stanza has a ports URIs line, not disabled
-    awk -v RS='' 'BEGIN { ok = 1 }
-      { u = 0; d = 0; n = split($0, l, "\n")
-        for (i = 1; i <= n; i++) {
-          if (l[i] ~ /^URIs:.*ports\.ubuntu\.com/) u = 1
-          if (tolower(l[i]) ~ /^enabled:[[:space:]]*(no|false)[[:space:]]*$/) d = 1
-        }
-        if (u && !d) ok = 0 }
-      END { exit ok }' "$1"
-  }
-  ports_active_list() {  # one-line: an uncommented deb line naming ports
-    grep -Eqs '^[[:space:]]*deb[[:space:]].*ports\.ubuntu\.com' "$1"
-  }
-  if { [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
-       && ! ports_active_sources \
-            /etc/apt/sources.list.d/ubuntu-ports-arm64.sources; } \
-     || { [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ] \
-          && ! ports_active_list \
-               /etc/apt/sources.list.d/ubuntu-ports-arm64.list; }; then
-    echo "ERROR: /etc/apt/sources.list.d/ubuntu-ports-arm64.* exists but" \
-         "has no active ports.ubuntu.com entry (a commented-out line or" \
-         "'Enabled: no' does not count). Review it by hand and merge" \
-         "in the ports.ubuntu.com arm64 entries you need rather than" \
-         "overwriting it; nothing below has been touched." >&2
+  keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+  ports_src=/etc/apt/sources.list.d/ubuntu-ports-arm64.sources
+  ports_lst=/etc/apt/sources.list.d/ubuntu-ports-arm64.list
+  # The exact text this block writes. It is defined once, up front, so the
+  # same strings are both compared against an existing file and written.
+  ports_src_want="Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: ${codename} ${codename}-updates ${codename}-security
+Components: main
+Architectures: arm64
+Signed-By: ${keyring}"
+  ports_lst_want="deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
+deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main
+deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main"
+  # An existing ports source file is kept only if it is byte-for-byte what
+  # this block would write (an interrupted or completed earlier run of this
+  # block), so a rerun resumes at apt update/install. Anything else -- a
+  # customised, edited, disabled, deb-src or other-architecture file -- is
+  # refused rather than guessed at.
+  if { [ -e "$ports_src" ] && [ "$(cat -- "$ports_src")" != "$ports_src_want" ]; } \
+     || { [ -e "$ports_lst" ] && [ "$(cat -- "$ports_lst")" != "$ports_lst_want" ]; }; then
+    echo "ERROR: /etc/apt/sources.list.d/ubuntu-ports-arm64.* exists but is" \
+         "not identical to what this block writes. Review it by hand and" \
+         "merge in the ports.ubuntu.com arm64 entries you need rather than" \
+         "overwriting it (or, to skip this block, run the apt update/install" \
+         "step yourself); nothing below has been touched." >&2
     false
   elif [ -z "$codename" ]; then
     echo "ERROR: \$UBUNTU_CODENAME is empty in /etc/os-release on" \
@@ -311,7 +309,6 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
     false
   else
     sudo dpkg --add-architecture arm64
-    keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
       # 24.04 (noble) and later: deb822 stanza format. Architectures-Remove
       # is a per-stanza field, so check and patch each stanza individually
@@ -349,15 +346,8 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
         fi
         printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null
       fi
-      [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
-        || sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null <<EOF
-Types: deb
-URIs: http://ports.ubuntu.com/ubuntu-ports
-Suites: ${codename} ${codename}-updates ${codename}-security
-Components: main
-Architectures: arm64
-Signed-By: ${keyring}
-EOF
+      [ -e "$ports_src" ] \
+        || printf '%s\n' "$ports_src_want" | sudo tee "$ports_src" >/dev/null
     else
       # 22.04 (jammy) and earlier, and in-place upgrades that kept this
       # format: classic one-line format. The substitution itself is
@@ -373,12 +363,8 @@ EOF
         sudo sed -i.man47.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
           /etc/apt/sources.list
       fi
-      [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ] \
-        || sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<EOF
-deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename} main
-deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main
-deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main
-EOF
+      [ -e "$ports_lst" ] \
+        || printf '%s\n' "$ports_lst_want" | sudo tee "$ports_lst" >/dev/null
     fi
     sudo apt update && \
       sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
