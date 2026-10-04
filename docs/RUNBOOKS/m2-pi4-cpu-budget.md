@@ -309,6 +309,10 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
     false
   else
     sudo dpkg --add-architecture arm64
+    # Cleared by any failed source edit below, so a half-edited source set
+    # never reaches `apt update` (this block is pasted, so there is no
+    # `set -e` to stop it).
+    man47_ok=1
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
       # 24.04 (noble) and later: deb822 stanza format. Architectures-Remove
       # is a per-stanza field, so check and patch each stanza individually
@@ -341,13 +345,19 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
         }
       ' "$src")
       if [ -n "$fixed" ] && [ "$fixed" != "$(cat -- "$src")" ]; then
-        if [ ! -e "$src.man47.bak" ]; then
-          sudo cp -- "$src" "$src.man47.bak"
+        # Back up first and write only if the backup exists, so a failed
+        # copy (e.g. a full disk) never leaves a rewritten file with no
+        # restore point.
+        if [ -e "$src.man47.bak" ] || sudo cp -- "$src" "$src.man47.bak"; then
+          printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null || man47_ok=0
+        else
+          echo "ERROR: could not back up $src; leaving it unchanged." >&2
+          man47_ok=0
         fi
-        printf '%s\n' "$fixed" | sudo tee -- "$src" >/dev/null
       fi
-      [ -e "$ports_src" ] \
-        || printf '%s\n' "$ports_src_want" | sudo tee "$ports_src" >/dev/null
+      [ "$man47_ok" = 1 ] && { [ -e "$ports_src" ] \
+        || printf '%s\n' "$ports_src_want" | sudo tee "$ports_src" >/dev/null \
+        || man47_ok=0; }
     else
       # 22.04 (jammy) and earlier, and in-place upgrades that kept this
       # format: classic one-line format. The substitution itself is
@@ -358,16 +368,23 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
       # once, on the first run:
       if [ -e /etc/apt/sources.list.man47.bak ]; then
         sudo sed -i -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
-          /etc/apt/sources.list
+          /etc/apt/sources.list || man47_ok=0
       else
         sudo sed -i.man47.bak -E 's|^(deb[[:space:]]+)([a-z0-9+.-]+:)|\1[arch-=arm64] \2|' \
-          /etc/apt/sources.list
+          /etc/apt/sources.list || man47_ok=0
       fi
-      [ -e "$ports_lst" ] \
-        || printf '%s\n' "$ports_lst_want" | sudo tee "$ports_lst" >/dev/null
+      [ "$man47_ok" = 1 ] && { [ -e "$ports_lst" ] \
+        || printf '%s\n' "$ports_lst_want" | sudo tee "$ports_lst" >/dev/null \
+        || man47_ok=0; }
     fi
-    sudo apt update && \
-      sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+    if [ "$man47_ok" = 1 ]; then
+      sudo apt update && \
+        sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
+    else
+      echo "ERROR: a source edit above failed; skipping apt update/install so" \
+           "a half-edited source set is not used. Fix the error and rerun." >&2
+      false
+    fi
   fi
 else
   if case " $(. /etc/os-release && printf '%s' "$ID_LIKE") " in
