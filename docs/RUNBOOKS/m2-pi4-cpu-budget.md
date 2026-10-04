@@ -224,8 +224,8 @@ package is still registered for it:
 2. **Sources.** The Ubuntu block backs up a default sources file once, as
    `<file>.man47.bak`, before editing it, and writes
    `/etc/apt/sources.list.d/ubuntu-ports-arm64.sources` (or `.list` on
-   older releases). The block keeps a ports file that already references
-   `ports.ubuntu.com` (from an interrupted earlier run or your own), so
+   older releases). The block keeps a ports file that already has an active
+   `ports.ubuntu.com` entry (from an interrupted earlier run or your own), so
    the file's presence does not prove this run wrote it. Remove it only
    if you know it was created by this runbook (check its mtime against
    `history.log`, or whether you had a ports source before); a file you
@@ -268,18 +268,33 @@ if case " $(. /etc/os-release && printf '%s' "$ID") " in
      *) false ;;
    esac; then
   codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-  # A ports source file that already points at ports.ubuntu.com (one this
-  # block wrote on an interrupted earlier run, or one you customised) is kept
-  # as-is, so a rerun resumes at apt update/install without overwriting it.
-  # Only a ports file that does NOT reference ports.ubuntu.com is refused.
+  # A ports source file with an ACTIVE ports.ubuntu.com entry (one this block
+  # wrote on an interrupted earlier run, or one you customised) is kept as-is,
+  # so a rerun resumes at apt update/install without overwriting it. A file
+  # that merely mentions the URL in a comment, or a deb822 stanza with
+  # `Enabled: no`, is NOT active and is refused like any other unknown file.
+  ports_active_sources() {  # deb822: some stanza has a ports URIs line, not disabled
+    awk -v RS='' 'BEGIN { ok = 1 }
+      { u = 0; d = 0; n = split($0, l, "\n")
+        for (i = 1; i <= n; i++) {
+          if (l[i] ~ /^URIs:.*ports\.ubuntu\.com/) u = 1
+          if (tolower(l[i]) ~ /^enabled:[[:space:]]*(no|false)[[:space:]]*$/) d = 1
+        }
+        if (u && !d) ok = 0 }
+      END { exit ok }' "$1"
+  }
+  ports_active_list() {  # one-line: an uncommented deb line naming ports
+    grep -Eqs '^[[:space:]]*deb[[:space:]].*ports\.ubuntu\.com' "$1"
+  }
   if { [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.sources ] \
-       && ! grep -qs 'ports.ubuntu.com' \
+       && ! ports_active_sources \
             /etc/apt/sources.list.d/ubuntu-ports-arm64.sources; } \
      || { [ -e /etc/apt/sources.list.d/ubuntu-ports-arm64.list ] \
-          && ! grep -qs 'ports.ubuntu.com' \
+          && ! ports_active_list \
                /etc/apt/sources.list.d/ubuntu-ports-arm64.list; }; then
     echo "ERROR: /etc/apt/sources.list.d/ubuntu-ports-arm64.* exists but" \
-         "does not reference ports.ubuntu.com. Review it by hand and merge" \
+         "has no active ports.ubuntu.com entry (a commented-out line or" \
+         "'Enabled: no' does not count). Review it by hand and merge" \
          "in the ports.ubuntu.com arm64 entries you need rather than" \
          "overwriting it; nothing below has been touched." >&2
     false
