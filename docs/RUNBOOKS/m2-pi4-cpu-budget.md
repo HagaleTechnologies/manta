@@ -308,10 +308,11 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
          "cleanup is needed for this path." >&2
     false
   else
-    sudo dpkg --add-architecture arm64
     # Cleared by any failed source edit below, so a half-edited source set
     # never reaches `apt update` (this block is pasted, so there is no
-    # `set -e` to stop it).
+    # `set -e` to stop it). arm64 is enabled in dpkg only AFTER every source
+    # edit succeeds, so a failed edit leaves dpkg's architecture list alone
+    # and later `apt update` runs are not broken.
     man47_ok=1
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
       # 24.04 (noble) and later: deb822 stanza format. Architectures-Remove
@@ -378,11 +379,13 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
         || man47_ok=0; }
     fi
     if [ "$man47_ok" = 1 ]; then
-      sudo apt update && \
+      sudo dpkg --add-architecture arm64 && \
+        sudo apt update && \
         sudo apt install gcc-aarch64-linux-gnu libasound2-dev:arm64 pkg-config
     else
-      echo "ERROR: a source edit above failed; skipping apt update/install so" \
-           "a half-edited source set is not used. Fix the error and rerun." >&2
+      echo "ERROR: a source edit above failed; arm64 was not enabled and apt" \
+           "update/install were skipped so a half-edited source set is not" \
+           "used. Fix the error and rerun." >&2
       false
     fi
   fi
