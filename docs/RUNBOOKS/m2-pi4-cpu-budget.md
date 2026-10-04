@@ -234,8 +234,11 @@ package is still registered for it:
    is from an earlier run: the block never overwrites it, so it may be
    stale. Compare `diff <file>.man47.bak <file>`: restore the backup only
    if nothing else has edited that file since, otherwise remove just the
-   `Architectures-Remove: arm64` lines (or the `[arch-=arm64]` prefixes)
-   by hand. Delete each `.man47.bak` once you are done, so a later
+   `arm64` token by hand: delete an `Architectures-Remove: arm64` line only
+   if `arm64` is its only value, and from a combined line such as
+   `Architectures-Remove: i386 arm64` delete only the `arm64` word so the
+   existing `i386` exclusion stays; likewise remove the `arm64` from an
+   `[arch-=arm64]` prefix, or the whole prefix if that is all it holds. Delete each `.man47.bak` once you are done, so a later
    independent run starts from a fresh backup instead of a stale one.
 3. **The architecture.** `dpkg --print-foreign-architectures` shows
    whether arm64 is enabled. Remove it only if you were not using arm64
