@@ -332,10 +332,10 @@ deb [arch=arm64 signed-by=${keyring}] http://ports.ubuntu.com/ubuntu-ports ${cod
           n = split($0, lines, "\n")
           has_uris = 0; arch_line = 0; has_arm64 = 0
           for (i = 1; i <= n; i++) {
-            if (lines[i] ~ /^URIs:/) has_uris = 1
-            if (lines[i] ~ /^Architectures-Remove:/) {
+            if (tolower(lines[i]) ~ /^uris:/) has_uris = 1
+            if (tolower(lines[i]) ~ /^architectures-remove:/) {
               arch_line = i
-              if (lines[i] ~ /arm64/) has_arm64 = 1
+              if (tolower(lines[i]) ~ /arm64/) has_arm64 = 1
             }
           }
           if (arch_line && !has_arm64) lines[arch_line] = lines[arch_line] " arm64"
