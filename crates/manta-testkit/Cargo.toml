@@ -18,8 +18,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 manta-decode = { workspace = true }
 manta-dsp = { workspace = true }
+manta-input = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-manta-input = { workspace = true }
 tempfile = { workspace = true }

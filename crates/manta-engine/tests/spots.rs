@@ -19,6 +19,10 @@ fn decode_samples_spots_a_repeated_valid_callsign() {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
     let report = decode_samples(&iq, 96_000.0, 14_000_000.0, &PipelineConfig::default()).unwrap();
@@ -49,6 +53,10 @@ fn decode_samples_applies_freq_correction_consistently_to_report_and_spots() {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
     let cfg = PipelineConfig {
@@ -106,6 +114,10 @@ fn decode_samples_calibrates_track_meta_events_too() {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
 
@@ -187,6 +199,10 @@ fn decode_samples_spots_an_allowlisted_call_despite_bogus_cty_prefix() {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
     let cfg = PipelineConfig {
@@ -214,6 +230,10 @@ fn decode_samples_rejects_an_invalid_freq_correction_ppm() {
         qsb: None,
         watterson: None,
         char_wpm: None,
+        weight: 3.0,
+        char_gap_units: 3.0,
+        word_gap_units: 7.0,
+        rise_ms: 5.0,
     };
     let (iq, _texts) = render_scene(std::slice::from_ref(&sig), 96_000.0, 30.0, Some(1)).unwrap();
     let cfg = PipelineConfig {
