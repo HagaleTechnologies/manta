@@ -58,11 +58,14 @@ enum Command {
         config: Option<PathBuf>,
         /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
         ///
-        /// `hsmm` is complete but not yet measured against the default, so
-        /// treat it as experimental. Left unset rather than defaulting, so
-        /// that an explicit choice can be told apart from no choice at all:
-        /// when --config also names an engine, this flag wins if given, and
-        /// the file's value is used otherwise.
+        /// `hsmm` is experimental: it was tested and did not pass the accuracy
+        /// and CPU-cost checks needed to become the default. Left unset
+        /// rather than defaulting, so that an explicit choice can be told
+        /// apart from no choice at all: when --config also names an engine,
+        /// this flag wins if given, and the file's value is used otherwise.
+        // hsmm's promotion gate was measured and failed on 2026-09-09, on both
+        // accuracy and CPU budget:
+        // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
         #[command(flatten)]
@@ -104,11 +107,14 @@ enum Command {
         config: Option<PathBuf>,
         /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
         ///
-        /// `hsmm` is complete but not yet measured against the default, so
-        /// treat it as experimental. Left unset rather than defaulting, so
-        /// that an explicit choice can be told apart from no choice at all:
-        /// when --config also names an engine, this flag wins if given, and
-        /// the file's value is used otherwise.
+        /// `hsmm` is experimental: it was tested and did not pass the accuracy
+        /// and CPU-cost checks needed to become the default. Left unset
+        /// rather than defaulting, so that an explicit choice can be told
+        /// apart from no choice at all: when --config also names an engine,
+        /// this flag wins if given, and the file's value is used otherwise.
+        // hsmm's promotion gate was measured and failed on 2026-09-09, on both
+        // accuracy and CPU budget:
+        // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
         /// Write one JSON object per reference spot to this file. The
@@ -305,11 +311,14 @@ enum Command {
         replay_epoch: Option<i64>,
         /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
         ///
-        /// `hsmm` is complete but not yet measured against the default, so
-        /// treat it as experimental. Left unset rather than defaulting, so
-        /// that an explicit choice can be told apart from no choice at all:
-        /// when --config also names an engine, this flag wins if given, and
-        /// the file's value is used otherwise.
+        /// `hsmm` is experimental: it was tested and did not pass the accuracy
+        /// and CPU-cost checks needed to become the default. Left unset
+        /// rather than defaulting, so that an explicit choice can be told
+        /// apart from no choice at all: when --config also names an engine,
+        /// this flag wins if given, and the file's value is used otherwise.
+        // hsmm's promotion gate was measured and failed on 2026-09-09, on both
+        // accuracy and CPU budget:
+        // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
         #[command(flatten)]
@@ -919,10 +928,10 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
 
 /// `Engine::Hsmm` (Task 8: `TrackDecoder::push_hop_hsmm`) is a real, fully
 /// implemented and reviewed engine as of Task 11 -- it parses through like
-/// `legacy`/`edge-legacy`. It remains experimental/unmeasured for
-/// production use (SPEC v2 §8.4, Tasks 11-12 measure it), but that's a
-/// deployment/support-posture question for operators choosing `--engine
-/// hsmm` explicitly, not a reason to reject it at the CLI.
+/// `legacy`/`edge-legacy`. It remains experimental (its stage-2 gate was
+/// measured and failed, docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md),
+/// but that's a deployment/support-posture question for operators choosing
+/// `--engine hsmm` explicitly, not a reason to reject it at the CLI.
 fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
     s.parse()
 }
@@ -2951,6 +2960,37 @@ mod tests {
         assert!(
             bad.is_empty(),
             "internal jargon in --help:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// `hsmm` was measured against `legacy` and failed its promotion gate
+    /// (docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md), so no
+    /// `--engine` help may tell an operator it is unmeasured.
+    #[test]
+    fn engine_help_does_not_call_hsmm_unmeasured() {
+        use clap::CommandFactory as _;
+        let re = regex::Regex::new(r"(?i)unmeasured|not\s+(yet\s+)?measured").unwrap();
+        let mut out = Vec::new();
+        help_strings(&Cli::command(), "manta", &mut out);
+        let engine: Vec<_> = out.iter().filter(|(_, who, _)| who == "--engine").collect();
+        // decode, oracle and run each take --engine; an empty walk would
+        // pass vacuously. Count commands, not strings: each arg yields both
+        // a short and a long help string.
+        let commands: std::collections::BTreeSet<_> =
+            engine.iter().map(|(path, _, _)| path).collect();
+        assert!(
+            commands.len() >= 3,
+            "found --engine on {commands:?}, expected decode, oracle and run"
+        );
+        let bad: Vec<String> = engine
+            .iter()
+            .filter(|(_, _, text)| re.is_match(text))
+            .map(|(path, _, text)| format!("{path}: {text}"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "--engine help calls hsmm unmeasured:\n{}",
             bad.join("\n")
         );
     }

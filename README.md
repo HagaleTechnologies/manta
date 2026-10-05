@@ -161,9 +161,7 @@ off-table recording. Replay runs faster than realtime, so the hardware-free
 path above stops at `decode`; a paced replay that can drive the servers
 below is being worked on.
 
-`manta --help` lists every subcommand and flag. The older `--kiwi-freq` /
-`--soapy-freq` / `--soapy-rate` / `--hpsdr-freq` / `--hpsdr-rate` spellings
-still work.
+`manta --help` lists every subcommand and flag.
 
 ## Run it as a node
 
@@ -213,6 +211,11 @@ before you widen it, read
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+
+The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
+`--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
+`--hpsdr-rate-hz`. The older `--kiwi-freq` / `--soapy-freq` /
+`--soapy-rate` / `--hpsdr-freq` / `--hpsdr-rate` spellings still work.
 
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
