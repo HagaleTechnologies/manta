@@ -5,6 +5,10 @@ designed to be internet-reachable with no authentication, matching the DX
 cluster/RBN ecosystem's own long-standing convention (ARCHITECTURE.md §7).
 The Prometheus metrics endpoint is different: it's operationally useful, not
 part of that public-facing contract, and carries no authentication either.
+**`GET /healthz` (MAN-128) shares the metrics listener and its bind
+address/port** — it is not a separate port, so every mitigation below that
+applies to `[server].metrics_port` covers `/healthz` too. See
+`docs/RUNBOOKS/node-health.md` for its semantics.
 
 By default all three bind to `[server].bind_addr`, which defaults to
 `0.0.0.0` — every configured port is reachable from any network that can

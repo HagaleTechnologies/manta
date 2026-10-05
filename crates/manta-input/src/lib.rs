@@ -116,8 +116,9 @@ pub trait IqSource {
     /// Shared packet-loss/malformed counters for sources that can lose or
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
-    /// packets, and KiwiSDR/SoapySDR/audio currently count nothing of the
-    /// kind. A caller with `Some(handle)` may keep polling it after the
+    /// packets. KiwiSDR counts SND `seq` gaps and short frames (MAN-128);
+    /// SoapySDR/audio currently count nothing of the kind. A caller with
+    /// `Some(handle)` may keep polling it after the
     /// source itself has been moved into `manta_engine::listen`, which is
     /// the whole reason this is a shared handle rather than a `&self`
     /// snapshot getter.

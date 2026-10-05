@@ -3923,6 +3923,23 @@ mod tests {
             .contains("manta_input_malformed_packets_total{"));
     }
 
+    /// MAN-128: pins the label path for a non-HPSDR source. The daemon's
+    /// `health_counters()` wiring (above `input_health_of`) is already
+    /// generic over `source_name` -- this confirms a Kiwi-shaped source's
+    /// counters reach `/metrics` under `source="kiwi"` with no CLI change.
+    #[test]
+    fn kiwi_like_source_counters_reach_metrics_under_kiwi_label() {
+        let counters = manta_input::InputHealthCounters::new();
+        counters.record_gap();
+        counters.record_dropped(3);
+
+        let m = manta_server::metrics::Metrics::new();
+        m.set_input_health("kiwi", input_health_of(&counters));
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_input_gaps_detected_total{source="kiwi"} 1"#));
+        assert!(text.contains(r#"manta_input_dropped_packets_total{source="kiwi"} 3"#));
+    }
+
     // MAN-136 round-1 validate code-review finding 1: the increment
     // condition for `manta_spots_unresolved_geography_total` must match the
     // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
