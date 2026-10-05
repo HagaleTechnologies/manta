@@ -6,6 +6,7 @@ pub mod bounded_io;
 pub mod bus;
 pub mod command;
 pub mod config;
+pub mod iac;
 pub mod json_stream;
 pub mod metrics;
 pub mod metrics_http;
