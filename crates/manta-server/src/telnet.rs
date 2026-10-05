@@ -1,13 +1,17 @@
 //! Telnet DX-cluster server. ARCHITECTURE §7: "standard login prompt,
 //! emits RBN-format spots... enough command grammar (`sh/dx`, filters) for
-//! common clients not to choke." No real telnet IAC option negotiation --
-//! real cluster nodes and clients (N1MM, stock `telnet`) work fine over
-//! plain line-oriented text, and skipping IAC keeps this a small,
-//! auditable text protocol (MAN-22/23 harden it further).
+//! common clients not to choke." Line-oriented text protocol; telnet IAC
+//! option negotiation is stripped and refused rather than implemented
+//! (`crate::iac`) -- MAN-87: the earlier "skip IAC entirely" stance held
+//! for `nc` and piped `telnet`, but Windows `telnet.exe`, PuTTY's telnet
+//! mode and most DX-cluster clients negotiate on connect, and their
+//! `0xFF` bytes were failing the login read's UTF-8 validation outright
+//! (MAN-22/23 harden this listener further).
 
-use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
+use crate::bounded_io::{read_line_bounded_telnet, read_line_bounded_telnet_with_timeout};
 use crate::bus::SpotBus;
 use crate::command::{self, Command};
+use crate::iac::IacFilter;
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::rbn;
@@ -148,7 +152,7 @@ const REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 /// two cases apart: `Logged` for an error a specific branch already
 /// reported (the catch-all skips it), `Unlogged` for anything else. The
 /// blanket `From<std::io::Error>` impl below defaults every OTHER
-/// fallible site (the bare `?` writes) to `Unlogged`, so they keep
+/// fallible site (the handshake writes) to `Unlogged`, so they keep
 /// reaching the catch-all exactly as before -- a future fallible call
 /// site added without an explicit `Logged` wrap still gets caught by it,
 /// preserving MAN-59's original "no disconnect goes unrecorded" guarantee
@@ -345,7 +349,12 @@ async fn handle_client(
     // pre-login client.
     tokio::select! {
         result = write_with_timeout(&mut wr, b"login: \r\n") => {
-            result?;
+            // Same accounting as the negotiation-refusal write below
+            // (MAN-87 remediation, PR #129 Codex review).
+            if let Err(e) = result {
+                metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Err(e.into());
+            }
         }
         _ = shutdown.changed() => {
             if log_enabled {
@@ -356,8 +365,13 @@ async fn handle_client(
         }
     }
     let mut login_line = String::new();
+    // Owned here, not inside the read: an IAC sequence can straddle a
+    // chunk boundary and the command read below is cancelled mid-line by
+    // `tokio::select!`, so the filter's parse state has to outlive any
+    // single read the same way `cmd_line` does.
+    let mut iac = IacFilter::new();
     let login_result = tokio::select! {
-        result = read_line_bounded_with_timeout(&mut reader, &mut login_line) => result,
+        result = read_line_bounded_telnet_with_timeout(&mut reader, &mut login_line, &mut iac) => result,
         _ = shutdown.changed() => {
             if log_enabled {
                 tracing::info!("telnet: shutdown signalled during login read, disconnecting");
@@ -381,19 +395,41 @@ async fn handle_client(
             return Err(ClientError::Logged);
         }
     }
+    // Answer the negotiation the client opened with, before the greeting.
+    // RFC 854 negotiation is asynchronous -- no client blocks waiting for
+    // a reply before sending its callsign -- so batching the refusals to
+    // the end of the login read costs nothing and keeps the writer out of
+    // `bounded_io`.
+    if iac.has_replies() {
+        let replies = iac.take_replies();
+        if let Err(e) = write_with_timeout(&mut wr, &replies).await {
+            // MAN-87 remediation (PR #129 Codex review): a bare `?` here
+            // ended the task through the logging-only catch-all, abandoning
+            // whatever queued on `rx` during the login read uncounted. A
+            // control-frame write, so nothing was in flight (`false`); the
+            // error still propagates so the catch-all logs it.
+            metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Err(e.into());
+        }
+    }
     // MAN-59 review: the login line is client-supplied and unvalidated --
     // Display (`%`) writes it into the log verbatim, letting an
     // unauthenticated client embed CRs/ANSI escapes to forge additional
     // bogus log lines or manipulate terminal output. Debug (`?`) escapes
     // control characters instead.
+    let login = trim_login(&login_line);
     if log_enabled {
-        tracing::info!(login = ?login_line.trim(), "telnet: client logged in");
+        tracing::info!(login = ?login, "telnet: client logged in");
     }
 
     let banner = format!("de {station_call}-# >\r\n");
     tokio::select! {
         result = write_with_timeout(&mut wr, banner.as_bytes()) => {
-            result?;
+            // Same accounting as the negotiation-refusal write above.
+            if let Err(e) = result {
+                metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Err(e.into());
+            }
         }
         _ = shutdown.changed() => {
             if log_enabled {
@@ -408,7 +444,7 @@ async fn handle_client(
     const DEFAULT_SHOW_DX_COUNT: usize = 10;
     let mut min_unique: Option<u32> = None;
     // Not cleared at the top of the loop, deliberately: `tokio::select!`
-    // can cancel `read_line_bounded_with_timeout` mid-line (a spot arrived
+    // can cancel `read_line_bounded_telnet` mid-line (a spot arrived
     // first), and the bytes it already consumed from `reader` were
     // already appended into `cmd_line` as a side effect before that
     // cancellation point -- clearing here would discard them, silently
@@ -504,7 +540,7 @@ async fn handle_client(
             // a filter ack), so leaving it enabled after shutdown was
             // signalled would let a chatty client keep pushing the drain
             // arm out of the way with writes of its own.
-            n = read_line_bounded(&mut reader, &mut cmd_line), if !shutdown.has_changed().unwrap_or(true) => {
+            n = read_line_bounded_telnet(&mut reader, &mut cmd_line, &mut iac), if !shutdown.has_changed().unwrap_or(true) => {
                 let n = match n {
                     Ok(n) => n,
                     Err(e) => {
@@ -514,6 +550,33 @@ async fn handle_client(
                         return Err(ClientError::Logged);
                     }
                 };
+                // Mid-session negotiation (rare once every option has
+                // been refused once) is answered here rather than inside
+                // the read: `wr` is already mutably borrowed by this
+                // `select!`'s spot-writing branch, so the read future
+                // cannot hold it too.
+                if iac.has_replies() {
+                    let replies = iac.take_replies();
+                    if write_with_timeout(&mut wr, &replies).await.is_err() {
+                        // A bare `Ok(())` here (the prior behavior) was the
+                        // only write-failure site in this function that
+                        // left the accounting gap open -- the same one
+                        // every other write site already closes (round-15
+                        // review finding). The failed write itself isn't a
+                        // queued spot, so only the retained live-channel
+                        // backlog counts here (no `1 +`), matching the
+                        // filter-ack site below.
+                        // MAN-87 remediation (round-4 validation, code-
+                        // review finding F1).
+                        if log_enabled {
+                            tracing::warn!(
+                                "telnet: negotiation reply write failed, disconnecting"
+                            );
+                        }
+                        metrics.record_write_failed(rx.len() as u64);
+                        return Ok(());
+                    }
+                }
                 if n == 0 {
                     if log_enabled {
                         tracing::info!("telnet: client disconnected");
@@ -552,7 +615,18 @@ async fn handle_client(
                 // or bare `Unknown`), never the raw client-supplied line,
                 // which is unescaped and could otherwise inject the same
                 // way the login field could (see the fix just above).
-                let parsed_command = command::parse(&cmd_line);
+                //
+                // MAN-87 remediation (code-review finding 1): trimmed with
+                // the same predicate as the login line before parsing.
+                // `read_line_bounded_telnet` now recognizes CR NUL as a
+                // line terminator (interactive BSD/macOS `telnet(1)`), and
+                // both terminator bytes stay in `cmd_line`; `command::parse`
+                // only calls `str::trim`, which does not strip NUL, so
+                // `"sh/dx\r\0"` tokenized to `["SH", "DX", "\0"]` and every
+                // command from that client class was silently `Unknown`.
+                // `command.rs` is outside this ticket's change scope, so
+                // the trim happens at this call site instead of inside it.
+                let parsed_command = command::parse(trim_login(&cmd_line));
                 if log_enabled {
                     tracing::info!(command = ?parsed_command, "telnet: command received");
                 }
@@ -840,4 +914,40 @@ async fn write_with_timeout(
     tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))?
+}
+
+/// Strips the framing a real telnet client wraps its callsign in.
+///
+/// MAN-87 scenario 2: RFC 854's NVT encodes Enter as CR NUL, and macOS
+/// `telnet(1)` with piped stdin sends exactly that. `str::trim` alone is
+/// not enough -- it stops at the first character that is not Unicode
+/// whitespace, and NUL is not whitespace, so a trailing `\r\0` keeps BOTH
+/// bytes (the NUL stops the scan before the CR is ever reached) and they
+/// end up in the audit log, and in whatever identity this value grows
+/// into.
+///
+/// Trimming only: rejecting an implausible callsign is MAN-86's scope
+/// (its `sanitize_login` is this predicate plus shape checks, and
+/// subsumes this function on rebase -- see the plan's rebase rule).
+fn trim_login(raw: &str) -> &str {
+    raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_login_strips_the_cr_nul_a_real_telnet_client_sends() {
+        // Baseline first -- this is exactly why `str::trim` alone was not
+        // enough: NUL is not Unicode whitespace, so `trim` stops at it and
+        // never reaches the CR one position in.
+        assert_eq!("W5AU\r\u{0}".trim(), "W5AU\r\u{0}");
+
+        assert_eq!(trim_login("W5AU\r\u{0}"), "W5AU");
+        assert_eq!(trim_login("W5AU\r\u{0}\n"), "W5AU");
+        assert_eq!(trim_login("  W5AU  \r\n"), "W5AU");
+        assert_eq!(trim_login("W5AU\r\n"), "W5AU");
+        assert_eq!(trim_login("W5AU"), "W5AU");
+    }
 }
