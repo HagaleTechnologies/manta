@@ -25,7 +25,11 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 
 ## Status caveat
 
-A schema now exists in dispensa and rejects malformed batches — this is no longer design-phase. `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are required and non-nullable on it; every spot carries real or named-sentinel values for all five (never `null`), per `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`, which is the authoritative record of what each field means when a callsign doesn't resolve — see that doc and ARCHITECTURE §7 rather than restating the field set here. Validated spots reaching these surfaces come from [[spot-validation]].
+A schema now exists in dispensa and rejects malformed batches — this is no longer design-phase. `dxDxcc`/`deDxcc`/`dxContinent`/`deContinent`/`dxCqZone` are required and non-nullable on it; every spot carries real or named-sentinel values for all five (never `null`), per `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`, which is the authoritative record of what each field means when a callsign doesn't resolve — see that doc and ARCHITECTURE §7 rather than restating the field set here. `snrRefHz` (MAN-102 / decision D3) is not yet part of that frozen schema — see the SNR section below and `docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for the proposed fragment. Validated spots reaching these surfaces come from [[spot-validation]].
+
+## SNR reference bandwidth differs by surface (MAN-102 / decision D3)
+
+The telnet/RBN-uplink surface and the JSON surface quote SNR in two different reference bandwidths, on purpose — not restating the field set (see above), just flagging that the two numbers for the same spot are not directly comparable. Telnet/uplink render the 500 Hz bandwidth RBN and CW Skimmer use; JSON keeps the pipeline's native 2500 Hz measurement plus an explicit reference-bandwidth field. See `docs/DECISIONS/2026-09-07-man102-snr-reference-and-estimator.md` for the measurements and the dispensa schema-fragment proposal.
 
 ## Third surface: outbound RBN uplink
 

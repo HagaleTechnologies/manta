@@ -33,6 +33,25 @@ pub enum DecoderEvent {
     },
     TrackMeta {
         track_id: u32,
+        /// The hop's input-stream sample counter (MAN-102 review round 2,
+        /// finding 1). Was implicitly `0` for every `TrackMeta` (see
+        /// `manta_engine::track::event_sample_ts`'s old tie-break comment)
+        /// until this field existed, which sorted every `TrackMeta` ahead
+        /// of the *entire* batch it was emitted in -- including
+        /// `CharDecoded`/`WordBoundary` events from earlier, real hops in
+        /// that same batch -- letting a just-reset/just-reported SNR value
+        /// retroactively attach to characters decoded before it, with the
+        /// magnitude of the error depending on the caller's chunk size
+        /// (`decode_samples` batches differently than `listen`). A real
+        /// timestamp lets the existing `(sample_ts, track_id)` resequence
+        /// (SPEC §6 rule 6) place it correctly, the same treatment
+        /// `TrackClosed` already gets for an analogous problem.
+        /// `#[serde(default)]` (Codex review, PR #134 round 3) so an event
+        /// log from before this field existed still deserializes -- `0`
+        /// reproduces exactly the old synthetic-timestamp behavior this
+        /// field replaces.
+        #[serde(default)]
+        sample_ts: u64,
         snr_2500_db: f32,
         freq_hz: f64,
     },

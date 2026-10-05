@@ -78,7 +78,11 @@ impl Default for DecodeConfig {
     }
 }
 
-const META_INTERVAL_HOPS: u64 = 375; // SPEC §5: TrackMeta at 1 Hz cadence
+/// SPEC §5: `TrackMeta` at 1 Hz cadence. `pub` (MAN-102 review round 2,
+/// finding 2) so `manta-engine`'s peak-hold reset can align to this
+/// boundary directly, rather than only via `TrackMeta` actually firing --
+/// see `TrackDecoder::hop_count`.
+pub const META_INTERVAL_HOPS: u64 = 375;
 const WPM_REPORT_DELTA: f32 = 1.0; // SPEC §5: SpeedUpdate on >= 1 WPM change
 
 // SPEC §2.3: 10*log10(2500/93.75) -- same bandwidth correction as
@@ -122,6 +126,13 @@ pub struct TrackDecoder {
     snr_history: VecDeque<(u64, u64, f32)>,
     /// Decode-error counter (aborted garble characters). SPEC §4.4.
     pub garble_count: u32,
+    /// SPEC §2.3's floor-based SNR for this track, supplied by the layer
+    /// that owns the gate/floor state (`manta-engine`), exactly as
+    /// `freq_hz` is. `None` when a `TrackDecoder` is driven standalone
+    /// (manta-decode's own tests, manta-testkit's roundtrip vectors), in
+    /// which case `TrackMeta` falls back to the M0 keying-rail estimate.
+    /// MAN-102.
+    snr_2500_db: Option<f32>,
 }
 
 impl TrackDecoder {
@@ -162,12 +173,40 @@ impl TrackDecoder {
             last_snr: None,
             snr_history: VecDeque::new(),
             garble_count: 0,
+            snr_2500_db: None,
         }
     }
 
     /// Set the track's absolute RF frequency, reported in TrackMeta events. SPEC §5.
     pub fn set_freq_hz(&mut self, hz: f64) {
         self.freq_hz = hz;
+    }
+
+    /// Set the track's floor-based SNR in the 2500 Hz reference bandwidth,
+    /// reported in TrackMeta events. SPEC §2.3/§5. See `set_freq_hz` for why
+    /// this is pushed down from `manta-engine` rather than computed here:
+    /// the noise floor and gate live one crate above this one. MAN-102.
+    /// Consumed by every engine (see `tick_meta`) as the peak-held reported
+    /// *value* -- `last_snr` (via `snr_from_evidence`) is `EdgeLegacy`/
+    /// `Hsmm`'s own SPEC v2 §2.3 evidence-derived estimate, but it is a
+    /// single running instantaneous reading, not peak-held, and can swing
+    /// tens of dB within one message the same way `Legacy`'s keying-rail
+    /// ratio does; `tick_meta` uses it only as the presence gate (Codex
+    /// review, PR #134 round 2) -- `self.snr_2500_db.is_some()` on every
+    /// engine once `manta-engine` has pushed at least one hop.
+    pub fn set_snr_2500_db(&mut self, snr_2500_db: f32) {
+        self.snr_2500_db = Some(snr_2500_db);
+    }
+
+    /// Hops fed to this decoder so far. `manta-engine`'s peak-hold reset
+    /// checks `hop_count() % META_INTERVAL_HOPS == 0` to detect the SPEC §5
+    /// reporting boundary independent of whether it actually produced a
+    /// `TrackMeta` -- it does not while `!self.demod.running()` (pre-init/
+    /// retrying, SPEC §3.2), and without this the peak window was
+    /// unbounded for however long init takes instead of one interval
+    /// (MAN-102 review round 2, finding 2).
+    pub fn hop_count(&self) -> u64 {
+        self.hop_count
     }
 
     /// One hop: linear amplitude, linear power, optional spectral noise
@@ -306,20 +345,54 @@ impl TrackDecoder {
         }
     }
 
-    /// SPEC §5: TrackMeta at the 1 Hz cadence. `Legacy` reads its SNR
-    /// straight from the keying rails; `EdgeLegacy`/`Hsmm` use the SPEC v2
-    /// §2.3 evidence-derived estimate stashed by `snr_from_evidence`.
+    /// SPEC §5: TrackMeta at the 1 Hz cadence. Every engine prefers the
+    /// engine-supplied floor-based SPEC §2.3 peak-hold estimate
+    /// (`snr_2500_db`, pushed down by `manta-engine`, MAN-102) as the
+    /// reported *value*; each engine's own local estimate is used only as
+    /// its presence gate and standalone-driven fallback (`TrackDecoder`
+    /// exercised outside `manta-engine`, e.g. this crate's own unit tests
+    /// and `manta-testkit`'s roundtrip vectors, where `snr_2500_db` is
+    /// never set). `EdgeLegacy`/`Hsmm`'s `last_snr` is a single running
+    /// instantaneous SPEC v2 §2.3 evidence-derived reading, not peak-held,
+    /// and can swing tens of dB within one message the same way `Legacy`'s
+    /// keying-rail ratio does -- reporting it directly reintroduced
+    /// MAN-102's own miscalibration for those two engines (Codex review,
+    /// PR #134 round 2).
     fn tick_meta(&mut self, events: &mut Vec<DecoderEvent>) {
         self.hop_count += 1;
         if self.hop_count % META_INTERVAL_HOPS == 0 {
             let snr = if self.cfg.engine == Engine::Legacy {
-                self.demod.snr_2500_db()
+                // MAN-102 review round 1, finding 1: `self.demod.running()`
+                // is the real presence gate here -- it is what used to keep
+                // a never-keyed track (steady carrier, birdie, tuning note)
+                // from emitting `TrackMeta` at all, since the old code read
+                // presence straight off `self.demod.snr_2500_db()`, which
+                // returns `None` exactly when `!running()`. Falling back to
+                // `self.demod.snr_2500_db()` for the *value* without first
+                // checking `running()` let an engine-supplied
+                // `self.snr_2500_db` (always `Some` in production --
+                // `manta-engine` calls `set_snr_2500_db` on every queued
+                // hop) bypass that gate entirely. `running()` being true
+                // guarantees `self.demod.snr_2500_db()` is `Some`, so the
+                // `or_else` fallback always yields a value once we're past
+                // this check.
+                if self.demod.running() {
+                    self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
+                } else {
+                    None
+                }
             } else {
-                self.last_snr
+                // `last_snr.is_some()` is the presence gate (evidence has
+                // been seen at least once) -- same role `running()` plays
+                // for `Legacy`. The reported *value* prefers the engine-
+                // supplied peak-hold, falling back to the instantaneous
+                // `last_snr` only when this decoder is driven standalone.
+                self.last_snr.and(self.snr_2500_db.or(self.last_snr))
             };
             if let Some(snr) = snr {
                 events.push(DecoderEvent::TrackMeta {
                     track_id: self.track_id,
+                    sample_ts: self.last_ts,
                     snr_2500_db: snr,
                     freq_hz: self.freq_hz,
                 });
@@ -1140,6 +1213,87 @@ mod tests {
             DecoderEvent::char_decoded(1, 4, Glyph::Char('B'), 1.0),
         ];
         assert_eq!(events_to_text(&ev), "A B");
+    }
+
+    /// 375 hops (one META_INTERVAL_HOPS/SPEC §5 reporting interval) of a
+    /// keyed envelope, alternating enough to let `Demod`'s init succeed
+    /// (SPEC §3.1-§3.2's E_hi/E_lo ratio check) within this same window.
+    fn keyed_envelope_for_tests() -> Vec<f32> {
+        let mut env = Vec::new();
+        for _ in 0..12 {
+            env.extend(std::iter::repeat_n(1.0f32, 15));
+            env.extend(std::iter::repeat_n(0.01f32, 15));
+        }
+        env.extend(std::iter::repeat_n(1.0f32, 15));
+        env
+    }
+
+    #[test]
+    fn track_meta_uses_the_engine_supplied_snr_when_set() {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        dec.set_freq_hz(14_012_340.0);
+        let mut events = Vec::new();
+        // 375 hops of a keyed envelope is one META_INTERVAL_HOPS.
+        for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+            dec.set_snr_2500_db(19.5);
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let meta = events.iter().find_map(|e| match e {
+            DecoderEvent::TrackMeta { snr_2500_db, .. } => Some(*snr_2500_db),
+            _ => None,
+        });
+        assert_eq!(meta, Some(19.5), "the engine-supplied value must win");
+    }
+
+    #[test]
+    fn track_meta_falls_back_to_the_rail_estimate_when_unset() {
+        // A TrackDecoder driven standalone (manta-decode's own tests,
+        // manta-testkit's roundtrip_envelope) never calls set_snr_2500_db
+        // and must keep emitting the M0 rail estimate rather than nothing
+        // at all.
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, a) in keyed_envelope_for_tests().into_iter().enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        let rail_snr = dec.demod.snr_2500_db().expect(
+            "keyed_envelope_for_tests should bring the demod to Running within one interval",
+        );
+        let meta = events.iter().find_map(|e| match e {
+            DecoderEvent::TrackMeta { snr_2500_db, .. } => Some(*snr_2500_db),
+            _ => None,
+        });
+        assert_eq!(
+            meta,
+            Some(rail_snr),
+            "TrackMeta must carry the rail estimate exactly when no engine-supplied SNR is set"
+        );
+    }
+
+    #[test]
+    fn track_meta_is_not_emitted_for_a_track_whose_demod_never_initialized() {
+        // MAN-102 review round 1, finding 1 (regression). A steady carrier,
+        // birdie, or tuning note never lets `Demod` leave `Phase::Init`
+        // (E_hi/E_lo never crosses MIN_KEYING_RATIO -- see envelope.rs's
+        // `carrier_never_inits`), so `self.demod.running()` stays false
+        // forever. `manta-engine` calls `set_snr_2500_db` on every queued
+        // hop for every track it drives, including never-keyed ones, so a
+        // TrackDecoder here sees an engine-supplied SNR on every hop just
+        // like it would in production -- that must not be enough by itself
+        // to emit TrackMeta.
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        dec.set_freq_hz(14_012_340.0);
+        let mut events = Vec::new();
+        for i in 0..3000u64 {
+            dec.set_snr_2500_db(20.0);
+            events.extend(dec.push_envelope(0.5, i * 256));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DecoderEvent::TrackMeta { .. })),
+            "a never-initialized demod (steady carrier) must not emit TrackMeta, got {events:?}"
+        );
     }
 
     #[test]

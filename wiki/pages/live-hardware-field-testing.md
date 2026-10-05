@@ -8,9 +8,15 @@ sources:
   - docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md
   - docs/DECISIONS/2026-09-09-overnight-40m-soapy-field-test.md
   - docs/DECISIONS/2026-09-09-post-pr154-20m-daytime-validation.md
+  - docs/DECISIONS/2026-09-10-synchronized-rbn-capture-proves-detection-gap-is-manta-side.md
+  - docs/DECISIONS/2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md
+  - docs/DECISIONS/2026-09-09-20m-dial-shift-edge-artifact-confirmed.md
+  - docs/DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md
+  - docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md
+  - docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md
 verified:
-  commit: 455e1af
-  date: 2026-09-09
+  commit: 0495f37
+  date: 2026-09-10
 links:
   - spot-validation
   - overview
@@ -43,7 +49,7 @@ those for the full evidence and reasoning.
   yourself:
   ```bash
   manta listen --json --soapy-driver "driver=sdrplay" \
-      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain 40 \
+      --soapy-freq <hz> --soapy-rate 192000 --soapy-gain <gain> \
       > out.jsonl 2>err.log &
   PID=$!
   sleep 1800        # or whatever window you want
@@ -105,6 +111,22 @@ signal, not a detection/spot-generation bug) — see
 for the full original reasoning; treat the interior-passband clusters as
 a separate, still-untracked question until proven otherwise.
 
+**Update, confirmed on 20m** (`2026-09-09-20m-dial-shift-edge-artifact-
+confirmed.md`): a two-run dial-shift test (+30 kHz between runs) nails
+down both halves of this. **Both passband edges are a real detector/
+channelizer artifact** — `TrackPromoted` rate spikes ~3 kHz in from each
+true edge of the tuned passband in both runs, tracking the edge as it
+moves, and none of these edge tracks ever confirmed a spot. Together they
+were 28-35% of all promoted tracks in that session — a real cost even
+though they don't produce false spots. Separately, **an interior cluster
+around 14075 kHz did NOT move with the dial** — same absolute frequency
+both times — so it's not the same artifact; it's inside the US 20m RTTY/
+data segment (14070-14095 kHz) and is more likely a real continuous
+digital-mode signal whose keying trips the CW detector into promoting
+tracks that never validate (not confirmed against a live waterfall). Root
+cause of the edge artifact itself is still open (PFB edge-channel
+behavior is the leading suspect).
+
 **`snr_db` is not a useful signal here on its own.** A weak/flat-envelope
 track commonly lands at or near `20*log10(2) - 14.3 = -8.2794 dB` via
 `envelope.rs`'s rail-collapse clamp (`e_hi >= 2*e_lo`, SPEC §3.2) — but
@@ -150,6 +172,76 @@ propagation, not a configuration problem. Before chasing a hardware
 explanation for "nothing heard," check whether the band/time-of-day
 combination is even expected to be active.
 
+## Before blaming the detector: check if the signal even reaches the channelizer
+
+A "zero tracks despite a strong RBN-confirmed signal" finding feels like a
+detector/track-manager bug, but check one level lower first: run *only*
+the channelizer (bypassing `floor`/`gate`/`TrackManager` entirely) and
+look at raw per-channel power at the target frequency. `crates/manta-
+engine/examples/man171_power_map.rs` does this against a captured WAV.
+If the target frequency isn't measurably above the ambient floor even in
+raw channelizer output, the signal isn't reaching the ADC at a meaningful
+level — that's an antenna/RF-path question, not a manta code question,
+and no amount of detector tuning will fix it. A synchronized 40m capture
+on one physical rig showed RBN-confirmed signals up to 61 dB reading
+≤1.5 dB above ambient in raw channelizer power, with WWV (10.000 MHz —
+about as strong and reliable as HF gets) showing no distinguishable
+carrier either — the most likely explanation was a disconnected or
+misconfigured antenna on that rig (the source record recommends a physical
+check; it does not record one as done).
+`crates/manta-input/examples/iq_probe.rs` (build with `--features soapy`)
+captures a fresh WAV+JSON sidecar via manta's own `SoapySdrIqSource` for
+this kind of check; `crates/manta-engine/examples/man171_power_map.rs`
+does the raw-power-vs-floor comparison itself.
+
+**Correction, same day, unresolved**: don't treat "no distinguishable WWV
+carrier" as proof of total antenna disconnection without checking relative
+to a proper noise floor — a from-scratch single-bin correlation at
+10.000000 MHz on this session's RSP1B found a reproducible,
+frequency-locked bin (-58 to -54 dB relative to broadband RMS, the
+strongest of several tested bins). But 10 MHz is an exact 8 kHz multiple,
+and a known absolute-frequency-locked birdie sits at those, so this does
+not yet show a real WWV carrier, and it says nothing about whether the
+earlier run used different hardware (the cited record doesn't identify
+it). **The fix that
+actually resolved this rig's detection gap was physical**: reseating all
+antenna/feedline connections and adding a common-mode choke cut broadband
+RMS noise by ~13.5 dB (whether any connection was loose or disconnected
+beforehand is not recorded; the source only says all were reseated) and
+immediately produced the session's first fully validated real spot
+(`WI9Q`, a verified-real US callsign, confidence 0.43-0.54, real SNR,
+plausible WPM — matching none of the known artifact signatures above) —
+see `docs/DECISIONS/2026-09-10-antenna-path-fix-resolves-detection-gap.md`.
+The technique (raw channelizer power vs. floor, a WWV sanity check) is
+sound and worth reusing; the specific "disconnected antenna" diagnosis
+from one session doesn't generalize to every RSP1B setup automatically —
+weak-but-present is a real, different failure mode from absent, and
+common-mode noise on the feedline is a real, different fix from
+reconnecting a cable.
+
+**Confirmed at scale, same day**: a 90-minute wall-clock unattended 4-cycle soak
+(about 38 minutes of actual streaming, estimated from event counts; not
+90 minutes of live-SDR evidence) post-fix produced 22 confirmed spots, 13 (59%) matching the real-catch
+signature (`Cq`/`De` type, confidence 0.22-0.43) and 9 (41%) matching the
+known Beacon-exemption residual gap above. Several real-looking calls
+repeated across independent cycles (`W3RJ` 4x, `KC4X` 4x); cross-checked
+against simultaneously-captured RBN logs, 4 of 7 checked callsigns
+matched almost exactly in frequency (within 40 Hz), confirming the single
+-capture result generalizes rather than being a lucky one-off. See
+`docs/DECISIONS/2026-09-10-post-antenna-fix-90min-soak-and-service-reliability.md`.
+
+**A genuine hardware artifact can still look exactly like a manta bug.**
+The same session found a real, absolute-RF-frequency-locked comb of
+"birdies" every exact 8 kHz (confirmed on two different bands/dial
+settings — it doesn't move with the tuned center, ruling out a
+channelizer/rotation bug) — almost certainly an SDR/USB clock-harmonic
+artifact. `floor.rs`'s neighborhood-clamp (SPEC §2.2) never lets such a
+persistent, unmodulated interferer's channel learn to ignore it, so it
+free-runs a spawn/promote/30s-Silent-close/respawn cycle for the whole
+session. Don't assume every ~8kHz-spaced or grid-aligned spurious
+`TrackPromoted` cluster is a manta bug — check whether it survives a
+retune to a different band/frequency first.
+
 ## Setup gotchas
 
 Already covered in `docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md`:
@@ -159,3 +251,69 @@ outright). Also: a single `ErrorCode::Overflow` on a live USB stream used
 to kill the whole session outright — fixed in `crates/manta-input/src/
 soapy.rs` (#146, 2026-09-09) with its own bounded retry, so this is no
 longer something you need to work around.
+
+**`--soapy-gain` is a gain-*reduction* (attenuation) scale on this
+driver, not a gain scale — bigger number means less sensitive, not
+more** (`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`). `0` is
+maximum sensitivity, `48` is minimum. Every fixed-gain field session through
+2026-09-09 used `--soapy-gain 40`, which pins the IF stage at its
+absolute maximum attenuation (`IFGR=59`, the top of its whole `[20,59]`
+range) — chosen only to avoid the top-of-range activation failure above,
+never checked against actual sensitivity. A live sweep found chars-
+decoded markedly higher at `gain=10-20` than at `40`, and peak SNR higher
+at `gain=20` only (`gain=10`'s 2.43 dB was below `40`'s 3.81 dB)
+(`gain=0` is worse than `40`, though — the front end likely overloads on
+this busy an antenna at max sensitivity, so it's not simply "always use
+the minimum"). **Do not keep using `40` by default; sweep gain per session instead
+of assuming an optimum.** The sweep's better peak SNR at `gain=10-20` is
+provisional: the follow-up below found it came with artifact clusters and
+still no activity at real CW targets, so no gain is established as best
+until a locally present real signal or raw-IQ dynamic-range measurement is
+compared across gains.
+
+**Confirmed real but NOT a full fix**: a same-session follow-up capture
+at `gain=15` against live RBN found peak SNR much improved (18.65 dB vs.
+`gain=40`'s 3.81 dB) but **still zero track activity within ±3 kHz of 6
+specific real, multi-skimmer-confirmed RBN spots** in the same window.
+The gain bug is real and worth fixing, but it is not the (or not the
+whole) explanation for "almost no real CW heard" — something else, most
+plausibly the physical antenna/feedline path specifically feeding the
+RSP1B, was the open question at that point. The later
+`2026-09-10-man171-dead-zone-is-rf-path-not-manta-code.md` measured raw
+channelizer power plus a local WWV check and concluded the detector/DSP
+side is ruled out, so treat the RF path as the working explanation. See the
+same doc's follow-up section.
+
+**The SDRplay stream can stop activating mid-session, apparently with the
+`sdrplay_apiService` daemon wedged** (cause not established; root-owned
+LaunchDaemon, `/Library/SDRplayAPI/<ver>/bin/sdrplay_apiService`) —
+enumeration (`SoapySDRUtil --find`/`--probe`) kept working in the first
+occurrences (in the later 90-minute soak, enumeration itself also failed
+once with "No devices found!", so a failed `--find` can be this same
+failure), but stream
+`activate()` starts failing (`sdrplay_api_Fail`/`sdrplay_api_
+ServiceNotResponding`) consistently across every gain value, not just
+one. No client-side fix is known (a check for other processes holding the
+device was not performed) — it needs `sudo launchctl kickstart -k
+system/com.sdrplay.service` (or a service restart), a privileged action.
+If activation still fails after the restart, a physical USB unplug/replug of
+the RSP1B was what actually cleared it
+(`2026-09-09-soapy-gain-is-inverted-attenuation-scale.md`, follow-up section).
+If a run that worked minutes ago suddenly can't `activateStream()` at
+all, check this before assuming it's gain- or code-related.
+**SDRplay stream/device failures recur under sustained ~192 kS/s
+streaming** (root cause not established: service, USB/device path or
+manta-side are all still open) — seen four separate times in one session
+(`sdrplay_api_ServiceNotResponding` / `sdrplay_api_Fail`), sometimes
+requiring a privileged restart (`sudo launchctl kickstart -k
+system/com.sdrplay.service`) plus a physical USB replug, sometimes
+self-recovering within a minute or two with no intervention at all — both
+behaviors observed, so treat it as genuinely intermittent, not "wedged
+until a human fixes it." **For ordinary unattended/long-duration data collection, run
+short independent cycles (e.g. ~20-25 min) rather than one long capture**
+— a single long run has no resilience against a mid-run crash and can
+lose the whole session; cycling means one crash only costs that cycle.
+Check device enumeration (`SoapySDRUtil --find`) before each cycle starts
+so a skipped cycle is detected rather than silently producing an empty
+result. Do not cycle the M2 acceptance soak: `ROADMAP.md` requires 24
+uninterrupted hours with no crash, and restarts would defeat it.
