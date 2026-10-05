@@ -1,6 +1,24 @@
 //! SPEC-decode-core.md §4.6 per-callsign confidence, plus the cty/SCP
 //! adjustment the spec explicitly defers to this crate (ARCHITECTURE §6.3).
 
+/// Geometric mean of per-character decoder confidences: `(prod cᵢ)^(1/n)`.
+/// Shared by `c_call` below and `support::SupportLedger` (MAN-100), which
+/// needs the same per-word quantity -- computed before `c_call`'s
+/// repetition factor is applied -- as the per-occurrence figure it sums to
+/// break ties between confusable candidates. `0.0` for an empty slice
+/// (a word with no decoded characters carries no confidence).
+pub fn geo_mean(char_confidences: &[f32]) -> f32 {
+    if char_confidences.is_empty() {
+        return 0.0;
+    }
+    let n = char_confidences.len() as f32;
+    let log_sum: f32 = char_confidences
+        .iter()
+        .map(|c| c.max(f32::EPSILON).ln())
+        .sum();
+    (log_sum / n).exp()
+}
+
 /// SPEC §4.6: geometric mean of per-character confidences times a
 /// repetition factor (`r=1 -> 0.5`, `r=2 -> 0.75`, `r=3 -> 0.875`, ...).
 ///
@@ -10,14 +28,8 @@ pub fn c_call(char_confidences: &[f32], reps: u32) -> f32 {
         !char_confidences.is_empty(),
         "a callsign has at least one character"
     );
-    let n = char_confidences.len() as f32;
-    let log_sum: f32 = char_confidences
-        .iter()
-        .map(|c| c.max(f32::EPSILON).ln())
-        .sum();
-    let geo_mean = (log_sum / n).exp();
     let rep_factor = 1.0 - 0.5f32.powi(reps as i32);
-    geo_mean * rep_factor
+    geo_mean(char_confidences) * rep_factor
 }
 
 /// SCP membership: multiplicative boost capped at 1.0. Absence is neutral
