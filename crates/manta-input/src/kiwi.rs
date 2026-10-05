@@ -389,6 +389,9 @@ fn parse_snd_frame(body: &[u8]) -> Option<SndFrame> {
 #[derive(Default)]
 struct SndSeqTracker {
     last: Option<u32>,
+    /// Malformed frames received since the last valid one: they arrived, so
+    /// the next `seq` delta must not count them as lost.
+    malformed_since_last: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -414,19 +417,30 @@ impl SndSeqTracker {
                 0 => SeqObservation::Resync,
                 1 => SeqObservation::InOrder,
                 delta if delta <= MAX_PLAUSIBLE_SEQ_JUMP => {
-                    SeqObservation::Gap { missing: delta - 1 }
+                    match (delta - 1).saturating_sub(self.malformed_since_last) {
+                        0 => SeqObservation::InOrder,
+                        missing => SeqObservation::Gap { missing },
+                    }
                 }
                 _ => SeqObservation::Resync,
             },
         };
         self.last = Some(seq);
+        self.malformed_since_last = 0;
         observation
+    }
+
+    /// Note a malformed frame: its `seq` bytes may be missing or garbage, so
+    /// it doesn't move the baseline, but it is excluded from the next delta.
+    fn observe_malformed(&mut self) {
+        self.malformed_since_last = self.malformed_since_last.saturating_add(1);
     }
 }
 
 /// Parse one SND frame's body and account it against `counters`/`tracker`:
 /// a malformed (too-short) frame counts as one malformed packet, and a
-/// forward `seq` jump counts as one gap event plus its missing-frame count.
+/// forward `seq` jump counts as one gap event plus its missing-frame count,
+/// net of malformed frames received since the previous valid one.
 /// Returns the frame's samples, or `None` if the frame was malformed.
 fn account_snd_frame(
     counters: &InputHealthCounters,
@@ -437,6 +451,7 @@ fn account_snd_frame(
         Some(frame) => frame,
         None => {
             counters.record_malformed();
+            tracker.observe_malformed();
             return None;
         }
     };
@@ -670,6 +685,37 @@ mod tests {
         assert_eq!(counters.gaps_detected(), 1);
         assert_eq!(counters.dropped_packets(), 2);
         assert_eq!(counters.malformed_packets(), 1);
+    }
+
+    /// A malformed frame was received, not lost: it must not also be counted
+    /// as a gap/dropped frame by the next valid frame's `seq` delta.
+    #[test]
+    fn malformed_frame_between_valid_frames_is_not_counted_as_lost() {
+        let counters = InputHealthCounters::new();
+        let mut tracker = SndSeqTracker::default();
+
+        let frame_with_seq = |seq: u32| {
+            let mut body = vec![0u8; 17];
+            body[1..5].copy_from_slice(&seq.to_le_bytes());
+            body
+        };
+
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(1)).is_some());
+        assert!(account_snd_frame(&counters, &mut tracker, &[0u8; 5]).is_none());
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(3)).is_some());
+
+        assert_eq!(counters.malformed_packets(), 1);
+        assert_eq!(counters.gaps_detected(), 0);
+        assert_eq!(counters.dropped_packets(), 0);
+
+        // Real loss alongside a malformed arrival still counts, net of it:
+        // of seq 4-6, one arrived malformed and two were lost.
+        assert!(account_snd_frame(&counters, &mut tracker, &[0u8; 5]).is_none());
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(7)).is_some());
+
+        assert_eq!(counters.malformed_packets(), 2);
+        assert_eq!(counters.gaps_detected(), 1);
+        assert_eq!(counters.dropped_packets(), 2);
     }
 
     /// Resampling math alone, no network: construct the same `rubato::Fft`

@@ -68,7 +68,9 @@ scrape evidence.
   means a panic/abort).
 - **D13 — generalizing gap-stats means `KiwiIqSource::health_counters()`.**
   An SND frame shorter than its 17-byte header is malformed. A forward `seq`
-  jump of `1 < Δ ≤ 65536` is one gap event with `Δ−1` dropped frames; `Δ==0`
+  jump of `1 < Δ ≤ 65536` is one gap event with `Δ−1` dropped frames, less
+  any malformed frames received since the previous valid one (a malformed
+  frame does not move the baseline, but it arrived, so it is not lost); `Δ==0`
   or a larger/backward jump re-baselines silently (most likely a
   server-side counter reset, not real loss — kiwirecorder.py's own `seq`
   handling has no narrower documented wrap tolerance). Soapy is deferred: it
