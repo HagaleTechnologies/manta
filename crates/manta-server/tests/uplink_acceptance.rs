@@ -25,6 +25,12 @@
 //!     Then the spot is still forwarded to the target that is reachable
 //!     And the unreachable target's connection is retried independently
 //!
+//! MAN-159 acceptance scenario:
+//!   Scenario: Enabling the uplink without an explicit dry_run setting does not transmit
+//!     Given an operator adds a [[rbn_uplink]] block with no dry_run key at all
+//!     When manta starts
+//!     Then it does not transmit spots to the configured target
+//!
 //! The mock listener in this file stands in for RBN's own collection
 //! server -- manta is the connecting *client* here, the reverse of
 //! `telnet_acceptance.rs`'s role.
@@ -386,6 +392,65 @@ async fn disabled_uplink_makes_no_connection_attempt() {
         attempt.is_err(),
         "a disabled uplink must never attempt a connection"
     );
+}
+
+/// MAN-159 acceptance scenario:
+///   Scenario: Enabling the uplink without an explicit dry_run setting does not transmit
+///     Given an operator adds a [[rbn_uplink]] block with no dry_run key at all
+///     When manta starts
+///     Then it does not transmit spots to the configured target
+///
+/// Goes through the real `DaemonConfigFile`/`toml::from_str` path on purpose:
+/// `uplink_config()` sets `dry_run` explicitly, so it is structurally blind to
+/// the serde default this test exists to protect.
+#[tokio::test]
+async fn omitted_dry_run_key_logs_in_but_does_not_transmit() {
+    use manta_server::config::DaemonConfigFile;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let toml_src = format!(
+        r#"
+        [server]
+        station_callsign = "W3XYZ"
+        [[rbn_uplink]]
+        enabled = true
+        target_host = "127.0.0.1"
+        target_port = {}
+        "#,
+        addr.port()
+    );
+    let file: DaemonConfigFile = toml::from_str(&toml_src).unwrap();
+    let cfg = file.rbn_uplink[0].clone();
+    assert!(cfg.dry_run, "an omitted dry_run key must default to true");
+
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
+    let metrics = Arc::new(Metrics::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let bus2 = bus.clone();
+    let metrics2 = metrics.clone();
+    tokio::spawn(async move {
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, metrics2, shutdown_rx)
+            .await;
+    });
+
+    // The login handshake still completes -- dry-run gates the spot write
+    // only, so operators can still validate connectivity.
+    let (login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    assert_eq!(login_line.trim_end(), STATION_CALL);
+
+    bus.publish(sample_spot());
+
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(result.is_err(), "must not transmit, got: {line:?}");
+    assert_eq!(metrics.uplink_sent_total(), 0);
+    assert_eq!(metrics.uplink_suppressed_total(), 1);
+
+    let _ = shutdown_tx.send(true);
 }
 
 #[tokio::test]

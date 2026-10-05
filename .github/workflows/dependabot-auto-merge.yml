@@ -1,15 +1,47 @@
 name: Dependabot Auto-Merge
 
+# REVERTED TO SELF-CONTAINED (2026-09-14): the 2026-09-12 refactor (#191) split this into a thin
+# caller of credenza's dependabot-auto-merge.yml reusable workflow. That broke immediately and
+# silently -- GitHub does not let a PUBLIC repository call a `workflow_call` reusable workflow
+# stored in a PRIVATE repository (credenza is private), regardless of the private repo's own
+# access settings, because the calling repo's public build logs could otherwise leak the private
+# repo's workflow content. Every run since #191 landed (2026-09-13T01:30Z onward) has been a
+# zero-job startup failure: "error parsing called workflow ... workflow was not found". manta's
+# own ci.yml already documents this exact constraint for the SAME reason ("Self-contained (no
+# `uses:` call) since this repo is public") -- #191 contradicted it. Ten Dependabot PRs
+# (#115-#122, #196, #197) sat un-auto-merged as a result; fleet-wide audit 2026-09-14 found this.
+#
+# The approve/merge logic below is ported UNCHANGED from credenza's reusable workflow (itself
+# extracted from widdershins#421 after 21 Codex rounds) -- same SHA-pinned approval, same
+# base-retarget and moved-head re-checks immediately before each mutation, same major-bump /
+# failed-verification labeling. Only the invocation shape changed: inline steps instead of a
+# `uses:` call. The needs-human staleness check (`check-needs-human` job) and the Cargo
+# diff-safety verifier (`verify` job, MAN-218) are unchanged -- both were always local, and
+# neither depends on credenza.
 on: pull_request_target
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
-  auto-merge:
+  # Cargo analog of widdershins' own `verify` job (MAN-218): re-derives the actual
+  # dependency-version diff from Cargo.toml/Cargo.lock, independent of Dependabot's own
+  # self-reported update-type classification, before `auto-merge` uses a code-owner-identity
+  # credential to approve the PR. Python (stdlib-only, no pip install needed for TOML parsing --
+  # tomllib is 3.11+ stdlib) rather than widdershins' Node.js: this repo has no existing Node
+  # tooling at all, while it already has stdlib-only Python scripts (confidence-separation.py,
+  # score-against-rbn.py) -- matches that established convention rather than introducing a new
+  # language's toolchain. See scripts/verify-dependabot-diff-safe.py's own header for the fuller
+  # reasoning, including why this was NOT written in Rust (no local Rust toolchain to compile/test
+  # it against during development) or Node (would need a package.json+package-lock.json this repo
+  # has never had, purely to reuse comparator logic that Cargo's own simpler, OR-free requirement
+  # grammar doesn't actually need).
+  verify:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      safe: ${{ steps.verify.outputs.safe || 'true' }}
+      reason: ${{ steps.verify.outputs.reason || '' }}
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -17,25 +49,273 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # dependabot/fetch-metadata outputs are safe (controlled by GitHub, not user input)
-      - name: Auto-approve minor/patch updates
+      # Check out the trusted BASE branch, never the PR's own tree (Codex P1, widdershins#421
+      # round 2, applied here preemptively): the verifier's own threat model includes a
+      # compromised Dependabot identity/commit, not just an unforgeable actor -- checking out and
+      # running the PR's own tree would let a compromised commit replace the verifier itself with
+      # one that always reports SAFE. No `ref:` override -- actions/checkout defaults to the
+      # workflow's own trusted context, which for `pull_request_target` is the base branch.
+      # `fetch-depth: 0` so `origin/main` has real history for the verifier to diff against.
+      - name: Check out the trusted base branch (never the PR's own tree)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+
+      # Fetch the PR's head as a git OBJECT only -- never checked out as a working tree, same
+      # trust boundary as the checkout above.
+      - name: Fetch the PR's head commit (as an object, not a checkout)
+        run: git fetch origin ${{ github.event.pull_request.head.sha }}
+
+      # Runs the TRUSTED (base-branch) copy of the verifier against the PR's head SHA as an
+      # explicit argument -- never `HEAD` itself, which after the checkout above is the base
+      # branch, not the PR. Random per-run heredoc delimiter (Codex P1, widdershins#423 round 2,
+      # applied here preemptively): a fixed delimiter would be a real injection vector, since the
+      # verifier's own NOT SAFE messages interpolate raw requirement strings straight from
+      # Cargo.toml on the PR head, which its own threat model already treats as
+      # attacker-controlled.
+      - name: Verify Dependabot diff is a safe Cargo dependency-version bump
+        id: verify
         if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        run: |
+          set +e
+          output=$(python3 scripts/verify-dependabot-diff-safe.py origin/main ${{ github.event.pull_request.head.sha }} 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            delim="VERIFY_REASON_EOF_$(openssl rand -hex 16)"
+            {
+              echo "reason<<${delim}"
+              echo "$output"
+              echo "${delim}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  # This job's ONLY job is the side effect: clear needs-human if it's provably stale for the
+  # current head. It has no meaningful output to pass downstream (Codex P1, manta#191 round 1 --
+  # an earlier version computed `should_merge` here and passed it as a boolean input, leaving a
+  # job-boundary TOCTOU window between that read and credenza's merge mutation). credenza's
+  # reusable workflow now re-checks the LIVE label state itself, immediately before merging (via
+  # `merge_blocking_label` below) -- this job only needs to run, and complete, BEFORE that check
+  # (`needs: check-needs-human` on the auto-merge job below), so a stale label is already cleared
+  # by the time the live check reads it.
+  check-needs-human:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: read
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # needs-human guard (learned from widdershins auto-merge.yml round 21, applied here
+      # preemptively rather than rediscovered): this workflow triggers on `synchronize` too
+      # (pull_request_target's default types), which fires every time Dependabot itself
+      # rebases/updates the PR against a moved base -- a routine, expected event, not a new human
+      # decision. Without this guard, that rebase would silently re-arm auto-merge on a PR
+      # queue-retry-handler.yml already handed off to a human after its one automatic retry
+      # failed, bypassing that handoff entirely. Only computed for non-major updates -- matches
+      # this repo's pre-split behavior, where the equivalent check never ran for a major bump
+      # either (credenza's reusable workflow labels those for review regardless of this output).
+      - name: Check needs-human staleness
+        id: check
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Staleness check (Codex round 4, hardened round 5, ported unchanged): needs-human is
+          # PR-wide with no automatic clearing mechanism (a human decision by design), but
+          # queue-retry-handler.yml tags every attach with the exact SHA it was for -- without
+          # checking that, a fresh Dependabot rebase that resolves the original failure reads the
+          # exact same "needs-human present" state the broken one did, and stays silently stalled
+          # forever. Provenance is checked against the label's own most recent application (via
+          # the PR's timeline `labeled` event), not just marker content -- only a marker posted AT
+          # OR AFTER that event can be trusted to describe THIS application. Fail closed (keep
+          # pausing) whenever provenance can't be confirmed: no labeled event, no marker, or a
+          # marker older than the most recent labeling.
+          needs_human_is_stale() {
+            local current_head_sha12="$1"
+            local last_labeled_at marker_info marker_created_at recorded_sha12
+            local raw
+            if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
+              last_labeled_at=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-human")] | if length > 0 then (last | .created_at) else "" end' 2>/dev/null)
+            else
+              last_labeled_at=""
+            fi
+            [ -z "$last_labeled_at" ] && return 1
+            if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/comments" 2>/dev/null); then
+              marker_info=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.user.login == "github-actions[bot]") | select(.body | test("queue-retry-handler:needs-human sha=[0-9a-f]{12}")) | [.created_at, (.body | capture("queue-retry-handler:needs-human sha=(?<s>[0-9a-f]{12})").s)] | @tsv] | if length > 0 then last else "" end' 2>/dev/null)
+            else
+              marker_info=""
+            fi
+            [ -z "$marker_info" ] && return 1
+            marker_created_at=$(cut -f1 <<< "$marker_info")
+            recorded_sha12=$(cut -f2 <<< "$marker_info")
+            [ -z "$recorded_sha12" ] && return 1
+            [[ "$marker_created_at" < "$last_labeled_at" ]] && return 1
+            [ "$recorded_sha12" = "$current_head_sha12" ] && return 1
+            return 0
+          }
+
+          current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+          if grep -qxF "needs-human" <<< "$current_labels"; then
+            current_head_sha12=$(gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq '.headRefOid[0:12]')
+            if needs_human_is_stale "$current_head_sha12"; then
+              # Clear the label, not just ignore it (Codex round 5): leaving it attached would let
+              # queue-retry-handler.yml's own retry step see this same stale needs-human on this
+              # new revision's eventual merge-group failure and refuse to retry it -- silently
+              # stalling a corrected revision after its very first queue attempt. Also what makes
+              # credenza's downstream live label re-check see a clean state for this revision.
+              echo "::notice::needs-human on PR #$PR is stale (provably tied to an earlier revision, not the current head $current_head_sha12) -- clearing it and allowing auto-merge for the new revision."
+              gh api --method DELETE "repos/${REPO}/issues/${PR}/labels/needs-human" >/dev/null 2>&1 || true
+            else
+              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- leaving it attached. credenza's own live re-check will stand down without merging."
+            fi
+          fi
+
+  auto-merge:
+    needs: [verify, check-needs-human]
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Bound to the exact commit `verify` (MAN-218) checked, ported from credenza's reusable
+      # workflow (itself ported from widdershins#421 round 3-4): `gh pr review` has no
+      # SHA/commit option, so it always approves whatever the PR's THEN-current head is. If
+      # Dependabot pushes a new head after `verify` ran but before this step runs, a plain
+      # `gh pr review` would hand the new head an approval it never earned. Close that window
+      # from both ends: re-read the PR's current head immediately before approving and skip
+      # (not fail -- the new head's own synchronize event already queued a fresh run that will
+      # verify/approve it on its own merits) on any mismatch, and create the review through the
+      # REST API with `commit_id` pinned so the review record itself is anchored to the
+      # verified commit. GH_TOKEN is DEPENDABOT_APPROVE_PAT (org-wide secret, Pull requests:
+      # Read and write, a real CODEOWNERS-listed identity) -- github-actions[bot]/GITHUB_TOKEN
+      # cannot satisfy require_code_owner_review, live on manta-review-gate since 2026-09-12
+      # (MAN-209), and this repo's own settings additionally block GITHUB_TOKEN from approving
+      # PRs at all (`can_approve_pull_request_reviews: false`).
+      - name: Auto-approve minor/patch updates verified as a pure dependency-version bump
+        id: approve
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major' && needs.verify.outputs.safe == 'true'
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VERIFIED_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.DEPENDABOT_APPROVE_PAT }}
+          BASE_BRANCH: main
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          current_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          if [ "$current_sha" != "$VERIFIED_SHA" ]; then
+            echo "::warning::PR head moved from ${VERIFIED_SHA} (verified) to ${current_sha} before approval -- skipping approval for the unverified commit. ${current_sha}'s own synchronize event will re-run this workflow and verify/approve it independently."
+            exit 0
+          fi
+          current_base=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.ref')
+          if [ "$current_base" != "$BASE_BRANCH" ]; then
+            echo "::warning::PR base changed from ${BASE_BRANCH} to ${current_base} before approval -- standing down, this diff was only ever verified against ${BASE_BRANCH}."
+            exit 0
+          fi
+          gh api --method POST "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            -f commit_id="$VERIFIED_SHA" -f event="APPROVE" \
+            -f body="Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES} (verified: pure dependency-version bump at ${VERIFIED_SHA})" || {
+            pr_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" 2>/dev/null || echo '{}')
+            merged=$(printf '%s' "$pr_json" | jq -r '.merged // false')
+            state=$(printf '%s' "$pr_json" | jq -r '.state // "unknown"')
+            if [ "$merged" = "true" ]; then
+              echo "::warning::Approve failed because the PR is already merged — nothing further to do."
+            else
+              echo "::error::Approve failed and the PR is not merged (state=${state}) — a real failure, not the already-merged race."
+              exit 1
+            fi
+          }
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+
+      # Gated on steps.approve.outputs.approved, not just the verify/update-type check above --
+      # the mismatch branches in that step exit 0 without setting it, so this only proceeds once
+      # a real approval landed for THIS head. Pinned via --match-head-commit as a second,
+      # atomic-at-the-mutation guard against the same commit.
+      - name: Enable auto-merge for approved update
+        if: steps.approve.outputs.approved == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VERIFIED_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_BRANCH: main
+        run: |
+          current_base=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.ref')
+          if [ "$current_base" != "$BASE_BRANCH" ]; then
+            echo "::warning::PR base changed from ${BASE_BRANCH} to ${current_base} before auto-merge could be armed -- standing down, this diff was only ever verified against ${BASE_BRANCH}."
+            exit 0
+          fi
+          # Live re-check immediately before the mutation (Codex P1, manta#191): check-needs-human
+          # already clears a provably-stale needs-human earlier in this run, but a maintainer
+          # could attach a fresh one in the gap between that job and this step. Read it fresh,
+          # right here, rather than trust a job-boundary-old read.
+          current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')
+          if grep -qxF "needs-human" <<< "$current_labels"; then
+            echo "::warning::PR currently carries \"needs-human\" -- standing down without enabling auto-merge. The approval above still stands; a future push or manual label-clear can let a subsequent run merge it."
+            exit 0
+          fi
+          gh pr merge "$PR_URL" --auto --squash --match-head-commit "$VERIFIED_SHA" || {
+            merged=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.merged' 2>/dev/null || echo "false")
+            if [ "$merged" = "true" ]; then
+              echo "::warning::Enable auto-merge failed because the PR is already merged — nothing further to do."
+            else
+              current_sha=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || echo "")
+              if [ -n "$current_sha" ] && [ "$current_sha" != "$VERIFIED_SHA" ]; then
+                echo "::warning::PR head moved from ${VERIFIED_SHA} to ${current_sha} before auto-merge could be armed -- standing down for the unverified head. ${current_sha}'s own synchronize event will re-run this workflow and verify/approve/arm it independently."
+                exit 0
+              fi
+              echo "::error::Enable auto-merge failed and the PR is not merged (state unknown or head unchanged) — a real failure, not the already-merged or moved-head race."
+              exit 1
+            fi
+          }
+
+      # Broadened beyond semver-major: a minor/patch update whose `verify` job (MAN-218) came
+      # back NOT safe needs the exact same human-review fallback a major bump gets -- silently
+      # doing nothing would leave it sitting unapproved and unauto-merged with no signal to
+      # anyone, defeating the reason that verifier exists at all.
+      - name: Label updates that need human review (major bump, or a failed Cargo diff-safety check)
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major' || needs.verify.outputs.safe != 'true'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
-        run: |
-          gh pr review "$PR_URL" --approve --body "Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES}"
-
-      - name: Label major updates for review
-        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
           PREV_VER: ${{ steps.metadata.outputs.previous-version }}
           NEW_VER: ${{ steps.metadata.outputs.new-version }}
+          VERIFY_FAILURE_REASON: ${{ needs.verify.outputs.reason }}
         run: |
-          gh pr edit "$PR_URL" --add-label "major-update,needs-review"
-          gh pr comment "$PR_URL" --body "Major version bump: ${DEP_NAMES} (${PREV_VER} -> ${NEW_VER}). Requires manual review before merge."
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            reason="Major version bump: ${DEP_NAMES} (${PREV_VER} -> ${NEW_VER})."
+            labels="major-update,needs-review"
+          else
+            reason="Cargo diff-safety check flagged this ${UPDATE_TYPE} update for ${DEP_NAMES} as NOT a pure dependency-version bump: ${VERIFY_FAILURE_REASON}"
+            labels="needs-review"
+          fi
+          gh pr edit "$PR_URL" --add-label "$labels"
+          gh pr comment "$PR_URL" --body "$reason Requires manual review before merge."

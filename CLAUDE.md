@@ -1,9 +1,9 @@
 # manta
 
 Open-source, cross-platform, wideband multi-signal CW skimmer in Rust. Decodes
-every CW signal across an SDR passband and emits RBN-compatible spots — an open
-alternative to the single closed-source Windows program the Reverse Beacon
-Network currently depends on.
+every CW signal across an SDR passband and emits RBN-compatible spots — a
+second, independent implementation alongside CW Skimmer Server, for the
+Linux/ARM/headless platforms it has no native build for.
 
 ## Status
 
@@ -17,15 +17,24 @@ fading-robustness gap is classical-DSP work to fix before M4** (MAN-107
 through MAN-113), not deferred to M4 ML fusion by design — see
 docs/DECISIONS/2026-09-06-broad-review-decisions.md D8. **M2 acceptance
 is still open**: Pi4 CPU-budget leg (also paused pending MAN-100 through
-MAN-113 landing in full, not just MAN-107-113 above — D6) and 24 h
-live-SDR soak are unmet — both need physical hardware not
-reachable from this environment.
-`manta-dsp::single`/`freqest` deprecated in place.
+MAN-113 landing in full, not just MAN-107-113 above — D6), 24 h live-SDR
+soak, and **VR1–VR8** (ROADMAP.md's M2 "Accept when", a standing gate
+since 2026-09-09, not a one-time redesign check — 3/9 pass, see below)
+are unmet — the first two need physical hardware not reachable from this
+environment.
+`manta-dsp::single`/`freqest` deprecated in place. `decode.engine` default
+is still `legacy`; `hsmm` (MAN-166 decode-core-v2) is implemented and
+CLI-reachable but not promoted — stage-2 gate measured FAIL 2026-09-09
+(oracle as_word 56%/framed 32% vs required 60%/40%; 4/11 V-vectors, 3/9
+VR-vectors pass) — see
+docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md. Variable-width
+capture (issue #169, `--capture-rate-hz`) implemented -- see
+docs/superpowers/specs/2026-09-09-variable-width-capture-design.md.
 
 ## Documents (read in this order)
 
 - `README.md` — goals and non-goals
-- `ARCHITECTURE.md` — 8-crate workspace, data flow, channelizer/decoder/
+- `ARCHITECTURE.md` — 9-crate workspace, data flow, channelizer/decoder/
   validation/output design
 - `docs/SPEC-decode-core.md` — implementation-level algorithm spec: exact
   channelizer constants, noise-floor estimator, track state machine, decoder
@@ -62,7 +71,14 @@ descriptive and always loses conflicts with code and docs/.
     from manta's expected convention.
   - **SNR convention (still live):** this repo's spec froze SNR-in-2500-Hz;
     the shared `awgn_ref_bw()` design in SPEC-watterson reconciles it with
-    the benchmark harness's 3 kHz convention.
+    the benchmark harness's 3 kHz convention. **Superseded at the
+    wire-output boundary only** by MAN-102 / decision D3
+    (2026-09-06-broad-review-decisions.md): telnet/RBN-uplink spot lines now
+    quote SNR in the 500 Hz RBN/CW Skimmer reference bandwidth, converted
+    from the pipeline's native 2500 Hz value at render time; the JSON stream
+    keeps the native 2500 Hz value plus an explicit `snrRefHz` field. The
+    testkit's input-side 2500 Hz convention this bullet otherwise describes,
+    and the `awgn_ref_bw()` reconciliation, are unaffected.
 - Deterministic decode path is a hard requirement: file input → byte-identical
   spot logs.
 - Classical decoder first; ML fusion (dit's pattern) only at M4, gated on
@@ -100,7 +116,6 @@ in other clones, branches, or worktrees.
   --squash` right after opening; GitHub merges it unattended once required
   CI (`test (ubuntu-latest)`, `test (macos-latest)`) is green. See
   docs/DECISIONS/2026-07-25-pr-auto-merge-policy.md.
-
 
 ## Code review convergence
 
