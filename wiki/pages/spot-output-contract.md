@@ -35,3 +35,7 @@ The telnet/RBN-uplink surface and the JSON surface quote SNR in two different re
 ## Third surface: outbound RBN uplink
 
 manta can also act as a telnet *client*, logging into an RBN spot-collection endpoint and forwarding its own spots there (`crates/manta-server/src/uplink.rs`, one task per `[[rbn_uplink]]` config entry) — the mirror direction of the telnet server above. It ships **dry-run by default** (MAN-159): an entry with no `dry_run` key connects and logs in but transmits nothing, and each target logs its mode at startup. See README's "Outbound RBN uplink" section for the config shape; the uplink itself is unverified against a real RBN ingest pending MAN-90.
+
+## Audio-sourced spot frequencies (MAN-34)
+
+A spot's `freq_hz` on either surface is only absolute (real RF) when its source has an RF reference. The rig-audio input mode (`listen`/`listen --device`, `AudioIqSource`) has none of its own — pass `--dial-freq-hz` (or call `AudioIqSource::with_center_freq_hz` from library code) or its reported frequencies are bare baseband offsets, not RBN-compatible. `--dial-freq-hz` is added to the decoded audio-tone offset as-is, so it must be the suppressed-carrier/USB dial reading — on a CW-mode dial display, subtract your sidetone pitch first, or spots read high by the pitch amount. See `docs/DECISIONS/2026-09-05-man-34-audio-rf-reference.md`.
