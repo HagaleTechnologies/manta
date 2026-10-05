@@ -152,7 +152,7 @@ const REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
 /// two cases apart: `Logged` for an error a specific branch already
 /// reported (the catch-all skips it), `Unlogged` for anything else. The
 /// blanket `From<std::io::Error>` impl below defaults every OTHER
-/// fallible site (the bare `?` writes) to `Unlogged`, so they keep
+/// fallible site (the handshake writes) to `Unlogged`, so they keep
 /// reaching the catch-all exactly as before -- a future fallible call
 /// site added without an explicit `Logged` wrap still gets caught by it,
 /// preserving MAN-59's original "no disconnect goes unrecorded" guarantee
@@ -349,7 +349,12 @@ async fn handle_client(
     // pre-login client.
     tokio::select! {
         result = write_with_timeout(&mut wr, b"login: \r\n") => {
-            result?;
+            // Same accounting as the negotiation-refusal write below
+            // (MAN-87 remediation, PR #129 Codex review).
+            if let Err(e) = result {
+                metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Err(e.into());
+            }
         }
         _ = shutdown.changed() => {
             if log_enabled {
@@ -397,7 +402,15 @@ async fn handle_client(
     // `bounded_io`.
     if iac.has_replies() {
         let replies = iac.take_replies();
-        write_with_timeout(&mut wr, &replies).await?;
+        if let Err(e) = write_with_timeout(&mut wr, &replies).await {
+            // MAN-87 remediation (PR #129 Codex review): a bare `?` here
+            // ended the task through the logging-only catch-all, abandoning
+            // whatever queued on `rx` during the login read uncounted. A
+            // control-frame write, so nothing was in flight (`false`); the
+            // error still propagates so the catch-all logs it.
+            metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+            return Err(e.into());
+        }
     }
     // MAN-59 review: the login line is client-supplied and unvalidated --
     // Display (`%`) writes it into the log verbatim, letting an
@@ -412,7 +425,11 @@ async fn handle_client(
     let banner = format!("de {station_call}-# >\r\n");
     tokio::select! {
         result = write_with_timeout(&mut wr, banner.as_bytes()) => {
-            result?;
+            // Same accounting as the negotiation-refusal write above.
+            if let Err(e) = result {
+                metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+                return Err(e.into());
+            }
         }
         _ = shutdown.changed() => {
             if log_enabled {

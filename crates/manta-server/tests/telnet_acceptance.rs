@@ -997,3 +997,54 @@ async fn a_command_terminated_with_cr_nul_from_an_interactive_client_is_recogniz
         .unwrap();
     assert_eq!(line.trim_end(), expected);
 }
+
+/// MAN-87 remediation (PR #129 Codex review): the refusals answering a
+/// login-time negotiation are written before the greeting, outside the
+/// command loop. When that write failed, `?` ended the task through the
+/// logging-only catch-all, and the spots queued on this client's `rx`
+/// during the login read were abandoned without reaching
+/// `spots_dropped_write_failed_total` (ARCHITECTURE §8). The client here
+/// negotiates, sends its callsign and resets the connection, so the server
+/// reads a complete login line and then writes its refusal into a reset
+/// socket.
+///
+/// Linux only: the test relies on data that arrived before the reset
+/// staying readable, which Linux's TCP stack does and other platforms'
+/// may not (Windows can discard it, failing the login read before the
+/// write under test is reached).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_negotiation_reply_write_at_login_counts_the_abandoned_backlog() {
+    let (addr, bus, metrics, _shutdown_tx, tasks) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let mut prompt = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut prompt))
+        .await
+        .expect("expected the login prompt")
+        .unwrap();
+    assert!(n > 0, "expected a non-empty login prompt");
+
+    // Queued on this client's `rx` while it is still at the login prompt,
+    // so the count asserted below is provably nonzero.
+    bus.publish(sample_spot());
+    bus.publish(sample_spot());
+
+    // IAC WILL TERMINAL-TYPE, then the callsign, then an RST. `try_write`
+    // and the blocking sleep keep this current-thread runtime from polling
+    // the server task until the kernel has processed both the data and the
+    // reset, so the login read succeeds and the refusal write fails.
+    let login = b"\xff\xfb\x18W5AU\r\n";
+    assert_eq!(stream.try_write(login).unwrap(), login.len());
+    stream.set_zero_linger().unwrap();
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(100));
+
+    manta_server::tasks::await_all(&tasks, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        2,
+        "both spots queued during the login read must be counted when the refusal write fails"
+    );
+}
