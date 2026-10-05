@@ -503,6 +503,12 @@ enum Command {
         /// decoding them with an image at the negative-frequency mirror).
         #[arg(long)]
         source_iq: bool,
+        /// RF dial frequency in Hz, overriding the source's own
+        /// `center_freq_hz()` -- see `listen --dial-freq-hz`. Without it,
+        /// an audio source's reported frequencies (and the report's
+        /// `center_freq_hz`) are baseband offsets.
+        #[arg(long, value_parser = parse_dial_freq_hz)]
+        dial_freq_hz: Option<f64>,
         /// Emit the DoctorReport as one JSON object on stdout instead of a
         /// human-readable summary.
         #[arg(long)]
@@ -2652,6 +2658,7 @@ fn main() -> Result<()> {
             hpsdr_rate,
             capture_rate_hz,
             source_iq,
+            dial_freq_hz,
             json,
         } => {
             // Checked before any source is opened -- otherwise an invalid
@@ -2669,6 +2676,19 @@ fn main() -> Result<()> {
                     manta_engine::MAX_DURATION.as_secs()
                 );
             }
+            #[cfg(feature = "soapy")]
+            let has_soapy_source = soapy_driver.is_some();
+            #[cfg(not(feature = "soapy"))]
+            let has_soapy_source = false;
+            #[cfg(feature = "hpsdr")]
+            let has_hpsdr_source = hpsdr_host.is_some();
+            #[cfg(not(feature = "hpsdr"))]
+            let has_hpsdr_source = false;
+            let has_rf_aware_source = kiwi_host.is_some()
+                || has_soapy_source
+                || has_hpsdr_source
+                || source_iq_has_real_rf_center(&source, source_iq);
+            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
             let kiwi = KiwiOpts {
                 host: kiwi_host,
                 port: kiwi_port,
@@ -2707,16 +2727,17 @@ fn main() -> Result<()> {
                                 rate: soapy_rate,
                                 gain: soapy_gain,
                             },
-                            None,
+                            dial_freq_hz,
                         )?
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, source_iq, kiwi, None)?
+                        open_source(device, source, source_iq, kiwi, dial_freq_hz)?
                     }
                 }
             };
             let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
+            let src = apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
             let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain

@@ -546,6 +546,73 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
     assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
 }
 
+/// MAN-34 review finding: `manta doctor` hardcoded no dial frequency, so a
+/// rig-audio device or WAV diagnosed through it always reported baseband
+/// offsets even though `listen`/`soak` accept `--dial-freq-hz` for the same
+/// input. The flag must exist on `doctor` and reach the audio source.
+#[test]
+fn doctor_accepts_and_applies_dial_freq_hz_for_an_audio_source() {
+    let help = manta().args(["doctor", "--help"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("--dial-freq-hz"),
+        "doctor --help must list --dial-freq-hz"
+    );
+
+    // A bad value is rejected at parse time, proving the flag is wired to
+    // the same validator `listen` uses.
+    let bad = manta()
+        .args([
+            "doctor",
+            "--source",
+            "/nonexistent.wav",
+            "--dial-freq-hz",
+            "not-a-number",
+        ])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("dial-freq-hz"),
+        "stderr: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // A real 48 kHz mono audio WAV: the report's center frequency is the
+    // operator's dial frequency, not the audio source's own 0.0.
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("tone.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 48_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    for n in 0..(48_000 * 4) {
+        let t = n as f32 / 48_000.0;
+        w.write_sample((8_000.0 * (2.0 * std::f32::consts::PI * 700.0 * t).sin()) as i16)
+            .unwrap();
+    }
+    w.finalize().unwrap();
+
+    let out = manta()
+        .args(["doctor", "--duration", "3", "--json", "--source"])
+        .arg(&wav)
+        .args(["--dial-freq-hz", "14030000"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("doctor --json not JSON ({e}): stdout={stdout} stderr={stderr}")
+    });
+    assert_eq!(
+        report["center_freq_hz"].as_f64(),
+        Some(14_030_000.0),
+        "report: {report}"
+    );
+}
+
 /// SPEC v2 §0/§7: `manta listen` gets the same `--engine` flag `manta
 /// decode` already has (Task 6), threaded through to the same
 /// `PipelineConfig`/`DecodeConfig` `manta_engine::listen` reads (Task 9).
