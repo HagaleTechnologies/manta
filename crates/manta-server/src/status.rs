@@ -127,8 +127,25 @@ impl StatusDoc {
         }
     }
 
+    /// Pretty-printed JSON with DEL and the C1 controls (U+007F-U+009F)
+    /// `\u`-escaped as well (Codex review, PR #95): serde_json escapes only
+    /// U+0000-U+001F, so those would otherwise reach the terminal raw
+    /// through `manta status --json` when a spoofed endpoint puts them in a
+    /// label. serde_json never emits them outside a string literal, so
+    /// escaping each one keeps the output valid JSON with the same decoded
+    /// value.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("StatusDoc is infallibly serializable")
+        let json =
+            serde_json::to_string_pretty(self).expect("StatusDoc is infallibly serializable");
+        let mut out = String::with_capacity(json.len());
+        for c in json.chars() {
+            if ('\u{7f}'..='\u{9f}').contains(&c) {
+                out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }
 
@@ -148,6 +165,28 @@ fn target_health_label(health: UplinkHealth) -> &'static str {
         UplinkHealth::Flapping => "flapping",
         UplinkHealth::Down => "down",
     }
+}
+
+/// Makes a daemon-supplied string safe to write to the operator's terminal
+/// (Codex review, PR #95). `manta status --addr` can be pointed at any
+/// endpoint, and serde_json decodes `\u001b`, `\n` and friends inside a
+/// JSON string, so a spoofed or hostile endpoint could otherwise inject
+/// ANSI/OSC sequences or forge extra rows through a target label. Every
+/// Unicode control character (`char::is_control`: C0, DEL, C1) is replaced
+/// by its `char::escape_default` spelling (`\u{1b}`, `\n`, ...); all other
+/// characters, including non-control format characters, pass through
+/// unchanged. Only human-facing text goes through this: `StatusDoc` keeps
+/// the original value, and `--json` output is escaped by `to_json` instead.
+pub fn escape_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// One screen an operator can read without a manual (MAN-44). Fixed-width
@@ -196,7 +235,7 @@ pub fn render_human(doc: &StatusDoc) -> String {
     for t in &doc.uplink.targets {
         out.push_str(&format!(
             "  {:<30} {:<9} {:>6} {:>8} {:>8} {:>10}\n",
-            t.label,
+            escape_for_terminal(&t.label),
             target_health_label(t.health),
             t.sent,
             t.suppressed,
@@ -289,6 +328,59 @@ mod tests {
         let mut doc = StatusDoc::from_metrics(&metrics_fixture());
         doc.active_tracks = None;
         assert!(render_human(&doc).contains("active tracks  n/a"));
+    }
+
+    #[test]
+    fn human_render_escapes_control_characters_in_a_daemon_supplied_target_label() {
+        // Codex review, PR #95: `manta status --addr` can reach a spoofed
+        // endpoint, and serde_json decodes `\u001b`/`\n` inside a JSON
+        // string, so a label written verbatim could inject ANSI/OSC
+        // sequences or forge an extra table row on the operator's terminal.
+        let clean = render_human(&StatusDoc::from_metrics(&metrics_fixture()));
+        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
+        let hostile = "evil:7000\u{1b}]0;pwned\u{7}\n  forged.example:7000 connected";
+        doc.uplink.targets[0].label = hostile.to_string();
+
+        let out = render_human(&doc);
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "no control character but the renderer's own line breaks may reach the terminal: {out:?}"
+        );
+        assert_eq!(
+            out.lines().count(),
+            clean.lines().count(),
+            "an embedded newline must not forge an extra row: {out:?}"
+        );
+        assert!(out.contains(r"evil:7000\u{1b}]0;pwned\u{7}\n  forged.example:7000 connected"));
+        // The document keeps the original value: `--json` output is
+        // serde_json-escaped already and stays faithful to what was sent.
+        assert_eq!(doc.uplink.targets[0].label, hostile);
+        assert!(doc.to_json().contains(r"evil:7000\u001b]0;pwned\u0007\n"));
+    }
+
+    #[test]
+    fn json_output_escapes_del_and_c1_controls_that_serde_json_leaves_raw() {
+        // serde_json \u-escapes only U+0000-U+001F, so DEL and the C1
+        // controls (U+009B is a one-character CSI) in a spoofed endpoint's
+        // label would reach the terminal raw through `manta status --json`.
+        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
+        let hostile = "evil:7000\u{9b}2J\u{9d}0;pwned\u{9c}\u{7f}";
+        doc.uplink.targets[0].label = hostile.to_string();
+
+        let json = doc.to_json();
+        assert!(
+            !json.chars().any(|c| c.is_control() && c != '\n'),
+            "no control character but the pretty-printer's line breaks may reach the terminal: {json:?}"
+        );
+        assert!(
+            json.contains(r"evil:7000\u009b2J\u009d0;pwned\u009c\u007f"),
+            "{json:?}"
+        );
+        let back: StatusDoc = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.uplink.targets[0].label, hostile,
+            "the decoded value must be unchanged"
+        );
     }
 
     #[test]

@@ -2178,6 +2178,16 @@ fn status_exit_code(doc: &manta_server::status::StatusDoc) -> i32 {
     }
 }
 
+/// What `Command::Status` prints to stderr before exiting 2. Not escaped
+/// here as a whole: local diagnostics such as a `--config` TOML error carry
+/// a multi-line source snippet that must stay readable. Peer-supplied text
+/// is escaped where it enters the error instead -- the status line in
+/// `fetch_status_inner`, serde_json's quoted values in `parse_status_doc`
+/// (Codex review, PR #95).
+fn status_failure_message(e: &anyhow::Error) -> String {
+    format!("manta status: {e:#}")
+}
+
 /// Bounds a fetched status document's body size (MAN-44): a real status
 /// document is kilobytes at most, but a wrong or hostile endpoint
 /// answering `GET /status` must not be able to make this allocate without
@@ -2225,8 +2235,10 @@ async fn connect_any(
 /// candidate behavior is unit-testable with a fake, instantly-controllable
 /// "hangs forever" attempt under paused tokio time -- same precedent as
 /// `uplink::connect_first_reachable_bounded`. Each candidate gets its own
-/// slice of `overall_timeout` (split evenly across every candidate) rather
-/// than a bare, unbounded `TcpStream::connect`: without a per-candidate
+/// slice of `overall_timeout` -- the time still left before the deadline,
+/// split evenly across the candidates not yet tried, so a candidate that
+/// fails fast passes its unused time on -- rather than a bare, unbounded
+/// `TcpStream::connect`: without a per-candidate
 /// bound, a first address that silently black-holes SYNs (a firewall drop,
 /// not a refusal) consumed `fetch_status`'s ENTIRE outer timeout before a
 /// later, live candidate was ever dialled -- the exact failure this
@@ -2240,9 +2252,15 @@ where
     F: Fn(std::net::SocketAddr) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<T>>,
 {
-    let per_addr_timeout = overall_timeout / (addrs.len().max(1) as u32);
+    let deadline = tokio::time::Instant::now() + overall_timeout;
     let mut last_err = None;
-    for &addr in addrs {
+    for (i, &addr) in addrs.iter().enumerate() {
+        // Re-split what is LEFT of the deadline across the candidates not
+        // yet tried (Codex review, PR #95): a fixed up-front even split let
+        // fast refusals strand their unused time, so a live last candidate
+        // could time out with most of the budget unspent.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let per_addr_timeout = remaining / ((addrs.len() - i) as u32);
         match tokio::time::timeout(per_addr_timeout, connect(addr)).await {
             Ok(Ok(stream)) => return Ok((stream, addr)),
             Ok(Err(e)) => last_err = Some(e),
@@ -2282,7 +2300,10 @@ async fn fetch_status_inner(
         .await
         .context("reading the status line")?;
     if !status_line.starts_with("HTTP/1.1 200") {
-        bail!("daemon returned {}", status_line.trim_end());
+        bail!(
+            "daemon returned {}",
+            manta_server::status::escape_for_terminal(status_line.trim_end())
+        );
     }
 
     for _ in 0..MAX_STATUS_HEADER_LINES {
@@ -2345,8 +2366,7 @@ async fn fetch_status_inner(
 fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
     use manta_server::status::STATUS_SCHEMA_VERSION;
 
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("status body was not a valid status document")?;
+    let value: serde_json::Value = serde_json::from_str(body).map_err(invalid_status_doc)?;
     if let Some(version) = value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
@@ -2361,8 +2381,19 @@ fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
         }
     }
     let doc: manta_server::status::StatusDoc =
-        serde_json::from_value(value).context("status body was not a valid status document")?;
+        serde_json::from_value(value).map_err(invalid_status_doc)?;
     Ok(doc)
+}
+
+/// serde_json's data errors quote the offending value ("unknown variant
+/// `...`", "invalid type: string ..."), and that value comes from the
+/// peer, so it is escaped before it can reach the operator's terminal
+/// (Codex review, PR #95).
+fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
+    anyhow!(
+        "status body was not a valid status document: {}",
+        manta_server::status::escape_for_terminal(&e.to_string())
+    )
 }
 
 fn main() -> Result<()> {
@@ -2961,7 +2992,7 @@ fn main() -> Result<()> {
             let doc = match run_status(config.as_deref(), addr.as_deref(), timeout_secs) {
                 Ok(doc) => doc,
                 Err(e) => {
-                    eprintln!("manta status: {e:#}");
+                    eprintln!("{}", status_failure_message(&e));
                     std::process::exit(2);
                 }
             };
@@ -4466,6 +4497,104 @@ mod tests {
             started.elapsed() < overall_timeout,
             "the stalled first candidate must not consume the whole overall budget: elapsed {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Codex review, PR #95: a candidate that fails fast must hand its
+    /// unused slice of the budget to the candidates after it. Splitting
+    /// `overall_timeout` evenly up front gave the live fourth address here
+    /// only 5s / 4 = 1.25s, so a daemon that takes 3s to accept timed out
+    /// (exit 2, "could not reach") with nearly the whole deadline unspent.
+    #[tokio::test(start_paused = true)]
+    async fn connect_any_bounded_carries_unused_time_forward_to_later_candidates() {
+        let overall_timeout = std::time::Duration::from_secs(5);
+        let addrs: Vec<std::net::SocketAddr> = (1..=4)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect(); // never actually dialed -- `connect` below is faked
+        let connect = |addr: std::net::SocketAddr| async move {
+            if addr.port() < 4 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "refused",
+                ))
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Ok(())
+            }
+        };
+
+        let (_stream, addr) = connect_any_bounded(&addrs, overall_timeout, connect)
+            .await
+            .expect(
+                "three instant refusals must leave the fourth candidate the rest of the deadline",
+            );
+        assert_eq!(addr.port(), 4);
+    }
+
+    /// Same terminal-injection concern as `status::render_human`'s label
+    /// escaping (Codex review, PR #95), on the failure path: a spoofed
+    /// endpoint's status line is quoted in the error `manta status` prints
+    /// to stderr.
+    #[tokio::test]
+    async fn fetch_status_escapes_control_characters_in_a_peer_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 500 \x1b]0;pwned\x07Oops\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let err = fetch_status(&[addr], std::time::Duration::from_secs(5))
+            .await
+            .expect_err("a 500 status line must be an error");
+        let message = status_failure_message(&err);
+        assert!(
+            !message.chars().any(char::is_control),
+            "no peer-supplied control character may reach the terminal: {message:?}"
+        );
+        assert!(message.contains(r"\u{1b}]0;pwned\u{7}Oops"));
+    }
+
+    /// serde_json's data errors quote the offending value ("unknown variant
+    /// `...`"), and that value comes from the peer -- same escaping as the
+    /// status line above (Codex review, PR #95).
+    #[test]
+    fn parse_status_doc_escapes_control_characters_quoted_in_a_serde_error() {
+        let body = doc_with(manta_server::metrics::OverallUplinkHealth::Disabled)
+            .to_json()
+            .replace(r#""health": "disabled""#, r#""health": "\u001b[2J\npwned""#);
+        let err = parse_status_doc(&body).expect_err("an unknown health variant must not parse");
+        let message = status_failure_message(&err);
+        assert!(
+            message.contains("not a valid status document"),
+            "{message:?}"
+        );
+        assert!(
+            !message.chars().any(char::is_control),
+            "no peer-supplied control character may reach the terminal: {message:?}"
+        );
+        assert!(message.contains(r"\u{1b}[2J\npwned"), "{message:?}");
+    }
+
+    /// The escaping above is applied where peer text enters the error, not
+    /// to the whole chain at the stderr sink: a local `--config` TOML
+    /// error's multi-line source snippet must still print as lines.
+    #[test]
+    fn status_config_parse_errors_keep_their_multi_line_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "[server]\nbind_addr = \n").unwrap();
+        let err = run_status(Some(&path), None, 5).expect_err("a broken config must not parse");
+        let message = status_failure_message(&err);
+        assert!(message.contains("TOML parse error"), "{message:?}");
+        assert!(
+            message.contains('\n') && !message.contains(r"\n"),
+            "the TOML snippet must keep its real line breaks: {message:?}"
         );
     }
 
