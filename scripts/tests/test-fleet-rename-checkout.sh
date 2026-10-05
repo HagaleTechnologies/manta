@@ -960,5 +960,73 @@ if grep -q "unhealthy worktree" <<<"$out"
 then bad "T60 healthy worktree passes without rev-parse --path-format" "$out"
 else ok "T60 healthy worktree passes without rev-parse --path-format"; fi
 
+# --- T61: `git worktree list` exiting non-zero (emulated by a git wrapper)
+#     must not read as an empty, healthy inventory: --check fails verification instead of passing it, and
+#     --apply refuses before moving anything instead of skipping every
+#     repair and reporting MIGRATED ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+BROKENGIT="$R/brokengit"
+mkdir -p "$R/org/manta-worktrees" "$BROKENGIT"
+addwt "$C" "$R/org/manta-worktrees/w1" w1
+REAL_GIT="$(command -v git)"
+cat > "$BROKENGIT/git" <<EOF
+#!/usr/bin/env bash
+if [[ \${3:-} == worktree && \${4:-} == list ]]; then
+  echo "fatal: simulated unreadable worktree metadata" >&2; exit 128
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$BROKENGIT/git"
+out=$(PATH="$BROKENGIT:$PATH" "$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T61 --check exit" "$rc" "1"
+if grep -q "PASS  every linked worktree" <<<"$out"
+then bad "T61 --check does not pass an unreadable inventory" "$out"
+else ok "T61 --check does not pass an unreadable inventory"; fi
+out=$(PATH="$BROKENGIT:$PATH" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T61 --apply (already migrated) exit" "$rc" "2"
+if grep -q "cannot enumerate this checkout's worktrees" <<<"$out"
+then ok "T61 --apply (already migrated) refuses for the listing failure"
+else bad "T61 --apply (already migrated) refuses for the listing failure" "$out"; fi
+R=$(newroot); C=$(mkfixture "$R" skimmer)
+mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
+out=$(PATH="$BROKENGIT:$PATH" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T61 --apply exit" "$rc" "2"
+if [[ -d "$R/org/skimmer" && ! -e "$R/org/manta" ]] \
+   && grep -q "cannot enumerate this checkout's worktrees" <<<"$out"; then ok "T61 --apply moved nothing"
+else bad "T61 --apply moved nothing" "$out"; fi
+# Same defect in the busy preflight: a failing `ps` must refuse the move, not
+# read as "no process holds the checkout".
+R=$(newroot); mkfixture "$R" skimmer >/dev/null; mkdir -p "$R/fakebin"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$R/fakebin/ps"; chmod +x "$R/fakebin/ps"
+out=$(PATH="$R/fakebin:$PATH" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T61 --apply with failing ps exit" "$rc" "2"
+if [[ -d "$R/org/skimmer" && ! -e "$R/org/manta" ]] && grep -q "could not list processes" <<<"$out"
+then ok "T61 failing ps refuses the move"
+else bad "T61 failing ps refuses the move" "$out"; fi
+
+# --- T62: an origin spelled as the RELATIVE LOCAL PATH
+#     github.com/HagaleTechnologies/manta.git is a directory name to git, not
+#     the GitHub repository, so it must not normalize equal to the HTTPS URL:
+#     --check flags it and --apply repoints it ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+git -C "$C" remote set-url origin github.com/HagaleTechnologies/manta.git
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T62 --check exit" "$rc" "1"
+if grep -q "FAIL  origin = github.com/HagaleTechnologies/manta.git" <<<"$out"
+then ok "T62 --check flags a local-path origin"
+else bad "T62 --check flags a local-path origin" "$out"; fi
+out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T62 --apply exit" "$rc" "0"
+check "T62 --apply repoints origin" "$(git -C "$C" remote get-url origin)" \
+  "https://github.com/HagaleTechnologies/manta.git"
+# A '/' before the first ':' also makes git read a git@ spelling as a local
+# path rather than scp-style SSH.
+git -C "$C" remote set-url origin git@github.com/HagaleTechnologies:manta.git
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T62 --check exit (git@ local path)" "$rc" "1"
+if grep -q "FAIL  origin = git@github.com/HagaleTechnologies:manta.git" <<<"$out"
+then ok "T62 --check flags a git@ local-path origin"
+else bad "T62 --check flags a git@ local-path origin" "$out"; fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

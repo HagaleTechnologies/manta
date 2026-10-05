@@ -198,8 +198,15 @@ MAIN_REAL="$MAIN"
 
 # ---- worktree inventory ---------------------------------------------------
 # Emits "<path>\t<prunable|ok>" per worktree, main tree first.
+# Returns non-zero when `git worktree list` itself exits non-zero. Reading it
+# through a process substitution used to discard that status, so a failed
+# listing looked like an empty, healthy inventory: verify() passed it and
+# --apply skipped every repair. Callers must check the status. This does not
+# catch an entry git silently leaves out: an unreadable .git/worktrees/<id>
+# is omitted from the listing while git still exits 0 (git 2.47.3).
 inventory() {
-  local wt="" pr=""
+  local wt="" pr="" listing line
+  listing="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null)" || return 1
   while IFS= read -r line; do
     case "$line" in
       worktree\ *) [[ -n $wt ]] && printf '%s\t%s\n' "$wt" "${pr:-ok}"
@@ -207,8 +214,9 @@ inventory() {
       prunable*)   pr="prunable";;
       "")          ;;
     esac
-  done < <(git -C "$MAIN" worktree list --porcelain 2>/dev/null)
+  done <<<"$listing"
   [[ -n $wt ]] && printf '%s\t%s\n' "$wt" "${pr:-ok}"
+  return 0
 }
 
 # C2 (validation round): the basename-collision fallback below used to accept
@@ -257,9 +265,13 @@ report_pass_verdict() {
 # $1 = newline-separated baseline of paths that were ALREADY prunable before any
 #      move (empty for --check).
 verify() {
-  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root root_canon reg bn all_paths
+  local baseline="${1:-}" line path flag unhealthy=0 mainpath candidate root root_canon reg bn all_paths inv
   mainpath="$(git -C "$MAIN" rev-parse --show-toplevel)"
-  all_paths="$(inventory | cut -f1)"
+  if ! inv="$(inventory)"; then
+    fail "cannot enumerate worktrees: 'git -C $MAIN worktree list --porcelain' failed, so no linked worktree's health was verified"
+    unhealthy=1
+  fi
+  all_paths="$(cut -f1 <<<"$inv")"
 
   # Gherkin 1: directory named <new> present, no <old> directory remains.
   if [[ -d $NEW_MAIN ]]; then pass "directory '$NEW_NAME' present in $ORG_DIR"
@@ -277,7 +289,7 @@ verify() {
   local url; url="$(git -C "$MAIN" remote get-url origin 2>/dev/null || echo '<none>')"
   if [[ $url == '<none>' ]]; then
     fail "origin = <none> (want $REMOTE_URL)"
-  elif [[ "$(normalize_origin "$url")" == "$(normalize_origin "$REMOTE_URL")" ]]; then
+  elif same_origin "$url" "$REMOTE_URL"; then
     pass "origin = $url"
   else
     fail "origin = $url (want $REMOTE_URL)"
@@ -348,7 +360,7 @@ verify() {
       fail "unhealthy worktree — its .git does not resolve to $MAIN's repository (stale pointer or an unrelated repository): $candidate"
       unhealthy=1
     fi
-  done <<<"$(inventory)"
+  done <<<"$inv"
   [[ $unhealthy -eq 0 ]] && pass "every linked worktree resolves its git dir"
 
   # Desired End State: registry.json's MAN entry, when present, must resolve to
@@ -541,20 +553,33 @@ fi
 # CR-3: normalize protocol/user/.git-suffix away so an SSH origin
 # (git@github.com:org/repo(.git)?) is recognized as equivalent to the HTTPS
 # default rather than being flagged as drift or silently rewritten.
+# Returns non-zero for any other spelling: an unqualified string such as
+# `github.com/org/repo.git` is a relative local path to git, not a host URL,
+# and used to pass through unchanged and compare equal to the HTTPS form.
 normalize_origin() {
   local u="${1%.git}" host path
   case "$u" in
     git@*:*)
       u="${u#git@}"
       host="${u%%:*}"
+      # git reads a '/' before the first ':' as a local path, not scp syntax.
+      [[ $host == */* ]] && return 1
       path="${u#*:}"
       u="$host/$path"
       ;;
     ssh://git@*)  u="${u#ssh://git@}";;
     https://*)    u="${u#https://}";;
     http://*)     u="${u#http://}";;
+    *)            return 1;;
   esac
   printf '%s' "$u"
+}
+# True when $1 and $2 are the same string, or both are recognized URL forms
+# (see normalize_origin) naming the same host/org/repo.
+same_origin() {
+  local a b
+  [[ $1 == "$2" ]] && return 0
+  a="$(normalize_origin "$1")" && b="$(normalize_origin "$2")" && [[ $a == "$b" ]]
 }
 # CR-1/CR-3: `git remote set-url` cannot create a remote that does not exist —
 # on a checkout with no origin it dies with "No such remote 'origin'" after
@@ -569,7 +594,7 @@ set_origin() {
   if cur="$(git -C "$MAIN" remote get-url origin 2>/dev/null)"; then
     if [[ $cur == "$REMOTE_URL" ]]; then
       info "origin already correct"
-    elif [[ "$(normalize_origin "$cur")" == "$(normalize_origin "$REMOTE_URL")" ]]; then
+    elif same_origin "$cur" "$REMOTE_URL"; then
       if [[ $EXPLICIT_REMOTE_URL -eq 1 ]]; then
         say "repointing origin: $cur -> $REMOTE_URL (explicit --remote-url)"
         git -C "$MAIN" remote set-url origin "$REMOTE_URL" || die "git remote set-url failed"
@@ -608,13 +633,19 @@ busy_reasons() {
   # preflight on exactly the hosts the plan flags as macOS candidates. Filter
   # in bash (quoted case pattern, not a grep subprocess) so the filter itself
   # never becomes a process whose own argv contains $OLD_MAIN and matches.
-  if command -v ps >/dev/null 2>&1; then
+  # Capture ps's status: read through a process substitution, a failed
+  # listing looked like "no process holds the checkout" (same defect as
+  # inventory()), so report a missing or failing ps as a reason to refuse.
+  local procs procline
+  if command -v ps >/dev/null 2>&1 && procs="$(ps -Ao pid=,args= 2>/dev/null)"; then
     while IFS= read -r procline; do
       case "$procline" in
         *fleet-rename-checkout*) ;;
         *"$OLD_MAIN"*) printf 'process referencing the checkout: %s\n' "$procline";;
       esac
-    done < <(ps -Ao pid=,args= 2>/dev/null)
+    done <<<"$procs"
+  else
+    printf "could not list processes ('ps -Ao pid=,args=' is missing or failed), so a process holding the checkout cannot be ruled out\n"
   fi
   return 0
 }
@@ -726,7 +757,9 @@ $busy
     # F1: capture the prunable baseline before touching anything below, so
     # pre-existing cruft (KD 4 / ADR Decision 3) stays informational in
     # verify() instead of permanently failing a host that carries any.
-    BASELINE="$(inventory | awk -F'\t' '$2=="prunable"{print $1}')"
+    INV="$(inventory)" || die "cannot enumerate this checkout's worktrees ('git -C $MAIN worktree list --porcelain' failed); refusing to touch it.
+     Run 'git -C $MAIN worktree list --porcelain' to see git's error, fix its cause, then re-run."
+    BASELINE="$(awk -F'\t' '$2=="prunable"{print $1}' <<<"$INV")"
 
     # F2: a host where only the main clone was hand-renamed leaves $OLD_WTP
     # behind forever otherwise — move it now, before repairing worktrees,
@@ -741,7 +774,9 @@ $busy
       mv "$OLD_WTP" "$NEW_WTP" || die "mv of the worktree parent failed"
     fi
 
-    all_paths="$(inventory | cut -f1)"
+    INV="$(inventory)" || die "cannot enumerate this checkout's worktrees after moving the worktree parent ('git -C $MAIN worktree list --porcelain' failed).
+     Run 'git -C $MAIN worktree list --porcelain' to see git's error, fix its cause, then re-run --apply."
+    all_paths="$(cut -f1 <<<"$INV")"
     REPAIR=()
     while IFS=$'\t' read -r p _; do
       [[ -z $p ]] && continue
@@ -779,7 +814,7 @@ $busy
         # but fails to resolve its own git-dir, regardless of path remapping.
         REPAIR+=("$p")
       fi
-    done <<<"$(inventory)"
+    done <<<"$INV"
 
     if [[ ${#REPAIR[@]} -gt 0 ]]; then
       say "repairing ${#REPAIR[@]} linked worktree(s) recorded at a stale legacy path"
@@ -814,11 +849,13 @@ $busy
      Refusing to merge two worktree parents. Resolve by hand, then re-run."
   fi
 
-  # Baseline: which worktrees were ALREADY prunable before we touched anything (KD 4).
-  BASELINE="$(inventory | awk -F'\t' '$2=="prunable"{print $1}')"
-
   # Inventory BEFORE the move — afterwards `worktree list` reports stale paths.
-  WTS="$(inventory | cut -f1)"
+  # Refuse when it cannot be read: an empty list would skip every repair below.
+  INV="$(inventory)" || die "cannot enumerate this checkout's worktrees ('git -C $MAIN worktree list --porcelain' failed); refusing to move.
+     Run 'git -C $MAIN worktree list --porcelain' to see git's error, fix its cause, then re-run."
+  # Baseline: which worktrees were ALREADY prunable before we touched anything (KD 4).
+  BASELINE="$(awk -F'\t' '$2=="prunable"{print $1}' <<<"$INV")"
+  WTS="$(cut -f1 <<<"$INV")"
   MAINPATH="$(git -C "$MAIN" rev-parse --show-toplevel)"
 
   say "moving $OLD_MAIN -> $NEW_MAIN"
