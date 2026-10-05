@@ -86,9 +86,11 @@ fatal: not a git repository: /…/org/skimmer/.git/worktrees/MAN-9
 ```
 
 `scripts/fleet-rename-checkout.sh`'s `verify()` therefore runs `git -C <wt>
-rev-parse --git-dir` inside every worktree the inventory lists, in addition
+rev-parse --git-common-dir` inside every worktree the inventory lists and
+requires it to resolve to the main checkout's common git dir, in addition
 to checking for new `prunable` flags — the check `git worktree list` cannot
-make on its own.
+make on its own. (A bare `rev-parse --git-dir` is not enough: it also
+succeeds when the recorded path now holds an unrelated repository.)
 
 Pre-existing `prunable` entries (e.g. a worktree directory a human already
 `rm -rf`'d) are unrelated to this rename and exist independently of it. The

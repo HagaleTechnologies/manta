@@ -221,11 +221,16 @@ inventory() {
 # no-op. Returns success only when $1 is itself a worktree of $MAIN, verified
 # by comparing each side's real (canonicalized) common git dir rather than by
 # mere path string equality.
+# No `rev-parse --path-format=absolute`: git before 2.31 echoes that option
+# back as an output line, which would make every worktree fail the check. A
+# relative --git-common-dir is relative to the -C directory, so join it there.
 is_worktree_of_main() {
   local candidate="$1" common main_common
-  common="$(git -C "$candidate" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  common="$(git -C "$candidate" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ $common == /* ]] || common="$candidate/$common"
   common="$(cd "$common" 2>/dev/null && pwd -P)" || return 1
-  main_common="$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  main_common="$(git -C "$MAIN" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [[ $main_common == /* ]] || main_common="$MAIN/$main_common"
   main_common="$(cd "$main_common" 2>/dev/null && pwd -P)"
   [[ -n $common && $common == "$main_common" ]]
 }
@@ -334,9 +339,13 @@ verify() {
       fi
     fi
     # Gherkin 2, part B: the check `worktree list` CANNOT make (KD 2).
+    # A bare `rev-parse --git-dir` also succeeds when the recorded path now
+    # holds an unrelated repository (git lists that entry as not prunable,
+    # because its .git exists), so require the candidate to share $MAIN's
+    # common git dir.
     [[ $candidate == "$mainpath" ]] && continue
-    if [[ -d $candidate ]] && ! git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1; then
-      fail "unhealthy worktree — its .git file points at a stale location: $candidate"
+    if [[ -d $candidate ]] && ! is_worktree_of_main "$candidate"; then
+      fail "unhealthy worktree — its .git does not resolve to $MAIN's repository (stale pointer or an unrelated repository): $candidate"
       unhealthy=1
     fi
   done <<<"$(inventory)"
@@ -632,13 +641,32 @@ reconcile_registry() {
   # usage error without one (CR-1) — which on a fleet host would abort this
   # function with a raw shell error instead of the degrade-to-warning message
   # every other failure path here uses.
-  # V-4: the template lives in $reg's OWN directory (not $TMPDIR), so the
-  # final `mv` below is a same-filesystem rename (atomic) instead of a
-  # cross-filesystem copy. mktemp also always creates the file mode 0600 —
+  # V-4: the template lives in the OWN directory of the file it replaces
+  # ($reg_dest below, not $TMPDIR), so the final `mv` below is a
+  # same-filesystem rename (atomic) instead of a cross-filesystem copy.
+  # mktemp also always creates the file mode 0600 —
   # capture the registry's real mode first and restore it on the temp file
   # before the swap, or the `mv` silently narrows registry.json's
   # permissions and a daemon running under a different uid loses read access.
-  if ! tmp="$(mktemp "${reg}.XXXXXX")"; then
+  # A symlinked registry.json (dotfiles/stow layout) is rewritten at its
+  # final target, so the swap below updates the target and leaves the link
+  # in place instead of replacing the link with a regular file. `-f` above
+  # saw the chain end at a regular file, so this loop terminates unless the
+  # links are changed while it runs.
+  local reg_dest="$reg" link
+  while [[ -L $reg_dest ]]; do
+    link="$(readlink "$reg_dest")" || break
+    case "$link" in
+      /*) reg_dest="$link";;
+      *)  reg_dest="$(dirname -- "$reg_dest")/$link";;
+    esac
+  done
+  if [[ -L $reg_dest ]]; then
+    info "could not resolve the symlink $reg — leaving it untouched."
+    info "  Edit its target by hand so team \"$TEAM_NEW\" has repoRoot \"$NEW_MAIN\"."
+    return 0
+  fi
+  if ! tmp="$(mktemp "${reg_dest}.XXXXXX")"; then
     info "mktemp failed — skipping registry reconciliation."
     info "  Edit $reg by hand so team \"$TEAM_NEW\" has repoRoot \"$NEW_MAIN\"."
     return 0
@@ -665,7 +693,7 @@ reconcile_registry() {
     .projects = ((.projects // []) | map(if .team == $team then .repoRoot = $root else . end))
     | if any(.projects[]; .team == $team) then .
       else .projects += [{team: $team, repoRoot: $root}] end
-  ' "$reg" > "$tmp" && mv "$tmp" "$reg"; then
+  ' "$reg" > "$tmp" && mv "$tmp" "$reg_dest"; then
     say "registry.json: team $TEAM_NEW -> $NEW_MAIN"
   else
     rm -f "$tmp"; info "registry.json update failed — edit it by hand"

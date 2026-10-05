@@ -899,5 +899,66 @@ else
   skip "T57 registry mode assertion skipped (no jq)"
 fi
 
+# --- T58: a registered worktree path now occupied by an unrelated standalone
+#     repository is not a healthy worktree of the checkout. `git worktree
+#     list` does not mark it prunable (its .git exists), and a bare
+#     `rev-parse --git-dir` succeeds against the unrelated repo, so the
+#     health check must compare the common git dir with the checkout's ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+mkdir -p "$R/org/manta-worktrees"
+addwt "$C" "$R/org/manta-worktrees/w1" w1
+rm -rf "$R/org/manta-worktrees/w1"
+git -c init.defaultBranch=main init -q "$R/org/manta-worktrees/w1"
+out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T58 exit" "$rc" "1"
+if grep -q "unhealthy worktree.*$R/org/manta-worktrees/w1" <<<"$out"
+then ok "T58 flags a worktree path reused by an unrelated repository"
+else bad "T58 flags a worktree path reused by an unrelated repository" "$out"; fi
+
+# --- T59: --apply rewrites a symlinked registry.json (a dotfiles/stow
+#     layout) through the link: the link stays a link and its target gets
+#     the MAN entry, instead of the link being replaced by a regular file ---
+if command -v jq >/dev/null 2>&1; then
+  R=$(newroot); mkfixture "$R" skimmer >/dev/null
+  mkdir -p "$R/catalyst/execution-core" "$R/dotfiles"
+  printf '{"projects":[]}\n' > "$R/dotfiles/registry.json"
+  ln -s ../../dotfiles/registry.json "$R/catalyst/execution-core/registry.json"
+  out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+  check "T59 exit" "$rc" "0"
+  if [[ -L "$R/catalyst/execution-core/registry.json" ]]; then ok "T59 registry.json is still a symlink"
+  else bad "T59 registry.json is still a symlink" "$out"; fi
+  check "T59 link target updated" \
+    "$(jq -r '.projects[]|select(.team=="MAN")|.repoRoot' "$R/dotfiles/registry.json")" \
+    "$R/org/manta"
+  if compgen -G "$R/catalyst/execution-core/registry.json.*" >/dev/null \
+     || compgen -G "$R/dotfiles/registry.json.*" >/dev/null
+  then bad "T59 no temp file left behind" "$(ls -la "$R/catalyst/execution-core" "$R/dotfiles")"
+  else ok "T59 no temp file left behind"; fi
+else
+  skip "T59 skipped (no jq)"
+fi
+
+# --- T60: the T58 health check still passes a healthy worktree on git older
+#     than 2.31, which has no `rev-parse --path-format`: emulated by a git
+#     wrapper that echoes that option back the way an unknown option is ---
+R=$(newroot); C=$(mkfixture "$R" manta)
+mkdir -p "$R/org/manta-worktrees" "$R/oldgit"
+addwt "$C" "$R/org/manta-worktrees/w1" w1
+REAL_GIT="$(command -v git)"
+cat > "$R/oldgit/git" <<EOF
+#!/usr/bin/env bash
+args=()
+for a in "\$@"; do
+  if [[ \$a == --path-format=* ]]; then printf '%s\n' "\$a"; else args+=("\$a"); fi
+done
+exec "$REAL_GIT" "\${args[@]}"
+EOF
+chmod +x "$R/oldgit/git"
+out=$(PATH="$R/oldgit:$PATH" "$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+check "T60 exit" "$rc" "0"
+if grep -q "unhealthy worktree" <<<"$out"
+then bad "T60 healthy worktree passes without rev-parse --path-format" "$out"
+else ok "T60 healthy worktree passes without rev-parse --path-format"; fi
+
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
