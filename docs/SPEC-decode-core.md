@@ -433,7 +433,11 @@ TrackMeta   { track_id, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
 start). Wall-clock time exists only at the spot-emission boundary
 (`manta-server`), derived as `stream_start_time + sample_ts / fs` where
 `stream_start_time` comes from config/file sidecar — never from `Instant::now()`
-inside the decode path.
+inside the decode path. A live source's disconnect/reconnect (MAN-73) reports
+the missed span, in samples, via `IqSource::take_discontinuity()`; `listen()`
+advances the sample clock by that count and starts a fresh track segment, so
+`sample_ts` stays monotonic and wall-clock-true across the gap with no audio
+spliced in. File replay never reports a discontinuity.
 
 ---
 

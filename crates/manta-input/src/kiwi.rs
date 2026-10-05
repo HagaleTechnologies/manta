@@ -42,7 +42,7 @@ use num_complex::Complex32;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use std::collections::VecDeque;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{Message, WebSocket};
 
@@ -84,6 +84,60 @@ const TARGET_RATE_HZ: usize = 96_000;
 /// this ~0.5 s regardless of `RESAMPLER_CHUNK`.
 const RESAMPLER_CHUNK: usize = 16_384;
 
+/// Bounds DNS resolution plus `TcpStream::connect` together (MAN-73): a
+/// target that silently black-holes SYNs (e.g. a firewall drop, not a
+/// refusal), or a stalled resolver, would otherwise leave `connect()`
+/// pending for the OS's own timeout (commonly minutes) -- unlike
+/// `uplink.rs`'s connect, this one runs on `ReconnectingSource`'s blocking
+/// read-loop thread, which cannot be interrupted by Ctrl-C mid-connect;
+/// only this timeout bounds it. Mirrors `uplink.rs`'s own `CONNECT_TIMEOUT`
+/// value (see `resolve_and_connect` for why resolution needs its own bound
+/// too, unlike `uplink.rs`'s async equivalent).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolves `host:port` and connects to the first address that accepts,
+/// the whole operation bounded by `CONNECT_TIMEOUT` (MAN-73, code review
+/// round 1): `(host, port).to_socket_addrs()` is a synchronous, blocking
+/// `getaddrinfo(3)` call with no timeout of its own, so a stalled system
+/// resolver would otherwise hang this uninterruptible thread indefinitely
+/// before `TcpStream::connect_timeout` ever got a chance to run --
+/// `uplink.rs`'s `connect_any_resolved_address` bounds the equivalent async
+/// call with `tokio::time::timeout`; there is no Tokio runtime here, so
+/// resolution plus every per-address connect attempt instead run on a
+/// detached thread, raced against this function's own `recv_timeout`. A
+/// resolver stall past `CONNECT_TIMEOUT` returns an `Err` to the caller
+/// immediately; the detached thread is abandoned (matching the accepted
+/// tradeoff `uplink.rs` documents for its own blocking `getaddrinfo` call)
+/// rather than left to block a reconnect attempt forever.
+fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned_host = host.to_string();
+    std::thread::spawn(move || {
+        let outcome = (owned_host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| anyhow!("resolve {owned_host}:{port}: {e}"))
+            .and_then(|addrs| {
+                let mut last_err = None;
+                for addr in addrs {
+                    match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(last_err
+                    .map(anyhow::Error::from)
+                    .unwrap_or_else(|| anyhow!("no addresses resolved for {owned_host}:{port}")))
+            });
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(CONNECT_TIMEOUT) {
+        Ok(outcome) => outcome.with_context(|| format!("TCP connect to {host}:{port}")),
+        Err(_) => Err(anyhow!(
+            "TCP connect to {host}:{port} timed out (DNS resolution or connect exceeded {CONNECT_TIMEOUT:?})"
+        )),
+    }
+}
+
 /// TCP read timeout: bounds how long a single `socket.read()` call blocks,
 /// keeping `read()` responsive to repeated calls (and, at the engine layer,
 /// to Ctrl-C) rather than blocking indefinitely on a stalled network.
@@ -119,8 +173,7 @@ impl KiwiIqSource {
     /// to `TARGET_RATE_HZ`. `password` is `""` for anonymous/no-password
     /// receivers (most public ones).
     pub fn connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> Result<Self> {
-        let tcp = TcpStream::connect((host, port))
-            .with_context(|| format!("TCP connect to {host}:{port}"))?;
+        let tcp = resolve_and_connect(host, port)?;
         tcp.set_read_timeout(Some(READ_TIMEOUT))
             .context("set TCP read timeout")?;
 
@@ -441,6 +494,24 @@ mod tests {
         // "connection refused" path, no real network dependency.
         let result = KiwiIqSource::connect("127.0.0.1", 1, 14_025_000.0, "");
         assert!(result.is_err(), "expected a clean Err, not a panic");
+    }
+
+    #[test]
+    fn connect_to_a_resolvable_but_refusing_address_fails_within_the_connect_timeout() {
+        // MAN-73: exercises the new per-address `connect_timeout` loop. A
+        // refused connection returns near-instantly regardless of
+        // CONNECT_TIMEOUT, but this guards against a future regression
+        // back to an unbounded `TcpStream::connect` -- a black-holed
+        // address (not exercised here; needs network control) would hang
+        // for the OS's own connect timeout instead of this crate's bound.
+        let start = Instant::now();
+        let result = KiwiIqSource::connect("127.0.0.1", 1, 14_025_000.0, "");
+        assert!(result.is_err(), "expected a clean Err, not a panic");
+        assert!(
+            start.elapsed() < CONNECT_TIMEOUT,
+            "connect must fail within CONNECT_TIMEOUT, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

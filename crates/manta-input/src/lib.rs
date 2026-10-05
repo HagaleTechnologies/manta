@@ -46,6 +46,22 @@ pub trait IqSource {
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         None
     }
+
+    /// MAN-73: number of samples (at `sample_rate()`) the source *missed*
+    /// immediately before the samples returned by the most recent `read()`
+    /// -- e.g. a live connection that was lost and re-established. Returns
+    /// the value once, then `None` until the next gap. Default `None`:
+    /// file and continuously-streaming sources never have gaps.
+    /// `manta_engine::listen` responds by closing the current track
+    /// segment and starting a fresh one whose sample clock is advanced by
+    /// this many samples, so spot timestamps stay wall-clock-true and no
+    /// audio is spliced across the outage. Deliberately NOT zero-fill: a
+    /// zero-filled outage past ~2.5s pins `manta-dsp::floor`'s 25th-
+    /// percentile noise floor at -140 dBFS and floods false tracks on
+    /// resume (measured; see docs/DECISIONS/2026-10-05-man73-source-reconnect.md).
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// JSON sidecar alongside a WAV fixture, carrying metadata the WAV format itself can't. ARCHITECTURE §3.
@@ -222,6 +238,15 @@ mod tests {
         w.write_sample(0.0f32).unwrap();
         w.finalize().unwrap();
         assert!(WavIqSource::open(&wav).is_err());
+    }
+
+    #[test]
+    fn default_take_discontinuity_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let mut src = WavIqSource::open(&wav).unwrap();
+        assert_eq!(src.take_discontinuity(), None);
     }
 
     #[test]

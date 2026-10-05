@@ -445,6 +445,21 @@ impl TrackManager {
         self.owner_of.len()
     }
 
+    /// The id the next spawned track will receive. MAN-73: used by
+    /// `listen()`'s segment restart to carry the id sequence across a
+    /// discontinuity, so a fresh segment's `TrackManager` never reuses an
+    /// id from the segment it replaced.
+    pub fn next_track_id(&self) -> u32 {
+        self.next_id
+    }
+
+    /// Resume track id assignment from `next` instead of this manager's
+    /// default of 1. MAN-73: used by `listen()`'s segment restart so ids
+    /// are never reused within a session.
+    pub fn resume_track_ids_from(&mut self, next: u32) {
+        self.next_id = next;
+    }
+
     /// Issue #26: per-`CloseReason` counts of every track closed so far
     /// (`Unconfirmed`/`HangExpired`/`Silent` from `Lifecycle`'s state
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
@@ -1196,6 +1211,40 @@ mod tests {
             1,
             "issue #26: merge must be counted"
         );
+    }
+
+    /// MAN-73: `listen()`'s segment restart resumes id assignment from the
+    /// prior segment's `next_track_id()` so ids are never reused within a
+    /// session.
+    #[test]
+    fn resume_track_ids_from_continues_numbering() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.resume_track_ids_from(42);
+        let mut all_events = Vec::new();
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            all_events.extend(tm.process_hops(&hops, |m| m * hop_samples));
+        }
+        all_events.extend(tm.finish());
+        let first_track_meta_id = all_events
+            .iter()
+            .find_map(|e| match e {
+                DecoderEvent::TrackMeta { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .expect("V1 should produce at least one TrackMeta event");
+        assert_eq!(first_track_meta_id, 42);
     }
 
     /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render

@@ -5,6 +5,7 @@
 //! format and this repo's own reference implementation of that protocol
 //! from the server side.
 
+use crate::backoff::{next_backoff, AttemptOutcome as ConnectAttemptError, INITIAL_BACKOFF};
 use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::config::RbnUplinkConfig;
@@ -17,8 +18,6 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch, Semaphore};
 
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Bounds `TcpStream::connect` (MAN-58 comment finding 1): a target that
 /// silently black-holes SYNs (e.g. a firewall drop, not a refusal) would
 /// otherwise leave this attempt pending for the OS's own connect timeout
@@ -61,26 +60,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// time.
 const MAX_TARGET_RESPONSE_LINES: u32 = 30;
 const TARGET_RESPONSE_RATE_WINDOW: Duration = Duration::from_secs(60);
-
-/// Whether a connection attempt got far enough to matter for backoff:
-/// a connection that completed login before dropping was healthy, so the
-/// *next* attempt should retry quickly rather than inherit backoff state
-/// from an unrelated earlier outage. A connection that never got past
-/// `TcpStream::connect`/login (target down, refusing, wrong port) hasn't
-/// demonstrated that, so backoff keeps growing.
-enum ConnectAttemptError {
-    NeverConnected,
-    Disconnected,
-}
-
-/// Pure backoff-transition function, split out so this policy is
-/// unit-testable without any real sleeping/timing.
-fn next_backoff(current: Duration, outcome: &ConnectAttemptError) -> Duration {
-    match outcome {
-        ConnectAttemptError::Disconnected => INITIAL_BACKOFF,
-        ConnectAttemptError::NeverConnected => (current * 2).min(MAX_BACKOFF),
-    }
-}
 
 /// Reconnect-with-backoff loop around one uplink connection. Never
 /// returns while `config.enabled` and the shutdown signal hasn't fired --
@@ -571,30 +550,6 @@ async fn write_with_timeout(
 mod tests {
     use super::*;
     use std::net::TcpListener as StdTcpListener;
-
-    #[test]
-    fn backoff_resets_after_a_connection_that_reached_login() {
-        let grown = Duration::from_secs(16);
-        assert_eq!(
-            next_backoff(grown, &ConnectAttemptError::Disconnected),
-            INITIAL_BACKOFF
-        );
-    }
-
-    #[test]
-    fn backoff_doubles_and_caps_when_never_connected() {
-        assert_eq!(
-            next_backoff(Duration::from_secs(1), &ConnectAttemptError::NeverConnected),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            next_backoff(
-                Duration::from_secs(45),
-                &ConnectAttemptError::NeverConnected
-            ),
-            MAX_BACKOFF
-        );
-    }
 
     fn sample_spot_for_loss_tests() -> manta_spot::Spot {
         manta_spot::Spot {

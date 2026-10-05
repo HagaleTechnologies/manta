@@ -7,6 +7,9 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::PathBuf;
 
+mod reconnect;
+use reconnect::ReconnectingSource;
+
 #[derive(Parser)]
 #[command(
     name = "manta",
@@ -268,6 +271,9 @@ enum Command {
 }
 
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
+/// `Clone`: MAN-73's `LiveSourceSpec` carries one of these so a live source
+/// can be re-opened by `ReconnectingSource` after a loss.
+#[derive(Clone)]
 struct KiwiOpts {
     host: Option<String>,
     port: u16,
@@ -277,6 +283,7 @@ struct KiwiOpts {
 
 /// SoapySDR connection flags (feature `soapy`), grouped for the same reason.
 #[cfg(feature = "soapy")]
+#[derive(Clone)]
 struct SoapyOpts {
     driver: Option<String>,
     freq: Option<f64>,
@@ -286,11 +293,125 @@ struct SoapyOpts {
 
 /// HPSDR/Hermes connection flags (feature `hpsdr`), grouped for the same reason.
 #[cfg(feature = "hpsdr")]
+#[derive(Clone)]
 struct HpsdrOpts {
     host: Option<String>,
     port: u16,
     freq: Option<f64>,
     rate: Option<f64>,
+}
+
+/// Everything needed to (re)open the configured live input. MAN-73: a
+/// reconnectable kind (every variant but `File`) is re-opened by
+/// `ReconnectingSource` after a loss; `File` (deterministic replay) never
+/// is. `name()` must keep returning the same label `set_source_health`
+/// always used for that kind, since dashboards/scrapes key on it.
+#[derive(Clone)]
+enum LiveSourceSpec {
+    Kiwi(KiwiOpts),
+    #[cfg(feature = "soapy")]
+    Soapy(SoapyOpts),
+    #[cfg(feature = "hpsdr")]
+    Hpsdr(HpsdrOpts),
+    AudioDevice(Option<String>),
+    File(PathBuf),
+}
+
+impl LiveSourceSpec {
+    fn name(&self) -> &'static str {
+        match self {
+            LiveSourceSpec::Kiwi(_) => "kiwi",
+            #[cfg(feature = "soapy")]
+            LiveSourceSpec::Soapy(_) => "soapy",
+            #[cfg(feature = "hpsdr")]
+            LiveSourceSpec::Hpsdr(_) => "hpsdr",
+            LiveSourceSpec::AudioDevice(_) => "audio",
+            LiveSourceSpec::File(_) => "file",
+        }
+    }
+
+    /// Whether a loss of this source should be retried by
+    /// `ReconnectingSource` (MAN-73) rather than ending the daemon. File
+    /// replay's errors and EOF are deterministic and must reach `listen()`
+    /// unchanged -- see AGENTS.md's byte-identical-replay requirement.
+    fn is_reconnectable(&self) -> bool {
+        !matches!(self, LiveSourceSpec::File(_))
+    }
+
+    /// Open (or re-open) the described source, applying `FixedCenterFreqSource`
+    /// when `dial_freq_hz` is set -- so every call through this one method
+    /// produces a fully-composed source and nothing above it (in particular
+    /// `ReconnectingSource`) needs to know about dial-frequency overrides.
+    fn open(&self, dial_freq_hz: Option<f64>) -> Result<Box<dyn IqSource>> {
+        let src: Box<dyn IqSource> = match self {
+            LiveSourceSpec::Kiwi(kiwi) => {
+                let host = kiwi
+                    .host
+                    .as_deref()
+                    .expect("LiveSourceSpec::Kiwi always carries a host");
+                let freq = kiwi
+                    .freq
+                    .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
+                Box::new(manta_input::kiwi::KiwiIqSource::connect(
+                    host,
+                    kiwi.port,
+                    freq,
+                    &kiwi.password,
+                )?)
+            }
+            #[cfg(feature = "soapy")]
+            LiveSourceSpec::Soapy(soapy) => {
+                let driver = soapy
+                    .driver
+                    .as_deref()
+                    .expect("LiveSourceSpec::Soapy always carries a driver");
+                let freq = soapy
+                    .freq
+                    .ok_or_else(|| anyhow!("--soapy-freq is required with --soapy-driver"))?;
+                let rate = soapy
+                    .rate
+                    .ok_or_else(|| anyhow!("--soapy-rate is required with --soapy-driver"))?;
+                Box::new(manta_input::soapy::SoapySdrIqSource::open(
+                    driver, rate, freq, soapy.gain,
+                )?)
+            }
+            #[cfg(feature = "hpsdr")]
+            LiveSourceSpec::Hpsdr(hpsdr) => {
+                let host = hpsdr
+                    .host
+                    .clone()
+                    .expect("LiveSourceSpec::Hpsdr always carries a host");
+                let freq = hpsdr
+                    .freq
+                    .ok_or_else(|| anyhow!("--hpsdr-freq is required with --hpsdr-host"))?;
+                let rate = hpsdr
+                    .rate
+                    .ok_or_else(|| anyhow!("--hpsdr-rate is required with --hpsdr-host"))?;
+                let cfg = manta_input::hpsdr::HpsdrConfig {
+                    host,
+                    port: hpsdr.port,
+                    ddc_count: 1,
+                    sample_rate_hz: rate,
+                    center_freq_hz: vec![freq],
+                };
+                let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
+                Box::new(sources.remove(0))
+            }
+            LiveSourceSpec::AudioDevice(device) => {
+                Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?)
+            }
+            LiveSourceSpec::File(path) => {
+                Box::new(manta_input::AudioIqSource::from_wav_file(path)?)
+            }
+        };
+        Ok(match dial_freq_hz {
+            Some(freq_hz) => Box::new(FixedCenterFreqSource {
+                inner: src,
+                freq_hz,
+            }),
+            None => src,
+        })
+    }
 }
 
 /// Open a single-DDC HPSDR/Hermes device (feature `hpsdr`) as an
@@ -411,6 +532,10 @@ impl IqSource for FixedCenterFreqSource {
 
     fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         self.inner.confirmed_live_handle()
+    }
+
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.inner.take_discontinuity()
     }
 }
 
@@ -1005,8 +1130,7 @@ fn main() -> Result<()> {
             dial_freq_hz,
             replay_epoch,
         } => {
-            let is_file_replay = source.is_some();
-            // Captured before `open_source` consumes `source` below --
+            // Captured before `spec.open()` consumes `source` below --
             // needed to derive a recording-specific replay epoch.
             let replay_path = source.clone();
             #[cfg(feature = "soapy")]
@@ -1018,17 +1142,6 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "hpsdr"))]
             let has_hpsdr_source = false;
             let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
-            let source_name = if kiwi_host.is_some() {
-                "kiwi"
-            } else if has_soapy_source {
-                "soapy"
-            } else if has_hpsdr_source {
-                "hpsdr"
-            } else if is_file_replay {
-                "file"
-            } else {
-                "audio"
-            };
 
             if server_config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
@@ -1046,45 +1159,87 @@ fn main() -> Result<()> {
                 password: kiwi_password,
             };
             let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
+
+            // MAN-73: `spec` describes how to (re)open the configured
+            // input -- `ReconnectingSource` below calls `spec.open(...)`
+            // again every time a live source needs to be reopened, so the
+            // precedence here (hpsdr, then kiwi, then soapy, then
+            // device/file) must match what `open_hpsdr_source`/
+            // `open_source` used to decide once at startup.
+            let spec: LiveSourceSpec;
             #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq,
-                rate: hpsdr_rate,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
+            {
+                if hpsdr_host.is_some() {
+                    spec = LiveSourceSpec::Hpsdr(HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq,
+                        rate: hpsdr_rate,
+                    });
+                } else if kiwi.host.is_some() {
+                    spec = LiveSourceSpec::Kiwi(kiwi);
+                } else {
                     #[cfg(feature = "soapy")]
                     {
-                        open_source(
-                            device,
-                            source,
-                            kiwi,
-                            SoapyOpts {
+                        if soapy_driver.is_some() {
+                            spec = LiveSourceSpec::Soapy(SoapyOpts {
                                 driver: soapy_driver,
                                 freq: soapy_freq,
                                 rate: soapy_rate,
                                 gain: soapy_gain,
-                            },
-                        )?
+                            });
+                        } else if let Some(path) = source {
+                            spec = LiveSourceSpec::File(path);
+                        } else {
+                            spec = LiveSourceSpec::AudioDevice(device);
+                        }
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-                        open_source(device, source, kiwi)?
+                        if let Some(path) = source {
+                            spec = LiveSourceSpec::File(path);
+                        } else {
+                            spec = LiveSourceSpec::AudioDevice(device);
+                        }
                     }
                 }
-            };
-            let src: Box<dyn IqSource> = match dial_freq_hz {
-                Some(freq_hz) => Box::new(FixedCenterFreqSource {
-                    inner: src,
-                    freq_hz,
-                }),
-                None => src,
-            };
+            }
+            #[cfg(not(feature = "hpsdr"))]
+            {
+                if kiwi.host.is_some() {
+                    spec = LiveSourceSpec::Kiwi(kiwi);
+                } else {
+                    #[cfg(feature = "soapy")]
+                    {
+                        if soapy_driver.is_some() {
+                            spec = LiveSourceSpec::Soapy(SoapyOpts {
+                                driver: soapy_driver,
+                                freq: soapy_freq,
+                                rate: soapy_rate,
+                                gain: soapy_gain,
+                            });
+                        } else if let Some(path) = source {
+                            spec = LiveSourceSpec::File(path);
+                        } else {
+                            spec = LiveSourceSpec::AudioDevice(device);
+                        }
+                    }
+                    #[cfg(not(feature = "soapy"))]
+                    {
+                        if let Some(path) = source {
+                            spec = LiveSourceSpec::File(path);
+                        } else {
+                            spec = LiveSourceSpec::AudioDevice(device);
+                        }
+                    }
+                }
+            }
+
+            // Startup fail-fast (unchanged): a wrong host/port or a
+            // missing device still ends the process immediately here, as
+            // today -- only a loss *after* this succeeds is retried by
+            // `ReconnectingSource` below.
+            let first = spec.open(dial_freq_hz)?;
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --server-config wasn't
@@ -1130,35 +1285,25 @@ fn main() -> Result<()> {
                     };
 
                     let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                        start_spot_server(&path, first.sample_rate(), epoch, session_nonce)?;
                     // Real, if coarse, health signal: this source opened
                     // and is running. `active_tracks` has no equivalent
                     // hook yet -- manta-engine exposes no live track-count
                     // API for `listen()`'s callbacks to read, so it stays
                     // at Metrics::default()'s 0 until that surface exists.
                     //
-                    // MAN-55: for a source where `open()` succeeding
-                    // doesn't confirm a live device (HPSDR's UDP
-                    // connect/send need no peer response at all),
-                    // `confirmed_live_handle()` returns Some, and health
-                    // starts false, flipping true only once the source's
-                    // own read loop has actually processed a valid
-                    // packet. Every other source type (Kiwi/Soapy/audio/
-                    // file) returns None from the trait's default and
-                    // keeps the original immediate-true behavior, since
-                    // opening those already implies liveness.
-                    match src.confirmed_live_handle() {
-                        Some(live) => {
-                            server.metrics.set_source_health(source_name, false);
-                            let metrics = server.metrics.clone();
-                            rt.spawn(async move {
-                                while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                }
-                                metrics.set_source_health(source_name, true);
-                            });
-                        }
-                        None => server.metrics.set_source_health(source_name, true),
+                    // MAN-73: for every reconnectable source kind, ALL
+                    // health reporting (including this initial value) is
+                    // now owned by `ReconnectingSource` below, which reads
+                    // the same `confirmed_live_handle()` signal the old
+                    // MAN-55 watcher task used to, and additionally flips
+                    // health false/true across every later reconnect, not
+                    // just the first connection. File replay is the only
+                    // kind that bypasses `ReconnectingSource` entirely
+                    // (determinism; see `is_reconnectable`'s doc comment),
+                    // so its health is set true here, once, immediately.
+                    if !spec.is_reconnectable() {
+                        server.metrics.set_source_health(spec.name(), true);
                     }
                     (Some(rt), Some(server))
                 }
@@ -1170,6 +1315,36 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
+
+            // MAN-73: wrap every reconnectable source so a later read
+            // error/EOF is retried with `manta-server::backoff`'s policy
+            // instead of propagating out of `listen()` and ending the
+            // process. File replay is passed through unwrapped -- its
+            // errors and EOF must reach `listen()` unchanged for
+            // byte-identical replay.
+            let src: Box<dyn IqSource> = if spec.is_reconnectable() {
+                let initial_healthy = first.confirmed_live_handle().is_none();
+                let name = spec.name();
+                let on_health: reconnect::HealthSink = match &spot_server {
+                    Some(server) => {
+                        let metrics = server.metrics.clone();
+                        Box::new(move |healthy| metrics.set_source_health(name, healthy))
+                    }
+                    None => Box::new(|_healthy| {}),
+                };
+                let reopen_spec = spec.clone();
+                Box::new(ReconnectingSource::new(
+                    name,
+                    first,
+                    Box::new(move || reopen_spec.open(dial_freq_hz)),
+                    stop.clone(),
+                    initial_healthy,
+                    on_health,
+                ))
+            } else {
+                first
+            };
+
             let listen_result = manta_engine::listen(
                 src,
                 &cfg,
@@ -1730,5 +1905,69 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    #[test]
+    fn live_source_spec_reports_reconnectable_only_for_live_kinds() {
+        assert!(LiveSourceSpec::Kiwi(KiwiOpts {
+            host: Some("h".into()),
+            port: 8073,
+            freq: Some(14_000_000.0),
+            password: String::new(),
+        })
+        .is_reconnectable());
+        assert!(LiveSourceSpec::AudioDevice(None).is_reconnectable());
+        assert!(!LiveSourceSpec::File(PathBuf::from("rec.wav")).is_reconnectable());
+    }
+
+    #[test]
+    fn live_source_spec_name_matches_metrics_label() {
+        // MAN-73: `name()` feeds `set_source_health`'s label directly --
+        // a mismatch here would silently split one source's health series
+        // across two metric labels.
+        assert_eq!(
+            LiveSourceSpec::Kiwi(KiwiOpts {
+                host: Some("h".into()),
+                port: 8073,
+                freq: Some(14_000_000.0),
+                password: String::new(),
+            })
+            .name(),
+            "kiwi"
+        );
+        assert_eq!(LiveSourceSpec::AudioDevice(None).name(), "audio");
+        assert_eq!(
+            LiveSourceSpec::File(PathBuf::from("rec.wav")).name(),
+            "file"
+        );
+    }
+
+    struct GapProbeSource {
+        gap: Option<u64>,
+    }
+
+    impl IqSource for GapProbeSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+    }
+
+    #[test]
+    fn fixed_center_freq_source_forwards_take_discontinuity() {
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(GapProbeSource { gap: Some(48_000) }),
+            freq_hz: 14_000_000.0,
+        };
+        assert_eq!(src.take_discontinuity(), Some(48_000));
+        assert_eq!(src.take_discontinuity(), None);
     }
 }
