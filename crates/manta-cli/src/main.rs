@@ -649,11 +649,13 @@ struct FilterOpts {
     /// Correct a receiver whose clock reads off-frequency, in parts per
     /// million.
     ///
-    /// Every reported frequency is scaled by 1 + ppm/1000000, so a
-    /// receiver reading about 20 Hz high on 14 MHz is corrected with
-    /// roughly -1.4. 0 disables the correction. This is the same idea as
-    /// CW Skimmer's FreqCalibration setting, expressed in ppm rather than
-    /// as a raw multiplier.
+    /// Decoded and spotted frequencies are scaled by 1 + ppm/1000000, so
+    /// a receiver reading about 20 Hz high on 14 MHz is corrected with
+    /// roughly -1.4. 0 disables the correction. `doctor` still prints the
+    /// source's own centre frequency uncorrected; the correction only
+    /// affects the frequencies it validates. This is the same idea as CW
+    /// Skimmer's FreqCalibration setting, expressed in ppm rather than as
+    /// a raw multiplier.
     #[arg(
         long,
         default_value_t = 0.0,
