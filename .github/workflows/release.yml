@@ -1,22 +1,29 @@
 name: Release
 
-# MAN-21: builds and validates the release binaries + Docker image for
-# every committed platform, from `pull_request` (path-filtered, build-only
-# validation), `workflow_dispatch` (manual re-run), or a real `v*` tag
-# push (also validated here, redundantly with release-publish.yml, purely
-# for CI hygiene -- harmless, never publishes anything).
+# MAN-21: builds and validates the release binaries + Docker image for every committed
+# platform, from `workflow_dispatch` (manual re-run) or a real `v*` tag push.
 #
-# This file NEVER publishes anything and NEVER requests write permissions
-# anywhere -- deliberately, so it's safe to also trigger on `pull_request`
-# without a PR being able to reach any credential by editing it (PR #78
-# review round 6). The actual publish path (Docker push to GHCR, GitHub
-# Release creation) lives in release-publish.yml, which has NO
-# `pull_request` trigger at all -- see that file's own header comment for
-# why splitting the trigger SET, not just the job, matters here.
+# HAG-47: `pull_request` DROPPED as a trigger (2026-09-09 fleet CI redesign report, week-1
+# stop-the-bleed list -- flagged then, never actually done until now). This was wasted
+# PR-time build cost with no corresponding requirement: none of this file's jobs (`build`,
+# `docker-build`) are required status checks (confirmed via `gh api
+# repos/HagaleTechnologies/manta/rulesets` -- required checks are `test (macos-latest)`,
+# `test (ubuntu-latest)`, `Wait for Codex Review`, `Supply Chain`), and no other workflow in
+# this repo depends on a PR-triggered run of this one. Release artifacts are only ever
+# consumed from a tag push; a PR touching release.yml/release-publish.yml/Dockerfile/etc. now
+# gets no build here at all until it's tagged.
+#
+# This file NEVER publishes anything and NEVER requests write permissions anywhere --
+# deliberately, a leftover invariant from when this file also ran on `pull_request` without a
+# PR being able to reach any credential by editing it (PR #78 review round 6); left in place
+# since it's still true and still cheap insurance. The actual publish path (Docker push to
+# GHCR, GitHub Release creation) lives in release-publish.yml, which never had a
+# `pull_request` trigger at all -- see that file's own header comment.
 
 on:
   push:
     tags:
+<<<<<<< HEAD
       # MAN-65: 'v*' also matched non-release tags (e.g. `vendor-freeze`),
       # each of which used to spend five platform builds just to fail. The
       # glob language can't express SemVer, so it only filters the obvious
@@ -39,6 +46,9 @@ on:
       # validation.
       - 'scripts/release-version.sh'
       - 'scripts/tests/release-version.test.sh'
+=======
+      - 'v*'
+>>>>>>> 187192a89cdaf44126aa318ecd1b316eeca99c29
   workflow_dispatch: {}
 
 env:
@@ -147,7 +157,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
         with:
           key: release-${{ matrix.target }}
 

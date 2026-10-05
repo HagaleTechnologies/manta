@@ -22,6 +22,22 @@ async fn spawn_server() -> (
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
+    spawn_server_with_drain_deadline(manta_server::tasks::CLIENT_DRAIN_DEADLINE).await
+}
+
+/// MAN-45 (PR #63 round-16 finding): lets a test drive the per-client
+/// shutdown-drain deadline directly (e.g. `Duration::ZERO`, to make an
+/// expiry exact rather than timing-dependent) instead of always waiting on
+/// the production `CLIENT_DRAIN_DEADLINE`.
+async fn spawn_server_with_drain_deadline(
+    drain_deadline: Duration,
+) -> (
+    std::net::SocketAddr,
+    Arc<SpotBus>,
+    Arc<Metrics>,
+    tokio::sync::watch::Sender<bool>,
+    manta_server::tasks::ClientTasks,
+) {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
@@ -54,6 +70,7 @@ async fn spawn_server() -> (
                 manta_server::telnet::MAX_TELNET_COMMANDS,
                 manta_server::telnet::COMMAND_RATE_WINDOW,
             ),
+            drain_deadline,
         )
         .await;
     });
@@ -379,6 +396,197 @@ async fn shutdown_drains_an_already_queued_spot_before_disconnecting() {
     assert_eq!(n, 0, "expected EOF after shutdown drain, got: {trailing:?}");
 }
 
+/// Validation round 17 (CR-1): before this fix, `handle_client`'s pre-loop
+/// login handshake (prompt write, login-line read, banner write) never
+/// observed `shutdown` at all -- a client that received the prompt and then
+/// simply stalled without sending a login line held its task inside
+/// `read_line_bounded_with_timeout` for up to `bounded_io::IDLE_READ_TIMEOUT`
+/// (30s), invisible to shutdown the whole time. The fix races every step of
+/// the handshake against `shutdown.changed()`. This is fully deterministic
+/// (no timing race): the "client" here never sends anything after reading
+/// the prompt, so the ONLY way the connection can close is via the new
+/// shutdown-aware branch -- without the fix this test would hang until the
+/// assertion's own timeout fires.
+///
+/// MAN-45 remediate (code-review round 18, finding 2): also asserts the
+/// abandoned backlog lands on `spots_dropped_shutdown_total`, NOT
+/// `spots_dropped_write_failed_total` -- no write ever failed on this path,
+/// the daemon shut down cleanly, and conflating the two would mislead an
+/// operator reading `spots_dropped_write_failed_total`'s own "socket write
+/// timed out or failed" HELP text.
+#[tokio::test]
+async fn shutdown_during_login_handshake_disconnects_promptly_instead_of_idling_out() {
+    let (addr, bus, metrics, shutdown_tx, _tasks) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Read (and discard) the login prompt, then go silent -- exactly a
+    // client that connects and never logs in.
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("expected the login prompt")
+        .unwrap();
+    assert!(n > 0, "expected a non-empty login prompt");
+
+    // Queued on this client's subscribed `rx` while it's stalled at the
+    // login prompt, so the abandoned-backlog count below is provably
+    // nonzero rather than a vacuous 0 == 0.
+    bus.publish(sample_spot());
+    bus.publish(sample_spot());
+
+    let _ = shutdown_tx.send(true);
+
+    let mut trailing = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+        .await
+        .expect(
+            "a client stalled in the pre-login handshake must disconnect promptly once \
+             shutdown is signalled, not wait out the idle-read timeout",
+        );
+    assert_eq!(
+        read_result.unwrap(),
+        0,
+        "expected EOF after shutdown during the login handshake"
+    );
+
+    assert_eq!(
+        metrics.spots_dropped_shutdown_total(),
+        2,
+        "the two queued spots must be charged to the shutdown counter"
+    );
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        0,
+        "no write ever failed on this path -- it must not inflate the write-failure counter"
+    );
+}
+
+/// MAN-45 (PR #63 round-16 finding): a drain that cannot finish inside its
+/// own deadline must COUNT everything it abandons, never truncate silently
+/// (ARCHITECTURE §8). Driven with a zero deadline so the expiry is exact
+/// rather than timing-dependent -- the property under test is the
+/// accounting, not the duration.
+///
+/// The assertion is the invariant, not a fixed split: `select!` may still
+/// deliver some spots through the LIVE arm before the shutdown arm wins, so
+/// what must hold is that every published spot is either delivered or
+/// counted, never neither.
+#[tokio::test]
+async fn shutdown_drain_deadline_counts_the_backlog_it_could_not_write() {
+    let (addr, bus, metrics, shutdown_tx, _tasks) =
+        spawn_server_with_drain_deadline(Duration::ZERO).await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    // Published and signalled without an intervening await, so the client
+    // task first wakes with all three already queued AND shutdown set.
+    for _ in 0..3 {
+        bus.publish(sample_spot());
+    }
+    let _ = shutdown_tx.send(true);
+
+    // Read to EOF: the connection must close, not hang.
+    let mut delivered = 0usize;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => delivered += 1,
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delivered + metrics.spots_dropped_write_failed_total() as usize,
+        3,
+        "every published spot must be delivered or counted, never neither",
+    );
+}
+
+/// MAN-45 (PR #63 round-19 P1 review finding, re-raised against an earlier
+/// head): once shutdown is pending, a backlogged client must not keep
+/// winning the live-spot arm. `tokio::select!` picks a RANDOM ready arm, so
+/// before the `if !shutdown.has_changed()` preconditions landed on every
+/// write-capable arm (`telnet::handle_client`'s live-spot and command-read
+/// arms, `json_stream`'s TCP and WS equivalents) a client with a backlog
+/// could perform an UNBOUNDED number of two-`WRITE_TIMEOUT` live writes
+/// after shutdown was signalled and before its own `CLIENT_DRAIN_DEADLINE`
+/// clock ever started -- which `SHUTDOWN_DRAIN_DEADLINE`'s
+/// `2 * WRITE_TIMEOUT + CLIENT_DRAIN_DEADLINE` model (manta-cli's `main.rs`)
+/// cannot cover at any constant value.
+///
+/// The invariant is AT MOST ONE live write after shutdown, not zero: the
+/// preconditions are evaluated when `select!` is entered, so a handler
+/// already parked in `select!` when shutdown fires can still take the
+/// live-spot arm once (both arms are ready and the pick is random) before
+/// the next trip through the loop disables it for good. One is exactly what
+/// the outer deadline budgets for.
+///
+/// Repeated independent trials because `select!` picks a random ready arm,
+/// so one trial only samples one coin flip. Measured honesty note, from
+/// running this test against a build with both of `handle_client`'s
+/// preconditions deleted: that build ALSO stays within the bound here
+/// (`delivered` came out 0 or 1 in every trial, the same distribution the
+/// fixed build produces). Reaching two or more post-shutdown live writes
+/// needs writes slow enough to matter -- a client that has stopped reading,
+/// so each write runs against `WRITE_TIMEOUT` -- which is a tens-of-seconds
+/// test this suite deliberately does not carry. So this locks the observable
+/// invariant the outer `SHUTDOWN_DRAIN_DEADLINE` model depends on (at most
+/// one live write precedes the drain, and every published spot is either
+/// delivered or counted); it is a guard against that invariant regressing,
+/// not a demonstration that the preconditions are load-bearing in this
+/// fast-write scenario.
+#[tokio::test]
+async fn shutdown_bounds_live_writes_to_at_most_one_before_the_drain() {
+    const TRIALS: usize = 16;
+    const QUEUED: usize = 4;
+
+    for trial in 0..TRIALS {
+        // Zero drain deadline so the trial resolves immediately: whatever
+        // the live arm did NOT write is abandoned and counted rather than
+        // slowly written out, which is what makes `delivered` the exact
+        // count of post-shutdown LIVE writes.
+        let (addr, bus, metrics, shutdown_tx, _tasks) =
+            spawn_server_with_drain_deadline(Duration::ZERO).await;
+        let (mut reader, _wr) = connect_and_login(addr).await;
+
+        // Published and signalled without an intervening await (this test
+        // runs on the current-thread runtime), so the client task first
+        // wakes with the whole backlog queued AND shutdown already set --
+        // the exact interleaving the finding describes.
+        for _ in 0..QUEUED {
+            bus.publish(sample_spot());
+        }
+        let _ = shutdown_tx.send(true);
+
+        let mut delivered = 0usize;
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => delivered += 1,
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            delivered <= 1,
+            "trial {trial}: at most one live spot write may precede the shutdown drain \
+             (the outer SHUTDOWN_DRAIN_DEADLINE budgets for exactly one), got {delivered}",
+        );
+        assert_eq!(
+            delivered
+                + metrics.spots_dropped_write_failed_total() as usize
+                + metrics.spots_dropped_shutdown_total() as usize,
+            QUEUED,
+            "trial {trial}: every published spot must be delivered or counted, never neither",
+        );
+    }
+}
+
 #[tokio::test]
 async fn connecting_client_is_counted_in_metrics() {
     let (addr, _bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
@@ -627,5 +835,216 @@ async fn a_second_connection_from_the_same_ip_cannot_multiply_the_command_rate_b
         n, 0,
         "expected connection B to be disconnected once the SHARED per-IP budget \
          (already exhausted by connection A) was exceeded, got: {extra:?}"
+    );
+}
+
+/// MAN-87 scenario 1: Windows `telnet.exe`, PuTTY's telnet mode and most
+/// DX-cluster client software send IAC option negotiation the instant the
+/// connection opens. Before the fix, the `0xFF` bytes failed the login
+/// read's UTF-8 validation and the connection was dropped with
+/// "login read rejected ... error=line contains invalid UTF-8" before the
+/// callsign was ever read.
+#[tokio::test]
+async fn a_client_that_negotiates_telnet_options_still_logs_in() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    // IAC WILL TERMINAL-TYPE(24), IAC DO SUPPRESS-GO-AHEAD(3), callsign.
+    wr.write_all(b"\xff\xfb\x18\xff\xfd\x03W5AU\r\n")
+        .await
+        .unwrap();
+
+    // The refusals and the greeting are separate writes -- read until both
+    // have arrived rather than assuming one TCP segment carries them.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must answer the negotiation, not stall")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+    // Every option is refused: IAC DONT TERMINAL-TYPE, IAC WONT SGA.
+    assert_eq!(
+        &got[..6],
+        &[0xff, 0xfe, 0x18, 0xff, 0xfc, 0x03],
+        "expected the negotiation to be refused, got {got:?}"
+    );
+}
+
+/// MAN-87 scenario 2: RFC 854's NVT encodes Enter as CR NUL, and macOS
+/// `telnet(1)` with piped stdin sends the callsign that way with no
+/// trailing newline at all, closing its write half afterwards.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_and_no_newline_is_accepted() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    drop(wr); // EOF, exactly as piped-stdin telnet does
+
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+        .await
+        .expect("server must not stall")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&rest).contains(STATION_CALL),
+        "expected the post-login prompt, got {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+}
+
+/// MAN-87 review round 2 (C1): the interactive case, not just piped
+/// stdin -- BSD/macOS `telnet(1)`'s `crlf` toggle defaults to FALSE, so
+/// Enter is sent as CR NUL while the client stays interactive (its write
+/// half is never closed). The test above only proves the EOF-after-CR-NUL
+/// case; without this fix the server never finds a line to trim and the
+/// client is dropped by the idle timeout instead of logging in.
+#[tokio::test]
+async fn a_login_terminated_with_cr_nul_is_accepted_with_the_connection_kept_open() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` here -- an interactive client keeps
+    // its write half open, waiting on the post-login greeting.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Round-3 validation, code-review finding 1: `read_line_bounded_telnet`
+/// recognizes CR NUL as a line terminator (C1, above) but leaves both
+/// bytes in the assembled line. `trim_login` stripped them on the LOGIN
+/// path only -- the command path passed `cmd_line` straight to
+/// `command::parse`, whose `str::trim` does not strip NUL, so `"sh/dx\r\0"`
+/// tokenized to `["SH", "DX", "\0"]` and matched no command arm: an
+/// interactive BSD/macOS `telnet(1)` client (or Windows `telnet.exe`, or
+/// PuTTY telnet mode -- the exact clients this ticket exists to support)
+/// could log in but every command it issued silently did nothing. Proves
+/// the command line is now trimmed with the same predicate before parsing.
+#[tokio::test]
+async fn a_command_terminated_with_cr_nul_from_an_interactive_client_is_recognized() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+
+    // Published BEFORE login: pure history, reachable ONLY via a
+    // correctly-parsed `sh/dx` replay -- unlike a live-published spot,
+    // this proves the command was actually recognized as `ShowDx` rather
+    // than silently accepted-but-ignored as `Command::Unknown` (which
+    // would leave the connection alive with nothing to distinguish it).
+    let spot = sample_spot();
+    let expected = rbn::format_line(&spot, STATION_CALL, bus.unix_ts_for(spot.sample_ts));
+    bus.publish(spot);
+
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+
+    let mut prompt = String::new();
+    reader.read_line(&mut prompt).await.unwrap();
+
+    wr.write_all("W5AU\r\u{0}".as_bytes()).await.unwrap();
+    // Deliberately NOT dropping `wr` -- an interactive client keeps its
+    // write half open, exactly as `crlf`-off BSD/macOS telnet(1) does.
+
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("server must not stall waiting for an EOF that never comes")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+
+    // Issue "sh/dx" the same way this client's Enter key sends it: CR NUL,
+    // connection kept open.
+    wr.write_all("sh/dx\r\u{0}".as_bytes()).await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect(
+            "sh/dx over a CR-NUL-terminated command line must replay history, \
+             not be silently parsed as Unknown",
+        )
+        .unwrap();
+    assert_eq!(line.trim_end(), expected);
+}
+
+/// MAN-87 remediation (PR #129 Codex review): the refusals answering a
+/// login-time negotiation are written before the greeting, outside the
+/// command loop. When that write failed, `?` ended the task through the
+/// logging-only catch-all, and the spots queued on this client's `rx`
+/// during the login read were abandoned without reaching
+/// `spots_dropped_write_failed_total` (ARCHITECTURE §8). The client here
+/// negotiates, sends its callsign and resets the connection, so the server
+/// reads a complete login line and then writes its refusal into a reset
+/// socket.
+///
+/// Linux only: the test relies on data that arrived before the reset
+/// staying readable, which Linux's TCP stack does and other platforms'
+/// may not (Windows can discard it, failing the login read before the
+/// write under test is reached).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_negotiation_reply_write_at_login_counts_the_abandoned_backlog() {
+    let (addr, bus, metrics, _shutdown_tx, tasks) = spawn_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let mut prompt = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut prompt))
+        .await
+        .expect("expected the login prompt")
+        .unwrap();
+    assert!(n > 0, "expected a non-empty login prompt");
+
+    // Queued on this client's `rx` while it is still at the login prompt,
+    // so the count asserted below is provably nonzero.
+    bus.publish(sample_spot());
+    bus.publish(sample_spot());
+
+    // IAC WILL TERMINAL-TYPE, then the callsign, then an RST. `try_write`
+    // and the blocking sleep keep this current-thread runtime from polling
+    // the server task until the kernel has processed both the data and the
+    // reset, so the login read succeeds and the refusal write fails.
+    let login = b"\xff\xfb\x18W5AU\r\n";
+    assert_eq!(stream.try_write(login).unwrap(), login.len());
+    stream.set_zero_linger().unwrap();
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(100));
+
+    manta_server::tasks::await_all(&tasks, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        metrics.spots_dropped_write_failed_total(),
+        2,
+        "both spots queued during the login read must be counted when the refusal write fails"
     );
 }
