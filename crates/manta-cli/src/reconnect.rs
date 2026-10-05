@@ -202,6 +202,15 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                 }
             }
 
+            // A reopened source's outage ends where its first read begins,
+            // not where it returns (PR #207 review): that read can block
+            // while capturing the samples it returns (a Kiwi fills its
+            // resampler first), and the engine counts those samples as it
+            // processes them. The same anchor the session's own `SpotBus`
+            // epoch uses, which is taken before the first read. Bound: time
+            // that read spends waiting before any data arrives is excluded
+            // from the gap too.
+            let first_read_started = self.reopened.then(|| self.env.now());
             let inner = self.inner.as_mut().expect("checked Some above");
             match inner.read(buf) {
                 Ok(0) => return Ok(0),
@@ -209,9 +218,8 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                     if !self.productive {
                         self.productive = true;
                         self.backoff = INITIAL_BACKOFF; // ladder resets on recovery
-                        if self.reopened {
-                            let now = self.env.now();
-                            let outage = now.duration_since(self.last_ok);
+                        if let Some(resumed_at) = first_read_started {
+                            let outage = resumed_at.duration_since(self.last_ok);
                             let gap = (outage.as_secs_f64() * self.fs).round() as u64;
                             self.discontinuity = Some(gap);
                             self.reopened = false;
@@ -220,13 +228,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                                 self.name,
                                 outage.as_secs_f64()
                             );
-                            self.last_ok = now;
-                        } else {
-                            self.last_ok = self.env.now();
                         }
-                    } else {
-                        self.last_ok = self.env.now();
                     }
+                    self.last_ok = self.env.now();
                     self.report_health(true);
                     return Ok(n);
                 }
@@ -639,6 +643,72 @@ mod tests {
 
         assert_eq!(src.take_discontinuity(), Some(expected));
         assert_eq!(src.take_discontinuity(), None, "reported only once");
+    }
+
+    /// A source whose every `read` takes `takes` of virtual time before it
+    /// returns, like a reopened Kiwi filling its resampler before its first
+    /// output.
+    struct SlowSource {
+        inner: ScriptedSource,
+        env: FakeEnv,
+        takes: Duration,
+    }
+
+    impl IqSource for SlowSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+            self.env.advance(self.takes);
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn discontinuity_excludes_time_the_first_read_spends_capturing_samples() {
+        // PR #207 review: the engine counts the samples a reopened source
+        // returns as it processes them, so the time its first read spent
+        // capturing them must not be counted again in the gap.
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let env = FakeEnv::new();
+        let env_handle = env.clone();
+        let mut reopened = Some(SlowSource {
+            inner: scripted(FS, CENTER, vec![ok_chunk(8)]),
+            env: env.clone(),
+            takes: Duration::from_millis(1500),
+        });
+        let opener: Opener = Box::new(move || {
+            Ok(Box::new(reopened.take().expect("reopened only once")) as Box<dyn IqSource>)
+        });
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            env,
+        );
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        let t0 = env_handle.clock.get();
+        src.read(&mut b).unwrap(); // errors, sleeps 1s, reopens, first read takes 1.5s
+        assert_eq!(
+            env_handle.clock.get() - t0,
+            INITIAL_BACKOFF + Duration::from_millis(1500),
+            "the reopened source's first read must have taken its 1.5s"
+        );
+
+        assert_eq!(
+            src.take_discontinuity(),
+            Some((INITIAL_BACKOFF.as_secs_f64() * FS).round() as u64),
+            "the gap ends where the first read began, not where it returned"
+        );
     }
 
     #[test]

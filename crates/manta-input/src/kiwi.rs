@@ -41,8 +41,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use num_complex::Complex32;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{Message, WebSocket};
 
@@ -137,21 +138,63 @@ fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
     })
 }
 
+/// `(host, port)` targets whose `run_with_overall_timeout` worker thread is
+/// still running, including workers whose caller already timed out and
+/// moved on (MAN-73, PR #207 review). `ReconnectingSource` retries a lost
+/// Kiwi forever, so without this a resolver or connect that keeps
+/// outliving `OVERALL_CONNECT_TIMEOUT` would leave one more abandoned
+/// thread behind on every attempt. With it, at most one worker per target
+/// is ever outstanding -- the same bound `uplink.rs`'s `resolver_slot`
+/// gives its lookups, and keyed per target for the same reason (PR #80
+/// review round 11): one stuck target must not block another.
+static OUTSTANDING_CONNECTS: Mutex<BTreeSet<(String, u16)>> = Mutex::new(BTreeSet::new());
+
+fn outstanding_connects() -> MutexGuard<'static, BTreeSet<(String, u16)>> {
+    // The set stays consistent even if a holder panicked: every critical
+    // section is a single insert or remove.
+    OUTSTANDING_CONNECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Holds one target's `OUTSTANDING_CONNECTS` entry; removes it on drop.
+struct OutstandingConnect((String, u16));
+
+impl Drop for OutstandingConnect {
+    fn drop(&mut self) {
+        outstanding_connects().remove(&self.0);
+    }
+}
+
 /// Runs `attempt` on a detached thread, raced against this function's own
 /// `recv_timeout(OVERALL_CONNECT_TIMEOUT)`. A stall past that window
 /// returns an `Err` to the
 /// caller immediately; the detached thread is abandoned (matching the
 /// accepted tradeoff `uplink.rs` documents for its own blocking
 /// `getaddrinfo` call) rather than left to block a reconnect attempt
-/// forever.
+/// forever. While an earlier worker for the same `host:port` is still
+/// running, this returns an `Err` at once without spawning another (see
+/// `OUTSTANDING_CONNECTS`).
 fn run_with_overall_timeout<T: Send + 'static>(
     host: &str,
     port: u16,
     attempt: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    let target = (host.to_string(), port);
+    if !outstanding_connects().insert(target.clone()) {
+        bail!(
+            "TCP connect to {host}:{port} skipped: a previous attempt's DNS resolution or \
+             connect is still running; not starting another thread"
+        );
+    }
+    let slot = OutstandingConnect(target);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(attempt());
+        let outcome = attempt();
+        // Released before the send, so a caller that has received this
+        // outcome can always start its next attempt straight away.
+        drop(slot);
+        let _ = tx.send(outcome);
     });
     match rx.recv_timeout(OVERALL_CONNECT_TIMEOUT) {
         Ok(outcome) => outcome.with_context(|| format!("TCP connect to {host}:{port}")),
@@ -549,6 +592,55 @@ mod tests {
             Ok("second address")
         });
         assert_eq!(outcome.unwrap(), "second address");
+    }
+
+    #[test]
+    fn a_still_running_connect_worker_blocks_another_for_the_same_target() {
+        // MAN-73, PR #207 review: ReconnectingSource retries forever, so a
+        // connect worker that is still running (a hung resolver, here a
+        // worker parked on a channel) must not be joined by a new one on
+        // every retry. The slot is moved into the worker thread, so it is
+        // held the same way after the caller's own window has expired.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            run_with_overall_timeout("kiwi.example", 8074, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("first")
+            })
+        });
+        started_rx.recv().unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_attempt = ran.clone();
+        let err = run_with_overall_timeout("kiwi.example", 8074, move || {
+            ran_in_attempt.store(true, Ordering::SeqCst);
+            Ok("second")
+        })
+        .expect_err("a second worker for the same target must not start");
+        assert!(err.to_string().contains("still running"), "{err:#}");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the second attempt must never run"
+        );
+
+        assert_eq!(
+            run_with_overall_timeout("kiwi.example", 8075, || Ok("other target")).unwrap(),
+            "other target",
+            "a stuck target must not block a different one"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), "first");
+        assert_eq!(
+            run_with_overall_timeout("kiwi.example", 8074, || Ok("third")).unwrap(),
+            "third",
+            "the slot is free again once the earlier worker has finished"
+        );
     }
 
     #[test]
