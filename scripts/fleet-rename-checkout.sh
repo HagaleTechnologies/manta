@@ -17,12 +17,6 @@
 #
 # See docs/RUNBOOKS/fleet-checkout-rename.md and
 #     docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md
-#
-# shellcheck disable=SC2015
-# `A && B || C` is used throughout as pass/fail/info reporting, never as
-# if/then/else control flow: pass()/fail()/info()/say() are printf wrappers
-# that always return 0, so B never fails in a way that would let C run
-# unintentionally.
 set -uo pipefail
 
 OLD_NAME=skimmer
@@ -144,7 +138,7 @@ host_name() {
   if [[ -r $cfg ]] && command -v jq >/dev/null 2>&1; then
     n="$(jq -r '.catalyst.host.name // empty' "$cfg" 2>/dev/null)"
   fi
-  [[ -n $n ]] && printf '%s' "$n" || hostname | cut -d. -f1
+  if [[ -n $n ]]; then printf '%s' "$n"; else hostname | cut -d. -f1; fi
 }
 
 say "== MAN-27 fleet checkout rename =="
@@ -263,12 +257,12 @@ verify() {
   all_paths="$(inventory | cut -f1)"
 
   # Gherkin 1: directory named <new> present, no <old> directory remains.
-  [[ -d $NEW_MAIN ]] && pass "directory '$NEW_NAME' present in $ORG_DIR" \
-                     || fail "directory '$NEW_NAME' absent in $ORG_DIR"
-  [[ -e $OLD_MAIN ]] && fail "legacy '$OLD_NAME' directory still present: $OLD_MAIN" \
-                     || pass "no '$OLD_NAME' directory remains in $ORG_DIR"
-  [[ -e $OLD_WTP ]]  && fail "legacy worktree parent still present: $OLD_WTP" \
-                     || pass "no '${OLD_NAME}-worktrees' directory remains"
+  if [[ -d $NEW_MAIN ]]; then pass "directory '$NEW_NAME' present in $ORG_DIR"
+  else fail "directory '$NEW_NAME' absent in $ORG_DIR"; fi
+  if [[ -e $OLD_MAIN ]]; then fail "legacy '$OLD_NAME' directory still present: $OLD_MAIN"
+  else pass "no '$OLD_NAME' directory remains in $ORG_DIR"; fi
+  if [[ -e $OLD_WTP ]]; then fail "legacy worktree parent still present: $OLD_WTP"
+  else pass "no '${OLD_NAME}-worktrees' directory remains"; fi
 
   # Gherkin 1: origin points at the new URL. CR-3: accept any origin URL that
   # resolves to the same host/org/repo as $REMOTE_URL (SSH or HTTPS) — the
@@ -404,15 +398,15 @@ tooling_hits() {
   # link-build-cache.sh live "if they're outside the default roots", which
   # only makes sense as a widening of the scan, not a narrowing of it. A root
   # that does not exist or is not readable is reported, not silently dropped:
-  # grep would otherwise exit 2 for it and the caller's `|| true` below would
-  # swallow that with no trace (also C-5).
+  # grep would otherwise exit 2 for it, and the scan used to discard that
+  # status with no trace (also C-5).
   local roots=() r
   while IFS= read -r r; do
     # CR-3 (validation round): default roots were only checked with `-d`,
     # unlike --scan-root's `-d && -r` — an existing-but-unreadable default
     # root used to enter roots[] and have grep's permission error swallowed
-    # by tooling_hits()'s own `2>/dev/null` and trailing `|| true`, reporting
-    # a silent clean scan indistinguishable from one that actually ran.
+    # by tooling_hits()'s own `2>/dev/null` and discarded exit status,
+    # reporting a silent clean scan indistinguishable from one that actually ran.
     if [[ ! -e $r ]]; then
       # F7: a missing DEFAULT root used to be dropped with no trace at all,
       # indistinguishable downstream from "scanned it, found nothing" —
@@ -486,7 +480,20 @@ tooling_hits() {
     | grep -v "^${RAW_OLD_MAIN}/" \
     | grep -v "^${RAW_NEW_MAIN}/" \
     | grep -v "^${RAW_OLD_WTP}/" \
-    | grep -v "^${RAW_NEW_WTP}/" || true
+    | grep -v "^${RAW_NEW_WTP}/"
+  # Status 1 from any stage only means "no lines" (nothing matched, or every
+  # match was filtered out above): the normal clean result. Anything higher
+  # is a real error: from the first grep it usually means it could not read
+  # something under a root (a dangling symlink, a permission-denied
+  # subdirectory). Warn instead of letting it pass as a clean scan.
+  local st=("${PIPESTATUS[@]}") s
+  for s in "${st[@]}"; do
+    if [[ $s -gt 1 ]]; then
+      say "warning: the tooling-preflight scan did not complete cleanly (grep exit statuses: ${st[*]}) — some paths under the scan roots may not have been checked" >&2
+      break
+    fi
+  done
+  return 0
 }
 
 # On an already-migrated host with no legacy worktree parent left over,
@@ -636,8 +643,15 @@ reconcile_registry() {
     info "  Edit $reg by hand so team \"$TEAM_NEW\" has repoRoot \"$NEW_MAIN\"."
     return 0
   fi
+  # GNU stat first, then BSD/macOS stat. If neither can read the mode, say so:
+  # the swap below then leaves registry.json at mktemp's 0600. -L so a
+  # symlinked registry.json yields its target's mode, not the link's own 0777.
   local reg_mode
-  reg_mode="$(stat -c '%a' "$reg" 2>/dev/null || stat -f '%Lp' "$reg" 2>/dev/null || true)"
+  if ! reg_mode="$(stat -L -c '%a' "$reg" 2>/dev/null)" \
+     && ! reg_mode="$(stat -L -f '%Lp' "$reg" 2>/dev/null)"; then
+    reg_mode=""
+    info "could not read the permission bits of $reg — the rewritten file will be mode 0600; check them after this run."
+  fi
   [[ -n $reg_mode ]] && chmod "$reg_mode" "$tmp" 2>/dev/null
   # Correct an existing MAN entry in place, or append one. A stale SKI entry is
   # left alone on purpose: checkout-sync.mjs drops entries whose repoRoot is
@@ -647,13 +661,15 @@ reconcile_registry() {
   # raw $HOME-spelled one — it is unambiguous across a symlinked org dir,
   # and verify()'s own read side now accepts either spelling, so a
   # pre-existing entry in the raw form is never falsely flagged as drift.
-  jq --arg team "$TEAM_NEW" --arg root "$NEW_MAIN" '
+  if jq --arg team "$TEAM_NEW" --arg root "$NEW_MAIN" '
     .projects = ((.projects // []) | map(if .team == $team then .repoRoot = $root else . end))
     | if any(.projects[]; .team == $team) then .
       else .projects += [{team: $team, repoRoot: $root}] end
-  ' "$reg" > "$tmp" && mv "$tmp" "$reg" \
-    && say "registry.json: team $TEAM_NEW -> $NEW_MAIN" \
-    || { rm -f "$tmp"; info "registry.json update failed — edit it by hand"; }
+  ' "$reg" > "$tmp" && mv "$tmp" "$reg"; then
+    say "registry.json: team $TEAM_NEW -> $NEW_MAIN"
+  else
+    rm -f "$tmp"; info "registry.json update failed — edit it by hand"
+  fi
   local stale
   stale="$(jq -r --arg old "$OLD_NAME" '.projects[]? | select((.repoRoot|type=="string") and (.repoRoot|endswith("/" + $old))) | .team' "$reg" 2>/dev/null)"
   [[ -n $stale ]] && info "stale registry entries left in place (inert, dropped on read per CTL-854): $stale"

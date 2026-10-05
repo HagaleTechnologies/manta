@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 # Fixture-driven tests for scripts/fleet-rename-checkout.sh.
 # bash + git only, no CI wiring — see docs/DECISIONS/2026-09-04-man27-fleet-checkout-rename.md.
-#
-# shellcheck disable=SC2015
-# `A && B || C` is used throughout as ok/bad reporting, never as if/then/else
-# control flow: ok()/bad()/skip() are printf wrappers that always return 0.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,7 +10,7 @@ PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf 'FAIL %s\n     %s\n' "$1" "${2:-}"; }
 skip() { SKIP=$((SKIP+1)); printf 'SKIP %s\n' "$1"; }
-check(){ [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "expected [$3], got [$2]"; }
+check(){ if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "expected [$3], got [$2]"; fi; }
 
 # A fixture org dir: <root>/org/<name> clone, optional <name>-worktrees siblings.
 mkfixture() { # $1=root $2=clone-name; echoes the clone path
@@ -83,9 +79,9 @@ R=$(newroot); C=$(mkfixture "$R" skimmer)
 mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T1 exit"          "$rc" "1"
-grep -q "MIGRATION NEEDED" <<<"$out" && ok "T1 verdict" || bad "T1 verdict" "$out"
-grep -q "skimmer-worktrees/w1" <<<"$out" && ok "T1 lists worktree" || bad "T1 lists worktree" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T1 --check mutated nothing" || bad "T1 --check mutated nothing"
+if grep -q "MIGRATION NEEDED" <<<"$out"; then ok "T1 verdict"; else bad "T1 verdict" "$out"; fi
+if grep -q "skimmer-worktrees/w1" <<<"$out"; then ok "T1 lists worktree"; else bad "T1 lists worktree" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T1 --check mutated nothing"; else bad "T1 --check mutated nothing"; fi
 
 # --- T2: already migrated and healthy -> exit 0, all PASS ---
 R=$(newroot); C=$(mkfixture "$R" manta)
@@ -93,19 +89,19 @@ mkdir -p "$R/org/manta-worktrees"; addwt "$C" "$R/org/manta-worktrees/w1" w1
 git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.git
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T2 exit" "$rc" "0"
-grep -q "ALREADY MIGRATED" <<<"$out" && ok "T2 verdict" || bad "T2 verdict" "$out"
+if grep -q "ALREADY MIGRATED" <<<"$out"; then ok "T2 verdict"; else bad "T2 verdict" "$out"; fi
 
 # --- T3: no checkout at all on this host -> exit 0, NOT PRESENT (not a failure) ---
 R=$(newroot); mkdir -p "$R/org"
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T3 exit" "$rc" "0"
-grep -q "NOT PRESENT" <<<"$out" && ok "T3 verdict" || bad "T3 verdict" "$out"
+if grep -q "NOT PRESENT" <<<"$out"; then ok "T3 verdict"; else bad "T3 verdict" "$out"; fi
 
 # --- T4: BOTH skimmer and manta present -> exit 2, refuses (ambiguous) ---
 R=$(newroot); mkfixture "$R" skimmer >/dev/null; mkfixture "$R" manta >/dev/null
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T4 exit" "$rc" "2"
-grep -qi "both .* present" <<<"$out" && ok "T4 refuses" || bad "T4 refuses" "$out"
+if grep -qi "both .* present" <<<"$out"; then ok "T4 refuses"; else bad "T4 refuses" "$out"; fi
 
 # --- T5: health predicate catches the invisible main-only-move breakage (KD 2) ---
 R=$(newroot); C=$(mkfixture "$R" skimmer); mkdir -p "$R/wt"
@@ -113,10 +109,10 @@ addwt "$C" "$R/wt/MAN-9" MAN-9
 mv "$R/org/skimmer" "$R/org/manta"          # main moved, worktree did not
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T5 exit" "$rc" "1"
-grep -q "unhealthy worktree" <<<"$out" && ok "T5 detects invisible breakage" \
-  || bad "T5 detects invisible breakage" "$out"
-grep -q "prunable" <<<"$out" && bad "T5 must not rely on prunable" "$out" \
-  || ok "T5 not relying on prunable"
+if grep -q "unhealthy worktree" <<<"$out"; then ok "T5 detects invisible breakage"
+else bad "T5 detects invisible breakage" "$out"; fi
+if grep -q "prunable" <<<"$out"; then bad "T5 must not rely on prunable" "$out"
+else ok "T5 not relying on prunable"; fi
 
 # --- T6: pre-existing prunable entry is informational, not a failure (KD 4) ---
 R=$(newroot); C=$(mkfixture "$R" manta)
@@ -124,14 +120,14 @@ git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.gi
 mkdir -p "$R/wt"; addwt "$C" "$R/wt/dead" dead; rm -rf "$R/wt/dead"
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T6 exit" "$rc" "0"
-grep -q "pre-existing prunable" <<<"$out" && ok "T6 informational" || bad "T6 informational" "$out"
+if grep -q "pre-existing prunable" <<<"$out"; then ok "T6 informational"; else bad "T6 informational" "$out"; fi
 
 # --- T7: wrong origin on an otherwise-migrated clone -> exit 1 ---
 R=$(newroot); C=$(mkfixture "$R" manta)
 git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/skimmer.git
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T7 exit" "$rc" "1"
-grep -q "origin" <<<"$out" && ok "T7 flags origin" || bad "T7 flags origin" "$out"
+if grep -q "origin" <<<"$out"; then ok "T7 flags origin"; else bad "T7 flags origin" "$out"; fi
 
 # --- T8: full happy path — both dirs move, worktree healthy, origin repointed ---
 R=$(newroot); C=$(mkfixture "$R" skimmer)
@@ -139,32 +135,32 @@ mkdir -p "$R/org/skimmer-worktrees"; addwt "$C" "$R/org/skimmer-worktrees/w1" w1
 echo dirty > "$R/org/skimmer-worktrees/w1/scratch"          # KD 6
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T8 exit"        "$rc" "0"
-[[ -d "$R/org/manta" ]]            && ok "T8 clone renamed"    || bad "T8 clone renamed" "$out"
-[[ ! -e "$R/org/skimmer" ]]        && ok "T8 old gone"         || bad "T8 old gone"
-[[ -d "$R/org/manta-worktrees/w1" ]] && ok "T8 wt parent moved" || bad "T8 wt parent moved"
-[[ -f "$R/org/manta-worktrees/w1/scratch" ]] && ok "T8 dirty state survived" \
-  || bad "T8 dirty state survived"
+if [[ -d "$R/org/manta" ]]; then ok "T8 clone renamed"; else bad "T8 clone renamed" "$out"; fi
+if [[ ! -e "$R/org/skimmer" ]]; then ok "T8 old gone"; else bad "T8 old gone"; fi
+if [[ -d "$R/org/manta-worktrees/w1" ]]; then ok "T8 wt parent moved"; else bad "T8 wt parent moved"; fi
+if [[ -f "$R/org/manta-worktrees/w1/scratch" ]]; then ok "T8 dirty state survived"
+else bad "T8 dirty state survived"; fi
 check "T8 origin" \
   "$(git -C "$R/org/manta" remote get-url origin)" \
   "https://github.com/HagaleTechnologies/manta.git"
 # The regression that bare `git worktree repair` would leave behind (KD 1):
-git -C "$R/org/manta" worktree list --porcelain | grep -q '^prunable' \
-  && bad "T8 no prunable" || ok "T8 no prunable"
-git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T8 worktree healthy from inside" || bad "T8 worktree healthy from inside"
+if git -C "$R/org/manta" worktree list --porcelain | grep -q '^prunable'
+then bad "T8 no prunable"; else ok "T8 no prunable"; fi
+if git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1
+then ok "T8 worktree healthy from inside"; else bad "T8 worktree healthy from inside"; fi
 
 # --- T9: idempotent — a second --apply is a clean no-op (KD 7) ---
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T9 exit" "$rc" "0"
-grep -q "ALREADY MIGRATED\|nothing to move" <<<"$out" && ok "T9 no-op" || bad "T9 no-op" "$out"
+if grep -q "ALREADY MIGRATED\|nothing to move" <<<"$out"; then ok "T9 no-op"; else bad "T9 no-op" "$out"; fi
 
 # --- T10: worktrees outside the org dir (~/catalyst/wt shape) are repaired too (KD 2) ---
 R=$(newroot); C=$(mkfixture "$R" skimmer); mkdir -p "$R/wt/HagaleTechnologies"
 addwt "$C" "$R/wt/HagaleTechnologies/MAN-9" MAN-9
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T10 exit" "$rc" "0"
-git -C "$R/wt/HagaleTechnologies/MAN-9" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T10 external worktree repaired" || bad "T10 external worktree repaired" "$out"
+if git -C "$R/wt/HagaleTechnologies/MAN-9" rev-parse --git-dir >/dev/null 2>&1
+then ok "T10 external worktree repaired"; else bad "T10 external worktree repaired" "$out"; fi
 
 # --- T11: a dead worktree path must not turn the run red (KD 3) ---
 R=$(newroot); C=$(mkfixture "$R" skimmer); mkdir -p "$R/wt" "$R/org/skimmer-worktrees"
@@ -172,31 +168,31 @@ addwt "$C" "$R/org/skimmer-worktrees/live" live
 addwt "$C" "$R/wt/dead" dead; rm -rf "$R/wt/dead"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T11 exit" "$rc" "0"
-grep -q "pre-existing prunable" <<<"$out" && ok "T11 dead wt informational" \
-  || bad "T11 dead wt informational" "$out"
-git -C "$R/org/manta-worktrees/live" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T11 live wt repaired" || bad "T11 live wt repaired"
+if grep -q "pre-existing prunable" <<<"$out"; then ok "T11 dead wt informational"
+else bad "T11 dead wt informational" "$out"; fi
+if git -C "$R/org/manta-worktrees/live" rev-parse --git-dir >/dev/null 2>&1
+then ok "T11 live wt repaired"; else bad "T11 live wt repaired"; fi
 
 # --- T12: refuses to move while an index.lock / rebase is in flight ---
 R=$(newroot); C=$(mkfixture "$R" skimmer); : > "$C/.git/index.lock"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T12 exit" "$rc" "2"
-grep -qi "in use\|lock" <<<"$out" && ok "T12 busy refusal" || bad "T12 busy refusal" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T12 nothing moved" || bad "T12 nothing moved"
+if grep -qi "in use\|lock" <<<"$out"; then ok "T12 busy refusal"; else bad "T12 busy refusal" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T12 nothing moved"; else bad "T12 nothing moved"; fi
 
 # --- T13: a worktree parent that does not exist is fine (clone-only host) ---
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T13 exit" "$rc" "0"
-[[ -d "$R/org/manta" && ! -e "$R/org/manta-worktrees" ]] \
-  && ok "T13 no spurious wt parent" || bad "T13 no spurious wt parent"
+if [[ -d "$R/org/manta" && ! -e "$R/org/manta-worktrees" ]]
+then ok "T13 no spurious wt parent"; else bad "T13 no spurious wt parent"; fi
 
 # --- T14: refuses if the destination worktree parent already exists ---
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 mkdir -p "$R/org/skimmer-worktrees" "$R/org/manta-worktrees"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T14 exit" "$rc" "2"
-[[ -d "$R/org/skimmer" ]] && ok "T14 nothing moved" || bad "T14 nothing moved"
+if [[ -d "$R/org/skimmer" ]]; then ok "T14 nothing moved"; else bad "T14 nothing moved"; fi
 
 # --- T15: registry with a stale SKI repoRoot gains a correct MAN entry ---
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
@@ -240,7 +236,7 @@ fi
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T17 exit" "$rc" "0"
-grep -q "no registry.json" <<<"$out" && ok "T17 notes absence" || bad "T17 notes absence" "$out"
+if grep -q "no registry.json" <<<"$out"; then ok "T17 notes absence"; else bad "T17 notes absence" "$out"; fi
 
 # --- T18: malformed registry.json warns, does not corrupt, does not fail the rename ---
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
@@ -253,9 +249,9 @@ check "T18 file untouched" "$(cat "$R/catalyst/execution-core/registry.json")" '
 # script correctly short-circuits earlier with its own "jq not installed" notice
 # instead (same degrade-to-warning path T15-T17 rely on when jq is absent).
 if command -v jq >/dev/null 2>&1; then
-  grep -qi "could not parse" <<<"$out" && ok "T18 warns" || bad "T18 warns" "$out"
+  if grep -qi "could not parse" <<<"$out"; then ok "T18 warns"; else bad "T18 warns" "$out"; fi
 else
-  grep -qi "jq not installed" <<<"$out" && ok "T18 warns (no jq)" || bad "T18 warns (no jq)" "$out"
+  if grep -qi "jq not installed" <<<"$out"; then ok "T18 warns (no jq)"; else bad "T18 warns (no jq)" "$out"; fi
 fi
 
 # --- T19: tooling preflight blocks --apply on a hardcoded old path ---
@@ -265,15 +261,15 @@ printf 'CACHE_SRC="%s/org/skimmer/target"\n' "$R" > "$R/tools/link-build-cache.s
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/tools" 2>&1); rc=$?
 check "T19 exit" "$rc" "2"
-grep -q "link-build-cache.sh" <<<"$out" && ok "T19 names the file" || bad "T19 names the file" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T19 nothing moved" || bad "T19 nothing moved"
+if grep -q "link-build-cache.sh" <<<"$out"; then ok "T19 names the file"; else bad "T19 names the file" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T19 nothing moved"; else bad "T19 nothing moved"; fi
 
 # --- T20: --allow-tooling-hits overrides, and says so ---
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/tools" --allow-tooling-hits 2>&1); rc=$?
 check "T20 exit" "$rc" "0"
-grep -q "OVERRIDE" <<<"$out" && ok "T20 records override" || bad "T20 records override" "$out"
-[[ -d "$R/org/manta" ]] && ok "T20 moved" || bad "T20 moved"
+if grep -q "OVERRIDE" <<<"$out"; then ok "T20 records override"; else bad "T20 records override" "$out"; fi
+if [[ -d "$R/org/manta" ]]; then ok "T20 moved"; else bad "T20 moved"; fi
 
 # --- T21: --check reports tooling hits without blocking (exit reflects rename only) ---
 R=$(newroot); mkfixture "$R" manta >/dev/null
@@ -282,7 +278,7 @@ mkdir -p "$R/tools"; printf 'x=%s/org/skimmer\n' "$R" > "$R/tools/link-build-cac
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" --scan-root "$R/tools" 2>&1)
 rc=$?
 check "T21 exit" "$rc" "0"
-grep -q "tooling reference" <<<"$out" && ok "T21 reports" || bad "T21 reports" "$out"
+if grep -q "tooling reference" <<<"$out"; then ok "T21 reports"; else bad "T21 reports" "$out"; fi
 
 # --- T22: every long flag the runbook shows is a flag the parser's case block
 #     accepts (matched against the parser only, so a prose comment mentioning a
@@ -294,7 +290,7 @@ while IFS= read -r f; do
   [[ -z $f ]] && continue
   grep -qE -- "(^[[:space:]]*${f}[)|])|(\\|${f}[)|])" <<<"$PARSER" || missing="$missing $f"
 done < <(grep -o -- '--[a-z][a-z-]*' "$RB" | sort -u)
-[[ -z $missing ]] && ok "T22 runbook flags all exist" || bad "T22 runbook flags all exist" "$missing"
+if [[ -z $missing ]]; then ok "T22 runbook flags all exist"; else bad "T22 runbook flags all exist" "$missing"; fi
 
 # --- T23: default scan roots (no --scan-root given) must not block on the
 #     checkout's own linked-worktree .git pointer file, which necessarily
@@ -314,8 +310,8 @@ mkdir -p "$ORG/skimmer-worktrees"
 addwt "$ORG/skimmer" "$ORG/skimmer-worktrees/w1" w1
 out=$(HOME="$R" "$SUT" --apply --org-dir "$ORG" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T23 exit" "$rc" "0"
-[[ -d "$ORG/manta" ]] && ok "T23 moved despite default-scan-root self-reference" \
-  || bad "T23 moved despite default-scan-root self-reference" "$out"
+if [[ -d "$ORG/manta" ]]; then ok "T23 moved despite default-scan-root self-reference"
+else bad "T23 moved despite default-scan-root self-reference" "$out"; fi
 
 # --- T24: --apply on an already-migrated host is a verified no-op even when a
 #     scanned worktree contains literal old-path strings (this repo's own test
@@ -330,8 +326,8 @@ printf 'x=%s/org/skimmer-worktrees/w1\n' "$R" \
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/org" 2>&1); rc=$?
 check "T24 exit" "$rc" "0"
-grep -q "ALREADY MIGRATED\|nothing to move" <<<"$out" && ok "T24 no-op despite worktree content" \
-  || bad "T24 no-op despite worktree content" "$out"
+if grep -q "ALREADY MIGRATED\|nothing to move" <<<"$out"; then ok "T24 no-op despite worktree content"
+else bad "T24 no-op despite worktree content" "$out"; fi
 
 # --- T25: --check must not report ALREADY MIGRATED when a worktree was moved by
 #     hand without `git worktree repair` (C1) ---
@@ -342,8 +338,8 @@ mv "$R/org/skimmer-worktrees" "$R/org/manta-worktrees"
 git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T25 exit" "$rc" "1"
-grep -qi "was not repaired" <<<"$out" && ok "T25 detects unrepaired hand-move" \
-  || bad "T25 detects unrepaired hand-move" "$out"
+if grep -qi "was not repaired" <<<"$out"; then ok "T25 detects unrepaired hand-move"
+else bad "T25 detects unrepaired hand-move" "$out"; fi
 
 # --- T26: a registry.json MAN entry left pointing at the old path fails --check
 #     (never a silent all-PASS over a dangling registry entry) — C4 ---
@@ -355,7 +351,7 @@ printf '{"projects":[{"team":"MAN","repoRoot":"%s/org/skimmer"}]}\n' "$R" \
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 if command -v jq >/dev/null 2>&1; then
   check "T26 exit" "$rc" "1"
-  grep -qi "registry.json" <<<"$out" && ok "T26 flags stale registry" || bad "T26 flags stale registry" "$out"
+  if grep -qi "registry.json" <<<"$out"; then ok "T26 flags stale registry"; else bad "T26 flags stale registry" "$out"; fi
 else
   skip "T26 skipped (no jq)"
 fi
@@ -379,10 +375,10 @@ out=$(PATH="$R/fakebin:$PATH" "$SUT" --apply --org-dir "$R/org" \
       --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 if command -v jq >/dev/null 2>&1; then
   check "T28 exit" "$rc" "1"
-  grep -qi "usage: mktemp\|No such file or directory" <<<"$out" \
-    && bad "T28 no raw mktemp/shell error" "$out" || ok "T28 no raw mktemp/shell error"
-  grep -q "mktemp failed" <<<"$out" && ok "T28 prints actionable message" \
-    || bad "T28 prints actionable message" "$out"
+  if grep -qi "usage: mktemp\|No such file or directory" <<<"$out"
+  then bad "T28 no raw mktemp/shell error" "$out"; else ok "T28 no raw mktemp/shell error"; fi
+  if grep -q "mktemp failed" <<<"$out"; then ok "T28 prints actionable message"
+  else bad "T28 prints actionable message" "$out"; fi
   check "T28 registry untouched" \
     "$(cat "$R/catalyst/execution-core/registry.json")" '{"projects":[]}'
 else
@@ -405,10 +401,10 @@ check "T29 exit" "$rc" "0"
 check "T29 origin repointed" \
   "$(git -C "$R/org/manta" remote get-url origin)" \
   "https://github.com/HagaleTechnologies/manta.git"
-git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T29 worktree repaired" || bad "T29 worktree repaired" "$out"
-git -C "$R/org/manta" worktree list --porcelain | grep -q '^prunable' \
-  && bad "T29 no prunable" "$out" || ok "T29 no prunable"
+if git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1
+then ok "T29 worktree repaired"; else bad "T29 worktree repaired" "$out"; fi
+if git -C "$R/org/manta" worktree list --porcelain | grep -q '^prunable'
+then bad "T29 no prunable" "$out"; else ok "T29 no prunable"; fi
 "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" >/dev/null 2>&1; rc2=$?
 check "T29 second apply exit" "$rc2" "0"
 
@@ -422,9 +418,9 @@ mv "$R/org/skimmer-worktrees" "$R/org/manta-worktrees"
 git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
 out=$("$SUT" --apply --org-dir "$R/org/" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T30 exit" "$rc" "0"
-git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T30 worktree repaired despite trailing slash" \
-  || bad "T30 worktree repaired despite trailing slash" "$out"
+if git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1
+then ok "T30 worktree repaired despite trailing slash"
+else bad "T30 worktree repaired despite trailing slash" "$out"; fi
 
 # --- T31: a symlinked --org-dir component (macOS /tmp -> /private/tmp,
 #     $TMPDIR -> /private/var/..., or ~/code-repos on a symlinked volume)
@@ -439,9 +435,9 @@ mv "$R/real/org/skimmer-worktrees" "$R/real/org/manta-worktrees"
 git -C "$R/real/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
 out=$("$SUT" --apply --org-dir "$R/link/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T31 exit" "$rc" "0"
-git -C "$R/real/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T31 worktree repaired through symlinked org-dir" \
-  || bad "T31 worktree repaired through symlinked org-dir" "$out"
+if git -C "$R/real/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1
+then ok "T31 worktree repaired through symlinked org-dir"
+else bad "T31 worktree repaired through symlinked org-dir" "$out"; fi
 
 # --- T32: a symlinked file inside a scanned root (a stow/dotfiles-style
 #     ~/bin symlink farm — the normal layout link-build-cache.sh lives in) is
@@ -454,9 +450,9 @@ ln -s "$R/real-tools/link-build-cache.sh" "$R/bin/link-build-cache.sh"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/bin" 2>&1); rc=$?
 check "T32 exit" "$rc" "2"
-grep -q "link-build-cache.sh" <<<"$out" && ok "T32 finds symlinked file" \
-  || bad "T32 finds symlinked file" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T32 nothing moved" || bad "T32 nothing moved"
+if grep -q "link-build-cache.sh" <<<"$out"; then ok "T32 finds symlinked file"
+else bad "T32 finds symlinked file" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T32 nothing moved"; else bad "T32 nothing moved"; fi
 
 # --- T33: --scan-root ADDS to the default scan roots rather than replacing
 #     them — a hit under a default root must still block --apply even when
@@ -470,9 +466,9 @@ mkdir -p "$R/extra-scan-root"
 out=$(HOME="$R" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/extra-scan-root" 2>&1); rc=$?
 check "T33 exit" "$rc" "2"
-grep -q "uses-old-path.sh" <<<"$out" \
-  && ok "T33 default root hit still found alongside --scan-root" \
-  || bad "T33 default root hit still found alongside --scan-root" "$out"
+if grep -q "uses-old-path.sh" <<<"$out"
+then ok "T33 default root hit still found alongside --scan-root"
+else bad "T33 default root hit still found alongside --scan-root" "$out"; fi
 
 # --- T34: a --scan-root that does not exist is reported as skipped rather
 #     than silently absorbed by grep's own exit 2 (validation-round finding
@@ -480,8 +476,8 @@ grep -q "uses-old-path.sh" <<<"$out" \
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/does-not-exist" 2>&1); rc=$?
-grep -qi "does not exist" <<<"$out" \
-  && ok "T34 warns about missing --scan-root" || bad "T34 warns about missing --scan-root" "$out"
+if grep -qi "does not exist" <<<"$out"
+then ok "T34 warns about missing --scan-root"; else bad "T34 warns about missing --scan-root" "$out"; fi
 
 # --- T35: --apply on an already-migrated host with an unrelated pre-existing
 #     dead worktree must still exit 0 (validation-round finding F1) — the
@@ -492,9 +488,9 @@ git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.gi
 mkdir -p "$R/wt"; addwt "$C" "$R/wt/dead" dead; rm -rf "$R/wt/dead"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T35 exit" "$rc" "0"
-grep -q "ALREADY MIGRATED" <<<"$out" && ok "T35 verdict" || bad "T35 verdict" "$out"
-grep -q "pre-existing prunable" <<<"$out" && ok "T35 dead wt informational" \
-  || bad "T35 dead wt informational" "$out"
+if grep -q "ALREADY MIGRATED" <<<"$out"; then ok "T35 verdict"; else bad "T35 verdict" "$out"; fi
+if grep -q "pre-existing prunable" <<<"$out"; then ok "T35 dead wt informational"
+else bad "T35 dead wt informational" "$out"; fi
 
 # --- T36: --apply converges a half-hand-migrated host — main clone renamed
 #     by hand, worktree parent left at its legacy name (validation-round
@@ -506,12 +502,12 @@ mv "$R/org/skimmer" "$R/org/manta"
 git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T36 exit" "$rc" "0"
-[[ -d "$R/org/manta-worktrees" ]] && ok "T36 worktree parent moved" \
-  || bad "T36 worktree parent moved" "$out"
-[[ ! -e "$R/org/skimmer-worktrees" ]] && ok "T36 legacy worktree parent gone" \
-  || bad "T36 legacy worktree parent gone"
-git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T36 worktree repaired" || bad "T36 worktree repaired"
+if [[ -d "$R/org/manta-worktrees" ]]; then ok "T36 worktree parent moved"
+else bad "T36 worktree parent moved" "$out"; fi
+if [[ ! -e "$R/org/skimmer-worktrees" ]]; then ok "T36 legacy worktree parent gone"
+else bad "T36 legacy worktree parent gone"; fi
+if git -C "$R/org/manta-worktrees/w1" rev-parse --git-dir >/dev/null 2>&1
+then ok "T36 worktree repaired"; else bad "T36 worktree repaired"; fi
 
 # --- T37: a dead worktree entry and an unrelated, distinct, live worktree
 #     that happens to share its basename must not be conflated (validation-
@@ -524,10 +520,10 @@ addwt "$C" "$R/org/manta-worktrees/w1" w1
 addwt "$C" "$R/wt/w1" w1-dead; rm -rf "$R/wt/w1"
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T37 exit" "$rc" "0"
-grep -q "pre-existing prunable" <<<"$out" && ok "T37 dead entry informational" \
-  || bad "T37 dead entry informational" "$out"
-grep -q "was not repaired" <<<"$out" && bad "T37 must not conflate basename collision" "$out" \
-  || ok "T37 does not conflate basename collision"
+if grep -q "pre-existing prunable" <<<"$out"; then ok "T37 dead entry informational"
+else bad "T37 dead entry informational" "$out"; fi
+if grep -q "was not repaired" <<<"$out"; then bad "T37 must not conflate basename collision" "$out"
+else ok "T37 does not conflate basename collision"; fi
 
 # --- T38: --apply is not refused merely because <new>-worktrees already
 #     exists when there is no <old>-worktrees to merge it with (validation-
@@ -536,9 +532,9 @@ R=$(newroot); mkfixture "$R" skimmer >/dev/null
 mkdir -p "$R/org/manta-worktrees"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T38 exit" "$rc" "0"
-[[ -d "$R/org/manta" ]] && ok "T38 clone renamed" || bad "T38 clone renamed" "$out"
-[[ -d "$R/org/manta-worktrees" ]] && ok "T38 pre-existing worktree parent survives" \
-  || bad "T38 pre-existing worktree parent survives"
+if [[ -d "$R/org/manta" ]]; then ok "T38 clone renamed"; else bad "T38 clone renamed" "$out"; fi
+if [[ -d "$R/org/manta-worktrees" ]]; then ok "T38 pre-existing worktree parent survives"
+else bad "T38 pre-existing worktree parent survives"; fi
 
 # --- T39: registry.json's file mode survives --apply un-narrowed — mktemp
 #     creates 0600 by default, so mv-ing that over registry.json would leave
@@ -573,9 +569,9 @@ printf 'CACHE_SRC=%s/org/skimmer-worktrees/w1/target\n' "$R" > "$R/tools/link-bu
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/tools" 2>&1); rc=$?
 check "T40 exit" "$rc" "2"
-grep -q "link-build-cache.sh" <<<"$out" && ok "T40 blocks pending worktree-parent move" \
-  || bad "T40 blocks pending worktree-parent move" "$out"
-[[ -d "$R/org/skimmer-worktrees" ]] && ok "T40 nothing moved" || bad "T40 nothing moved"
+if grep -q "link-build-cache.sh" <<<"$out"; then ok "T40 blocks pending worktree-parent move"
+else bad "T40 blocks pending worktree-parent move" "$out"; fi
+if [[ -d "$R/org/skimmer-worktrees" ]]; then ok "T40 nothing moved"; else bad "T40 nothing moved"; fi
 
 # --- T41: a symlinked --org-dir component must not turn the checkout's OWN
 #     worktree files into false-positive "tooling hits" — only OLD_MAIN had a
@@ -594,9 +590,9 @@ printf 'x=%s/real/org/skimmer-worktrees/w1\n' "$R" \
 out=$("$SUT" --check --org-dir "$R/link/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/link/org" 2>&1); rc=$?
 check "T41 exit" "$rc" "0"
-grep -q "tooling reference" <<<"$out" \
-  && bad "T41 no false-positive tooling hit through symlinked org-dir" "$out" \
-  || ok "T41 no false-positive tooling hit through symlinked org-dir"
+if grep -q "tooling reference" <<<"$out"
+then bad "T41 no false-positive tooling hit through symlinked org-dir" "$out"
+else ok "T41 no false-positive tooling hit through symlinked org-dir"; fi
 
 # --- T42: --apply on the ALREADY-MIGRATED branch repairs an external
 #     worktree (the ~/catalyst/wt/<key>/<ticket> shape) whose own directory
@@ -611,13 +607,13 @@ mv "$R/org/skimmer" "$R/org/manta"          # hand-rename: already STATE=migrate
 git -C "$R/org/manta" remote set-url origin https://github.com/HagaleTechnologies/manta.git
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T42 exit" "$rc" "0"
-git -C "$R/wt/MAN-9" rev-parse --git-dir >/dev/null 2>&1 \
-  && ok "T42 external worktree repaired on already-migrated host" \
-  || bad "T42 external worktree repaired on already-migrated host" "$out"
+if git -C "$R/wt/MAN-9" rev-parse --git-dir >/dev/null 2>&1
+then ok "T42 external worktree repaired on already-migrated host"
+else bad "T42 external worktree repaired on already-migrated host" "$out"; fi
 out2=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc2=$?
 check "T42 second apply exit" "$rc2" "0"
-grep -q "ALREADY MIGRATED" <<<"$out2" && ok "T42 converges (no re-run loop)" \
-  || bad "T42 converges (no re-run loop)" "$out2"
+if grep -q "ALREADY MIGRATED" <<<"$out2"; then ok "T42 converges (no re-run loop)"
+else bad "T42 converges (no re-run loop)" "$out2"; fi
 
 # --- T43: registry.json repoRoot written in the raw, $HOME-spelled form
 #     through a symlinked org dir is accepted as correct, not flagged as
@@ -632,8 +628,8 @@ printf '{"projects":[{"team":"MAN","repoRoot":"%s/link/org/manta"}]}\n' "$R" \
 out=$("$SUT" --check --org-dir "$R/link/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 if command -v jq >/dev/null 2>&1; then
   check "T43 exit" "$rc" "0"
-  grep -qi "FAIL.*registry.json" <<<"$out" && bad "T43 raw-spelled repoRoot not flagged as drift" "$out" \
-    || ok "T43 raw-spelled repoRoot not flagged as drift"
+  if grep -qi "FAIL.*registry.json" <<<"$out"; then bad "T43 raw-spelled repoRoot not flagged as drift" "$out"
+  else ok "T43 raw-spelled repoRoot not flagged as drift"; fi
 else
   skip "T43 skipped (no jq)"
 fi
@@ -645,11 +641,11 @@ fi
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T44 exit" "$rc" "0"
-[[ -d "$R/org/manta" ]] && ok "T44 still moves (warns, does not refuse)" \
-  || bad "T44 still moves (warns, does not refuse)" "$out"
-grep -qi "no tooling-preflight scan roots" <<<"$out" \
-  && ok "T44 warns when the scan-root set is empty" \
-  || bad "T44 warns when the scan-root set is empty" "$out"
+if [[ -d "$R/org/manta" ]]; then ok "T44 still moves (warns, does not refuse)"
+else bad "T44 still moves (warns, does not refuse)" "$out"; fi
+if grep -qi "no tooling-preflight scan roots" <<<"$out"
+then ok "T44 warns when the scan-root set is empty"
+else bad "T44 warns when the scan-root set is empty" "$out"; fi
 
 # --- T45: --apply on a checkout with no origin remote at all ADDS one
 #     instead of calling `git remote set-url`, which cannot create a remote
@@ -664,9 +660,9 @@ check "T45 exit" "$rc" "0"
 check "T45 origin added" \
   "$(git -C "$R/org/manta" remote get-url origin)" \
   "https://github.com/HagaleTechnologies/manta.git"
-grep -q "adding origin" <<<"$out" && ok "T45 logs an add, not a repoint" \
-  || bad "T45 logs an add, not a repoint" "$out"
-grep -q "VERDICT: MIGRATED" <<<"$out" && ok "T45 converges" || bad "T45 converges" "$out"
+if grep -q "adding origin" <<<"$out"; then ok "T45 logs an add, not a repoint"
+else bad "T45 logs an add, not a repoint" "$out"; fi
+if grep -q "VERDICT: MIGRATED" <<<"$out"; then ok "T45 converges"; else bad "T45 converges" "$out"; fi
 
 # --- T46: the tooling preflight catches the literal `$HOME/…` and `~/…`
 #     spellings of the old path — the two forms a human actually writes by
@@ -675,14 +671,15 @@ grep -q "VERDICT: MIGRATED" <<<"$out" && ok "T45 converges" || bad "T45 converge
 #     shell-expanded to a real path (validation-round finding CR-2) ---
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 mkdir -p "$R/tools"
-printf 'CACHE_SRC="$HOME/org/skimmer/target"\n' > "$R/tools/link-build-cache-home.sh"
+# Literal $HOME text on purpose: the tool under scan hardcodes the unexpanded spelling.
+printf '%s\n' "CACHE_SRC=\"\$HOME/org/skimmer/target\"" > "$R/tools/link-build-cache-home.sh"
 out=$(HOME="$R" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/tools" 2>&1); rc=$?
 check "T46a exit" "$rc" "2"
-grep -q "link-build-cache-home.sh" <<<"$out" \
-  && ok "T46a catches literal \$HOME-spelled path" \
-  || bad "T46a catches literal \$HOME-spelled path" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T46a nothing moved" || bad "T46a nothing moved"
+if grep -q "link-build-cache-home.sh" <<<"$out"
+then ok "T46a catches literal \$HOME-spelled path"
+else bad "T46a catches literal \$HOME-spelled path" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T46a nothing moved"; else bad "T46a nothing moved"; fi
 
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 mkdir -p "$R/tools"
@@ -690,10 +687,10 @@ printf 'CACHE_SRC=~/org/skimmer/target\n' > "$R/tools/link-build-cache-tilde.sh"
 out=$(HOME="$R" "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/tools" 2>&1); rc=$?
 check "T46b exit" "$rc" "2"
-grep -q "link-build-cache-tilde.sh" <<<"$out" \
-  && ok "T46b catches literal ~-spelled path" \
-  || bad "T46b catches literal ~-spelled path" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T46b nothing moved" || bad "T46b nothing moved"
+if grep -q "link-build-cache-tilde.sh" <<<"$out"
+then ok "T46b catches literal ~-spelled path"
+else bad "T46b catches literal ~-spelled path" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T46b nothing moved"; else bad "T46b nothing moved"; fi
 
 # --- T47: an SSH origin (git@github.com:org/repo.git) resolving to the same
 #     repo as the desired HTTPS URL is accepted as already-correct by
@@ -704,8 +701,8 @@ R=$(newroot); C=$(mkfixture "$R" manta)
 git -C "$C" remote set-url origin git@github.com:HagaleTechnologies/manta.git
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T47a exit" "$rc" "0"
-grep -q "ALREADY MIGRATED" <<<"$out" && ok "T47a SSH origin accepted by --check" \
-  || bad "T47a SSH origin accepted by --check" "$out"
+if grep -q "ALREADY MIGRATED" <<<"$out"; then ok "T47a SSH origin accepted by --check"
+else bad "T47a SSH origin accepted by --check" "$out"; fi
 
 R=$(newroot); C=$(mkfixture "$R" skimmer)
 git -C "$C" remote set-url origin git@github.com:HagaleTechnologies/manta.git
@@ -714,8 +711,8 @@ check "T47b exit" "$rc" "0"
 check "T47b origin protocol preserved" \
   "$(git -C "$R/org/manta" remote get-url origin)" \
   "git@github.com:HagaleTechnologies/manta.git"
-grep -qi "leaving its protocol alone" <<<"$out" && ok "T47b explains why it did not rewrite" \
-  || bad "T47b explains why it did not rewrite" "$out"
+if grep -qi "leaving its protocol alone" <<<"$out"; then ok "T47b explains why it did not rewrite"
+else bad "T47b explains why it did not rewrite" "$out"; fi
 
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --remote-url https://github.com/HagaleTechnologies/manta.git 2>&1); rc=$?
@@ -735,11 +732,11 @@ echo 'not json {' > "$R/catalyst/execution-core/registry.json"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T48 exit" "$rc" "0"
 if command -v jq >/dev/null 2>&1; then
-  grep -q "VERDICT: MIGRATED — all checks pass\.$" <<<"$out" \
-    && bad "T48 verdict must not claim bare all-checks-pass when registry unverified" "$out" \
-    || ok "T48 verdict must not claim bare all-checks-pass when registry unverified"
-  grep -qi "registry.json's 'MAN' entry NOT verified" <<<"$out" \
-    && ok "T48 verdict names the unverified registry" || bad "T48 verdict names the unverified registry" "$out"
+  if grep -q "VERDICT: MIGRATED — all checks pass\.$" <<<"$out"
+  then bad "T48 verdict must not claim bare all-checks-pass when registry unverified" "$out"
+  else ok "T48 verdict must not claim bare all-checks-pass when registry unverified"; fi
+  if grep -qi "registry.json's 'MAN' entry NOT verified" <<<"$out"
+  then ok "T48 verdict names the unverified registry"; else bad "T48 verdict names the unverified registry" "$out"; fi
 else
   skip "T48 skipped (no jq)"
 fi
@@ -763,8 +760,8 @@ git -C "$R" remote add origin https://github.com/me/dotfiles.git
 mkdir -p "$R/org/skimmer"
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T49 exit" "$rc" "2"
-grep -qi "is not a git repository" <<<"$out" && ok "T49 refuses non-repo checkout" \
-  || bad "T49 refuses non-repo checkout" "$out"
+if grep -qi "is not a git repository" <<<"$out"; then ok "T49 refuses non-repo checkout"
+else bad "T49 refuses non-repo checkout" "$out"; fi
 check "T49 enclosing repo origin untouched" \
   "$(git -C "$R" remote get-url origin)" \
   "https://github.com/me/dotfiles.git"
@@ -780,9 +777,9 @@ printf 'CACHE_SRC="%s/org/skimmer/target"\n' "$R" > "$R/tools/link-build-cache.s
 out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
       --scan-root "$R/tools/link-build-cache.sh" 2>&1); rc=$?
 check "T50 exit" "$rc" "2"
-grep -q "link-build-cache.sh" <<<"$out" && ok "T50 accepts a file as --scan-root" \
-  || bad "T50 accepts a file as --scan-root" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T50 nothing moved" || bad "T50 nothing moved"
+if grep -q "link-build-cache.sh" <<<"$out"; then ok "T50 accepts a file as --scan-root"
+else bad "T50 accepts a file as --scan-root" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T50 nothing moved"; else bad "T50 nothing moved"; fi
 
 # --- T51: --check --apply together is refused (validation-round finding
 #     C1) — the two mode flags used to share one case arm with no
@@ -792,9 +789,9 @@ grep -q "link-build-cache.sh" <<<"$out" && ok "T50 accepts a file as --scan-root
 R=$(newroot); mkfixture "$R" skimmer >/dev/null
 out=$("$SUT" --check --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T51 exit" "$rc" "2"
-grep -qi "mutually exclusive" <<<"$out" && ok "T51 refuses conflicting mode flags" \
-  || bad "T51 refuses conflicting mode flags" "$out"
-[[ -d "$R/org/skimmer" ]] && ok "T51 nothing moved" || bad "T51 nothing moved"
+if grep -qi "mutually exclusive" <<<"$out"; then ok "T51 refuses conflicting mode flags"
+else bad "T51 refuses conflicting mode flags" "$out"; fi
+if [[ -d "$R/org/skimmer" ]]; then ok "T51 nothing moved"; else bad "T51 nothing moved"; fi
 # Repeating the SAME flag twice is not a conflict.
 out=$("$SUT" --check --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T51 repeated same flag exit" "$rc" "1"
@@ -816,11 +813,11 @@ git -C "$R/foreign/repo" config user.name  test
 git -C "$R/foreign/repo" -c commit.gpgsign=false commit -qm init
 addwt "$R/foreign/repo" "$R/org/manta-worktrees/w1" w1-foreign
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
-grep -q "was not repaired" <<<"$out" && bad "T52 must not adopt a foreign worktree" "$out" \
-  || ok "T52 does not adopt a foreign worktree"
+if grep -q "was not repaired" <<<"$out"; then bad "T52 must not adopt a foreign worktree" "$out"
+else ok "T52 does not adopt a foreign worktree"; fi
 check "T52 exit" "$rc" "0"
-grep -q "pre-existing prunable" <<<"$out" && ok "T52 dead entry reported informational" \
-  || bad "T52 dead entry reported informational" "$out"
+if grep -q "pre-existing prunable" <<<"$out"; then ok "T52 dead entry reported informational"
+else bad "T52 dead entry reported informational" "$out"; fi
 
 # --- T53: a stray FILE (not a directory) named `skimmer` must not make the
 #     host fail forever (validation-round finding C3) — classify() and the
@@ -834,11 +831,73 @@ git -C "$C" remote set-url origin https://github.com/HagaleTechnologies/manta.gi
 touch "$R/org/skimmer"
 out=$("$SUT" --check --org-dir "$R/org" --catalyst-dir "$R/catalyst" 2>&1); rc=$?
 check "T53 exit" "$rc" "2"
-grep -qi "is not a directory" <<<"$out" && ok "T53 refuses stray non-directory 'skimmer'" \
-  || bad "T53 refuses stray non-directory 'skimmer'" "$out"
-grep -qi "legacy .skimmer. directory still present" <<<"$out" \
-  && bad "T53 must not loop with a misleading directory FAIL" "$out" \
-  || ok "T53 must not loop with a misleading directory FAIL"
+if grep -qi "is not a directory" <<<"$out"; then ok "T53 refuses stray non-directory 'skimmer'"
+else bad "T53 refuses stray non-directory 'skimmer'" "$out"; fi
+if grep -qi "legacy .skimmer. directory still present" <<<"$out"
+then bad "T53 must not loop with a misleading directory FAIL" "$out"
+else ok "T53 must not loop with a misleading directory FAIL"; fi
+
+# --- T54: when grep cannot read a path under a scan root (here a dangling
+#     symlink, which `grep -R` follows and fails on with exit 2), the tooling
+#     preflight warns that the scan was incomplete instead of reporting it as
+#     a clean scan. Skipped where this platform's grep does not fail on it ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/tools"; ln -s "$R/does-not-exist" "$R/tools/dangling"
+grep -RIn no-such-text "$R/tools" >/dev/null 2>&1; probe=$?
+if [[ $probe -gt 1 ]]; then
+  out=$("$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" \
+        --scan-root "$R/tools" 2>&1); rc=$?
+  check "T54 exit" "$rc" "0"
+  if grep -q "scan did not complete cleanly" <<<"$out"; then ok "T54 warns about an incomplete scan"
+  else bad "T54 warns about an incomplete scan" "$out"; fi
+else
+  skip "T54 skipped (this grep does not fail on a dangling symlink)"
+fi
+
+# --- T55: both scripts are shellcheck-clean (plan Phases 1-3) ---
+if command -v shellcheck >/dev/null 2>&1; then
+  out=$(shellcheck -x "$SUT" "$REPO_ROOT/scripts/tests/test-fleet-rename-checkout.sh" 2>&1); rc=$?
+  if [[ $rc -eq 0 ]]; then ok "T55 shellcheck clean"; else bad "T55 shellcheck clean" "$out"; fi
+else
+  skip "T55 skipped (no shellcheck)"
+fi
+
+# --- T56: when neither GNU nor BSD stat can read registry.json's mode, the
+#     run says the rewritten file is left at 0600 instead of staying silent,
+#     and the registry is still updated ---
+R=$(newroot); mkfixture "$R" skimmer >/dev/null
+mkdir -p "$R/catalyst/execution-core" "$R/fakebin"
+printf '{"projects":[]}\n' > "$R/catalyst/execution-core/registry.json"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$R/fakebin/stat"
+chmod +x "$R/fakebin/stat"
+out=$(PATH="$R/fakebin:$PATH" "$SUT" --apply --org-dir "$R/org" \
+      --catalyst-dir "$R/catalyst" 2>&1); rc=$?
+if command -v jq >/dev/null 2>&1; then
+  check "T56 exit" "$rc" "0"
+  if grep -q "could not read the permission bits" <<<"$out"; then ok "T56 reports unreadable mode"
+  else bad "T56 reports unreadable mode" "$out"; fi
+  if grep -q "registry.json: team MAN" <<<"$out"; then ok "T56 registry still updated"
+  else bad "T56 registry still updated" "$out"; fi
+else
+  skip "T56 skipped (no jq)"
+fi
+
+# --- T57: a symlinked registry.json (a dotfiles/stow layout) must not come
+#     out of --apply world-writable: the mode copied onto the rewritten file
+#     is the link target's, not the symlink's own 0777 ---
+if command -v jq >/dev/null 2>&1; then
+  R=$(newroot); mkfixture "$R" skimmer >/dev/null
+  mkdir -p "$R/catalyst/execution-core" "$R/dotfiles"
+  printf '{"projects":[]}\n' > "$R/dotfiles/registry.json"
+  chmod 644 "$R/dotfiles/registry.json"
+  ln -s "$R/dotfiles/registry.json" "$R/catalyst/execution-core/registry.json"
+  "$SUT" --apply --org-dir "$R/org" --catalyst-dir "$R/catalyst" >/dev/null 2>&1
+  after="$(stat -L -c '%a' "$R/catalyst/execution-core/registry.json" 2>/dev/null \
+           || stat -L -f '%Lp' "$R/catalyst/execution-core/registry.json" 2>/dev/null)"
+  check "T57 symlinked registry.json not left world-writable" "$after" "644"
+else
+  skip "T57 registry mode assertion skipped (no jq)"
+fi
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]
