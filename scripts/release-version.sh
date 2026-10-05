@@ -56,16 +56,34 @@ suffix; see docs/RUNBOOKS/release.md."
 # release, not a release candidate -- a defect the original finding did not
 # name but which lived in the same three lines), so prerelease ordering
 # rules are not needed here.
+#
+# Components are compared as decimal STRINGS (leading zeros stripped, then
+# longer is bigger, then lexicographic), never with `-gt`/`-lt`: SEMVER_RE
+# puts no bound on a component's size, and Bash's test operators use
+# fixed-width integers -- on overflow (v9223372036854775808.0.0) they print
+# "integer expression expected" and return false inside an `if`, which
+# `set -e` ignores, so the bigger tag silently lost and an older release
+# could claim :latest (PR #107 review).
 version_gt() {  # version_gt A B -> 0 if A > B
-  local a="$1" b="$2" i
+  local a="$1" b="$2" i x y
   local -a A B          # bash 3.2: indexed arrays are fine, associative are not
   IFS=. read -r A0 A1 A2 <<< "$a"
   IFS=. read -r B0 B1 B2 <<< "$b"
   A=("$A0" "$A1" "$A2")
   B=("$B0" "$B1" "$B2")
   for i in 0 1 2; do
-    if [ "${A[$i]}" -gt "${B[$i]}" ]; then return 0; fi
-    if [ "${A[$i]}" -lt "${B[$i]}" ]; then return 1; fi
+    x="${A[$i]}"
+    y="${B[$i]}"
+    # Strip leading zeros (the tag scan below accepts v01.2.3), keeping
+    # one "0" for an all-zero component.
+    x="${x#"${x%%[!0]*}"}"
+    y="${y#"${y%%[!0]*}"}"
+    x="${x:-0}"
+    y="${y:-0}"
+    if [ "${#x}" -gt "${#y}" ]; then return 0; fi
+    if [ "${#x}" -lt "${#y}" ]; then return 1; fi
+    if [[ $x > $y ]]; then return 0; fi
+    if [[ $x < $y ]]; then return 1; fi
   done
   return 1
 }

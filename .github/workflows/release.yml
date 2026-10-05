@@ -44,21 +44,24 @@ permissions:
   contents: read
 
 jobs:
-  # MAN-65: same gate as release-publish.yml's, so a bad tag is reported by
-  # the build-and-validate workflow too. Deliberately NOT a `needs:` of
-  # `build`: a job skipped by its own `if:` also skips everything that
-  # needs it, which would silently skip the entire build matrix on every
-  # `workflow_dispatch` run (this job's `if:` is push-only; a dispatch never
-  # touches a tag at all).
+  # MAN-65: same gate as release-publish.yml's, and `build` needs it, so a
+  # near-miss tag fails here in seconds instead of also starting all five
+  # platform builds (PR #107 review). The push-only condition sits on the
+  # STEP, not the job: a job skipped by its own `if:` also skips everything
+  # that needs it, which would silently skip the entire build matrix on
+  # every `workflow_dispatch` run. On a dispatch this job runs and succeeds
+  # as a no-op: a dispatch is a manual build of whatever ref was picked
+  # (branch or tag), not a tag push, and this file never publishes it.
   validate-tag:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - shell: bash
+      - if: github.event_name == 'push'
+        shell: bash
         run: scripts/release-version.sh validate "$GITHUB_REF_NAME"
 
   build:
+    needs: validate-tag
     strategy:
       fail-fast: false
       matrix:

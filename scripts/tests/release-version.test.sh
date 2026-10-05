@@ -134,6 +134,13 @@ newest_case true  v1.2.3 v1.2.3 not-a-release   # junk tags are ignored
 newest_case false v1.2.3 v1.2.3 v1.2.4+meta     # a tag this pipeline would
                                                  # refuse to publish must not
                                                  # be treated as a release
+# PR #107 review: a component past Bash's 64-bit integer range made `-gt`
+# and `-lt` both error out as false, so the bigger tag lost and the older
+# release claimed :latest. Components now compare as decimal strings.
+newest_case false v1.0.0 v1.0.0 v9223372036854775808.0.0
+newest_case true  v9223372036854775808.0.0 v1.0.0 v9223372036854775808.0.0
+newest_case true  v1.2.3 v1.02.2 v1.2.3         # leading zeros are stripped,
+                                                 # not counted as digits
 
 echo "== is-newest-stable: hard failure on an unreadable/empty tag list =="
 # MAN-65 remediate round 7, finding 3.C: an empty tag listing used to be
@@ -161,6 +168,36 @@ newest_case_dies() {  # newest_case_dies <ref>
 }
 
 newest_case_dies v1.2.3
+
+echo "== release workflows: validate-tag gates the build =="
+# PR #107 review: release.yml's validate-tag ran BESIDE `build` instead of
+# before it, so a near-miss tag (v1.2.3+linux) still started all five
+# platform builds. In both release workflows `build` must need it, and
+# validate-tag must have no job-level `if:` -- a skipped job skips every
+# job that needs it, which would drop the whole build on workflow_dispatch.
+job_block() {  # job_block <workflow-file> <job-id> -> that job's lines
+  awk -v job="  $2:" '
+    $0 == job { injob = 1; print; next }
+    injob && /^  [A-Za-z0-9_-]+:/ { exit }
+    injob { print }
+  ' "$1"
+}
+for wf in release.yml release-publish.yml; do
+  path="$REPO_ROOT/.github/workflows/$wf"
+  # Here-strings, not `job_block | grep -q`: grep -q exits on its first
+  # match, and under pipefail the SIGPIPE awk can then take fails the check.
+  build_job="$(job_block "$path" build)"
+  gate_job="$(job_block "$path" validate-tag)"
+  if [ -z "$gate_job" ]; then
+    fail "$wf: no '  validate-tag:' job header found, so nothing was checked"
+  fi
+  if ! grep -Eq '^    needs: \[?validate-tag\]?$' <<< "$build_job"; then
+    fail "$wf: the build job does not declare needs: validate-tag"
+  fi
+  if grep -Eq '^    if:' <<< "$gate_job"; then
+    fail "$wf: validate-tag has a job-level if:, which skips build when false"
+  fi
+done
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures failure(s)" >&2
