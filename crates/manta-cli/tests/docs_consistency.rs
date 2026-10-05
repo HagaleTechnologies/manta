@@ -602,3 +602,28 @@ fn spec_input_center_freq_hz_is_documented_as_cli_only() {
         );
     }
 }
+
+/// MAN-65 finding 2: CI cannot prove `manta.exe` starts on a machine without
+/// the Visual C++ Redistributable, so the release-pipeline decision doc hands
+/// that check to the release runbook by section name. The section must exist
+/// and hold the actual procedure, not just a heading.
+#[test]
+fn release_runbook_has_the_clean_windows_check_the_decision_doc_cites() {
+    const HEADING: &str =
+        "Manual check: the Windows ZIP starts without the Visual C++ Redistributable";
+    let decision = squash_whitespace(&doc(
+        "docs/DECISIONS/2026-09-05-man65-release-pipeline-hardening.md",
+    ));
+    assert!(
+        decision.contains(&format!("`docs/RUNBOOKS/release.md`, \"{HEADING}\"")),
+        "the MAN-65 decision doc no longer cites the runbook's clean-Windows check by name"
+    );
+    let runbook = doc("docs/RUNBOOKS/release.md");
+    let check = section(&runbook, HEADING);
+    for needle in ["manta.exe --help", "vcruntime140.dll"] {
+        assert!(
+            check.contains(needle),
+            "the runbook's clean-Windows check never says `{needle}`"
+        );
+    }
+}

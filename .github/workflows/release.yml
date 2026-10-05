@@ -23,7 +23,6 @@ name: Release
 on:
   push:
     tags:
-<<<<<<< HEAD
       # MAN-65: 'v*' also matched non-release tags (e.g. `vendor-freeze`),
       # each of which used to spend five platform builds just to fail. The
       # glob language can't express SemVer, so it only filters the obvious
@@ -31,24 +30,6 @@ on:
       # failure for near-misses (v1.2.3+linux and friends) -- a near-miss
       # must FAIL loudly, not be silently ignored.
       - 'v[0-9]*'
-  pull_request:
-    paths:
-      - '.github/workflows/release.yml'
-      - '.github/workflows/release-publish.yml'
-      - 'Dockerfile'
-      - 'Cross.toml'
-      - '.dockerignore'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      # MAN-65: these are release-critical too -- a PR that changes only
-      # the version-validation helper should still run this workflow's
-      # validation.
-      - 'scripts/release-version.sh'
-      - 'scripts/tests/release-version.test.sh'
-=======
-      - 'v*'
->>>>>>> 187192a89cdaf44126aa318ecd1b316eeca99c29
   workflow_dispatch: {}
 
 env:
@@ -67,8 +48,8 @@ jobs:
   # the build-and-validate workflow too. Deliberately NOT a `needs:` of
   # `build`: a job skipped by its own `if:` also skips everything that
   # needs it, which would silently skip the entire build matrix on every
-  # `pull_request` run (this job's `if:` is push-only; `pull_request` and
-  # `workflow_dispatch` never touch a tag at all).
+  # `workflow_dispatch` run (this job's `if:` is push-only; a dispatch never
+  # touches a tag at all).
   validate-tag:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest

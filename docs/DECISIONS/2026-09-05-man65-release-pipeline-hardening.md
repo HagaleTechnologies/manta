@@ -110,8 +110,10 @@ rather than reporting a false pass.
 actually *starts* on a Windows machine that has never had the
 Redistributable installed. GitHub's `windows-latest` runner image already
 has the Redistributable present, so a successful run there proves nothing
-either way. This is recorded as a manual verification step
-(`docs/RUNBOOKS/release.md`), not an automated one.
+either way. This is recorded as a manual verification step, run before
+every release is announced (`docs/RUNBOOKS/release.md`, "Manual check: the
+Windows ZIP starts without the Visual C++ Redistributable"), not an
+automated one.
 
 ## Finding 3 — Overlapping tag builds can race on the shared `:latest` tag
 
@@ -311,8 +313,32 @@ only in a README parenthetical and a Linear ticket.
 - GHCR package visibility itself — a deliberate, permanent human step, not
   a gap awaiting a future fix (Finding 4).
 - MAN-66 (the protected-Environment gap for `packages: write` in
-  `release-publish.yml`) — a separate ticket, flagged to a human directly,
-  out of scope here.
+  `release-publish.yml`) — a separate ticket, landed on `main` separately
+  (#193); see "Reconciled with `main`" below for how this work fits it.
+
+## Reconciled with `main` (MAN-66, HAG-46, HAG-47)
+
+`main` changed three things this branch also touched, and this work was
+merged onto them:
+
+- **MAN-66 (#193)** split `docker-publish` into `docker-publish-release`
+  (tag push only, in the `ghcr-publish` environment) and
+  `docker-build-dispatch` (manual `workflow_dispatch` only). Where the
+  sections above say `docker-publish` about a tag push (Finding 3's
+  ordering and recency reasoning included), read `docker-publish-release`.
+  Both jobs take their version and image from `validate-tag`, neither
+  writes `:latest`, and both carry the anonymous-pull probe, gated on
+  their own push condition. Only `docker-publish-release` feeds
+  `publish-latest`, which now `needs: docker-publish-release` and also
+  runs in the `ghcr-publish` environment, because it is the other job that
+  holds `packages: write` on the tag-push path.
+- **HAG-46** renamed `ci.yml` to `ci-full.yml`. The release-version
+  harness runs in `ci-full.yml`'s `test` job, on the ubuntu and macOS
+  legs. It is skipped on the Windows leg `main` added, since the script
+  only ever runs on the release workflows' ubuntu runners.
+- **HAG-47** dropped `release.yml`'s `pull_request` trigger, so this
+  branch's path-filter additions for the two scripts are gone with it. The
+  `v[0-9]*` tag glob stays.
 
 ## References
 
@@ -326,4 +352,4 @@ only in a README parenthetical and a Linear ticket.
 - Code: `scripts/release-version.sh`,
   `scripts/tests/release-version.test.sh`,
   `.github/workflows/release.yml`, `.github/workflows/release-publish.yml`,
-  `.github/workflows/ci.yml` (`test` job), `README.md`.
+  `.github/workflows/ci-full.yml` (`test` job), `README.md`.

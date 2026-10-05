@@ -87,10 +87,10 @@ permissions:
 jobs:
   # MAN-65 finding 1: fail an unpublishable tag in SECONDS, before five
   # platform builds burn -- and before Buildx rejects it 30 minutes in and
-  # takes the `release` job (needs: docker-publish) down with it. This job
-  # is also now the single place the version and image name are derived;
-  # `build` and `docker-publish` consume its outputs instead of each
-  # re-deriving them.
+  # takes the `release` job (needs: docker-publish-release) down with it.
+  # This job is also now the single place the version and image name are
+  # derived; `build` and both Docker jobs consume its outputs instead of
+  # each re-deriving them.
   validate-tag:
     runs-on: ubuntu-latest
     outputs:
@@ -265,10 +265,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-<<<<<<< HEAD
-  docker-publish:
-    needs: [validate-tag, build]
-=======
   # Split into two mutually-exclusive jobs (Codex P2, manta#193 round 1): the original single
   # job's `environment: ghcr-publish` blocked EVERY run on a non-`v*` ref, including the
   # legitimate `workflow_dispatch` "test push" path this file's own comments describe (targeting
@@ -278,7 +274,7 @@ jobs:
   # protection against the threat model MAN-66 describes while breaking a real, supported use
   # case. Only the real `push: tags: v*` path is gated now.
   docker-publish-release:
-    needs: build
+    needs: [validate-tag, build]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # MAN-66 (accepted risk, see this file's header comment for the full reasoning): gates the
@@ -297,26 +293,6 @@ jobs:
 
       - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
 
-      - name: Determine version, image, and tag list
-        id: version
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # OCI/Docker repository paths must be lowercase; github.repository
-          # is case-preserving ("HagaleTechnologies/manta") and buildx
-          # rejects a mixed-case tag outright.
-          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "tags<<RELEASE_TAGS_EOF"
-            echo "$IMAGE:$VERSION"
-            echo "$IMAGE:latest"
-            echo "RELEASE_TAGS_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -329,74 +305,10 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.version.outputs.tags }}
-
-  # Ungated, deliberately: this only ever runs from a manual `workflow_dispatch` (any ref) --
-  # never automatically from a PR event -- so it isn't reachable by the threat model MAN-66
-  # describes, and gating it behind `ghcr-publish`'s tag-only policy would incorrectly block the
-  # dry-build (`publish=false`, any ref) and test-push (`publish=true`, targeting a branch) paths
-  # this job exists to support.
-  docker-build-dispatch:
-    needs: build
-    if: github.event_name == 'workflow_dispatch'
->>>>>>> 187192a89cdaf44126aa318ecd1b316eeca99c29
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-
-      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
-
-<<<<<<< HEAD
-=======
-      - name: Determine version, image, and tag list
-        id: version
-        shell: bash
-        run: |
-          VERSION="dispatch-${{ github.run_id }}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-
-          # `:latest` is reserved for real tag pushes only (docker-publish-release) -- a
-          # workflow_dispatch run with publish=true can target any branch, not just a release,
-          # and README's `docker run ghcr.io/.../manta:latest` install command must always trace
-          # to a real tagged release, not a manual test build that happened to also push.
-          {
-            echo "tags<<RELEASE_TAGS_EOF"
-            echo "$IMAGE:$VERSION"
-            echo "RELEASE_TAGS_EOF"
-          } >> "$GITHUB_OUTPUT"
-
->>>>>>> 187192a89cdaf44126aa318ecd1b316eeca99c29
-      - name: Log in to GHCR
-        if: inputs.publish
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-<<<<<<< HEAD
-          push: ${{ github.event_name == 'push' || inputs.publish == true }}
-          # `:latest` is reserved for real tag pushes only, and is no
-          # longer written HERE at all (MAN-65 finding 3) -- see
-          # `publish-latest` below. A workflow_dispatch run with
-          # publish=true can target any branch, not just a release, and
-          # README's `docker run ghcr.io/.../manta:latest` install command
-          # must always trace to a real tagged release, not a manual test
-          # build that happened to also push. The dispatch-<run_id> tag is
-          # still pushed on a dispatch publish, for testing this job
-          # specifically -- just never `:latest`.
+          # The version tag only. `:latest` is no longer written HERE at all
+          # (MAN-65 finding 3) -- see `publish-latest` below. Version and image
+          # come from `validate-tag`, the one place they are derived (MAN-65
+          # finding 1).
           tags: ${{ needs.validate-tag.outputs.image }}:${{ needs.validate-tag.outputs.version }}
 
       # MAN-65 finding 4 (remediate round 7, finding 3.B): this used to be
@@ -422,7 +334,86 @@ jobs:
       # package setting that isn't the actual failure. success() only
       # allows the probe to run when nothing earlier in the job has failed.
       - name: Verify the image is anonymously pullable
-        if: success() && (github.event_name == 'push' || inputs.publish == true)
+        if: success()
+        env:
+          IMAGE_PATH: ${{ github.repository }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -uo pipefail
+          REPO_LC="$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')"
+          TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO_LC}:pull&service=ghcr.io" | jq -r .token || true)"
+          CODE="$(curl -sSL -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN:-}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${REPO_LC}/manifests/${VERSION}" || true)"
+          if [ "$CODE" = "200" ]; then
+            echo "OK: ghcr.io/${REPO_LC}:${VERSION} is anonymously pullable." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### :warning: GHCR package is not anonymously pullable (HTTP ${CODE})"
+              echo
+              echo "README's \`docker run ghcr.io/${REPO_LC}:latest\` will return an"
+              echo "authorization error for everyone until this one-time step is done:"
+              echo
+              # MAN-65 remediate round 7, finding 3.D: derived rather than
+              # hardcoded -- this repo has already been renamed once
+              # (docs/DECISIONS/2026-09-01-rename-to-manta.md), and a
+              # hardcoded name would 404 after the next rename or in a fork.
+              echo "1. https://github.com/${IMAGE_PATH}/pkgs/container/${REPO_LC##*/}"
+              echo "2. **Package settings** -> **Danger Zone** -> **Change visibility** -> **Public**"
+              echo
+              echo "See docs/RUNBOOKS/release.md. This is a deliberate human step (MAN-65 finding 4)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=GHCR package not public::anonymous pull of ${REPO_LC}:${VERSION} returned ${CODE}; see the job summary"
+          fi
+
+  # Ungated, deliberately: this only ever runs from a manual `workflow_dispatch` (any ref) --
+  # never automatically from a PR event -- so it isn't reachable by the threat model MAN-66
+  # describes, and gating it behind `ghcr-publish`'s tag-only policy would incorrectly block the
+  # dry-build (`publish=false`, any ref) and test-push (`publish=true`, targeting a branch) paths
+  # this job exists to support.
+  docker-build-dispatch:
+    needs: [validate-tag, build]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Log in to GHCR
+        if: inputs.publish
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.publish == true }}
+          # `:latest` is reserved for real tag pushes only (`publish-latest`) --
+          # a workflow_dispatch run with publish=true can target any branch, not
+          # just a release, and README's `docker run ghcr.io/.../manta:latest`
+          # install command must always trace to a real tagged release, not a
+          # manual test build that happened to also push. The dispatch-<run_id>
+          # tag `validate-tag` derives is still pushed on a dispatch publish, for
+          # testing this job specifically -- just never `:latest`.
+          tags: ${{ needs.validate-tag.outputs.image }}:${{ needs.validate-tag.outputs.version }}
+
+      # Same probe as docker-publish-release's (MAN-65 finding 4) -- keep the
+      # two in sync. Gated on the condition that gates this job's own push: a
+      # publish=true test push can be the one that first creates the private
+      # GHCR package.
+      - name: Verify the image is anonymously pullable
+        if: success() && inputs.publish == true
         env:
           IMAGE_PATH: ${{ github.repository }}
           VERSION: ${{ needs.validate-tag.outputs.version }}
@@ -466,7 +457,7 @@ jobs:
   #    previously PENDING run in a concurrency group whenever a new one
   #    arrives, regardless of `cancel-in-progress` -- that setting only
   #    protects the run already IN PROGRESS. Pending order is ARRIVAL
-  #    order (this job's `needs: docker-publish`, so arrival order is
+  #    order (this job's `needs: docker-publish-release`, so arrival order is
   #    build-completion order), not tag-version order: with three
   #    overlapping releases, the run for the actual newest tag can be the
   #    one sitting pending, cancelled by a release that is neither the
@@ -502,9 +493,13 @@ jobs:
   # `release` below deliberately does NOT depend on this job: a declined
   # `:latest` write must never block a GitHub Release.
   publish-latest:
-    needs: [validate-tag, docker-publish]
+    needs: [validate-tag, docker-publish-release]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # MAN-66: behind the same `ghcr-publish` tag-only deployment policy as
+    # docker-publish-release -- this job also holds `packages: write` on
+    # the tag-push path.
+    environment: ghcr-publish
     permissions:
       contents: read
       packages: write
@@ -558,10 +553,6 @@ jobs:
           IMAGE: ${{ needs.validate-tag.outputs.image }}
           VERSION: ${{ needs.validate-tag.outputs.version }}
         run: docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
-=======
-          push: ${{ inputs.publish == true }}
-          tags: ${{ steps.version.outputs.tags }}
->>>>>>> 187192a89cdaf44126aa318ecd1b316eeca99c29
 
   release:
     needs: [build, docker-publish-release]

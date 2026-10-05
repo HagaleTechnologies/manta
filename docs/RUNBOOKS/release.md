@@ -19,17 +19,21 @@ design rationale behind the behaviour described here.
    - **`release.yml`** builds and packages all five targets (macOS
      x86_64/arm64, Windows x86_64, Linux x86_64/arm64) and validates the
      multi-arch Docker build (`push: false`) — this run never publishes
-     anything; it exists so a tag push gets the same build-validation a PR
-     would have gotten.
+     anything; it is a build-only check of the tagged commit (it no longer
+     runs on pull requests at all, since HAG-47).
    - **`release-publish.yml`** does the real work, in order:
      `validate-tag` (rejects an unpublishable tag in seconds, before any
      platform build starts) → `build` (rebuilds the same five targets) →
-     `docker-publish` (pushes the multi-arch image to GHCR as
+     `docker-publish-release` (pushes the multi-arch image to GHCR as
      `ghcr.io/hagaletechnologies/manta:X.Y.Z`) → `publish-latest` (see
      below) and, in parallel, `release` (creates the GitHub Release from
-     the five build artifacts).
+     the five build artifacts). `docker-publish-release` and
+     `publish-latest` run in the `ghcr-publish` environment (MAN-66).
 4. Watch the `release-publish.yml` run's summary for the GHCR visibility
    warning and the `:latest`-not-updated warning — see below.
+5. **Before announcing the release, run the clean-Windows check** below
+   ("Manual check: the Windows ZIP starts without the Visual C++
+   Redistributable"). CI cannot prove it.
 
 ## Accepted tag grammar
 
@@ -74,8 +78,9 @@ a human, don't silently work around it" disposition this repo already
 applies to MAN-66, `.github/workflows/release-publish.yml`'s own header
 comment).
 
-What *is* automated is noticing: the `docker-publish` job's "Verify the
-image is anonymously pullable" step performs an anonymous pull probe on
+What *is* automated is noticing: the `docker-publish-release` job's "Verify
+the image is anonymously pullable" step (and its copy in
+`docker-build-dispatch`, for a `publish=true` manual run) performs an anonymous pull probe on
 every release — including a pre-release's first publish, which is when
 this package is most likely to be created — and writes to the run's own
 step summary:
@@ -91,6 +96,51 @@ package is still private; the fix is the out-of-band human action above.
 Do this once, the first time a real tag is published; subsequent releases
 push to the same already-public package and the probe reports "OK".
 
+## Manual check: the Windows ZIP starts without the Visual C++ Redistributable
+
+The Windows build links the MSVC C runtime statically (MAN-65 finding 2),
+and every release build checks that: the "Assert the Windows binary is
+statically CRT-linked" step fails the build if `manta.exe` imports
+`VCRUNTIME140`, `MSVCP140` or any `api-ms-win-crt-*` DLL. What CI cannot
+show is that the binary *starts* on a machine without the redistributable.
+GitHub's `windows-latest` runner already has it installed, so a binary
+that runs there proves nothing either way. This check is manual, and it
+is the finding's real acceptance test. Do it for every release, before
+announcing it:
+
+1. Download `manta-windows-x86_64.zip` from the GitHub Release's assets.
+2. Use a Windows x86_64 machine or VM that has never had the Visual C++
+   2015-2022 Redistributable installed. Confirm that no copy of the runtime
+   is reachable, from a PowerShell prompt opened in the folder you will
+   unzip into:
+
+   ```powershell
+   where.exe vcruntime140.dll   # must find nothing
+   ```
+
+   `where.exe` searches the current folder and every `PATH` directory
+   (System32 included), the same places Windows would load the DLL from.
+   Other software can ship its own `vcruntime140.dll` on `PATH` without the
+   redistributable being installed. If it finds any copy, this machine
+   cannot tell a static build from a dynamic one. Use a different one.
+3. Unzip the archive and run the binary from the unpacked
+   `manta-windows-x86_64` folder:
+
+   ```powershell
+   .\manta.exe --help
+   ```
+
+   It must print manta's help text. A dialog or error naming
+   `VCRUNTIME140.dll`, `MSVCP140.dll` or an `api-ms-win-crt-*` DLL means
+   the release shipped a dynamically linked binary.
+
+If the check fails, edit the GitHub Release to warn Windows users before
+announcing it. Then look at the Windows entry's `rustflags` in the build
+matrix of both `release.yml` and `release-publish.yml`, and at any other
+place that sets rustflags for that build: Cargo takes rustflags from one
+source and does not merge them, so a flag set somewhere else can replace
+`+crt-static` without any error.
+
 ## If `:latest` ends up wrong
 
 `publish-latest` re-checks, immediately before writing `:latest`, whether
@@ -102,9 +152,9 @@ used to let the older build's `:latest` write win if it finished last
 
 This check is deliberately a Git-tag comparison, not a check of what GHCR
 has actually published: if a numerically newer tag's own
-`release-publish` run failed before reaching `docker-publish` (so no image
-was ever pushed for it), this run still declines to write `:latest` on
-that tag's account. A decline shows up as a `::warning` and a
+`release-publish` run failed before reaching `docker-publish-release` (so
+no image was ever pushed for it), this run still declines to write
+`:latest` on that tag's account. A decline shows up as a `::warning` and a
 `$GITHUB_STEP_SUMMARY` block on the `Is this still the newest stable
 release?` step — watch for it the same way you watch for the GHCR
 visibility warning above. See

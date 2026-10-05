@@ -154,6 +154,14 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # MAN-65: the release pipeline's tag grammar and :latest recency
+      # logic are testable without pushing a tag, and this rides the
+      # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new
+      # job auto-merge wouldn't wait for. Skipped on the windows-latest
+      # leg: scripts/release-version.sh only ever runs on the release
+      # workflows' ubuntu-latest runners.
+      - if: runner.os != 'Windows'
+        run: bash scripts/tests/release-version.test.sh
   # Same Dependabot-only pull_request gate as `test` above -- not itself a required check, but
   # matches this job's own pre-migration behavior (ran for a Dependabot PR too, gated only by
   # codex-clean's tolerant skip) rather than silently dropping coverage for a Dependabot bump

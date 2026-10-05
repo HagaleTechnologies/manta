@@ -116,21 +116,18 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   line above turns it on. `soapy` (RTL-SDR, Airspy, SDRplay, HackRF via
   SoapySDR) needs the native SoapySDR system library installed first;
   once you have it, add it: `--features hpsdr,soapy`.
-- Windows binaries need the [Visual C++
+- Windows binaries from the release workflow link the MSVC runtime
+  statically, so they need no Visual C++ Redistributable. A Windows build
+  from source links it dynamically unless you set
+  `RUSTFLAGS="-C target-feature=+crt-static"` yourself, so a binary built
+  that way needs the [Visual C++
   Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
-  installed if it isn't already.
+  on any machine that doesn't already have it.
+- If the `docker run` above returns an authorization error, the GHCR
+  package still needs its one-time "make public" step — see
+  [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
 
-<<<<<<< HEAD
-Both are built by [`.github/workflows/release-publish.yml`](.github/workflows/release-publish.yml)
-directly from each tagged release's commit — every published binary
-traces to a specific, auditable source revision. Windows binaries link the
-MSVC runtime statically, so they need no Visual C++ Redistributable. (If
-the `docker run` above returns an authorization error, the GHCR package
-still needs its one-time "make public" step — see
-[docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).)
-=======
 ## 60-second demo
->>>>>>> 187192a89cdaf44126aa318ecd1b316eeca99c29
 
 No SDR, no radio. With `manta` on `PATH` from the install above, generate
 a synthetic golden vector and decode it:
