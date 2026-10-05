@@ -2337,10 +2337,16 @@ fn main() -> Result<()> {
             // exists to guarantee. Installing the handler first makes the
             // whole observable window -- banner included -- covered by the
             // drain. A signal landing before the decode loop starts is
-            // handled correctly by construction: `listen_with_observers`
-            // observes `stop` and returns, and the shutdown sequence below
-            // runs on that path exactly as it does for a signal arriving
-            // mid-decode. The banner itself still precedes the listener
+            // observed by `listen_with_observers` before its next startup-
+            // calibration read (review round 7; before that round it was
+            // observed only once the two-second calibration buffer had
+            // filled); it processes only what it has already read and
+            // returns `Ok` without reading again. A read already in flight is not
+            // interrupted: it returns with whatever the source yields next,
+            // or fails after that source's own stall bound, and the shutdown
+            // sequence below runs on both the `Ok` and the error path,
+            // exactly as it does for a signal arriving mid-decode. The
+            // banner itself still precedes the listener
             // tasks (see `start_spot_server`), so its ordering against
             // per-connection lines is unchanged.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2528,7 +2534,9 @@ fn main() -> Result<()> {
             // the padding and calibration `on_tracks` callbacks BEFORE its
             // loop first examines `stop` (manta-engine/src/listen.rs: the
             // two `on_tracks(n_tracks)` calls above `loop { if
-            // stop.load(..) { break } }`), so a SIGINT arriving during the
+            // stop.load(..) { break } }`) -- also when a stop request cut
+            // the calibration fill short (review round 7), since what was
+            // read is still processed -- so a SIGINT arriving during the
             // two-second startup calibration would otherwise publish
             // `ready: decoding` for a run that shuts down without ever
             // decoding a chunk.

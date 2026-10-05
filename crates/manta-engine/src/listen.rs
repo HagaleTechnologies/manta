@@ -165,6 +165,21 @@ pub fn listen_with_observers(
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
     while filled < calib_n {
+        // MAN-122 review round 7: checked before EVERY calibration read, not
+        // only once the decode loop below starts. The daemon installs its
+        // Ctrl-C handler before it logs the `listening:` banner, so a stop
+        // request can land at any point while this two-second buffer fills;
+        // without this check it was honoured only once the buffer was full.
+        // A read already in flight is not interrupted; it returns with
+        // whatever the source yields next, or fails after that source's own
+        // stall bound (`IqSource::read`'s implementations in `manta-input`).
+        // `break`, not `return`: whatever was read is still processed below
+        // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
+        // `soak`) still analyses every sample it read, and the decode loop's
+        // own `stop` check then ends the run without another read.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
             anyhow::bail!("audio source ended during startup calibration");
@@ -222,7 +237,10 @@ pub fn listen_with_observers(
     let n_tracks = tm.decoding_track_count();
     report_active_tracks(n_tracks);
     on_tracks(n_tracks);
-    for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
+    // `..filled`: the whole buffer unless a stop request cut the fill short.
+    for ev in tm.process_hops(&ch.process(&calib[..filled]), |m| {
+        m.saturating_sub(pad_hops) * hop
+    }) {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
         for spot in validator.ingest(&ev) {
             on_spot(&spot);
@@ -621,6 +639,89 @@ mod tests {
             counts.last().copied(),
             Some(0),
             "a failed read must publish 0 before propagating, or the gauge stays frozen through shutdown drain, got {counts:?}"
+        );
+    }
+
+    /// A live-shaped source: short reads that never reach EOF, and a Ctrl-C
+    /// that lands during its first read -- i.e. while `listen` is still
+    /// filling its startup calibration buffer.
+    struct StopsDuringCalibrationSource {
+        stop: Arc<AtomicBool>,
+        reads: Arc<AtomicU64>,
+    }
+
+    impl manta_input::IqSource for StopsDuringCalibrationSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Relaxed);
+            let n = buf.len().min(64);
+            buf[..n].fill(Complex32::new(0.0, 0.0));
+            Ok(n)
+        }
+    }
+
+    /// Runs `listen_with_observers` against `StopsDuringCalibrationSource`
+    /// with `stop` initially `stop_before_start`, returning how many reads
+    /// it issued and every `on_tracks` value.
+    fn run_stopping_during_calibration(stop_before_start: bool) -> (u64, Vec<usize>) {
+        let stop = Arc::new(AtomicBool::new(stop_before_start));
+        let reads = Arc::new(AtomicU64::new(0));
+        let src: Box<dyn manta_input::IqSource> = Box::new(StopsDuringCalibrationSource {
+            stop: stop.clone(),
+            reads: reads.clone(),
+        });
+        let mut counts = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        )
+        .expect("a stop request during calibration is a clean shutdown, not an error");
+        (reads.load(Ordering::Relaxed), counts)
+    }
+
+    /// MAN-122 review round 7: the daemon installs its Ctrl-C handler
+    /// before it logs the `listening:` banner, so a signal can land while
+    /// `listen` is still filling the two-second calibration buffer. The
+    /// calibration loop must check `stop` before each read, not keep
+    /// reading until the buffer is full and only check `stop` once the
+    /// decode loop starts. What was read is still processed and flushed,
+    /// so the run ends through `finish()` and settles the count at 0.
+    #[test]
+    fn listen_stops_during_startup_calibration_without_filling_the_buffer() {
+        let (reads, counts) = run_stopping_during_calibration(false);
+        assert_eq!(
+            reads, 1,
+            "listen must not issue another read once stop is set during calibration"
+        );
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped run must still end through finish(), got {counts:?}"
+        );
+    }
+
+    /// The same, for a signal that lands before `listen` starts at all --
+    /// e.g. at the daemon's `listening:` banner: no read is issued, so a
+    /// source that would block cannot hold up shutdown.
+    #[test]
+    fn listen_issues_no_read_when_stop_is_already_set() {
+        let (reads, counts) = run_stopping_during_calibration(true);
+        assert_eq!(reads, 0, "stop was set before listen started");
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped run must still end through finish(), got {counts:?}"
         );
     }
 
