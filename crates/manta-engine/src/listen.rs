@@ -3,6 +3,7 @@
 //! the merged multi-track decode event stream as it's produced. No actor/
 //! ring-thread split; see design doc §4.
 
+use crate::latency::DecodeLatencyObserver;
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
@@ -39,6 +40,14 @@ pub struct ListenObservers {
     /// existing callers -- including `soak()` and the CPU-budget bench --
     /// pay nothing.
     pub active_tracks: Option<Arc<AtomicU64>>,
+    /// MAN-128: wall-clock time spent on one steady-state input chunk --
+    /// channelize, track/decode, validate, `on_spot` -- measured from after
+    /// `src.read()` returns until the chunk's processing ends. Excludes the
+    /// source read wait and the startup calibration/padding blocks (a 2s
+    /// block processed as one chunk would otherwise skew the distribution).
+    /// `None` (the default) skips both the `Instant::now()` calls and the
+    /// observation entirely, so `listen()`'s existing callers pay nothing.
+    pub decode_latency: Option<Arc<DecodeLatencyObserver>>,
 }
 
 /// Zeroes the active-track observer on EVERY exit path out of
@@ -192,6 +201,10 @@ pub fn listen_with_observers(
         if n == 0 {
             break;
         }
+        let t0 = observers
+            .decode_latency
+            .as_ref()
+            .map(|_| std::time::Instant::now());
         for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
             m.saturating_sub(pad_hops) * hop
         }) {
@@ -201,6 +214,9 @@ pub fn listen_with_observers(
             }
         }
         report_active_tracks(&tm);
+        if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
+            obs.observe(t0.elapsed());
+        }
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
@@ -273,6 +289,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             ListenObservers {
                 active_tracks: Some(gauge.clone()),
+                ..Default::default()
             },
             |_ev| peak = peak.max(observed.load(Ordering::Relaxed)),
             |_spot| {},
@@ -340,6 +357,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             ListenObservers {
                 active_tracks: Some(gauge.clone()),
+                ..Default::default()
             },
             |_ev| {},
             |_spot| {},
@@ -559,5 +577,65 @@ mod tests {
             spots.is_empty(),
             "blocklisted callsign must never be spotted, got {spots:?}"
         );
+    }
+
+    /// MAN-128: one latency sample per steady-state chunk, none for
+    /// calibration/padding. `N = calib_n + 3*CHUNK_SAMPLES + 100` reads as
+    /// 2048, 2048, 2048, 100 (then EOF) -- 4 steady-state chunks.
+    #[test]
+    fn listen_with_observers_records_one_latency_sample_per_steady_state_chunk() {
+        use crate::latency::DecodeLatencyObserver;
+
+        let fs = 48_000.0;
+        let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
+        let n_samples = calib_n + 3 * CHUNK_SAMPLES + 100;
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: vec![Complex32::new(0.0, 0.0); n_samples],
+            cursor: 0,
+            fs,
+            center_freq_hz: 14_000_000.0,
+        });
+
+        let obs = Arc::new(DecodeLatencyObserver::new());
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                decode_latency: Some(obs.clone()),
+                ..Default::default()
+            },
+            |_ev| {},
+            |_spot| {},
+        )
+        .unwrap();
+
+        assert_eq!(obs.snapshot().count, 4);
+    }
+
+    /// The default path must stay exactly as cheap as before: no observer
+    /// means no `Instant::now()` call and no observation recorded.
+    #[test]
+    fn plain_listen_records_nothing() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        listen(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |_ev| {},
+            |_spot| {},
+        )
+        .unwrap();
+        // No observer was supplied -- nothing to assert beyond "this
+        // compiles and runs with ListenObservers::default()", which is the
+        // whole point: `listen()`'s existing callers pay nothing new.
     }
 }
