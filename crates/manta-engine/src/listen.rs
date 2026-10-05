@@ -140,9 +140,11 @@ fn emit(
 /// MAN-73: a live source may report a discontinuity via
 /// `IqSource::take_discontinuity()` (e.g. after a reconnect). When it does,
 /// the current segment (channelizer + track manager) is closed -- every
-/// open track gets its `TrackClosed` -- and a fresh segment starts, with
-/// its sample clock advanced by the reported gap and its track ids
-/// continuing from the closed segment's. This keeps spot timestamps
+/// open track gets its `TrackClosed`, as `ClosureKind::Bookkeeping` rather
+/// than `SignalEnded`, since the transmission may still be on the air --
+/// and a fresh segment starts, with its sample clock advanced by the
+/// reported gap and its track ids continuing from the closed segment's.
+/// This keeps spot timestamps
 /// wall-clock-true across the outage without splicing pre-outage audio
 /// onto post-outage audio or zero-filling the gap (zero-fill pins the
 /// noise floor and floods false tracks on resume -- see
@@ -270,7 +272,9 @@ pub fn listen_with_observers(
             break;
         }
         if let Some(gap) = src.take_discontinuity() {
-            let finish_events = seg.tm.finish();
+            // Not `finish()`: an outage is not an end of signal (see
+            // `TrackManager::finish_for_discontinuity`).
+            let finish_events = seg.tm.finish_for_discontinuity();
             emit(
                 finish_events,
                 &mut validator,
@@ -373,6 +377,10 @@ mod tests {
         served: usize,
         armed: bool,
         pending_gap: Option<u64>,
+        /// Set once `take_discontinuity()` has handed the gap to `listen()`,
+        /// so a test can tell the events `listen()` emits after the
+        /// discontinuity from those before it.
+        gap_taken: Arc<AtomicBool>,
     }
 
     impl GapSource {
@@ -389,6 +397,7 @@ mod tests {
                 served: 0,
                 armed: false,
                 pending_gap: None,
+                gap_taken: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -423,7 +432,11 @@ mod tests {
             Ok(n)
         }
         fn take_discontinuity(&mut self) -> Option<u64> {
-            self.pending_gap.take()
+            let gap = self.pending_gap.take();
+            if gap.is_some() {
+                self.gap_taken.store(true, Ordering::Relaxed);
+            }
+            gap
         }
     }
 
@@ -515,6 +528,58 @@ mod tests {
         assert!(
             closed_before_first_post_gap_char,
             "the pre-gap track's TrackClosed must arrive before any post-gap CharDecoded"
+        );
+    }
+
+    /// MAN-73 (PR #207 review): a transport outage is not an end of
+    /// signal. Every track the discontinuity tears down must close as
+    /// `Bookkeeping { survivor_track_id: None }`, never `SignalEnded`:
+    /// `SignalEnded` tells `manta-spot`'s `Validator` the transmission
+    /// ended, so the post-reconnect track's next call utterance of the same
+    /// CQ would count as a distinct message, and pending beacons would
+    /// resolve early.
+    #[test]
+    fn a_discontinuity_closes_open_tracks_as_bookkeeping_not_signal_ended() {
+        use manta_decode::events::ClosureKind;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        // 20 s of V1's looped CQ with the gap armed 12 s in: past startup
+        // calibration and mid-transmission, so a track is open at the gap.
+        let samples = rendered.samples[..(spec.fs * 20.0) as usize].to_vec();
+        let src = GapSource::new(samples, spec.fs, spec.center_freq_hz, spec.fs as u64)
+            .arm_after_samples((spec.fs * 12.0) as usize);
+        let gap_taken = src.gap_taken.clone();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        let mut seen_before_gap: std::collections::BTreeSet<u32> = Default::default();
+        let mut closed_at_gap: Vec<(u32, ClosureKind)> = Vec::new();
+        manta_engine_listen_with_discontinuity_probe(Box::new(src), &stop, &mut spots, |ev| {
+            let id = crate::track::event_track_id(ev);
+            if !gap_taken.load(Ordering::Relaxed) {
+                seen_before_gap.insert(id);
+            } else if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                // Only the pre-gap segment's tracks: its `TrackManager` is
+                // dropped right after the teardown, so any of its tracks
+                // closing after the gap was closed BY the teardown.
+                if seen_before_gap.contains(track_id) {
+                    closed_at_gap.push((*track_id, *closure));
+                }
+            }
+        })
+        .unwrap();
+
+        assert!(
+            !closed_at_gap.is_empty(),
+            "test setup: a track must still be open when the gap arrives"
+        );
+        assert!(
+            closed_at_gap.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "a discontinuity must close tracks as Bookkeeping, not SignalEnded: {closed_at_gap:?}"
         );
     }
 

@@ -28,11 +28,14 @@ counter near 0, so naively tearing down and re-running `listen()` from scratch o
 would back-date every post-reconnect spot's timestamp against the session's one fixed epoch.
 Instead, `listen()` (`manta-engine/src/listen.rs`) owns a `Segment` (channelizer + track manager)
 that it can restart in place: on `take_discontinuity() == Some(gap)`, it closes the current
-segment's tracks (emitting their `TrackClosed` events), advances its running sample-clock base by
-`consumed + gap`, and builds a fresh `Segment` whose `TrackManager` resumes track-id numbering
-from where the old one left off (`TrackManager::next_track_id`/`resume_track_ids_from`) — so a
-restarted segment never reuses an id, and `sample_ts` stays monotonic and wall-clock-true with no
-audio spliced across the gap.
+segment's tracks (emitting their `TrackClosed` events as `ClosureKind::Bookkeeping {
+survivor_track_id: None }` via `TrackManager::finish_for_discontinuity`, not `finish()`'s
+`SignalEnded`: an outage is not evidence the transmission ended, and `SignalEnded` would let the
+validator count the post-reconnect track's next call utterance as a distinct message), advances
+its running sample-clock base by `consumed + gap`, and builds a fresh `Segment` whose
+`TrackManager` resumes track-id numbering from where the old one left off
+(`TrackManager::next_track_id`/`resume_track_ids_from`) — so a restarted segment never reuses an
+id, and `sample_ts` stays monotonic and wall-clock-true with no audio spliced across the gap.
 
 ### Why not zero-fill the gap
 

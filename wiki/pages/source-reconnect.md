@@ -20,7 +20,9 @@ as wildly over threshold on resume and floods false tracks. Report the outage in
 `IqSource::take_discontinuity()` instead and let `manta_engine::listen` restart the track segment
 with no synthetic samples at all — see the decision doc for the full design and why retrying the
 whole `listen()` call (instead of restarting just the segment) would back-date timestamps against
-`SpotBus`'s fixed session epoch.
+`SpotBus`'s fixed session epoch. Gotcha: the restart closes the old tracks with
+`TrackManager::finish_for_discontinuity` (`Bookkeeping`), never `finish()` (`SignalEnded`) — the
+decision doc says why.
 
 ## Symptom
 

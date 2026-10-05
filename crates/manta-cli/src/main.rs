@@ -1859,6 +1859,30 @@ const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// costs one relaxed atomic load per tick.
 const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// MAN-73: the `manta_source_health` sink a `ReconnectingSource` reports
+/// through. The unhealthy transition also zeroes the shared active-track
+/// gauge (PR #207 review): for the whole outage `listen()` is blocked in
+/// the reconnecting `read()`, so it can't publish a count itself, and the
+/// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
+/// count. `listen()` publishes the real count again after its first
+/// post-reconnect chunk.
+fn source_health_sink(
+    name: &'static str,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+    active_tracks: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> reconnect::HealthSink {
+    Box::new(move |healthy| {
+        if !healthy {
+            if let Some(gauge) = &active_tracks {
+                gauge.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(metrics) = &metrics {
+            metrics.set_source_health(name, healthy);
+        }
+    })
+}
+
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
 /// `SHUTDOWN_DRAIN_DEADLINE`. `Runtime::shutdown_timeout`'s `duration`
@@ -2470,13 +2494,11 @@ fn main() -> Result<()> {
             let src: Box<dyn IqSource> = if spec.is_reconnectable() {
                 let initial_healthy = first.confirmed_live_handle().is_none();
                 let name = spec.name();
-                let on_health: reconnect::HealthSink = match &spot_server {
-                    Some(server) => {
-                        let metrics = server.metrics.clone();
-                        Box::new(move |healthy| metrics.set_source_health(name, healthy))
-                    }
-                    None => Box::new(|_healthy| {}),
-                };
+                let on_health = source_health_sink(
+                    name,
+                    spot_server.as_ref().map(|server| server.metrics.clone()),
+                    active_tracks.clone(),
+                );
                 let reopen_spec = spec.clone();
                 Box::new(ReconnectingSource::new(
                     name,
@@ -3890,6 +3912,37 @@ mod tests {
         fn take_discontinuity(&mut self) -> Option<u64> {
             self.gap.take()
         }
+    }
+
+    /// MAN-73 (PR #207 review): during an outage `listen()` is blocked in
+    /// the reconnecting `read()` and can't republish the active-track
+    /// count, so the unhealthy transition itself must zero the shared
+    /// gauge, or `manta_active_tracks` exports the pre-drop tracks until
+    /// samples resume.
+    #[test]
+    fn source_health_sink_zeroes_active_tracks_when_the_source_goes_unhealthy() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        let gauge = Arc::new(AtomicU64::new(3));
+        let mut sink = source_health_sink("kiwi", Some(metrics.clone()), Some(gauge.clone()));
+
+        sink(true);
+        assert_eq!(
+            gauge.load(Ordering::Relaxed),
+            3,
+            "a healthy report leaves the live count alone"
+        );
+        sink(false);
+        assert_eq!(
+            gauge.load(Ordering::Relaxed),
+            0,
+            "an unhealthy source has no active tracks"
+        );
+        assert!(metrics
+            .render_prometheus_text()
+            .contains(r#"manta_source_health{source="kiwi"} 0"#));
     }
 
     #[test]

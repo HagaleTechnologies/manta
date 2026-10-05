@@ -1540,6 +1540,31 @@ impl TrackManager {
     /// Flush every track's decoder (SPEC §5 end-of-stream). Call once,
     /// after the last `process_hops`.
     pub fn finish(&mut self) -> Vec<DecoderEvent> {
+        self.close_all(false)
+    }
+
+    /// Close every track at a source discontinuity (MAN-73: a live source
+    /// reconnected after an outage), not a stream end. A transport gap is
+    /// not evidence the RF signal ended -- the same transmission can still
+    /// be on the air when samples resume (PR #207 review) -- so each track
+    /// closes like a Merged/Evicted one: `finish_decoder_speed_only` (no
+    /// forced decode of a truncated trailing element) and
+    /// `ClosureKind::Bookkeeping` with no survivor, which keeps
+    /// `manta-spot`'s `Validator` from reading the post-reconnect track as a
+    /// distinct message. Its pending beacons are discarded and counted
+    /// (`pending_beacon_lost_to_eviction`, as for an Evicted/Silent close),
+    /// never resolved against a truncated track's speed. Under the
+    /// `EdgeLegacy`/`Hsmm` engines `TrackDecoder::finish_speed_only` flushes
+    /// nothing (MAN-169), so those engines' buffered output is dropped here
+    /// as at a merge/eviction. As with `finish`, the manager holds no tracks
+    /// afterwards.
+    pub fn finish_for_discontinuity(&mut self) -> Vec<DecoderEvent> {
+        self.close_all(true)
+    }
+
+    /// Shared body of `finish` (`discontinuity == false`: genuine stream
+    /// end, `SignalEnded`) and `finish_for_discontinuity` (`true`).
+    fn close_all(&mut self, discontinuity: bool) -> Vec<DecoderEvent> {
         use rayon::prelude::*;
         // MAN-194: end-of-stream is another point where every remaining
         // track's refiner stops receiving new input -- drain each one's
@@ -1558,7 +1583,13 @@ impl TrackManager {
             .tracks
             .values_mut()
             .par_bridge()
-            .flat_map_iter(|t| t.finish_decoder())
+            .flat_map_iter(|t| {
+                if discontinuity {
+                    t.finish_decoder_speed_only()
+                } else {
+                    t.finish_decoder()
+                }
+            })
             .collect();
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         // MAN-19 round 3: honor the same teardown contract `process_hops`
@@ -1597,8 +1628,15 @@ impl TrackManager {
                 .into_iter()
                 .map(|track_id| DecoderEvent::TrackClosed {
                     track_id,
-                    // Overall stream end -- always a genuine end-of-signal (round 9).
-                    closure: ClosureKind::SignalEnded,
+                    // Overall stream end -- always a genuine end-of-signal
+                    // (round 9). A discontinuity is not (MAN-73).
+                    closure: if discontinuity {
+                        ClosureKind::Bookkeeping {
+                            survivor_track_id: None,
+                        }
+                    } else {
+                        ClosureKind::SignalEnded
+                    },
                 }),
         );
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
