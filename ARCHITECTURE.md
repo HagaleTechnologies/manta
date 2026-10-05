@@ -379,6 +379,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   SNR field is quoted in the 500 Hz reference bandwidth RBN/CW Skimmer use
   (MAN-102 / decision D3), converted from the decoder's native 2500 Hz
   measurement at render time — see `docs/SPEC-decode-core.md` §2.3.
+  Telnet option negotiation (RFC 854 IAC) is stripped from the client's byte
+  stream and refused — every option, always — so that clients which negotiate
+  on connect can log in; manta implements no telnet options. See
+  `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md`.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
