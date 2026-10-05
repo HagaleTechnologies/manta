@@ -1816,6 +1816,14 @@ fn daemon_build_info() -> manta_server::metrics::BuildInfo {
     }
 }
 
+/// The three listener names `/healthz`/`manta_listener_up` track (MAN-128)
+/// -- named constants so `set_listener_up`'s and `spawn_tracked_listener`'s
+/// call sites below can't drift apart via a typo in one of the two paired
+/// string literals (code-review finding, round 1).
+const LISTENER_TELNET: &str = "telnet";
+const LISTENER_JSON: &str = "json";
+const LISTENER_METRICS: &str = "metrics";
+
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
 /// daemon's own listener loops only return via `shutdown_tx`, but a
@@ -1906,9 +1914,9 @@ fn start_spot_server(
         // returns via `?` before this point), so every listener starts
         // "up" -- `spawn_tracked_listener` below flips each back to "down"
         // the moment its own task actually ends.
-        metrics.set_listener_up("telnet", true);
-        metrics.set_listener_up("json", true);
-        metrics.set_listener_up("metrics", true);
+        metrics.set_listener_up(LISTENER_TELNET, true);
+        metrics.set_listener_up(LISTENER_JSON, true);
+        metrics.set_listener_up(LISTENER_METRICS, true);
 
         let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::telnet::MAX_TELNET_COMMANDS,
@@ -1917,7 +1925,7 @@ fn start_spot_server(
         );
         manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
         spawn_tracked_listener(
-            "telnet",
+            LISTENER_TELNET,
             metrics.clone(),
             manta_server::telnet::serve(
                 telnet_listener,
@@ -1944,7 +1952,7 @@ fn start_spot_server(
         );
         manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
         spawn_tracked_listener(
-            "json",
+            LISTENER_JSON,
             metrics.clone(),
             manta_server::json_stream::serve(
                 json_listener,
@@ -1978,7 +1986,7 @@ fn start_spot_server(
         // the process (round-11 review finding).
         manta_server::tasks::spawn_reaper(tasks.clone());
         spawn_tracked_listener(
-            "metrics",
+            LISTENER_METRICS,
             metrics.clone(),
             manta_server::metrics_http::serve(
                 metrics_listener,
