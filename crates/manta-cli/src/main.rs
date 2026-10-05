@@ -538,7 +538,12 @@ enum LiveSourceSpec {
     #[cfg(feature = "hpsdr")]
     Hpsdr(HpsdrOpts),
     AudioDevice(Option<String>),
-    File(PathBuf),
+    /// `source_iq` selects `WavIqSource` over `AudioIqSource`; see
+    /// `open_audio_source`.
+    File {
+        path: PathBuf,
+        source_iq: bool,
+    },
 }
 
 impl LiveSourceSpec {
@@ -550,7 +555,7 @@ impl LiveSourceSpec {
             #[cfg(feature = "hpsdr")]
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
             LiveSourceSpec::AudioDevice(_) => "audio",
-            LiveSourceSpec::File(_) => "file",
+            LiveSourceSpec::File { .. } => "file",
         }
     }
 
@@ -559,14 +564,21 @@ impl LiveSourceSpec {
     /// replay's errors and EOF are deterministic and must reach `listen()`
     /// unchanged -- see AGENTS.md's byte-identical-replay requirement.
     fn is_reconnectable(&self) -> bool {
-        !matches!(self, LiveSourceSpec::File(_))
+        !matches!(self, LiveSourceSpec::File { .. })
     }
 
-    /// Open (or re-open) the described source, applying `FixedCenterFreqSource`
-    /// when `dial_freq_hz` is set -- so every call through this one method
+    /// Open (or re-open) the described source, applying `maybe_decimate`
+    /// for `capture_rate_hz` and then `FixedCenterFreqSource` when
+    /// `dial_freq_hz` is set -- so every call through this one method
     /// produces a fully-composed source and nothing above it (in particular
-    /// `ReconnectingSource`) needs to know about dial-frequency overrides.
-    fn open(&self, dial_freq_hz: Option<f64>) -> Result<Box<dyn IqSource>> {
+    /// `ReconnectingSource`) needs to know about either wrapper. A reopen
+    /// therefore also starts a fresh decimator, with no filter state carried
+    /// across the outage.
+    fn open(
+        &self,
+        capture_rate_hz: Option<f64>,
+        dial_freq_hz: Option<f64>,
+    ) -> Result<Box<dyn IqSource>> {
         let src: Box<dyn IqSource> = match self {
             LiveSourceSpec::Kiwi(kiwi) => {
                 let host = kiwi
@@ -624,10 +636,11 @@ impl LiveSourceSpec {
             LiveSourceSpec::AudioDevice(device) => {
                 Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?)
             }
-            LiveSourceSpec::File(path) => {
-                Box::new(manta_input::AudioIqSource::from_wav_file(path)?)
+            LiveSourceSpec::File { path, source_iq } => {
+                open_audio_source(None, Some(path.clone()), *source_iq)?
             }
         };
+        let src = maybe_decimate(src, capture_rate_hz)?;
         Ok(match dial_freq_hz {
             Some(freq_hz) => Box::new(FixedCenterFreqSource {
                 inner: src,
@@ -812,11 +825,10 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.confirmed_live_handle()
     }
 
-<<<<<<< HEAD
     fn take_discontinuity(&mut self) -> Option<u64> {
         self.inner.take_discontinuity()
     }
-=======
+
     fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
         self.inner.health_counters()
     }
@@ -871,7 +883,6 @@ fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
         ));
     }
     Ok(hz)
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
 }
 
 /// Clap value parser for `--freq-correction-ppm`: fails at CLI-parse time
@@ -2199,25 +2210,10 @@ fn main() -> Result<()> {
             let has_hpsdr_source = hpsdr_host.is_some();
             #[cfg(not(feature = "hpsdr"))]
             let has_hpsdr_source = false;
-<<<<<<< HEAD
-            let has_rf_aware_source = kiwi_host.is_some() || has_soapy_source || has_hpsdr_source;
-=======
             let has_rf_aware_source = kiwi_host.is_some()
                 || has_soapy_source
                 || has_hpsdr_source
                 || source_iq_has_real_rf_center(&source, source_iq);
-            let source_name = if kiwi_host.is_some() {
-                "kiwi"
-            } else if has_soapy_source {
-                "soapy"
-            } else if has_hpsdr_source {
-                "hpsdr"
-            } else if is_file_replay {
-                "file"
-            } else {
-                "audio"
-            };
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
 
             if config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
                 bail!(
@@ -2234,17 +2230,6 @@ fn main() -> Result<()> {
                 freq: kiwi_freq,
                 password: kiwi_password,
             };
-<<<<<<< HEAD
-            let cfg = build_pipeline_config(freq_correction_ppm, allowlist, blocklist, notch)?;
-
-            // MAN-73: `spec` describes how to (re)open the configured
-            // input -- `ReconnectingSource` below calls `spec.open(...)`
-            // again every time a live source needs to be reopened, so the
-            // precedence here (hpsdr, then kiwi, then soapy, then
-            // device/file) must match what `open_hpsdr_source`/
-            // `open_source` used to decide once at startup.
-            let spec: LiveSourceSpec;
-=======
             // SPEC v2 §7: `[decode]` (from --config, if given) is
             // the baseline; an explicit --engine overrides just its
             // `engine` key (merge_cli_engine). `engine = "hsmm"` is a fully
@@ -2260,7 +2245,13 @@ fn main() -> Result<()> {
                 decode_cfg.engine,
             )?;
             cfg.decode = decode_cfg;
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
+            // MAN-73: `spec` describes how to (re)open the configured
+            // input -- `ReconnectingSource` below calls `spec.open(...)`
+            // again every time a live source needs to be reopened, so the
+            // precedence here (hpsdr, then kiwi, then soapy, then
+            // device/file) must match what `open_hpsdr_source`/
+            // `open_source` used to decide once at startup.
+            let spec: LiveSourceSpec;
             #[cfg(feature = "hpsdr")]
             {
                 if hpsdr_host.is_some() {
@@ -2275,33 +2266,23 @@ fn main() -> Result<()> {
                 } else {
                     #[cfg(feature = "soapy")]
                     {
-<<<<<<< HEAD
                         if soapy_driver.is_some() {
                             spec = LiveSourceSpec::Soapy(SoapyOpts {
-=======
-                        open_source(
-                            device,
-                            source,
-                            source_iq,
-                            kiwi,
-                            SoapyOpts {
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
                                 driver: soapy_driver,
                                 freq: soapy_freq,
                                 rate: soapy_rate,
                                 gain: soapy_gain,
                             });
                         } else if let Some(path) = source {
-                            spec = LiveSourceSpec::File(path);
+                            spec = LiveSourceSpec::File { path, source_iq };
                         } else {
                             spec = LiveSourceSpec::AudioDevice(device);
                         }
                     }
                     #[cfg(not(feature = "soapy"))]
                     {
-<<<<<<< HEAD
                         if let Some(path) = source {
-                            spec = LiveSourceSpec::File(path);
+                            spec = LiveSourceSpec::File { path, source_iq };
                         } else {
                             spec = LiveSourceSpec::AudioDevice(device);
                         }
@@ -2323,7 +2304,7 @@ fn main() -> Result<()> {
                                 gain: soapy_gain,
                             });
                         } else if let Some(path) = source {
-                            spec = LiveSourceSpec::File(path);
+                            spec = LiveSourceSpec::File { path, source_iq };
                         } else {
                             spec = LiveSourceSpec::AudioDevice(device);
                         }
@@ -2331,7 +2312,7 @@ fn main() -> Result<()> {
                     #[cfg(not(feature = "soapy"))]
                     {
                         if let Some(path) = source {
-                            spec = LiveSourceSpec::File(path);
+                            spec = LiveSourceSpec::File { path, source_iq };
                         } else {
                             spec = LiveSourceSpec::AudioDevice(device);
                         }
@@ -2343,21 +2324,8 @@ fn main() -> Result<()> {
             // missing device still ends the process immediately here, as
             // today -- only a loss *after* this succeeds is retried by
             // `ReconnectingSource` below.
-            let first = spec.open(dial_freq_hz)?;
-=======
-                        open_source(device, source, source_iq, kiwi)?
-                    }
-                }
-            };
-            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
-            let src: Box<dyn IqSource> = match dial_freq_hz {
-                Some(freq_hz) => Box::new(FixedCenterFreqSource {
-                    inner: src,
-                    freq_hz,
-                }),
-                None => src,
-            };
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
+            let first = spec.open(capture_rate_hz, dial_freq_hz)?;
+            let source_name = spec.name();
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
@@ -2403,30 +2371,8 @@ fn main() -> Result<()> {
                                 .as_nanos(),
                         };
 
-<<<<<<< HEAD
-                    let (rt, server) =
-                        start_spot_server(&path, first.sample_rate(), epoch, session_nonce)?;
-                    // Real, if coarse, health signal: this source opened
-                    // and is running. `active_tracks` has no equivalent
-                    // hook yet -- manta-engine exposes no live track-count
-                    // API for `listen()`'s callbacks to read, so it stays
-                    // at Metrics::default()'s 0 until that surface exists.
-                    //
-                    // MAN-73: for every reconnectable source kind, ALL
-                    // health reporting (including this initial value) is
-                    // now owned by `ReconnectingSource` below, which reads
-                    // the same `confirmed_live_handle()` signal the old
-                    // MAN-55 watcher task used to, and additionally flips
-                    // health false/true across every later reconnect, not
-                    // just the first connection. File replay is the only
-                    // kind that bypasses `ReconnectingSource` entirely
-                    // (determinism; see `is_reconnectable`'s doc comment),
-                    // so its health is set true here, once, immediately.
-                    if !spec.is_reconnectable() {
-                        server.metrics.set_source_health(spec.name(), true);
-=======
                         let (rt, server) =
-                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                            start_spot_server(&path, first.sample_rate(), epoch, session_nonce)?;
                         // MAN-45 (round-9 finding): the daemon's own copy of the
                         // gauge `manta_engine::listen_with_observers` updates as
                         // it runs (on the MAIN thread, outside this tokio
@@ -2454,29 +2400,18 @@ fn main() -> Result<()> {
                                 }
                             })
                         };
-                        // MAN-55: for a source where `open()` succeeding
-                        // doesn't confirm a live device (HPSDR's UDP
-                        // connect/send need no peer response at all),
-                        // `confirmed_live_handle()` returns Some, and health
-                        // starts false, flipping true only once the source's
-                        // own read loop has actually processed a valid
-                        // packet. Every other source type (Kiwi/Soapy/audio/
-                        // file) returns None from the trait's default and
-                        // keeps the original immediate-true behavior, since
-                        // opening those already implies liveness.
-                        match src.confirmed_live_handle() {
-                            Some(live) => {
-                                server.metrics.set_source_health(source_name, false);
-                                let metrics = server.metrics.clone();
-                                rt.spawn(async move {
-                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(200))
-                                            .await;
-                                    }
-                                    metrics.set_source_health(source_name, true);
-                                });
-                            }
-                            None => server.metrics.set_source_health(source_name, true),
+                        // MAN-73: for every reconnectable source kind, ALL
+                        // health reporting (including this initial value) is
+                        // now owned by `ReconnectingSource` below, which reads
+                        // the same `confirmed_live_handle()` signal the old
+                        // MAN-55 watcher task used to, and additionally flips
+                        // health false/true across every later reconnect, not
+                        // just the first connection. File replay is the only
+                        // kind that bypasses `ReconnectingSource` entirely
+                        // (determinism; see `is_reconnectable`'s doc comment),
+                        // so its health is set true here, once, immediately.
+                        if !spec.is_reconnectable() {
+                            server.metrics.set_source_health(source_name, true);
                         }
 
                         // MAN-56: HPSDR's packet loss/malformed counters are
@@ -2486,12 +2421,16 @@ fn main() -> Result<()> {
                         // shape `set_source_health` uses above -- and read the
                         // handle HERE, before `listen(src, ..)` below takes
                         // ownership of the source for the rest of the run.
+                        // Read from `first`, the startup connection: after a
+                        // MAN-73 reconnect the reopened device counts into
+                        // its own fresh counters, which are not published,
+                        // so these series cover the first connection only.
                         // Sources with no wire-packet loss model return None
                         // and publish no series at all, which is deliberate:
                         // a permanently-zero counter reads as "no loss" rather
                         // than "not measured" (ARCHITECTURE §8's
                         // "absent means not measured" distinction).
-                        if let Some(counters) = src.health_counters() {
+                        if let Some(counters) = first.health_counters() {
                             let metrics = server.metrics.clone();
                             // Published once eagerly so the series exists (at
                             // 0) from the very first scrape rather than only
@@ -2512,7 +2451,6 @@ fn main() -> Result<()> {
                             Some(active_tracks),
                             Some(active_tracks_poller),
                         )
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
                     }
                     None => (None, None, None, None),
                 };
@@ -2522,7 +2460,6 @@ fn main() -> Result<()> {
             ctrlc::set_handler(move || {
                 stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
             })?;
-<<<<<<< HEAD
 
             // MAN-73: wrap every reconnectable source so a later read
             // error/EOF is retried with `manta-server::backoff`'s policy
@@ -2544,7 +2481,7 @@ fn main() -> Result<()> {
                 Box::new(ReconnectingSource::new(
                     name,
                     first,
-                    Box::new(move || reopen_spec.open(dial_freq_hz)),
+                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
                     stop.clone(),
                     initial_healthy,
                     on_health,
@@ -2553,8 +2490,6 @@ fn main() -> Result<()> {
                 first
             };
 
-            let listen_result = manta_engine::listen(
-=======
             // Printed AFTER the handler is installed, and via `eprintln!`
             // rather than `tracing::info!` because the subscriber is only
             // initialized inside `start_spot_server` -- a plain `listen`
@@ -2570,7 +2505,6 @@ fn main() -> Result<()> {
             // under `--json` (MAN-59 round 6); this goes to stderr.
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
             let listen_result = manta_engine::listen_with_observers(
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
                 src,
                 &cfg,
                 stop,
@@ -3896,7 +3830,6 @@ mod tests {
         assert!(accepted2, "second configured target must be connected to");
     }
 
-<<<<<<< HEAD
     #[test]
     fn live_source_spec_reports_reconnectable_only_for_live_kinds() {
         assert!(LiveSourceSpec::Kiwi(KiwiOpts {
@@ -3907,7 +3840,11 @@ mod tests {
         })
         .is_reconnectable());
         assert!(LiveSourceSpec::AudioDevice(None).is_reconnectable());
-        assert!(!LiveSourceSpec::File(PathBuf::from("rec.wav")).is_reconnectable());
+        assert!(!LiveSourceSpec::File {
+            path: PathBuf::from("rec.wav"),
+            source_iq: false,
+        }
+        .is_reconnectable());
     }
 
     #[test]
@@ -3927,7 +3864,11 @@ mod tests {
         );
         assert_eq!(LiveSourceSpec::AudioDevice(None).name(), "audio");
         assert_eq!(
-            LiveSourceSpec::File(PathBuf::from("rec.wav")).name(),
+            LiveSourceSpec::File {
+                path: PathBuf::from("rec.wav"),
+                source_iq: false,
+            }
+            .name(),
             "file"
         );
     }
@@ -3959,7 +3900,8 @@ mod tests {
         };
         assert_eq!(src.take_discontinuity(), Some(48_000));
         assert_eq!(src.take_discontinuity(), None);
-=======
+    }
+
     // MAN-56: input-layer health counters wiring.
 
     /// A wrapper `IqSource` that forgets to forward `health_counters`
@@ -4117,6 +4059,5 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             geography_is_unresolved(&cty, "W1AW"),
             "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
         );
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
     }
 }

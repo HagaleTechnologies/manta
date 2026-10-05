@@ -21,57 +21,6 @@ const CHUNK_SAMPLES: usize = 2048;
 /// startup lead-in padding below it.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
-<<<<<<< HEAD
-/// One continuous decode segment: its own channelizer and track manager,
-/// spanning the sample clock until the next discontinuity (MAN-73). The
-/// `Validator` spans every segment of a `listen()` call; only the segment
-/// itself (and its sample clock) restarts.
-struct Segment {
-    ch: manta_dsp::channelizer::Channelizer,
-    tm: crate::track::TrackManager,
-    hop: u64,
-    pad_hops: u64,
-}
-
-fn new_segment(
-    fs: f64,
-    center_freq_hz: f64,
-    cfg: &PipelineConfig,
-    next_id: u32,
-) -> Result<Segment> {
-    let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let hop = ch.hop() as u64;
-    let pad_samples = ch.filter_len();
-    let pad_hops = (pad_samples as u64).div_ceil(hop);
-    let mut tm = crate::track::TrackManager::new(
-        ch.n_channels(),
-        fs,
-        center_freq_hz,
-        cfg.detector,
-        cfg.decode.clone(),
-    );
-    tm.resume_track_ids_from(next_id);
-    Ok(Segment {
-        ch,
-        tm,
-        hop,
-        pad_hops,
-    })
-}
-
-fn emit(
-    events: Vec<DecoderEvent>,
-    validator: &mut Validator,
-    calibration_factor: f64,
-    on_event: &mut impl FnMut(&DecoderEvent),
-    on_spot: &mut impl FnMut(&crate::Spot),
-) {
-    for ev in events {
-        on_event(&crate::calibrate_track_meta(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
-=======
 /// Optional live handles into a running `listen()` loop, for a caller that
 /// needs to observe engine-owned state the callbacks can't see.
 ///
@@ -121,25 +70,73 @@ impl ActiveTracksGuard {
     fn clear(&self) {
         if let Some(gauge) = &self.0 {
             gauge.store(0, Ordering::Relaxed);
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
         }
     }
 }
 
-<<<<<<< HEAD
-=======
 impl Drop for ActiveTracksGuard {
     fn drop(&mut self) {
         self.clear();
     }
 }
 
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
+/// One continuous decode segment: its own channelizer and track manager,
+/// spanning the sample clock until the next discontinuity (MAN-73). The
+/// `Validator` spans every segment of a `listen()` call; only the segment
+/// itself (and its sample clock) restarts.
+struct Segment {
+    ch: manta_dsp::channelizer::Channelizer,
+    tm: crate::track::TrackManager,
+    hop: u64,
+    pad_hops: u64,
+}
+
+fn new_segment(
+    fs: f64,
+    center_freq_hz: f64,
+    cfg: &PipelineConfig,
+    next_id: u32,
+) -> Result<Segment> {
+    let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let hop = ch.hop() as u64;
+    let pad_samples = ch.filter_len();
+    let pad_hops = (pad_samples as u64).div_ceil(hop);
+    let mut tm = crate::track::TrackManager::new(
+        ch.n_channels(),
+        fs,
+        center_freq_hz,
+        cfg.detector,
+        cfg.decode.clone(),
+    );
+    tm.resume_track_ids_from(next_id);
+    Ok(Segment {
+        ch,
+        tm,
+        hop,
+        pad_hops,
+    })
+}
+
+fn emit(
+    events: Vec<DecoderEvent>,
+    validator: &mut Validator,
+    calibration_factor: f64,
+    on_event: &mut impl FnMut(&DecoderEvent),
+    on_spot: &mut impl FnMut(&crate::Spot),
+) {
+    for ev in events {
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
+        for spot in validator.ingest(&ev) {
+            on_spot(&spot);
+        }
+    }
+}
+
 /// Run the streaming decode loop against `src` until `read` returns 0 (EOF,
 /// file replay) or `stop` is set (Ctrl-C, live audio). Each decoded event is
 /// passed to `on_event` as it's produced. Design doc §4.
 ///
-<<<<<<< HEAD
 /// MAN-73: a live source may report a discontinuity via
 /// `IqSource::take_discontinuity()` (e.g. after a reconnect). When it does,
 /// the current segment (channelizer + track manager) is closed -- every
@@ -151,10 +148,9 @@ impl Drop for ActiveTracksGuard {
 /// noise floor and floods false tracks on resume -- see
 /// `IqSource::take_discontinuity`'s doc comment). File replay never
 /// reports a discontinuity, so this is a no-op there.
-=======
+///
 /// Unchanged entry point: `listen_with_observers` with no observers. Kept so
 /// MAN-45's engine addition costs its four existing call sites nothing.
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
 pub fn listen(
     src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
@@ -205,7 +201,15 @@ pub fn listen_with_observers(
         validator.allowlist(call);
     }
 
-<<<<<<< HEAD
+    // O(1) (`TrackManager::active_track_count` is `tracks.len()`), once per
+    // processed chunk and skipped entirely when no observer is registered
+    // -- immaterial against the Pi4 CPU budget.
+    let report_active_tracks = |tm: &crate::track::TrackManager| {
+        if let Some(gauge) = &observers.active_tracks {
+            gauge.store(tm.active_track_count() as u64, Ordering::Relaxed);
+        }
+    };
+
     let mut seg = new_segment(fs, center_freq_hz, cfg, 1)?;
     let mut seg_base: u64 = 0;
 
@@ -220,6 +224,7 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
+    report_active_tracks(&seg.tm);
 
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
@@ -239,35 +244,9 @@ pub fn listen_with_observers(
             seg_base += filled as u64 + gap;
             filled = n;
             continue;
-=======
-    // O(1) (`TrackManager::active_track_count` is `tracks.len()`), once per
-    // processed chunk and skipped entirely when no observer is registered
-    // -- immaterial against the Pi4 CPU budget.
-    let report_active_tracks = |tm: &crate::track::TrackManager| {
-        if let Some(gauge) = &observers.active_tracks {
-            gauge.store(tm.active_track_count() as u64, Ordering::Relaxed);
-        }
-    };
-
-    let pad_samples = ch.filter_len();
-    let pad_hops = (pad_samples as u64).div_ceil(hop);
-    let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
-    for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
-        }
-    }
-    report_active_tracks(&tm);
-    for ev in tm.process_hops(&ch.process(&calib), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
         }
         filled += n;
     }
-<<<<<<< HEAD
     let events = seg.tm.process_hops(&seg.ch.process(&calib), |m| {
         seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
     });
@@ -278,10 +257,8 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
+    report_active_tracks(&seg.tm);
     let mut seg_consumed: u64 = calib_n as u64;
-=======
-    report_active_tracks(&tm);
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -292,7 +269,6 @@ pub fn listen_with_observers(
         if n == 0 {
             break;
         }
-<<<<<<< HEAD
         if let Some(gap) = src.take_discontinuity() {
             let finish_events = seg.tm.finish();
             emit(
@@ -316,22 +292,6 @@ pub fn listen_with_observers(
                 &mut on_event,
                 &mut on_spot,
             );
-=======
-        for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
-            m.saturating_sub(pad_hops) * hop
-        }) {
-            on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-            for spot in validator.ingest(&ev) {
-                on_spot(&spot);
-            }
-        }
-        report_active_tracks(&tm);
-    }
-    for ev in tm.finish() {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
         }
         let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
@@ -343,9 +303,9 @@ pub fn listen_with_observers(
             &mut on_event,
             &mut on_spot,
         );
+        report_active_tracks(&seg.tm);
         seg_consumed += n as u64;
     }
-<<<<<<< HEAD
     let events = seg.tm.finish();
     emit(
         events,
@@ -354,12 +314,10 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
-=======
     // `finish()` closes every remaining track, so the gauge must settle
     // back to 0 here rather than being left at whatever the last processed
     // chunk reported.
-    report_active_tracks(&tm);
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
+    report_active_tracks(&seg.tm);
     Ok(())
 }
 
@@ -393,7 +351,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     /// MAN-73 test double: serves `samples` on a loop. Once the cumulative
     /// number of samples served reaches `arm_at` (default: the full
     /// vector length, i.e. "after exhaustion"), the *next* `read()` call
@@ -502,7 +459,7 @@ mod tests {
                 DecoderEvent::TrackMeta { track_id, .. } => {
                     track_meta_ids.push((order, *track_id));
                 }
-                DecoderEvent::TrackClosed { track_id } => {
+                DecoderEvent::TrackClosed { track_id, .. } => {
                     closed_ids.insert(*track_id);
                 }
                 DecoderEvent::CharDecoded { track_id, .. } => {
@@ -594,7 +551,59 @@ mod tests {
             GapSource::new(rendered.samples.clone(), spec.fs, spec.center_freq_hz, gap)
                 .arm_after_samples(arm_after),
         );
-=======
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        listen(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            |_ev| {},
+            |spot| spots.push(spot.clone()),
+        )
+        .unwrap();
+
+        assert!(!spots.is_empty(), "expected at least one spot");
+        let min_expected_ts = arm_after as u64 + gap;
+        assert!(
+            spots.iter().all(|s| s.sample_ts >= min_expected_ts),
+            "every spot's sample_ts must be >= {min_expected_ts} (discarded pre-gap calibration \
+             samples + the gap), got {spots:?}"
+        );
+    }
+
+    /// MAN-73: a source that never reports a discontinuity (every source
+    /// today, and file replay always) must decode identically across runs
+    /// -- this is the regression the golden/determinism suites already
+    /// pin globally; this test documents the contract locally for this
+    /// module.
+    #[test]
+    fn listen_without_discontinuity_is_unchanged() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+
+        let run = || {
+            let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            });
+            let mut spots = Vec::new();
+            listen(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                |_ev| {},
+                |spot| spots.push((spot.callsign.clone(), spot.sample_ts, spot.track_id)),
+            )
+            .unwrap();
+            spots
+        };
+
+        assert_eq!(run(), run(), "identical input must decode identically");
+    }
+
     /// MAN-45 (PR #63 round-9 finding): `manta_active_tracks` reported a
     /// constant 0 on every production run because `listen()` exposed no
     /// live track count to its caller -- `TrackManager::active_track_count()`
@@ -720,7 +729,6 @@ mod tests {
             fs: spec.fs,
             center_freq_hz: spec.center_freq_hz,
         });
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut spots = Vec::new();
@@ -733,49 +741,7 @@ mod tests {
         )
         .unwrap();
 
-<<<<<<< HEAD
-        assert!(!spots.is_empty(), "expected at least one spot");
-        let min_expected_ts = arm_after as u64 + gap;
-        assert!(
-            spots.iter().all(|s| s.sample_ts >= min_expected_ts),
-            "every spot's sample_ts must be >= {min_expected_ts} (discarded pre-gap calibration \
-             samples + the gap), got {spots:?}"
-        );
-    }
-
-    /// MAN-73: a source that never reports a discontinuity (every source
-    /// today, and file replay always) must decode identically across runs
-    /// -- this is the regression the golden/determinism suites already
-    /// pin globally; this test documents the contract locally for this
-    /// module.
-    #[test]
-    fn listen_without_discontinuity_is_unchanged() {
-        let spec = manta_testkit::vectors::v1();
-        let rendered = manta_testkit::vectors::render(&spec).unwrap();
-
-        let run = || {
-            let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
-                samples: rendered.samples.clone(),
-                cursor: 0,
-                fs: spec.fs,
-                center_freq_hz: spec.center_freq_hz,
-            });
-            let mut spots = Vec::new();
-            listen(
-                src,
-                &PipelineConfig::default(),
-                Arc::new(AtomicBool::new(false)),
-                |_ev| {},
-                |spot| spots.push((spot.callsign.clone(), spot.sample_ts, spot.track_id)),
-            )
-            .unwrap();
-            spots
-        };
-
-        assert_eq!(run(), run(), "identical input must decode identically");
-=======
         assert!(!spots.is_empty(), "V1's repeated W1AW should have spotted");
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
     }
 
     #[test]

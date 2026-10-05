@@ -909,7 +909,6 @@ impl TrackManager {
         self.owner_of.len()
     }
 
-<<<<<<< HEAD
     /// The id the next spawned track will receive. MAN-73: used by
     /// `listen()`'s segment restart to carry the id sequence across a
     /// discontinuity, so a fresh segment's `TrackManager` never reuses an
@@ -923,7 +922,8 @@ impl TrackManager {
     /// are never reused within a session.
     pub fn resume_track_ids_from(&mut self, next: u32) {
         self.next_id = next;
-=======
+    }
+
     /// SPEC v2 §2.2's min-of-six-neighbors spectral reference for a
     /// track's centroid channel, converted from dB to linear power (the
     /// unit `NoiseTracker::push`'s `spectral_ref_power` expects). Always
@@ -954,7 +954,6 @@ impl TrackManager {
     fn spectral_ref_power(floor: &FloorBank, center: f64) -> Option<f32> {
         let c = center.round() as usize;
         Some(10f64.powf(floor.spectral_reference_db(c) / 10.0) as f32)
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
     }
 
     /// Issue #26: per-`CloseReason` counts of every track closed so far
@@ -3105,7 +3104,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     /// MAN-73: `listen()`'s segment restart resumes id assignment from the
     /// prior segment's `next_track_id()` so ids are never reused within a
     /// session.
@@ -3138,7 +3136,8 @@ mod tests {
             })
             .expect("V1 should produce at least one TrackMeta event");
         assert_eq!(first_track_meta_id, 42);
-=======
+    }
+
     /// Minimal rectangular CW envelope, one amplitude sample per HOP (not
     /// per raw sample) -- mirrors `manta_decode::decoder`'s own private
     /// test helper of the same shape, duplicated here since it isn't
@@ -3383,7 +3382,6 @@ mod tests {
              before finishing -- a fresh decoder that never saw a hop cannot produce this output \
              on its own, got nothing"
         );
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
     }
 
     /// Full-scale end-to-end detector test: a real 1024-channel, 120 s render

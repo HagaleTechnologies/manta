@@ -113,7 +113,6 @@ pub trait IqSource {
         None
     }
 
-<<<<<<< HEAD
     /// MAN-73: number of samples (at `sample_rate()`) the source *missed*
     /// immediately before the samples returned by the most recent `read()`
     /// -- e.g. a live connection that was lost and re-established. Returns
@@ -127,7 +126,9 @@ pub trait IqSource {
     /// percentile noise floor at -140 dBFS and floods false tracks on
     /// resume (measured; see docs/DECISIONS/2026-10-05-man73-source-reconnect.md).
     fn take_discontinuity(&mut self) -> Option<u64> {
-=======
+        None
+    }
+
     /// Shared packet-loss/malformed counters for sources that can lose or
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
@@ -142,7 +143,6 @@ pub trait IqSource {
     /// silently swallows the inner source's counters. Not enforceable by
     /// the type system; see that impl.
     fn health_counters(&self) -> Option<std::sync::Arc<InputHealthCounters>> {
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
         None
     }
 }

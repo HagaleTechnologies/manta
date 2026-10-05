@@ -84,36 +84,42 @@ const TARGET_RATE_HZ: usize = 96_000;
 /// this ~0.5 s regardless of `RESAMPLER_CHUNK`.
 const RESAMPLER_CHUNK: usize = 16_384;
 
-/// Bounds DNS resolution plus `TcpStream::connect` together (MAN-73): a
-/// target that silently black-holes SYNs (e.g. a firewall drop, not a
-/// refusal), or a stalled resolver, would otherwise leave `connect()`
-/// pending for the OS's own timeout (commonly minutes) -- unlike
-/// `uplink.rs`'s connect, this one runs on `ReconnectingSource`'s blocking
-/// read-loop thread, which cannot be interrupted by Ctrl-C mid-connect;
-/// only this timeout bounds it. Mirrors `uplink.rs`'s own `CONNECT_TIMEOUT`
-/// value (see `resolve_and_connect` for why resolution needs its own bound
-/// too, unlike `uplink.rs`'s async equivalent).
+/// Bounds each resolved address's `TcpStream::connect_timeout` attempt
+/// (MAN-73): a target that silently black-holes SYNs (e.g. a firewall drop,
+/// not a refusal) would otherwise leave `connect()` pending for the OS's
+/// own timeout (commonly minutes). Mirrors `uplink.rs`'s own per-address
+/// `CONNECT_TIMEOUT` value.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounds DNS resolution plus every per-address connect attempt together
+/// (MAN-73). Unlike `uplink.rs`'s connect, this one runs on
+/// `ReconnectingSource`'s blocking read-loop thread, which cannot be
+/// interrupted by Ctrl-C mid-connect, so a stop signal landing mid-reopen
+/// waits up to this long, then the WebSocket handshake, before
+/// `manta-cli`'s up-to-50s shutdown drain even starts -- more, in that
+/// worst case, than the 60s `docker stop -t 60` grace the README
+/// recommends. 3x `CONNECT_TIMEOUT`, matching `uplink.rs`'s
+/// `OVERALL_CONNECT_TIMEOUT` and for the same reason (PR #80 review, round
+/// 2): a window equal to one address's `CONNECT_TIMEOUT` is used up by a
+/// black-holed first address (e.g. a dropped AAAA record), and since every
+/// reconnect re-resolves and starts from that same first address, a
+/// reachable later address would never be tried at all.
+const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Resolves `host:port` and connects to the first address that accepts,
-/// the whole operation bounded by `CONNECT_TIMEOUT` (MAN-73, code review
-/// round 1): `(host, port).to_socket_addrs()` is a synchronous, blocking
-/// `getaddrinfo(3)` call with no timeout of its own, so a stalled system
-/// resolver would otherwise hang this uninterruptible thread indefinitely
-/// before `TcpStream::connect_timeout` ever got a chance to run --
-/// `uplink.rs`'s `connect_any_resolved_address` bounds the equivalent async
-/// call with `tokio::time::timeout`; there is no Tokio runtime here, so
-/// resolution plus every per-address connect attempt instead run on a
-/// detached thread, raced against this function's own `recv_timeout`. A
-/// resolver stall past `CONNECT_TIMEOUT` returns an `Err` to the caller
-/// immediately; the detached thread is abandoned (matching the accepted
-/// tradeoff `uplink.rs` documents for its own blocking `getaddrinfo` call)
-/// rather than left to block a reconnect attempt forever.
+/// the whole operation bounded by `OVERALL_CONNECT_TIMEOUT` (MAN-73, code
+/// review round 1): `(host, port).to_socket_addrs()` is a synchronous,
+/// blocking `getaddrinfo(3)` call with no timeout of its own, so a stalled
+/// system resolver would otherwise hang this uninterruptible thread
+/// indefinitely before `TcpStream::connect_timeout` ever got a chance to
+/// run -- `uplink.rs`'s `connect_any_resolved_address` bounds the
+/// equivalent async call with `tokio::time::timeout`; there is no Tokio
+/// runtime here, so resolution plus every per-address connect attempt
+/// instead run on a detached thread (see `run_with_overall_timeout`).
 fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
-    let (tx, rx) = std::sync::mpsc::channel();
     let owned_host = host.to_string();
-    std::thread::spawn(move || {
-        let outcome = (owned_host.as_str(), port)
+    run_with_overall_timeout(host, port, move || {
+        (owned_host.as_str(), port)
             .to_socket_addrs()
             .map_err(|e| anyhow!("resolve {owned_host}:{port}: {e}"))
             .and_then(|addrs| {
@@ -127,13 +133,30 @@ fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
                 Err(last_err
                     .map(anyhow::Error::from)
                     .unwrap_or_else(|| anyhow!("no addresses resolved for {owned_host}:{port}")))
-            });
-        let _ = tx.send(outcome);
+            })
+    })
+}
+
+/// Runs `attempt` on a detached thread, raced against this function's own
+/// `recv_timeout(OVERALL_CONNECT_TIMEOUT)`. A stall past that window
+/// returns an `Err` to the
+/// caller immediately; the detached thread is abandoned (matching the
+/// accepted tradeoff `uplink.rs` documents for its own blocking
+/// `getaddrinfo` call) rather than left to block a reconnect attempt
+/// forever.
+fn run_with_overall_timeout<T: Send + 'static>(
+    host: &str,
+    port: u16,
+    attempt: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(attempt());
     });
-    match rx.recv_timeout(CONNECT_TIMEOUT) {
+    match rx.recv_timeout(OVERALL_CONNECT_TIMEOUT) {
         Ok(outcome) => outcome.with_context(|| format!("TCP connect to {host}:{port}")),
         Err(_) => Err(anyhow!(
-            "TCP connect to {host}:{port} timed out (DNS resolution or connect exceeded {CONNECT_TIMEOUT:?})"
+            "TCP connect to {host}:{port} timed out (DNS resolution or connect exceeded {OVERALL_CONNECT_TIMEOUT:?})"
         )),
     }
 }
@@ -512,6 +535,20 @@ mod tests {
             "connect must fail within CONNECT_TIMEOUT, took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn overall_connect_window_outlasts_a_black_holed_first_address() {
+        // MAN-73 validate finding: a black-holed first address uses its
+        // whole CONNECT_TIMEOUT (plus however long resolution took) before
+        // the per-address loop moves on. The overall window must still be
+        // open when the next, reachable address accepts -- a window of one
+        // CONNECT_TIMEOUT expired first, so every reconnect failed forever.
+        let outcome = run_with_overall_timeout("kiwi.example", 8073, || {
+            std::thread::sleep(CONNECT_TIMEOUT + Duration::from_millis(200));
+            Ok("second address")
+        });
+        assert_eq!(outcome.unwrap(), "second address");
     }
 
     #[test]

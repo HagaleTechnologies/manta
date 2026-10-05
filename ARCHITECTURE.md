@@ -467,34 +467,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
-<<<<<<< HEAD
-  `manta_spots_dropped_write_failed_total`, per-protocol client-connected
-  gauges, `manta_source_health`, and the uplink counters
-  (`crates/manta-server/src/metrics.rs`) — not input-layer overruns or
-  per-stage queue depths, which MAN-56 tracks as a separate gap.
-  **`manta_active_tracks` is served but not populated** (corrected
-  2026-09-03, review round 4): the field/gauge exists in `Metrics`, but
-  `set_active_tracks`'s only non-test call site is absent — `main.rs`'s
-  own comment says the engine exposes no hook for it yet — so every
-  production daemon run reports a constant `0`, not a real track count.
-  Listed separately from the "currently-implemented" set above so an
-  operator doesn't read a served-but-frozen placeholder as live data.
-  **`manta_source_health` tracks live reconnect state** (MAN-73, closing
-  MAN-64's one-sided-gauge finding): every reconnectable source kind
-  (Kiwi, HPSDR, Soapy, a plain audio device — everything but file replay)
-  is wrapped at startup by `manta-cli::reconnect::ReconnectingSource`,
-  which owns this gauge for that source's whole process lifetime. It
-  reads `0` while the source is down and retrying with backoff (reusing
-  `manta-server::backoff`'s 1s-60s policy) and `1` once samples are
-  flowing again — including the very first connection, for a source kind
-  (HPSDR) where opening a socket proves nothing about a device actually
-  being present (see `IqSource::confirmed_live_handle`). File replay's
-  health is set `1` once, immediately, and never read again: its errors
-  and EOF are deterministic and must reach `listen()` unchanged, so it is
-  never wrapped. A source that keeps failing to reopen now retries
-  forever instead of ending the daemon — see
-  `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`.
-=======
   `manta_spots_dropped_write_failed_total`,
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the
   daemon shut down while a client was still in its PRE-LOGIN/handshake
@@ -542,14 +514,24 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
   (every other caller — `soak()`, the CPU-budget bench, both integration
   tests) is unchanged and pays nothing for this.
-  **`manta_source_health` is one-sided** (corrected 2026-09-03, review
-  round 7, filed as **MAN-64**): the only production call site
-  (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
-  on a later failure, and a fatal source read tears the daemon down
-  instead. It's a startup-success marker, not live health reporting —
-  don't read it as the latter until MAN-64 either wires real transitions
-  or this note is the accepted-permanent behavior.
->>>>>>> 1c64ae8294754251cdfa6de5f3f2d59a71acd0b1
+  **`manta_source_health` tracks live reconnect state** (MAN-73, closing
+  MAN-64's one-sided-gauge finding): every reconnectable source kind
+  (Kiwi, HPSDR, Soapy, a plain audio device — everything but file replay)
+  is wrapped at startup by `manta-cli::reconnect::ReconnectingSource`,
+  which owns this gauge for that source's whole process lifetime. It
+  reads `0` while the source is down and retrying with backoff (reusing
+  `manta-server::backoff`'s 1s-60s policy) and `1` once samples are
+  flowing again — including the very first connection, for a source kind
+  (HPSDR) where opening a socket proves nothing about a device actually
+  being present (see `IqSource::confirmed_live_handle`). File replay's
+  health is set `1` once, immediately, and never read again: its errors
+  and EOF are deterministic and must reach `listen()` unchanged, so it is
+  never wrapped. A source that keeps failing to reopen now retries
+  forever instead of ending the daemon — see
+  `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`. The
+  `manta_input_*` series are read from the startup connection only: after
+  a reconnect they keep reporting that first HPSDR device's counters, and
+  the reopened device's own counters are not published.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
