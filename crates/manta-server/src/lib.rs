@@ -6,7 +6,11 @@ pub mod bounded_io;
 pub mod bus;
 pub mod command;
 pub mod config;
+<<<<<<< HEAD
 pub mod health;
+=======
+pub mod iac;
+>>>>>>> 7db507267524660b2daa95011012f6caf930337d
 pub mod json_stream;
 pub mod metrics;
 pub mod metrics_http;
