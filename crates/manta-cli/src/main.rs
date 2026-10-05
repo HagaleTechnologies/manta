@@ -4405,6 +4405,28 @@ mod tests {
         }
     }
 
+    /// Reads the client's request through its blank line before a fake
+    /// `/status` server answers it, as the real `metrics_http::read_headers`
+    /// does (without that function's line-count and line-length bounds --
+    /// the peer here is always this file's own `fetch_status`). A fake
+    /// that closes with the request still unread makes the kernel send RST
+    /// instead of FIN: macOS then fails the client's pending read with
+    /// "Connection reset by peer (os error 54)" and drops the response it
+    /// had not consumed yet, while Linux delivers the response first and
+    /// hides the reset -- why these tests were green on ubuntu-latest and
+    /// red on macos-latest.
+    async fn read_request_head(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if socket.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+    }
+
     /// Code-review regression (finding 1): a hostname that resolves to
     /// several addresses -- e.g. `localhost` returning `::1` before
     /// `127.0.0.1` on a dual-stack host -- must not make `manta status`
@@ -4430,6 +4452,7 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
             socket
                 .write_all(
                     format!(
@@ -4542,6 +4565,7 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
             socket
                 .write_all(b"HTTP/1.1 500 \x1b]0;pwned\x07Oops\r\n\r\n")
                 .await
@@ -4652,6 +4676,7 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
             socket.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             socket
@@ -4682,6 +4707,7 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_head(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -4700,6 +4726,7 @@ mod tests {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut socket, _) = listener2.accept().await.unwrap();
+            read_request_head(&mut socket).await;
             let body = "not json";
             socket
                 .write_all(
