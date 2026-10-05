@@ -7,6 +7,7 @@
 //! `refine` is decode-core-v2 §3's optional per-track narrowband refiner.
 
 pub mod channelizer;
+pub mod decimate;
 pub mod floor;
 pub mod freqest;
 pub mod hilbert;

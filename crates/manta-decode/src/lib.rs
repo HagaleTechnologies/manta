@@ -12,6 +12,9 @@ pub mod noise;
 pub mod timing;
 pub mod tree;
 
+pub use decoder::META_INTERVAL_HOPS;
+pub use envelope::SNR_BW_CORR_DB;
+
 /// Channel output (envelope) rate, invariant across input rates. SPEC §1.1.
 pub const FO_HZ: f64 = 375.0;
 /// Hop period in milliseconds. SPEC §1.1.

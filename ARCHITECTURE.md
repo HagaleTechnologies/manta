@@ -50,25 +50,28 @@ allow).
 manta/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── manta-input          # IQ sources: SoapySDR, KiwiSDR client, file, audio
+│   ├── manta-input          # IQ sources: SoapySDR, HPSDR/Hermes, KiwiSDR client, file, audio
 │   ├── manta-dsp            # PFB channelizer, noise-floor estimation, envelope
 │   ├── manta-decode         # CW keying state machine, timing, Morse decode
 │   ├── manta-spot           # callsign validation, CQ/DE parse, dedupe, scoring
 │   ├── manta-server         # telnet cluster server + JSON/WebSocket stream
 │   ├── manta-engine         # orchestration: track lifecycle, decoder pool
 │   ├── manta-testkit        # synthetic CW generator, golden-IQ harness
-│   └── manta-cli            # `manta` binary: daemon + subcommands
+│   ├── manta-cli            # `manta` binary: daemon + subcommands
+│   └── manta-soak-harness   # 24h soak measurement harness (ROADMAP M2 gate),
+│                             # not shipped in the manta binary
 ```
 
 Dependency graph (arrows = depends on):
 
 ```
 manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp
-                     │        ├──▶ manta-dsp ──────▶ coppa-dsp
-                     │        ├──▶ manta-decode
-                     │        └──▶ manta-spot ──────▶ manta-decode
-                     └──▶ manta-server
+        │            │        ├──▶ manta-dsp ──────▶ coppa-dsp
+        │            │        ├──▶ manta-decode
+        │            │        └──▶ manta-spot ──────▶ manta-decode
+        └──────────────────▶ manta-server
 manta-testkit ──▶ manta-dsp, manta-decode, coppa-channel
+manta-soak-harness ──▶ manta-dsp, manta-input, manta-engine, manta-testkit
 ```
 
 M1 added `manta-input → manta-dsp` (the shared Hilbert transformer, used
@@ -98,7 +101,7 @@ versioned deps.
 
 ## 3. Input layer (`manta-input`)
 
-One trait, four implementations:
+One trait, five implementations:
 
 ```
 trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
@@ -108,6 +111,11 @@ trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
   native SoapySDR library (CI, contributors without hardware).
+- **OpenHPSDR/Hermes** (Protocol 1 "Metis" over UDP, feature-gated `hpsdr`):
+  Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images. Pure UDP/std with
+  no native-library dependency; the gate mirrors `soapy`. The wire facts are
+  spike-pinned (`docs/DECISIONS/2026-09-02-hpsdr-hermes-protocol-spike.md`), not yet
+  confirmed against live hardware.
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
   low-budget nodes contribute spots.
@@ -124,6 +132,19 @@ band segment; CW allocations are ≤ 100 kHz wide). Supported ceiling: 768 kS/s
 (Airspy HF+ full span). The channelizer parameterizes N to hold channel spacing
 near 100 Hz regardless of input rate (§4). Multi-band via multiple daemon
 instances, not one instance retuning — simpler, and SDRs are cheap.
+
+**Variable-width capture** (issue #169): an optional decimation stage
+(`manta-dsp::decimate::Decimator`, wrapped as
+`manta-input::DecimatingSource`) sits between a live `IqSource` and the
+channelizer.
+Operators select a narrower effective capture rate via
+`--capture-rate-hz`; the SDR still opens at its best native rate, and a
+cascade of Kaiser-windowed halfband FIR decimate-by-2 stages narrows it
+down before the channelizer ever sees it. Only exact power-of-two
+factors are supported (no general resampling), and the resulting rate
+must itself satisfy the channelizer's `fs/93.75` table constraint.
+Motivated by live-hardware field evidence (2026-09-09) that a narrower
+capture bandwidth can improve real-signal detection on some hardware.
 
 All sources normalize to `Complex32` at the native rate into an `rtrb` ring;
 input overruns are counted, surfaced as metrics, and never block the SDR thread.
@@ -269,7 +290,53 @@ transmission may never produce again).
    repetitions, SNR, SCP/cty hits). **Exemption**: messages already
    type-tagged `BEACON` by step 1's context parse skip this gate entirely
    — NCDXF-style beacons ID once per power-step cycle and legitimately
-   won't repeat within the window (MAN-28).
+   won't repeat within the window (MAN-28). **"Distinct" requires separate
+   messages** (MAN-100): two decodes of the same text count as one
+   repetition, not two, unless they clear `MIN_MESSAGE_WORD_GAP` (3)
+   decoded words apart **or** `MIN_MESSAGE_TIME_GAP_SECONDS` (60 s) of
+   `sample_ts` apart (MAN-100 remediation C2) — SPEC's own default payload
+   template repeats the callsign back-to-back within a single transmission
+   (`CQ CQ DE <CALL> <CALL> K`), and without the word-gap half of this rule
+   that one message's fading-corrupted double utterance alone could
+   satisfy the gate; without the time-gap half, a short ID (e.g.
+   "DE `<CALL>`") puts even two genuinely separate transmissions only 2
+   words apart, which a word-gap-only rule cannot tell apart from one
+   message's double utterance.
+4b. **Cross-candidate variant arbitration** (MAN-100): before a candidate
+   spots, it's checked against every other decoded, spottable-shaped word
+   (one that itself passes steps 1's grammar/cty check) observed on the same
+   track within the same 90 s window. It's withheld if a confusable,
+   better-supported rival exists — confusable meaning a substring/superstring
+   relationship or a shared ≥ 3-character prefix at edit distance ≤ 2;
+   better-supported meaning strictly more message-distinct repetitions (ties
+   broken by summed per-occurrence confidence), or the candidate being a
+   strict prefix of a rival that has been observed at all (≥ 1 repetition
+   of its own — shape decides once a rival exists, regardless of how
+   little support it has; MAN-100 remediation round 3 reverted an earlier
+   attempt to also require the rival to clear the same ≥ 2-rep floor a
+   spottable candidate must, since that excluded the ticket's own
+   measured "W6JQ"/"W6JQA" case) — and, symmetrically, a rival that is itself
+   a strict prefix of the candidate never wins this comparison regardless of
+   its own repetition count (MAN-100 remediation C1: shape decides a
+   prefix-containment pair in both directions, not just when arbitrating
+   the shorter form). This closes the gap that let a track spot both a
+   real callsign and a fading-truncated fragment of it as if they were two
+   different stations — measured on a 50-signal CCIR-poor pileup at an 18%
+   busted-spot rate among distinct spotted calls, none of which `c_call`
+   alone could distinguish (bogus and genuine confidence ranges overlapped
+   completely). Purely subtractive: this step can only withhold a spot the
+   rest of the pipeline would have emitted, never produce one, so it can
+   never itself cause a false spot. Never fires against an
+   operator-allowlisted callsign, one present in the bundled `master.scp`,
+   or a `SpotType::Beacon` candidate (MAN-100 remediation C3) — the beacon
+   exemption mirrors step 4's own repetition-gate exemption immediately
+   above: a once-per-cycle beacon's rep count is structurally low, so a
+   confusable rival's fading-corrupted repeat could otherwise outrank and
+   permanently suppress the genuine beacon on rep count alone. All three
+   exemptions trade toward recall on exactly the population RBN cares
+   about, at the cost (measured as zero on the available multi-signal
+   test scenes, for the allowlist/SCP pair) of occasionally letting a
+   truncation or confusable variant of an exempt call through unarbitrated.
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
@@ -306,9 +373,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 - **Telnet DX cluster server** (default :7300): standard login prompt, emits
   RBN-format spots —
-  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  23 dB  28 WPM  CQ  0312Z`.
+  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  30 dB  28 WPM  CQ  0312Z`.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
-  clients not to choke. This is the RBN/aggregator compatibility surface.
+  clients not to choke. This is the RBN/aggregator compatibility surface. The
+  SNR field is quoted in the 500 Hz reference bandwidth RBN/CW Skimmer use
+  (MAN-102 / decision D3), converted from the decoder's native 2500 Hz
+  measurement at render time — see `docs/SPEC-decode-core.md` §2.3.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
@@ -318,6 +388,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `dxCqZone` (and their `de*` counterparts) carry named, out-of-domain
   `UNKNOWN_*` sentinels rather than `null` or a fabricated-looking value —
   see `docs/DECISIONS/2026-09-07-man136-dxcc-and-unknown-geography-sentinels.md`.
+  Its `snr` field keeps the native 2500 Hz measurement (no 500 Hz conversion)
+  alongside an explicit `snrRefHz` field naming that bandwidth, so a consumer
+  of either surface never has to guess which convention it's reading
+  (MAN-102 / decision D3).
 - Both servers are thin fan-out consumers of one broadcast channel; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -390,9 +464,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   scoped to, nor the daemon-lifecycle surface MAN-122 scoped to), and
   `manta --status` hitting a local control socket for live stats is
   similarly not yet implemented (MAN-44). Prometheus text
-  endpoint (the "(feature `metrics`)" phrasing in older revisions of this
-  doc was stale — no Cargo `metrics` feature has ever existed; the
-  endpoint is unconditionally compiled and served whenever
+  endpoint (compiled in unconditionally, no feature flag — the "(feature
+  `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
+  `metrics` feature has ever existed; the endpoint is served whenever
   `--config` is set — `--server-config` is MAN-77's deprecated alias of
   that flag): input overruns, active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still

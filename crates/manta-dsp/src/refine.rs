@@ -1,8 +1,23 @@
 //! Per-track narrowband refinement: an optional, per-hop channel derotator
 //! and lowpass that sharpens a track's amplitude estimate using its
 //! fractional centroid offset. SPEC v2 §3. Enabled when `decode.refine_bw_hz`
-//! is greater than zero (default 0, meaning off); the engine call site is
-//! out of scope for this module (deferred to MAN-168).
+//! is greater than zero (default 0, meaning off).
+//!
+//! The engine call site (MAN-168/MAN-194, `manta-engine::track::Track::
+//! decoder_input`) uses [`GROUP_DELAY_HOPS`] for both of this constant's
+//! purposes: sizing the convergence window (`TAPS`, equal to
+//! `2*GROUP_DELAY_HOPS + 1`, real hops needed before the FIR's 11-tap
+//! window is no longer partly zero-padded from a reset) AND pairing a
+//! refined amplitude with the correctly delayed `sample_ts` it actually
+//! describes (`Refiner::push`'s output at hop `t` is evidence about hop
+//! `t - GROUP_DELAY_HOPS`, not hop `t`). A one-report-per-hop interface
+//! could not do the latter without either skipping hops or duplicating an
+//! observation at the boundaries (track birth, a channel reset, end of
+//! stream); `decoder_input` returns a `SmallVec` of `(amplitude, raw_power,
+//! spectral_ref_power, sample_ts)` 4-tuples specifically so it can emit
+//! zero, one, or several reports per input hop, which is what a correct
+//! hold-back/drain protocol requires. See MAN-194 and `decoder_input`'s own
+//! doc comment for the full protocol.
 
 use num_complex::Complex32;
 
@@ -13,6 +28,14 @@ const HOP_RATE_HZ: f64 = 375.0;
 const CHANNEL_SPACING_HZ: f64 = 93.75;
 /// SPEC v2 §3: 11-tap FIR.
 const TAPS: usize = 11;
+/// Group delay of the symmetric `TAPS`-tap FIR, in hops: `Refiner::push`'s
+/// output at hop `t` corresponds to the input sample from `t -
+/// GROUP_DELAY_HOPS` hops ago, not the current hop. Public so a caller
+/// (MAN-168's `manta-engine` call site) can derive its FIR-convergence
+/// window (`2*GROUP_DELAY_HOPS + 1 == TAPS`) -- see the module doc
+/// comment for why that caller does NOT use this for delayed `sample_ts`
+/// pairing, despite the name.
+pub const GROUP_DELAY_HOPS: usize = (TAPS - 1) / 2;
 
 fn sinc(x: f64) -> f64 {
     if x.abs() < 1e-12 {
