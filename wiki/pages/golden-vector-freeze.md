@@ -25,3 +25,7 @@ The freeze was *blocked* through most of design phase because coppa's Watterson 
 - Watterson uses the streaming `WattersonChannel` API, not the deprecated one-shot helper (SPEC §7 note).
 
 For the exact vectors, seeds, `fs`, and pass criteria (e.g. V8w: 0 bogus, 0 cross-channel ghost decodes), read SPEC §7 — never restated here.
+
+## Gotcha: `#[ignore]` is not the only way a golden-vector assertion can be inert
+
+MAN-101 found that V8w's three SPEC §7 criteria lived in one `#[ignore]`d test function, ordered so the (separately-tracked, failing) CER `assert!` ran first. A Rust `assert!` panics and unwinds the whole function, so the "0 bogus callsigns" and "0 ghost decodes" checks after it never executed even on a run with `--ignored` passed — removing `#[ignore]` alone would not have made them run. Any multi-assertion golden-vector test has this hazard: an earlier failing assertion silently disables every check written after it in the same function, independent of `#[ignore]`. See `docs/DECISIONS/2026-09-07-man101-v8w-bogus-call-gate.md` for the fix (split into an independent, always-run test) and its CI-cost tradeoff.
