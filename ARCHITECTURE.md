@@ -487,16 +487,43 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_source_health`, the uplink counters, and (MAN-56, landed
   2026-09-04) `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
-  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
-  per-stage queue depths, decode rate, spots/min, spot-confidence
-  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  (`crates/manta-server/src/metrics.rs`). **MAN-128 (landed 2026-10-05)
+  added**: `manta_spots_by_band_total{band,type}` (a new family alongside
+  the unchanged `manta_spots_total` rollup — the two are incremented
+  together and the labeled family sums to the aggregate);
+  `manta_decode_latency_seconds` (a real Prometheus histogram: wall-clock
+  time per steady-state input chunk, excluding the source-read wait and
+  calibration — its `_count` rate is spots-pipeline throughput, closing
+  the "decode rate" gap noted below); `manta_start_time_seconds`/
+  `manta_uptime_seconds`/`manta_build_info{version,git_sha,features}`
+  (process uptime and build metadata — `git_sha` is `"unknown"` in a
+  Docker build, since `.dockerignore` excludes `.git`);
+  `manta_uplink_target_*{target="host:port"}` (per-target labels for every
+  uplink counter, derived-sum aggregates preserved under their old
+  unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`
+  (the same verdict `/healthz`, below, reports). What's still genuinely
+  missing: per-stage queue depths, spots/min, spot-confidence histogram,
+  and **ring**-overrun counting for live audio (§3 — blocked on
   a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
-  report none) and are **absent**, not a frozen zero, for every other
-  source — the same "absent means not measured" distinction that motivated
-  the `manta_active_tracks` caveat before it was populated.
+  actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
+  generalized MAN-56's gap-stat wiring to KiwiSDR's SND `seq` field;
+  soapy/audio report none) and are **absent**, not a frozen zero, for
+  every other source — the same "absent means not measured" distinction
+  that motivated the `manta_active_tracks` caveat before it was populated.
+- **`GET /healthz` (MAN-128)**: shares the metrics listener/bind address.
+  Returns `200 OK`/body `ok\n...` only while every registered source is
+  healthy, every registered listener (telnet/JSON/metrics) is up, and the
+  decode loop has made progress within the last 10 s (or was never armed —
+  library use only; the daemon always arms it). Otherwise `503 Service
+  Unavailable`/body `unhealthy\n...`, with one line per failing check so an
+  operator can see why. The RBN uplink is deliberately **excluded** from
+  this verdict — an uplink outage must not make an orchestrator restart a
+  node that is decoding fine; uplink health is visible per target on
+  `/metrics` only. `manta_healthy`/`manta_listener_up` on `/metrics` are
+  computed by the exact same evaluation, so a Prometheus-only operator and
+  a liveness probe can never disagree.
   **`manta_active_tracks` is now populated** (MAN-45, corrected
   2026-09-04): `manta_engine::listen_with_observers` publishes
   `TrackManager::active_track_count()` into a shared handle as the decode
