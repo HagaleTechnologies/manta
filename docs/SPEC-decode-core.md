@@ -884,14 +884,34 @@ allowlist = []
 # for the measured column table and that scoping.
 # line_format = "rbn"
 
+# [server] keys for station identity (MAN-86), set inside your real
+# [server] table: the operator details RBN Aggregator reads out of
+# the telnet greeting banner on connect (MAN-86, Aggregator manual v6.0
+# §3.1/§9.2; wire format in
+# `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md`).
+# `station_callsign` is REQUIRED and has no default; the three operator
+# keys are optional, and each one is dropped from the banner when absent
+# rather than rendered as an empty placeholder. All four are validated at
+# deserialize time (a bad value fails daemon start, it is never written to
+# the wire): `station_callsign` against `manta_spot::grammar::is_plausible`,
+# `operator_name`/`operator_qth` as non-empty free text with no control
+# characters (they are interpolated verbatim into every client's banner,
+# so an embedded CR/LF would forge cluster lines), `operator_grid` as a 4-
+# or 6-character Maidenhead locator.
+# station_callsign = "W3XYZ"    # required, no default
+# operator_name = "Art"         # optional, default: absent
+# operator_qth = "Switzerland"  # optional, default: absent
+# operator_grid = "JN46la"      # optional, default: absent
+
 # [server] and [[rbn_uplink]] (manta_server::config) configure the
 # telnet/JSON/metrics servers and the RBN uplink; README.md's "Run it as a
 # node" shows both. `run` starts the servers only when the resolved config
 # has a [server] table.
 ```
 
-The `[server]` block's only normative key here is `line_format` above
-(`"rbn"` default | `"skimmer"`, MAN-88); its further transport keys (listen
+The `[server]` block's normative keys here are `line_format` above
+(`"rbn"` default | `"skimmer"`, MAN-88) and the station/operator identity
+keys (MAN-86); its further transport keys (listen
 addresses, per-IP connection and command budgets) are deployment settings
 rather than normative constants of this spec, and
 `crates/manta-server/src/config.rs` is their reference.
@@ -930,6 +950,11 @@ parsed by `manta_decode::config_file::DecodeConfigToml`, and every command
 that takes `--config` (`run`, `soak`, `doctor`, `decode`, `oracle`) reads
 `[decode]` through it. The full decision record is
 `docs/DECISIONS/2026-10-06-man261-config-surface.md`.
+
+`[server]`'s remaining keys are operational limits, not decode-core
+constants: listener ports and the per-listener connection/rate quotas
+(MAN-57/MAN-61) are documented on `manta_server::config::ServerConfig`'s
+own fields, with the exposure policy in ARCHITECTURE §7.
 
 ## 10. Deviations from ARCHITECTURE.md
 

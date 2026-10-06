@@ -18,6 +18,13 @@ const BANDS_HZ: &[(&str, f64, f64)] = &[
     ("6m", 50_000_000.0, 54_000_000.0),
 ];
 
+/// The allocation table itself, for callers that need the band BOUNDS and
+/// not just a name (MAN-86's SETT segment derivation). Ascending by
+/// frequency, which `sett::segments_for_passband` relies on.
+pub fn allocations() -> &'static [(&'static str, f64, f64)] {
+    BANDS_HZ
+}
+
 /// `"unknown"` for anything outside a recognized amateur HF/6m allocation
 /// rather than panicking or guessing -- manta may be tuned to a segment
 /// that doesn't map cleanly (e.g. a receiver test tone).

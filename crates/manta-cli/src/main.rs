@@ -1015,6 +1015,17 @@ impl IqSource for FixedCenterFreqSource {
         self.freq_hz
     }
 
+    /// Only the centre frequency is overridden -- the wrapped source's own
+    /// RF passband must still reach `SKIMMER/SETT`, or wrapping a
+    /// resampling source (KiwiSDR) or a rig-audio source in
+    /// `--dial-freq-hz` would silently re-introduce the "advertise the
+    /// processing rate" bug this method exists to prevent (MAN-86 review).
+    /// The wrapped bounds are offsets from the centre, so overriding the
+    /// centre alone relocates them correctly.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.inner.rf_passband_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -2173,7 +2184,25 @@ fn shutdown_runtime_after_drain(
 struct SourceInfo<'a> {
     name: &'a str,
     sample_rate_hz: f64,
+    /// Also the RF centre the MAN-86 `SKIMMER/SETT` segments are derived
+    /// around (`IqSource::center_freq_hz`, after any `--dial-freq-hz`
+    /// override).
     dial_freq_hz: f64,
+    /// MAN-86 review: deliberately SEPARATE from `sample_rate_hz`, not
+    /// derived from it. `sample_rate_hz` is the per-sample timing quantity
+    /// `SpotBus` needs to turn a sample index into wall clock;
+    /// `rf_passband_hz` is the `(lo, hi)` offsets from `dial_freq_hz` of
+    /// the spectrum the receiver actually delivers, and only that may be
+    /// advertised to Aggregator as decodable coverage. The two differ for
+    /// any resampling source, and the passband is not even symmetric for a
+    /// rig-audio source -- see `IqSource::rf_passband_hz`.
+    rf_passband_hz: (f64, f64),
+    /// The same multiplicative factor `manta-engine::listen` applies to
+    /// every emitted spot frequency (`--freq-correction-ppm`). MAN-86
+    /// review: the advertised segments have to move with the spots, or at
+    /// the supported +/-1000 ppm limit manta advertises bounds that exclude
+    /// frequencies from its own spot stream.
+    freq_calibration: f64,
 }
 
 /// MAN-128: the engine's `DecodeLatencySnapshot` and `manta-server`'s
@@ -2235,6 +2264,35 @@ fn daemon_build_info() -> manta_server::metrics::BuildInfo {
             "none".to_string()
         } else {
             features.join(",")
+        },
+    }
+}
+
+/// The identity and `SKIMMER/SETT` settings every telnet client is told
+/// about this station. Split out of `start_spot_server` (which can only be
+/// exercised through a real bound listener) so the source-to-SETT wiring
+/// itself is unit-testable -- MAN-86 review found two ways for it to
+/// advertise coverage manta cannot actually hear, and neither was visible
+/// from `sett.rs`'s own tests.
+fn station_profile(
+    cfg: &manta_server::config::ServerConfig,
+    center_freq_hz: f64,
+    rf_passband_hz: (f64, f64),
+    freq_calibration: f64,
+) -> manta_server::telnet::StationProfile {
+    manta_server::telnet::StationProfile {
+        call: cfg.station_callsign.clone(),
+        operator_name: cfg.operator_name.clone(),
+        operator_qth: cfg.operator_qth.clone(),
+        operator_grid: cfg.operator_grid.clone(),
+        sett: manta_server::sett::SettSettings {
+            validation_level: manta_server::sett::ValidationLevel::Normal,
+            cq_only: false,
+            segments: manta_server::sett::segments_for_passband(
+                center_freq_hz,
+                rf_passband_hz,
+                freq_calibration,
+            ),
         },
     }
 }
@@ -2373,6 +2431,23 @@ fn start_spot_server(
             cfg.telnet_max_commands_per_ip,
         );
         manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
+        // MAN-86: Aggregator will not forward spots from a source that
+        // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
+        // `profile` carries the operator identity for the greeting banner
+        // and the live-passband segments for the SETT reply.
+        if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
+            tracing::warn!(
+                "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
+                 operator_grid so RBN Aggregator can record this node's location \
+                 (Aggregator manual v6.0 §9.2)"
+            );
+        }
+        let profile = std::sync::Arc::new(station_profile(
+            &cfg,
+            source.dial_freq_hz,
+            source.rf_passband_hz,
+            source.freq_calibration,
+        ));
         spawn_tracked_listener(
             LISTENER_TELNET,
             metrics.clone(),
@@ -2380,7 +2455,7 @@ fn start_spot_server(
                 telnet_listener,
                 bus.clone(),
                 metrics.clone(),
-                cfg.station_callsign.clone(),
+                profile,
                 shutdown_rx.clone(),
                 tasks.clone(),
                 manta_server::tasks::new_connection_limiter(
@@ -3119,6 +3194,13 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
+                    // Already validated at clap-parse time by
+                    // `parse_freq_correction_ppm`; re-derived here because
+                    // the factor, not the ppm, is what the advertised SETT
+                    // bounds are scaled by (MAN-86 review).
+                    let freq_calibration =
+                        manta_spot::calibration_factor_from_ppm(freq_correction_ppm)
+                            .map_err(|e| anyhow!(e))?;
                     // MAN-122: the banner `start_spot_server` logs names
                     // the source, its sample rate and its dial frequency,
                     // so all three are read HERE, from `first` (the
@@ -3131,6 +3213,8 @@ fn main() -> Result<()> {
                             name: source_name,
                             sample_rate_hz: first.sample_rate(),
                             dial_freq_hz: first.center_freq_hz(),
+                            rf_passband_hz: first.rf_passband_hz(),
+                            freq_calibration,
                         },
                         epoch,
                         session_nonce,
@@ -4108,6 +4192,8 @@ mod tests {
                 name: "file",
                 sample_rate_hz: 96_000.0,
                 dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -4881,6 +4967,8 @@ mod tests {
                 name: "file",
                 sample_rate_hz: 96_000.0,
                 dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -4937,6 +5025,8 @@ mod tests {
                 name: "file",
                 sample_rate_hz: 96_000.0,
                 dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -4957,6 +5047,47 @@ mod tests {
         assert!(
             accepted.unwrap_or(false),
             "enabled=true must connect to the configured target"
+        );
+    }
+
+    // MAN-86: the three new [server] operator-identity keys must load
+    // through the real --server-config path (`start_spot_server`), not
+    // just through manta-server's own unit tests. Additive on a
+    // deny_unknown_fields struct, so a config WITHOUT them (every other
+    // test in this module) must keep loading too.
+    #[test]
+    fn server_config_accepts_the_operator_identity_keys() {
+        let cfg_file = write_temp_file(
+            r#"
+            [server]
+            station_callsign = "HB9H"
+            bind_addr = "127.0.0.1"
+            telnet_port = 0
+            json_port = 0
+            metrics_port = 0
+            operator_name = "Art"
+            operator_qth = "Switzerland"
+            operator_grid = "JN46la"
+            "#
+            .as_bytes(),
+        );
+
+        let result = start_spot_server(
+            cfg_file.path(),
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_040_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        );
+        assert!(
+            result.is_ok(),
+            "a config with the operator-identity keys present must still start: {:?}",
+            result.err()
         );
     }
 
@@ -5002,6 +5133,8 @@ mod tests {
                 name: "file",
                 sample_rate_hz: 96_000.0,
                 dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
             },
             std::time::SystemTime::UNIX_EPOCH,
             0,
@@ -5673,6 +5806,63 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 panic!("{key}: {body:?} was rejected: {e:#}");
             }
         }
+
+    // MAN-86 review: the two ways the source-to-SETT wiring can advertise
+    // coverage manta cannot hear. Both go through `station_profile`, the
+    // exact code path `start_spot_server` uses, rather than calling
+    // `segments_for_passband` directly.
+
+    fn test_server_config(callsign: &str) -> manta_server::config::ServerConfig {
+        let cfg_file = write_temp_file(
+            format!(
+                r#"
+                [server]
+                station_callsign = "{callsign}"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                "#
+            )
+            .as_bytes(),
+        );
+        let text = std::fs::read_to_string(cfg_file.path()).unwrap();
+        let file: manta_server::config::DaemonConfigFile = toml::from_str(&text).unwrap();
+        file.server
+    }
+
+    #[test]
+    fn sett_advertises_a_rig_audio_source_only_above_its_dial_frequency() {
+        // `--source` WAV / an audio device with --dial-freq-hz: analytic
+        // audio carries spectrum ONLY above the dial, over the rig's ~3 kHz
+        // AF passband -- not the +/-24 kHz its 48 kS/s stream could hold.
+        let cfg = test_server_config("W3XYZ");
+        let profile = station_profile(
+            &cfg,
+            14_027_000.0,
+            (
+                manta_input::AUDIO_PASSBAND_LO_HZ,
+                manta_input::AUDIO_PASSBAND_HI_HZ,
+            ),
+            1.0,
+        );
+        assert_eq!(
+            profile.sett.to_string(),
+            "SETT: vlNormal 14027.3-14030.0",
+            "audio coverage must be dial+0.3..dial+3.0 kHz"
+        );
+    }
+
+    #[test]
+    fn sett_advertises_the_frequency_corrected_passband_not_the_raw_one() {
+        // --freq-correction-ppm moves every emitted spot; the advertised
+        // bounds have to move with them.
+        let cfg = test_server_config("W3XYZ");
+        let factor = manta_spot::calibration_factor_from_ppm(1_000.0).unwrap();
+        let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
+        let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
+        assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
+        assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.0");
     }
 
     // MAN-89 (PR #131 review, rounds 6 and 7): `station_geography_unresolved`
