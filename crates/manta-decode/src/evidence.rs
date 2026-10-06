@@ -322,7 +322,7 @@ impl Evidence {
             }
         };
         let anchor = sign_edge
-            || self.hop_out % self.cfg.fallback_hops as u64 == 0
+            || self.hop_out.is_multiple_of(self.cfg.fallback_hops as u64)
             || present != self.last_present;
         self.last_sign = sign;
         self.last_present = present;
