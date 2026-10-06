@@ -40,5 +40,6 @@ serde_json = { workspace = true }
 manta-dsp = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
+hound = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
