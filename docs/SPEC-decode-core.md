@@ -286,19 +286,35 @@ apparent keying depth) the track stays in a *pre-decode* state and
 re-attempts initialization every 1 s; no elements are emitted (prevents
 decoding carriers/noise).
 
-Per-hop update — update only the rail a sample confidently belongs to; a
-sample inside the decision band is mid-transition and belongs to neither
-level train, so it updates neither rail (**[DEVIATION]**, MAN-103: the old
-`a[m] > T` split let transition samples drag `E_hi` down, reintroducing a
-transition-width-dependent residual):
+Per-hop update — **[DEVIATION]** (MAN-213,
+`docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md`, superseding
+MAN-103's D5 band-gated rail update). The key-decision band (§3.3) does
+**not** gate rail updates: under that rule a mark that fades to about half
+its pre-fade amplitude sits inside the band, so neither rail updates, `E_hi`
+freezes at its pre-fade level, the key never goes down and the faded marks
+are lost. Every sample instead updates exactly one rail, split at the
+geometric mean `T_cls = sqrt(E_hi · E_lo)` — the pre-MAN-103 classification.
+On top of that split, a **fade re-anchor**: a sustained run of at least
+`debounce_hops` (§3.3, 12 ms) consecutive samples between the old key-down
+threshold `1.25 · T_cls` and the key-down bound `mid + half` is a faded mark,
+and sets `E_hi` to their mean, so the band follows the fade down. This
+restores the pre-MAN-103 `1.25·T` fade margin without moving the key
+decision itself (§3.3 is unchanged). All of `mid`, `half` and `T_cls` are
+computed from the rails before this hop's update:
 
 ```
-mid = (E_hi + E_lo) / 2
-half = hyst_frac * (E_hi - E_lo)
-if a[m] > mid + half:  E_hi ← E_hi + α_hi · (a[m] − E_hi)
-elif a[m] < mid - half: E_lo ← E_lo + α_lo · (a[m] − E_lo)
-# else: a[m] is inside the band -- neither rail updates
+mid = (E_hi + E_lo) / 2 ; half = hyst_frac * (E_hi - E_lo)
+T_cls = sqrt(E_hi * max(E_lo, 1e-6))
+if a[m] > T_cls: E_hi ← E_hi + α_hi · (a[m] − E_hi)
+else:            E_lo ← E_lo + α_lo · (a[m] − E_lo)
+# fade re-anchor: n consecutive hops with 1.25·T_cls < a ≤ mid + half,
+# n ≥ debounce_hops  →  E_hi ← mean(a over those n hops)
 ```
+
+The re-anchor fires on every hop while the run stays at or above
+`debounce_hops` (the run is not reset when it fires). The one-shot `A_ref`
+re-estimation (§3.1) rescales the run's accumulated sum by the same factor as
+the rails.
 
 Time constants: `τ_lo = 500 ms` fixed
 (`α_lo = 1 − e^{−2.667/500} = 0.00532`).
@@ -308,13 +324,15 @@ must ride QSB (fast) but average over several elements (≥ 5 dits) so a single
 stretched dah doesn't drag it.
 
 Floors: `E_hi ≥ 2·E_lo` is enforced after every update (if violated, set
-`E_hi = 2·E_lo`); prevents rail collapse during long silences.
+`E_hi = 2·E_lo`); prevents rail collapse during long silences. It is also the
+lowest value the fade re-anchor can drive `E_hi` to.
 
 ### 3.3 Key decision with hysteresis and debounce
 
 - **[DEVIATION]** (MAN-103): key-down when `a[m] > mid + half`; key-up when
-  `a[m] < mid - half` (the same additive band as §3.2's rail split, recomputed
-  from the current rails); between the two bounds the previous state holds.
+  `a[m] < mid - half` (recomputed from the current rails, after §3.2's
+  update); between the two bounds the previous state holds. This band is the
+  **key decision only** — it does not gate §3.2's rail updates (MAN-213).
   `hyst_frac = 0.15` (band = 35%..65% of the keying depth `E_hi − E_lo`).
   Replaces the prior `1.25·T` / `0.80·T` multiplicative band: that band was
   symmetric in the *log* domain, not the linear one, so it reintroduced the

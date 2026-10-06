@@ -96,6 +96,13 @@ that grows with transition width, because transition samples drag `E_hi`
 down. Excluding the band from both rail updates removes that residual (see
 Measurements below).
 
+**Superseded by MAN-213** (`docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md`):
+band-gating the rails froze both of them whenever a mark faded into the band
+(D9's mechanism). Rails are split at the geometric mean again, plus a
+sustained-fade `E_hi` re-anchor; D3's key-decision band is unchanged. The
+transition-width residual this decision removed comes back only on slow
+ramps (> 6 hops), bounded in that doc's edge-bias table.
+
 **D6 — Two-sided `DIT_BIAS_CAP_FRAC = 0.35`.** MAN-7's original design
 clamped its correction to `[0, 0.35*mu_dit]`, reasoning that the old
 asymmetric hysteresis made a *negative* bias physically impossible. After D3
@@ -229,6 +236,11 @@ normalization, both already named in that ticket range — and "restore a
 downward adaptation path for `E_hi`" is now the concrete first thing to try
 there. **Nothing in this change widens or re-ignores a gate to accommodate
 this.**
+
+**Resolved by MAN-213** (`docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md`):
+the downward adaptation path for `E_hi` is restored (geometric-mean rail
+split plus a sustained-fade re-anchor at the old `1.25*T` margin). V6 passes
+(CER 0.0159) and V8w validates 28/50 with 0 bogus.
 
 **D10 — Tie the Farnsworth long-gap floor to the character boundary
 (`FARNS_LONG_U = CHAR_GAP_DITS`).** Added in validation round 1 remediation;
@@ -465,6 +477,15 @@ not a rebase fixup. This PR's rebase-only changes (CHAR_GAP_DITS/hyst_frac
 conflict resolution against MAN-100/PR-#161-era code, `SignalSpec` field
 additions) are otherwise complete and independently correct; only D3-D6's
 own fading cost blocks landing. Tracked as MAN-213 (blocks this ticket).
+
+## Status update (2026-10-05): MAN-213 lands this change with its fix
+
+MAN-213 carries this change's commits, rebased onto current `main`, together
+with the fade-tracking rail fix D9 called for (D5 superseded, D3 kept). With
+both applied, V8w's spots test validates 28/50 known callsigns with 0 bogus
+(`MIN_V8W_VALIDATED` raised to 20), V6 passes at CER 0.0159 and is
+un-ignored, and V2 still reads 34.96 WPM against `35 +/- 2`. See
+`docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md`.
 
 ## References
 
