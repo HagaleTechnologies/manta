@@ -520,14 +520,23 @@ async fn shutdown_during_login_handshake_disconnects_promptly_instead_of_idling_
     let (addr, bus, metrics, shutdown_tx, _tasks) = spawn_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // Read (and discard) the login prompt, then go silent -- exactly a
-    // client that connects and never logs in.
-    let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .expect("expected the login prompt")
-        .unwrap();
-    assert!(n > 0, "expected a non-empty login prompt");
+    // Read (and discard) the whole greeting banner through its callsign
+    // prompt (MAN-86: several lines, not one `login: ` line), then go
+    // silent -- exactly a client that connects and never logs in.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains("Please enter your callsign: \r\n") {
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut buf))
+            .await
+            .expect("expected the greeting banner")
+            .unwrap();
+        assert!(
+            n > 0,
+            "connection closed before the callsign prompt: {got:?}"
+        );
+        got.extend_from_slice(&buf[..n]);
+    }
 
     // Queued on this client's subscribed `rx` while it's stalled at the
     // login prompt, so the abandoned-backlog count below is provably
@@ -1226,12 +1235,22 @@ async fn a_failed_negotiation_reply_write_at_login_counts_the_abandoned_backlog(
     let (addr, bus, metrics, _shutdown_tx, tasks) = spawn_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    let mut prompt = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut prompt))
-        .await
-        .expect("expected the login prompt")
-        .unwrap();
-    assert!(n > 0, "expected a non-empty login prompt");
+    // MAN-86: the greeting is a multi-line banner -- read through its
+    // callsign prompt rather than assuming one short read holds it.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains("Please enter your callsign: \r\n") {
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut buf))
+            .await
+            .expect("expected the greeting banner")
+            .unwrap();
+        assert!(
+            n > 0,
+            "connection closed before the callsign prompt: {got:?}"
+        );
+        got.extend_from_slice(&buf[..n]);
+    }
 
     // Queued on this client's `rx` while it is still at the login prompt,
     // so the count asserted below is provably nonzero.
