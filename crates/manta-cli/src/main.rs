@@ -777,7 +777,7 @@ impl LiveSourceSpec {
                     .expect("LiveSourceSpec::Kiwi always carries a host");
                 let freq = kiwi
                     .freq
-                    .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
+                    .ok_or_else(|| anyhow!("--kiwi-freq-hz is required with --kiwi-host"))?;
                 Box::new(manta_input::kiwi::KiwiIqSource::connect(
                     host,
                     kiwi.port,
@@ -793,10 +793,10 @@ impl LiveSourceSpec {
                     .expect("LiveSourceSpec::Soapy always carries a driver");
                 let freq = soapy
                     .freq
-                    .ok_or_else(|| anyhow!("--soapy-freq is required with --soapy-driver"))?;
+                    .ok_or_else(|| anyhow!("--soapy-freq-hz is required with --soapy-driver"))?;
                 let rate = soapy
                     .rate
-                    .ok_or_else(|| anyhow!("--soapy-rate is required with --soapy-driver"))?;
+                    .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
                 Box::new(manta_input::soapy::SoapySdrIqSource::open(
                     driver, rate, freq, soapy.gain,
                 )?)
@@ -809,10 +809,10 @@ impl LiveSourceSpec {
                     .expect("LiveSourceSpec::Hpsdr always carries a host");
                 let freq = hpsdr
                     .freq
-                    .ok_or_else(|| anyhow!("--hpsdr-freq is required with --hpsdr-host"))?;
+                    .ok_or_else(|| anyhow!("--hpsdr-freq-hz is required with --hpsdr-host"))?;
                 let rate = hpsdr
                     .rate
-                    .ok_or_else(|| anyhow!("--hpsdr-rate is required with --hpsdr-host"))?;
+                    .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with --hpsdr-host"))?;
                 let cfg = manta_input::hpsdr::HpsdrConfig {
                     host,
                     port: hpsdr.port,
@@ -2950,36 +2950,6 @@ fn main() -> Result<()> {
                         server.metrics.set_source_health(source_name, true);
                     }
 
-                    // MAN-56: HPSDR's packet loss/malformed counters are
-                    // input-layer state manta-server cannot compute itself
-                    // (it has no manta-input dependency). Sample them into
-                    // Metrics on a timer, the same wiring-layer-injection
-                    // shape `set_source_health` uses above -- and read the
-                    // handle HERE, before `listen(src, ..)` below takes
-                    // ownership of the source for the rest of the run.
-                    // Read from `first`, the startup connection: after a
-                    // MAN-73 reconnect the reopened device counts into
-                    // its own fresh counters, which are not published,
-                    // so these series cover the first connection only.
-                    // Sources with no wire-packet loss model return None
-                    // and publish no series at all, which is deliberate:
-                    // a permanently-zero counter reads as "no loss" rather
-                    // than "not measured" (ARCHITECTURE §8's
-                    // "absent means not measured" distinction).
-                    if let Some(counters) = first.health_counters() {
-                        let metrics = server.metrics.clone();
-                        // Published once eagerly so the series exists (at
-                        // 0) from the very first scrape rather than only
-                        // after one poll interval.
-                        metrics.set_input_health(source_name, input_health_of(&counters));
-                        rt.spawn(async move {
-                            loop {
-                                tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
-                                metrics.set_input_health(source_name, input_health_of(&counters));
-                            }
-                        });
-                    }
-
                     (
                         Some(rt),
                         Some(server),
@@ -2998,6 +2968,7 @@ fn main() -> Result<()> {
             // process. File replay is passed through unwrapped -- its
             // errors and EOF must reach `listen()` unchanged for
             // byte-identical replay.
+            let input_health: Option<std::sync::Arc<reconnect::InputHealthTotals>>;
             let src: Box<dyn IqSource> = if spec.is_reconnectable() {
                 let initial_healthy = first.confirmed_live_handle().is_none();
                 let name = spec.name();
@@ -3007,17 +2978,50 @@ fn main() -> Result<()> {
                     active_tracks.clone(),
                 );
                 let reopen_spec = spec.clone();
-                Box::new(ReconnectingSource::new(
+                let wrapped = ReconnectingSource::new(
                     name,
                     first,
                     Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
                     stop.clone(),
                     initial_healthy,
                     on_health,
-                ))
+                );
+                input_health = wrapped.input_health();
+                Box::new(wrapped)
             } else {
+                input_health = reconnect::InputHealthTotals::for_source(first.as_ref());
                 first
             };
+
+            // MAN-56: a source's packet loss/malformed counters are
+            // input-layer state manta-server cannot compute itself (it
+            // has no manta-input dependency). Sample them into Metrics on
+            // a timer, the same wiring-layer-injection shape
+            // `set_source_health` uses -- and take the handle HERE, before
+            // `listen(src, ..)` below takes ownership of the source for
+            // the rest of the run. MAN-228: the handle is the
+            // `InputHealthTotals` summed over every connection, so the
+            // series keep counting across a MAN-73 reconnect instead of
+            // freezing at the startup connection's values. Sources with
+            // no wire-packet loss model publish no series at all, which
+            // is deliberate: a permanently-zero counter reads as "no
+            // loss" rather than "not measured" (ARCHITECTURE §8's
+            // "absent means not measured" distinction).
+            if let (Some(rt), Some(server), Some(counters)) =
+                (&server_runtime, &spot_server, input_health)
+            {
+                let metrics = server.metrics.clone();
+                // Published once eagerly so the series exists (at 0) from
+                // the very first scrape rather than only after one poll
+                // interval.
+                metrics.set_input_health(source_name, counters.snapshot());
+                rt.spawn(async move {
+                    loop {
+                        tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                        metrics.set_input_health(source_name, counters.snapshot());
+                    }
+                });
+            }
 
             // Printed via `eprintln!` rather than `tracing::info!` because
             // the subscriber is only initialized inside
@@ -4777,6 +4781,50 @@ mod tests {
             }
             .name(),
             "file"
+        );
+    }
+
+    fn open_error(spec: LiveSourceSpec) -> String {
+        match spec.open(None, None) {
+            Ok(_) => panic!("expected {} open to fail", spec.name()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// MAN-135 renamed the frequency/rate flags to `*-hz`; `run` opens its
+    /// input through `LiveSourceSpec::open`, so its "missing flag" errors
+    /// must name the same flags `doctor`/`soak` (`open_source`) do.
+    #[test]
+    fn live_source_spec_open_errors_name_the_hz_flags() {
+        assert_eq!(
+            open_error(LiveSourceSpec::Kiwi(KiwiOpts {
+                host: Some("h".into()),
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            })),
+            "--kiwi-freq-hz is required with --kiwi-host"
+        );
+    }
+
+    #[cfg(feature = "hpsdr")]
+    #[test]
+    fn live_source_spec_open_errors_name_the_hpsdr_hz_flags() {
+        let hpsdr = |freq, rate| {
+            LiveSourceSpec::Hpsdr(HpsdrOpts {
+                host: Some("192.168.1.100".into()),
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq,
+                rate,
+            })
+        };
+        assert_eq!(
+            open_error(hpsdr(None, None)),
+            "--hpsdr-freq-hz is required with --hpsdr-host"
+        );
+        assert_eq!(
+            open_error(hpsdr(Some(7_030_000.0), None)),
+            "--hpsdr-rate-hz is required with --hpsdr-host"
         );
     }
 
