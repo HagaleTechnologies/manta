@@ -55,13 +55,14 @@ async fn logs_from_serve(toml_src: &str) -> String {
 
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(96_000.0, epoch, 0));
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Metrics::new();
+    let target = metrics.register_uplink_target("127.0.0.1:1".to_string(), true);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let _ = shutdown_tx.send(true);
 
     {
         let _guard = tracing::subscriber::set_default(subscriber);
-        manta_server::uplink::serve(cfg, "W3XYZ".to_string(), bus, metrics, shutdown_rx).await;
+        manta_server::uplink::serve(cfg, "W3XYZ".to_string(), bus, target, shutdown_rx).await;
     }
 
     let bytes = capture.0.lock().unwrap().clone();

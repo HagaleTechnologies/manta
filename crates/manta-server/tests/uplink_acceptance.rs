@@ -87,11 +87,10 @@ fn spawn_uplink(target_port: u16, dry_run: bool) -> Harness {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let cfg = uplink_config(target_port, dry_run);
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{target_port}"), true);
     let bus2 = bus.clone();
-    let metrics2 = metrics.clone();
     tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, metrics2, shutdown_rx)
-            .await;
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx).await;
     });
 
     Harness {
@@ -110,19 +109,14 @@ fn spawn_uplinks(configs: Vec<RbnUplinkConfig>) -> Harness {
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    for cfg in configs {
+    let labels = manta_server::uplink::target_labels(&configs);
+    for (cfg, label) in configs.into_iter().zip(labels) {
+        let target = metrics.register_uplink_target(label, cfg.enabled);
         let bus2 = bus.clone();
-        let metrics2 = metrics.clone();
         let shutdown_rx2 = shutdown_rx.clone();
         tokio::spawn(async move {
-            manta_server::uplink::serve(
-                cfg,
-                STATION_CALL.to_string(),
-                bus2,
-                metrics2,
-                shutdown_rx2,
-            )
-            .await;
+            manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx2)
+                .await;
         });
     }
 
@@ -378,13 +372,14 @@ async fn disabled_uplink_makes_no_connection_attempt() {
 
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Metrics::new();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let mut cfg = uplink_config(addr.port(), false);
     cfg.enabled = false;
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{}", addr.port()), false);
     tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, metrics, shutdown_rx).await;
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, target, shutdown_rx).await;
     });
 
     let attempt = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
@@ -429,11 +424,10 @@ async fn omitted_dry_run_key_logs_in_but_does_not_transmit() {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{}", addr.port()), true);
     let bus2 = bus.clone();
-    let metrics2 = metrics.clone();
     tokio::spawn(async move {
-        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, metrics2, shutdown_rx)
-            .await;
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx).await;
     });
 
     // The login handshake still completes -- dry-run gates the spot write
@@ -559,6 +553,48 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
         .expect("reachable target stopped receiving spots while the other target retried")
         .unwrap();
     assert_eq!(line2.trim_end(), expected2);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-128 Scenario 4: with two targets, one connected and one stuck
+/// reconnecting, an operator must be able to tell WHICH target is down from
+/// labeled per-target series, not just the aggregate count.
+#[tokio::test]
+async fn two_targets_one_down_are_distinguishable_per_target() {
+    let listener_up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_up = listener_up.local_addr().unwrap().port();
+
+    let temp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_down = temp.local_addr().unwrap().port();
+    drop(temp);
+
+    let harness = spawn_uplinks(vec![
+        uplink_config(port_up, false),
+        uplink_config(port_down, false),
+    ]);
+
+    let (login_up, _reader_up, _wr_up) = mock_rbn_accept_and_login(&listener_up).await;
+    assert_eq!(login_up.trim_end(), STATION_CALL);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.metrics.uplink_reconnects_total() < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the down target never attempted a retry");
+
+    let text = harness.metrics.render_prometheus_text();
+    assert!(text.contains(&format!(
+        r#"manta_uplink_target_connected{{target="127.0.0.1:{port_up}"}} 1"#
+    )));
+    assert!(text.contains(&format!(
+        r#"manta_uplink_target_connected{{target="127.0.0.1:{port_down}"}} 0"#
+    )));
+    assert!(text.contains(&format!(
+        r#"manta_uplink_target_reconnects_total{{target="127.0.0.1:{port_up}"}} 0"#
+    )));
 
     let _ = harness.shutdown_tx.send(true);
 }
