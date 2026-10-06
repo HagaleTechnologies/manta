@@ -24,7 +24,12 @@ fn hsmm_three_runs_identical() {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        hashes.push(format!("{:x}", Sha256::digest(&out.stdout)));
+        hashes.push(
+            Sha256::digest(&out.stdout)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
     }
     assert!(hashes.iter().all(|h| h == &hashes[0]), "{hashes:?}");
 }
