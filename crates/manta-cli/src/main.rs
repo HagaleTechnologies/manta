@@ -2701,25 +2701,21 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
-<<<<<<< HEAD
-                    let (rt, server) =
-                        start_spot_server(&path, first.sample_rate(), epoch, session_nonce)?;
-=======
                     // MAN-122: the banner `start_spot_server` logs names
                     // the source, its sample rate and its dial frequency,
-                    // so all three are read HERE, before `src` is moved
-                    // into the pipeline below.
+                    // so all three are read HERE, from `first` (the
+                    // startup connection), before it is moved into the
+                    // pipeline below.
                     let (rt, server) = start_spot_server(
                         &path,
                         SourceInfo {
                             name: source_name,
-                            sample_rate_hz: src.sample_rate(),
-                            dial_freq_hz: src.center_freq_hz(),
+                            sample_rate_hz: first.sample_rate(),
+                            dial_freq_hz: first.center_freq_hz(),
                         },
                         epoch,
                         session_nonce,
                     )?;
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
                     // it runs (on the MAIN thread, outside this tokio
@@ -2835,13 +2831,6 @@ fn main() -> Result<()> {
                 None => (None, None, None, None, None, None),
             };
 
-<<<<<<< HEAD
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stop_handler = stop.clone();
-            ctrlc::set_handler(move || {
-                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
-            })?;
-
             // MAN-73: wrap every reconnectable source so a later read
             // error/EOF is retried with `manta-server::backoff`'s policy
             // instead of propagating out of `listen()` and ending the
@@ -2869,20 +2858,6 @@ fn main() -> Result<()> {
                 first
             };
 
-            // Printed AFTER the handler is installed, and via `eprintln!`
-            // rather than `tracing::info!` because the subscriber is only
-            // initialized inside `start_spot_server` -- a plain `listen`
-            // (no --server-config) has no subscriber at all. Two jobs:
-            // `listen` otherwise prints nothing at startup (2026-09-05
-            // review, lens 1 #4/#7), and it is the readiness handshake
-            // `tests/signal_shutdown.rs` waits for -- signalling any
-            // earlier races `set_handler` and kills the child under the OS
-            // default disposition regardless of MAN-85's fix. If the
-            // fuller startup banner (lens 1 #7) ever replaces this line,
-            // it must still be emitted here, after `set_handler`, and
-            // `READY_MARKER` updated to match. stdout stays pure JSON
-            // under `--json` (MAN-59 round 6); this goes to stderr.
-=======
             // Printed via `eprintln!` rather than `tracing::info!` because
             // the subscriber is only initialized inside
             // `start_spot_server` -- a plain `listen` (no --server-config)
@@ -2899,7 +2874,6 @@ fn main() -> Result<()> {
             // ever replaces this line, `READY_MARKER` must be updated to
             // match. stdout stays pure JSON under `--json` (MAN-59
             // round 6); this goes to stderr.
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.

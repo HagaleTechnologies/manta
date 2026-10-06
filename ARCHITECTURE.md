@@ -560,32 +560,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   computed by the exact same evaluation, so a Prometheus-only operator and
   a liveness probe can never disagree.
   **`manta_active_tracks` is now populated** (MAN-45, corrected
-<<<<<<< HEAD
-  2026-09-04): `manta_engine::listen_with_observers` publishes
-  `TrackManager::active_track_count()` into a shared handle as the decode
-  loop runs (`ListenObservers`); the daemon's server runtime polls it into
-  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
-  (every other caller — `soak()`, the CPU-budget bench, both integration
-  tests) is unchanged and pays nothing for this.
-  **`manta_source_health` tracks live reconnect state** (MAN-73, closing
-  MAN-64's one-sided-gauge finding): every reconnectable source kind
-  (Kiwi, HPSDR, Soapy, a plain audio device — everything but file replay)
-  is wrapped at startup by `manta-cli::reconnect::ReconnectingSource`,
-  which owns this gauge for that source's whole process lifetime. It
-  reads `0` while the source is down and retrying with backoff (reusing
-  `manta-server::backoff`'s 1s-60s policy) and `1` once samples are
-  flowing again — including the very first connection, for a source kind
-  (HPSDR) where opening a socket proves nothing about a device actually
-  being present (see `IqSource::confirmed_live_handle`). File replay's
-  health is set `1` once, immediately, and never read again: its errors
-  and EOF are deterministic and must reach `listen()` unchanged, so it is
-  never wrapped. A source that keeps failing to reopen now retries
-  forever instead of ending the daemon — see
-  `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`. The
-  `manta_input_*` series are read from the startup connection only: after
-  a reconnect they keep reporting that first HPSDR device's counters, and
-  the reopened device's own counters are not published.
-=======
   2026-09-04; its *source* corrected again 2026-09-07 by MAN-122). It had
   been served-but-frozen at a constant `0` since 2026-09-03 because
   `manta_engine::listen()` exposed no hook for it. Two observers now carry
@@ -612,19 +586,32 @@ validation (MAN-28). Dedupe (step 5) still applies.
   signal that real decoders are working on would have reported `tracks=0`.
   The gauge is driven back to `0` at end of stream and on a mid-stream
   read failure, so it doesn't stay stuck at the last live value after EOF
-  or an SDR disconnect. Note this is deliberately *not*
+  or a fatal source error. A reconnectable source's disconnect never
+  reaches `listen()` as a read failure (MAN-73, below): its unhealthy
+  transition zeroes the shared handle instead, which the poller publishes
+  within one `ACTIVE_TRACKS_POLL_INTERVAL`. Note this is deliberately *not*
   `TrackManager::active_track_count()` (what MAN-45 first published here),
   which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
   that lease no decoder and would inflate an operator-facing "is it
   decoding?" reading — and which keeps its own meaning for `soak_metrics`.
-  **`manta_source_health` is one-sided** (corrected 2026-09-03, review
-  round 7, filed as **MAN-64**): the only production call site
-  (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
-  on a later failure, and a fatal source read tears the daemon down
-  instead. It's a startup-success marker, not live health reporting —
-  don't read it as the latter until MAN-64 either wires real transitions
-  or this note is the accepted-permanent behavior.
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
+  **`manta_source_health` tracks live reconnect state** (MAN-73, closing
+  MAN-64's one-sided-gauge finding): every reconnectable source kind
+  (Kiwi, HPSDR, Soapy, a plain audio device — everything but file replay)
+  is wrapped at startup by `manta-cli::reconnect::ReconnectingSource`,
+  which owns this gauge for that source's whole process lifetime. It
+  reads `0` while the source is down and retrying with backoff (reusing
+  `manta-server::backoff`'s 1s-60s policy) and `1` once samples are
+  flowing again — including the very first connection, for a source kind
+  (HPSDR) where opening a socket proves nothing about a device actually
+  being present (see `IqSource::confirmed_live_handle`). File replay's
+  health is set `1` once, immediately, and never read again: its errors
+  and EOF are deterministic and must reach `listen()` unchanged, so it is
+  never wrapped. A source that keeps failing to reopen now retries
+  forever instead of ending the daemon — see
+  `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`. The
+  `manta_input_*` series are read from the startup connection only: after
+  a reconnect they keep reporting that first connection's counters, and
+  the reopened source's own counters are not published.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
