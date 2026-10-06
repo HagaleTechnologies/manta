@@ -12,12 +12,20 @@
 //! Time and sleeping are behind the `ReconnectEnv` trait so the state
 //! machine's tests run instantly, with no real sleeping.
 
+<<<<<<< HEAD
 use manta_input::{InputHealthCounters, IqSource};
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
 use manta_server::metrics::InputHealth;
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+=======
+use manta_input::IqSource;
+use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
+use num_complex::Complex32;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
 use std::time::{Duration, Instant};
 
 /// Wall clock + interruptible sleep, injected so tests run instantly and
@@ -60,6 +68,7 @@ impl ReconnectEnv for RealEnv {
 pub(crate) type Opener = Box<dyn FnMut() -> anyhow::Result<Box<dyn IqSource>>>;
 pub(crate) type HealthSink = Box<dyn FnMut(bool)>;
 
+<<<<<<< HEAD
 /// MAN-228: a source's MAN-56 input-health counters summed over every
 /// connection a `ReconnectingSource` makes. Each reopen builds a new device
 /// with its own fresh `InputHealthCounters`, so a handle taken from one
@@ -139,6 +148,8 @@ impl InputHealthTotals {
     }
 }
 
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
 /// Wraps a live `IqSource`, reopening it with backoff whenever it errors.
 /// `listen()` never observes the intermediate error: from its perspective
 /// `read()` just returns real samples a little later than usual, after an
@@ -166,9 +177,12 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     reopened: bool,
     last_ok: Instant,
     discontinuity: Option<u64>,
+<<<<<<< HEAD
     /// MAN-228: `None` when the first source counts nothing (MAN-56's
     /// "absent means not measured").
     input_health: Option<Arc<InputHealthTotals>>,
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
 }
 
 impl ReconnectingSource<RealEnv> {
@@ -206,7 +220,10 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let fs = first.sample_rate();
         let center_freq_hz = first.center_freq_hz();
         let last_ok = env.now();
+<<<<<<< HEAD
         let input_health = InputHealthTotals::for_source(first.as_ref());
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
         ReconnectingSource {
             name,
             inner: Some(first),
@@ -222,6 +239,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             reopened: false,
             last_ok,
             discontinuity: None,
+<<<<<<< HEAD
             input_health,
         }
     }
@@ -234,6 +252,11 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         self.input_health.clone()
     }
 
+=======
+        }
+    }
+
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
     fn report_health(&mut self, healthy: bool) {
         if healthy != self.reported_healthy {
             (self.on_health)(healthy);
@@ -278,9 +301,12 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                                 self.center_freq_hz
                             );
                         }
+<<<<<<< HEAD
                         if let Some(totals) = &self.input_health {
                             totals.attach(src.health_counters());
                         }
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
                         self.inner = Some(src);
                         self.productive = false;
                         self.reopened = true;
@@ -337,9 +363,12 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         AttemptOutcome::NeverConnected
                     };
                     self.inner = None;
+<<<<<<< HEAD
                     if let Some(totals) = &self.input_health {
                         totals.retire_current();
                     }
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
                     self.backoff = next_backoff(self.backoff, &outcome);
                     eprintln!(
                         "source {} lost: {e:#}; reconnecting in {}s",
@@ -892,6 +921,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// A device that counts like HPSDR/Kiwi: every `read` records
     /// `dropped_per_read` dropped packets, one gap and one malformed packet
     /// into its own `InputHealthCounters`, fresh per connection.
@@ -1099,6 +1129,8 @@ mod tests {
         assert!(src.input_health().is_none());
     }
 
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
     #[test]
     fn eof_from_inner_is_passed_through_not_retried() {
         let first = scripted(FS, CENTER, vec![ok_chunk(8), Ok(Vec::new())]);

@@ -7,7 +7,10 @@ maintainer: agent
 sources:
   - docs/DECISIONS/2026-10-05-man73-source-reconnect.md
   - crates/manta-cli/src/reconnect.rs
+<<<<<<< HEAD
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
+=======
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
 verified:
   commit: e398d46
@@ -23,11 +26,15 @@ with no synthetic samples at all — see the decision doc for the full design an
 whole `listen()` call (instead of restarting just the segment) would back-date timestamps against
 `SpotBus`'s fixed session epoch. Gotcha: the restart closes the old tracks with
 `TrackManager::finish_for_discontinuity` (`Bookkeeping`), never `finish()` (`SignalEnded`) — the
+<<<<<<< HEAD
 decision doc says why. Gotcha: a per-connection handle taken before wrapping (`health_counters()`,
 `confirmed_live_handle()`-style) goes stale at the first reconnect, because every reopen builds a
 new device with fresh counters, so poll `ReconnectingSource::input_health()` (MAN-228) instead; and
 syncing counts after `read()` returns is not enough, because HPSDR counts inside a `read()` that
 blocks until a valid packet arrives.
+=======
+decision doc says why.
+>>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
 
 ## Symptom
 
