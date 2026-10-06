@@ -183,14 +183,17 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
     }
 }
 
-/// Minimum accepted `--duration`. `listen()`'s fixed ~2s startup
+/// Minimum accepted `--duration`. Set when `listen()`'s fixed ~2s startup
 /// calibration read loop (`CALIBRATION_SECONDS`, private to `listen.rs`)
-/// isn't stop-aware -- it reads and analyzes that window regardless of
-/// `stop`, so a shorter requested duration would silently overrun it while
-/// still reporting the shorter number back. Comfortably above that 2s
-/// floor, not a tight fit to it. Kept local to doctor rather than plumbed
-/// into `listen()` itself, since ordinary `manta listen` has no duration
-/// bound to enforce in the first place.
+/// ignored `stop` and read that whole window regardless, so a shorter
+/// requested duration silently overran it while still reporting the
+/// shorter number back. Since MAN-122 review round 7 that loop checks
+/// `stop` before each read and analyzes only what it has read, so a
+/// shorter duration ends inside the window instead; the floor is unchanged
+/// and still keeps a run past it. Comfortably above that 2s floor, not a
+/// tight fit to it. Kept local to doctor rather than plumbed into
+/// `listen()` itself, since ordinary `manta listen` has no duration bound
+/// to enforce in the first place.
 ///
 /// This margin assumes the pipeline processes that 2s calibration buffer
 /// in at most its own wall-clock duration (real-time or faster) -- the
@@ -198,10 +201,11 @@ fn median(mut values: Vec<f32>) -> Option<f32> {
 /// within one Raspberry Pi 4 core), tracked and benched separately
 /// (ROADMAP M2's CPU-budget bench). A machine running meaningfully slower
 /// than that (round-5 review: roughly below 0.5x real-time) could still
-/// overrun this bound during calibration itself, since that read loop
-/// isn't stop-aware either -- the same underlying gap as `listen()`'s
-/// blocking-read interruptibility already noted as a deferred, shared,
-/// cross-cutting limitation (not something to fix inside doctor alone).
+/// overrun this bound while processing that buffer, which `stop` does not
+/// interrupt once its reads have ended, or while a single read is still in
+/// flight -- the same underlying gap as `listen()`'s blocking-read
+/// interruptibility already noted as a deferred, shared, cross-cutting
+/// limitation (not something to fix inside doctor alone).
 pub const MIN_DURATION: Duration = Duration::from_secs(3);
 
 /// Maximum accepted `--duration`. `doctor()` accumulates every `TrackMeta`
@@ -280,8 +284,8 @@ pub fn doctor(
         .map_err(|e| anyhow::anyhow!(e))?;
     if duration < MIN_DURATION {
         anyhow::bail!(
-            "--duration must be at least {}s -- listen()'s fixed startup calibration window \
-             isn't stop-aware, so a shorter duration would silently overrun it",
+            "--duration must be at least {}s -- listen() spends its first ~2s of audio filling \
+             a fixed startup calibration window, so a shorter run would end inside it",
             MIN_DURATION.as_secs()
         );
     }
