@@ -237,44 +237,6 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
-<<<<<<< HEAD
-=======
-    let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
-    let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
-    let mut filled = 0;
-    while filled < calib_n {
-        // MAN-122 review round 7: checked before EVERY calibration read, not
-        // only once the decode loop below starts. The daemon installs its
-        // Ctrl-C handler before it logs the `listening:` banner, so a stop
-        // request can land at any point while this two-second buffer fills;
-        // without this check it was honoured only once the buffer was full.
-        // A read already in flight is not interrupted; it returns with
-        // whatever the source yields next, or fails after that source's own
-        // stall bound (`IqSource::read`'s implementations in `manta-input`).
-        // `break`, not `return`: whatever was read is still processed below
-        // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
-        // `soak`) still analyses every sample it read, and the decode loop's
-        // own `stop` check then ends the run without another read.
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let n = src.read(&mut calib[filled..])?;
-        if n == 0 {
-            anyhow::bail!("audio source ended during startup calibration");
-        }
-        filled += n;
-    }
-    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let hop = ch.hop() as u64;
-    let mut tm = crate::track::TrackManager::new(
-        ch.n_channels(),
-        fs,
-        center_freq_hz,
-        cfg.detector,
-        cfg.decode.clone(),
-    );
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
     let mut validator = Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -308,27 +270,30 @@ pub fn listen_with_observers(
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
-    let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
-        seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
-    });
-    emit(
-        events,
-        &mut validator,
-        calibration_factor,
-        &mut on_event,
-        &mut on_spot,
-    );
-    report_active_tracks(&seg.tm);
 
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
     while filled < calib_n {
+        // MAN-122 review round 7: checked before EVERY calibration read, not
+        // only once the decode loop below starts. The daemon installs its
+        // Ctrl-C handler before it logs the `listening:` banner, so a stop
+        // request can land at any point while this two-second buffer fills;
+        // without this check it was honoured only once the buffer was full.
+        // A read already in flight is not interrupted; it returns with
+        // whatever the source yields next, or fails after that source's own
+        // stall bound (`IqSource::read`'s implementations in `manta-input`).
+        // `break`, not `return`: whatever was read is still processed below
+        // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
+        // `soak`) still analyses every sample it read, and the decode loop's
+        // own `stop` check then ends the run without another read.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
             anyhow::bail!("audio source ended during startup calibration");
         }
-<<<<<<< HEAD
         if let Some(gap) = src.take_discontinuity() {
             // A discontinuity during calibration: the pre-gap partial
             // buffer was never processed through the channelizer, so it's
@@ -339,24 +304,14 @@ pub fn listen_with_observers(
             seg_base += filled as u64 + gap;
             filled = n;
             continue;
-=======
-    }
-    let n_tracks = tm.decoding_track_count();
-    report_active_tracks(n_tracks);
-    on_tracks(n_tracks);
-    // `..filled`: the whole buffer unless a stop request cut the fill short.
-    for ev in tm.process_hops(&ch.process(&calib[..filled]), |m| {
-        m.saturating_sub(pad_hops) * hop
-    }) {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
         }
         filled += n;
     }
-<<<<<<< HEAD
-    let events = seg.tm.process_hops(&seg.ch.process(&calib), |m| {
+    // The startup lead-in padding is processed only once the calibration
+    // fill has returned, not before it: its `on_tracks` call is the first
+    // per-batch callback, and the daemon reads that first call as "the
+    // calibration read has returned" (MAN-122's `ready: decoding` event).
+    let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
         seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
     });
     emit(
@@ -366,13 +321,24 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
-    report_active_tracks(&seg.tm);
-    let mut seg_consumed: u64 = calib_n as u64;
-=======
-    let n_tracks = tm.decoding_track_count();
+    let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     on_tracks(n_tracks);
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
+    // `..filled`: the whole buffer unless a stop request cut the fill short.
+    let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
+        seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+    });
+    emit(
+        events,
+        &mut validator,
+        calibration_factor,
+        &mut on_event,
+        &mut on_spot,
+    );
+    let n_tracks = seg.tm.decoding_track_count();
+    report_active_tracks(n_tracks);
+    on_tracks(n_tracks);
+    let mut seg_consumed: u64 = filled as u64;
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -433,7 +399,6 @@ pub fn listen_with_observers(
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
-<<<<<<< HEAD
         let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
         });
@@ -444,26 +409,14 @@ pub fn listen_with_observers(
             &mut on_event,
             &mut on_spot,
         );
-        report_active_tracks(&seg.tm);
-=======
-        for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
-            m.saturating_sub(pad_hops) * hop
-        }) {
-            on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-            for spot in validator.ingest(&ev) {
-                on_spot(&spot);
-            }
-        }
-        let n_tracks = tm.decoding_track_count();
+        let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
         on_tracks(n_tracks);
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
         }
         seg_consumed += n as u64;
     }
-<<<<<<< HEAD
     let events = seg.tm.finish();
     emit(
         events,
@@ -472,24 +425,12 @@ pub fn listen_with_observers(
         &mut on_event,
         &mut on_spot,
     );
-    // `finish()` closes every remaining track, so the gauge must settle
-    // back to 0 here rather than being left at whatever the last processed
-    // chunk reported.
-    report_active_tracks(&seg.tm);
-=======
-    for ev in tm.finish() {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
-        }
-    }
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
     // live value after a source disconnects or a replay hits EOF.
     report_active_tracks(0);
     on_tracks(0);
->>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
     Ok(())
 }
 
