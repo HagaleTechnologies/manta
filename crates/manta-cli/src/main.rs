@@ -777,7 +777,7 @@ impl LiveSourceSpec {
                     .expect("LiveSourceSpec::Kiwi always carries a host");
                 let freq = kiwi
                     .freq
-                    .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
+                    .ok_or_else(|| anyhow!("--kiwi-freq-hz is required with --kiwi-host"))?;
                 Box::new(manta_input::kiwi::KiwiIqSource::connect(
                     host,
                     kiwi.port,
@@ -793,10 +793,10 @@ impl LiveSourceSpec {
                     .expect("LiveSourceSpec::Soapy always carries a driver");
                 let freq = soapy
                     .freq
-                    .ok_or_else(|| anyhow!("--soapy-freq is required with --soapy-driver"))?;
+                    .ok_or_else(|| anyhow!("--soapy-freq-hz is required with --soapy-driver"))?;
                 let rate = soapy
                     .rate
-                    .ok_or_else(|| anyhow!("--soapy-rate is required with --soapy-driver"))?;
+                    .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
                 Box::new(manta_input::soapy::SoapySdrIqSource::open(
                     driver, rate, freq, soapy.gain,
                 )?)
@@ -809,10 +809,10 @@ impl LiveSourceSpec {
                     .expect("LiveSourceSpec::Hpsdr always carries a host");
                 let freq = hpsdr
                     .freq
-                    .ok_or_else(|| anyhow!("--hpsdr-freq is required with --hpsdr-host"))?;
+                    .ok_or_else(|| anyhow!("--hpsdr-freq-hz is required with --hpsdr-host"))?;
                 let rate = hpsdr
                     .rate
-                    .ok_or_else(|| anyhow!("--hpsdr-rate is required with --hpsdr-host"))?;
+                    .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with --hpsdr-host"))?;
                 let cfg = manta_input::hpsdr::HpsdrConfig {
                     host,
                     port: hpsdr.port,
@@ -2709,31 +2709,17 @@ fn main() -> Result<()> {
             // `open_source` used to decide once at startup.
             let spec: LiveSourceSpec;
             #[cfg(feature = "hpsdr")]
-<<<<<<< HEAD
             {
                 if hpsdr_host.is_some() {
                     spec = LiveSourceSpec::Hpsdr(HpsdrOpts {
                         host: hpsdr_host,
                         port: hpsdr_port,
-                        freq: hpsdr_freq,
-                        rate: hpsdr_rate,
+                        freq: hpsdr_freq_hz,
+                        rate: hpsdr_rate_hz,
                     });
                 } else if kiwi.host.is_some() {
                     spec = LiveSourceSpec::Kiwi(kiwi);
                 } else {
-=======
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq_hz,
-                rate: hpsdr_rate_hz,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
->>>>>>> 8975a5d21f82225ce7da872e55233070963ee027
                     #[cfg(feature = "soapy")]
                     {
                         if soapy_driver.is_some() {
@@ -2769,8 +2755,8 @@ fn main() -> Result<()> {
                         if soapy_driver.is_some() {
                             spec = LiveSourceSpec::Soapy(SoapyOpts {
                                 driver: soapy_driver,
-                                freq: soapy_freq,
-                                rate: soapy_rate,
+                                freq: soapy_freq_hz,
+                                rate: soapy_rate_hz,
                                 gain: soapy_gain,
                             });
                         } else if let Some(path) = source {
@@ -4795,6 +4781,50 @@ mod tests {
             }
             .name(),
             "file"
+        );
+    }
+
+    fn open_error(spec: LiveSourceSpec) -> String {
+        match spec.open(None, None) {
+            Ok(_) => panic!("expected {} open to fail", spec.name()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// MAN-135 renamed the frequency/rate flags to `*-hz`; `run` opens its
+    /// input through `LiveSourceSpec::open`, so its "missing flag" errors
+    /// must name the same flags `doctor`/`soak` (`open_source`) do.
+    #[test]
+    fn live_source_spec_open_errors_name_the_hz_flags() {
+        assert_eq!(
+            open_error(LiveSourceSpec::Kiwi(KiwiOpts {
+                host: Some("h".into()),
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            })),
+            "--kiwi-freq-hz is required with --kiwi-host"
+        );
+    }
+
+    #[cfg(feature = "hpsdr")]
+    #[test]
+    fn live_source_spec_open_errors_name_the_hpsdr_hz_flags() {
+        let hpsdr = |freq, rate| {
+            LiveSourceSpec::Hpsdr(HpsdrOpts {
+                host: Some("192.168.1.100".into()),
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq,
+                rate,
+            })
+        };
+        assert_eq!(
+            open_error(hpsdr(None, None)),
+            "--hpsdr-freq-hz is required with --hpsdr-host"
+        );
+        assert_eq!(
+            open_error(hpsdr(Some(7_030_000.0), None)),
+            "--hpsdr-rate-hz is required with --hpsdr-host"
         );
     }
 
