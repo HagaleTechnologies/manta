@@ -527,18 +527,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
   a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
-<<<<<<< HEAD
-  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
-  report none) and are **absent**, not a frozen zero, for every other
-  source — "absent means not measured", so an operator never reads a
-  placeholder as live data; the same distinction that motivated the
-  `manta_active_tracks` caveat before it was populated.
-=======
   actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
   generalized MAN-56's gap-stat wiring to KiwiSDR's SND `seq` field;
   soapy/audio report none) and are **absent**, not a frozen zero, for
-  every other source — the same "absent means not measured" distinction
-  that motivated the `manta_active_tracks` caveat before it was populated.
+  every other source — "absent means not measured", so an operator never
+  reads a placeholder as live data; the same distinction that motivated
+  the `manta_active_tracks` caveat before it was populated.
 - **`GET /healthz` (MAN-128)**: shares the metrics listener/bind address.
   Returns `200 OK`/body `ok\n...` only while every registered source is
   healthy, every registered listener (telnet/JSON/metrics) is up, and the
@@ -551,7 +545,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `/metrics` only. `manta_healthy`/`manta_listener_up` on `/metrics` are
   computed by the exact same evaluation, so a Prometheus-only operator and
   a liveness probe can never disagree.
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
   **`manta_active_tracks` is now populated** (MAN-45, corrected
   2026-09-04; its *source* corrected again 2026-09-07 by MAN-122). It had
   been served-but-frozen at a constant `0` since 2026-09-03 because

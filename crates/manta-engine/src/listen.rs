@@ -296,16 +296,12 @@ pub fn listen_with_observers(
                 on_spot(&spot);
             }
         }
-<<<<<<< HEAD
         let n_tracks = tm.decoding_track_count();
         report_active_tracks(n_tracks);
         on_tracks(n_tracks);
-=======
-        report_active_tracks(&tm);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
         }
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
     }
     for ev in tm.finish() {
         on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
@@ -912,6 +908,7 @@ mod tests {
             },
             |_ev| {},
             |_spot| {},
+            |_n| {},
         )
         .unwrap();
 

@@ -1567,14 +1567,13 @@ mod tests {
         assert!(!m.uplink_connected());
     }
 
-<<<<<<< HEAD
     // MAN-122: the periodic status line reads these getters directly
     // instead of parsing render_prometheus_text() back out of a String.
     #[test]
     fn live_state_getters_read_back_what_the_recorders_wrote() {
         let m = Metrics::new();
-        m.record_spot();
-        m.record_spot();
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
         m.set_active_tracks(4);
         m.inc_telnet_clients();
         m.inc_json_clients();
@@ -1599,7 +1598,8 @@ mod tests {
         m.record_pipeline_batch();
         m.record_pipeline_batch();
         assert_eq!(m.pipeline_batches(), 2);
-=======
+    }
+
     #[test]
     fn no_targets_registered_renders_aggregates_at_zero_and_per_target_headers_only() {
         let text = Metrics::new().render_prometheus_text();
@@ -1936,6 +1936,5 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_healthy 0"));
         assert!(text.contains(r#"manta_listener_up{listener="json"} 0"#));
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
     }
 }

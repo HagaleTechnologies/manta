@@ -65,9 +65,23 @@ async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_st
     metrics.set_active_tracks(3);
     metrics.inc_telnet_clients();
     metrics.inc_json_clients();
-    metrics.mark_uplink_connected();
+    // MAN-128 moved uplink state onto per-target handles; the status line
+    // reads the aggregate `uplink_connected()` derived from them.
+    metrics
+        .register_uplink_target("rbn.example:7000".to_string(), true)
+        .mark_connected();
+    let spot = manta_spot::Spot {
+        callsign: "W1AW".to_string(),
+        freq_hz: 14_025_000.0,
+        snr_db: 20.0,
+        wpm: 20.0,
+        spot_type: manta_spot::SpotType::Cq,
+        confidence: 0.9,
+        track_id: 1,
+        sample_ts: 0,
+    };
     for _ in 0..5 {
-        metrics.record_spot();
+        metrics.record_spot(&spot);
     }
 
     let (_tx, rx) = tokio::sync::watch::channel(false);

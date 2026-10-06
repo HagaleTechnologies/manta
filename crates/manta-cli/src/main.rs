@@ -1866,14 +1866,14 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
-<<<<<<< HEAD
 /// What the MAN-122 startup banner names about the live source; carried as
 /// one struct so `start_spot_server`'s argument list stays at four.
 struct SourceInfo<'a> {
     name: &'a str,
     sample_rate_hz: f64,
     dial_freq_hz: f64,
-=======
+}
+
 /// MAN-128: the engine's `DecodeLatencySnapshot` and `manta-server`'s
 /// `LatencyHistogram` are deliberately disjoint types (the same dependency-
 /// free-`manta-server` boundary `input_health_of` crosses above) -- this is
@@ -1886,7 +1886,6 @@ fn latency_histogram_of(
         bucket_counts: s.bucket_counts.clone(),
         sum_seconds: s.sum_seconds,
     }
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
 }
 
 /// How often the daemon samples an input source's `InputHealthCounters`
@@ -2032,7 +2031,6 @@ fn start_spot_server(
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
 
-<<<<<<< HEAD
         // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
         // failure never produces a banner at all) but BEFORE any listener task is
         // spawned -- on a multi-thread runtime a spawned accept loop can admit a
@@ -2060,7 +2058,7 @@ fn start_spot_server(
                 metrics_addr: metrics_listener.local_addr()?,
             })
         );
-=======
+
         // MAN-128: all three binds above already succeeded (a failed bind
         // returns via `?` before this point), so every listener starts
         // "up" -- `spawn_tracked_listener` below flips each back to "down"
@@ -2068,7 +2066,6 @@ fn start_spot_server(
         metrics.set_listener_up(LISTENER_TELNET, true);
         metrics.set_listener_up(LISTENER_JSON, true);
         metrics.set_listener_up(LISTENER_METRICS, true);
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
 
         let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::telnet::MAX_TELNET_COMMANDS,
@@ -2161,10 +2158,7 @@ fn start_spot_server(
         // Vec is empty). Each task owns its own SpotBus subscription and
         // backoff state, so one target being down never affects another's
         // delivery or retry timing.
-<<<<<<< HEAD
         let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
-        for uplink_cfg in rbn_uplink_cfgs {
-=======
         // MAN-128 D6/D7: one `UplinkTarget` registered per configured entry,
         // BEFORE its `serve` task is spawned, so a scrape landing before the
         // first connect attempt still sees the target's `enabled` family
@@ -2173,7 +2167,6 @@ fn start_spot_server(
         let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
         for (uplink_cfg, label) in rbn_uplink_cfgs.into_iter().zip(uplink_labels) {
             let target = metrics.register_uplink_target(label, uplink_cfg.enabled);
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
                 cfg.station_callsign.clone(),
@@ -2519,83 +2512,31 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
-<<<<<<< HEAD
-                        // MAN-122: the banner `start_spot_server` logs names
-                        // the source, its sample rate and its dial frequency,
-                        // so all three are read HERE, before `src` is moved
-                        // into the pipeline below.
-                        let (rt, server) = start_spot_server(
-                            &path,
-                            SourceInfo {
-                                name: source_name,
-                                sample_rate_hz: src.sample_rate(),
-                                dial_freq_hz: src.center_freq_hz(),
-                            },
-                            epoch,
-                            session_nonce,
-                        )?;
-                        // MAN-45 (round-9 finding): the daemon's own copy of the
-                        // gauge `manta_engine::listen_with_observers` updates as
-                        // it runs (on the MAIN thread, outside this tokio
-                        // runtime) -- polled into `Metrics` below, the same
-                        // bridge shape MAN-55's `confirmed_live_handle` watcher
-                        // uses for source liveness. MAN-122 additionally takes
-                        // the same count synchronously off `listen`'s per-batch
-                        // `on_tracks` callback, for the status line's
-                        // decode-progress heartbeat, which a polled gauge value
-                        // cannot express (a steady count and a wedged decode
-                        // loop look identical through the atomic alone).
-                        let active_tracks =
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                        // MAN-45 remediate (code-review finding 1): the
-                        // `JoinHandle` is kept, not discarded, so the shutdown
-                        // sequence below can abort this poller and WAIT for it
-                        // to actually stop before writing the deterministic
-                        // zero -- otherwise a tick already in flight can read
-                        // the still-stale gauge and write it right back after
-                        // the zero, undoing it.
-                        let active_tracks_poller = {
-                            let gauge = active_tracks.clone();
-                            let track_metrics = server.metrics.clone();
-                            rt.spawn(async move {
-                                loop {
-                                    track_metrics.set_active_tracks(
-                                        gauge.load(std::sync::atomic::Ordering::Relaxed),
-                                    );
-                                    tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
-                                }
-                            })
-                        };
-                        // MAN-55: for a source where `open()` succeeding
-                        // doesn't confirm a live device (HPSDR's UDP
-                        // connect/send need no peer response at all),
-                        // `confirmed_live_handle()` returns Some, and health
-                        // starts false, flipping true only once the source's
-                        // own read loop has actually processed a valid
-                        // packet. Every other source type (Kiwi/Soapy/audio/
-                        // file) returns None from the trait's default and
-                        // keeps the original immediate-true behavior, since
-                        // opening those already implies liveness.
-                        match src.confirmed_live_handle() {
-                            Some(live) => {
-                                server.metrics.set_source_health(source_name, false);
-                                let metrics = server.metrics.clone();
-                                rt.spawn(async move {
-                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(200))
-                                            .await;
-                                    }
-                                    metrics.set_source_health(source_name, true);
-                                });
-=======
-                    let (rt, server) =
-                        start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
+                    // MAN-122: the banner `start_spot_server` logs names
+                    // the source, its sample rate and its dial frequency,
+                    // so all three are read HERE, before `src` is moved
+                    // into the pipeline below.
+                    let (rt, server) = start_spot_server(
+                        &path,
+                        SourceInfo {
+                            name: source_name,
+                            sample_rate_hz: src.sample_rate(),
+                            dial_freq_hz: src.center_freq_hz(),
+                        },
+                        epoch,
+                        session_nonce,
+                    )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
                     // it runs (on the MAIN thread, outside this tokio
                     // runtime) -- polled into `Metrics` below, the same
                     // bridge shape MAN-55's `confirmed_live_handle` watcher
-                    // uses for source liveness.
+                    // uses for source liveness. MAN-122 additionally takes
+                    // the same count synchronously off `listen`'s per-batch
+                    // `on_tracks` callback, for the status line's
+                    // decode-progress heartbeat, which a polled gauge value
+                    // cannot express (a steady count and a wedged decode
+                    // loop look identical through the atomic alone).
                     let active_tracks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                     // MAN-45 remediate (code-review finding 1): the
                     // `JoinHandle` is kept, not discarded, so the shutdown
@@ -2613,7 +2554,6 @@ fn main() -> Result<()> {
                                     gauge.load(std::sync::atomic::Ordering::Relaxed),
                                 );
                                 tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
->>>>>>> 75bf549820b95bc977b074b4fadaa9d350b2c0e9
                             }
                         })
                     };
