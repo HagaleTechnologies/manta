@@ -609,15 +609,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   never wrapped. A source that keeps failing to reopen now retries
   forever instead of ending the daemon — see
   `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`. The
-<<<<<<< HEAD
   `manta_input_*` series sum every connection a reconnectable source makes
   (MAN-228, `manta-cli::reconnect::InputHealthTotals`), so they keep
   counting across a reconnect and never reset mid-process.
-=======
-  `manta_input_*` series are read from the startup connection only: after
-  a reconnect they keep reporting that first connection's counters, and
-  the reopened source's own counters are not published.
->>>>>>> 612293bc288f738f2c9958eee43450b77a1324a1
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
