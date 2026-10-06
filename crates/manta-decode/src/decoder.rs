@@ -360,7 +360,7 @@ impl TrackDecoder {
     /// PR #134 round 2).
     fn tick_meta(&mut self, events: &mut Vec<DecoderEvent>) {
         self.hop_count += 1;
-        if self.hop_count % META_INTERVAL_HOPS == 0 {
+        if self.hop_count.is_multiple_of(META_INTERVAL_HOPS) {
             let snr = if self.cfg.engine == Engine::Legacy {
                 // MAN-102 review round 1, finding 1: `self.demod.running()`
                 // is the real presence gate here -- it is what used to keep

@@ -16,7 +16,7 @@
   <a href="https://github.com/HagaleTechnologies/manta/actions/workflows/ci-full.yml"><img alt="CI" src="https://github.com/HagaleTechnologies/manta/actions/workflows/ci-full.yml/badge.svg"></a>
   <a href="https://github.com/HagaleTechnologies/manta/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/HagaleTechnologies/manta"></a>
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg">
-  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
+  <img alt="Rust 1.98+" src="https://img.shields.io/badge/rust-1.98%2B-orange.svg">
 </p>
 
 `manta` is a headless daemon written in Rust. It takes wideband IQ from a
@@ -59,7 +59,7 @@ more than one implementation of it, on more than one operating system.
 ## Installation
 
 There is no tagged release yet, so there is no prebuilt binary or Docker
-image to pull — build from source. You need Rust 1.85+ and a `git`
+image to pull — build from source. You need Rust 1.98+ and a `git`
 executable on `PATH`. Git is a build-time requirement, not just a way to
 clone this repo: manta depends on
 [`coppa`](https://github.com/HagaleTechnologies/coppa) as a rev-pinned git

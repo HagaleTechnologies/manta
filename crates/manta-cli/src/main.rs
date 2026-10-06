@@ -1775,6 +1775,21 @@ struct SpotServer {
     /// life of the process, so re-running the same binary search on every
     /// spot only re-derives a constant.
     station_geography_unresolved: bool,
+    /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
+    /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
+    /// task's actual exit right after `shutdown_tx.send(true)` and before
+    /// the client drain begins. The task's own two shutdown guards (a
+    /// `biased` select and a re-borrow after the sleep) still leave a
+    /// check-to-log window: shutdown can be signalled between the second
+    /// borrow returning `false` and the `tracing::info!` that follows, so a
+    /// status line could still land in the middle of the drain. Awaiting
+    /// the handle here is what makes shutdown and emission mutually
+    /// ordered -- once the join returns, the task is gone and no further
+    /// line can be emitted. `None` when the status line is disabled
+    /// (`status_interval_secs = 0`), in which case there is nothing to
+    /// await. `Mutex<Option<..>>` because shutdown only ever holds
+    /// `&SpotServer` and must `take()` the handle to join it.
+    status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
@@ -2012,6 +2027,14 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
+/// What the MAN-122 startup banner names about the live source; carried as
+/// one struct so `start_spot_server`'s argument list stays at four.
+struct SourceInfo<'a> {
+    name: &'a str,
+    sample_rate_hz: f64,
+    dial_freq_hz: f64,
+}
+
 /// MAN-128: the engine's `DecodeLatencySnapshot` and `manta-server`'s
 /// `LatencyHistogram` are deliberately disjoint types (the same dependency-
 /// free-`manta-server` boundary `input_health_of` crosses above) -- this is
@@ -2106,7 +2129,7 @@ fn spawn_tracked_listener(
 
 fn start_spot_server(
     config_path: &std::path::Path,
-    sample_rate_hz: f64,
+    source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
@@ -2143,7 +2166,7 @@ fn start_spot_server(
     let cfg = file.server;
 
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
-        sample_rate_hz,
+        source.sample_rate_hz,
         epoch,
         session_nonce,
     ));
@@ -2161,13 +2184,41 @@ fn start_spot_server(
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let status_line = rt.block_on(async {
         let telnet_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
         let json_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
+
+        // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
+        // failure never produces a banner at all) but BEFORE any listener task is
+        // spawned -- on a multi-thread runtime a spawned accept loop can admit a
+        // client immediately, and its per-connection line would otherwise be able
+        // to land ahead of the banner. `local_addr()`, not the configured port,
+        // so a `*_port = 0` (ephemeral) config still names the real address.
+        //
+        // Review round 2: this line says `listening:`, not `ready:`. Three
+        // bound sockets are not evidence that anything will ever be decoded --
+        // a replay shorter than `manta_engine`'s two-second calibration window,
+        // or a live source that fails its first reads, exits here with the
+        // pipeline never having started. The readiness event proper is emitted
+        // from the decode loop's first batch (see `format_pipeline_ready`'s
+        // call site).
+        tracing::info!(
+            "{}",
+            manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                source: source.name,
+                sample_rate_hz: source.sample_rate_hz,
+                dial_freq_hz: source.dial_freq_hz,
+                station_callsign: &cfg.station_callsign,
+                telnet_addr: telnet_listener.local_addr()?,
+                json_addr: json_listener.local_addr()?,
+                metrics_addr: metrics_listener.local_addr()?,
+            })
+        );
 
         // MAN-128: all three binds above already succeeded (a failed bind
         // returns via `?` before this point), so every listener starts
@@ -2268,6 +2319,7 @@ fn start_spot_server(
         // Vec is empty). Each task owns its own SpotBus subscription and
         // backoff state, so one target being down never affects another's
         // delivery or retry timing.
+        let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
         // MAN-128 D6/D7: one `UplinkTarget` registered per configured entry,
         // BEFORE its `serve` task is spawned, so a scrape landing before the
         // first connect attempt still sees the target's `enabled` family
@@ -2285,7 +2337,20 @@ fn start_spot_server(
             ));
         }
 
-        anyhow::Ok(())
+        // MAN-122 scenario 2. The handle travels out of this block and
+        // into `SpotServer::status_line` so shutdown can join the task --
+        // see that field's doc comment.
+        let status_line = manta_server::status::spawn_status_line(
+            metrics.clone(),
+            cfg.status_interval_secs
+                .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
+                    std::time::Duration::from_secs(secs)
+                }),
+            enabled_uplinks,
+            shutdown_rx.clone(),
+        );
+
+        anyhow::Ok(status_line)
     })?;
 
     Ok((
@@ -2297,6 +2362,7 @@ fn start_spot_server(
             tasks,
             station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
             cty,
+            status_line: std::sync::Mutex::new(status_line),
         },
     ))
 }
@@ -2556,6 +2622,35 @@ fn main() -> Result<()> {
             let first = spec.open(capture_rate_hz, dial_freq_hz)?;
             let source_name = spec.name();
 
+            // MAN-122 review round 6 (P2): installed HERE -- before
+            // `start_spot_server` binds the sockets and logs the
+            // `listening:` startup banner naming them -- and not after it,
+            // as an earlier revision did. That banner is an advertisement:
+            // a supervisor or operator that reacts to it by immediately
+            // sending SIGINT/SIGTERM must not hit the signal's DEFAULT
+            // disposition, which terminates the daemon outright and skips
+            // the client/status shutdown drain that MAN-85's handler
+            // exists to guarantee. Installing the handler first makes the
+            // whole observable window -- banner included -- covered by the
+            // drain. A signal landing before the decode loop starts is
+            // observed by `listen_with_observers` before its next startup-
+            // calibration read (review round 7; before that round it was
+            // observed only once the two-second calibration buffer had
+            // filled); it processes only what it has already read and
+            // returns `Ok` without reading again. A read already in flight is not
+            // interrupted: it returns with whatever the source yields next,
+            // or fails after that source's own stall bound, and the shutdown
+            // sequence below runs on both the `Ok` and the error path,
+            // exactly as it does for a signal arriving mid-decode. The
+            // banner itself still precedes the listener
+            // tasks (see `start_spot_server`), so its ordering against
+            // per-connection lines is unchanged.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_handler = stop.clone();
+            ctrlc::set_handler(move || {
+                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+            })?;
+
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
             // given, in which case `spot_server` stays None too. `epoch`/
@@ -2606,14 +2701,36 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
+<<<<<<< HEAD
                     let (rt, server) =
                         start_spot_server(&path, first.sample_rate(), epoch, session_nonce)?;
+=======
+                    // MAN-122: the banner `start_spot_server` logs names
+                    // the source, its sample rate and its dial frequency,
+                    // so all three are read HERE, before `src` is moved
+                    // into the pipeline below.
+                    let (rt, server) = start_spot_server(
+                        &path,
+                        SourceInfo {
+                            name: source_name,
+                            sample_rate_hz: src.sample_rate(),
+                            dial_freq_hz: src.center_freq_hz(),
+                        },
+                        epoch,
+                        session_nonce,
+                    )?;
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
                     // it runs (on the MAIN thread, outside this tokio
                     // runtime) -- polled into `Metrics` below, the same
                     // bridge shape MAN-55's `confirmed_live_handle` watcher
-                    // uses for source liveness.
+                    // uses for source liveness. MAN-122 additionally takes
+                    // the same count synchronously off `listen`'s per-batch
+                    // `on_tracks` callback, for the status line's
+                    // decode-progress heartbeat, which a polled gauge value
+                    // cannot express (a steady count and a wedged decode
+                    // loop look identical through the atomic alone).
                     let active_tracks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                     // MAN-45 remediate (code-review finding 1): the
                     // `JoinHandle` is kept, not discarded, so the shutdown
@@ -2718,6 +2835,7 @@ fn main() -> Result<()> {
                 None => (None, None, None, None, None, None),
             };
 
+<<<<<<< HEAD
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_handler = stop.clone();
             ctrlc::set_handler(move || {
@@ -2764,7 +2882,42 @@ fn main() -> Result<()> {
             // it must still be emitted here, after `set_handler`, and
             // `READY_MARKER` updated to match. stdout stays pure JSON
             // under `--json` (MAN-59 round 6); this goes to stderr.
+=======
+            // Printed via `eprintln!` rather than `tracing::info!` because
+            // the subscriber is only initialized inside
+            // `start_spot_server` -- a plain `listen` (no --server-config)
+            // has no subscriber at all. Two jobs: `listen` otherwise prints
+            // nothing at startup (2026-09-05 review, lens 1 #4/#7), and it
+            // is the readiness handshake `tests/signal_shutdown.rs` waits
+            // for. It remains AFTER `ctrlc::set_handler`, which as of
+            // review round 6 runs further above (before `start_spot_server`
+            // and its `listening:` banner), so every startup line this
+            // daemon emits -- this marker and the banner alike -- is now
+            // published with the handler already installed; no line
+            // advertises a daemon that would still die on the signal's
+            // default disposition. If the fuller startup banner (lens 1 #7)
+            // ever replaces this line, `READY_MARKER` must be updated to
+            // match. stdout stays pure JSON under `--json` (MAN-59
+            // round 6); this goes to stderr.
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+            // Captured before `src` is moved into the pipeline, for the
+            // readiness event below.
+            let source_sample_rate_hz = src.sample_rate();
+            let mut pipeline_ready_logged = false;
+            // MAN-122 review round 5 (P2): `stop` is moved into
+            // `listen_with_observers` below, so the readiness observer needs
+            // its own handle to read the cancellation flag. The engine runs
+            // the padding and calibration `on_tracks` callbacks BEFORE its
+            // loop first examines `stop` (manta-engine/src/listen.rs: the
+            // two `on_tracks(n_tracks)` calls above `loop { if
+            // stop.load(..) { break } }`) -- also when a stop request cut
+            // the calibration fill short (review round 7), since what was
+            // read is still processed -- so a SIGINT arriving during the
+            // two-second startup calibration would otherwise publish
+            // `ready: decoding` for a run that shuts down without ever
+            // decoding a chunk.
+            let stop_ready = stop.clone();
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -2774,11 +2927,11 @@ fn main() -> Result<()> {
                     decode_latency: decode_latency.clone(),
                 },
                 |ev| {
+                    use manta_decode::events::DecoderEvent;
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
                     }
-                    use manta_decode::events::DecoderEvent;
                     use std::io::Write as _;
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
@@ -2830,6 +2983,55 @@ fn main() -> Result<()> {
                         spot.wpm,
                         spot.confidence
                     );
+                },
+                // MAN-122 review round 1: the live track gauge comes from
+                // `TrackManager`'s own lifecycle -- how many tracks are
+                // promoted and holding a decoder right now -- not from the
+                // `DecoderEvent` stream above. A promoted track whose
+                // demodulator has not latched emits nothing for up to the
+                // ~30 s silent-GC window, so an event-derived count reports
+                // `tracks=0` on a node that is genuinely decoding weak
+                // signals.
+                //
+                // Review round 2: this observer fires once per processed
+                // batch (repeats included), so it is also the daemon's
+                // decode-progress heartbeat. Two relaxed atomics per
+                // ~43 ms chunk, immediately after that chunk's channelizer
+                // + TrackManager work -- unmeasurable against it, and the
+                // only thing that lets the status line say "stalled"
+                // instead of republishing a frozen `tracks=N` forever.
+                |n_tracks| {
+                    if let Some(server) = &spot_server {
+                        server.metrics.set_active_tracks(n_tracks as u64);
+                        server.metrics.record_pipeline_batch();
+                        // The first batch is the earliest moment the daemon
+                        // can honestly claim to be decoding: `listen`'s
+                        // calibration read has returned, the channelizer is
+                        // built and the TrackManager has processed real
+                        // hops. The startup banner above only ever claimed
+                        // bound sockets (review round 2).
+                        // Checked here rather than only at first-batch
+                        // time so a cancelled startup cannot publish a
+                        // false readiness event: `stop` is already `true`
+                        // by the time the calibration callbacks run, and
+                        // the decode loop breaks out immediately after
+                        // them. Not latching `pipeline_ready_logged` on
+                        // this path is deliberate -- the flag means "we
+                        // have claimed readiness", and no claim was made.
+                        if !pipeline_ready_logged
+                            && !stop_ready.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            pipeline_ready_logged = true;
+                            tracing::info!(
+                                "{}",
+                                manta_server::status::format_pipeline_ready(
+                                    env!("CARGO_PKG_VERSION"),
+                                    source_name,
+                                    source_sample_rate_hz,
+                                )
+                            );
+                        }
+                    }
                 },
             );
 
@@ -2893,6 +3095,27 @@ fn main() -> Result<()> {
                 }
                 server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
+                // MAN-122 review round 4 (P2): shutdown is signalled ABOVE
+                // and the periodic status task is joined HERE, before the
+                // client drain below starts -- the task's own guards order
+                // shutdown against its two `select!` poll points, but not
+                // against the wall clock between its last `shutdown.borrow()`
+                // and the `tracing::info!` that follows, so a line could
+                // otherwise still be emitted into the middle of the drain.
+                // Joining makes the two mutually ordered: `spawn_status_line`
+                // returns from its `shutdown.changed()` arm as soon as the
+                // send above is observed, so this wait is bounded by one
+                // scheduler poll, not by `status_interval_secs`.
+                if let Some(status_line) = server
+                    .status_line
+                    .lock()
+                    .expect("status-line handle mutex poisoned")
+                    .take()
+                {
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(status_line);
+                    }
+                }
             }
             // `server_runtime`/`spot_server` are always constructed as a
             // matched pair (both `Some` or both `None`, see their
@@ -3275,6 +3498,65 @@ mod tests {
              a handler can already be running when shutdown fires, plus \
              CLIENT_DRAIN_DEADLINE = {:?} for its own drain loop once it gets there)",
             manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
+    }
+
+    /// MAN-122 review round 4 (P2): `spawn_status_line`'s in-task guards
+    /// cannot close the window between its post-sleep `shutdown.borrow()`
+    /// and its `tracing::info!`, so the daemon must order the two from the
+    /// outside -- retain the task's `JoinHandle` and AWAIT it right after
+    /// signalling shutdown, before the client drain starts. This pins both
+    /// halves of that: the handle really is retained on `SpotServer` for a
+    /// config that enables the status line (a discarded handle is
+    /// unjoinable and the ordering is unenforceable), and joining it after
+    /// `shutdown_tx.send(true)` completes promptly rather than blocking for
+    /// a whole `status_interval_secs`.
+    #[test]
+    fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
+        let cfg_file = write_temp_file(
+            br#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                status_interval_secs = 3600
+                "#,
+        );
+
+        let (rt, server) = start_spot_server(
+            cfg_file.path(),
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        let handle =
+            server.status_line.lock().unwrap().take().expect(
+                "a non-zero status_interval_secs must leave a joinable handle on SpotServer",
+            );
+
+        let _ = server.shutdown_tx.send(true);
+        // One hour of configured interval against a one-second budget: this
+        // can only pass because the task's `shutdown.changed()` arm is
+        // `biased`-first and returns without waiting for the next tick.
+        let joined = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle).await
+        });
+        assert!(
+            joined.is_ok(),
+            "the status task must be joinable within a scheduler poll of shutdown, \
+             not at the next status_interval_secs tick"
+        );
+        assert!(
+            joined.unwrap().is_ok(),
+            "the status task must exit cleanly, not panic"
         );
     }
 
@@ -4016,7 +4298,11 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4066,7 +4352,11 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4125,7 +4415,11 @@ mod tests {
 
         let (rt, _server) = start_spot_server(
             cfg_file.path(),
-            96_000.0,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )

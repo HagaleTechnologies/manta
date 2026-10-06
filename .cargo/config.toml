@@ -7,7 +7,7 @@
 #
 # CONSEQUENCE, and the reason this is spelled out rather than left implicit:
 # building manta FROM SOURCE therefore requires a `git` executable on PATH in
-# addition to Rust 1.85+ (README's Quickstart states both). A machine with
+# addition to Rust 1.98+ (README's Quickstart states both). A machine with
 # rustup but no git -- a minimal Windows install, say, or a slim container --
 # fails at the fetch step before compiling anything, with `could not execute
 # process 'git fetch ...' (never executed)`. End users are unaffected: the
