@@ -744,64 +744,160 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`.
 
 ## 9. Configuration keys
 
-All normative constants above, with defaults:
+Every configurable constant above, with its real code default. The block
+below is valid TOML that `manta` loads as-is (`manta decode --config` on
+it decodes byte-identically to no config at all; `docs_consistency.rs`
+checks both that and that each value equals the code default). Keys the
+code still hard-codes are listed commented out, marked `not configurable
+yet` -- the loader rejects them with that message rather than ignoring
+them.
 
 ```toml
 [detector]
-on_snr_db = 6.0        off_snr_db = 3.0
-confirm_ms = 50        hang_ms = 5000
-gc_ms = 30000          warmup_ms = 2000
-floor_quantile = 0.25  floor_window_ms = 10000
-block_channels = 32    block_allowance_db = 3.0
+# Bounds: 0 <= off_snr_db <= on_snr_db <= 100; every *_ms in [0, 3600000],
+# converted with ms_to_hops (§1.1); confirm_ms/hang_ms/gc_ms must round to
+# >= 1 hop; track_cap >= 1.
+# Rise threshold, dB SNR. 12.0, not SPEC v1's 6.0: raised by
+# docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md item 2 (§10).
+on_snr_db = 12.0
+off_snr_db = 3.0
+confirm_ms = 50                     # 19 hops
+hang_ms = 5000                      # 1875 hops
+gc_ms = 30000                       # 11250 hops
+warmup_ms = 2000                    # 750 hops
+# Max concurrent tracks (ARCHITECTURE §4); 1200 per
+# docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md.
+track_cap = 1200
+# MAN-171: a channel whose track closed Silent may not spawn a new
+# CANDIDATE for this long.
+silent_respawn_cooldown_ms = 30000  # 11250 hops
+# floor_quantile = 0.25       # not configurable yet: compile-time constant in manta-dsp::floor
+# floor_window_ms = 10000     # not configurable yet: compile-time constant in manta-dsp::floor
+# block_channels = 32         # not configurable yet: compile-time constant in manta-dsp::floor
+# block_allowance_db = 3.0    # not configurable yet: compile-time constant in manta-dsp::floor
 
 [decode]
-timing_sigma = 0.25    beam_width = 4
-debounce_ms = 12       hyst_up = 1.25       hyst_down = 0.80
-tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
-mu_ratio_bounds = [2.2, 4.5]
-char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
-cluster_alpha = 0.15
+# SPEC-decode-core-v2.md §7 lists the v2 evidence/noise/HSMM keys.
+engine = "legacy"           # "legacy" | "edge-legacy" | "hsmm"; --engine overrides
+timing_sigma = 0.25
+beam_width = 4
+debounce_ms = 12
+hyst_up = 1.25
+hyst_down = 0.80
+tau_lo_ms = 500
+tau_hi_bounds_ms = [100, 400]
+flush_gap_dits = 7.0
+# mu_ratio_bounds = [2.2, 4.5]  # not configurable yet: compile-time constant in manta-decode::timing
+# char_gap_dits = 2.0           # not configurable yet: compile-time constant in manta-decode::timing (legacy engine: 1.6)
+# word_gap_dits = 5.0           # not configurable yet: compile-time constant in manta-decode::timing
+# cluster_alpha = 0.15          # not configurable yet: compile-time constant in manta-decode::timing
 
 [input]
+# The source. Omit `type` (and every source key) to use the default audio
+# device, or when command-line flags pick the source. Each type takes only
+# its own source keys (required ones marked *):
+#   audio: device
+#   file:  path*, iq
+#   kiwi:  host*, freq_hz*, port, password
+#   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
+#   hpsdr: host*, freq_hz*, rate_hz*, port        (build with --features hpsdr)
+# Any source flag on the command line (--device, --source, --kiwi-host,
+# --soapy-driver, --hpsdr-host) replaces a typed [input] table whole,
+# its shared keys below included. Example:
+# type = "kiwi"               # audio | file | kiwi | soapy | hpsdr
+# host = "<your-kiwi-host>"   # kiwi, hpsdr
+# port = 8073                 # kiwi (default 8073), hpsdr (default 1024)
+# freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
+# password = ""               # kiwi (default "")
+# The other types' keys:
+# device = "USB Audio"        # audio: device-name substring; omit for the default device
+# path = "capture.wav"        # file: relative to this file's directory
+# iq = false                  # file: true for a raw complex-IQ WAV (--source-iq)
+# driver = "driver=rtlsdr"    # soapy: SoapySDR device args
+# rate_hz = 192000.0          # soapy, hpsdr: sample rate, Hz
+# gain_db = 30.0              # soapy: omit for the device's AGC
+
+# Shared keys, valid with any type or none:
+
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]
-# (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29. CLI-only
-# for now (--freq-correction-ppm); a daemon TOML value has no effect.
+# (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29. `decode`
+# applies it too. --freq-correction-ppm and
+# MANTA_INPUT_FREQ_CORRECTION_PPM override it.
 freq_correction_ppm = 0.0
-# Target post-decimation capture rate, Hz (issue #169). None (the
-# default) uses the source's native rate unchanged. Must evenly divide
-# the source's native rate by a power of two, and must itself satisfy
-# fs/93.75 being a power of two. manta_dsp::decimate::Decimator,
-# manta_input::DecimatingSource. CLI-only for now (--capture-rate-hz) --
-# like freq_correction_ppm above, DaemonConfigFile does not yet model
-# this [input] table, so setting this key in a daemon TOML config file
-# has no effect; only the CLI flag reaches maybe_decimate.
-# capture_rate_hz = 48000   # omit entirely to use the source's native rate
+
+# Target post-decimation capture rate, Hz (issue #169). Omit to use the
+# source's native rate unchanged. Must evenly divide the source's native
+# rate by a power of two, and must itself satisfy fs/93.75 being a power
+# of two. manta_dsp::decimate::Decimator, manta_input::DecimatingSource.
+# --capture-rate-hz and MANTA_INPUT_CAPTURE_RATE_HZ override it.
+# capture_rate_hz = 48000
 
 # Operator-supplied RF dial frequency, Hz, for a source that has no RF
 # reference of its own (rig-audio passband). §1.3; MAN-34. Omit for
 # sources that report their own tuned frequency. Must be finite and > 0;
-# without it, audio-sourced frequencies are baseband offsets.
-# CLI-only for now (--dial-freq-hz on run/listen and soak) -- like
-# capture_rate_hz above, DaemonConfigFile does not yet model this [input]
-# table, so setting this key in a daemon TOML config file has no effect,
-# and `run --config` on any source with no RF reference of its own still
-# requires --dial-freq-hz.
+# without it, audio-sourced frequencies are baseband offsets, and `run`
+# with a [server] table refuses such a source. --dial-freq-hz and
+# MANTA_INPUT_CENTER_FREQ_HZ override it.
 # center_freq_hz = 14030000
+
+# Fixed replay epoch, Unix seconds: the wall-clock instant a replayed
+# file's first sample maps to, in place of the file's mtime (`run` on file
+# replay only). --replay-epoch and MANTA_INPUT_REPLAY_EPOCH override it.
+# replay_epoch = 1700000000
 
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty
 # validation and the repetition gate entirely in manta-spot's validator.
+# A non-empty --allowlist replaces this list.
 allowlist = []
+# Bad-callsign file, one callsign per line, `#` comments allowed (MAN-31).
+# A relative path resolves against this config file's directory.
+# --blocklist overrides it.
+# blocklist_path = "bad-calls.txt"
+# Notched frequency ranges, one `low_hz-high_hz` per line (MAN-31). Same
+# path rule; --notch overrides it.
+# notch_path = "notches.txt"
+
+# [server] and [[rbn_uplink]] (manta_server::config) configure the
+# telnet/JSON/metrics servers and the RBN uplink; README.md's "Run it as a
+# node" shows both. `run` starts the servers only when the resolved config
+# has a [server] table.
 ```
 
-`SPEC-decode-core-v2.md` §7 adds a `[decode]` `engine` key (`"legacy"` |
-`"edge-legacy"` | `"hsmm"`, see that doc's §0) plus the `EdgeLegacy`/`Hsmm`
+**Precedence and the environment.** `run`, `soak` and `doctor` resolve
+every key as: command-line flag, then `MANTA_<TABLE>_<KEY>` environment
+variable (`MANTA_INPUT_FREQ_CORRECTION_PPM` is `input.freq_correction_ppm`;
+`<TABLE>` is one of `SERVER`, `INPUT`, `SPOT`, `DETECTOR`, `DECODE`), then
+the config file, then the default above. `--config` names the file;
+without it they read `MANTA_CONFIG`. An environment value is parsed as a
+TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
+back to a bare string -- except for the string-typed keys, which are
+always taken verbatim: `server.station_callsign`, `server.bind_addr`,
+`input.type`, `input.device`, `input.path`, `input.host`,
+`input.password`, `input.driver`, `spot.blocklist_path`,
+`spot.notch_path` and `decode.engine`. Relative paths from the file
+resolve against the file's directory; those from a flag or the
+environment resolve against the working directory. `[[rbn_uplink]]`
+cannot be set from the environment.
+
+Unknown tables, unknown keys in a known table, and unknown `MANTA_*`
+variables are errors that name the offender, raised before any source
+I/O. `MANTA_GIT_SHA` is exempt: it is read at build time
+(`crates/manta-cli/build.rs`), never at run time. `decode` and `oracle`
+read only the file `--config` names and never the environment
+(`MANTA_CONFIG` included), so their output cannot depend on the ambient
+environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and
+`input.freq_correction_ppm`, `oracle` applies `[decode]`, and both
+validate the whole file.
+
+`SPEC-decode-core-v2.md` §7 adds `[decode]` keys beyond `engine` (`"legacy"`
+| `"edge-legacy"` | `"hsmm"`, see that doc's §0): the `EdgeLegacy`/`Hsmm`
 evidence/noise/HSMM tunables, additive over this table -- see that
-document's §7 for the full v2 key list and defaults. Parsed by
-`manta_decode::config_file::DecodeConfigFile` and threaded into
-`manta-cli`'s `Listen` (and, after MAN-166 Task 13's follow-up, `Decode`/
-`Oracle`) subcommands' `--engine`/`--server-config` handling -- soon `run`'s
-per MAN-77.
+document's §7 for the full v2 key list and defaults. All of them are
+parsed by `manta_decode::config_file::DecodeConfigToml`, and every command
+that takes `--config` (`run`, `soak`, `doctor`, `decode`, `oracle`) reads
+`[decode]` through it. The full decision record is
+`docs/DECISIONS/2026-10-06-man261-config-surface.md`.
 
 ## 10. Deviations from ARCHITECTURE.md
 
@@ -816,3 +912,7 @@ per MAN-77.
 4. Stopband target tightened from the implied ~60 dB to **80 dB** (§1.2) —
    free given 8 taps/branch, and pileup scenes (V8) have ≥ 27 dB dynamic
    range between neighbors.
+5. **`[detector] on_snr_db` defaults to 12.0, not 6.0** (§2.3, §9): raised
+   by `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` item 2 --
+   at 6.0 dB the channelizer's autocorrelated per-hop noise produced 298
+   spurious ACTIVE tracks on V1.

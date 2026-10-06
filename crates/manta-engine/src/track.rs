@@ -5,7 +5,7 @@
 
 /// SPEC §9 `[detector]` table, plus ARCHITECTURE §4's track cap (not in the
 /// literal SPEC table -- see the plan's Global Constraints).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectorConfig {
     /// Rise threshold in dB SNR. **Deviation from SPEC §9's literal 6.0 dB
     /// default (see `impl Default`).**

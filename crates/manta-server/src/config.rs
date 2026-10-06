@@ -263,7 +263,10 @@ impl RbnUplinkConfig {
 /// level too (an earlier version did) rejected every other real, valid
 /// table in the unified config, making `--config` unusable with
 /// the actual daemon config this repo's own docs describe (round-11
-/// review finding).
+/// review finding). MAN-261: the strict top-level check (an unknown table
+/// such as `[detectr]` is an error naming it) lives once in
+/// `manta-cli`'s `config` module, the only crate that knows the full table
+/// set; the daemon itself now parses `[server]`/`[[rbn_uplink]]` there too.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DaemonConfigFile {
     pub server: ServerConfig,
