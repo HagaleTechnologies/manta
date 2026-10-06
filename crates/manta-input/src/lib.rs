@@ -166,8 +166,10 @@ impl WavIqSource {
             (f, b) => bail!("unsupported WAV format {f:?}/{b}-bit (need Float32 or Int16)"),
         };
         let samples = interleaved
-            .chunks_exact(2)
-            .map(|c| Complex32::new(c[0], c[1]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[re, im]| Complex32::new(re, im))
             .collect();
 
         let sidecar_path = path.with_extension("json");

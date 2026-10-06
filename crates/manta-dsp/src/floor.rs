@@ -169,7 +169,7 @@ impl FloorBank {
             }
             self.smoothed_init = true;
         }
-        if self.hop_counter % DECIMATION_HOPS == 0 {
+        if self.hop_counter.is_multiple_of(DECIMATION_HOPS) {
             for (ch, &p) in self.channels.iter_mut().zip(power_db) {
                 ch.push(p);
             }

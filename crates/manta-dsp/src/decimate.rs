@@ -148,7 +148,7 @@ impl HalfbandStage {
         for &x in input {
             self.hist.pop_front();
             self.hist.push_back(x);
-            let keep = self.parity % 2 == 0;
+            let keep = self.parity.is_multiple_of(2);
             self.parity = self.parity.wrapping_add(1);
             if keep {
                 // Sequential f64 accumulation (SPEC §6.4 determinism convention).
