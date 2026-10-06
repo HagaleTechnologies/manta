@@ -768,7 +768,8 @@ cluster_alpha = 0.15
 
 [input]
 # Per-source oscillator drift correction, ppm; range [-1000, 1000]
-# (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29.
+# (`manta_spot::calibration_factor_from_ppm`). §1.4, MAN-29. CLI-only
+# for now (--freq-correction-ppm); a daemon TOML value has no effect.
 freq_correction_ppm = 0.0
 # Target post-decimation capture rate, Hz (issue #169). None (the
 # default) uses the source's native rate unchanged. Must evenly divide
@@ -779,6 +780,17 @@ freq_correction_ppm = 0.0
 # this [input] table, so setting this key in a daemon TOML config file
 # has no effect; only the CLI flag reaches maybe_decimate.
 # capture_rate_hz = 48000   # omit entirely to use the source's native rate
+
+# Operator-supplied RF dial frequency, Hz, for a source that has no RF
+# reference of its own (rig-audio passband). §1.3; MAN-34. Omit for
+# sources that report their own tuned frequency. Must be finite and > 0;
+# without it, audio-sourced frequencies are baseband offsets.
+# CLI-only for now (--dial-freq-hz on run/listen and soak) -- like
+# capture_rate_hz above, DaemonConfigFile does not yet model this [input]
+# table, so setting this key in a daemon TOML config file has no effect,
+# and `run --config` on any source with no RF reference of its own still
+# requires --dial-freq-hz.
+# center_freq_hz = 14030000
 
 [spot]
 # Operator Watch List (§6, MAN-28): callsigns here bypass grammar/cty

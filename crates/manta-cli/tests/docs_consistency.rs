@@ -528,3 +528,77 @@ fn wiki_overview_verified_stamp_is_not_the_pre_rewrite_one() {
          found the page's claims stale, so the stamp cannot be vouching for the current body"
     );
 }
+
+// ---- MAN-34 (PR #108 Codex review): SPEC §9's [input] center_freq_hz is CLI-only ----
+
+/// The lines of SPEC §9's `[input]` config table: from its `[input]` header
+/// up to the next table header or the end of the fenced block.
+fn spec_input_table_lines() -> Vec<String> {
+    let spec = doc("docs/SPEC-decode-core.md");
+    let keys = section(&spec, "9. Configuration keys");
+    keys.lines()
+        .skip_while(|l| l.trim() != "[input]")
+        .skip(1)
+        .take_while(|l| !l.starts_with('[') && !l.starts_with("```"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `center_freq_hz` reaches an audio source only through `--dial-freq-hz`.
+/// `DaemonConfigFile` does not model `[input]`, and `run --config` checks
+/// for the flag without consulting the file -- so a daemon TOML that sets
+/// the key still fails the `--dial-freq-hz is required with --config`
+/// guard. SPEC §9 listed it as a live `center_freq_hz = 0.0` key (and `0.0`
+/// is a value `--dial-freq-hz` rejects). Until a config file can supply it,
+/// the SPEC must comment the key out and call it CLI-only, as it already
+/// does for `capture_rate_hz`.
+#[test]
+fn spec_input_center_freq_hz_is_documented_as_cli_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("daemon.toml");
+    fs::write(
+        &cfg,
+        "[server]\nstation_callsign = \"W1AW\"\n\n[input]\ncenter_freq_hz = 14030000.0\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
+        .args(["run", "--source", "/nonexistent.wav", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("--dial-freq-hz is required with --config"),
+        "`run --config` without --dial-freq-hz no longer fails the expected guard for a \
+         daemon TOML that sets [input] center_freq_hz. If [input] now reaches source \
+         construction, uncomment the SPEC §9 key and update this test; otherwise update \
+         the expected message. stderr: {stderr}"
+    );
+
+    let input = spec_input_table_lines();
+    assert!(!input.is_empty(), "SPEC §9 has no `[input]` table to check");
+    for line in &input {
+        assert!(
+            !line.trim_start().starts_with("center_freq_hz"),
+            "SPEC §9 [input] sets `center_freq_hz` as a live key, but a daemon TOML \
+             cannot supply it: {line}"
+        );
+    }
+    let key = input
+        .iter()
+        .position(|l| l.trim_start().starts_with("# center_freq_hz"))
+        .expect("SPEC §9 [input] no longer documents center_freq_hz");
+    let comment: Vec<&str> = input[..key]
+        .iter()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with('#'))
+        .map(String::as_str)
+        .collect();
+    let comment = comment.join(" ");
+    for needle in ["CLI-only", "--dial-freq-hz", "DaemonConfigFile"] {
+        assert!(
+            comment.contains(needle),
+            "SPEC §9 [input] center_freq_hz comment never says `{needle}`: {comment}"
+        );
+    }
+}

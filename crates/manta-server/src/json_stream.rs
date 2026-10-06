@@ -609,7 +609,7 @@ fn is_ws_protocol_violation(e: &tokio_tungstenite::tungstenite::Error) -> bool {
         // these routine resets to the rejection budget, defeating the
         // fix's own purpose.
         WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => false,
-        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8 | WsError::AttackAttempt => {
+        WsError::Protocol(_) | WsError::Capacity(_) | WsError::Utf8(_) | WsError::AttackAttempt => {
             true
         }
         _ => false,
@@ -951,7 +951,7 @@ mod tests {
                 max_size: 10,
             }
         )));
-        assert!(is_ws_protocol_violation(&WsError::Utf8));
+        assert!(is_ws_protocol_violation(&WsError::Utf8(String::new())));
         assert!(is_ws_protocol_violation(&WsError::AttackAttempt));
     }
 
