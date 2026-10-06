@@ -12,11 +12,12 @@
 //! Time and sleeping are behind the `ReconnectEnv` trait so the state
 //! machine's tests run instantly, with no real sleeping.
 
-use manta_input::IqSource;
+use manta_input::{InputHealthCounters, IqSource};
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
+use manta_server::metrics::InputHealth;
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Wall clock + interruptible sleep, injected so tests run instantly and
@@ -59,6 +60,85 @@ impl ReconnectEnv for RealEnv {
 pub(crate) type Opener = Box<dyn FnMut() -> anyhow::Result<Box<dyn IqSource>>>;
 pub(crate) type HealthSink = Box<dyn FnMut(bool)>;
 
+/// MAN-228: a source's MAN-56 input-health counters summed over every
+/// connection a `ReconnectingSource` makes. Each reopen builds a new device
+/// with its own fresh `InputHealthCounters`, so a handle taken from one
+/// connection freezes at the first reconnect; this is the one handle that
+/// stays current for the whole process.
+///
+/// `snapshot()` reads the live connection's atomics directly rather than
+/// syncing a copy after each `read()` returns: HPSDR counts malformed
+/// datagrams *inside* a `read()` that never returns while no valid packet
+/// arrives, and those counts must still reach `/metrics`.
+pub(crate) struct InputHealthTotals {
+    state: Mutex<TotalsState>,
+}
+
+struct TotalsState {
+    /// Final counts of every connection already lost.
+    retired: InputHealth,
+    /// The live connection's own counters; `None` during an outage.
+    current: Option<Arc<InputHealthCounters>>,
+}
+
+fn add_health(a: InputHealth, b: InputHealth) -> InputHealth {
+    InputHealth {
+        dropped_packets: a.dropped_packets + b.dropped_packets,
+        gaps_detected: a.gaps_detected + b.gaps_detected,
+        malformed_packets: a.malformed_packets + b.malformed_packets,
+    }
+}
+
+impl InputHealthTotals {
+    pub(crate) fn new(first: Arc<InputHealthCounters>) -> Self {
+        InputHealthTotals {
+            state: Mutex::new(TotalsState {
+                retired: InputHealth::default(),
+                current: Some(first),
+            }),
+        }
+    }
+
+    /// Totals starting from `first`'s counters, or `None` when it counts
+    /// nothing (MAN-56's "absent means not measured").
+    pub(crate) fn for_source(first: &dyn IqSource) -> Option<Arc<Self>> {
+        first
+            .health_counters()
+            .map(|counters| Arc::new(Self::new(counters)))
+    }
+
+    /// Retired connections' totals plus the live connection's counts so
+    /// far. Monotonic: `retire_current` folds a lost connection's final
+    /// counts in under the same lock, so the sum never dips.
+    pub(crate) fn snapshot(&self) -> InputHealth {
+        let state = self.state.lock().expect("input health lock poisoned");
+        match &state.current {
+            Some(counters) => add_health(state.retired, crate::input_health_of(counters)),
+            None => state.retired,
+        }
+    }
+
+    /// The live connection was lost (and already dropped, so its counts
+    /// are final): fold them into `retired`.
+    fn retire_current(&self) {
+        let mut state = self.state.lock().expect("input health lock poisoned");
+        if let Some(counters) = state.current.take() {
+            state.retired = add_health(state.retired, crate::input_health_of(&counters));
+        }
+    }
+
+    /// A reopened connection's counters, which start at 0. Only ever
+    /// called after `retire_current`, so nothing still attached is lost.
+    fn attach(&self, counters: Option<Arc<InputHealthCounters>>) {
+        let mut state = self.state.lock().expect("input health lock poisoned");
+        debug_assert!(
+            state.current.is_none(),
+            "attach without retiring the lost connection first"
+        );
+        state.current = counters;
+    }
+}
+
 /// Wraps a live `IqSource`, reopening it with backoff whenever it errors.
 /// `listen()` never observes the intermediate error: from its perspective
 /// `read()` just returns real samples a little later than usual, after an
@@ -86,6 +166,9 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     reopened: bool,
     last_ok: Instant,
     discontinuity: Option<u64>,
+    /// MAN-228: `None` when the first source counts nothing (MAN-56's
+    /// "absent means not measured").
+    input_health: Option<Arc<InputHealthTotals>>,
 }
 
 impl ReconnectingSource<RealEnv> {
@@ -123,6 +206,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         let fs = first.sample_rate();
         let center_freq_hz = first.center_freq_hz();
         let last_ok = env.now();
+        let input_health = InputHealthTotals::for_source(first.as_ref());
         ReconnectingSource {
             name,
             inner: Some(first),
@@ -138,7 +222,16 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             reopened: false,
             last_ok,
             discontinuity: None,
+            input_health,
         }
+    }
+
+    /// MAN-228: the input-health counters summed over every connection, for
+    /// the daemon's `manta_input_*` poller. Deliberately not exposed as
+    /// `IqSource::health_counters()`: that returns one connection's handle,
+    /// which goes stale at the next reconnect -- the bug this replaces.
+    pub(crate) fn input_health(&self) -> Option<Arc<InputHealthTotals>> {
+        self.input_health.clone()
     }
 
     fn report_health(&mut self, healthy: bool) {
@@ -184,6 +277,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                                 src.center_freq_hz(),
                                 self.center_freq_hz
                             );
+                        }
+                        if let Some(totals) = &self.input_health {
+                            totals.attach(src.health_counters());
                         }
                         self.inner = Some(src);
                         self.productive = false;
@@ -241,6 +337,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         AttemptOutcome::NeverConnected
                     };
                     self.inner = None;
+                    if let Some(totals) = &self.input_health {
+                        totals.retire_current();
+                    }
                     self.backoff = next_backoff(self.backoff, &outcome);
                     eprintln!(
                         "source {} lost: {e:#}; reconnecting in {}s",
@@ -791,6 +890,213 @@ mod tests {
             err.to_string().contains("center frequency"),
             "error must mention the center frequency mismatch, got: {err}"
         );
+    }
+
+    /// A device that counts like HPSDR/Kiwi: every `read` records
+    /// `dropped_per_read` dropped packets, one gap and one malformed packet
+    /// into its own `InputHealthCounters`, fresh per connection.
+    struct CountingSource {
+        inner: ScriptedSource,
+        counters: Arc<InputHealthCounters>,
+        dropped_per_read: u64,
+    }
+
+    impl CountingSource {
+        fn new(script: Vec<anyhow::Result<Vec<Complex32>>>, dropped_per_read: u64) -> Self {
+            CountingSource {
+                inner: scripted(FS, CENTER, script),
+                counters: Arc::new(InputHealthCounters::new()),
+                dropped_per_read,
+            }
+        }
+    }
+
+    impl IqSource for CountingSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+            self.counters.record_dropped(self.dropped_per_read);
+            self.counters.record_gap();
+            self.counters.record_malformed();
+            self.inner.read(buf)
+        }
+        fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+            Some(self.counters.clone())
+        }
+    }
+
+    /// One `CountingSource` per scripted reopen, handed out in order.
+    fn counting_opener(sources: Vec<CountingSource>) -> Opener {
+        let mut sources = VecDeque::from(sources);
+        Box::new(move || {
+            Ok(Box::new(
+                sources
+                    .pop_front()
+                    .expect("opener called more times than the test scripted"),
+            ) as Box<dyn IqSource>)
+        })
+    }
+
+    fn assert_no_field_dips(earlier: InputHealth, later: InputHealth) {
+        assert!(
+            later.dropped_packets >= earlier.dropped_packets
+                && later.gaps_detected >= earlier.gaps_detected
+                && later.malformed_packets >= earlier.malformed_packets,
+            "a published counter went backwards: {earlier:?} -> {later:?}"
+        );
+    }
+
+    #[test]
+    fn input_health_sums_every_connection_across_a_reconnect() {
+        // MAN-228: the handle the daemon used to poll was the startup
+        // connection's, which froze at 2 here while the reopened device's
+        // count went unpublished, and the wrapper itself reported `None`.
+        let first = CountingSource::new(vec![ok_chunk(8), err_chunk("lost")], 1);
+        let c1 = first.counters.clone();
+        let second = CountingSource::new(vec![ok_chunk(8), ok_chunk(8)], 1);
+        let c2 = second.counters.clone();
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            counting_opener(vec![second]),
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        let totals = src
+            .input_health()
+            .expect("a first source with counters publishes totals");
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap(); // errors, reopens, resumes on `second`
+        assert_eq!(c1.malformed_packets(), 2, "first device: two reads");
+        assert_eq!(c2.malformed_packets(), 1, "second device: one read");
+        assert_eq!(
+            totals.snapshot(),
+            add_health(crate::input_health_of(&c1), crate::input_health_of(&c2)),
+            "every connection's counts are published, not just the first's"
+        );
+        assert_eq!(totals.snapshot().malformed_packets, 3);
+    }
+
+    #[test]
+    fn input_health_reads_the_live_connection_without_a_returning_read() {
+        // HPSDR counts malformed datagrams inside a `read()` that does not
+        // return until a valid packet arrives, so the totals must read the
+        // live device's counters, not a copy synced after `read()` returns.
+        let first = CountingSource::new(vec![ok_chunk(8), err_chunk("lost")], 1);
+        let second = CountingSource::new(vec![ok_chunk(8)], 1);
+        let c2 = second.counters.clone();
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            counting_opener(vec![second]),
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        let totals = src.input_health().unwrap();
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap(); // reconnects onto `second`
+        let before = totals.snapshot();
+
+        // The current device counts with no further `read()` returning.
+        c2.record_dropped(5);
+        c2.record_gap();
+        c2.record_malformed();
+        let after = totals.snapshot();
+        assert_eq!(after.dropped_packets, before.dropped_packets + 5);
+        assert_eq!(after.gaps_detected, before.gaps_detected + 1);
+        assert_eq!(after.malformed_packets, before.malformed_packets + 1);
+    }
+
+    #[test]
+    fn input_health_never_dips_across_a_connections_retirement() {
+        // The lost device counted more (10 dropped per read) than its
+        // replacement ever will in this test: dropping its counts at the
+        // reconnect, or losing them during the outage, shows as a dip.
+        let first = CountingSource::new(vec![ok_chunk(8), err_chunk("lost")], 10);
+        let second = CountingSource::new(vec![ok_chunk(8)], 1);
+        let mid_outage: Rc<RefCell<Option<InputHealth>>> = Rc::new(RefCell::new(None));
+        let totals_slot: Rc<RefCell<Option<Arc<InputHealthTotals>>>> = Rc::new(RefCell::new(None));
+        let opener: Opener = {
+            let mut reopen = counting_opener(vec![second]);
+            let mid_outage = mid_outage.clone();
+            let totals_slot = totals_slot.clone();
+            Box::new(move || {
+                // Runs mid-outage: the lost device is already retired and
+                // the replacement not yet attached.
+                let totals = totals_slot.borrow().clone().expect("slot set below");
+                *mid_outage.borrow_mut() = Some(totals.snapshot());
+                reopen()
+            })
+        };
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        let totals = src.input_health().unwrap();
+        *totals_slot.borrow_mut() = Some(totals.clone());
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        let before = totals.snapshot();
+        src.read(&mut b).unwrap(); // the losing read: retires, reopens, resumes
+        let during = mid_outage.borrow().expect("the opener ran");
+        let after = totals.snapshot();
+
+        assert_no_field_dips(before, during);
+        assert_no_field_dips(during, after);
+        assert_eq!(
+            during.dropped_packets, 20,
+            "the outage publishes the lost device's final counts"
+        );
+        assert_eq!(after.dropped_packets, 21);
+    }
+
+    #[test]
+    fn a_first_source_without_counters_publishes_no_input_health() {
+        // MAN-56's "absent means not measured": no frozen-zero series for a
+        // source kind that counts nothing, before or after a reconnect.
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let (opener, _calls) = opener_from(VecDeque::from(vec![Ok(scripted(
+            FS,
+            CENTER,
+            vec![ok_chunk(8)],
+        ))]));
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        assert!(src.input_health().is_none());
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap(); // reconnects
+        assert!(src.input_health().is_none());
     }
 
     #[test]
