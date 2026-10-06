@@ -176,13 +176,46 @@ pub fn listen(
         ListenObservers::default(),
         on_event,
         on_spot,
+        |_n| {},
     )
 }
 
-/// Like `listen`, but additionally publishes engine-owned live state
-/// (currently just the active-track count) into `observers` as the decode
-/// loop runs. See `ListenObservers`'s doc comment for why this is a shared
-/// atomic rather than a third callback.
+/// Like `listen`, but additionally publishes engine-owned live state (the
+/// active-track count) to the caller two ways: into `observers`, a shared
+/// atomic a consumer on another thread can poll on its own schedule
+/// (MAN-45), and to `on_tracks`, a synchronous per-batch callback (MAN-122).
+/// Both carry the same number; they exist side by side because they answer
+/// different questions -- see `ListenObservers`'s doc comment for why the
+/// gauge is an atomic, and the `on_tracks` paragraphs below for why the
+/// daemon additionally needs the per-batch *edge*.
+///
+/// `on_tracks` is called with
+/// `TrackManager::decoding_track_count()` after every batch the pipeline
+/// processes, including the final `finish()`, which reports 0.
+///
+/// MAN-122 review round 2: it fires on EVERY batch, not only when the
+/// count changes. The call is the daemon's only per-batch signal that the
+/// synchronous decode loop is still turning over -- a status line derived
+/// from change-only notifications cannot tell "quiet band, count steady at
+/// 2" from "`IqSource::read` wedged, count frozen at 2 since an hour ago",
+/// which is exactly the question the line exists to answer. Suppressing
+/// repeats is the caller's business now (`manta-cli` keeps the gauge store
+/// unconditional -- one relaxed atomic per ~43 ms chunk is nothing against
+/// the per-batch DSP work it follows).
+///
+/// MAN-122 review round 1: the daemon's `manta_active_tracks` gauge and its
+/// status line's `tracks=` field must come from the manager's own lifecycle
+/// state, not from the `DecoderEvent` stream `on_event` already sees. A
+/// track that `TrackManager` has promoted but whose demodulator has not
+/// latched emits no events at all -- `TrackDecoder` withholds `TrackMeta`
+/// until `snr_2500_db()` is `Some`, and a silent ACTIVE track survives to
+/// the ~30 s `gc_hops` GC -- so an event-derived count reports zero while
+/// real decoders are running on weak or unmodulated signals. This is the
+/// count that cannot lie about that.
+///
+/// Kept as a separate entry point rather than extra parameters on
+/// `listen()` so the existing callers and tests are untouched; `listen()`
+/// is now a no-op-observer wrapper over this.
 pub fn listen_with_observers(
     mut src: Box<dyn IqSource>,
     cfg: &PipelineConfig,
@@ -190,6 +223,7 @@ pub fn listen_with_observers(
     observers: ListenObservers,
     mut on_event: impl FnMut(&DecoderEvent),
     mut on_spot: impl FnMut(&crate::Spot),
+    mut on_tracks: impl FnMut(usize),
 ) -> Result<()> {
     // Declared before the first `?` below so that EVERY early return from
     // here on clears the observer -- see `ActiveTracksGuard`'s doc comment.
@@ -203,6 +237,44 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
+<<<<<<< HEAD
+=======
+    let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
+    let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
+    let mut filled = 0;
+    while filled < calib_n {
+        // MAN-122 review round 7: checked before EVERY calibration read, not
+        // only once the decode loop below starts. The daemon installs its
+        // Ctrl-C handler before it logs the `listening:` banner, so a stop
+        // request can land at any point while this two-second buffer fills;
+        // without this check it was honoured only once the buffer was full.
+        // A read already in flight is not interrupted; it returns with
+        // whatever the source yields next, or fails after that source's own
+        // stall bound (`IqSource::read`'s implementations in `manta-input`).
+        // `break`, not `return`: whatever was read is still processed below
+        // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
+        // `soak`) still analyses every sample it read, and the decode loop's
+        // own `stop` check then ends the run without another read.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let n = src.read(&mut calib[filled..])?;
+        if n == 0 {
+            anyhow::bail!("audio source ended during startup calibration");
+        }
+        filled += n;
+    }
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let hop = ch.hop() as u64;
+    let mut tm = crate::track::TrackManager::new(
+        ch.n_channels(),
+        fs,
+        center_freq_hz,
+        cfg.detector,
+        cfg.decode.clone(),
+    );
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
     let mut validator = Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -212,12 +284,23 @@ pub fn listen_with_observers(
         validator.allowlist(call);
     }
 
-    // O(1) (`TrackManager::active_track_count` is `tracks.len()`), once per
-    // processed chunk and skipped entirely when no observer is registered
-    // -- immaterial against the Pi4 CPU budget.
-    let report_active_tracks = |tm: &crate::track::TrackManager| {
+    // One relaxed store over a count that is a single filtered pass across
+    // the (cap-bounded) track map, once per processed chunk and skipped
+    // entirely when no observer is registered -- immaterial against the Pi4
+    // CPU budget and against the channelizer + TrackManager work it follows.
+    //
+    // MAN-122: the published number is `decoding_track_count()`, NOT
+    // `active_track_count()`. MAN-45 introduced this gauge against the
+    // latter (every entry in `tracks`, unconfirmed CANDIDATEs included);
+    // candidates are mostly noise-blip rise crossings that close within
+    // `confirm_hops` without ever leasing a decoder, so counting them
+    // inflates an operator-facing "is it decoding?" reading with signals
+    // nothing is decoding. See `TrackManager::decoding_track_count`'s doc
+    // comment for the full argument. `active_track_count` keeps its
+    // existing meaning for `soak_metrics`' peak/eviction accounting.
+    let report_active_tracks = |n_tracks: usize| {
         if let Some(gauge) = &observers.active_tracks {
-            gauge.store(tm.active_track_count() as u64, Ordering::Relaxed);
+            gauge.store(n_tracks as u64, Ordering::Relaxed);
         }
     };
 
@@ -245,6 +328,7 @@ pub fn listen_with_observers(
         if n == 0 {
             anyhow::bail!("audio source ended during startup calibration");
         }
+<<<<<<< HEAD
         if let Some(gap) = src.take_discontinuity() {
             // A discontinuity during calibration: the pre-gap partial
             // buffer was never processed through the channelizer, so it's
@@ -255,9 +339,23 @@ pub fn listen_with_observers(
             seg_base += filled as u64 + gap;
             filled = n;
             continue;
+=======
+    }
+    let n_tracks = tm.decoding_track_count();
+    report_active_tracks(n_tracks);
+    on_tracks(n_tracks);
+    // `..filled`: the whole buffer unless a stop request cut the fill short.
+    for ev in tm.process_hops(&ch.process(&calib[..filled]), |m| {
+        m.saturating_sub(pad_hops) * hop
+    }) {
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
+        for spot in validator.ingest(&ev) {
+            on_spot(&spot);
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
         }
         filled += n;
     }
+<<<<<<< HEAD
     let events = seg.tm.process_hops(&seg.ch.process(&calib), |m| {
         seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
     });
@@ -270,13 +368,34 @@ pub fn listen_with_observers(
     );
     report_active_tracks(&seg.tm);
     let mut seg_consumed: u64 = calib_n as u64;
+=======
+    let n_tracks = tm.decoding_track_count();
+    report_active_tracks(n_tracks);
+    on_tracks(n_tracks);
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let n = src.read(&mut chunk)?;
+        // A read error must not escape via `?` before the gauge is
+        // zeroed. The end-of-stream `on_tracks(0)` below is only reached
+        // on a clean EOF or a `stop` request, so a mid-stream failure --
+        // an SDR disconnecting, say -- would otherwise leave
+        // `manta_active_tracks` (and the status line's `tracks=`) frozen
+        // at its last nonzero value for the whole shutdown drain, up to
+        // `SHUTDOWN_DRAIN_DEADLINE` (25 s), while the metrics listener is
+        // still answering scrapes with decoders that no longer exist.
+        // Publish 0 first, then propagate the original error unchanged.
+        let n = match src.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                report_active_tracks(0);
+                on_tracks(0);
+                return Err(e);
+            }
+        };
         if n == 0 {
             break;
         }
@@ -314,6 +433,7 @@ pub fn listen_with_observers(
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
+<<<<<<< HEAD
         let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
             seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
         });
@@ -325,11 +445,25 @@ pub fn listen_with_observers(
             &mut on_spot,
         );
         report_active_tracks(&seg.tm);
+=======
+        for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
+            m.saturating_sub(pad_hops) * hop
+        }) {
+            on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
+            for spot in validator.ingest(&ev) {
+                on_spot(&spot);
+            }
+        }
+        let n_tracks = tm.decoding_track_count();
+        report_active_tracks(n_tracks);
+        on_tracks(n_tracks);
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
         }
         seg_consumed += n as u64;
     }
+<<<<<<< HEAD
     let events = seg.tm.finish();
     emit(
         events,
@@ -342,6 +476,20 @@ pub fn listen_with_observers(
     // back to 0 here rather than being left at whatever the last processed
     // chunk reported.
     report_active_tracks(&seg.tm);
+=======
+    for ev in tm.finish() {
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
+        for spot in validator.ingest(&ev) {
+            on_spot(&spot);
+        }
+    }
+    // `finish()` flushes and drops every decoder and closes every remaining
+    // track: nothing is being decoded once the stream has ended, so both
+    // observers must settle back to 0 rather than be left holding the last
+    // live value after a source disconnects or a replay hits EOF.
+    report_active_tracks(0);
+    on_tracks(0);
+>>>>>>> 0792f22ad28b4778b44781ac566005fb00379564
     Ok(())
 }
 
@@ -691,10 +839,12 @@ mod tests {
 
     /// MAN-45 (PR #63 round-9 finding): `manta_active_tracks` reported a
     /// constant 0 on every production run because `listen()` exposed no
-    /// live track count to its caller -- `TrackManager::active_track_count()`
-    /// existed but was reachable only from inside the engine. This proves
-    /// the observer handle tracks the real count during the run and settles
-    /// at 0 afterward (`TrackManager::finish()` closes every track).
+    /// live track count to its caller -- the manager's own count existed but
+    /// was reachable only from inside the engine. This proves the observer
+    /// handle tracks the real count during the run and settles at 0
+    /// afterward (`TrackManager::finish()` closes every track). MAN-122: the
+    /// number published here is `decoding_track_count()`, so an unconfirmed
+    /// noise candidate can never lift it off 0.
     #[test]
     fn listen_with_observers_publishes_a_live_active_track_count() {
         use std::sync::atomic::AtomicU64;
@@ -721,6 +871,7 @@ mod tests {
             },
             |_ev| peak = peak.max(observed.load(Ordering::Relaxed)),
             |_spot| {},
+            |_n| {},
         )
         .unwrap();
 
@@ -789,6 +940,7 @@ mod tests {
             },
             |_ev| {},
             |_spot| {},
+            |_n| {},
         )
         .unwrap_err();
         assert!(
@@ -867,6 +1019,216 @@ mod tests {
             "freq_hz {freq_hz} should be near {} (center_freq_hz + V1's known offset), not near 12340 \
              (which is what a hardcoded center_freq_hz=0.0 would produce)",
             spec.center_freq_hz + 12_340.0
+        );
+    }
+
+    /// MAN-122 review round 1: the track-count observer reports
+    /// `TrackManager`'s promoted-track count, rises above zero while a real
+    /// signal is being decoded, and is driven back to zero by `finish()` so
+    /// the daemon's gauge doesn't stay stuck at the last live value after
+    /// EOF or an SDR disconnect. Review round 2: it also fires once per
+    /// processed batch, repeats included -- that per-batch edge is what the
+    /// daemon's status line uses to tell a wedged decode loop from a quiet
+    /// band.
+    #[test]
+    fn listen_reports_the_managers_track_count_and_clears_it_at_end_of_stream() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut counts: Vec<usize> = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        )
+        .unwrap();
+
+        assert!(
+            counts.iter().any(|&n| n > 0),
+            "V1 is a clean +20 dB tone -- the observer must see a promoted track at some point, got {counts:?}"
+        );
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "finish() drops every decoder, so the final reported count must be 0, got {counts:?}"
+        );
+        // One call per batch: the padding batch, the calibration batch, one
+        // per CHUNK_SAMPLES-sized read, and one final zero from finish().
+        // Far more calls than there are distinct values -- the point being
+        // that a steady count still produces a steady stream of calls.
+        assert!(
+            counts.len()
+                > counts
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+            "the observer must fire per batch, repeats included, got {counts:?}"
+        );
+    }
+
+    /// A source that replays `samples` and then FAILS instead of reporting
+    /// EOF -- an SDR disconnecting mid-stream, not a file running out.
+    struct FailsAtEndSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+    }
+
+    impl manta_input::IqSource for FailsAtEndSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if self.cursor >= self.samples.len() {
+                anyhow::bail!("source disconnected");
+            }
+            let n = buf.len().min(self.samples.len() - self.cursor);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            Ok(n)
+        }
+    }
+
+    /// MAN-122 review round 3: a mid-stream `IqSource::read` failure exits
+    /// `listen_with_observers` before the end-of-stream `on_tracks(0)`,
+    /// so without an explicit zero on the error path the daemon's
+    /// `manta_active_tracks` gauge (and the status line's `tracks=`) would
+    /// stay frozen at its last nonzero value for the whole shutdown drain
+    /// while the metrics listener still answers scrapes.
+    #[test]
+    fn listen_zeroes_the_track_count_when_a_read_fails_mid_stream() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FailsAtEndSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut counts: Vec<usize> = Vec::new();
+        let err = listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        )
+        .expect_err("the source fails instead of reaching EOF, so listen must propagate the error");
+        assert!(
+            err.to_string().contains("source disconnected"),
+            "the original read error must be propagated unchanged, got {err}"
+        );
+
+        assert!(
+            counts.iter().any(|&n| n > 0),
+            "V1 is a clean +20 dB tone -- a track must have been promoted before the failure, got {counts:?}"
+        );
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "a failed read must publish 0 before propagating, or the gauge stays frozen through shutdown drain, got {counts:?}"
+        );
+    }
+
+    /// A live-shaped source: short reads that never reach EOF, and a Ctrl-C
+    /// that lands during its first read -- i.e. while `listen` is still
+    /// filling its startup calibration buffer.
+    struct StopsDuringCalibrationSource {
+        stop: Arc<AtomicBool>,
+        reads: Arc<AtomicU64>,
+    }
+
+    impl manta_input::IqSource for StopsDuringCalibrationSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Relaxed);
+            let n = buf.len().min(64);
+            buf[..n].fill(Complex32::new(0.0, 0.0));
+            Ok(n)
+        }
+    }
+
+    /// Runs `listen_with_observers` against `StopsDuringCalibrationSource`
+    /// with `stop` initially `stop_before_start`, returning how many reads
+    /// it issued and every `on_tracks` value.
+    fn run_stopping_during_calibration(stop_before_start: bool) -> (u64, Vec<usize>) {
+        let stop = Arc::new(AtomicBool::new(stop_before_start));
+        let reads = Arc::new(AtomicU64::new(0));
+        let src: Box<dyn manta_input::IqSource> = Box::new(StopsDuringCalibrationSource {
+            stop: stop.clone(),
+            reads: reads.clone(),
+        });
+        let mut counts = Vec::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |_ev| {},
+            |_spot| {},
+            |n| counts.push(n),
+        )
+        .expect("a stop request during calibration is a clean shutdown, not an error");
+        (reads.load(Ordering::Relaxed), counts)
+    }
+
+    /// MAN-122 review round 7: the daemon installs its Ctrl-C handler
+    /// before it logs the `listening:` banner, so a signal can land while
+    /// `listen` is still filling the two-second calibration buffer. The
+    /// calibration loop must check `stop` before each read, not keep
+    /// reading until the buffer is full and only check `stop` once the
+    /// decode loop starts. What was read is still processed and flushed,
+    /// so the run ends through `finish()` and settles the count at 0.
+    #[test]
+    fn listen_stops_during_startup_calibration_without_filling_the_buffer() {
+        let (reads, counts) = run_stopping_during_calibration(false);
+        assert_eq!(
+            reads, 1,
+            "listen must not issue another read once stop is set during calibration"
+        );
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped run must still end through finish(), got {counts:?}"
+        );
+    }
+
+    /// The same, for a signal that lands before `listen` starts at all --
+    /// e.g. at the daemon's `listening:` banner: no read is issued, so a
+    /// source that would block cannot hold up shutdown.
+    #[test]
+    fn listen_issues_no_read_when_stop_is_already_set() {
+        let (reads, counts) = run_stopping_during_calibration(true);
+        assert_eq!(reads, 0, "stop was set before listen started");
+        assert_eq!(
+            counts.last().copied(),
+            Some(0),
+            "the stopped run must still end through finish(), got {counts:?}"
         );
     }
 
@@ -1035,6 +1397,7 @@ mod tests {
             },
             |_ev| {},
             |_spot| {},
+            |_n| {},
         )
         .unwrap();
 

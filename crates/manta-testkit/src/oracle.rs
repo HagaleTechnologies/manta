@@ -333,7 +333,7 @@ fn summarize(spots: &[OracleSpot], results: &[OracleResult]) -> OracleSummary {
     // pass or fail purely from this rounding-direction bug.
     let median = if ratios.is_empty() {
         None
-    } else if ratios.len() % 2 == 0 {
+    } else if ratios.len().is_multiple_of(2) {
         let hi = ratios.len() / 2;
         Some((ratios[hi - 1] + ratios[hi]) / 2.0)
     } else {
