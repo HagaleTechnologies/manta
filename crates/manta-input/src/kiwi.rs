@@ -36,14 +36,14 @@
 //!   unless flags bit `0x80` is set (little-endian). Real captures were a
 //!   constant 2068 bytes (20-byte header + 512 complex pairs) every frame.
 
-use crate::IqSource;
+use crate::{InputHealthCounters, IqSource};
 use anyhow::{anyhow, bail, Context, Result};
 use num_complex::Complex32;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use std::collections::{BTreeSet, VecDeque};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{Message, WebSocket};
 
@@ -220,6 +220,15 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
 /// `SND` frames (confirmed live: an initial send is not enough).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Bound on a forward `seq` jump (MAN-128, generalizing MAN-56's gap-stat
+/// wiring beyond HPSDR) before it's treated as a counter reset rather than a
+/// genuine loss event. Upstream `jks-prv/kiwiclient`'s `kiwirecorder.py:312`
+/// treats SND `seq` as a simple per-block counter (`Block: %08x`) with no
+/// documented wrap tolerance narrower than this; a jump bigger than this is
+/// far more likely to be a server-side reconnect/reset than real loss, so it
+/// re-baselines silently instead of reporting a nonsensical gap count.
+const MAX_PLAUSIBLE_SEQ_JUMP: u32 = 65_536;
+
 /// A KiwiSDR receiver (network SDR) as an `IqSource`. ARCHITECTURE §3.
 pub struct KiwiIqSource {
     socket: WebSocket<TcpStream>,
@@ -231,6 +240,11 @@ pub struct KiwiIqSource {
     /// Resampled-output chunk assembler; `read()` drains from here.
     pending: VecDeque<Complex32>,
     last_keepalive: Instant,
+    /// MAN-128: shared packet-loss/malformed counters, fed from each SND
+    /// frame's `seq` field by `account_snd_frame`. Surfaced via
+    /// `health_counters()`, same as HPSDR's `GapDetector` handle.
+    health: Arc<InputHealthCounters>,
+    seq: SndSeqTracker,
 }
 
 impl KiwiIqSource {
@@ -370,6 +384,8 @@ impl KiwiIqSource {
             raw: Vec::new(),
             pending: VecDeque::new(),
             last_keepalive: Instant::now(),
+            health: Arc::new(InputHealthCounters::new()),
+            seq: SndSeqTracker::default(),
         })
     }
 
@@ -442,15 +458,26 @@ fn parse_kv_f64(text: &str, key: &str) -> Option<f64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Parse an SND frame's bytes (after the 3-byte `"SND"` tag) into raw,
-/// un-resampled complex samples normalized to roughly [-1, 1] (matching
-/// `WavIqSource`'s i16 convention). See module docs for the byte layout.
-fn parse_snd_frame(body: &[u8]) -> Vec<Complex32> {
+/// One parsed `SND` frame: its sequence number (MAN-128 gap tracking) and
+/// raw, un-resampled complex samples.
+struct SndFrame {
+    seq: u32,
+    samples: Vec<Complex32>,
+}
+
+/// Parse an SND frame's bytes (after the 3-byte `"SND"` tag). Returns `None`
+/// when the frame is shorter than the fixed header (malformed -- MAN-128,
+/// mirroring MAN-22's HPSDR malformed-packet counting); a frame exactly as
+/// long as the header is valid, with zero samples. Sample values are
+/// normalized to roughly [-1, 1] (matching `WavIqSource`'s i16 convention).
+/// See module docs for the byte layout.
+fn parse_snd_frame(body: &[u8]) -> Option<SndFrame> {
     const HEADER_LEN: usize = 1 + 4 + 2 + 10; // flags + seq + smeter + gps
-    if body.len() <= HEADER_LEN {
-        return Vec::new();
+    if body.len() < HEADER_LEN {
+        return None;
     }
     let flags = body[0];
+    let seq = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
     let little_endian = flags & 0x80 != 0;
     let payload = &body[HEADER_LEN..];
     let n_pairs = payload.len() / 4;
@@ -469,7 +496,88 @@ fn parse_snd_frame(body: &[u8]) -> Vec<Complex32> {
             q_raw as f32 / 32768.0,
         ));
     }
-    out
+    Some(SndFrame { seq, samples: out })
+}
+
+/// Tracks the `seq` field across consecutive `SND` frames (MAN-128,
+/// generalizing MAN-56's HPSDR gap-stat wiring to KiwiSDR) to detect lost
+/// frames. KiwiSDR's SND `seq` advances by exactly 1 per frame in normal
+/// operation (confirmed against kiwirecorder.py's own `Block: %08x` log,
+/// `jks-prv/kiwiclient`).
+#[derive(Default)]
+struct SndSeqTracker {
+    last: Option<u32>,
+    /// Malformed frames received since the last valid one: they arrived, so
+    /// the next `seq` delta must not count them as lost.
+    malformed_since_last: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeqObservation {
+    /// The very first frame seen: nothing to compare against yet.
+    Baseline,
+    /// `seq` advanced by exactly 1: no loss.
+    InOrder,
+    /// `seq` advanced by more than 1 (bounded by `MAX_PLAUSIBLE_SEQ_JUMP`):
+    /// `missing` frames were dropped in transit.
+    Gap { missing: u32 },
+    /// A duplicate, backward, or implausibly large jump: most likely a
+    /// server-side counter reset, not a real loss event. Re-baselines
+    /// silently rather than reporting a nonsensical gap.
+    Resync,
+}
+
+impl SndSeqTracker {
+    fn observe(&mut self, seq: u32) -> SeqObservation {
+        let observation = match self.last {
+            None => SeqObservation::Baseline,
+            Some(last) => match seq.wrapping_sub(last) {
+                0 => SeqObservation::Resync,
+                1 => SeqObservation::InOrder,
+                delta if delta <= MAX_PLAUSIBLE_SEQ_JUMP => {
+                    match (delta - 1).saturating_sub(self.malformed_since_last) {
+                        0 => SeqObservation::InOrder,
+                        missing => SeqObservation::Gap { missing },
+                    }
+                }
+                _ => SeqObservation::Resync,
+            },
+        };
+        self.last = Some(seq);
+        self.malformed_since_last = 0;
+        observation
+    }
+
+    /// Note a malformed frame: its `seq` bytes may be missing or garbage, so
+    /// it doesn't move the baseline, but it is excluded from the next delta.
+    fn observe_malformed(&mut self) {
+        self.malformed_since_last = self.malformed_since_last.saturating_add(1);
+    }
+}
+
+/// Parse one SND frame's body and account it against `counters`/`tracker`:
+/// a malformed (too-short) frame counts as one malformed packet, and a
+/// forward `seq` jump counts as one gap event plus its missing-frame count,
+/// net of malformed frames received since the previous valid one.
+/// Returns the frame's samples, or `None` if the frame was malformed.
+fn account_snd_frame(
+    counters: &InputHealthCounters,
+    tracker: &mut SndSeqTracker,
+    body: &[u8],
+) -> Option<Vec<Complex32>> {
+    let frame = match parse_snd_frame(body) {
+        Some(frame) => frame,
+        None => {
+            counters.record_malformed();
+            tracker.observe_malformed();
+            return None;
+        }
+    };
+    if let SeqObservation::Gap { missing } = tracker.observe(frame.seq) {
+        counters.record_gap();
+        counters.record_dropped(missing as u64);
+    }
+    Some(frame.samples)
 }
 
 impl IqSource for KiwiIqSource {
@@ -479,6 +587,10 @@ impl IqSource for KiwiIqSource {
 
     fn center_freq_hz(&self) -> f64 {
         self.center_freq_hz
+    }
+
+    fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+        Some(self.health.clone())
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -521,12 +633,13 @@ impl IqSource for KiwiIqSource {
 
             match msg {
                 Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"SND" => {
-                    let samples = parse_snd_frame(&b[3..]);
-                    for s in samples {
-                        self.raw.push(s.re);
-                        self.raw.push(s.im);
+                    if let Some(samples) = account_snd_frame(&self.health, &mut self.seq, &b[3..]) {
+                        for s in samples {
+                            self.raw.push(s.re);
+                            self.raw.push(s.im);
+                        }
+                        self.drain_resampler()?;
                     }
-                    self.drain_resampler()?;
                 }
                 Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"MSG" => {
                     let text = String::from_utf8_lossy(&b[3..]);
@@ -662,11 +775,14 @@ mod tests {
         // + 2 complex pairs (BE by default).
         let mut body = vec![0u8; 17];
         body[0] = 0x08; // stereo, big-endian
+        body[1..5].copy_from_slice(&42u32.to_le_bytes()); // seq
         body.extend_from_slice(&1000i16.to_be_bytes()); // I0
         body.extend_from_slice(&(-2000i16).to_be_bytes()); // Q0
         body.extend_from_slice(&32767i16.to_be_bytes()); // I1
         body.extend_from_slice(&(-32768i16).to_be_bytes()); // Q1
-        let samples = parse_snd_frame(&body);
+        let frame = parse_snd_frame(&body).expect("valid frame");
+        assert_eq!(frame.seq, 42);
+        let samples = frame.samples;
         assert_eq!(samples.len(), 2);
         assert!((samples[0].re - 1000.0 / 32768.0).abs() < 1e-6);
         assert!((samples[0].im - (-2000.0 / 32768.0)).abs() < 1e-6);
@@ -676,14 +792,129 @@ mod tests {
         // Same payload bytes, little-endian flag set: values decode differently.
         let mut le_body = body.clone();
         le_body[0] = 0x08 | 0x80;
-        let le_samples = parse_snd_frame(&le_body);
+        let le_samples = parse_snd_frame(&le_body).expect("valid frame").samples;
         assert_eq!(le_samples.len(), 2);
         assert_ne!(le_samples[0].re, samples[0].re);
     }
 
     #[test]
-    fn short_snd_frame_yields_no_samples() {
-        assert!(parse_snd_frame(&[0u8; 10]).is_empty());
+    fn frame_shorter_than_header_is_malformed() {
+        assert!(parse_snd_frame(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn header_only_frame_is_valid_with_zero_samples() {
+        let mut body = vec![0u8; 17];
+        body[1..5].copy_from_slice(&7u32.to_le_bytes());
+        let frame = parse_snd_frame(&body).expect("header-only frame is valid");
+        assert_eq!(frame.seq, 7);
+        assert!(frame.samples.is_empty());
+    }
+
+    #[test]
+    fn seq_tracker_first_frame_sets_baseline_without_loss() {
+        let mut t = SndSeqTracker::default();
+        assert_eq!(t.observe(7), SeqObservation::Baseline);
+    }
+
+    #[test]
+    fn seq_tracker_consecutive_frames_report_no_gap() {
+        let mut t = SndSeqTracker::default();
+        t.observe(7);
+        assert_eq!(t.observe(8), SeqObservation::InOrder);
+        assert_eq!(t.observe(9), SeqObservation::InOrder);
+    }
+
+    #[test]
+    fn seq_tracker_forward_jump_reports_one_gap_and_missing_frames() {
+        let mut t = SndSeqTracker::default();
+        t.observe(7);
+        assert_eq!(t.observe(11), SeqObservation::Gap { missing: 3 });
+    }
+
+    #[test]
+    fn seq_tracker_wraps_at_u32_max() {
+        let mut t = SndSeqTracker::default();
+        t.observe(u32::MAX);
+        assert_eq!(t.observe(0), SeqObservation::InOrder);
+
+        let mut t2 = SndSeqTracker::default();
+        t2.observe(u32::MAX);
+        assert_eq!(t2.observe(2), SeqObservation::Gap { missing: 2 });
+    }
+
+    #[test]
+    fn seq_tracker_duplicate_or_backward_rebaselines_without_counting() {
+        let mut t = SndSeqTracker::default();
+        t.observe(100);
+        assert_eq!(t.observe(100), SeqObservation::Resync);
+
+        let mut t2 = SndSeqTracker::default();
+        t2.observe(100);
+        assert_eq!(t2.observe(50), SeqObservation::Resync);
+        assert_eq!(t2.observe(51), SeqObservation::InOrder);
+    }
+
+    #[test]
+    fn seq_tracker_implausibly_large_jump_rebaselines() {
+        let mut t = SndSeqTracker::default();
+        t.observe(0);
+        assert_eq!(
+            t.observe(MAX_PLAUSIBLE_SEQ_JUMP + 1),
+            SeqObservation::Resync
+        );
+    }
+
+    #[test]
+    fn kiwi_health_counters_apply_tracker_results() {
+        let counters = InputHealthCounters::new();
+        let mut tracker = SndSeqTracker::default();
+
+        let frame_with_seq = |seq: u32| {
+            let mut body = vec![0u8; 17];
+            body[1..5].copy_from_slice(&seq.to_le_bytes());
+            body
+        };
+
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(1)).is_some());
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(2)).is_some());
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(5)).is_some());
+        assert!(account_snd_frame(&counters, &mut tracker, &[0u8; 5]).is_none());
+
+        assert_eq!(counters.gaps_detected(), 1);
+        assert_eq!(counters.dropped_packets(), 2);
+        assert_eq!(counters.malformed_packets(), 1);
+    }
+
+    /// A malformed frame was received, not lost: it must not also be counted
+    /// as a gap/dropped frame by the next valid frame's `seq` delta.
+    #[test]
+    fn malformed_frame_between_valid_frames_is_not_counted_as_lost() {
+        let counters = InputHealthCounters::new();
+        let mut tracker = SndSeqTracker::default();
+
+        let frame_with_seq = |seq: u32| {
+            let mut body = vec![0u8; 17];
+            body[1..5].copy_from_slice(&seq.to_le_bytes());
+            body
+        };
+
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(1)).is_some());
+        assert!(account_snd_frame(&counters, &mut tracker, &[0u8; 5]).is_none());
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(3)).is_some());
+
+        assert_eq!(counters.malformed_packets(), 1);
+        assert_eq!(counters.gaps_detected(), 0);
+        assert_eq!(counters.dropped_packets(), 0);
+
+        // Real loss alongside a malformed arrival still counts, net of it:
+        // of seq 4-6, one arrived malformed and two were lost.
+        assert!(account_snd_frame(&counters, &mut tracker, &[0u8; 5]).is_none());
+        assert!(account_snd_frame(&counters, &mut tracker, &frame_with_seq(7)).is_some());
+
+        assert_eq!(counters.malformed_packets(), 2);
+        assert_eq!(counters.gaps_detected(), 1);
+        assert_eq!(counters.dropped_packets(), 2);
     }
 
     /// Resampling math alone, no network: construct the same `rubato::Fft`

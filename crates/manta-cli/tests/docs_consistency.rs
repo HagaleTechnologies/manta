@@ -18,7 +18,11 @@ fn repo_root() -> PathBuf {
 
 fn doc(rel: &str) -> String {
     let p = repo_root().join(rel);
-    fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+    fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+        // Windows checkouts may convert LF to CRLF; the tests below parse LF-delimited
+        // frontmatter and line structure.
+        .replace("\r\n", "\n")
 }
 
 /// Every run of whitespace collapsed to a single space, so a phrase that a
