@@ -50,11 +50,14 @@ if a > T_cls: E_hi ← E_hi + α_hi·(a − E_hi)      # pre-MAN-103 classificat
 else:         E_lo ← E_lo + α_lo·(a − E_lo)
 if 1.25·T_cls < a ≤ mid + half: fade_run += 1; fade_sum += a
 else:                           fade_run = 0;  fade_sum = 0
-if fade_run ≥ debounce_hops:    E_hi ← fade_sum / fade_run
+if fade_run ≥ max(debounce_hops, 1): E_hi ← fade_sum / fade_run
 ```
 
 The re-anchor fires on every hop while the run is at or above `debounce_hops`
-(it is not reset when it fires). The collapse floor, the one-shot `A_ref`
+(it is not reset when it fires). The `max(…, 1)` only matters for a configured
+`debounce_ms` that rounds to 0 hops, where an empty run would otherwise give
+`E_hi = 0/0 = NaN` (found in self-review; pinned by
+`zero_debounce_does_not_poison_e_hi`). The collapse floor, the one-shot `A_ref`
 re-estimation (which now also rescales `fade_sum`) and MAN-103's D3 key
 decision all run afterwards, unchanged. `K = FADE_FLOOR_RATIO = 1.25` is
 exactly the pre-MAN-103 key-down threshold, so the fade margin restored is the
@@ -222,7 +225,11 @@ pipeline — stands, with a larger per-cell spread at 40 WPM than stated.
   40 WPM scene; MAN-103 fixed that merge and this change keeps it, so the
   assertion is flipped to `assert_eq!` (Legacy returns
   `"CQ TEST W5AU W5AU TEST"`).
-- `cargo test --release -p manta-decode --lib`: 107 passed, 0 failed.
+- `envelope::tests::zero_debounce_does_not_poison_e_hi`: a `debounce_ms`
+  that rounds to 0 hops leaves `E_hi` finite (fails with `NaN` without the
+  `max(…, 1)` guard).
+- `cargo test --release -p manta-decode --lib`: 108 passed, 0 failed (the
+  plan's 107 plus the review-driven test above).
 
 ### First mark after an abrupt fade
 

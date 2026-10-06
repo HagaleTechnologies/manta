@@ -308,11 +308,12 @@ T_cls = sqrt(E_hi * max(E_lo, 1e-6))
 if a[m] > T_cls: E_hi ← E_hi + α_hi · (a[m] − E_hi)
 else:            E_lo ← E_lo + α_lo · (a[m] − E_lo)
 # fade re-anchor: n consecutive hops with 1.25·T_cls < a ≤ mid + half,
-# n ≥ debounce_hops  →  E_hi ← mean(a over those n hops)
+# n ≥ max(debounce_hops, 1)  →  E_hi ← mean(a over those n hops)
 ```
 
 The re-anchor fires on every hop while the run stays at or above
-`debounce_hops` (the run is not reset when it fires). The one-shot `A_ref`
+`debounce_hops` (the run is not reset when it fires); a `debounce_ms` that
+rounds to 0 hops still needs one in-zone sample. The one-shot `A_ref`
 re-estimation (§3.1) rescales the run's accumulated sum by the same factor as
 the rails.
 

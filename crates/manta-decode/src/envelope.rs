@@ -323,7 +323,9 @@ impl Demod {
             self.fade_run = 0;
             self.fade_sum = 0.0;
         }
-        if self.fade_run >= self.debounce_hops {
+        // `max(1)`: a configured `debounce_ms` that rounds to 0 hops must
+        // not re-anchor on an empty run (0/0 would make `E_hi` NaN).
+        if self.fade_run >= self.debounce_hops.max(1) {
             self.e_hi = self.fade_sum / self.fade_run as f32;
         }
         // (2) rail-collapse floor (SPEC §3.2)
@@ -766,5 +768,27 @@ mod tests {
         for &m in &marks[1..] {
             assert!(m.abs_diff(30) <= 1, "faded mark length {marks:?}");
         }
+    }
+
+    /// MAN-213 review: with `debounce_ms` rounding to 0 hops the fade
+    /// re-anchor must still need one in-zone sample, never divide an empty
+    /// run (`0/0` NaN would freeze the key and silence the track).
+    #[test]
+    fn zero_debounce_does_not_poison_e_hi() {
+        let mut d = Demod::new(DemodConfig {
+            debounce_ms: 0.0,
+            ..DemodConfig::default()
+        });
+        assert_eq!(d.debounce_hops, 0);
+        let mut ts = 0u64;
+        let mut marks = 0;
+        for level in [1.0f32, 0.02, 0.5, 0.02].iter().cycle().take(4 * 40) {
+            for _ in 0..30 {
+                marks += d.push(*level, ts).iter().filter(|r| r.mark).count();
+                ts += 256;
+            }
+        }
+        assert!(d.e_hi.is_finite(), "e_hi {}", d.e_hi);
+        assert!(marks > 0, "no marks emitted");
     }
 }
