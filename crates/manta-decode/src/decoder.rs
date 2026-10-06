@@ -1624,4 +1624,34 @@ mod tests {
         events.extend(dec.finish());
         assert_eq!(events_to_text(&events), "TTTTT");
     }
+
+    /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact
+    /// through a mid-text fade -- abrupt (-6 / -9 dB inside a word gap),
+    /// gradual (-6 dB ramp) and periodic QSB (10 dB peak-to-trough, 2 s).
+    #[test]
+    fn legacy_decodes_through_a_mid_text_fade() {
+        let text = "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K";
+        let base = rect_envelope_depth(text, 22, 30.0);
+        let n = base.len();
+        let lo = 10f32.powf(-30.0 / 20.0);
+        let profiles: [(&str, &dyn Fn(usize) -> f32); 4] = [
+            ("step -6 dB", &|i| if i < n / 3 { 1.0 } else { 0.5 }),
+            ("step -9 dB", &|i| if i < n / 3 { 1.0 } else { 0.355 }),
+            ("ramp -6 dB", &|i| {
+                1.0 - 0.5 * ((i as f32 / n as f32 - 0.3).clamp(0.0, 0.2) / 0.2)
+            }),
+            ("QSB 10 dB / 2 s", &|i| {
+                let t = i as f32 / 375.0;
+                0.658 + 0.342 * (std::f32::consts::PI * t).cos()
+            }),
+        ];
+        for (name, gain) in profiles {
+            let env: Vec<f32> = base
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| lo + (v - lo) * gain(i))
+                .collect();
+            assert_eq!(decode_with(Engine::Legacy, &env), text, "{name}");
+        }
+    }
 }

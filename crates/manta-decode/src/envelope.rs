@@ -682,4 +682,50 @@ mod tests {
             }
         }
     }
+
+    /// MAN-213 Scenario 1: a mark that fades to half its pre-fade amplitude
+    /// must pull `E_hi` down to the new level and stay keyed, not stall the
+    /// rail at its pre-fade value and vanish inside the decision band.
+    #[test]
+    fn faded_mark_rail_tracks_down_and_stays_keyed() {
+        let mut d = Demod::new(DemodConfig::default());
+        let db = d.debounce_hops;
+        let mut ts = 0u64;
+        let mut runs = Vec::new();
+        let mut feed = |d: &mut Demod, level: f32, hops: u32, runs: &mut Vec<Run>| {
+            for _ in 0..hops {
+                runs.extend(d.push(level, ts));
+                ts += 256;
+            }
+        };
+        for _ in 0..30 {
+            feed(&mut d, 1.0, 30, &mut runs);
+            feed(&mut d, 0.02, 30, &mut runs);
+        }
+        assert!((d.e_hi - 1.0).abs() < 0.05, "warm-up e_hi {}", d.e_hi);
+        // Runs are emitted one confirmation late, so select by timestamp.
+        let fade_start_ts = 30 * 60 * 256;
+        // 2 * debounce_hops into the fade, the rail has re-anchored and the
+        // key is down.
+        feed(&mut d, 0.5, 2 * db, &mut runs);
+        assert!(d.key_down, "faded mark never keyed down (e_hi {})", d.e_hi);
+        feed(&mut d, 0.5, 60 - 2 * db, &mut runs);
+        assert!((d.e_hi - 0.5).abs() < 0.05, "e_hi stalled at {}", d.e_hi);
+        feed(&mut d, 0.02, 30, &mut runs);
+        for _ in 0..5 {
+            feed(&mut d, 0.5, 30, &mut runs);
+            feed(&mut d, 0.02, 30, &mut runs);
+        }
+        runs.extend(d.finish());
+        let marks: Vec<u32> = runs
+            .iter()
+            .filter(|r| r.mark && r.start_ts >= fade_start_ts)
+            .map(|r| r.hops)
+            .collect();
+        assert_eq!(marks.len(), 6, "faded marks lost or split: {marks:?}");
+        assert!(marks[0] >= 60 - db, "first faded mark {marks:?}");
+        for &m in &marks[1..] {
+            assert!(m.abs_diff(30) <= 1, "faded mark length {marks:?}");
+        }
+    }
 }
