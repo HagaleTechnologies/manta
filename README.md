@@ -142,7 +142,7 @@ needs it spelled out, so it is a placeholder here too and you can drop the
 flag entirely when yours is on 8073:
 
 ```sh
-manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
@@ -182,7 +182,7 @@ Start the server in one terminal. It runs in the foreground until you stop it:
 
 ```sh
 manta run --config server.toml --kiwi-host <your-kiwi-host> \
-    --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+    --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
 Then probe it from a second terminal:
@@ -211,6 +211,11 @@ before you widen it, read
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
+
+The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
+`--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
+`--hpsdr-rate-hz`. The older `--kiwi-freq` / `--soapy-freq` /
+`--soapy-rate` / `--hpsdr-freq` / `--hpsdr-rate` spellings still work.
 
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
