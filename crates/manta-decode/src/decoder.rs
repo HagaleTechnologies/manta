@@ -935,11 +935,11 @@ mod tests {
             decode_with(Engine::EdgeLegacy, &env),
             "CQ TEST W5AU W5AU TEST"
         );
-        // Documents the defect this engine fixes: fed the SAME deep-keyed
-        // scene, the Legacy chain's geometric-mean threshold (SPEC v1 §3.2)
-        // merges words together (its E_hi/E_lo rails can't track the deep
-        // keying depth correctly at contest speed).
-        assert_ne!(decode_with(Engine::Legacy, &env), "CQ TEST W5AU W5AU TEST");
+        // The Legacy chain's old geometric-mean key threshold (SPEC v1
+        // §3.2) merged words on this deep-keyed scene. MAN-103's midpoint
+        // key-decision band fixed that word-merge, MAN-213's fade-tracking
+        // rails kept the fix, and both engines now decode it exactly.
+        assert_eq!(decode_with(Engine::Legacy, &env), "CQ TEST W5AU W5AU TEST");
     }
 
     #[test]

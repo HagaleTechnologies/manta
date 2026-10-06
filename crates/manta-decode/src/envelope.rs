@@ -56,6 +56,11 @@ const INIT_HOPS: usize = 375; // SPEC §3.2: rails from the first 1 s
 const AREF_HOPS: usize = 188; // SPEC §3.1: A_ref from the first 500 ms (ms_to_hops(500))
 const MIN_KEYING_RATIO: f32 = 2.0; // SPEC §3.2: < 6 dB apparent depth -> pre-decode
 const E_LO_FLOOR: f32 = 1e-6;
+/// SPEC §3.2 (MAN-213): fade-evidence floor, as a multiple of the rails'
+/// geometric mean -- exactly the pre-MAN-103 key-down threshold
+/// `1.25*sqrt(E_hi*E_lo)`, so the fade margin MAN-103 traded away is
+/// restored without moving the key decision itself.
+const FADE_FLOOR_RATIO: f32 = 1.25;
 /// SPEC §2.3: `10*log10(2500/93.75)`, the channel (93.75 Hz) to 2500 Hz
 /// reference-bandwidth conversion. `pub` (MAN-102) so `manta-engine` can
 /// convert its own floor-based `S - F` estimate with the identical
@@ -89,6 +94,10 @@ pub struct Demod {
     held: Option<Run>,
     reest_done: bool,
     debounce_hops: u32,
+    /// MAN-213: consecutive hops whose sample sits between the fade floor
+    /// and the key-down bound, and their sum (SPEC §3.2 fade re-anchor).
+    fade_run: u32,
+    fade_sum: f32,
 }
 
 impl Demod {
@@ -115,6 +124,8 @@ impl Demod {
             held: None,
             reest_done: false,
             debounce_hops,
+            fade_run: 0,
+            fade_sum: 0.0,
         }
     }
 
@@ -273,10 +284,11 @@ impl Demod {
     }
 
     /// Additive symmetric keying-decision band about the linear-amplitude
-    /// midpoint of the two rails (MAN-103 D3/D5, replacing the geometric-
-    /// mean threshold `T = sqrt(E_hi*E_lo)`). Shared by the rail-update
-    /// split and the key decision so the two can never define the boundary
-    /// differently.
+    /// midpoint of the two rails (MAN-103 D3, replacing the geometric-mean
+    /// threshold `T = sqrt(E_hi*E_lo)` for the key decision). Gates the key
+    /// decision and bounds the fade re-anchor zone from above; the rail
+    /// split itself uses the geometric mean (MAN-213), so an in-band faded
+    /// mark still updates a rail instead of freezing both.
     fn decision_band(&self) -> (f32, f32) {
         let lo = self.e_lo.max(E_LO_FLOOR);
         let mid = 0.5 * (self.e_hi + lo);
@@ -286,17 +298,33 @@ impl Demod {
 
     fn step(&mut self, a_raw: f32, sample_ts: u64, out: &mut Vec<Run>) {
         let a = a_raw / self.a_ref;
-        // Pinned decision 9 ordering, MAN-103 D3/D5:
-        // (1) rail update against the previous decision band -- update only
-        //     the rail a sample confidently belongs to (SPEC §3.2). A
-        //     sample inside the band is mid-transition and belongs to
-        //     neither level train (D5): excluding it removes a
-        //     transition-width-dependent residual the old `a > T` split left.
+        // Pinned decision 9 ordering, MAN-103 D3 + MAN-213:
+        // (1) rail update against the previous rails (SPEC §3.2). Every
+        //     sample updates exactly one rail, split at the geometric mean
+        //     `T_cls = sqrt(E_hi*E_lo)` (the pre-MAN-103 classification):
+        //     gating the rails on the key-decision band (MAN-103 D5) froze
+        //     both rails whenever a mark faded into that band. A sustained
+        //     run of `debounce_hops` samples between the old key-down
+        //     threshold `1.25*T_cls` and the key-down bound `mid + half` is
+        //     a faded mark, and re-anchors `E_hi` to its mean so the band
+        //     follows the fade down -- see
+        //     docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md.
         let (mid, half) = self.decision_band();
-        if a > mid + half {
+        let t_cls = (self.e_hi * self.e_lo.max(E_LO_FLOOR)).sqrt();
+        if a > t_cls {
             self.e_hi += self.alpha_hi * (a - self.e_hi);
-        } else if a < mid - half {
+        } else {
             self.e_lo += self.alpha_lo * (a - self.e_lo);
+        }
+        if a > FADE_FLOOR_RATIO * t_cls && a <= mid + half {
+            self.fade_run += 1;
+            self.fade_sum += a;
+        } else {
+            self.fade_run = 0;
+            self.fade_sum = 0.0;
+        }
+        if self.fade_run >= self.debounce_hops {
+            self.e_hi = self.fade_sum / self.fade_run as f32;
         }
         // (2) rail-collapse floor (SPEC §3.2)
         if self.e_hi < 2.0 * self.e_lo {
@@ -313,6 +341,7 @@ impl Demod {
             let factor = self.a_ref / new_ref;
             self.e_hi *= factor;
             self.e_lo *= factor;
+            self.fade_sum *= factor;
             self.a_ref = new_ref;
             self.reest_done = true;
         }
@@ -605,14 +634,19 @@ mod tests {
     /// -- inflating every measured mark, worse at higher depth and wider
     /// transition width (i.e. worse near a channel edge, where the
     /// recovered envelope's rise/fall is slower). The additive band about
-    /// the linear-amplitude midpoint (D3), with both rails updated only
-    /// from samples outside that band (D5), must recover the envelope's
-    /// true 50%-crossing mark duration regardless of depth or transition
-    /// width. Feeds a synthetic, noiseless, exactly symmetric raised-cosine
-    /// keyed envelope and checks the measured mark against the analytically
-    /// known 50%-crossing duration -- see
+    /// the linear-amplitude midpoint (D3) must recover the envelope's true
+    /// 50%-crossing mark duration regardless of depth: within ±1 hop for
+    /// ramps of up to 6 hops. The 12-hop ramp is a degenerate triangular
+    /// pulse (no flat top); MAN-213's fade-tolerant geometric-mean rail
+    /// split lets its transition samples pull `E_hi` slightly low, a
+    /// measured +2..+3 hop residual bounded here to `0..=3`. Feeds a
+    /// synthetic, noiseless, exactly symmetric raised-cosine keyed envelope
+    /// and checks the measured mark against the analytically known
+    /// 50%-crossing duration -- see
     /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md for the
-    /// before/after bias tables this test pins.
+    /// before/after bias tables this test pins, and
+    /// docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md for
+    /// the MAN-213 edge-bias table.
     #[test]
     fn keying_edge_placement_is_unbiased_across_depth_and_ramp() {
         const ON_HOPS: u32 = 24;
@@ -673,8 +707,13 @@ mod tests {
                 );
                 for &m in &steady {
                     let bias = m as i64 - true_mark_hops as i64;
+                    let ok = if ramp_hops <= 6 {
+                        bias.abs() <= 1
+                    } else {
+                        (0..=3).contains(&bias)
+                    };
                     assert!(
-                        bias.abs() <= 1,
+                        ok,
                         "depth {depth_db} dB ramp {ramp_hops} hops: measured mark {m} hops, \
                          true 50%-crossing mark {true_mark_hops} hops, bias {bias}"
                     );

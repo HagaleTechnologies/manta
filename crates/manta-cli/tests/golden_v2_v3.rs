@@ -198,18 +198,12 @@ fn v5_passes_end_to_end_from_wav() {
     );
 }
 
-/// Ignored: regressed from green (sub-project 1's placeholder detector) to
-/// CER 0.1429 (need <= 0.10) under the real detector/track manager landed
-/// in M2 sub-project 2. Errors scattered throughout the decode rather than
-/// confined to a lost leading prefix, ruling out the SPEC §2.1 warmup-floor
-/// mechanism behind every other Task 11 tolerance fix on this branch --
-/// confirmed during Task 11's investigation as a genuine, unrelated
-/// classical-decoder fading-robustness gap under `WattersonPreset` fading,
-/// same family as V5's pre-existing `#[ignore]`. Filed as
-/// <https://github.com/HagaleTechnologies/manta/issues/25>; revisit
-/// alongside V5 once manta-decode gains real fading resilience (M4).
+/// Passes since MAN-213's fade-tracking keying rails (measured CER 0.0159
+/// against <= 0.10) -- see
+/// docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md. Issue
+/// <https://github.com/HagaleTechnologies/manta/issues/25> is the fading gap
+/// this test tracked while `#[ignore]`d.
 #[test]
-#[ignore]
 fn v6_passes_end_to_end_from_wav() {
     let spec = manta_testkit::vectors::v6();
     let (report, manifest) = decode_report(&spec);
