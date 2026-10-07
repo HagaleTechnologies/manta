@@ -5,7 +5,7 @@
 
 /// SPEC §9 `[detector]` table, plus ARCHITECTURE §4's track cap (not in the
 /// literal SPEC table -- see the plan's Global Constraints).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectorConfig {
     /// Rise threshold in dB SNR. **Deviation from SPEC §9's literal 6.0 dB
     /// default (see `impl Default`).**
@@ -909,6 +909,21 @@ impl TrackManager {
         self.owner_of.len()
     }
 
+    /// The id the next spawned track will receive. MAN-73: used by
+    /// `listen()`'s segment restart to carry the id sequence across a
+    /// discontinuity, so a fresh segment's `TrackManager` never reuses an
+    /// id from the segment it replaced.
+    pub fn next_track_id(&self) -> u32 {
+        self.next_id
+    }
+
+    /// Resume track id assignment from `next` instead of this manager's
+    /// default of 1. MAN-73: used by `listen()`'s segment restart so ids
+    /// are never reused within a session.
+    pub fn resume_track_ids_from(&mut self, next: u32) {
+        self.next_id = next;
+    }
+
     /// SPEC v2 §2.2's min-of-six-neighbors spectral reference for a
     /// track's centroid channel, converted from dB to linear power (the
     /// unit `NoiseTracker::push`'s `spectral_ref_power` expects). Always
@@ -1549,6 +1564,31 @@ impl TrackManager {
     /// Flush every track's decoder (SPEC §5 end-of-stream). Call once,
     /// after the last `process_hops`.
     pub fn finish(&mut self) -> Vec<DecoderEvent> {
+        self.close_all(false)
+    }
+
+    /// Close every track at a source discontinuity (MAN-73: a live source
+    /// reconnected after an outage), not a stream end. A transport gap is
+    /// not evidence the RF signal ended -- the same transmission can still
+    /// be on the air when samples resume (PR #207 review) -- so each track
+    /// closes like a Merged/Evicted one: `finish_decoder_speed_only` (no
+    /// forced decode of a truncated trailing element) and
+    /// `ClosureKind::Bookkeeping` with no survivor, which keeps
+    /// `manta-spot`'s `Validator` from reading the post-reconnect track as a
+    /// distinct message. Its pending beacons are discarded and counted
+    /// (`pending_beacon_lost_to_eviction`, as for an Evicted/Silent close),
+    /// never resolved against a truncated track's speed. Under the
+    /// `EdgeLegacy`/`Hsmm` engines `TrackDecoder::finish_speed_only` flushes
+    /// nothing (MAN-169), so those engines' buffered output is dropped here
+    /// as at a merge/eviction. As with `finish`, the manager holds no tracks
+    /// afterwards.
+    pub fn finish_for_discontinuity(&mut self) -> Vec<DecoderEvent> {
+        self.close_all(true)
+    }
+
+    /// Shared body of `finish` (`discontinuity == false`: genuine stream
+    /// end, `SignalEnded`) and `finish_for_discontinuity` (`true`).
+    fn close_all(&mut self, discontinuity: bool) -> Vec<DecoderEvent> {
         use rayon::prelude::*;
         // MAN-194: end-of-stream is another point where every remaining
         // track's refiner stops receiving new input -- drain each one's
@@ -1567,7 +1607,13 @@ impl TrackManager {
             .tracks
             .values_mut()
             .par_bridge()
-            .flat_map_iter(|t| t.finish_decoder())
+            .flat_map_iter(|t| {
+                if discontinuity {
+                    t.finish_decoder_speed_only()
+                } else {
+                    t.finish_decoder()
+                }
+            })
             .collect();
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         // MAN-19 round 3: honor the same teardown contract `process_hops`
@@ -1606,8 +1652,15 @@ impl TrackManager {
                 .into_iter()
                 .map(|track_id| DecoderEvent::TrackClosed {
                     track_id,
-                    // Overall stream end -- always a genuine end-of-signal (round 9).
-                    closure: ClosureKind::SignalEnded,
+                    // Overall stream end -- always a genuine end-of-signal
+                    // (round 9). A discontinuity is not (MAN-73).
+                    closure: if discontinuity {
+                        ClosureKind::Bookkeeping {
+                            survivor_track_id: None,
+                        }
+                    } else {
+                        ClosureKind::SignalEnded
+                    },
                 }),
         );
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
@@ -3181,6 +3234,40 @@ mod tests {
             1,
             "issue #26: merge must be counted"
         );
+    }
+
+    /// MAN-73: `listen()`'s segment restart resumes id assignment from the
+    /// prior segment's `next_track_id()` so ids are never reused within a
+    /// session.
+    #[test]
+    fn resume_track_ids_from_continues_numbering() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+        let hop_samples = ch.hop() as u64;
+        let mut tm = TrackManager::new(
+            ch.n_channels(),
+            spec.fs,
+            spec.center_freq_hz,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.resume_track_ids_from(42);
+        let mut all_events = Vec::new();
+        for chunk in rendered.samples.chunks(4096) {
+            let hops = ch.process(chunk);
+            all_events.extend(tm.process_hops(&hops, |m| m * hop_samples));
+        }
+        all_events.extend(tm.finish());
+        let first_track_meta_id = all_events
+            .iter()
+            .find_map(|e| match e {
+                DecoderEvent::TrackMeta { track_id, .. } => Some(*track_id),
+                _ => None,
+            })
+            .expect("V1 should produce at least one TrackMeta event");
+        assert_eq!(first_track_meta_id, 42);
     }
 
     /// Minimal rectangular CW envelope, one amplitude sample per HOP (not

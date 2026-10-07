@@ -34,7 +34,7 @@ No GUI. CLI, a TOML config file, and Prometheus metrics.
 $ telnet manta.example.org 7300
 login: W1XYZ
 de W5AU-# >
-DX de W5AU-#:  14000.7  W1AW     CW   7 dB  20 WPM  CQ  1533Z
+DX de W5AU-#:   14000.70  W1AW           CW     7 dB  20 WPM  CQ      1533Z
 ```
 
 ## Why
@@ -142,7 +142,7 @@ needs it spelled out, so it is a placeholder here too and you can drop the
 flag entirely when yours is on 8073:
 
 ```sh
-manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+manta listen --kiwi-host <your-kiwi-host> --kiwi-port <your-kiwi-port> --kiwi-freq-hz 7030000
 ```
 
 File replay (`listen --source`) takes 48 kHz mono audio, or a raw complex-IQ
@@ -165,25 +165,43 @@ below is being worked on.
 
 ## Run it as a node
 
-`run --config` starts the DX cluster telnet server, the JSON/WebSocket
-stream, and the metrics endpoint alongside the decoder:
+One TOML file describes a node: the station and servers in `[server]`, the
+receiver in `[input]`. With a `[server]` table, `run --config` starts the
+DX cluster telnet server, the JSON/WebSocket stream, and the metrics
+endpoint alongside the decoder:
 
 ```toml
-# server.toml
+# manta.toml
 [server]
 station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:` and JSON `deCall`
 bind_addr = "127.0.0.1"     # 0.0.0.0 to accept remote clients
 telnet_port = 7300
 json_port   = 7301
 metrics_port = 7302
+
+[input]
+type = "kiwi"               # audio | file | kiwi | soapy | hpsdr
+host = "<your-kiwi-host>"   # a receiver from the public directory above
+port = 8073   # <your-kiwi-port>: replace if your receiver is not on 8073
+freq_hz = 7030000.0
 ```
 
 Start the server in one terminal. It runs in the foreground until you stop it:
 
 ```sh
-manta run --config server.toml --kiwi-host <your-kiwi-host> \
-    --kiwi-port <your-kiwi-port> --kiwi-freq 7030000
+manta run --config manta.toml
 ```
+
+Every flag still overrides the file, for one-off runs: `run --config
+manta.toml --freq-correction-ppm 2.5` corrects this session only, and
+`--source`, `--device` or `--kiwi-host` replace the whole `[input]` table.
+Service managers can set `MANTA_CONFIG=/etc/manta/manta.toml` instead of
+passing `--config`, and override single keys with `MANTA_<TABLE>_<KEY>`
+variables (`MANTA_INPUT_FREQ_HZ=14030000`). `[spot]`, `[detector]` and
+`[decode]` tables tune the rest;
+[docs/SPEC-decode-core.md](docs/SPEC-decode-core.md) §9 lists every key,
+its default and its precedence. An unknown table or key is an error, not
+silently ignored.
 
 Then probe it from a second terminal:
 
@@ -212,6 +230,11 @@ before you widen it, read
 | OpenHPSDR / Hermes (Hermes-Lite 2, Red Pitaya, QMTech) | `listen --hpsdr-host`, feature `hpsdr` — on in the install line above, no native dependency | Working; protocol verified against reference sources, not yet against hardware |
 | RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — **not** in the install line above; needs the SoapySDR system library, then `--features hpsdr,soapy` | Working, needs hardware soak |
 
+The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
+`--soapy-freq-hz`, `--soapy-rate-hz`, `--hpsdr-freq-hz` and
+`--hpsdr-rate-hz`. The older `--kiwi-freq` / `--soapy-freq` /
+`--soapy-rate` / `--hpsdr-freq` / `--hpsdr-rate` spellings still work.
+
 Targets Linux (x86-64 and ARM, Raspberry Pi 4 class), macOS, and Windows.
 The CPU budget is a full 192 kS/s passband inside one Raspberry Pi 4 core,
 enforced by criterion benches.
@@ -219,9 +242,9 @@ enforced by criterion benches.
 ## Outputs
 
 All four ship today. `manta run --config <file>` starts the telnet
-server, the JSON/WebSocket stream and the metrics endpoint together; the
-outbound uplink starts alongside them only if that config also carries at
-least one `[[rbn_uplink]]` block.
+server, the JSON/WebSocket stream and the metrics endpoint together when
+the file has a `[server]` table; the outbound uplink starts alongside them
+only if that config also carries at least one `[[rbn_uplink]]` block.
 
 - **DX cluster telnet server** (`:7300`) — standard login prompt and
   RBN-format `DX de` lines, with enough command grammar (`sh/dx`,

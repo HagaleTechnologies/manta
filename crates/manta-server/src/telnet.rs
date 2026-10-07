@@ -184,6 +184,7 @@ pub async fn serve(
     ip_quota: IpQuota,
     ip_command_limiter: IpRateLimiter,
     drain_deadline: Duration,
+    line_format: rbn::LineFormat,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -262,6 +263,7 @@ pub async fn serve(
                 log_enabled,
                 rejection_log_limiter,
                 drain_deadline,
+                line_format,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -296,7 +298,8 @@ pub async fn serve(
         peer_ip,
         ip_command_limiter,
         log_enabled,
-        rejection_log_limiter
+        rejection_log_limiter,
+        line_format
     ),
     fields(peer = %peer)
 )]
@@ -313,6 +316,7 @@ async fn handle_client(
     log_enabled: bool,
     rejection_log_limiter: IpRateLimiter,
     drain_deadline: Duration,
+    line_format: rbn::LineFormat,
 ) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
@@ -486,7 +490,7 @@ async fn handle_client(
                                 continue; // below threshold: filtered out
                             }
                         }
-                        if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                        if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot, line_format)
                             .await
                             .is_err()
                         {
@@ -714,7 +718,7 @@ async fn handle_client(
                                     continue;
                                 }
                             }
-                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot)
+                            if write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot, line_format)
                                 .await
                                 .is_err()
                             {
@@ -852,7 +856,13 @@ async fn handle_client(
                                 || !matches!(
                                     tokio::time::timeout(
                                         remaining,
-                                        write_spot_line(&mut wr, &bus, &station_call, &bus_spot.spot),
+                                        write_spot_line(
+                                            &mut wr,
+                                            &bus,
+                                            &station_call,
+                                            &bus_spot.spot,
+                                            line_format,
+                                        ),
                                     )
                                     .await,
                                     Ok(Ok(())),
@@ -900,9 +910,10 @@ async fn write_spot_line(
     bus: &SpotBus,
     station_call: &str,
     spot: &manta_spot::Spot,
+    line_format: rbn::LineFormat,
 ) -> std::io::Result<()> {
     let unix_ts = bus.unix_ts_for(spot.sample_ts);
-    let line = rbn::format_line(spot, station_call, unix_ts);
+    let line = rbn::format_line(spot, station_call, unix_ts, line_format);
     write_with_timeout(wr, line.as_bytes()).await?;
     write_with_timeout(wr, b"\r\n").await
 }

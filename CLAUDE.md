@@ -37,6 +37,9 @@ VR-vectors pass) — see
 docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md. Variable-width
 capture (issue #169, `--capture-rate-hz`) implemented -- see
 docs/superpowers/specs/2026-09-09-variable-width-capture-design.md.
+MAN-261: one TOML file (`[server]`/`[[rbn_uplink]]`/`[input]`/`[spot]`/
+`[detector]`/`[decode]`, CLI > `MANTA_*` > file) configures
+`run`/`soak`/`doctor` — see docs/DECISIONS/2026-10-06-man261-config-surface.md.
 
 ## Documents (read in this order)
 

@@ -1,6 +1,7 @@
 //! Telnet DX-cluster server + JSON Lines/WebSocket spot stream.
 //! ARCHITECTURE §7-§8.
 
+pub mod backoff;
 pub mod band;
 pub mod bounded_io;
 pub mod bus;

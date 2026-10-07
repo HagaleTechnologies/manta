@@ -845,6 +845,8 @@ dependencies = [
  "manta-spot",
  "manta-testkit",
  "num-complex",
+ "regex",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -852,6 +854,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
 ]
 
 [[package]]
@@ -893,6 +896,7 @@ dependencies = [
  "rayon",
  "serde",
  "smallvec",
+ "toml",
  "windows-sys",
 ]
 
