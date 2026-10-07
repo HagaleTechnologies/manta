@@ -706,7 +706,10 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_chars > 1 {
                         self.single_flush_gaps.clear();
+<<<<<<< HEAD
                         self.gaps.confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms());
+=======
+>>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
                     }
                     self.word_chars = 0;
                 }
@@ -753,11 +756,14 @@ impl TrackDecoder {
                 // Farnsworth spacing, which this censoring hides, is
                 // recovered separately from the closed lengths of gaps
                 // flushed after one-character words (`observe_single_flush`).
+<<<<<<< HEAD
                 // A word of two or more characters ends here, so this gap
                 // can confirm such a rebuild (MAN-264).
                 if self.word_chars > 0 {
                     self.gaps.confirm_rebuilt(gap_ms, self.tracker.mu_dit_ms());
                 }
+=======
+>>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
                 self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
@@ -1722,6 +1728,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// MAN-264: one-character words at ordinary spacing, two of them
     /// followed by a 1.6 s pause, fill the rebuild window with
     /// `[8, 8, 33, 33, 8]` dits. That split passes
@@ -1790,6 +1797,8 @@ mod tests {
         assert!(out.ends_with(tail), "{out:?}");
     }
 
+=======
+>>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
     /// `rect_envelope` with Farnsworth spacing: characters keyed at
     /// `char_wpm`, inter-character and word gaps stretched to the ARRL
     /// Farnsworth timing for `eff_wpm`.
@@ -1844,6 +1853,7 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
     /// MAN-264: a fade that drops a dit inside a character, after the
     /// heavy-Farnsworth rebuild has stood a while, leaves an ordinary
     /// 3-dit gap. It must split only that character ("4" as "IA"), not
@@ -1868,6 +1878,8 @@ mod tests {
         assert!(out.ends_with(&expected), "{out:?}");
     }
 
+=======
+>>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
     /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact
     /// through a mid-text fade -- abrupt (-6 / -9 dB inside a word gap),
     /// gradual (-6 dB ramp) and periodic QSB (10 dB peak-to-trough, 2 s).

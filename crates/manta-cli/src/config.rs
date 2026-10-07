@@ -92,6 +92,12 @@ pub(crate) struct Loaded {
     pub input: InputFile,
     /// Top-level tables present after the overlay (for "ignored" notes).
     pub present: BTreeSet<String>,
+    /// The whole document after the `MANTA_*` overlay, untyped: which keys
+    /// were actually set, as written (`manta config check`'s summary and
+    /// placeholder scan, MAN-76).
+    pub raw: toml::Table,
+    /// The `MANTA_<TABLE>_<KEY>` variables the overlay applied, sorted.
+    pub env_vars: Vec<String>,
 }
 
 /// `[spot]`, with relative file paths already resolved (file values against
@@ -134,7 +140,7 @@ impl InputKind {
     }
 
     /// Source keys this type accepts; the shared keys are valid with any type.
-    fn keys(self) -> &'static [&'static str] {
+    pub(crate) fn keys(self) -> &'static [&'static str] {
         match self {
             InputKind::Audio => &["device"],
             InputKind::File => &["path", "iq"],
@@ -287,6 +293,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
     let input = validate_input(input_toml, &|p| resolve_path("input", "path", p))
         .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
 
+    let mut env_vars: Vec<String> = overlay.vars_by_table.into_values().flatten().collect();
+    env_vars.sort();
     Ok(Loaded {
         origin,
         server,
@@ -296,6 +304,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         spot,
         input,
         present: doc.keys().cloned().collect(),
+        raw: doc,
+        env_vars,
     })
 }
 
@@ -1196,6 +1206,32 @@ mod tests {
         );
         // MANTA_CONFIG itself is not an overlay key.
         assert!(load_env(None, &[("MANTA_CONFIG", "/etc/manta.toml")]).is_ok());
+    }
+
+    #[test]
+    fn loaded_carries_the_overlaid_document_and_env_var_names() {
+        let loaded = load_env(
+            Some("[detector]\non_snr_db = 20.0\n"),
+            &[("MANTA_DETECTOR_ON_SNR_DB", "15")],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.raw["detector"]["on_snr_db"],
+            toml::Value::Integer(15)
+        );
+        assert_eq!(
+            loaded.env_vars,
+            vec!["MANTA_DETECTOR_ON_SNR_DB".to_string()]
+        );
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_CONFIG", "/etc/manta.toml"),
+                ("MANTA_GIT_SHA", "abc123"),
+            ],
+        )
+        .unwrap();
+        assert!(loaded.env_vars.is_empty(), "{:?}", loaded.env_vars);
     }
 
     #[test]

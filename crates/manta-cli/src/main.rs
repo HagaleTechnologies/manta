@@ -9,6 +9,7 @@ use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
 mod config;
+mod config_cmd;
 mod reconnect;
 use reconnect::ReconnectingSource;
 
@@ -650,6 +651,40 @@ enum Command {
         json: bool,
         #[command(flatten)]
         filters: FilterOpts,
+    },
+    /// Check or create a config file, without starting anything.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+// MAN-76: `manta config check` / `manta config init`; see config_cmd.rs and
+// docs/DECISIONS/2026-10-07-man76-config-check-init.md.
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Validate a config file and print the settings it resolves to.
+    ///
+    /// Runs every check `manta run` applies to its config, including the
+    /// MANTA_* environment variables, without opening the receiver,
+    /// binding a port or starting a server. Exits 0 when the config is
+    /// valid and 1, naming the setting and the problem, when it is not.
+    Check {
+        /// Config file to check. Defaults to $MANTA_CONFIG, then to
+        /// manta.toml in the current directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Write a new config file listing every setting at its default.
+    ///
+    /// Every setting is commented out, so the new file changes nothing
+    /// until you edit it. Refuses to replace an existing file without
+    /// --force.
+    Init {
+        /// Where to write the file; `-` prints it instead.
+        #[arg(long, default_value = config_cmd::DEFAULT_PATH)]
+        out: PathBuf,
+        /// Replace the file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1916,32 +1951,16 @@ struct SpotServer {
     status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
-/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
-/// exactly the condition `manta_spots_unresolved_geography_total` counts.
-///
-/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
-/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
-/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
-/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
-/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
-/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
-/// alone would let those spots go out carrying `dxDxcc: -1` with the
-/// counter still at zero, silently withholding the one signal this metric
-/// exists to give (round-1 validate code-review finding 1).
-///
-/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
-/// (round-7 review finding 2): `cty.lookup` answers for it through the base
-/// call's prefix, but `from_spot` deliberately discards that answer and emits
-/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
-/// real position is unknown -- so the spot does carry the sentinels this
-/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
-/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
-/// the whole test.
-fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
-    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
-        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
-}
+// MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
+// `UNKNOWN_*` sentinels?" predicate that
+// `manta_spots_unresolved_geography_total` is defined over used to be
+// defined HERE, one crate away from the `SpotMessage::from_spot` it has to
+// agree with -- and it drifted: the station side was classified from the raw
+// configured `station_callsign` while `from_spot` resolved the SSID-stripped
+// one. It now lives beside that code in `manta-server::spot_message`, with
+// the station-side entry point doing the stripping itself so no call site
+// can forget it.
+use manta_server::spot_message::{geography_is_unresolved, station_geography_unresolved};
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
 /// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
@@ -2483,7 +2502,12 @@ fn start_spot_server(
             metrics,
             shutdown_tx,
             tasks,
-            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            // MAN-89: `station_geography_unresolved` strips the RBN `-N`
+            // per-band SSID itself, so this flag is classified through the
+            // SAME string `SpotMessage::from_spot` resolves the de side
+            // through -- see its doc comment for what an unstripped
+            // classification costs.
+            station_geography_unresolved: station_geography_unresolved(&cty, &cfg.station_callsign),
             cty,
             status_line: std::sync::Mutex::new(status_line),
         },
@@ -2511,6 +2535,43 @@ struct CliOverrides {
 }
 
 impl CliOverrides {
+    /// No command-line say at all: what `manta config check` resolves with,
+    /// so it validates exactly what the file and environment give `run`.
+    fn none() -> Self {
+        CliOverrides {
+            device: None,
+            source: None,
+            source_iq: false,
+            kiwi: KiwiOpts {
+                host: None,
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            },
+            #[cfg(feature = "soapy")]
+            soapy: SoapyOpts {
+                driver: None,
+                freq: None,
+                rate: None,
+                gain: None,
+            },
+            #[cfg(feature = "hpsdr")]
+            hpsdr: HpsdrOpts {
+                host: None,
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq: None,
+                rate: None,
+            },
+            freq_correction_ppm: None,
+            dial_freq_hz: None,
+            capture_rate_hz: None,
+            replay_epoch: None,
+            allowlist: Vec::new(),
+            blocklist: None,
+            notch: None,
+        }
+    }
+
     /// The flag that selects a source, if any: given one, the command line
     /// defines the whole source (D6).
     fn source_selector(&self) -> Option<&'static str> {
@@ -3679,6 +3740,8 @@ fn main() -> Result<()> {
                 print_doctor_report(&report);
             }
         }
+        Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
+        Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
     }
     Ok(())
 }
@@ -3819,6 +3882,27 @@ mod tests {
         }
     }
 
+    /// Words an operator who has never seen this repo's specs, roadmap or
+    /// ticket tracker must not meet. Case-insensitive and whole-word: `SPEC`
+    /// and `spec` are the same leak to an operator, but "special-event
+    /// call" is ordinary English and must not trip the guard.
+    const JARGON: &[&str] = &[
+        r"(?i)\bspec\b",
+        r"(?i)\barchitecture\b",
+        r"(?i)\broadmap\b",
+        r"(?i)\bappendix\b",
+        r"\u{a7}",
+        r"\bM[0-4]\b",
+        r"(?i)\bMAN-\d+",
+    ];
+
+    fn jargon_res() -> Vec<regex::Regex> {
+        JARGON
+            .iter()
+            .map(|p| regex::Regex::new(p).unwrap())
+            .collect()
+    }
+
     /// MAN-135: `--help` is read by operators who have never seen this
     /// repo's specs, roadmap, or ticket tracker. Contributor-facing
     /// provenance belongs in `//` comments, which clap never republishes;
@@ -3826,22 +3910,7 @@ mod tests {
     #[test]
     fn help_text_is_free_of_internal_process_jargon() {
         use clap::CommandFactory as _;
-        // Case-insensitive and whole-word: `SPEC` and `spec` are the same
-        // leak to an operator, but "special-event call" is ordinary English
-        // and must not trip the guard.
-        let patterns = [
-            r"(?i)\bspec\b",
-            r"(?i)\barchitecture\b",
-            r"(?i)\broadmap\b",
-            r"(?i)\bappendix\b",
-            r"\u{a7}",
-            r"\bM[0-4]\b",
-            r"(?i)\bMAN-\d+",
-        ];
-        let res: Vec<regex::Regex> = patterns
-            .iter()
-            .map(|p| regex::Regex::new(p).unwrap())
-            .collect();
+        let res = jargon_res();
 
         let mut out = Vec::new();
         help_strings(&Cli::command(), "manta", &mut out);
@@ -3857,6 +3926,26 @@ mod tests {
         assert!(
             bad.is_empty(),
             "internal jargon in --help:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// MAN-76: `manta config init` writes the scaffold into an operator's
+    /// own file, so it is operator-facing copy just as `--help` is.
+    #[test]
+    fn scaffold_is_free_of_internal_process_jargon() {
+        let res = jargon_res();
+        let mut bad = Vec::new();
+        for (n, line) in config_cmd::SCAFFOLD.lines().enumerate() {
+            for re in &res {
+                if let Some(m) = re.find(line) {
+                    bad.push(format!("line {}: {:?} -- {line}", n + 1, m.as_str()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "internal jargon in the config scaffold:\n{}",
             bad.join("\n")
         );
     }
@@ -5297,38 +5386,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     // ---- MAN-261: CLI > env > file precedence (`resolve`) and coverage
 
     fn cli_overrides() -> CliOverrides {
-        CliOverrides {
-            device: None,
-            source: None,
-            source_iq: false,
-            kiwi: KiwiOpts {
-                host: None,
-                port: 8073,
-                freq: None,
-                password: String::new(),
-            },
-            #[cfg(feature = "soapy")]
-            soapy: SoapyOpts {
-                driver: None,
-                freq: None,
-                rate: None,
-                gain: None,
-            },
-            #[cfg(feature = "hpsdr")]
-            hpsdr: HpsdrOpts {
-                host: None,
-                port: manta_input::hpsdr::CONTROL_PORT,
-                freq: None,
-                rate: None,
-            },
-            freq_correction_ppm: None,
-            dial_freq_hz: None,
-            capture_rate_hz: None,
-            replay_epoch: None,
-            allowlist: Vec::new(),
-            blocklist: None,
-            notch: None,
-        }
+        CliOverrides::none()
     }
 
     fn loaded_from(body: &str) -> config::Loaded {
@@ -5619,5 +5677,43 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 panic!("{key}: {body:?} was rejected: {e:#}");
             }
         }
+    }
+
+    // MAN-89 (PR #131 review, rounds 6 and 7): `station_geography_unresolved`
+    // is precomputed from the operator's configured `station_callsign`, which
+    // may carry an RBN `-N` per-band SSID. It must be classified through the
+    // SAME string `SpotMessage::from_spot` resolves -- the SSID-stripped one
+    // -- or a mobile node's spots go out with the de-side sentinels while
+    // `manta_spots_unresolved_geography_total` stays at zero. These drive the
+    // production entry point directly rather than stripping in the test, so
+    // the strip cannot silently move back out to the call sites.
+
+    #[test]
+    fn an_ssid_bearing_mobile_station_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        for call in ["K5ARH/MM-1", "K5ARH/AM-1", "K5ARH/MM-99"] {
+            assert!(
+                !geography_is_unresolved(&cty, call),
+                "test premise: unstripped, {call} reads as resolved -- this is the bug"
+            );
+            assert!(
+                station_geography_unresolved(&cty, call),
+                "{call} carries the de-side sentinels and must be counted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ssid_bearing_ordinary_station_callsign_is_not_counted_as_unresolved() {
+        // The other direction: stripping must not turn a perfectly resolvable
+        // node identity into a counted one.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(!station_geography_unresolved(&cty, "W1AW-1"));
+        assert!(!station_geography_unresolved(&cty, "W1AW/P-2"));
+        // An SSID-free identity is classified exactly as before.
+        assert!(!station_geography_unresolved(&cty, "W1AW"));
+        assert!(station_geography_unresolved(&cty, "W1AW/MM"));
     }
 }

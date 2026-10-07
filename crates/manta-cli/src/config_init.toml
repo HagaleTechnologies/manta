@@ -1,0 +1,199 @@
+# manta configuration file, written by `manta config init`.
+#
+# Every setting manta reads is listed below, commented out and set to its
+# built-in default. To change one, delete the `#` at the start of its line
+# and edit the value. A setting left commented out keeps the built-in
+# default, including any improved default a later manta release brings.
+# A setting marked "no default" shows an example value instead.
+#
+# Check this file:   manta config check --config manta.toml
+# Run with it:       manta run --config manta.toml
+#
+# A command-line flag overrides this file for one run, and so does a
+# MANTA_<TABLE>_<KEY> environment variable such as MANTA_INPUT_FREQ_HZ;
+# a flag beats a variable.
+
+
+# --- Servers -----------------------------------------------------------------
+# The DX-cluster telnet server, the JSON Lines / WebSocket spot stream and
+# the Prometheus metrics endpoint. `manta run` starts them only when this
+# file has a [server] table: delete the `#` in front of [server] and of
+# station_callsign, and set your callsign.
+#
+# With a sound card or a WAV recording as the receiver, `manta run` also
+# needs your radio's dial frequency: set center_freq_hz under [input].
+
+#[server]
+
+# Your callsign, sent as the spotter of every spot. No default; required
+# whenever [server] is present.
+#station_callsign = "N0CALL"
+
+# Address all three servers listen on. The default, 0.0.0.0, accepts
+# connections on every network interface, as a public cluster node
+# expects. The metrics endpoint has no password and shares this address:
+# set "127.0.0.1" to accept connections from this machine only.
+#bind_addr = "0.0.0.0"
+
+#telnet_port = 7300                  # DX-cluster telnet server
+#json_port = 7301                    # JSON Lines and WebSocket spot stream
+#metrics_port = 7302                 # Prometheus metrics, GET /metrics
+
+# Telnet spot-line layout: "rbn" (the Reverse Beacon Network's layout,
+# which most loggers read) or "skimmer" (CW Skimmer's own layout, for
+# running behind an Aggregator).
+#line_format = "rbn"
+
+# Seconds between the one-line status reports in the log; 0 turns them off.
+#status_interval_secs = 60
+
+# Limits per client IP address; 0 removes a limit. Raise them when clients
+# reach manta through a reverse proxy, where they all share its address.
+#telnet_max_connections_per_ip = 16  # open telnet connections
+#json_max_connections_per_ip = 16    # open JSON and WebSocket connections
+#metrics_max_connections_per_ip = 8  # open metrics connections
+#telnet_max_commands_per_ip = 30     # telnet commands per 10 seconds
+#json_max_pings_per_ip = 10          # WebSocket pings per 60 seconds
+
+
+# --- Uplink to an RBN-style collector ----------------------------------------
+# Forwards every spot to an upstream collector. Needs [server]. Delete the
+# `#` in front of [[rbn_uplink]] and the settings below to use it; repeat
+# the block once per collector.
+
+#[[rbn_uplink]]
+
+#enabled = true                      # no default: whether this uplink connects
+#target_host = "<collector-host>"    # no default: the collector's host name
+#target_port = 7000                  # no default: <collector-port>
+#login_callsign = "N0CALL"           # default: station_callsign from [server]
+
+# true: connect and log in, but send no spots. Set false only once you mean
+# to send spots to the collector.
+#dry_run = true
+
+
+# --- Receiver ----------------------------------------------------------------
+# With `type` and every receiver setting commented out, manta listens to
+# the system's default sound card, or to whatever source the command line
+# names. A source flag on the command line (--device, --source,
+# --kiwi-host, --soapy-driver, --hpsdr-host) replaces this whole table,
+# shared settings included.
+
+[input]
+
+# Receiver type: "audio", "file", "kiwi", "soapy" or "hpsdr". No default.
+# Each type reads only its own settings below; "required" ones must be set.
+#type = "kiwi"
+
+# type = "audio", a sound card:
+#device = "USB Audio"                # no default (the system's default input); part of the device's name
+
+# type = "file", a WAV recording replayed as if live:
+#path = "capture.wav"                # required; relative to this file's directory
+#iq = false                          # true for a two-channel IQ recording, not mono audio
+
+# type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
+# HPSDR/Hermes radio (hpsdr needs a manta built with hpsdr support):
+#host = "<your-receiver-host>"       # required for kiwi and hpsdr
+#port = 8073                         # default 8073 for kiwi, 1024 for hpsdr
+#password = ""                       # kiwi only; leave empty for public receivers
+
+# type = "soapy", a SoapySDR device (needs a manta built with soapy support):
+#driver = "driver=rtlsdr"            # required: SoapySDR device arguments
+#gain_db = 30.0                      # no default: the device's automatic gain
+
+# Shared by kiwi, soapy and hpsdr:
+#freq_hz = 7030000.0                 # required: the receiver's centre frequency, Hz
+#rate_hz = 192000.0                  # required for soapy and hpsdr: sample rate, Hz
+
+# The settings below apply to any receiver type, or none.
+
+# Oscillator correction for this receiver, parts per million, -1000 to 1000.
+#freq_correction_ppm = 0.0
+
+# Your radio's dial frequency, Hz, for a sound card or WAV recording that
+# carries no frequency of its own. No default: without it, frequencies are
+# audio offsets, and `manta run` with [server] refuses to start.
+#center_freq_hz = 14030000.0
+
+# Decimate to this sample rate, Hz, before decoding. No default: decode at
+# the receiver's own rate. It must divide that rate by a power of two.
+#capture_rate_hz = 48000.0
+
+# WAV replay only: the time, in Unix seconds, that the recording's first
+# sample stands for. No default: the file's modification time.
+#replay_epoch = 1700000000
+
+
+# --- Spot filters ------------------------------------------------------------
+
+[spot]
+
+# Callsigns always spotted, skipping the plausibility checks, for example
+# ["W1AW", "K1ABC"]. A non-empty --allowlist replaces this list.
+#allowlist = []
+
+# File of callsigns never to spot, one per line; `#` starts a comment.
+# Relative to this file's directory. No default.
+#blocklist_path = "bad-calls.txt"
+
+# File of frequency ranges never to spot, one low_hz-high_hz range per
+# line. Relative to this file's directory. No default.
+#notch_path = "notches.txt"
+
+
+# --- Signal detection --------------------------------------------------------
+# When a signal becomes a track that gets decoded, and when the track ends.
+
+[detector]
+
+#on_snr_db = 12.0                    # signal-to-noise ratio, dB, that starts a track (0 to 100)
+#off_snr_db = 3.0                    # ratio below which a track counts as silent (0 to on_snr_db)
+#confirm_ms = 50.0                   # how long a signal must last before it is decoded
+#hang_ms = 5000.0                    # how long a silent track waits before it closes
+#gc_ms = 30000.0                     # a track that decodes no character this long is closed
+#warmup_ms = 2000.0                  # start-up time spent measuring the noise; no tracks before it
+#track_cap = 1200                    # most signals decoded at once
+#silent_respawn_cooldown_ms = 30000.0  # wait before a channel whose track went silent starts another
+
+
+# --- Decoder -----------------------------------------------------------------
+# Expert tuning. The defaults are the measured best values; change them
+# only to experiment.
+
+[decode]
+
+# "legacy" (the default), "edge-legacy" or "hsmm". hsmm is experimental: it
+# did not pass the accuracy and speed checks needed to become the default.
+# --engine overrides this.
+#engine = "legacy"
+
+# Keying and character decoding:
+#timing_sigma = 0.25                 # timing tolerance when matching dots and dashes
+#beam_width = 4                      # character guesses kept at each step
+#debounce_ms = 12.0                  # shortest key-down or key-up accepted, ms
+#hyst_frac = 0.15                    # keying threshold hysteresis, fraction of keying depth
+#tau_lo_ms = 500.0                   # noise-level tracking time constant, ms
+#tau_hi_bounds_ms = [100.0, 400.0]   # signal-level tracking time constant, [low, high] ms
+#flush_gap_dits = 7.0                # silence, in dot lengths, that ends a word
+
+# Evidence and noise front end, edge-legacy and hsmm only:
+#sigma_u = 0.3                       # keying-edge timing spread
+#llr_clip = 10.0                     # cap on per-sample mark/space evidence
+#hold_dits = 4.0                     # mark-level hold window, dot lengths
+#fallback_hops = 8                   # evidence interval when no keying edge is seen
+#noise_window_ms = 1500.0            # noise-floor window, ms
+#noise_min_bias_db = 2.16            # noise-floor minimum correction, dB
+#spectral_min_bias_db = 1.5          # neighbouring-channel noise correction, dB
+#spectral_beta = 0.5                 # weight of the neighbouring-channel noise estimate
+#refine_bw_hz = 0.0                  # reserved, no effect yet; 0 = off
+
+# hsmm only:
+#dur_sigma = 0.22                    # element-length tolerance
+#mark_insert_penalty = -1.5          # penalty against reading noise as an extra element
+#beam = 12                           # hypotheses kept per step
+#lookahead_dits = 25.0               # how far ahead, in dot lengths, before a character is final
+#speed_alpha = 0.2                   # how quickly the speed estimate follows the sender
+#seed_units_hops = [9.0, 13.0, 18.0, 26.0, 38.0]  # starting dot lengths tried
+#conf_kappa = 6.0                    # confidence scale

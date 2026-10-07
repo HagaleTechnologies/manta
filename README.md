@@ -186,6 +186,18 @@ port = 8073   # <your-kiwi-port>: replace if your receiver is not on 8073
 freq_hz = 7030000.0
 ```
 
+To start from a file that lists every setting instead, `manta config init`
+writes a `manta.toml` with each one commented out at its default and
+explained. Before you run a file, `manta config check` validates it,
+including any `MANTA_*` variables, and prints the settings it resolves to.
+It opens no receiver and no port, and exits non-zero naming the setting
+and the problem when something is wrong:
+
+```sh
+manta config init                         # writes ./manta.toml; never replaces one
+manta config check --config manta.toml
+```
+
 Start the server in one terminal. It runs in the foreground until you stop it:
 
 ```sh

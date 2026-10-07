@@ -494,6 +494,7 @@ one-character words re-initialize the long-gap pair. A word of two or more
 characters, or a flushed garble, clears that window. The rebuild happens
 only on a clean split: the largest-ratio split leaves at least two gaps in
 each cluster, max/min is `≥ 2`, and the clusters' nearest members differ by
+<<<<<<< HEAD
 `≥ 1.8` (MAN-213; MAN-103 D8 resolution). A rebuilt pair is discarded, and
 the long-gap statistics restart, when a classified gap of at least `2.0` but
 under `5.0` dits arrives before five confirming word gaps. An ordinary
@@ -505,6 +506,9 @@ one-character words at ordinary spacing decode as one merged word, so a
 pause after such a run does confirm it. After five confirmations the
 rebuild stands, so a dit lost to a fade inside a character cannot discard
 it (MAN-264).
+=======
+`≥ 1.8` (MAN-213; MAN-103 D8 resolution).
+>>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
 
 ### 4.3 Per-element likelihoods
 
