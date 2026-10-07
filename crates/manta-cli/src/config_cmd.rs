@@ -734,10 +734,14 @@ mod tests {
 
     // ---- Phase 3: the scaffold and its drift guards
 
+    /// One `#key = value` setting line: `(key, value_src, line_no)`, with
+    /// `line_no` 0-based.
+    type Setting = (String, String, usize);
+
     /// The scaffold's table sections: header line -> its setting lines.
     /// A section runs from `[x]`, `#[x]` or `#[[x]]` to the next header.
-    fn sections() -> Vec<(String, Vec<(String, String, usize)>)> {
-        let mut out: Vec<(String, Vec<(String, String, usize)>)> = Vec::new();
+    fn sections() -> Vec<(String, Vec<Setting>)> {
+        let mut out: Vec<(String, Vec<Setting>)> = Vec::new();
         let header = regex::Regex::new(r"^#?\[\[?([a-z_]+)\]\]?\s*$").unwrap();
         let setting = regex::Regex::new(r"^#([a-z_]+) = (.*)$").unwrap();
         for (n, l) in SCAFFOLD.lines().enumerate() {
@@ -753,8 +757,8 @@ mod tests {
         out
     }
 
-    /// `(key, value_src, line_no)` for every setting line of `table`.
-    fn setting_lines(table: &str) -> Vec<(String, String, usize)> {
+    /// Every setting line of `table`.
+    fn setting_lines(table: &str) -> Vec<Setting> {
         let all: Vec<_> = sections().into_iter().filter(|(t, _)| t == table).collect();
         assert_eq!(
             all.len(),
