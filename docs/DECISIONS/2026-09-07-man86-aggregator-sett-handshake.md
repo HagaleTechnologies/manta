@@ -208,6 +208,15 @@ round 1 are captured here rather than chased inline:
   allocation. That is the configuration the V1–V10 golden vectors run in, so this needs its own
   ticket, its own golden-vector review, and a decision on what a source with no RF reference
   should claim at all.
+- **Audio-source SETT bounds are metadata only** (PR #128 review, 2026-10-07). For an audio device
+  or mono WAV, SETT advertises dial+`AUDIO_PASSBAND_LO_HZ`..`AUDIO_PASSBAND_HI_HZ`
+  (300–3000 Hz), but `AudioIqSource::read` hands the engine the whole 48 kHz analytic stream
+  unfiltered, so a tone above 3 kHz — the audio soak's deliberate 3400 Hz caller is one — still
+  decodes and is spotted outside the advertised coverage. Same class as the item above. The two
+  fixes are a configurable rig-filter passband (which still leaves the default narrower than what
+  is decoded) or a 300–3000 Hz band-limit in `AudioIqSource::read`, which changes the
+  deterministic decode path for every audio input and needs its own golden-vector review.
+  Deferred, with Tony's agreement, to a follow-up ticket.
 
 ## Residual risk
 
