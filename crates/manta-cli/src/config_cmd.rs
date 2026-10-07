@@ -276,6 +276,18 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                     l.push_str(&format!(" {key}={v}"));
                 }
             }
+            // MAN-86: the greeting-banner identity. Free text is quoted so a
+            // QTH with spaces stays one token; the grid is validated as a
+            // bare locator.
+            if let Some(v) = &s.operator_name {
+                l.push_str(&format!(" operator_name={v:?}"));
+            }
+            if let Some(v) = &s.operator_qth {
+                l.push_str(&format!(" operator_qth={v:?}"));
+            }
+            if let Some(v) = &s.operator_grid {
+                l.push_str(&format!(" operator_grid={v}"));
+            }
             l
         }
     });
@@ -488,6 +500,26 @@ mod tests {
         assert!(server.contains(" telnet_port=0 "), "{server}");
         assert!(server.contains(" line_format=skimmer"), "{server}");
         assert!(server.ends_with(" status_interval_secs=0"), "{server}");
+    }
+
+    #[test]
+    fn summary_server_line_shows_operator_identity_only_when_set() {
+        // MAN-86 (PR #128 review): the Aggregator-facing identity keys are
+        // `Option`s, so D6 lists them when set and omits them when absent.
+        // Free text is quoted so a QTH with spaces stays one token.
+        let lines = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        assert!(!line(&lines, "server:").contains("operator_"));
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"HB9H\"\noperator_name = \"Art\"\n\
+             operator_qth = \"Richmond Hill, ON\"\noperator_grid = \"FN03gw\"\n",
+        );
+        let server = line(&lines, "server:");
+        assert!(
+            server.ends_with(
+                " operator_name=\"Art\" operator_qth=\"Richmond Hill, ON\" operator_grid=FN03gw"
+            ),
+            "{server}"
+        );
     }
 
     #[test]
@@ -834,6 +866,9 @@ mod tests {
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
         ("server", "station_callsign"),
+        ("server", "operator_name"),
+        ("server", "operator_qth"),
+        ("server", "operator_grid"),
         ("rbn_uplink", "enabled"),
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),
