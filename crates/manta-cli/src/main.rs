@@ -1787,30 +1787,16 @@ fn validate_decode_config(
     // place a `[decode]` table from disk enters the process.
     if !cfg.demod.hyst_frac.is_finite() {
         bail!(
-<<<<<<< HEAD
             "[decode] hyst_frac must be finite in {} (got {})",
-            path.display(),
-            cfg.demod.hyst_frac
-=======
-            "[decode] hyst_up/hyst_down must be finite in {} (got hyst_up={}, hyst_down={})",
             origin,
-            cfg.demod.hyst_up,
-            cfg.demod.hyst_down
->>>>>>> f0ab9aec4128d22f1dee9f02bfa903646a043930
+            cfg.demod.hyst_frac
         );
     }
     if cfg.demod.hyst_frac <= 0.0 || cfg.demod.hyst_frac >= 0.5 {
         bail!(
-<<<<<<< HEAD
             "[decode] hyst_frac must be > 0.0 and < 0.5 in {} (got {})",
-            path.display(),
-            cfg.demod.hyst_frac
-=======
-            "[decode] hyst_up must be > hyst_down > 0 in {} (got hyst_up={}, hyst_down={})",
             origin,
-            cfg.demod.hyst_up,
-            cfg.demod.hyst_down
->>>>>>> f0ab9aec4128d22f1dee9f02bfa903646a043930
+            cfg.demod.hyst_frac
         );
     }
     if !cfg.demod.debounce_ms.is_finite() || cfg.demod.debounce_ms <= 0.0 {

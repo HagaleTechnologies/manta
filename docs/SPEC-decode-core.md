@@ -887,29 +887,21 @@ silent_respawn_cooldown_ms = 30000  # 11250 hops
 # block_allowance_db = 3.0    # not configurable yet: compile-time constant in manta-dsp::floor
 
 [decode]
-<<<<<<< HEAD
-timing_sigma = 0.25    beam_width = 4
-debounce_ms = 12       hyst_frac = 0.15
-tau_lo_ms = 500        tau_hi_bounds_ms = [100, 400]
-mu_ratio_bounds = [2.2, 4.5]
-char_gap_dits = 2.0    word_gap_dits = 5.0  flush_gap_dits = 7.0
-cluster_alpha = 0.15
-=======
 # SPEC-decode-core-v2.md §7 lists the v2 evidence/noise/HSMM keys.
 engine = "legacy"           # "legacy" | "edge-legacy" | "hsmm"; --engine overrides
 timing_sigma = 0.25
 beam_width = 4
 debounce_ms = 12
-hyst_up = 1.25
-hyst_down = 0.80
+# Key-decision band half-width as a fraction of keying depth (§3.3,
+# MAN-103); replaces v1's hyst_up/hyst_down. Must be > 0.0 and < 0.5.
+hyst_frac = 0.15
 tau_lo_ms = 500
 tau_hi_bounds_ms = [100, 400]
 flush_gap_dits = 7.0
 # mu_ratio_bounds = [2.2, 4.5]  # not configurable yet: compile-time constant in manta-decode::timing
-# char_gap_dits = 2.0           # not configurable yet: compile-time constant in manta-decode::timing (legacy engine: 1.6)
+# char_gap_dits = 2.0           # not configurable yet: compile-time constant in manta-decode::timing (every engine, MAN-103)
 # word_gap_dits = 5.0           # not configurable yet: compile-time constant in manta-decode::timing
 # cluster_alpha = 0.15          # not configurable yet: compile-time constant in manta-decode::timing
->>>>>>> f0ab9aec4128d22f1dee9f02bfa903646a043930
 
 [input]
 # The source. Omit `type` (and every source key) to use the default audio
@@ -1057,15 +1049,12 @@ that takes `--config` (`run`, `soak`, `doctor`, `decode`, `oracle`) reads
 4. Stopband target tightened from the implied ~60 dB to **80 dB** (§1.2) —
    free given 8 taps/branch, and pileup scenes (V8) have ≥ 27 dB dynamic
    range between neighbors.
-<<<<<<< HEAD
-5. **Keying threshold is an additive band about the linear-amplitude
-   midpoint, not a geometric-mean threshold with multiplicative hysteresis**
-   (§3.2/§3.3, MAN-103): ARCHITECTURE §5's "adaptive threshold at their
-   geometric mean" text is superseded — see
-   `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`.
-=======
 5. **`[detector] on_snr_db` defaults to 12.0, not 6.0** (§2.3, §9): raised
    by `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` item 2 --
    at 6.0 dB the channelizer's autocorrelated per-hop noise produced 298
    spurious ACTIVE tracks on V1.
->>>>>>> f0ab9aec4128d22f1dee9f02bfa903646a043930
+6. **Keying threshold is an additive band about the linear-amplitude
+   midpoint, not a geometric-mean threshold with multiplicative hysteresis**
+   (§3.2/§3.3, MAN-103): ARCHITECTURE §5's "adaptive threshold at their
+   geometric mean" text is superseded — see
+   `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`.
