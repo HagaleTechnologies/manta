@@ -455,7 +455,10 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 - **Single TOML config** (MAN-261,
   `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with six
-  tables — `[server]` (station callsign, bind address, ports),
+  tables — `[server]` (station callsign, which may carry an RBN `-N`
+  per-band SSID per
+  `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
+  bind address; ports),
   `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files), `[detector]` (thresholds, timers, track cap) and `[decode]` —
