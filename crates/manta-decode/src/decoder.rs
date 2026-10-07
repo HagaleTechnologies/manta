@@ -801,7 +801,9 @@ impl TrackDecoder {
             self.single_flush_gaps.remove(0);
         }
         if self.single_flush_gaps.len() == SINGLE_FLUSH_REINIT
-            && self.gaps.reinit_from_flushed(&self.single_flush_gaps)
+            && self
+                .gaps
+                .reinit_from_flushed(&self.single_flush_gaps, self.cfg.flush_gap_dits)
         {
             self.single_flush_gaps.clear();
         }
@@ -1866,6 +1868,38 @@ mod tests {
         let out = decode_with(Engine::Legacy, &env);
         let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
         assert!(out.ends_with(&expected), "{out:?}");
+    }
+
+    /// MAN-264: with `[decode] flush_gap_dits` below 5, a genuine
+    /// Farnsworth character gap between the two outruns the flush and
+    /// helps rebuild the pair, so it must not discard the rebuild as an
+    /// ordinary character gap would. At 3.5 dits, ~4.9-dit character gaps
+    /// undid two rebuilds and the second repeat decoded
+    /// "C Q CQ D E G 4 X X X G4XXX K".
+    #[test]
+    fn legacy_low_flush_keeps_a_genuine_rebuild() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let text = [rep; 8].join(" ");
+        let settled = [rep; 7].join(" ");
+        for char_wpm in [15.0, 18.0, 20.0, 22.0] {
+            let eff_wpm = 0.82 * char_wpm;
+            let cfg = DecodeConfig {
+                flush_gap_dits: 3.5,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            let env = farnsworth_envelope(&text, char_wpm, eff_wpm);
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let out = events_to_text(&events);
+            assert!(
+                out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
     }
 
     /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact

@@ -289,7 +289,16 @@ its own word.
   false rebuild: five pauses that each end a decoded word of two or more
   characters, before the first ordinary character gap, lock it in. Under a
   false rebuild that word is a merged run of one-character words, or a word
-  whose character gaps are all 5 dits or more.
+  whose character gaps are all 5 dits or more. With `flush_gap_dits`
+  configured below 5, the discard range, and that last bound, end lower:
+  at the larger of `flush_gap_dits` and the rebuilt low cluster over
+  `FARNS_MIN_RATIO`. Genuine Farnsworth character gaps between the flush
+  and 5 dits outran the flush and built the pair. At 3.5 dits, ~4.9-dit
+  character gaps undid two rebuilds and cost a repeat at 15 to 22 WPM
+  (`legacy_low_flush_keeps_a_genuine_rebuild`). The low-cluster term keeps
+  the false-rebuild check at a flush of 3 dits or less, where ordinary
+  3-dit character gaps outrun the flush too
+  (`rebuilt_pair_disproof_follows_a_low_flush`).
 
 Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
 timing, `CQ CQ DE G4XXX G4XXX K` eight times:

@@ -498,11 +498,14 @@ each cluster, max/min is `≥ 2`, and the clusters' nearest members differ by
 the long-gap statistics restart, when a classified gap of at least `2.0` but
 under `5.0` dits arrives before five confirming word gaps. An ordinary
 character gap contradicts the rebuild's premise that every character gap
-outran the flush. A confirming word gap, classified or flushed, ends a
-decoded word of two or more characters. Gaps after decoded one-character
-words built the pair, so they never confirm it. Under a false rebuild,
-one-character words at ordinary spacing decode as one merged word, so a
-pause after such a run does confirm it. After five confirmations the
+outran the flush. With `flush_gap_dits` below `5.0`, the upper bound is
+the larger of `flush_gap_dits` and the rebuilt low cluster over `1.8`: a
+character gap above both outran the flush and belongs to the low cluster, so
+it is consistent with the rebuild. A confirming word gap, classified or
+flushed, ends a decoded word of two or more characters. Gaps after decoded
+one-character words built the pair, so they never confirm it. Under a false
+rebuild, one-character words at ordinary spacing decode as one merged word,
+so a pause after such a run does confirm it. After five confirmations the
 rebuild stands, so a dit lost to a fade inside a character cannot discard
 it (MAN-264).
 
