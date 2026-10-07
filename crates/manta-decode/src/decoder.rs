@@ -1716,6 +1716,39 @@ mod tests {
         );
     }
 
+    /// MAN-264: one-character words at ordinary spacing, two of them
+    /// followed by a 1.6 s pause, fill the rebuild window with
+    /// `[8, 8, 33, 33, 8]` dits. That split passes
+    /// `GapClassifier::reinit_from_flushed`'s check, so the word gaps
+    /// became the character cluster and every later word merged
+    /// ("W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK"), from a warm start
+    /// and from a cold one.
+    #[test]
+    fn legacy_pauses_after_one_char_words_do_not_merge_later_words() {
+        // rect_envelope("R") ends in an 8-dit tail: concatenated, 8-dit
+        // word gaps that the 7-dit flush closes. 144 + 456 hops = 1.6 s.
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        let mut env = rect_envelope("W1AW", 18);
+        for pause in [0, 0, 456, 456, 0] {
+            env.extend(rect_envelope("R", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        assert_eq!(
+            decode_with(Engine::Legacy, &env),
+            format!("W1AW R R R R R {tail}")
+        );
+
+        let mut env = Vec::new();
+        for pause in [0, 0, 456, 456, 0, 0, 0] {
+            env.extend(rect_envelope("H", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
     /// `rect_envelope` with Farnsworth spacing: characters keyed at
     /// `char_wpm`, inter-character and word gaps stretched to the ARRL
     /// Farnsworth timing for `eff_wpm`.
