@@ -1803,6 +1803,30 @@ mod tests {
         }
     }
 
+    /// MAN-264: a fade that drops a dit inside a character, after the
+    /// heavy-Farnsworth rebuild has stood a while, leaves an ordinary
+    /// 3-dit gap. It must split only that character ("4" as "IA"), not
+    /// reset the long-gap statistics and decode the characters after it
+    /// as separate words ("GIA X X X G 4 X X X K").
+    #[test]
+    fn legacy_heavy_farnsworth_survives_a_dropped_dit() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let mut damaged = farnsworth_envelope(rep, 18.0, 5.0);
+        let starts: Vec<usize> = (0..damaged.len())
+            .filter(|&i| damaged[i] > 0.0 && (i == 0 || damaged[i - 1] == 0.0))
+            .collect();
+        // Mark 25 is the third dit of "4" (....-), after C Q C Q D E G's
+        // 23 marks and the 4's first two.
+        let dit = (1200.0 / 18.0 / HOP_MS as f32).round() as usize;
+        damaged[starts[25]..starts[25] + dit].fill(0.0);
+        let mut env = farnsworth_envelope(&[rep; 4].join(" "), 18.0, 5.0);
+        env.extend(damaged);
+        env.extend(farnsworth_envelope(&[rep; 3].join(" "), 18.0, 5.0));
+        let out = decode_with(Engine::Legacy, &env);
+        let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
+        assert!(out.ends_with(&expected), "{out:?}");
+    }
+
     /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact
     /// through a mid-text fade -- abrupt (-6 / -9 dB inside a word gap),
     /// gradual (-6 dB ramp) and periodic QSB (10 dB peak-to-trough, 2 s).

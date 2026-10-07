@@ -428,8 +428,12 @@ pub struct GapClassifier {
     long_seen: u32,
     char_gap_dits: f32,
     /// Set when `reinit_from_flushed` rebuilt `pair`; cleared when an
-    /// ordinary character gap disproves the rebuild (see `classify`).
+    /// ordinary character gap disproves the rebuild, or when
+    /// `FARNS_MIN_COUNT` longer gaps confirm it (see `classify`).
     rebuilt: bool,
+    /// Gaps of at least `WORD_GAP_DITS` that `classify` has seen since
+    /// the rebuild.
+    rebuilt_confirms: u32,
 }
 
 impl GapClassifier {
@@ -450,6 +454,7 @@ impl GapClassifier {
             long_seen: 0,
             char_gap_dits,
             rebuilt: false,
+            rebuilt_confirms: 0,
         }
     }
 
@@ -549,7 +554,7 @@ impl GapClassifier {
     /// irregular fragment spacing with no gap between clusters. Two pauses
     /// can, at ordinary spacing, with the word gaps as the low cluster
     /// (MAN-264). `classify` discards such a rebuild at the first ordinary
-    /// character gap.
+    /// character gap, unless `FARNS_MIN_COUNT` longer gaps confirm it first.
     pub fn reinit_from_flushed(&mut self, us: &[f32]) -> bool {
         let mut s = us.to_vec();
         s.sort_by(f32::total_cmp);
@@ -564,6 +569,7 @@ impl GapClassifier {
         self.pair.reinit_from(us);
         self.long_seen = self.long_seen.max(n as u32);
         self.rebuilt = true;
+        self.rebuilt_confirms = 0;
         true
     }
 
@@ -575,11 +581,18 @@ impl GapClassifier {
         // character gap outran the 7-dit flush. A character gap below the
         // nominal word threshold disproves it: the window held word gaps
         // and pauses, and the rebuilt boundary sits above every real word
-        // gap. Start the long-gap statistics over.
-        if self.rebuilt && u >= self.char_gap_dits && u < WORD_GAP_DITS {
-            self.pair = ClusterPair::new(None);
-            self.long_seen = 0;
-            self.rebuilt = false;
+        // gap. Start the long-gap statistics over. Once `FARNS_MIN_COUNT`
+        // longer gaps have arrived first, the rebuild stands, so a fade
+        // that drops a dit inside a Farnsworth character cannot undo it.
+        if self.rebuilt && u >= self.char_gap_dits {
+            if u < WORD_GAP_DITS {
+                self.pair = ClusterPair::new(None);
+                self.long_seen = 0;
+                self.rebuilt = false;
+            } else {
+                self.rebuilt_confirms += 1;
+                self.rebuilt = self.rebuilt_confirms < FARNS_MIN_COUNT;
+            }
         }
         // Thresholds from statistics BEFORE this gap is incorporated.
         let active = self.farnsworth_active();
@@ -863,6 +876,22 @@ mod tests {
         let mut g = GapClassifier::new();
         assert!(g.reinit_from_flushed(&[23.5, 55.0, 23.5, 55.0, 23.5]));
         assert_eq!(g.classify(1.0 * mu, mu), GapClass::InterElement);
+        assert_eq!(g.classify(23.5 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(55.0 * mu, mu), GapClass::InterWord);
+    }
+
+    /// MAN-264: once `FARNS_MIN_COUNT` long gaps have confirmed a rebuild,
+    /// an ordinary character gap (a dit lost to a fade inside a
+    /// Farnsworth character) no longer resets it.
+    #[test]
+    fn rebuilt_pair_stands_once_confirmed() {
+        let mu = 48.0;
+        let mut g = GapClassifier::new();
+        assert!(g.reinit_from_flushed(&[23.5, 55.0, 23.5, 55.0, 23.5]));
+        for _ in 0..FARNS_MIN_COUNT {
+            assert_eq!(g.classify(23.5 * mu, mu), GapClass::InterChar);
+        }
+        assert_eq!(g.classify(3.0 * mu, mu), GapClass::InterChar);
         assert_eq!(g.classify(23.5 * mu, mu), GapClass::InterChar);
         assert_eq!(g.classify(55.0 * mu, mu), GapClass::InterWord);
     }

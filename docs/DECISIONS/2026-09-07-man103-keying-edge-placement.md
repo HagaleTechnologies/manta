@@ -266,9 +266,13 @@ its own word.
   spacing `[8, 8, 33, 33, 8]` passes, and every later word merged (MAN-264:
   `W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK` for pauses of 0.8 to 4.65 s).
   So `classify` discards a rebuilt pair at the first gap of 2 to 5 dits, an
-  ordinary character gap that the rebuild's premise rules out. Heavy
+  ordinary character gap that the rebuild's premise rules out. Clean heavy
   Farnsworth never produces one. The 14-cell grid and `5NN TU` are
-  unchanged.
+  unchanged. A fade that drops a dit inside a character does produce one,
+  so the check ends once five gaps of 5 dits or more have confirmed the
+  rebuild. Without that bound, one dropped dit in a `4` at 18/5 decoded
+  `GIA X X X G 4 X X X K` instead of `GIAXXX G4XXX K`
+  (`legacy_heavy_farnsworth_survives_a_dropped_dit`).
 
 Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
 timing, `CQ CQ DE G4XXX G4XXX K` eight times:
