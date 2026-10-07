@@ -550,15 +550,11 @@ impl GapClassifier {
     /// between the clusters' nearest members. So one pause among them
     /// cannot set the word-gap cluster (`decoder.rs`'s
     /// `legacy_early_pause_does_not_merge_later_words`), and neither can
-<<<<<<< HEAD
     /// irregular fragment spacing with no gap between clusters. Two pauses
     /// can, at ordinary spacing, with the word gaps as the low cluster
     /// (MAN-264). `classify` discards such a rebuild at the first ordinary
     /// character gap, unless `confirm_rebuilt` has counted
     /// `FARNS_MIN_COUNT` word gaps first.
-=======
-    /// irregular fragment spacing with no gap between clusters.
->>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
     pub fn reinit_from_flushed(&mut self, us: &[f32]) -> bool {
         let mut s = us.to_vec();
         s.sort_by(f32::total_cmp);
@@ -572,7 +568,6 @@ impl GapClassifier {
         }
         self.pair.reinit_from(us);
         self.long_seen = self.long_seen.max(n as u32);
-<<<<<<< HEAD
         self.rebuilt = true;
         self.rebuilt_confirms = 0;
         true
@@ -595,11 +590,6 @@ impl GapClassifier {
         }
     }
 
-=======
-        true
-    }
-
->>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
     /// Classify one gap given the current dit estimate, incorporating it into the
     /// Farnsworth long-gap statistics if applicable. SPEC §4.2.
     pub fn classify(&mut self, gap_ms: f32, mu_dit_ms: f32) -> GapClass {
@@ -880,7 +870,6 @@ mod tests {
         assert!(g.flush_threshold_dits(7.0) > 23.5);
     }
 
-<<<<<<< HEAD
     /// MAN-264: two pauses after one-character words at ordinary spacing
     /// pass the rebuild's split check, with the 8-dit word gaps as the
     /// low cluster. The first ordinary character gap must undo it.
@@ -928,8 +917,6 @@ mod tests {
         assert_eq!(g.classify(7.0 * mu, mu), GapClass::InterWord);
     }
 
-=======
->>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
     #[test]
     fn unimodal_dah_init_assumes_dahs_not_dits() {
         // Pinned decision 20 fix: a lone ~180 ms cluster (all-dah opener, e.g.

@@ -262,7 +262,6 @@ its own word.
   clusters' nearest members must differ by at least `FARNS_MIN_RATIO` (1.8).
   So one pause cannot set the word-gap cluster, and irregular fragment
   spacing such as `[8, 9, 12, 20, 25]` dits cannot either. Two pauses can,
-<<<<<<< HEAD
   if both follow one-character words inside one such window. At ordinary
   spacing `[8, 8, 33, 33, 8]` passes, and every later word merged (MAN-264:
   `W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK` for pauses of 0.8 to 4.65 s).
@@ -291,9 +290,6 @@ its own word.
   characters, before the first ordinary character gap, lock it in. Under a
   false rebuild that word is a merged run of one-character words, or a word
   whose character gaps are all 5 dits or more.
-=======
-  but only if both follow one-character words inside one such window.
->>>>>>> 463ec23a3ba5c487b33e7aa42b3e807bd9726c52
 
 Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
 timing, `CQ CQ DE G4XXX G4XXX K` eight times:
