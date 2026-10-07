@@ -157,6 +157,20 @@ endpoint today — a different layer (lost/rejected datagrams before demux, not
 ring backpressure after it), not a partial implementation of the ring gauge
 above.
 
+**Reconnect (MAN-73).** A live source's `IqSource::read()` can fail -- a
+stalled Kiwi socket, an HPSDR stall-escalation, a dropped audio device.
+`manta-cli` wraps every such source (not file replay) in
+`ReconnectingSource`, which reopens it with `manta-server::backoff`'s
+1s-60s policy instead of letting the error reach `listen()` and end the
+process. Samples lost to the outage are reported once via the trait's
+`take_discontinuity()` method; `manta_engine::listen` responds by closing
+the current track segment and starting a fresh one with the sample clock
+advanced by the gap, so spot timestamps stay wall-clock-true with no
+audio spliced across the gap and no zero-fill (see
+`docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
+was rejected). File replay is exempt: its errors and EOF must reach
+`listen()` unchanged for byte-identical replay.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
@@ -582,18 +596,32 @@ validation (MAN-28). Dedupe (step 5) still applies.
   signal that real decoders are working on would have reported `tracks=0`.
   The gauge is driven back to `0` at end of stream and on a mid-stream
   read failure, so it doesn't stay stuck at the last live value after EOF
-  or an SDR disconnect. Note this is deliberately *not*
+  or a fatal source error. A reconnectable source's disconnect never
+  reaches `listen()` as a read failure (MAN-73, below): its unhealthy
+  transition zeroes the shared handle instead, which the poller publishes
+  within one `ACTIVE_TRACKS_POLL_INTERVAL`. Note this is deliberately *not*
   `TrackManager::active_track_count()` (what MAN-45 first published here),
   which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
   that lease no decoder and would inflate an operator-facing "is it
   decoding?" reading — and which keeps its own meaning for `soak_metrics`.
-  **`manta_source_health` is one-sided** (corrected 2026-09-03, review
-  round 7, filed as **MAN-64**): the only production call site
-  (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
-  on a later failure, and a fatal source read tears the daemon down
-  instead. It's a startup-success marker, not live health reporting —
-  don't read it as the latter until MAN-64 either wires real transitions
-  or this note is the accepted-permanent behavior.
+  **`manta_source_health` tracks live reconnect state** (MAN-73, closing
+  MAN-64's one-sided-gauge finding): every reconnectable source kind
+  (Kiwi, HPSDR, Soapy, a plain audio device — everything but file replay)
+  is wrapped at startup by `manta-cli::reconnect::ReconnectingSource`,
+  which owns this gauge for that source's whole process lifetime. It
+  reads `0` while the source is down and retrying with backoff (reusing
+  `manta-server::backoff`'s 1s-60s policy) and `1` once samples are
+  flowing again — including the very first connection, for a source kind
+  (HPSDR) where opening a socket proves nothing about a device actually
+  being present (see `IqSource::confirmed_live_handle`). File replay's
+  health is set `1` once, immediately, and never read again: its errors
+  and EOF are deterministic and must reach `listen()` unchanged, so it is
+  never wrapped. A source that keeps failing to reopen now retries
+  forever instead of ending the daemon — see
+  `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`. The
+  `manta_input_*` series sum every connection a reconnectable source makes
+  (MAN-228, `manta-cli::reconnect::InputHealthTotals`), so they keep
+  counting across a reconnect and never reset mid-process.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 

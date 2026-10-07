@@ -41,9 +41,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use num_complex::Complex32;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
-use std::collections::VecDeque;
-use std::net::TcpStream;
-use std::sync::Arc;
+use std::collections::{BTreeSet, VecDeque};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{Message, WebSocket};
 
@@ -84,6 +84,125 @@ const TARGET_RATE_HZ: usize = 96_000;
 /// startup latency (analogous to `CALIBRATION_SECONDS`) should budget for
 /// this ~0.5 s regardless of `RESAMPLER_CHUNK`.
 const RESAMPLER_CHUNK: usize = 16_384;
+
+/// Bounds each resolved address's `TcpStream::connect_timeout` attempt
+/// (MAN-73): a target that silently black-holes SYNs (e.g. a firewall drop,
+/// not a refusal) would otherwise leave `connect()` pending for the OS's
+/// own timeout (commonly minutes). Mirrors `uplink.rs`'s own per-address
+/// `CONNECT_TIMEOUT` value.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounds DNS resolution plus every per-address connect attempt together
+/// (MAN-73). Unlike `uplink.rs`'s connect, this one runs on
+/// `ReconnectingSource`'s blocking read-loop thread, which cannot be
+/// interrupted by Ctrl-C mid-connect, so a stop signal landing mid-reopen
+/// waits up to this long, then the WebSocket handshake, before
+/// `manta-cli`'s up-to-50s shutdown drain even starts -- more, in that
+/// worst case, than the 60s `docker stop -t 60` grace the README
+/// recommends. 3x `CONNECT_TIMEOUT`, matching `uplink.rs`'s
+/// `OVERALL_CONNECT_TIMEOUT` and for the same reason (PR #80 review, round
+/// 2): a window equal to one address's `CONNECT_TIMEOUT` is used up by a
+/// black-holed first address (e.g. a dropped AAAA record), and since every
+/// reconnect re-resolves and starts from that same first address, a
+/// reachable later address would never be tried at all.
+const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolves `host:port` and connects to the first address that accepts,
+/// the whole operation bounded by `OVERALL_CONNECT_TIMEOUT` (MAN-73, code
+/// review round 1): `(host, port).to_socket_addrs()` is a synchronous,
+/// blocking `getaddrinfo(3)` call with no timeout of its own, so a stalled
+/// system resolver would otherwise hang this uninterruptible thread
+/// indefinitely before `TcpStream::connect_timeout` ever got a chance to
+/// run -- `uplink.rs`'s `connect_any_resolved_address` bounds the
+/// equivalent async call with `tokio::time::timeout`; there is no Tokio
+/// runtime here, so resolution plus every per-address connect attempt
+/// instead run on a detached thread (see `run_with_overall_timeout`).
+fn resolve_and_connect(host: &str, port: u16) -> Result<TcpStream> {
+    let owned_host = host.to_string();
+    run_with_overall_timeout(host, port, move || {
+        (owned_host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| anyhow!("resolve {owned_host}:{port}: {e}"))
+            .and_then(|addrs| {
+                let mut last_err = None;
+                for addr in addrs {
+                    match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(last_err
+                    .map(anyhow::Error::from)
+                    .unwrap_or_else(|| anyhow!("no addresses resolved for {owned_host}:{port}")))
+            })
+    })
+}
+
+/// `(host, port)` targets whose `run_with_overall_timeout` worker thread is
+/// still running, including workers whose caller already timed out and
+/// moved on (MAN-73, PR #207 review). `ReconnectingSource` retries a lost
+/// Kiwi forever, so without this a resolver or connect that keeps
+/// outliving `OVERALL_CONNECT_TIMEOUT` would leave one more abandoned
+/// thread behind on every attempt. With it, at most one worker per target
+/// is ever outstanding -- the same bound `uplink.rs`'s `resolver_slot`
+/// gives its lookups, and keyed per target for the same reason (PR #80
+/// review round 11): one stuck target must not block another.
+static OUTSTANDING_CONNECTS: Mutex<BTreeSet<(String, u16)>> = Mutex::new(BTreeSet::new());
+
+fn outstanding_connects() -> MutexGuard<'static, BTreeSet<(String, u16)>> {
+    // The set stays consistent even if a holder panicked: every critical
+    // section is a single insert or remove.
+    OUTSTANDING_CONNECTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Holds one target's `OUTSTANDING_CONNECTS` entry; removes it on drop.
+struct OutstandingConnect((String, u16));
+
+impl Drop for OutstandingConnect {
+    fn drop(&mut self) {
+        outstanding_connects().remove(&self.0);
+    }
+}
+
+/// Runs `attempt` on a detached thread, raced against this function's own
+/// `recv_timeout(OVERALL_CONNECT_TIMEOUT)`. A stall past that window
+/// returns an `Err` to the
+/// caller immediately; the detached thread is abandoned (matching the
+/// accepted tradeoff `uplink.rs` documents for its own blocking
+/// `getaddrinfo` call) rather than left to block a reconnect attempt
+/// forever. While an earlier worker for the same `host:port` is still
+/// running, this returns an `Err` at once without spawning another (see
+/// `OUTSTANDING_CONNECTS`).
+fn run_with_overall_timeout<T: Send + 'static>(
+    host: &str,
+    port: u16,
+    attempt: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let target = (host.to_string(), port);
+    if !outstanding_connects().insert(target.clone()) {
+        bail!(
+            "TCP connect to {host}:{port} skipped: a previous attempt's DNS resolution or \
+             connect is still running; not starting another thread"
+        );
+    }
+    let slot = OutstandingConnect(target);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = attempt();
+        // Released before the send, so a caller that has received this
+        // outcome can always start its next attempt straight away.
+        drop(slot);
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(OVERALL_CONNECT_TIMEOUT) {
+        Ok(outcome) => outcome.with_context(|| format!("TCP connect to {host}:{port}")),
+        Err(_) => Err(anyhow!(
+            "TCP connect to {host}:{port} timed out (DNS resolution or connect exceeded {OVERALL_CONNECT_TIMEOUT:?})"
+        )),
+    }
+}
 
 /// TCP read timeout: bounds how long a single `socket.read()` call blocks,
 /// keeping `read()` responsive to repeated calls (and, at the engine layer,
@@ -134,8 +253,7 @@ impl KiwiIqSource {
     /// to `TARGET_RATE_HZ`. `password` is `""` for anonymous/no-password
     /// receivers (most public ones).
     pub fn connect(host: &str, port: u16, center_freq_hz: f64, password: &str) -> Result<Self> {
-        let tcp = TcpStream::connect((host, port))
-            .with_context(|| format!("TCP connect to {host}:{port}"))?;
+        let tcp = resolve_and_connect(host, port)?;
         tcp.set_read_timeout(Some(READ_TIMEOUT))
             .context("set TCP read timeout")?;
 
@@ -555,6 +673,87 @@ mod tests {
         // "connection refused" path, no real network dependency.
         let result = KiwiIqSource::connect("127.0.0.1", 1, 14_025_000.0, "");
         assert!(result.is_err(), "expected a clean Err, not a panic");
+    }
+
+    #[test]
+    fn connect_to_a_resolvable_but_refusing_address_fails_within_the_connect_timeout() {
+        // MAN-73: exercises the new per-address `connect_timeout` loop. A
+        // refused connection returns near-instantly regardless of
+        // CONNECT_TIMEOUT, but this guards against a future regression
+        // back to an unbounded `TcpStream::connect` -- a black-holed
+        // address (not exercised here; needs network control) would hang
+        // for the OS's own connect timeout instead of this crate's bound.
+        let start = Instant::now();
+        let result = KiwiIqSource::connect("127.0.0.1", 1, 14_025_000.0, "");
+        assert!(result.is_err(), "expected a clean Err, not a panic");
+        assert!(
+            start.elapsed() < CONNECT_TIMEOUT,
+            "connect must fail within CONNECT_TIMEOUT, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn overall_connect_window_outlasts_a_black_holed_first_address() {
+        // MAN-73 validate finding: a black-holed first address uses its
+        // whole CONNECT_TIMEOUT (plus however long resolution took) before
+        // the per-address loop moves on. The overall window must still be
+        // open when the next, reachable address accepts -- a window of one
+        // CONNECT_TIMEOUT expired first, so every reconnect failed forever.
+        let outcome = run_with_overall_timeout("kiwi.example", 8073, || {
+            std::thread::sleep(CONNECT_TIMEOUT + Duration::from_millis(200));
+            Ok("second address")
+        });
+        assert_eq!(outcome.unwrap(), "second address");
+    }
+
+    #[test]
+    fn a_still_running_connect_worker_blocks_another_for_the_same_target() {
+        // MAN-73, PR #207 review: ReconnectingSource retries forever, so a
+        // connect worker that is still running (a hung resolver, here a
+        // worker parked on a channel) must not be joined by a new one on
+        // every retry. The slot is moved into the worker thread, so it is
+        // held the same way after the caller's own window has expired.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            run_with_overall_timeout("kiwi.example", 8074, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("first")
+            })
+        });
+        started_rx.recv().unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_attempt = ran.clone();
+        let err = run_with_overall_timeout("kiwi.example", 8074, move || {
+            ran_in_attempt.store(true, Ordering::SeqCst);
+            Ok("second")
+        })
+        .expect_err("a second worker for the same target must not start");
+        assert!(err.to_string().contains("still running"), "{err:#}");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the second attempt must never run"
+        );
+
+        assert_eq!(
+            run_with_overall_timeout("kiwi.example", 8075, || Ok("other target")).unwrap(),
+            "other target",
+            "a stuck target must not block a different one"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), "first");
+        assert_eq!(
+            run_with_overall_timeout("kiwi.example", 8074, || Ok("third")).unwrap(),
+            "third",
+            "the slot is free again once the earlier worker has finished"
+        );
     }
 
     #[test]

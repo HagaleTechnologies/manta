@@ -89,9 +89,76 @@ impl Drop for ActiveTracksGuard {
     }
 }
 
+/// One continuous decode segment: its own channelizer and track manager,
+/// spanning the sample clock until the next discontinuity (MAN-73). The
+/// `Validator` spans every segment of a `listen()` call; only the segment
+/// itself (and its sample clock) restarts.
+struct Segment {
+    ch: manta_dsp::channelizer::Channelizer,
+    tm: crate::track::TrackManager,
+    hop: u64,
+    pad_hops: u64,
+}
+
+fn new_segment(
+    fs: f64,
+    center_freq_hz: f64,
+    cfg: &PipelineConfig,
+    next_id: u32,
+) -> Result<Segment> {
+    let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let hop = ch.hop() as u64;
+    let pad_samples = ch.filter_len();
+    let pad_hops = (pad_samples as u64).div_ceil(hop);
+    let mut tm = crate::track::TrackManager::new(
+        ch.n_channels(),
+        fs,
+        center_freq_hz,
+        cfg.detector,
+        cfg.decode.clone(),
+    );
+    tm.resume_track_ids_from(next_id);
+    Ok(Segment {
+        ch,
+        tm,
+        hop,
+        pad_hops,
+    })
+}
+
+fn emit(
+    events: Vec<DecoderEvent>,
+    validator: &mut Validator,
+    calibration_factor: f64,
+    on_event: &mut impl FnMut(&DecoderEvent),
+    on_spot: &mut impl FnMut(&crate::Spot),
+) {
+    for ev in events {
+        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
+        for spot in validator.ingest(&ev) {
+            on_spot(&spot);
+        }
+    }
+}
+
 /// Run the streaming decode loop against `src` until `read` returns 0 (EOF,
 /// file replay) or `stop` is set (Ctrl-C, live audio). Each decoded event is
 /// passed to `on_event` as it's produced. Design doc §4.
+///
+/// MAN-73: a live source may report a discontinuity via
+/// `IqSource::take_discontinuity()` (e.g. after a reconnect). When it does,
+/// the current segment (channelizer + track manager) is closed -- every
+/// open track gets its `TrackClosed`, as `ClosureKind::Bookkeeping` rather
+/// than `SignalEnded`, since the transmission may still be on the air --
+/// and a fresh segment starts, with its sample clock advanced by the
+/// reported gap and its track ids continuing from the closed segment's.
+/// This keeps spot timestamps
+/// wall-clock-true across the outage without splicing pre-outage audio
+/// onto post-outage audio or zero-filling the gap (zero-fill pins the
+/// noise floor and floods false tracks on resume -- see
+/// `IqSource::take_discontinuity`'s doc comment). File replay never
+/// reports a discontinuity, so this is a no-op there.
 ///
 /// Unchanged entry point: `listen_with_observers` with no observers. Kept so
 /// MAN-45's engine addition costs its four existing call sites nothing.
@@ -170,41 +237,6 @@ pub fn listen_with_observers(
     let fs = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
 
-    let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
-    let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
-    let mut filled = 0;
-    while filled < calib_n {
-        // MAN-122 review round 7: checked before EVERY calibration read, not
-        // only once the decode loop below starts. The daemon installs its
-        // Ctrl-C handler before it logs the `listening:` banner, so a stop
-        // request can land at any point while this two-second buffer fills;
-        // without this check it was honoured only once the buffer was full.
-        // A read already in flight is not interrupted; it returns with
-        // whatever the source yields next, or fails after that source's own
-        // stall bound (`IqSource::read`'s implementations in `manta-input`).
-        // `break`, not `return`: whatever was read is still processed below
-        // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
-        // `soak`) still analyses every sample it read, and the decode loop's
-        // own `stop` check then ends the run without another read.
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let n = src.read(&mut calib[filled..])?;
-        if n == 0 {
-            anyhow::bail!("audio source ended during startup calibration");
-        }
-        filled += n;
-    }
-    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let hop = ch.hop() as u64;
-    let mut tm = crate::track::TrackManager::new(
-        ch.n_channels(),
-        fs,
-        center_freq_hz,
-        cfg.detector,
-        cfg.decode.clone(),
-    );
     let mut validator = Validator::bundled(fs)
         .with_freq_correction_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -234,30 +266,79 @@ pub fn listen_with_observers(
         }
     };
 
-    let pad_samples = ch.filter_len();
-    let pad_hops = (pad_samples as u64).div_ceil(hop);
-    let padding = vec![Complex32::new(0.0, 0.0); pad_samples];
-    for ev in tm.process_hops(&ch.process(&padding), |m| m.saturating_sub(pad_hops) * hop) {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
+    let mut seg = new_segment(fs, center_freq_hz, cfg, 1)?;
+    let mut seg_base: u64 = 0;
+
+    let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
+
+    let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
+    let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
+    let mut filled = 0;
+    while filled < calib_n {
+        // MAN-122 review round 7: checked before EVERY calibration read, not
+        // only once the decode loop below starts. The daemon installs its
+        // Ctrl-C handler before it logs the `listening:` banner, so a stop
+        // request can land at any point while this two-second buffer fills;
+        // without this check it was honoured only once the buffer was full.
+        // A read already in flight is not interrupted; it returns with
+        // whatever the source yields next, or fails after that source's own
+        // stall bound (`IqSource::read`'s implementations in `manta-input`).
+        // `break`, not `return`: whatever was read is still processed below
+        // and flushed by `finish()`, so a watchdog-bounded caller (`doctor`,
+        // `soak`) still analyses every sample it read, and the decode loop's
+        // own `stop` check then ends the run without another read.
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
+        let n = src.read(&mut calib[filled..])?;
+        if n == 0 {
+            anyhow::bail!("audio source ended during startup calibration");
+        }
+        if let Some(gap) = src.take_discontinuity() {
+            // A discontinuity during calibration: the pre-gap partial
+            // buffer was never processed through the channelizer, so it's
+            // simply discarded (not spliced) -- keep the post-gap samples
+            // just read, advance the sample clock by the discarded samples
+            // plus the gap, and keep filling from there.
+            calib.copy_within(filled..filled + n, 0);
+            seg_base += filled as u64 + gap;
+            filled = n;
+            continue;
+        }
+        filled += n;
     }
-    let n_tracks = tm.decoding_track_count();
+    // The startup lead-in padding is processed only once the calibration
+    // fill has returned, not before it: its `on_tracks` call is the first
+    // per-batch callback, and the daemon reads that first call as "the
+    // calibration read has returned" (MAN-122's `ready: decoding` event).
+    let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+        seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+    });
+    emit(
+        events,
+        &mut validator,
+        calibration_factor,
+        &mut on_event,
+        &mut on_spot,
+    );
+    let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill short.
-    for ev in tm.process_hops(&ch.process(&calib[..filled]), |m| {
-        m.saturating_sub(pad_hops) * hop
-    }) {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
-        }
-    }
-    let n_tracks = tm.decoding_track_count();
+    let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
+        seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+    });
+    emit(
+        events,
+        &mut validator,
+        calibration_factor,
+        &mut on_event,
+        &mut on_spot,
+    );
+    let n_tracks = seg.tm.decoding_track_count();
     report_active_tracks(n_tracks);
     on_tracks(n_tracks);
+    let mut seg_consumed: u64 = filled as u64;
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     loop {
@@ -284,31 +365,66 @@ pub fn listen_with_observers(
         if n == 0 {
             break;
         }
+        if let Some(gap) = src.take_discontinuity() {
+            // Not `finish()`: an outage is not an end of signal (see
+            // `TrackManager::finish_for_discontinuity`).
+            let finish_events = seg.tm.finish_for_discontinuity();
+            emit(
+                finish_events,
+                &mut validator,
+                calibration_factor,
+                &mut on_event,
+                &mut on_spot,
+            );
+            let next_id = seg.tm.next_track_id();
+            seg_base += seg_consumed + gap;
+            seg_consumed = 0;
+            seg = new_segment(fs, center_freq_hz, cfg, next_id)?;
+            let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+                seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+            });
+            emit(
+                events,
+                &mut validator,
+                calibration_factor,
+                &mut on_event,
+                &mut on_spot,
+            );
+        }
+        // MAN-128: steady-state chunk latency, timed from here (after the
+        // read and after any outage-segment rebuild above, so a one-off
+        // `new_segment` does not skew the distribution) to the end of the
+        // chunk's processing.
         let t0 = observers
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
-        for ev in tm.process_hops(&ch.process(&chunk[..n]), |m| {
-            m.saturating_sub(pad_hops) * hop
-        }) {
-            on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-            for spot in validator.ingest(&ev) {
-                on_spot(&spot);
-            }
-        }
-        let n_tracks = tm.decoding_track_count();
+        let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
+            seg_base + m.saturating_sub(seg.pad_hops) * seg.hop
+        });
+        emit(
+            events,
+            &mut validator,
+            calibration_factor,
+            &mut on_event,
+            &mut on_spot,
+        );
+        let n_tracks = seg.tm.decoding_track_count();
         report_active_tracks(n_tracks);
         on_tracks(n_tracks);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
         }
+        seg_consumed += n as u64;
     }
-    for ev in tm.finish() {
-        on_event(&crate::calibrate_freq_events(&ev, calibration_factor));
-        for spot in validator.ingest(&ev) {
-            on_spot(&spot);
-        }
-    }
+    let events = seg.tm.finish();
+    emit(
+        events,
+        &mut validator,
+        calibration_factor,
+        &mut on_event,
+        &mut on_spot,
+    );
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -346,6 +462,320 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
+    }
+
+    /// MAN-73 test double: serves `samples` on a loop. Once the cumulative
+    /// number of samples served reaches `arm_at` (default: the full
+    /// vector length, i.e. "after exhaustion"), the *next* `read()` call
+    /// rewinds to the start of `samples` and arms a one-shot
+    /// `take_discontinuity()` of `gap` samples -- simulating a
+    /// `ReconnectingSource` that lost the connection, waited out `gap`
+    /// worth of wall-clock time, and resumed producing real samples.
+    /// `chunk_cap` bounds how many samples a single `read()` call serves,
+    /// so a caller reading into a buffer much larger than `chunk_cap`
+    /// (e.g. the startup calibration buffer) still sees the gap arm
+    /// partway through, not only at a whole-buffer boundary.
+    struct GapSource {
+        samples: Vec<Complex32>,
+        cursor: usize,
+        fs: f64,
+        center_freq_hz: f64,
+        gap: u64,
+        arm_at: usize,
+        chunk_cap: usize,
+        served: usize,
+        armed: bool,
+        pending_gap: Option<u64>,
+        /// Set once `take_discontinuity()` has handed the gap to `listen()`,
+        /// so a test can tell the events `listen()` emits after the
+        /// discontinuity from those before it.
+        gap_taken: Arc<AtomicBool>,
+    }
+
+    impl GapSource {
+        fn new(samples: Vec<Complex32>, fs: f64, center_freq_hz: f64, gap_samples: u64) -> Self {
+            let arm_at = samples.len();
+            GapSource {
+                chunk_cap: samples.len().max(1),
+                samples,
+                cursor: 0,
+                fs,
+                center_freq_hz,
+                gap: gap_samples,
+                arm_at,
+                served: 0,
+                armed: false,
+                pending_gap: None,
+                gap_taken: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// Arm the gap after `k` cumulative samples served instead of at
+        /// exhaustion -- used to simulate a discontinuity arriving
+        /// partway through startup calibration.
+        fn arm_after_samples(mut self, k: usize) -> Self {
+            self.arm_at = k;
+            self.chunk_cap = (k / 4).max(64);
+            self
+        }
+    }
+
+    impl manta_input::IqSource for GapSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center_freq_hz
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if !self.armed && self.served >= self.arm_at {
+                self.cursor = 0;
+                self.armed = true;
+                self.pending_gap = Some(self.gap);
+            }
+            let avail = self.samples.len() - self.cursor;
+            let n = buf.len().min(avail).min(self.chunk_cap);
+            buf[..n].copy_from_slice(&self.samples[self.cursor..self.cursor + n]);
+            self.cursor += n;
+            self.served += n;
+            Ok(n)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            let gap = self.pending_gap.take();
+            if gap.is_some() {
+                self.gap_taken.store(true, Ordering::Relaxed);
+            }
+            gap
+        }
+    }
+
+    /// MAN-73: a discontinuity reported mid-stream closes the current
+    /// segment (every open track gets `TrackClosed`), starts a fresh one
+    /// whose sample clock is advanced by the gap, and never re-reads any
+    /// pre-gap data -- so no false spot is produced by splicing pre- and
+    /// post-gap audio together, track ids are never reused, and spot
+    /// timestamps land on the correct (post-gap) side of the clock.
+    #[test]
+    fn listen_restarts_the_segment_on_a_discontinuity_and_advances_sample_ts() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let len = rendered.samples.len() as u64;
+        let gap = (spec.fs as u64) * 3600; // 1 hour
+        let src: Box<dyn manta_input::IqSource> = Box::new(GapSource::new(
+            rendered.samples.clone(),
+            spec.fs,
+            spec.center_freq_hz,
+            gap,
+        ));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        let mut track_meta_ids: Vec<(u64, u32)> = Vec::new(); // (approx order, track_id)
+        let mut closed_before_first_post_gap_char = true;
+        let mut seen_post_gap_char = false;
+        let mut closed_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut order = 0u64;
+        manta_engine_listen_with_discontinuity_probe(src, &stop, &mut spots, |ev| {
+            order += 1;
+            match ev {
+                DecoderEvent::TrackMeta { track_id, .. } => {
+                    track_meta_ids.push((order, *track_id));
+                }
+                DecoderEvent::TrackClosed { track_id, .. } => {
+                    closed_ids.insert(*track_id);
+                }
+                DecoderEvent::CharDecoded { track_id, .. } => {
+                    if *track_id > 1 && !closed_ids.contains(&1) {
+                        // A post-gap track emitted a char before the
+                        // pre-gap track (id 1) was ever closed.
+                        closed_before_first_post_gap_char = false;
+                    }
+                    if *track_id > 1 {
+                        seen_post_gap_char = true;
+                    }
+                }
+                _ => {}
+            }
+        })
+        .unwrap();
+        let _ = stop;
+
+        assert!(!spots.is_empty(), "expected at least one spot");
+        assert!(
+            spots.iter().all(|s: &crate::Spot| s.callsign == "W1AW"),
+            "every spot must be W1AW (no false spot from splicing pre/post-gap audio): {spots:?}"
+        );
+        assert!(
+            spots.iter().any(|s| s.sample_ts < len),
+            "expected at least one pre-gap spot, got {spots:?}"
+        );
+        assert!(
+            spots.iter().any(|s| s.sample_ts >= len + gap),
+            "expected at least one post-gap spot with sample_ts >= {}, got {spots:?}",
+            len + gap
+        );
+
+        let pre_gap_ids: std::collections::BTreeSet<u32> = track_meta_ids
+            .iter()
+            .filter(|(_, id)| *id == 1)
+            .map(|(_, id)| *id)
+            .collect();
+        let post_gap_ids: std::collections::BTreeSet<u32> = track_meta_ids
+            .iter()
+            .map(|(_, id)| *id)
+            .filter(|id| !pre_gap_ids.contains(id))
+            .collect();
+        assert!(
+            !post_gap_ids.is_empty(),
+            "expected at least one post-gap track id, got {track_meta_ids:?}"
+        );
+        assert!(
+            post_gap_ids.iter().all(|id| pre_gap_ids.iter().all(|p| id > p)),
+            "every post-gap track id must be greater than every pre-gap id: pre={pre_gap_ids:?} post={post_gap_ids:?}"
+        );
+        assert!(seen_post_gap_char, "expected a post-gap CharDecoded event");
+        assert!(
+            closed_before_first_post_gap_char,
+            "the pre-gap track's TrackClosed must arrive before any post-gap CharDecoded"
+        );
+    }
+
+    /// MAN-73 (PR #207 review): a transport outage is not an end of
+    /// signal. Every track the discontinuity tears down must close as
+    /// `Bookkeeping { survivor_track_id: None }`, never `SignalEnded`:
+    /// `SignalEnded` tells `manta-spot`'s `Validator` the transmission
+    /// ended, so the post-reconnect track's next call utterance of the same
+    /// CQ would count as a distinct message, and pending beacons would
+    /// resolve early.
+    #[test]
+    fn a_discontinuity_closes_open_tracks_as_bookkeeping_not_signal_ended() {
+        use manta_decode::events::ClosureKind;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        // 20 s of V1's looped CQ with the gap armed 12 s in: past startup
+        // calibration and mid-transmission, so a track is open at the gap.
+        let samples = rendered.samples[..(spec.fs * 20.0) as usize].to_vec();
+        let src = GapSource::new(samples, spec.fs, spec.center_freq_hz, spec.fs as u64)
+            .arm_after_samples((spec.fs * 12.0) as usize);
+        let gap_taken = src.gap_taken.clone();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        let mut seen_before_gap: std::collections::BTreeSet<u32> = Default::default();
+        let mut closed_at_gap: Vec<(u32, ClosureKind)> = Vec::new();
+        manta_engine_listen_with_discontinuity_probe(Box::new(src), &stop, &mut spots, |ev| {
+            let id = crate::track::event_track_id(ev);
+            if !gap_taken.load(Ordering::Relaxed) {
+                seen_before_gap.insert(id);
+            } else if let DecoderEvent::TrackClosed { track_id, closure } = ev {
+                // Only the pre-gap segment's tracks: its `TrackManager` is
+                // dropped right after the teardown, so any of its tracks
+                // closing after the gap was closed BY the teardown.
+                if seen_before_gap.contains(track_id) {
+                    closed_at_gap.push((*track_id, *closure));
+                }
+            }
+        })
+        .unwrap();
+
+        assert!(
+            !closed_at_gap.is_empty(),
+            "test setup: a track must still be open when the gap arrives"
+        );
+        assert!(
+            closed_at_gap.iter().all(|(_, closure)| *closure
+                == ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }),
+            "a discontinuity must close tracks as Bookkeeping, not SignalEnded: {closed_at_gap:?}"
+        );
+    }
+
+    /// Thin wrapper around `listen()` used only by the discontinuity tests
+    /// above/below, so the on_event closure can observe every event
+    /// (including TrackClosed) while still routing spots to a Vec the way
+    /// the other tests in this module do.
+    fn manta_engine_listen_with_discontinuity_probe(
+        src: Box<dyn manta_input::IqSource>,
+        stop: &Arc<AtomicBool>,
+        spots: &mut Vec<crate::Spot>,
+        mut on_event: impl FnMut(&DecoderEvent),
+    ) -> Result<()> {
+        listen(
+            src,
+            &PipelineConfig::default(),
+            stop.clone(),
+            |ev| on_event(ev),
+            |spot| spots.push(spot.clone()),
+        )
+    }
+
+    /// MAN-73: a discontinuity reported *during* startup calibration
+    /// discards the pre-gap partial calibration buffer (it's never
+    /// processed through the channelizer) rather than splicing it onto
+    /// post-gap data, and still advances the sample clock correctly.
+    #[test]
+    fn listen_handles_a_discontinuity_during_startup_calibration() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let gap = (spec.fs as u64) * 5; // 5 s
+        let arm_after = (spec.fs * 0.5).round() as usize; // 0.5 s into the 2 s calibration fill
+        let src: Box<dyn manta_input::IqSource> = Box::new(
+            GapSource::new(rendered.samples.clone(), spec.fs, spec.center_freq_hz, gap)
+                .arm_after_samples(arm_after),
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spots = Vec::new();
+        listen(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            |_ev| {},
+            |spot| spots.push(spot.clone()),
+        )
+        .unwrap();
+
+        assert!(!spots.is_empty(), "expected at least one spot");
+        let min_expected_ts = arm_after as u64 + gap;
+        assert!(
+            spots.iter().all(|s| s.sample_ts >= min_expected_ts),
+            "every spot's sample_ts must be >= {min_expected_ts} (discarded pre-gap calibration \
+             samples + the gap), got {spots:?}"
+        );
+    }
+
+    /// MAN-73: a source that never reports a discontinuity (every source
+    /// today, and file replay always) must decode identically across runs
+    /// -- this is the regression the golden/determinism suites already
+    /// pin globally; this test documents the contract locally for this
+    /// module.
+    #[test]
+    fn listen_without_discontinuity_is_unchanged() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+
+        let run = || {
+            let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            });
+            let mut spots = Vec::new();
+            listen(
+                src,
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                |_ev| {},
+                |spot| spots.push((spot.callsign.clone(), spot.sample_ts, spot.track_id)),
+            )
+            .unwrap();
+            spots
+        };
+
+        assert_eq!(run(), run(), "identical input must decode identically");
     }
 
     /// MAN-45 (PR #63 round-9 finding): `manta_active_tracks` reported a

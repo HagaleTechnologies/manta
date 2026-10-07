@@ -845,6 +845,7 @@ dependencies = [
  "manta-spot",
  "manta-testkit",
  "num-complex",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
