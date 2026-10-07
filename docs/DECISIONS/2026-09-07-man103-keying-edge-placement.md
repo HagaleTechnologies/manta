@@ -199,6 +199,45 @@ later, when the space finally closes and `process_run` takes its
 follow-up work: it changes what the Farnsworth clusters converge to, so it
 needs its own V10/V7/V9 measurement, and V10 is a currently-enforced gate.
 
+**Correction (MAN-213, PR #214 review).** Two measured corrections to the
+paragraph above, from synthetic legacy-engine envelopes at 25 WPM (dit 48 ms):
+
+- **Restoring the bootstrap depends on the input.** The censored observations
+  alone cannot leave the unimodal init: five values near 7 never reach the
+  2:1 split ratio, and the unconfirmed re-anchor needs a value of at least
+  `2*lo`. So V10 bootstraps only because some of its long gaps still reach
+  the pair uncensored, through `classify`. A Farnsworth text where none do
+  never bootstraps: `5NN TU` repeated (25 WPM characters, 8.3-dit character
+  gaps, 19.3-dit word gaps) decodes as `5 N N T U ...` for the whole
+  transmission. `main` at `f0ab9ae` fails the same way, and also
+  decodes the V10 text letter by letter on a clean envelope.
+- **Feeding the true gap is not safe as the improvement above describes it.**
+  A track survives up to `hang_ms` (5000 ms) of silence, so a pause between
+  calls closes as a long gap (~33 dits for 1.6 s). A prototype that observed
+  the closed length (flushed length plus post-flush remainder) fixed
+  `5NN TU` but broke plain 3/7-dit spacing. One 1.6 s pause inside the first
+  five long gaps lifts the long-gap boundary above the 7-dit word gap, and
+  every later word merges: `W1AW` + pause + `W1AW TEST W1AW TEST` decodes as
+  `W1AW W1AWTESTW1AWTEST`, and `CQ` + pause + `CQ DE W1AW W1AW K` merges the
+  same way. Neither scene recovers before it ends, because a word gap below
+  the boundary updates `lo`, not `hi`. By the init arithmetic, no fixed clamp
+  on the observed length separates the cases: the 2:1 init split needs a
+  Farnsworth word gap of at least ~16.6 dits, and in a `[3, 3, 3, 7, pause]`
+  init a pause clamped above ~16.3 dits already lifts the boundary past 7.
+  `decoder.rs`'s `legacy_early_pause_does_not_merge_later_words` pins the
+  pause case. The follow-up therefore needs pause-robust long-gap
+  statistics (for example, an init that rejects a lone outlier), measured
+  against V7/V9/V10, not just the closed length. The same hazard already
+  reaches the pair through the two paths that bypass `check_flush`'s
+  censoring. A pause before the speed tracker is ready replays from
+  `pending` through `classify` at full length (`R` + pause +
+  `W1AW TEST W1AW TEST` decodes as `R W1AW TESTW1AWTEST`). So does a pause
+  after a character whose only unemitted mark is still held one flip behind:
+  `cur_marks` is then empty, so `check_flush` never fires (`TEST` + pause +
+  `W1AW TEST W1AW TEST` decodes as `TEST W1AWTESTW1AWTEST`, on `main` too).
+  So the pause-robust fix belongs in the long-gap statistics that
+  every path feeds, not at the `observe_flushed` call site alone.
+
 **D9 — Record the fading movement; do not chase it.** A midpoint threshold
 sits further above the noise floor than the old geometric mean at high
 apparent depth, so a faded signal drops below it after a shallower fade.

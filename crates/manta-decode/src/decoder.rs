@@ -710,7 +710,18 @@ impl TrackDecoder {
             if gap_ms >= flush_dits * self.tracker.mu_dit_ms() {
                 // This gap never reaches `classify` (it's resolved here,
                 // by the safety net) -- fold it into the Farnsworth
-                // long-gap statistics directly (MAN-103 D8).
+                // long-gap statistics directly (MAN-103 D8). `gap_ms` is
+                // the flush threshold, not the gap's closed length, and
+                // that censoring is deliberate: observing the closed
+                // length of a pause flushed here (a track survives
+                // `hang_ms` of silence) would pin the word-gap cluster
+                // above every real word gap and merge all later words
+                // (`legacy_early_pause_does_not_merge_later_words`). It
+                // covers only pauses this flush resolves: a pause that
+                // reaches `classify` instead (replayed from `pending`
+                // during warmup, or open while the held last mark leaves
+                // `cur_marks` empty) still enters at full length -- see
+                // the MAN-103 decision doc, D8 correction.
                 self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
@@ -1623,6 +1634,24 @@ mod tests {
         }
         events.extend(dec.finish());
         assert_eq!(events_to_text(&events), "TTTTT");
+    }
+
+    /// A 1.6 s pause inside the first five long gaps (a run station
+    /// listening between calls) must not merge the words that follow.
+    /// Guards against `check_flush` observing a flushed pause's closed
+    /// length (~33 dits) instead of the flush threshold: that lifts the
+    /// long-gap boundary above the 7-dit word gap, and this decodes as
+    /// "W1AW W1AWTESTW1AWTEST".
+    #[test]
+    fn legacy_early_pause_does_not_merge_later_words() {
+        let mut env = rect_envelope("W1AW", 18);
+        // rect_envelope's 8-dit (144-hop) tail + 456 hops = 600 hops = 1.6 s.
+        env.extend(std::iter::repeat_n(0.0, 456));
+        env.extend(rect_envelope("W1AW TEST W1AW TEST", 18));
+        assert_eq!(
+            decode_with(Engine::Legacy, &env),
+            "W1AW W1AW TEST W1AW TEST"
+        );
     }
 
     /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact
