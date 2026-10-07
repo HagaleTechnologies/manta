@@ -453,9 +453,19 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 8. Configuration & observability
 
-- Single TOML config (coppa convention): device, center freq, band plan
-  (CW segment limits — don't decode/spot outside them), thresholds, track cap,
-  server ports, cty/scp paths, station callsign (spotter ID).
+- **Single TOML config** (MAN-261,
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with six
+  tables — `[server]` (station callsign, bind address, ports),
+  `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
+  capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
+  files), `[detector]` (thresholds, timers, track cap) and `[decode]` —
+  read by `run`, `soak` and `doctor` (`--config`, else `MANTA_CONFIG`) and
+  by `decode`/`oracle`. Precedence is flag, then `MANTA_<TABLE>_<KEY>`
+  environment variable, then file, then default; `decode` and `oracle`
+  never read the environment. Unknown tables, keys and `MANTA_*` variables
+  are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
+  configurable: a band plan (CW segment limits), cty/scp paths, and the
+  compile-time constants SPEC §9 marks `not configurable yet`.
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
@@ -491,8 +501,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
-  `--config` is set — `--server-config` is MAN-77's deprecated alias of
-  that flag): input overruns, active tracks, evictions, decode rate,
+  the resolved config has a `[server]` table — `--server-config` is
+  MAN-77's deprecated alias of `--config`): input overruns, active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,

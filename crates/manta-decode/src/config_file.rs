@@ -9,7 +9,9 @@
 //! parse the same TOML text a SECOND time into `DecodeConfigFile`, independent of
 //! `DaemonConfigFile` -- the same pattern that file's own doc comment
 //! already establishes for keeping `[server]`/`[[rbn_uplink]]` parsing
-//! self-contained.
+//! self-contained. MAN-261: `manta-cli`'s `config` module now parses the
+//! file once, rejects unknown top-level tables there, and types `[decode]`
+//! through `DecodeConfigToml`.
 //!
 //! This lives in `manta-decode` (not in `manta-cli`, which is the only
 //! current consumer) so that every exposed key's default is sourced
@@ -308,7 +310,9 @@ impl DecodeConfigToml {
 /// `[spot]` tables alongside `[decode]`, and this struct is parsed from the
 /// SAME file text a second time, independently of `DaemonConfigFile` --
 /// denying unknown fields at this level would reject every one of those
-/// other real, valid tables.
+/// other real, valid tables. MAN-261: the strict top-level check lives once
+/// in `manta-cli`'s `config` module, which types `[decode]` through
+/// `DecodeConfigToml` directly.
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct DecodeConfigFile {
     #[serde(default)]

@@ -8,6 +8,7 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
+mod config;
 mod reconnect;
 use reconnect::ReconnectingSource;
 
@@ -51,10 +52,11 @@ enum Command {
         /// Print the full decode report as one JSON object.
         #[arg(long, help_heading = "Output")]
         json: bool,
-        /// TOML config file with a `[decode]` table.
+        /// TOML config file; the whole file is validated.
         ///
-        /// Its values are the baseline; an explicit --engine overrides just
-        /// the engine setting.
+        /// Its `[decode]` values are the baseline; an explicit --engine
+        /// overrides just the engine setting. The environment (MANTA_CONFIG,
+        /// MANTA_*) is not read here, so output never depends on it.
         // `--server-config` stays as a hidden alias for the flag's old
         // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config")]
@@ -100,10 +102,11 @@ enum Command {
         /// How many seconds around each reference spot to decode.
         #[arg(long, default_value_t = 40.0, value_parser = parse_window_s)]
         window_s: f64,
-        /// TOML config file with a `[decode]` table.
+        /// TOML config file; the whole file is validated.
         ///
-        /// Its values are the baseline; an explicit --engine overrides just
-        /// the engine setting.
+        /// Its `[decode]` values are the baseline; an explicit --engine
+        /// overrides just the engine setting. The environment (MANTA_CONFIG,
+        /// MANTA_*) is not read here, so output never depends on it.
         // `--server-config` stays as a hidden alias for the flag's old
         // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config")]
@@ -482,6 +485,14 @@ enum Command {
         /// an audio source's reported frequencies are baseband offsets.
         #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
         dial_freq_hz: Option<f64>,
+        /// TOML config file whose `[input]`, `[spot]`, `[detector]` and
+        /// `[decode]` tables supply what the flags leave unset.
+        ///
+        /// Falls back to $MANTA_CONFIG. Flags override the file, and
+        /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
+        /// `soak` never starts the spot servers.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Check whether a source is hearing anything, and say what it found.
     ///
@@ -625,6 +636,14 @@ enum Command {
         /// `center_freq_hz`, are baseband offsets.
         #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
         dial_freq_hz: Option<f64>,
+        /// TOML config file whose `[input]`, `[spot]`, `[detector]` and
+        /// `[decode]` tables supply what the flags leave unset.
+        ///
+        /// Falls back to $MANTA_CONFIG. Flags override the file, and
+        /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
+        /// `doctor` never starts the spot servers.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Print the full report as one JSON object instead of a readable
         /// summary.
         #[arg(long, help_heading = "Output")]
@@ -659,13 +678,14 @@ struct FilterOpts {
     /// affects the frequencies it validates. This is the same idea as CW
     /// Skimmer's FreqCalibration setting, expressed in ppm rather than as
     /// a raw multiplier.
+    ///
+    /// Defaults to 0, or to `input.freq_correction_ppm` from --config.
     #[arg(
         long,
-        default_value_t = 0.0,
         value_parser = parse_freq_correction_ppm,
         allow_negative_numbers = true
     )]
-    freq_correction_ppm: f64,
+    freq_correction_ppm: Option<f64>,
     /// Spot this callsign even when the usual validity checks reject it.
     ///
     /// Repeat the flag for more than one call. Use it for a station you
@@ -746,6 +766,19 @@ impl LiveSourceSpec {
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
             LiveSourceSpec::AudioDevice(_) => "audio",
             LiveSourceSpec::File { .. } => "file",
+        }
+    }
+
+    /// Kiwi/Soapy/Hpsdr, or an IQ WAV whose sidecar reports a real (> 0)
+    /// center frequency: a source that already knows its own tuned
+    /// frequency, so `--dial-freq-hz` is an override and not a requirement.
+    fn is_rf_aware(&self) -> bool {
+        match self {
+            LiveSourceSpec::AudioDevice(_) => false,
+            LiveSourceSpec::File { path, source_iq } => {
+                source_iq_has_real_rf_center(path, *source_iq)
+            }
+            _ => true,
         }
     }
 
@@ -841,96 +874,6 @@ impl LiveSourceSpec {
     }
 }
 
-/// Open a single-DDC HPSDR/Hermes device (feature `hpsdr`) as an
-/// `IqSource`, or `None` if `--hpsdr-host` wasn't given. Checked ahead of
-/// `open_source`'s kiwi/soapy/audio chain, so `--hpsdr-host` takes priority
-/// over those the same way `kiwi.host` already takes priority over
-/// `soapy.driver` inside that chain -- in practice only one of
-/// kiwi/soapy/hpsdr is ever set, since each already `conflicts_with_all`
-/// `device`/`source`.
-#[cfg(feature = "hpsdr")]
-fn open_hpsdr_source(hpsdr: HpsdrOpts) -> Result<Option<Box<dyn IqSource>>> {
-    let Some(host) = hpsdr.host else {
-        return Ok(None);
-    };
-    let freq = hpsdr
-        .freq
-        .ok_or_else(|| anyhow!("--hpsdr-freq-hz is required with --hpsdr-host"))?;
-    let rate = hpsdr
-        .rate
-        .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with --hpsdr-host"))?;
-    let cfg = manta_input::hpsdr::HpsdrConfig {
-        host,
-        port: hpsdr.port,
-        ddc_count: 1,
-        sample_rate_hz: rate,
-        center_freq_hz: vec![freq],
-    };
-    let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
-    Ok(Some(Box::new(sources.remove(0))))
-}
-
-/// Open a live audio device, WAV replay, KiwiSDR network source, or
-/// SoapySDR device (feature `soapy`) based on which CLI flags were set.
-/// `kiwi.host` takes priority over `soapy.driver` (clap's
-/// `conflicts_with_all` on each already rules out `device`/`source` being
-/// set alongside either).
-#[cfg(feature = "soapy")]
-fn open_source(
-    device: Option<String>,
-    source: Option<PathBuf>,
-    source_iq: bool,
-    kiwi: KiwiOpts,
-    soapy: SoapyOpts,
-    dial_freq_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
-    if let Some(host) = kiwi.host {
-        let freq = kiwi
-            .freq
-            .ok_or_else(|| anyhow!("--kiwi-freq-hz is required with --kiwi-host"))?;
-        return Ok(Box::new(manta_input::kiwi::KiwiIqSource::connect(
-            &host,
-            kiwi.port,
-            freq,
-            &kiwi.password,
-        )?));
-    }
-    if let Some(driver) = soapy.driver {
-        let freq = soapy
-            .freq
-            .ok_or_else(|| anyhow!("--soapy-freq-hz is required with --soapy-driver"))?;
-        let rate = soapy
-            .rate
-            .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
-        return Ok(Box::new(manta_input::soapy::SoapySdrIqSource::open(
-            &driver, rate, freq, soapy.gain,
-        )?));
-    }
-    open_audio_source(device, source, source_iq, dial_freq_hz)
-}
-
-#[cfg(not(feature = "soapy"))]
-fn open_source(
-    device: Option<String>,
-    source: Option<PathBuf>,
-    source_iq: bool,
-    kiwi: KiwiOpts,
-    dial_freq_hz: Option<f64>,
-) -> Result<Box<dyn IqSource>> {
-    if let Some(host) = kiwi.host {
-        let freq = kiwi
-            .freq
-            .ok_or_else(|| anyhow!("--kiwi-freq-hz is required with --kiwi-host"))?;
-        return Ok(Box::new(manta_input::kiwi::KiwiIqSource::connect(
-            &host,
-            kiwi.port,
-            freq,
-            &kiwi.password,
-        )?));
-    }
-    open_audio_source(device, source, source_iq, dial_freq_hz)
-}
-
 /// `--source <path>.wav` covers two distinct file formats sharing the same
 /// flag: a mono real-audio recording (M1 "Audio passband" input, e.g.
 /// captured from a rig's RX line-out -- decoded via `AudioIqSource`'s
@@ -1006,13 +949,10 @@ fn audio_with_dial(
 /// negative `center_freq_hz` passed the old `!= 0.0` check and would have
 /// published negative/invalid RF frequencies through spot outputs) -- an
 /// RF dial frequency in this domain is never zero or negative.
-fn source_iq_has_real_rf_center(source: &Option<PathBuf>, source_iq: bool) -> bool {
+fn source_iq_has_real_rf_center(path: &Path, source_iq: bool) -> bool {
     if !source_iq {
         return false;
     }
-    let Some(path) = source else {
-        return false;
-    };
     manta_input::WavIqSource::open(path)
         .map(|src| src.center_freq_hz() > 0.0)
         .unwrap_or(false)
@@ -1078,25 +1018,6 @@ fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq
     }
 }
 
-/// Applies `--dial-freq-hz` as an override on top of an already-RF-aware
-/// source (KiwiSDR/SoapySDR/HPSDR), which reports a tuned frequency of its
-/// own that the operator is allowed to supersede. Audio and raw-IQ file
-/// sources carry the operator's dial frequency from `open_audio_source`
-/// instead, so this is a no-op for them even when `dial_freq_hz` is `Some`.
-fn apply_rf_aware_override(
-    src: Box<dyn IqSource>,
-    has_rf_aware_source: bool,
-    dial_freq_hz: Option<f64>,
-) -> Box<dyn IqSource> {
-    match dial_freq_hz {
-        Some(freq_hz) if has_rf_aware_source => Box::new(FixedCenterFreqSource {
-            inner: src,
-            freq_hz,
-        }),
-        _ => src,
-    }
-}
-
 /// Wrap `src` in a `DecimatingSource` targeting `capture_rate_hz`, unless
 /// it's `None` or already matches the source's native rate (a no-op in
 /// either case -- omitting `--capture-rate-hz` reproduces today's exact
@@ -1140,9 +1061,15 @@ fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --capture-rate-hz {s:?}: {e}"))?;
+    check_capture_rate_hz("--capture-rate-hz", hz)
+}
+
+/// `parse_capture_rate_hz`'s check, shared with `input.capture_rate_hz`
+/// (MAN-261); `name` is the flag or config key the message cites.
+fn check_capture_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz < MIN_CAPTURE_RATE_HZ {
         return Err(format!(
-            "--capture-rate-hz must be a finite number of Hz >= {MIN_CAPTURE_RATE_HZ}, got {hz}"
+            "{name} must be a finite number of Hz >= {MIN_CAPTURE_RATE_HZ}, got {hz}"
         ));
     }
     Ok(hz)
@@ -1156,6 +1083,13 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     let ppm: f64 = s
         .parse()
         .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+    check_freq_correction_ppm(ppm)
+}
+
+/// `parse_freq_correction_ppm`'s check, shared with
+/// `input.freq_correction_ppm` (MAN-261). The message already names
+/// `freq_correction_ppm`, so it serves both spellings unchanged.
+fn check_freq_correction_ppm(ppm: f64) -> std::result::Result<f64, String> {
     manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| e.to_string())?;
     Ok(ppm)
 }
@@ -1331,9 +1265,15 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+    check_dial_freq_hz("--dial-freq-hz", hz)
+}
+
+/// `parse_dial_freq_hz`'s check, shared with `input.center_freq_hz`
+/// (MAN-261); `name` is the flag or config key the message cites.
+fn check_dial_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
-            "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
+            "{name} must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)
@@ -1347,14 +1287,19 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
 /// -- a finite, positive but tiny rate like `1e-20` still overflows it and
 /// panics (round-2 review finding: the round-1 fix rejected NaN/inf/<=0 but
 /// not an unrealistically small positive value).
-#[cfg(feature = "hpsdr")]
 const MIN_HPSDR_RATE_HZ: f64 = 1_000.0;
 /// Upper bound for `--hpsdr-rate-hz`: generous headroom above any real
 /// HPSDR/Hermes rate, purely to keep the range symmetric and reject
 /// obviously-wrong input (e.g. a value with stray zeros) rather than to
 /// pin an exact hardware ceiling this CLI layer has no authority over.
-#[cfg(feature = "hpsdr")]
 const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
+
+/// Default HPSDR/Hermes control port for `[input] type = "hpsdr"`, defined
+/// on every build so the table validates identically with or without
+/// `--features hpsdr` (MAN-261); pinned to manta-input's own constant below.
+const HPSDR_CONTROL_PORT: u16 = 1024;
+#[cfg(feature = "hpsdr")]
+const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
 
 /// Clap value parser for `--hpsdr-rate-hz`: rejects non-finite (NaN/infinity)
 /// and out-of-range values at CLI-parse time. `HpsdrConfig::validate`'s own
@@ -1369,9 +1314,15 @@ fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --hpsdr-rate-hz {s:?}: {e}"))?;
+    check_hpsdr_rate_hz("--hpsdr-rate-hz", hz)
+}
+
+/// `parse_hpsdr_rate_hz`'s check, un-gated so `[input] type = "hpsdr"`
+/// validates identically on every build (MAN-261).
+fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || !(MIN_HPSDR_RATE_HZ..=MAX_HPSDR_RATE_HZ).contains(&hz) {
         return Err(format!(
-            "--hpsdr-rate-hz must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
+            "{name} must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
              {MAX_HPSDR_RATE_HZ}, got {hz}"
         ));
     }
@@ -1389,9 +1340,14 @@ fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --hpsdr-freq-hz {s:?}: {e}"))?;
+    check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
+}
+
+/// `parse_hpsdr_freq_hz`'s check, un-gated like `check_hpsdr_rate_hz`.
+fn check_hpsdr_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
-            "--hpsdr-freq-hz must be a finite, positive number of Hz, got {hz}"
+            "{name} must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)
@@ -1420,9 +1376,15 @@ fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
     let secs: i64 = s
         .parse()
         .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+    check_replay_epoch("--replay-epoch", secs)
+}
+
+/// `parse_replay_epoch`'s check, shared with `input.replay_epoch`
+/// (MAN-261); `name` is the flag or config key the message cites.
+fn check_replay_epoch(name: &str, secs: i64) -> std::result::Result<i64, String> {
     if !(0..=MAX_REPLAY_EPOCH_SECS).contains(&secs) {
         return Err(format!(
-            "--replay-epoch must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
+            "{name} must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
              (2100-01-01), got {secs}"
         ));
     }
@@ -1447,11 +1409,13 @@ fn build_pipeline_config(
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    detector: manta_engine::DetectorConfig,
     engine: Engine,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist,
+        detector,
         ..Default::default()
     };
     cfg.decode.engine = engine;
@@ -1468,27 +1432,13 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
-/// Loads the `[decode]` TOML table (SPEC v2 §7) from `--server-config`, if
-/// given, into a full `manta_decode::decoder::DecodeConfig`. Parses the
-/// same file's raw text a SECOND time, independent of
-/// `manta_server::config::DaemonConfigFile` -- that struct deliberately
-/// does not model `[decode]` (see its own doc comment), and re-parsing the
-/// same text into a separately-modeled top-level table is the existing
-/// pattern for this unified daemon config (`ServerConfig`/`RbnUplinkConfig`
-/// already work this way). `Ok(DecodeConfig::default())` when no
-/// `--server-config` path is given, matching `PipelineConfig::default()`'s
-/// own decode baseline.
-fn load_decode_config_file(
-    server_config: Option<&Path>,
+/// Range-checks a `[decode]` table (SPEC v2 §7) loaded by `config::load`
+/// from `origin` (the config file's path, or "environment"). Every message
+/// names `origin`; `config::load` adds no context layer on top.
+fn validate_decode_config(
+    cfg: manta_decode::decoder::DecodeConfig,
+    origin: &str,
 ) -> Result<manta_decode::decoder::DecodeConfig> {
-    let Some(path) = server_config else {
-        return Ok(manta_decode::decoder::DecodeConfig::default());
-    };
-    let cfg_text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading --server-config {}", path.display()))?;
-    let file: manta_decode::config_file::DecodeConfigFile = toml::from_str(&cfg_text)
-        .with_context(|| format!("parsing [decode] table in {}", path.display()))?;
-    let cfg = file.decode.into_decode_config();
     // Codex review, PR #161: `fallback_hops = 0` deserializes successfully (it's a
     // plain u32 with no serde-level range check) but Evidence::push's anchor
     // computation divides by it (`self.hop_out % self.cfg.fallback_hops as u64`),
@@ -1499,7 +1449,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] fallback_hops must be nonzero in {} (0 would divide by zero on the \
              first evidence hop)",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 2: `tau_hi_bounds_ms = [400, 100]` (or any
@@ -1515,14 +1465,14 @@ fn load_decode_config_file(
             "[decode] tau_hi_bounds_ms must be a finite [low, high] pair with 0 < low <= high \
              in {} (got [{tau_hi_lo}, {tau_hi_hi}], which would panic in f64::clamp on the \
              first speed update)",
-            path.display()
+            origin
         );
     }
     if !cfg.demod.tau_lo_ms.is_finite() || cfg.demod.tau_lo_ms <= 0.0 {
         bail!(
             "[decode] tau_lo_ms must be a finite, positive number of milliseconds in {} \
              (got {})",
-            path.display(),
+            origin,
             cfg.demod.tau_lo_ms
         );
     }
@@ -1544,14 +1494,14 @@ fn load_decode_config_file(
         bail!(
             "[decode] timing_sigma must be finite and >= {MIN_TIMING_SIGMA} in {} (got {}; \
              smaller values can underflow log_likelihood's denominator to a NaN score)",
-            path.display(),
+            origin,
             cfg.beam.sigma
         );
     }
     if cfg.beam.width == 0 {
         bail!(
             "[decode] beam_width must be nonzero in {} (0 disables the beam decoder entirely)",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 3: `[decode] beam = 0` (the hsmm
@@ -1566,7 +1516,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] hsmm beam must be nonzero in {} (0 empties the live hypothesis set on the \
              first anchor step, silently emitting no decoded text)",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 4: `sigma_u = 0` puts a hop exactly on
@@ -1585,7 +1535,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] sigma_u must be finite and >= {MIN_SIGMA_U} in {} (got {}; smaller values \
              can underflow the LLR denominator to 0/0)",
-            path.display(),
+            origin,
             cfg.evidence.sigma_u
         );
     }
@@ -1600,7 +1550,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] seed_units_hops must have at least one entry in {} (an empty list seeds \
              zero tokens at every keying onset, silently emitting no decoded text)",
-            path.display()
+            origin
         );
     }
     if let Some(bad) = cfg
@@ -1611,7 +1561,7 @@ fn load_decode_config_file(
     {
         bail!(
             "[decode] every seed_units_hops entry must be finite and positive in {} (got {bad})",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 18: a seed outside the decoder's
@@ -1632,7 +1582,7 @@ fn load_decode_config_file(
              valid initial mark transition for any real signal)",
             cfg.hsmm.u_min,
             cfg.hsmm.u_max,
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 4: `conf_kappa = 0` makes the common
@@ -1644,7 +1594,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] conf_kappa must be finite and strictly positive in {} (got {}; 0 makes the \
              no-competing-hypothesis confidence path compute 0/0)",
-            path.display(),
+            origin,
             cfg.hsmm.conf_kappa
         );
     }
@@ -1662,7 +1612,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] dur_sigma must be finite and >= {MIN_DUR_SIGMA} in {} (got {}; smaller \
              values can underflow log_dur_prior's denominator to 0/0)",
-            path.display(),
+            origin,
             cfg.hsmm.dur_sigma
         );
     }
@@ -1680,7 +1630,7 @@ fn load_decode_config_file(
     if !cfg.evidence.hold_dits.is_finite() || cfg.evidence.hold_dits <= 0.0 || !max_h.is_finite() {
         bail!(
             "[decode] hold_dits must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.evidence.hold_dits
         );
     }
@@ -1699,7 +1649,7 @@ fn load_decode_config_file(
              Evidence's internal retention cap ({}), silently truncating the delay line and \
              discarding evidence centers",
             cfg.evidence.hold_dits,
-            path.display(),
+            origin,
             cfg.hsmm.u_max,
             manta_decode::evidence::MAX_RETAIN,
         );
@@ -1714,7 +1664,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] speed_alpha must be finite in {} (got {}; a non-finite value poisons \
              every subsequent speed update and duration prior with NaN)",
-            path.display(),
+            origin,
             cfg.hsmm.speed_alpha
         );
     }
@@ -1727,7 +1677,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] speed_alpha must be nonnegative in {} (got {}; a negative gain moves the \
              speed estimate away from observed durations instead of toward them)",
-            path.display(),
+            origin,
             cfg.hsmm.speed_alpha
         );
     }
@@ -1739,7 +1689,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] mark_insert_penalty must be finite in {} (got {}; a non-finite value \
              poisons every Dit/Dah transition's score with NaN)",
-            path.display(),
+            origin,
             cfg.hsmm.mark_insert_penalty
         );
     }
@@ -1751,7 +1701,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] noise_min_bias_db must be finite in {} (got {}; a non-finite value makes \
              every temporal noise estimate infinite, silently closing the evidence gate)",
-            path.display(),
+            origin,
             cfg.noise.noise_min_bias_db
         );
     }
@@ -1766,7 +1716,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] spectral_min_bias_db must be finite in {} (got {}; a non-finite value \
              makes every spectral noise estimate infinite, silently closing the evidence gate)",
-            path.display(),
+            origin,
             cfg.noise.spectral_min_bias_db
         );
     }
@@ -1774,7 +1724,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] spectral_beta must be finite in {} (got {}; a non-finite value makes \
              every spectral noise estimate infinite, silently closing the evidence gate)",
-            path.display(),
+            origin,
             cfg.noise.spectral_beta
         );
     }
@@ -1790,7 +1740,7 @@ fn load_decode_config_file(
             "[decode] spectral_beta must be nonnegative in {} (got {}; a negative value makes \
              the spectral term always lose to max(), silently disabling the spectral \
              noise discount)",
-            path.display(),
+            origin,
             cfg.noise.spectral_beta
         );
     }
@@ -1804,7 +1754,7 @@ fn load_decode_config_file(
             "[decode] lookahead_dits must be finite and nonnegative in {} (got {}; a negative \
              value forces every non-consensus entry immediately, and a non-finite value \
              disables forced commits entirely)",
-            path.display(),
+            origin,
             cfg.hsmm.lookahead_dits
         );
     }
@@ -1817,7 +1767,7 @@ fn load_decode_config_file(
     if !cfg.noise.noise_window_ms.is_finite() || cfg.noise.noise_window_ms <= 0.0 {
         bail!(
             "[decode] noise_window_ms must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.noise.noise_window_ms
         );
     }
@@ -1834,7 +1784,7 @@ fn load_decode_config_file(
     if !cfg.demod.hyst_up.is_finite() || !cfg.demod.hyst_down.is_finite() {
         bail!(
             "[decode] hyst_up/hyst_down must be finite in {} (got hyst_up={}, hyst_down={})",
-            path.display(),
+            origin,
             cfg.demod.hyst_up,
             cfg.demod.hyst_down
         );
@@ -1842,7 +1792,7 @@ fn load_decode_config_file(
     if cfg.demod.hyst_down <= 0.0 || cfg.demod.hyst_up <= cfg.demod.hyst_down {
         bail!(
             "[decode] hyst_up must be > hyst_down > 0 in {} (got hyst_up={}, hyst_down={})",
-            path.display(),
+            origin,
             cfg.demod.hyst_up,
             cfg.demod.hyst_down
         );
@@ -1850,14 +1800,14 @@ fn load_decode_config_file(
     if !cfg.demod.debounce_ms.is_finite() || cfg.demod.debounce_ms <= 0.0 {
         bail!(
             "[decode] debounce_ms must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.demod.debounce_ms
         );
     }
     if !cfg.flush_gap_dits.is_finite() || cfg.flush_gap_dits <= 0.0 {
         bail!(
             "[decode] flush_gap_dits must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.flush_gap_dits
         );
     }
@@ -1869,7 +1819,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] llr_clip must be finite and positive in {} (got {}; f32::clamp panics on \
              a negative or non-finite bound)",
-            path.display(),
+            origin,
             cfg.evidence.llr_clip
         );
     }
@@ -1890,11 +1840,18 @@ fn load_decode_config_file(
         bail!(
             "[decode] refine_bw_hz must be finite and nonnegative in {} (got {}; use 0.0 to \
              disable refinement, not a negative value)",
-            path.display(),
+            origin,
             cfg.refine_bw_hz
         );
     }
     Ok(cfg)
+}
+
+/// Test-only entry point over the production loader (`config::load`), kept
+/// so the `[decode]` validation tests exercise the real path unmodified.
+#[cfg(test)]
+fn load_decode_config_file(config: Option<&Path>) -> Result<manta_decode::decoder::DecodeConfig> {
+    Ok(config::load(config, config::Env::Ignore)?.decode)
 }
 
 /// SPEC v2 §7: an explicit `--engine` flag overrides the `[decode]` table's
@@ -2293,7 +2250,8 @@ fn spawn_tracked_listener(
 }
 
 fn start_spot_server(
-    config_path: &std::path::Path,
+    cfg: manta_server::config::ServerConfig,
+    rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
     source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
@@ -2325,11 +2283,8 @@ fn start_spot_server(
         )
         .try_init();
 
-    let cfg_text = std::fs::read_to_string(config_path)?;
-    let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
-    let rbn_uplink_cfgs = file.rbn_uplink.clone();
-    let cfg = file.server;
-
+    // MAN-261: `[server]`/`[[rbn_uplink]]` arrive already parsed and
+    // validated by `config::load`, before any source was opened.
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
         source.sample_rate_hz,
         epoch,
@@ -2533,6 +2488,272 @@ fn start_spot_server(
     ))
 }
 
+/// The command line's say in source/input/spot selection, before it is
+/// merged over the config file and environment (`resolve`, MAN-261).
+struct CliOverrides {
+    device: Option<String>,
+    source: Option<PathBuf>,
+    source_iq: bool,
+    kiwi: KiwiOpts,
+    #[cfg(feature = "soapy")]
+    soapy: SoapyOpts,
+    #[cfg(feature = "hpsdr")]
+    hpsdr: HpsdrOpts,
+    freq_correction_ppm: Option<f64>,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+    replay_epoch: Option<i64>,
+    allowlist: Vec<String>,
+    blocklist: Option<PathBuf>,
+    notch: Option<PathBuf>,
+}
+
+impl CliOverrides {
+    /// The flag that selects a source, if any: given one, the command line
+    /// defines the whole source (D6).
+    fn source_selector(&self) -> Option<&'static str> {
+        #[cfg(feature = "hpsdr")]
+        if self.hpsdr.host.is_some() {
+            return Some("--hpsdr-host");
+        }
+        #[cfg(feature = "soapy")]
+        if self.soapy.driver.is_some() {
+            return Some("--soapy-driver");
+        }
+        if self.kiwi.host.is_some() {
+            Some("--kiwi-host")
+        } else if self.source.is_some() {
+            Some("--source")
+        } else if self.device.is_some() {
+            Some("--device")
+        } else {
+            None
+        }
+    }
+
+    /// The source the flags describe, in today's priority order: hpsdr,
+    /// then kiwi, then soapy, then a WAV file or audio device.
+    fn into_spec(self) -> LiveSourceSpec {
+        #[cfg(feature = "hpsdr")]
+        if self.hpsdr.host.is_some() {
+            return LiveSourceSpec::Hpsdr(self.hpsdr);
+        }
+        if self.kiwi.host.is_some() {
+            return LiveSourceSpec::Kiwi(self.kiwi);
+        }
+        #[cfg(feature = "soapy")]
+        if self.soapy.driver.is_some() {
+            return LiveSourceSpec::Soapy(self.soapy);
+        }
+        match self.source {
+            Some(path) => LiveSourceSpec::File {
+                path,
+                source_iq: self.source_iq,
+            },
+            None => LiveSourceSpec::AudioDevice(self.device),
+        }
+    }
+}
+
+/// `[spot]` after the CLI is merged over the file/env layer (D6).
+#[derive(Debug, PartialEq)]
+struct SpotResolved {
+    allowlist: Vec<String>,
+    blocklist: Option<PathBuf>,
+    notch: Option<PathBuf>,
+}
+
+/// A non-empty `--allowlist` replaces the file's list (never concatenated);
+/// `--blocklist`/`--notch` beat `blocklist_path`/`notch_path`.
+fn resolve_spot(
+    cli_allowlist: Vec<String>,
+    cli_blocklist: Option<PathBuf>,
+    cli_notch: Option<PathBuf>,
+    spot: &config::SpotFile,
+) -> SpotResolved {
+    SpotResolved {
+        allowlist: if cli_allowlist.is_empty() {
+            spot.allowlist.clone()
+        } else {
+            cli_allowlist
+        },
+        blocklist: cli_blocklist.or_else(|| spot.blocklist_path.clone()),
+        notch: cli_notch.or_else(|| spot.notch_path.clone()),
+    }
+}
+
+/// Everything a live command needs after CLI > env > file > default.
+struct Resolved {
+    spec: LiveSourceSpec,
+    freq_correction_ppm: f64,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+    replay_epoch: Option<i64>,
+    spot: SpotResolved,
+    /// Printed to stderr by the caller, never stdout.
+    notes: Vec<String>,
+}
+
+/// D6: merges the command line over the loaded file + environment layer.
+fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
+    let mut notes = Vec::new();
+    let spot = resolve_spot(
+        cli.allowlist.clone(),
+        cli.blocklist.clone(),
+        cli.notch.clone(),
+        &loaded.spot,
+    );
+    let mut shared = loaded.input.shared.clone();
+    let (freq_correction_ppm, dial_freq_hz, capture_rate_hz, replay_epoch) = (
+        cli.freq_correction_ppm,
+        cli.dial_freq_hz,
+        cli.capture_rate_hz,
+        cli.replay_epoch,
+    );
+    let spec = match (cli.source_selector(), &loaded.input.source) {
+        (Some(flag), Some(file_source)) => {
+            // A typed [input] describes one receiver: its ppm and dial
+            // belong to it, not to whatever the command line names instead.
+            notes.push(format!(
+                "note: {flag} selects the source; ignoring [input] (type = \"{}\") from {}, \
+                 including its freq_correction_ppm/center_freq_hz",
+                file_source.kind().name(),
+                loaded.origin
+            ));
+            shared = config::SharedInput::default();
+            cli.into_spec()
+        }
+        (Some(_), None) | (None, None) => cli.into_spec(),
+        (None, Some(file_source)) => spec_from_file(file_source, cli.source_iq)?,
+    };
+    Ok(Resolved {
+        spec,
+        freq_correction_ppm: freq_correction_ppm
+            .or(shared.freq_correction_ppm)
+            .unwrap_or(0.0),
+        dial_freq_hz: dial_freq_hz.or(shared.center_freq_hz),
+        capture_rate_hz: capture_rate_hz.or(shared.capture_rate_hz),
+        replay_epoch: replay_epoch.or(shared.replay_epoch),
+        spot,
+        notes,
+    })
+}
+
+/// The `LiveSourceSpec` a typed `[input]` describes. `--source-iq` without
+/// `--source` sets `iq` on a `type = "file"` source (D6).
+fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
+    Ok(match source {
+        config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
+        config::SourceFromFile::File { path, iq } => LiveSourceSpec::File {
+            path: path.clone(),
+            source_iq: *iq || cli_source_iq,
+        },
+        config::SourceFromFile::Kiwi {
+            host,
+            port,
+            freq_hz,
+            password,
+        } => LiveSourceSpec::Kiwi(KiwiOpts {
+            host: Some(host.clone()),
+            port: *port,
+            freq: Some(*freq_hz),
+            password: password.clone(),
+        }),
+        #[cfg(feature = "soapy")]
+        config::SourceFromFile::Soapy {
+            driver,
+            freq_hz,
+            rate_hz,
+            gain_db,
+        } => LiveSourceSpec::Soapy(SoapyOpts {
+            driver: Some(driver.clone()),
+            freq: Some(*freq_hz),
+            rate: Some(*rate_hz),
+            gain: *gain_db,
+        }),
+        #[cfg(not(feature = "soapy"))]
+        config::SourceFromFile::Soapy { .. } => {
+            bail!("input.type = \"soapy\" needs a manta built with --features soapy")
+        }
+        #[cfg(feature = "hpsdr")]
+        config::SourceFromFile::Hpsdr {
+            host,
+            port,
+            freq_hz,
+            rate_hz,
+        } => LiveSourceSpec::Hpsdr(HpsdrOpts {
+            host: Some(host.clone()),
+            port: *port,
+            freq: Some(*freq_hz),
+            rate: Some(*rate_hz),
+        }),
+        #[cfg(not(feature = "hpsdr"))]
+        config::SourceFromFile::Hpsdr { .. } => {
+            bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
+        }
+    })
+}
+
+/// `run`/`soak`/`doctor`'s shared start: load the config (`--config`, else
+/// `MANTA_CONFIG`) with the `MANTA_*` overlay, merge the CLI over it, print
+/// the merge notes, and build the pipeline config. The environment is read
+/// here and only here, with `vars_os` so a non-UTF-8 variable is never a
+/// panic (MAN-261 scenario 4).
+struct Prepared {
+    config_path: Option<PathBuf>,
+    loaded: config::Loaded,
+    resolved: Resolved,
+    pipeline: PipelineConfig,
+}
+
+fn prepare_live(
+    cli: CliOverrides,
+    config_flag: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+) -> Result<Prepared> {
+    let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
+    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    let resolved = resolve(cli, &loaded)?;
+    for note in &resolved.notes {
+        eprintln!("{note}");
+    }
+    let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
+    let mut pipeline = build_pipeline_config(
+        resolved.freq_correction_ppm,
+        resolved.spot.allowlist.clone(),
+        resolved.spot.blocklist.clone(),
+        resolved.spot.notch.clone(),
+        loaded.detector,
+        decode.engine,
+    )?;
+    pipeline.decode = decode;
+    Ok(Prepared {
+        config_path,
+        loaded,
+        resolved,
+        pipeline,
+    })
+}
+
+/// `decode`/`oracle`: one stderr note naming the tables present in the file
+/// that the command does not apply (D7).
+fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str]) {
+    let ignored: Vec<&str> = loaded
+        .present
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !applied.contains(t))
+        .collect();
+    if !ignored.is_empty() {
+        eprintln!(
+            "note: {command} ignores [{}] from {}",
+            ignored.join("], ["),
+            loaded.origin
+        );
+    }
+}
+
 fn main() -> Result<()> {
     warn_deprecations();
     match Cli::parse().command {
@@ -2543,13 +2764,38 @@ fn main() -> Result<()> {
             config,
             engine,
         } => {
-            let decode_from_file = load_decode_config_file(config.as_deref())?;
-            let decode_cfg = merge_cli_engine(engine, decode_from_file);
+            let FilterOpts {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+            } = filters;
+            // D7/D8: the whole file is validated, the environment is never
+            // read; [decode], [detector], [spot] and input.freq_correction_ppm
+            // apply, with the CLI over the file.
+            let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
+            note_ignored_tables(&loaded, "decode", &["decode", "detector", "spot", "input"]);
+            let shared = &loaded.input.shared;
+            if loaded.input.source.is_some()
+                || shared.center_freq_hz.is_some()
+                || shared.capture_rate_hz.is_some()
+                || shared.replay_epoch.is_some()
+            {
+                eprintln!(
+                    "note: decode applies only input.freq_correction_ppm from [input] in {}",
+                    loaded.origin
+                );
+            }
+            let spot = resolve_spot(allowlist, blocklist, notch, &loaded.spot);
+            let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
             let mut cfg = build_pipeline_config(
-                filters.freq_correction_ppm,
-                filters.allowlist,
-                filters.blocklist,
-                filters.notch,
+                freq_correction_ppm
+                    .or(loaded.input.shared.freq_correction_ppm)
+                    .unwrap_or(0.0),
+                spot.allowlist,
+                spot.blocklist,
+                spot.notch,
+                loaded.detector,
                 decode_cfg.engine,
             )?;
             cfg.decode = decode_cfg;
@@ -2572,12 +2818,13 @@ fn main() -> Result<()> {
             engine,
             jsonl,
         } => {
+            let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
+            note_ignored_tables(&loaded, "oracle", &["decode"]);
             let mut src = manta_input::WavIqSource::open(&path)?;
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
             let iq = manta_input::read_all(&mut src)?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
-            let decode_from_file = load_decode_config_file(config.as_deref())?;
-            let cfg = merge_cli_engine(engine, decode_from_file);
+            let cfg = merge_cli_engine(engine, loaded.decode);
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
@@ -2653,136 +2900,84 @@ fn main() -> Result<()> {
             replay_epoch,
             engine,
         } => {
-            // Captured before `spec.open()` consumes `source` below --
-            // needed to derive a recording-specific replay epoch.
-            let replay_path = source.clone();
-            #[cfg(feature = "soapy")]
-            let has_soapy_source = soapy_driver.is_some();
-            #[cfg(not(feature = "soapy"))]
-            let has_soapy_source = false;
-            #[cfg(feature = "hpsdr")]
-            let has_hpsdr_source = hpsdr_host.is_some();
-            #[cfg(not(feature = "hpsdr"))]
-            let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some()
-                || has_soapy_source
-                || has_hpsdr_source
-                || source_iq_has_real_rf_center(&source, source_iq);
-
-            if config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
-                bail!(
-                    "--dial-freq-hz is required with --config when using a plain \
-                     audio device or a real-audio --source WAV file -- neither \
-                     reports a real RF frequency (KiwiSDR, SoapySDR and HPSDR \
-                     already know theirs from \
-                     --kiwi-freq-hz/--soapy-freq-hz/--hpsdr-freq-hz, and a \
-                     --source-iq recording reads its own from its sidecar)"
-                );
-            }
-            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
-
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq_hz,
-                password: kiwi_password,
-            };
-            // SPEC v2 §7: `[decode]` (from --config, if given) is
-            // the baseline; an explicit --engine overrides just its
-            // `engine` key (merge_cli_engine). `engine = "hsmm"` is a fully
-            // implemented and reviewed engine (Task 8) and needs no gate
-            // here as of Task 11.
-            let decode_from_file = load_decode_config_file(config.as_deref())?;
-            let decode_cfg = merge_cli_engine(engine, decode_from_file);
-            let mut cfg = build_pipeline_config(
-                filters.freq_correction_ppm,
-                filters.allowlist,
-                filters.blocklist,
-                filters.notch,
-                decode_cfg.engine,
-            )?;
-            cfg.decode = decode_cfg;
-            // MAN-73: `spec` describes how to (re)open the configured
-            // input -- `ReconnectingSource` below calls `spec.open(...)`
-            // again every time a live source needs to be reopened, so the
-            // precedence here (hpsdr, then kiwi, then soapy, then
-            // device/file) must match what `open_hpsdr_source`/
-            // `open_source` used to decide once at startup.
-            let spec: LiveSourceSpec;
-            #[cfg(feature = "hpsdr")]
-            {
-                if hpsdr_host.is_some() {
-                    spec = LiveSourceSpec::Hpsdr(HpsdrOpts {
+            let FilterOpts {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+            } = filters;
+            let Prepared {
+                config_path,
+                loaded,
+                resolved,
+                pipeline: cfg,
+            } = prepare_live(
+                CliOverrides {
+                    device,
+                    source,
+                    source_iq,
+                    kiwi: KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq_hz,
+                        password: kiwi_password,
+                    },
+                    #[cfg(feature = "soapy")]
+                    soapy: SoapyOpts {
+                        driver: soapy_driver,
+                        freq: soapy_freq_hz,
+                        rate: soapy_rate_hz,
+                        gain: soapy_gain,
+                    },
+                    #[cfg(feature = "hpsdr")]
+                    hpsdr: HpsdrOpts {
                         host: hpsdr_host,
                         port: hpsdr_port,
                         freq: hpsdr_freq_hz,
                         rate: hpsdr_rate_hz,
-                    });
-                } else if kiwi.host.is_some() {
-                    spec = LiveSourceSpec::Kiwi(kiwi);
-                } else {
-                    #[cfg(feature = "soapy")]
-                    {
-                        if soapy_driver.is_some() {
-                            spec = LiveSourceSpec::Soapy(SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq_hz,
-                                rate: soapy_rate_hz,
-                                gain: soapy_gain,
-                            });
-                        } else if let Some(path) = source {
-                            spec = LiveSourceSpec::File { path, source_iq };
-                        } else {
-                            spec = LiveSourceSpec::AudioDevice(device);
-                        }
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        if let Some(path) = source {
-                            spec = LiveSourceSpec::File { path, source_iq };
-                        } else {
-                            spec = LiveSourceSpec::AudioDevice(device);
-                        }
-                    }
-                }
-            }
-            #[cfg(not(feature = "hpsdr"))]
-            {
-                if kiwi.host.is_some() {
-                    spec = LiveSourceSpec::Kiwi(kiwi);
-                } else {
-                    #[cfg(feature = "soapy")]
-                    {
-                        if soapy_driver.is_some() {
-                            spec = LiveSourceSpec::Soapy(SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq_hz,
-                                rate: soapy_rate_hz,
-                                gain: soapy_gain,
-                            });
-                        } else if let Some(path) = source {
-                            spec = LiveSourceSpec::File { path, source_iq };
-                        } else {
-                            spec = LiveSourceSpec::AudioDevice(device);
-                        }
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        if let Some(path) = source {
-                            spec = LiveSourceSpec::File { path, source_iq };
-                        } else {
-                            spec = LiveSourceSpec::AudioDevice(device);
-                        }
-                    }
-                }
-            }
-
-            // Startup fail-fast (unchanged): a wrong host/port or a
-            // missing device still ends the process immediately here, as
-            // today -- only a loss *after* this succeeds is retried by
-            // `ReconnectingSource` below.
-            let first = spec.open(capture_rate_hz, dial_freq_hz)?;
+                    },
+                    freq_correction_ppm,
+                    dial_freq_hz,
+                    capture_rate_hz,
+                    replay_epoch,
+                    allowlist,
+                    blocklist,
+                    notch,
+                },
+                config,
+                engine,
+            )?;
+            let spec = &resolved.spec;
+            let dial_freq_hz = resolved.dial_freq_hz;
+            // Needed to derive a recording-specific replay epoch/nonce.
+            let replay_path = match spec {
+                LiveSourceSpec::File { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            let has_rf_aware_source = spec.is_rf_aware();
             let source_name = spec.name();
+
+            // Servers start iff the resolved config has a [server] table
+            // (D7); the guard runs after the load and before any source I/O.
+            if loaded.server.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+                bail!(
+                    "--dial-freq-hz is required with --config when using a plain \
+                     audio device or --source WAV file -- neither reports a real RF \
+                     frequency (KiwiSDR/SoapySDR already know theirs from \
+                     --kiwi-freq/--soapy-freq); set it with --dial-freq-hz, \
+                     MANTA_INPUT_CENTER_FREQ_HZ, or input.center_freq_hz"
+                );
+            }
+            if config_path.is_some() && loaded.server.is_none() {
+                eprintln!(
+                    "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
+                     started",
+                    loaded.origin
+                );
+            }
+            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
+            let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
+            let replay_epoch = resolved.replay_epoch;
 
             // MAN-122 review round 6 (P2): installed HERE -- before
             // `start_spot_server` binds the sockets and logs the
@@ -2829,8 +3024,8 @@ fn main() -> Result<()> {
                 mut active_tracks_poller,
                 decode_latency,
                 mut decode_latency_poller,
-            ) = match config {
-                Some(path) => {
+            ) = match loaded.server.clone() {
+                Some(server_cfg) => {
                     // `epoch` feeds SpotBus's wall-clock conversion (every
                     // JSON `timestamp`/RBN Zulu field a client observes) --
                     // a live session's epoch is this process's real start
@@ -2869,7 +3064,8 @@ fn main() -> Result<()> {
                     // startup connection), before it is moved into the
                     // pipeline below.
                     let (rt, server) = start_spot_server(
-                        &path,
+                        server_cfg,
+                        loaded.rbn_uplink.clone(),
                         SourceInfo {
                             name: source_name,
                             sample_rate_hz: first.sample_rate(),
@@ -3294,70 +3490,65 @@ fn main() -> Result<()> {
             source_iq,
             filters,
             dial_freq_hz,
+            config,
         } => {
-            #[cfg(feature = "soapy")]
-            let has_soapy_source = soapy_driver.is_some();
-            #[cfg(not(feature = "soapy"))]
-            let has_soapy_source = false;
-            #[cfg(feature = "hpsdr")]
-            let has_hpsdr_source = hpsdr_host.is_some();
-            #[cfg(not(feature = "hpsdr"))]
-            let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some()
-                || has_soapy_source
-                || has_hpsdr_source
-                || source_iq_has_real_rf_center(&source, source_iq);
-            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
-
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq_hz,
-                password: kiwi_password,
-            };
-            let cfg = build_pipeline_config(
-                filters.freq_correction_ppm,
-                filters.allowlist,
-                filters.blocklist,
-                filters.notch,
-                Engine::Legacy,
-            )?;
-            #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq_hz,
-                rate: hpsdr_rate_hz,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
+            let FilterOpts {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+            } = filters;
+            let Prepared {
+                loaded,
+                resolved,
+                pipeline: cfg,
+                ..
+            } = prepare_live(
+                CliOverrides {
+                    device,
+                    source,
+                    source_iq,
+                    kiwi: KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq_hz,
+                        password: kiwi_password,
+                    },
                     #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            source_iq,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq_hz,
-                                rate: soapy_rate_hz,
-                                gain: soapy_gain,
-                            },
-                            dial_freq_hz,
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, source_iq, kiwi, dial_freq_hz)?
-                    }
-                }
-            };
-            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
-            let src = apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
+                    soapy: SoapyOpts {
+                        driver: soapy_driver,
+                        freq: soapy_freq_hz,
+                        rate: soapy_rate_hz,
+                        gain: soapy_gain,
+                    },
+                    #[cfg(feature = "hpsdr")]
+                    hpsdr: HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq_hz,
+                        rate: hpsdr_rate_hz,
+                    },
+                    freq_correction_ppm,
+                    dial_freq_hz,
+                    capture_rate_hz,
+                    replay_epoch: None,
+                    allowlist,
+                    blocklist,
+                    notch,
+                },
+                config,
+                None,
+            )?;
+            if loaded.server.is_some() {
+                eprintln!(
+                    "note: soak does not start the spot servers; ignoring [server] from {}",
+                    loaded.origin
+                );
+            }
+            let spec = &resolved.spec;
+            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
+            let src: Box<dyn IqSource> =
+                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {
@@ -3392,8 +3583,15 @@ fn main() -> Result<()> {
             capture_rate_hz,
             source_iq,
             dial_freq_hz,
+            config,
             json,
         } => {
+            let FilterOpts {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+            } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
             // connect/activate already spent real time (or hung/failed for
@@ -3409,68 +3607,57 @@ fn main() -> Result<()> {
                     manta_engine::MAX_DURATION.as_secs()
                 );
             }
-            #[cfg(feature = "soapy")]
-            let has_soapy_source = soapy_driver.is_some();
-            #[cfg(not(feature = "soapy"))]
-            let has_soapy_source = false;
-            #[cfg(feature = "hpsdr")]
-            let has_hpsdr_source = hpsdr_host.is_some();
-            #[cfg(not(feature = "hpsdr"))]
-            let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some()
-                || has_soapy_source
-                || has_hpsdr_source
-                || source_iq_has_real_rf_center(&source, source_iq);
-            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq_hz,
-                password: kiwi_password,
-            };
-            let cfg = build_pipeline_config(
-                filters.freq_correction_ppm,
-                filters.allowlist,
-                filters.blocklist,
-                filters.notch,
-                Engine::Legacy,
-            )?;
-            #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq_hz,
-                rate: hpsdr_rate_hz,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
+            let Prepared {
+                loaded,
+                resolved,
+                pipeline: cfg,
+                ..
+            } = prepare_live(
+                CliOverrides {
+                    device,
+                    source,
+                    source_iq,
+                    kiwi: KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq_hz,
+                        password: kiwi_password,
+                    },
                     #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            source_iq,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq_hz,
-                                rate: soapy_rate_hz,
-                                gain: soapy_gain,
-                            },
-                            dial_freq_hz,
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, source_iq, kiwi, dial_freq_hz)?
-                    }
-                }
-            };
-            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
-            let src = apply_rf_aware_override(src, has_rf_aware_source, dial_freq_hz);
+                    soapy: SoapyOpts {
+                        driver: soapy_driver,
+                        freq: soapy_freq_hz,
+                        rate: soapy_rate_hz,
+                        gain: soapy_gain,
+                    },
+                    #[cfg(feature = "hpsdr")]
+                    hpsdr: HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq_hz,
+                        rate: hpsdr_rate_hz,
+                    },
+                    freq_correction_ppm,
+                    dial_freq_hz,
+                    capture_rate_hz,
+                    replay_epoch: None,
+                    allowlist,
+                    blocklist,
+                    notch,
+                },
+                config,
+                None,
+            )?;
+            if loaded.server.is_some() {
+                eprintln!(
+                    "note: doctor does not start the spot servers; ignoring [server] from {}",
+                    loaded.origin
+                );
+            }
+            let spec = &resolved.spec;
+            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
+            let src: Box<dyn IqSource> =
+                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain
@@ -3824,8 +4011,10 @@ mod tests {
                 "#,
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, server) = start_spot_server(
-            cfg_file.path(),
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -4595,8 +4784,10 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -4649,8 +4840,10 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -4712,8 +4905,10 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -5093,5 +5288,332 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             geography_is_unresolved(&cty, "W1AW"),
             "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
         );
+    }
+
+    // ---- MAN-261: CLI > env > file precedence (`resolve`) and coverage
+
+    fn cli_overrides() -> CliOverrides {
+        CliOverrides {
+            device: None,
+            source: None,
+            source_iq: false,
+            kiwi: KiwiOpts {
+                host: None,
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            },
+            #[cfg(feature = "soapy")]
+            soapy: SoapyOpts {
+                driver: None,
+                freq: None,
+                rate: None,
+                gain: None,
+            },
+            #[cfg(feature = "hpsdr")]
+            hpsdr: HpsdrOpts {
+                host: None,
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq: None,
+                rate: None,
+            },
+            freq_correction_ppm: None,
+            dial_freq_hz: None,
+            capture_rate_hz: None,
+            replay_epoch: None,
+            allowlist: Vec::new(),
+            blocklist: None,
+            notch: None,
+        }
+    }
+
+    fn loaded_from(body: &str) -> config::Loaded {
+        let f = write_temp_file(body.as_bytes());
+        config::load(Some(f.path()), config::Env::Ignore).unwrap()
+    }
+
+    const KIWI_INPUT: &str =
+        "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nfreq_hz = 14025000.0\n\
+                              freq_correction_ppm = 2.5\ncenter_freq_hz = 14000000.0\n";
+
+    #[test]
+    fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
+        let loaded = loaded_from(KIWI_INPUT);
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("v1.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::File { .. }));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(r.dial_freq_hz, None);
+        assert_eq!(r.notes.len(), 1);
+        assert!(
+            r.notes[0].contains("--source selects the source; ignoring [input] (type = \"kiwi\")")
+        );
+    }
+
+    #[test]
+    fn untyped_input_shared_keys_survive_a_cli_source() {
+        let loaded = loaded_from("[input]\nfreq_correction_ppm = 2.5\n");
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("v1.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert!(r.notes.is_empty());
+    }
+
+    #[test]
+    fn config_source_is_used_when_no_cli_source_is_given() {
+        let r = resolve(cli_overrides(), &loaded_from(KIWI_INPUT)).unwrap();
+        let LiveSourceSpec::Kiwi(kiwi) = &r.spec else {
+            panic!("expected the kiwi source from [input]");
+        };
+        assert_eq!(kiwi.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(kiwi.freq, Some(14_025_000.0));
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert_eq!(r.dial_freq_hz, Some(14_000_000.0));
+    }
+
+    #[test]
+    fn cli_ppm_beats_file_ppm() {
+        let cli = CliOverrides {
+            freq_correction_ppm: Some(4.0),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert_eq!(r.freq_correction_ppm, 4.0);
+    }
+
+    #[test]
+    fn explicit_cli_ppm_zero_beats_file_ppm() {
+        let cli = CliOverrides {
+            freq_correction_ppm: Some(0.0),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert_eq!(r.freq_correction_ppm, 0.0);
+    }
+
+    #[test]
+    fn source_iq_flag_sets_iq_on_a_config_file_source() {
+        let cli = CliOverrides {
+            source_iq: true,
+            ..cli_overrides()
+        };
+        let r = resolve(
+            cli,
+            &loaded_from("[input]\ntype = \"file\"\npath = \"/x/v1.wav\"\n"),
+        )
+        .unwrap();
+        let LiveSourceSpec::File { path, source_iq } = &r.spec else {
+            panic!("expected the file source from [input]");
+        };
+        assert_eq!(path, &PathBuf::from("/x/v1.wav"));
+        assert!(*source_iq);
+    }
+
+    #[test]
+    fn cli_allowlist_replaces_file_allowlist() {
+        let spot = config::SpotFile {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, &spot);
+        assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
+    }
+
+    #[test]
+    fn empty_cli_allowlist_keeps_file_allowlist() {
+        let spot = config::SpotFile {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        let r = resolve_spot(Vec::new(), None, None, &spot);
+        assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
+    }
+
+    #[test]
+    fn cli_blocklist_beats_blocklist_path() {
+        let spot = config::SpotFile {
+            blocklist_path: Some(PathBuf::from("/cfg/bad.txt")),
+            notch_path: Some(PathBuf::from("/cfg/n.txt")),
+            ..Default::default()
+        };
+        let r = resolve_spot(Vec::new(), Some(PathBuf::from("cli.txt")), None, &spot);
+        assert_eq!(r.blocklist, Some(PathBuf::from("cli.txt")));
+        assert_eq!(r.notch, Some(PathBuf::from("/cfg/n.txt")));
+    }
+
+    #[test]
+    fn name_matches_today_source_names() {
+        let kiwi = || KiwiOpts {
+            host: Some("h".into()),
+            port: 8073,
+            freq: Some(7e6),
+            password: String::new(),
+        };
+        assert_eq!(LiveSourceSpec::Kiwi(kiwi()).name(), "kiwi");
+        assert_eq!(LiveSourceSpec::AudioDevice(None).name(), "audio");
+        assert_eq!(
+            LiveSourceSpec::File {
+                path: PathBuf::from("x.wav"),
+                source_iq: false
+            }
+            .name(),
+            "file"
+        );
+        #[cfg(feature = "soapy")]
+        assert_eq!(
+            LiveSourceSpec::Soapy(SoapyOpts {
+                driver: Some("d".into()),
+                freq: Some(7e6),
+                rate: Some(48e3),
+                gain: None
+            })
+            .name(),
+            "soapy"
+        );
+        #[cfg(feature = "hpsdr")]
+        assert_eq!(
+            LiveSourceSpec::Hpsdr(HpsdrOpts {
+                host: Some("h".into()),
+                port: 1024,
+                freq: Some(7e6),
+                rate: Some(48e3)
+            })
+            .name(),
+            "hpsdr"
+        );
+    }
+
+    #[cfg(not(feature = "soapy"))]
+    #[test]
+    fn soapy_input_type_needs_the_soapy_feature() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"soapy\"\ndriver = \"d\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+        );
+        let err = resolve(cli_overrides(), &loaded).err().unwrap().to_string();
+        assert!(
+            err.contains("input.type = \"soapy\" needs a manta built with --features soapy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(not(feature = "hpsdr"))]
+    #[test]
+    fn hpsdr_input_type_needs_the_hpsdr_feature() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+        );
+        let err = resolve(cli_overrides(), &loaded).err().unwrap().to_string();
+        assert!(
+            err.contains("input.type = \"hpsdr\" needs a manta built with --features hpsdr"),
+            "{err}"
+        );
+    }
+
+    /// D10: every config-backed flag maps to the key it overrides.
+    const FLAG_KEYS: &[(&str, &str)] = &[
+        ("device", "input.device"),
+        ("source", "input.path"),
+        ("source_iq", "input.iq"),
+        ("kiwi_host", "input.host"),
+        ("kiwi_port", "input.port"),
+        ("kiwi_freq_hz", "input.freq_hz"),
+        ("kiwi_password", "input.password"),
+        ("soapy_driver", "input.driver"),
+        ("soapy_freq_hz", "input.freq_hz"),
+        ("soapy_rate_hz", "input.rate_hz"),
+        ("soapy_gain", "input.gain_db"),
+        ("hpsdr_host", "input.host"),
+        ("hpsdr_port", "input.port"),
+        ("hpsdr_freq_hz", "input.freq_hz"),
+        ("hpsdr_rate_hz", "input.rate_hz"),
+        ("freq_correction_ppm", "input.freq_correction_ppm"),
+        ("dial_freq_hz", "input.center_freq_hz"),
+        ("capture_rate_hz", "input.capture_rate_hz"),
+        ("replay_epoch", "input.replay_epoch"),
+        ("allowlist", "spot.allowlist"),
+        ("blocklist", "spot.blocklist_path"),
+        ("notch", "spot.notch_path"),
+        ("engine", "decode.engine"),
+    ];
+    /// Flags with no config key, by design.
+    const CLI_ONLY: &[&str] = &["json", "duration", "config", "path", "help", "version"];
+
+    #[test]
+    fn every_config_backed_flag_maps_to_a_key() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        for name in ["run", "soak", "doctor", "decode"] {
+            let sub = cli.find_subcommand(name).unwrap();
+            for arg in sub.get_arguments() {
+                let id = arg.get_id().as_str();
+                assert!(
+                    FLAG_KEYS.iter().any(|(flag, _)| *flag == id) || CLI_ONLY.contains(&id),
+                    "`manta {name} --{id}` has no config key: add it to FLAG_KEYS (and the \
+                     loader) or to CLI_ONLY"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_flag_key_is_accepted_by_the_loader() {
+        const TYPED: &[(&str, &str)] = &[
+            ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
+            ("file", "type = \"file\"\npath = \"x.wav\"\niq = true\n"),
+            (
+                "kiwi",
+                "type = \"kiwi\"\nhost = \"h\"\nport = 8073\nfreq_hz = 7e6\npassword = \"\"\n",
+            ),
+            (
+                "soapy",
+                "type = \"soapy\"\ndriver = \"d\"\nfreq_hz = 7e6\nrate_hz = 48000.0\ngain_db = 10.0\n",
+            ),
+            (
+                "hpsdr",
+                "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+            ),
+        ];
+        const SHARED: &[(&str, &str)] = &[
+            (
+                "input.freq_correction_ppm",
+                "[input]\nfreq_correction_ppm = 1.0\n",
+            ),
+            ("input.center_freq_hz", "[input]\ncenter_freq_hz = 7e6\n"),
+            (
+                "input.capture_rate_hz",
+                "[input]\ncapture_rate_hz = 6000.0\n",
+            ),
+            ("input.replay_epoch", "[input]\nreplay_epoch = 0\n"),
+            ("spot.allowlist", "[spot]\nallowlist = [\"W1AW\"]\n"),
+            (
+                "spot.blocklist_path",
+                "[spot]\nblocklist_path = \"b.txt\"\n",
+            ),
+            ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
+            ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+        ];
+        for (_, key) in FLAG_KEYS {
+            let body = match SHARED.iter().find(|(k, _)| k == key) {
+                Some((_, body)) => body.to_string(),
+                None => {
+                    let field = key.strip_prefix("input.").unwrap();
+                    let (_, table) = TYPED
+                        .iter()
+                        .find(|(_, t)| t.lines().any(|l| l.starts_with(&format!("{field} ="))))
+                        .unwrap_or_else(|| panic!("no [input] type takes {key}"));
+                    format!("[input]\n{table}")
+                }
+            };
+            let f = write_temp_file(body.as_bytes());
+            if let Err(e) = config::load(Some(f.path()), config::Env::Ignore) {
+                panic!("{key}: {body:?} was rejected: {e:#}");
+            }
+        }
     }
 }

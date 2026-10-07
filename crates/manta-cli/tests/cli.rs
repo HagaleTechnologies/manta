@@ -1,7 +1,176 @@
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 fn manta() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_manta"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    // MAN-261: `run`/`soak`/`doctor` read `MANTA_CONFIG` and
+    // `MANTA_<TABLE>_<KEY>` and reject unknown `MANTA_*` names, so a
+    // variable in the test runner's own environment must never leak into
+    // the child. Tests that exercise the env tier set theirs explicitly.
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+/// MAN-261: a minimal valid `[server]` table -- loopback only, every port 0
+/// (multi-agent hygiene: never bind a fixed port).
+const SERVER_TOML: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n";
+
+/// The prefix of `run`'s dial guard (MAN-34), pinned since before MAN-261.
+const DIAL_GUARD: &str = "--dial-freq-hz is required with --config";
+
+/// Writes `body` to `dir/name` and returns that path.
+fn write_cfg(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// V1 shortened to 30 s: long enough for its one W1AW CQ spot (emitted ~21 s
+/// in, after SPEC §2.1's warmup+confirm floor -- a 15 s or 20 s scene emits
+/// none), yet about four times quicker to replay than the full 120 s.
+fn short_v1() -> manta_testkit::vectors::VectorSpec {
+    manta_testkit::vectors::VectorSpec {
+        duration_s: 30.0,
+        ..manta_testkit::vectors::v1()
+    }
+}
+
+/// Writes `spec`'s fixture set (`<name>.wav` plus its `<name>.json`
+/// sidecar) into `dir` and returns the WAV's path.
+fn write_fixture(dir: &Path, spec: &manta_testkit::vectors::VectorSpec) -> PathBuf {
+    manta_testkit::vectors::write_fixture_set(spec, dir).unwrap();
+    dir.join(format!("{}.wav", spec.name))
+}
+
+/// `dir/v1.wav` (+ sidecar, `center_freq_hz` 14 000 000): [`short_v1`].
+fn v1_fixture(dir: &Path) -> PathBuf {
+    write_fixture(dir, &short_v1())
+}
+
+/// The spot objects from `run --json`'s stdout: each spot is printed as a
+/// `{"spot": {...}}` line, interleaved with `DecoderEvent` lines.
+fn run_spots(stdout: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("spot").cloned())
+        .collect()
+}
+
+/// Asserts a `run --json` exited 0 with exactly one spot, and returns that
+/// spot's `freq_hz`.
+fn single_spot_freq(out: &Output) -> f64 {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let spots = run_spots(&out.stdout);
+    assert_eq!(spots.len(), 1, "spots: {spots:?}; stderr: {stderr}");
+    spots[0]["freq_hz"].as_f64().unwrap()
+}
+
+/// Asserts `freq_hz == base * (1 + ppm * 1e-6)` to within 1 mHz.
+fn assert_ppm_scaled(freq_hz: f64, base: f64, ppm: f64, what: &str) {
+    let expected = base * (1.0 + ppm * 1e-6);
+    assert!(
+        (freq_hz - expected).abs() < 1e-3,
+        "{what}: expected {expected} (= {base} x (1 + {ppm}e-6)), got {freq_hz}"
+    );
+}
+
+/// Asserts a `decode --json` exited 0, and returns its report's `spots`.
+fn decode_spots(out: &Output) -> Vec<serde_json::Value> {
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    report["spots"].as_array().unwrap().clone()
+}
+
+/// Asserts `out` failed with every `needle` on stderr, and that it failed
+/// before touching the (nonexistent) WAV: `run`/`soak`/`doctor` report a
+/// missing source as `Failed to open WAV file: ...`, `decode` as
+/// `open WAV <path>`, both ending in ENOENT.
+fn assert_rejected_before_source_io(what: &str, out: &Output, needles: &[&str]) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{what}: expected a failure");
+    for needle in needles {
+        assert!(stderr.contains(needle), "{what}: no {needle:?} in {stderr}");
+    }
+    for io in ["open WAV", "No such file", "os error 2"] {
+        assert!(
+            !stderr.contains(io),
+            "{what}: the config must be rejected before any source I/O: {stderr}"
+        );
+    }
+}
+
+/// `run`, `decode`, `soak` and `doctor`, each given `--config cfg` and a
+/// nonexistent WAV, so a config error is the only way to fail before I/O.
+fn every_config_command(cfg: &Path) -> [(&'static str, Command); 4] {
+    let mut run = manta();
+    run.args([
+        "run",
+        "--source",
+        "/nonexistent.wav",
+        "--dial-freq-hz",
+        "14025000",
+        "--config",
+    ])
+    .arg(cfg);
+    let mut decode = manta();
+    decode
+        .args(["decode", "--config"])
+        .arg(cfg)
+        .arg("/nonexistent.wav");
+    let mut soak = manta();
+    soak.args([
+        "soak",
+        "--duration",
+        "2",
+        "--source",
+        "/nonexistent.wav",
+        "--config",
+    ])
+    .arg(cfg);
+    let mut doctor = manta();
+    doctor
+        .args([
+            "doctor",
+            "--duration",
+            "3",
+            "--source",
+            "/nonexistent.wav",
+            "--config",
+        ])
+        .arg(cfg);
+    [
+        ("run", run),
+        ("decode", decode),
+        ("soak", soak),
+        ("doctor", doctor),
+    ]
+}
+
+/// `dir` joined with a file name that is not valid UTF-8. The file is never
+/// created: macOS's APFS refuses non-UTF-8 names outright.
+#[cfg(unix)]
+fn non_utf8_path(dir: &Path, name: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    dir.join(std::ffi::OsStr::from_bytes(name))
+}
+
+/// MAN-261 scenario 4: an ordinary error (exit 1), never a panic (exit 101).
+#[cfg(unix)]
+fn assert_exit_1_without_panic(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert_ne!(out.status.code(), Some(101), "stderr: {stderr}");
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
 }
 
 /// SPEC §2.1's ~2.05 s mandatory warmup(750 hops)+confirm(19 hops) floor
@@ -150,22 +319,22 @@ fn decode_and_gen_are_unaffected_by_the_verb_promotion() {
 #[test]
 fn config_is_the_canonical_daemon_config_flag() {
     // Repro on e398d46: "error: unexpected argument '--config' found".
-    // Validated before any file I/O, so nonexistent paths provoke the
-    // --dial-freq-hz error, which proves --config was accepted and routed
-    // to the same field --server-config used to reach.
+    // MAN-261: the config is loaded (strictly) first, so it must be a real
+    // file with a valid [server]; the dial guard then fires after that
+    // successful load and before any source I/O (the WAV stays
+    // nonexistent). The --dial-freq-hz error proves --config was accepted
+    // and routed to the same field --server-config used to reach.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), "manta.toml", SERVER_TOML);
     let out = manta()
-        .args([
-            "run",
-            "--source",
-            "/nonexistent.wav",
-            "--config",
-            "/nonexistent.toml",
-        ])
+        .args(["run", "--source", "/nonexistent.wav", "--config"])
+        .arg(&cfg)
         .output()
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    assert!(stderr.contains(DIAL_GUARD), "stderr: {stderr}");
     // The error text must name the new flag, not the old one.
     assert!(stderr.contains("--config"), "stderr: {stderr}");
     assert!(
@@ -176,18 +345,18 @@ fn config_is_the_canonical_daemon_config_flag() {
 
 #[test]
 fn server_config_is_still_accepted_as_a_hidden_alias_of_config() {
+    // A real config (MAN-261: loaded before the dial guard fires).
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), "manta.toml", SERVER_TOML);
     let out = manta()
-        .args([
-            "run",
-            "--source",
-            "/nonexistent.wav",
-            "--server-config",
-            "/nonexistent.toml",
-        ])
+        .args(["run", "--source", "/nonexistent.wav", "--server-config"])
+        .arg(&cfg)
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--dial-freq-hz"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    assert!(stderr.contains(DIAL_GUARD), "stderr: {stderr}");
 
     // Hidden: help advertises the canonical name only.
     let help = manta().args(["run", "--help"]).output().unwrap();
@@ -336,22 +505,24 @@ fn config_does_not_require_dial_freq_hz_for_an_iq_wav_with_a_real_sidecar() {
     // wrongly rejected as "not RF-aware" and forced a redundant
     // --dial-freq-hz, even though the source already reports a real RF
     // center via WavIqSource::center_freq_hz(). This proves the gate no
-    // longer fires for that case -- the run still fails (the --config path
-    // doesn't exist), but it must fail for THAT reason, not the
-    // --dial-freq-hz one, proving the RF-awareness check itself now passes.
+    // longer fires for that case. MAN-261: with a real, valid [server]
+    // config (loopback, ports 0) the whole run now succeeds -- the file
+    // replay ends at EOF -- so the absence of the --dial-freq-hz error is
+    // no longer a vacuous pass behind a missing-config failure.
     // Requires --source-iq (round-4: no more channel-count sniffing).
     let dir = tempfile::tempdir().unwrap();
-    let spec = manta_testkit::vectors::v1(); // fs=96_000, center_freq_hz=14_000_000 (nonzero)
-    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = v1_fixture(dir.path()); // fs=96_000, center_freq_hz=14_000_000 (nonzero)
+    let cfg = write_cfg(dir.path(), "manta.toml", SERVER_TOML);
 
     let out = manta()
         .args(["run", "--source"])
-        .arg(dir.path().join("v1.wav"))
-        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .arg(&wav)
+        .args(["--source-iq", "--config"])
+        .arg(&cfg)
         .output()
         .unwrap();
-    assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
     assert!(
         !stderr.contains("--dial-freq-hz"),
         "RF-awareness gate should not fire for an IQ WAV with a real sidecar: {stderr}"
@@ -365,15 +536,19 @@ fn config_still_requires_dial_freq_hz_for_a_negative_sidecar_center_freq() {
     // an RF dial frequency in this domain is never negative, so a negative
     // sidecar value must still trip the --dial-freq-hz guard, the same as
     // the round-4 zero-sentinel case.
+    // MAN-261: a real [server] config, so the guard fires after a
+    // successful load rather than behind a missing-file error.
     let dir = tempfile::tempdir().unwrap();
-    let mut spec = manta_testkit::vectors::v1();
+    let mut spec = short_v1();
     spec.center_freq_hz = -1_000_000.0;
     manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let cfg = write_cfg(dir.path(), "manta.toml", SERVER_TOML);
 
     let out = manta()
         .args(["run", "--source"])
         .arg(dir.path().join("v1.wav"))
-        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .args(["--source-iq", "--config"])
+        .arg(&cfg)
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -382,6 +557,7 @@ fn config_still_requires_dial_freq_hz_for_a_negative_sidecar_center_freq() {
         stderr.contains("--dial-freq-hz"),
         "a negative sidecar center_freq_hz must still require --dial-freq-hz: {stderr}"
     );
+    assert!(stderr.contains(DIAL_GUARD), "stderr: {stderr}");
 }
 
 #[test]
@@ -394,17 +570,21 @@ fn config_requires_dial_freq_hz_for_an_iq_wav_with_a_zero_sidecar_center() {
     // for a source that doesn't actually report a real RF center. This
     // proves the opposite of the sibling "real sidecar" test above: the
     // guard must still fire when the sidecar's value is the zero sentinel.
+    // MAN-261: a real [server] config, so the guard fires after a
+    // successful load rather than behind a missing-file error.
     let dir = tempfile::tempdir().unwrap();
     let spec = manta_testkit::vectors::VectorSpec {
         center_freq_hz: 0.0,
-        ..manta_testkit::vectors::v1()
+        ..short_v1()
     };
     manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let cfg = write_cfg(dir.path(), "manta.toml", SERVER_TOML);
 
     let out = manta()
         .args(["run", "--source"])
         .arg(dir.path().join("v1.wav"))
-        .args(["--source-iq", "--config", "/nonexistent-daemon-config.toml"])
+        .args(["--source-iq", "--config"])
+        .arg(&cfg)
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -413,6 +593,7 @@ fn config_requires_dial_freq_hz_for_an_iq_wav_with_a_zero_sidecar_center() {
         stderr.contains("--dial-freq-hz"),
         "a sidecar with center_freq_hz: 0.0 must not bypass the --dial-freq-hz guard: {stderr}"
     );
+    assert!(stderr.contains(DIAL_GUARD), "stderr: {stderr}");
 }
 
 #[test]
@@ -526,16 +707,14 @@ fn kiwi_host_without_freq_is_a_clean_error() {
 
 #[test]
 fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
-    // Validated before any file I/O (open_source/start_spot_server), so
-    // nonexistent paths are fine for provoking this specific error.
+    // MAN-261: validated after the config loads and before any source I/O,
+    // so the config must be a real file with a valid [server] while the
+    // WAV path can stay nonexistent.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), "manta.toml", SERVER_TOML);
     let out = manta()
-        .args([
-            "listen",
-            "--source",
-            "/nonexistent.wav",
-            "--server-config",
-            "/nonexistent.toml",
-        ])
+        .args(["listen", "--source", "/nonexistent.wav", "--server-config"])
+        .arg(&cfg)
         .output()
         .unwrap();
     assert!(
@@ -544,6 +723,7 @@ fn server_config_without_dial_freq_for_audio_source_is_a_clean_error() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--dial-freq-hz"), "stderr: {stderr}");
+    assert!(stderr.contains(DIAL_GUARD), "stderr: {stderr}");
 }
 
 /// MAN-34 review finding: `manta doctor` hardcoded no dial frequency, so a
@@ -1430,4 +1610,814 @@ fn legacy_soapy_freq_and_rate_spellings_still_parse() {
             "{spelling} should still be accepted, got: {stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// MAN-261: one TOML file drives a deployment. Phase 1 -- the strict loader;
+// servers start iff [server] is present; scenario 3 (table) and scenario 4.
+// ---------------------------------------------------------------------------
+
+/// MAN-261 scenario 3 (table): a typo'd table is a hard error that names it,
+/// raised before any source I/O. Before MAN-261, `[detectr]` was silently
+/// ignored and the run failed only on the missing WAV (R2).
+#[test]
+fn unknown_table_in_config_fails_before_any_source_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!("{SERVER_TOML}[detectr]\non_snr_db = 99.0\n"),
+    );
+    for (what, mut cmd) in every_config_command(&cfg).into_iter().take(2) {
+        let out = cmd.output().unwrap();
+        assert_rejected_before_source_io(what, &out, &["detectr", "unrecognized"]);
+    }
+}
+
+/// MAN-261 D7: `run --config` with no `[server]` table decodes without the
+/// servers and says so. Before MAN-261 the same file failed late, after the
+/// source opened, with `missing field `server`` (R9).
+#[test]
+fn config_without_server_table_runs_without_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let cfg = write_cfg(
+        dir.path(),
+        "decode-only.toml",
+        "[decode]\nengine = \"legacy\"\n",
+    );
+
+    let out = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .args(["--source-iq", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    single_spot_freq(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no [server] table"), "stderr: {stderr}");
+    // The startup banner names the bound sockets (`telnet=...`); none bound.
+    assert!(!stderr.contains("telnet="), "servers started: {stderr}");
+}
+
+/// MAN-261 scenario 4, regression guard: a 0xFF byte in `run --source`'s
+/// path is an ordinary error (exit 1), never a panic (exit 101). Green from
+/// the start by design -- scenario 4 does not reproduce on `main`: the only
+/// argv scan, `warn_deprecations`, already reads `args_os()` lossily, and
+/// the panic MAN-74's validation found came from that branch's own
+/// `std::env::args()` call. This pins the behaviour so the new config and
+/// environment tiers cannot regress it.
+#[test]
+#[cfg(unix)]
+fn run_with_a_non_utf8_source_path_reports_an_error_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = non_utf8_path(dir.path(), b"man261-\xff.wav");
+    let out = manta()
+        .arg("run")
+        .arg("--source")
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_exit_1_without_panic(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("open WAV"), "stderr: {stderr}");
+}
+
+/// MAN-261 scenario 4, regression guard: a 0xFF byte in the `--config` path
+/// is an ordinary error (exit 1), never a panic. Green from the start by
+/// design: scenario 4 does not reproduce on `main` (see
+/// `run_with_a_non_utf8_source_path_reports_an_error_instead_of_panicking`).
+/// The config loader now reads this path first, so it is the code under
+/// guard.
+#[test]
+#[cfg(unix)]
+fn run_with_a_non_utf8_config_path_reports_an_error_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = non_utf8_path(dir.path(), b"man261-\xff.toml");
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("missing.wav"))
+        .args(["--dial-freq-hz", "14025000", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_exit_1_without_panic(&out);
+}
+
+/// MAN-261 scenario 4, regression guard: a non-UTF-8 value in an unrelated
+/// (non-`MANTA_*`) environment variable is skipped, not inspected -- the
+/// run fails only for the expected reason (the missing WAV), exit 1, no
+/// panic. Green from the start by design: scenario 4 does not reproduce on
+/// `main` (see `run_with_a_non_utf8_source_path_reports_an_error_instead_of_panicking`);
+/// this guards the new environment tier's `vars_os()` read. The name
+/// deliberately lacks the `MANTA_` prefix, which the strict tier would
+/// reject on its own.
+#[test]
+#[cfg(unix)]
+fn an_unrelated_non_utf8_env_var_does_not_panic_run() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("missing.wav"))
+        .env("ZZ_MAN261_NON_UTF8", std::ffi::OsStr::from_bytes(b"\xff"))
+        .output()
+        .unwrap();
+    assert_exit_1_without_panic(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("open WAV"), "stderr: {stderr}");
+}
+
+// ---------------------------------------------------------------------------
+// MAN-261 Phase 2: [detector] and [spot].
+// ---------------------------------------------------------------------------
+
+/// MAN-261: `[detector] on_snr_db` reaches `run`'s track manager. 99 dB
+/// promotes no track, so V1's W1AW spot (present without the file) is gone.
+#[test]
+fn detector_on_snr_db_from_config_silences_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let cfg = write_cfg(dir.path(), "det.toml", "[detector]\non_snr_db = 99.0\n");
+
+    let control = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    single_spot_freq(&control);
+
+    let out = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .args(["--source-iq", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    let spots = run_spots(&out.stdout);
+    assert!(
+        spots.is_empty(),
+        "on_snr_db = 99 must silence V1: {spots:?}"
+    );
+}
+
+/// MAN-261: `[detector]` also reaches `decode`. With no track promoted,
+/// `decode_samples` bails with `no signal found`.
+#[test]
+fn detector_on_snr_db_from_config_reaches_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let cfg = write_cfg(dir.path(), "det.toml", "[detector]\non_snr_db = 99.0\n");
+
+    let control = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(!decode_spots(&control).is_empty());
+
+    let out = manta()
+        .args(["decode", "--json", "--config"])
+        .arg(&cfg)
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no signal found"), "stderr: {stderr}");
+}
+
+/// MAN-261: `[spot] blocklist_path` suppresses a callsign, and a relative
+/// path resolves against the config file's directory, not the CWD (D6).
+/// Mirrors `decode_blocklist_flag_suppresses_a_callsign`.
+#[test]
+fn spot_blocklist_path_from_config_suppresses_a_callsign() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    std::fs::write(dir.path().join("bad-calls.txt"), "W1AW\n").unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[spot]\nblocklist_path = \"bad-calls.txt\"\n",
+    );
+    let is_w1aw = |s: &serde_json::Value| s["callsign"] == "W1AW";
+
+    let control = manta()
+        .current_dir(cwd.path())
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert!(decode_spots(&control).iter().any(is_w1aw));
+
+    let out = manta()
+        .current_dir(cwd.path())
+        .args(["decode", "--json", "--config"])
+        .arg(&cfg)
+        .arg(&wav)
+        .output()
+        .unwrap();
+    let spots = decode_spots(&out);
+    assert!(
+        !spots.iter().any(is_w1aw),
+        "blocklisted W1AW must never be spotted: {spots:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MAN-261 Phase 3: [input], CLI-over-file precedence, --config on soak/doctor.
+// ---------------------------------------------------------------------------
+
+/// Kills and reaps the child on drop, so a failed assertion never leaks a
+/// `manta run` still attached to the fake KiwiSDR.
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    /// Kills the child (harmless if it already exited) and returns its stderr.
+    fn finish(&mut self) -> String {
+        use std::io::Read as _;
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.0.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        stderr
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// What the fake KiwiSDR saw of the client's handshake.
+struct KiwiSession {
+    /// The WebSocket request path (`/<timestamp>/SND`).
+    path: String,
+    /// The first text frame (`SET auth t=kiwi p=<password>`).
+    auth: String,
+    /// The tuning command (`SET mod=iq ... freq=<kHz>`).
+    tune: String,
+}
+
+/// Records the WebSocket upgrade request's path for [`fake_kiwi_session`].
+/// A trait impl rather than a closure: `Callback`'s large `Err` type is
+/// tungstenite's to choose, and clippy only flags it on closures.
+struct CapturePath<'a>(&'a mut String);
+
+impl tungstenite::handshake::server::Callback for CapturePath<'_> {
+    fn on_request(
+        self,
+        request: &tungstenite::handshake::server::Request,
+        response: tungstenite::handshake::server::Response,
+    ) -> Result<
+        tungstenite::handshake::server::Response,
+        tungstenite::handshake::server::ErrorResponse,
+    > {
+        *self.0 = request.uri().path().to_owned();
+        Ok(response)
+    }
+}
+
+/// Plays a KiwiSDR's side of `KiwiIqSource::connect`
+/// (crates/manta-input/src/kiwi.rs): accept the WebSocket on `/<ts>/SND`,
+/// read `SET auth`, report `sample_rate=` in a binary `MSG` frame, then read
+/// until the `SET mod=iq` tuning command. Every wait is bounded (20 s to
+/// connect, 10 s per read) so a regression fails instead of hanging, and a
+/// child that exits without connecting fails at once.
+fn fake_kiwi_session(
+    listener: &std::net::TcpListener,
+    child: &mut std::process::Child,
+) -> Result<KiwiSession, String> {
+    use std::time::{Duration, Instant};
+    use tungstenite::Message;
+
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "manta exited ({status}) without connecting to the fake KiwiSDR"
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err("no connection to the fake KiwiSDR within 20 s".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("accept: {e}")),
+        }
+    };
+    // BSD/macOS sockets inherit the listener's non-blocking mode.
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    let timeout = Some(Duration::from_secs(10));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+
+    let mut path = String::new();
+    let mut ws = tungstenite::accept_hdr(stream, CapturePath(&mut path))
+        .map_err(|e| format!("WebSocket handshake: {e}"))?;
+
+    let auth = match ws.read().map_err(|e| format!("reading SET auth: {e}"))? {
+        Message::Text(t) => t.as_str().to_owned(),
+        other => return Err(format!("expected SET auth first, got {other:?}")),
+    };
+    // 12000 Hz / 93.75 Hz per channel = 128 channels: a valid rate.
+    ws.send(Message::binary(b"MSG sample_rate=12000.000".to_vec()))
+        .map_err(|e| format!("sending sample_rate: {e}"))?;
+    for _ in 0..32 {
+        match ws
+            .read()
+            .map_err(|e| format!("reading SET commands: {e}"))?
+        {
+            Message::Text(t) if t.as_str().starts_with("SET mod=iq") => {
+                let tune = t.as_str().to_owned();
+                return Ok(KiwiSession { path, auth, tune });
+            }
+            _ => continue,
+        }
+    }
+    Err("no SET mod=iq within 32 frames".into())
+}
+
+/// MAN-261 scenario 1: an `[input] type = "kiwi"` table alone makes
+/// `manta run --config f.toml` (no source flags) connect to that KiwiSDR,
+/// authenticate with its password and tune `freq_hz`. Hermetic: the KiwiSDR
+/// is an in-process fake on 127.0.0.1:0. Before MAN-261 `[input]` was never
+/// consulted and the run fell through to the default audio device (R1).
+#[test]
+fn kiwi_input_table_opens_that_source_with_no_source_flags() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "kiwi.toml",
+        &format!(
+            "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nport = {port}\n\
+             freq_hz = 14025000.0\npassword = \"pw\"\n"
+        ),
+    );
+
+    let mut child = ChildGuard(
+        manta()
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let session = fake_kiwi_session(&listener, &mut child.0);
+    let stderr = child.finish();
+    let session = session.unwrap_or_else(|e| panic!("{e}; manta stderr: {stderr}"));
+    assert!(session.path.ends_with("/SND"), "path: {}", session.path);
+    assert_eq!(session.auth, "SET auth t=kiwi p=pw");
+    assert!(
+        session.tune.contains("freq=14025.000"),
+        "tune: {}",
+        session.tune
+    );
+}
+
+/// The scenario-2 fixture: [`v1_fixture`] in `dir` plus `dir/manta.toml`,
+/// whose `[input]` names the WAV relative to the config's own directory and
+/// sets `freq_correction_ppm = 2.5`. Returns `(wav, cfg)`.
+fn ppm_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let wav = v1_fixture(dir);
+    let cfg = write_cfg(
+        dir,
+        "manta.toml",
+        "[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\nfreq_correction_ppm = 2.5\n",
+    );
+    (wav, cfg)
+}
+
+/// `run --json --source <wav> --source-iq` from `cwd`, no config: the
+/// uncorrected baseline spot frequency.
+fn baseline_spot_freq(cwd: &Path, wav: &Path) -> f64 {
+    let out = manta()
+        .current_dir(cwd)
+        .args(["run", "--json", "--source"])
+        .arg(wav)
+        .arg("--source-iq")
+        .output()
+        .unwrap();
+    single_spot_freq(&out)
+}
+
+/// MAN-261 scenario 2: `[input] freq_correction_ppm` scales the spot
+/// frequency exactly as the flag does, and an explicit
+/// `--freq-correction-ppm` beats it. Runs from a different CWD so the file's
+/// relative `path` must resolve against the config's directory. Before
+/// MAN-261 the file's ppm was ignored (R6).
+#[test]
+fn config_freq_correction_ppm_applies_and_the_cli_flag_overrides_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (wav, cfg) = ppm_fixture(dir.path());
+    let base = baseline_spot_freq(cwd.path(), &wav);
+
+    let from_file = manta()
+        .current_dir(cwd.path())
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_ppm_scaled(single_spot_freq(&from_file), base, 2.5, "file ppm 2.5");
+
+    let from_flag = manta()
+        .current_dir(cwd.path())
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .args(["--freq-correction-ppm", "4.0"])
+        .output()
+        .unwrap();
+    assert_ppm_scaled(
+        single_spot_freq(&from_flag),
+        base,
+        4.0,
+        "--freq-correction-ppm 4.0 over the file's 2.5",
+    );
+}
+
+/// MAN-261 scenario 3 (ppm): an out-of-range `[input] freq_correction_ppm`
+/// fails with the flag validator's own message, on every command that takes
+/// `--config`, before any source I/O. Before MAN-261 `decode` loaded it and
+/// failed only on the missing WAV (R3).
+#[test]
+fn out_of_range_freq_correction_ppm_in_input_is_rejected_like_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "ppm.toml",
+        "[input]\nfreq_correction_ppm = 999999\n",
+    );
+    for (what, mut cmd) in every_config_command(&cfg) {
+        let out = cmd.output().unwrap();
+        assert_rejected_before_source_io(
+            what,
+            &out,
+            &["freq_correction_ppm 999999 is outside the supported range [-1000, 1000]"],
+        );
+    }
+}
+
+/// MAN-261 scenario 3 (table) on the two commands that gained `--config`.
+#[test]
+fn unknown_table_in_config_fails_for_soak_and_doctor() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!("{SERVER_TOML}[detectr]\non_snr_db = 99.0\n"),
+    );
+    for (what, mut cmd) in every_config_command(&cfg).into_iter().skip(2) {
+        let out = cmd.output().unwrap();
+        assert_rejected_before_source_io(what, &out, &["detectr", "unrecognized"]);
+    }
+}
+
+/// MAN-261 D6: a CLI source flag defines the whole source. A typed `[input]`
+/// table is discarded as a unit -- including its shared
+/// `freq_correction_ppm` -- with a note. Nothing listens on port 1, so any
+/// attempt to use the KiwiSDR table would fail the run.
+#[test]
+fn cli_source_flag_replaces_a_typed_input_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let cfg = write_cfg(
+        dir.path(),
+        "kiwi.toml",
+        "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nport = 1\nfreq_hz = 14025000.0\n\
+         freq_correction_ppm = 2.5\n",
+    );
+    let base = baseline_spot_freq(dir.path(), &wav);
+
+    let out = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .args(["--source-iq", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let freq = single_spot_freq(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ignoring [input]"), "stderr: {stderr}");
+    assert_ppm_scaled(freq, base, 0.0, "the discarded table's ppm must not apply");
+}
+
+/// MAN-261 D6: `--source-iq` without `--source` sets `iq = true` on a config
+/// `type = "file"` source. Without it, V1's 96 kHz IQ WAV goes through
+/// `AudioIqSource`, which accepts only 48000 Hz.
+#[test]
+fn source_iq_flag_applies_to_a_config_file_source() {
+    let dir = tempfile::tempdir().unwrap();
+    v1_fixture(dir.path());
+    let cfg = write_cfg(
+        dir.path(),
+        "file.toml",
+        "[input]\ntype = \"file\"\npath = \"v1.wav\"\n",
+    );
+
+    let out = manta()
+        .args(["run", "--json", "--source-iq", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    single_spot_freq(&out);
+
+    let without = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(!without.status.success());
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(stderr.contains("48000"), "stderr: {stderr}");
+}
+
+/// MAN-261 D7: `input.center_freq_hz` satisfies `run`'s dial guard and takes
+/// exactly `--dial-freq-hz`'s path. The fixture's sidecar reports the zero
+/// "unknown center" sentinel, so only the operator's dial makes it RF-aware.
+#[test]
+fn config_center_freq_hz_satisfies_the_dial_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = write_fixture(
+        dir.path(),
+        &manta_testkit::vectors::VectorSpec {
+            center_freq_hz: 0.0,
+            ..short_v1()
+        },
+    );
+    let file_input = "[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n";
+    let server_only = write_cfg(dir.path(), "server.toml", SERVER_TOML);
+    let with_center = write_cfg(
+        dir.path(),
+        "center.toml",
+        &format!("{SERVER_TOML}{file_input}center_freq_hz = 14000000.0\n"),
+    );
+    let without_center = write_cfg(
+        dir.path(),
+        "no-center.toml",
+        &format!("{SERVER_TOML}{file_input}"),
+    );
+
+    let from_file = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&with_center)
+        .output()
+        .unwrap();
+    let from_file = single_spot_freq(&from_file);
+    let from_flag = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .args(["--source-iq", "--dial-freq-hz", "14000000", "--config"])
+        .arg(&server_only)
+        .output()
+        .unwrap();
+    let from_flag = single_spot_freq(&from_flag);
+    assert!(from_file > 14_000_000.0, "not absolute: {from_file}");
+    assert!(
+        (from_file - from_flag).abs() < 1e-3,
+        "input.center_freq_hz gave {from_file}, --dial-freq-hz gave {from_flag}"
+    );
+
+    let out = manta()
+        .args(["run", "--json", "--config"])
+        .arg(&without_center)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(DIAL_GUARD), "stderr: {stderr}");
+}
+
+/// MAN-261: `doctor --config` reads `[input]`, including `center_freq_hz`.
+/// Pattern: `doctor_accepts_and_applies_dial_freq_hz_for_an_audio_source`.
+#[test]
+fn doctor_reports_center_freq_hz_from_the_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    v1_fixture(dir.path());
+    let cfg = write_cfg(
+        dir.path(),
+        "doctor.toml",
+        "[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\ncenter_freq_hz = 7030000.0\n",
+    );
+
+    let out = manta()
+        .args(["doctor", "--duration", "3", "--json", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("doctor --json not JSON ({e}): stdout={stdout} stderr={stderr}")
+    });
+    assert_eq!(
+        report["center_freq_hz"].as_f64(),
+        Some(7_030_000.0),
+        "report: {report}"
+    );
+}
+
+/// MAN-261: `soak --config` opens the `[input]` source with no source flags.
+#[test]
+fn soak_runs_from_a_config_file_source() {
+    let dir = tempfile::tempdir().unwrap();
+    v1_fixture(dir.path());
+    let cfg = write_cfg(
+        dir.path(),
+        "soak.toml",
+        "[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n",
+    );
+
+    let out = manta()
+        .args(["soak", "--duration", "2", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("SoakReport"), "stderr: {stderr}");
+}
+
+/// MAN-261 D7: `soak` and `doctor` never start the spot servers; a
+/// `[server]` table in their config earns a note instead.
+#[test]
+fn soak_and_doctor_note_an_ignored_server_table() {
+    let dir = tempfile::tempdir().unwrap();
+    v1_fixture(dir.path());
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        &format!("{SERVER_TOML}[input]\ntype = \"file\"\npath = \"v1.wav\"\niq = true\n"),
+    );
+
+    for args in [
+        ["soak", "--duration", "2", "--config"].as_slice(),
+        ["doctor", "--duration", "3", "--json", "--config"].as_slice(),
+    ] {
+        let out = manta().args(args).arg(&cfg).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{}: stderr: {stderr}", args[0]);
+        assert!(
+            stderr.contains("does not start the spot servers"),
+            "{}: stderr: {stderr}",
+            args[0]
+        );
+        assert!(!stderr.contains("telnet="), "{}: {stderr}", args[0]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MAN-261 Phase 4: the MANTA_* environment tier (run, soak, doctor only).
+// ---------------------------------------------------------------------------
+
+/// MAN-261 precedence: CLI flag > `MANTA_*` > file > default, shown on
+/// `freq_correction_ppm` (file 2.5, env 3.0, flag 4.0).
+#[test]
+fn env_ppm_sits_between_file_and_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (wav, cfg) = ppm_fixture(dir.path());
+    let base = baseline_spot_freq(cwd.path(), &wav);
+
+    let from_env = manta()
+        .current_dir(cwd.path())
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .env("MANTA_INPUT_FREQ_CORRECTION_PPM", "3.0")
+        .output()
+        .unwrap();
+    assert_ppm_scaled(
+        single_spot_freq(&from_env),
+        base,
+        3.0,
+        "MANTA_INPUT_FREQ_CORRECTION_PPM=3.0 over the file's 2.5",
+    );
+
+    let from_flag = manta()
+        .current_dir(cwd.path())
+        .args(["run", "--json", "--config"])
+        .arg(&cfg)
+        .args(["--freq-correction-ppm", "4.0"])
+        .env("MANTA_INPUT_FREQ_CORRECTION_PPM", "3.0")
+        .output()
+        .unwrap();
+    assert_ppm_scaled(
+        single_spot_freq(&from_flag),
+        base,
+        4.0,
+        "--freq-correction-ppm 4.0 over MANTA_INPUT_FREQ_CORRECTION_PPM=3.0",
+    );
+}
+
+/// MAN-261 D8: `MANTA_CONFIG` names the config when `--config` is absent, and
+/// an explicit `--config` beats it.
+#[test]
+fn manta_config_env_is_the_config_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    std::fs::write(dir.path().join("bad-calls.txt"), "W1AW\n").unwrap();
+    let block = write_cfg(
+        dir.path(),
+        "block.toml",
+        "[spot]\nblocklist_path = \"bad-calls.txt\"\n",
+    );
+    let other = write_cfg(dir.path(), "other.toml", "[decode]\nengine = \"legacy\"\n");
+    let is_w1aw = |s: &serde_json::Value| s["callsign"] == "W1AW";
+
+    let from_env = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .arg("--source-iq")
+        .env("MANTA_CONFIG", &block)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&from_env.stderr);
+    assert!(from_env.status.success(), "stderr: {stderr}");
+    let spots = run_spots(&from_env.stdout);
+    assert!(
+        !spots.iter().any(is_w1aw),
+        "MANTA_CONFIG's blocklist must apply: {spots:?}"
+    );
+
+    let from_flag = manta()
+        .args(["run", "--json", "--source"])
+        .arg(&wav)
+        .args(["--source-iq", "--config"])
+        .arg(&other)
+        .env("MANTA_CONFIG", &block)
+        .output()
+        .unwrap();
+    single_spot_freq(&from_flag);
+    assert!(
+        run_spots(&from_flag.stdout).iter().any(is_w1aw),
+        "--config must beat MANTA_CONFIG"
+    );
+}
+
+/// MAN-261 scenario 4: a non-UTF-8 value in a `MANTA_*` variable is an error
+/// that names the variable (exit 1), never a panic, and it is raised before
+/// any source I/O.
+#[test]
+#[cfg(unix)]
+fn non_utf8_manta_env_value_is_an_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let out = manta()
+        .args(["run", "--source"])
+        .arg(dir.path().join("missing.wav"))
+        .arg("--source-iq")
+        .env("MANTA_INPUT_HOST", std::ffi::OsStr::from_bytes(b"h\xff"))
+        .output()
+        .unwrap();
+    assert_exit_1_without_panic(&out);
+    assert_rejected_before_source_io("run", &out, &["MANTA_INPUT_HOST is not valid UTF-8"]);
+}
+
+/// MAN-261 D8: `decode` is the deterministic golden-vector tool and never
+/// reads the environment -- not `MANTA_<TABLE>_<KEY>`, not unknown `MANTA_*`
+/// names, not `MANTA_CONFIG` -- so its output is byte-identical with and
+/// without them.
+#[test]
+fn decode_ignores_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let det = write_cfg(dir.path(), "det.toml", "[detector]\non_snr_db = 99.0\n");
+
+    let plain = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .output()
+        .unwrap();
+    assert_eq!(decode_spots(&plain).len(), 1);
+
+    let with_env = manta()
+        .args(["decode", "--json"])
+        .arg(&wav)
+        .env("MANTA_DETECTOR_ON_SNR_DB", "99")
+        .env("MANTA_FOO", "1")
+        .env("MANTA_CONFIG", &det)
+        .output()
+        .unwrap();
+    assert_eq!(decode_spots(&with_env).len(), 1);
+    assert_eq!(plain.stdout, with_env.stdout);
 }
