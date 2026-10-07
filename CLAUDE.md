@@ -43,6 +43,10 @@ MAN-261: one TOML file (`[server]`/`[[rbn_uplink]]`/`[input]`/`[spot]`/
 MAN-76: `manta config check` validates a config (run's pre-I/O pipeline, no
 source or listener) and `manta config init` writes a commented every-key
 scaffold — see docs/DECISIONS/2026-10-07-man76-config-check-init.md.
+MAN-96: secondary-skimmer field-node kit (outage counters,
+`scripts/field-node.py`, `scripts/shadow-compare.py`, runbook) implemented;
+the 30-day hardware run itself is outstanding — see
+docs/DECISIONS/2026-10-07-man96-secondary-skimmer-field-node.md.
 
 ## Documents (read in this order)
 

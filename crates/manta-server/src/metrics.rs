@@ -5,7 +5,9 @@
 //! (spots published, connected clients per protocol) and exposes
 //! `set_active_tracks`/`set_source_health`/`set_input_health` for the
 //! daemon wiring layer to inject engine-owned numbers manta-server has no
-//! way to compute itself.
+//! way to compute itself. `set_source_health` also feeds the per-source
+//! outage counters (`manta_source_outages_total`,
+//! `manta_source_down_seconds_total`; MAN-96).
 
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
 use manta_spot::SpotType;
@@ -236,6 +238,18 @@ impl UplinkTarget {
     }
 }
 
+/// MAN-96: one source's outage history. An outage is a healthy -> unhealthy
+/// edge; an initial unhealthy report (HPSDR starts unhealthy until
+/// confirmed live) is start-up, not an outage. `down_seconds_total` only
+/// grows when an outage ENDS, so an outage still in progress shows only as
+/// `manta_source_health == 0`.
+#[derive(Debug, Default)]
+struct SourceOutages {
+    outages_total: u64,
+    down_seconds_total: f64,
+    down_since: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -302,6 +316,11 @@ pub struct Metrics {
     /// worth graphing.
     pipeline_batches: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
+    /// MAN-96: per-source outage bookkeeping behind
+    /// `manta_source_outages_total` / `manta_source_down_seconds_total`.
+    /// Updated under `source_health`'s write guard (the only place both
+    /// locks are taken, always in that order).
+    source_outages: Mutex<BTreeMap<String, SourceOutages>>,
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
     /// counters. Engine/input-owned figures, injected by the daemon wiring
     /// layer on a timer -- see `manta-cli`'s `INPUT_HEALTH_POLL_INTERVAL`.
@@ -502,10 +521,37 @@ impl Metrics {
     }
 
     pub fn set_source_health(&self, source: &str, healthy: bool) {
-        self.source_health
+        self.set_source_health_at(source, healthy, Instant::now());
+    }
+
+    /// MAN-96: `set_source_health` with an explicit observation time, so the
+    /// outage counters are testable without sleeping. A healthy -> unhealthy
+    /// edge counts one outage and starts its clock; the next unhealthy ->
+    /// healthy edge adds the elapsed time to the completed down seconds.
+    /// Repeated reports of the same state change nothing.
+    pub fn set_source_health_at(&self, source: &str, healthy: bool, now: Instant) {
+        let mut health = self
+            .source_health
             .write()
-            .expect("source_health lock poisoned")
-            .insert(source.to_string(), healthy);
+            .expect("source_health lock poisoned");
+        let prev = health.insert(source.to_string(), healthy);
+        let mut outages = self
+            .source_outages
+            .lock()
+            .expect("source_outages lock poisoned");
+        let entry = outages.entry(source.to_string()).or_default();
+        match (prev, healthy) {
+            (Some(true), false) => {
+                entry.outages_total += 1;
+                entry.down_since = Some(now);
+            }
+            (Some(false), true) => {
+                if let Some(since) = entry.down_since.take() {
+                    entry.down_seconds_total += now.saturating_duration_since(since).as_secs_f64();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
@@ -845,17 +891,46 @@ impl Metrics {
             "# HELP manta_source_health Per-input-source health (1 = healthy, 0 = unhealthy).\n",
         );
         out.push_str("# TYPE manta_source_health gauge\n");
-        for (source, healthy) in self
+        // MAN-96: one guard for the gauge and both outage families, so the
+        // three render the same source set; `source_outages` is taken after
+        // `source_health`, matching `set_source_health_at`'s lock order.
+        let source_health = self
             .source_health
             .read()
-            .expect("source_health lock poisoned")
-            .iter()
-        {
+            .expect("source_health lock poisoned");
+        for (source, healthy) in source_health.iter() {
             out.push_str(&format!(
                 "manta_source_health{{source=\"{source}\"}} {}\n",
                 if *healthy { 1 } else { 0 }
             ));
         }
+        {
+            let outages = self
+                .source_outages
+                .lock()
+                .expect("source_outages lock poisoned");
+            out.push_str(
+                "# HELP manta_source_outages_total Times each input source went from healthy to unhealthy (a lost connection or failed read).\n",
+            );
+            out.push_str("# TYPE manta_source_outages_total counter\n");
+            for source in source_health.keys() {
+                let n = outages.get(source).map_or(0, |o| o.outages_total);
+                out.push_str(&format!(
+                    "manta_source_outages_total{{source=\"{source}\"}} {n}\n"
+                ));
+            }
+            out.push_str(
+                "# HELP manta_source_down_seconds_total Seconds each input source spent in outages that have ended; an outage still in progress is added when it ends.\n",
+            );
+            out.push_str("# TYPE manta_source_down_seconds_total counter\n");
+            for source in source_health.keys() {
+                let secs = outages.get(source).map_or(0.0, |o| o.down_seconds_total);
+                out.push_str(&format!(
+                    "manta_source_down_seconds_total{{source=\"{source}\"}} {secs:.3}\n"
+                ));
+            }
+        }
+        drop(source_health);
 
         // MAN-56: input-layer packet loss/malformed counters. Absent, not
         // zero, for sources with no wire-packet loss model -- the read
@@ -1385,6 +1460,106 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    // MAN-96: source-outage counters.
+
+    #[test]
+    fn source_outage_counters_count_healthy_to_unhealthy_edges_and_completed_down_time() {
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        m.set_source_health_at("soapy", true, t0);
+        m.set_source_health_at("soapy", false, t0 + Duration::from_secs(10));
+        m.set_source_health_at("soapy", true, t0 + Duration::from_millis(22_500));
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="soapy"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_down_seconds_total{source="soapy"} 12.500"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn initial_unhealthy_report_is_not_an_outage() {
+        // HPSDR starts unhealthy until confirmed live: absent -> false -> true
+        // is start-up, not an outage.
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        m.set_source_health_at("hpsdr", false, t0);
+        m.set_source_health_at("hpsdr", true, t0 + Duration::from_secs(3));
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="hpsdr"} 0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_down_seconds_total{source="hpsdr"} 0.000"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn repeated_unhealthy_reports_do_not_double_count() {
+        // true, false, false, true -> 1 outage, down time measured from the
+        // FIRST false.
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        m.set_source_health_at("kiwi", true, t0);
+        m.set_source_health_at("kiwi", false, t0 + Duration::from_secs(1));
+        m.set_source_health_at("kiwi", false, t0 + Duration::from_secs(4));
+        m.set_source_health_at("kiwi", true, t0 + Duration::from_secs(6));
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="kiwi"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_down_seconds_total{source="kiwi"} 5.000"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outage_counters_render_zero_for_a_never_down_source_with_type_lines() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains("# TYPE manta_source_outages_total counter\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE manta_source_down_seconds_total counter\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("manta_source_outages_total{source=\"file\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("manta_source_down_seconds_total{source=\"file\"} 0.000\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_outage_in_progress_is_not_counted_in_down_seconds_until_it_ends() {
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        m.set_source_health_at("soapy", true, t0);
+        m.set_source_health_at("soapy", false, t0 + Duration::from_secs(2));
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="soapy"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_down_seconds_total{source="soapy"} 0.000"#),
+            "{text}"
+        );
     }
 
     // MAN-56: input-layer packet loss/malformed counters.

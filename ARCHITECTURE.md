@@ -588,6 +588,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   every other source — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
+- **Source-outage counters (MAN-96)**: `manta_source_outages_total{source}`
+  (healthy → unhealthy edges) and `manta_source_down_seconds_total{source}`
+  (seconds in outages that have ended), counted in
+  `Metrics::set_source_health` and rendered at 0 for every registered
+  source, so a source drop shorter than a scrape interval still shows. An
+  outage in progress shows only as `manta_source_health == 0`. The 30-day
+  field-node ledger reads both (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 - **`GET /healthz` (MAN-128)**: shares the metrics listener/bind address.
   Returns `200 OK`/body `ok\n...` only while every registered source is
   healthy, every registered listener (telnet/JSON/metrics) is up, and the

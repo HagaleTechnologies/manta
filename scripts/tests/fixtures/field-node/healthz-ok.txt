@@ -1,0 +1,6 @@
+ok
+source file: healthy
+listener json: up
+listener metrics: up
+listener telnet: up
+decode: ok
