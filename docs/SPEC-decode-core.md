@@ -496,10 +496,15 @@ only on a clean split: the largest-ratio split leaves at least two gaps in
 each cluster, max/min is `≥ 2`, and the clusters' nearest members differ by
 `≥ 1.8` (MAN-213; MAN-103 D8 resolution). A rebuilt pair is discarded, and
 the long-gap statistics restart, when a classified gap of at least `2.0` but
-under `5.0` dits arrives before five classified gaps of `≥ 5.0` dits. An
-ordinary character gap contradicts the rebuild's premise that every
-character gap outran the flush. After those five gaps the rebuild stands, so
-a dit lost to a fade inside a character cannot discard it (MAN-264).
+under `5.0` dits arrives before five confirming word gaps. An ordinary
+character gap contradicts the rebuild's premise that every character gap
+outran the flush. A confirming word gap, classified or flushed, ends a
+decoded word of two or more characters. Gaps after decoded one-character
+words built the pair, so they never confirm it. Under a false rebuild,
+one-character words at ordinary spacing decode as one merged word, so a
+pause after such a run does confirm it. After five confirmations the
+rebuild stands, so a dit lost to a fade inside a character cannot discard
+it (MAN-264).
 
 ### 4.3 Per-element likelihoods
 

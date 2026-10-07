@@ -706,6 +706,7 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_chars > 1 {
                         self.single_flush_gaps.clear();
+                        self.gaps.confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms());
                     }
                     self.word_chars = 0;
                 }
@@ -752,6 +753,11 @@ impl TrackDecoder {
                 // Farnsworth spacing, which this censoring hides, is
                 // recovered separately from the closed lengths of gaps
                 // flushed after one-character words (`observe_single_flush`).
+                // A word of two or more characters ends here, so this gap
+                // can confirm such a rebuild (MAN-264).
+                if self.word_chars > 0 {
+                    self.gaps.confirm_rebuilt(gap_ms, self.tracker.mu_dit_ms());
+                }
                 self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
@@ -1741,6 +1747,41 @@ mod tests {
 
         let mut env = Vec::new();
         for pause in [0, 0, 456, 456, 0, 0, 0] {
+            env.extend(rect_envelope("H", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
+    /// MAN-264: five more one-character words after the false rebuild
+    /// above. The rebuilt pair lifts the flush threshold to ~23 dits, so
+    /// their 8-dit word gaps reach `classify`. Counted as confirmations,
+    /// they locked the false rebuild in before the first ordinary
+    /// character gap, and every later word merged
+    /// ("…RRRRRW1AWTESTW1AWTESTCQDEW1AWK"), from a warm start and from a
+    /// cold one. So did a ~0.9 s pause (19 dits) after each of them.
+    #[test]
+    fn legacy_one_char_words_after_a_false_rebuild_do_not_confirm_it() {
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        for extra_pause in [0, 200] {
+            let mut env = rect_envelope("W1AW", 18);
+            for pause in [0, 0, 456, 456, 0] {
+                env.extend(rect_envelope("R", 18));
+                env.extend(std::iter::repeat_n(0.0, pause));
+            }
+            for _ in 0..5 {
+                env.extend(rect_envelope("R", 18));
+                env.extend(std::iter::repeat_n(0.0, extra_pause));
+            }
+            env.extend(rect_envelope(tail, 18));
+            let out = decode_with(Engine::Legacy, &env);
+            assert!(out.ends_with(tail), "{extra_pause}: {out:?}");
+        }
+
+        let mut env = Vec::new();
+        for pause in [0, 0, 456, 456, 0, 0, 0, 0, 0, 0, 0] {
             env.extend(rect_envelope("H", 18));
             env.extend(std::iter::repeat_n(0.0, pause));
         }
