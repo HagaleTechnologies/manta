@@ -944,3 +944,33 @@ fn architecture_section_8_does_not_tie_servers_to_the_flag() {
         "ARCHITECTURE §8 no longer says when the servers run"
     );
 }
+
+/// MAN-76: the node section walks an operator through scaffolding and
+/// checking the config file before `manta run`, as copyable commands.
+#[test]
+fn readme_node_section_mentions_config_init_and_check() {
+    let readme = doc("README.md");
+    let commands = fenced_commands(section(&readme, "Run it as a node"));
+    for wanted in ["manta config init", "manta config check"] {
+        assert!(
+            commands.iter().any(|c| c.trim_start().starts_with(wanted)),
+            "README node section has no `{wanted}` command: {commands:?}"
+        );
+    }
+}
+
+/// MAN-76: ARCHITECTURE §8's config bullet names the command that validates
+/// a config without starting the daemon.
+#[test]
+fn architecture_section_8_mentions_config_check() {
+    let arch = doc("ARCHITECTURE.md");
+    let s8 = squash_whitespace(section(&arch, "8. Configuration"));
+    assert!(
+        s8.contains("`manta config check`"),
+        "ARCHITECTURE §8 does not mention `manta config check`"
+    );
+    assert!(
+        s8.contains("`manta config init`"),
+        "ARCHITECTURE §8 does not mention `manta config init`"
+    );
+}

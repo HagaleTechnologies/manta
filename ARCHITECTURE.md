@@ -472,6 +472,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
   are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
   configurable: a band plan (CW segment limits), cty/scp paths, and the
   compile-time constants SPEC §9 marks `not configurable yet`.
+  `manta config check` runs `run`'s config pipeline up to its first source
+  I/O (load, environment overlay, source resolution, blocklist/notch
+  reads), then prints a per-table summary of the resolved settings without
+  opening the receiver or binding a port; `manta config init` writes a
+  scaffold with every key commented out at its default, pinned to the code
+  defaults and the loader's key list by tests (MAN-76,
+  `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
