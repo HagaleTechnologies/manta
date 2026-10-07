@@ -453,10 +453,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 8. Configuration & observability
 
-<<<<<<< HEAD
 - **Single TOML config** (MAN-261,
   `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with six
-  tables — `[server]` (station callsign, bind address, ports),
+  tables — `[server]` (station callsign, which may carry an RBN `-N`
+  per-band SSID per
+  `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
+  bind address; ports),
   `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files), `[detector]` (thresholds, timers, track cap) and `[decode]` —
@@ -474,14 +476,6 @@ validation (MAN-28). Dedupe (step 5) still applies.
   scaffold with every key commented out at its default, pinned to the code
   defaults and the loader's key list by tests (MAN-76,
   `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
-=======
-- Single TOML config (coppa convention): device, center freq, band plan
-  (CW segment limits — don't decode/spot outside them), thresholds, track cap,
-  server ports, cty/scp paths, station callsign (spotter ID). The station
-  callsign accepts an optional trailing `-N` per-band SSID (`W5AU-1`),
-  matching RBN's own `CALL-N-#` multi-band node convention — see
-  `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`.
->>>>>>> 7756d6b (feat(manta-server,manta-spot): MAN-89 — accept RBN's CALL-N-# per-band SSID in station_callsign)
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):

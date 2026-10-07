@@ -646,7 +646,7 @@ mod tests {
     /// SSID to produce RBN's own `CALL-N-#` node identity.
     #[test]
     fn an_ssid_spotter_renders_as_call_n_hash() {
-        let line = format_line(&sample_spot(), "W5AU-1", 11_520);
+        let line = format_line(&capture_spot(), "W5AU-1", 11_520, LineFormat::Rbn);
         assert!(line.starts_with("DX de W5AU-1-#:"), "line was: {line}");
         // Never truncated, never abutting -- holds under any column layout.
         assert!(

@@ -54,6 +54,7 @@ async fn spawn_server(
                 manta_server::telnet::COMMAND_RATE_WINDOW,
             ),
             manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+            manta_server::rbn::LineFormat::Rbn,
         )
         .await;
     });
