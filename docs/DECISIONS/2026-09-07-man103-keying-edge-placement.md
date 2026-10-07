@@ -262,7 +262,49 @@ its own word.
   clusters' nearest members must differ by at least `FARNS_MIN_RATIO` (1.8).
   So one pause cannot set the word-gap cluster, and irregular fragment
   spacing such as `[8, 9, 12, 20, 25]` dits cannot either. Two pauses can,
-  but only if both follow one-character words inside one such window.
+  if both follow one-character words inside one such window. At ordinary
+  spacing `[8, 8, 33, 33, 8]` passes, and every later word merged (MAN-264:
+  `W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK` for pauses of 0.8 to 4.65 s).
+  So `classify` discards a rebuilt pair at the first gap of 2 to 5 dits, an
+  ordinary character gap that the rebuild's premise rules out. Clean heavy
+  Farnsworth never produces one. The 14-cell grid and `5NN TU` are
+  unchanged. A fade that drops a dit inside a character does produce one,
+  so the check ends once five word gaps have confirmed the rebuild. Without
+  that bound, one dropped dit in a `4` at 18/5 decoded
+  `GIA X X X G 4 X X X K` instead of `GIAXXX G4XXX K`
+  (`legacy_heavy_farnsworth_survives_a_dropped_dit`). A confirming gap,
+  classified or flushed, ends a decoded word of two or more characters
+  (`GapClassifier::confirm_rebuilt`, called from `process_run` and
+  `check_flush`). Counting every classified gap of 5 dits or more let
+  ordinary spacing confirm a false rebuild: the rebuilt pair raises the
+  flush threshold to ~23 dits, so the 8-dit gaps after five more
+  one-character words reached `classify`, and every later word merged again
+  (`W1AW R R R R R RRRRRW1AWTESTW1AWTESTCQDEW1AWK`,
+  `legacy_one_char_words_after_a_false_rebuild_do_not_confirm_it`). Gaps
+  after decoded one-character words built the rebuild, so they never
+  confirm it, with or without a pause. Two bounds remain. Before five
+  confirmations, a dropped dit still resets a genuine rebuild; the track
+  re-bootstraps from its next flushed one-character words (at 18/5, one
+  repeat in: `C Q D E G 4 X X X G4XXX K`). And pauses can still confirm a
+  false rebuild: five pauses that each end a decoded word of two or more
+  characters, before the first ordinary character gap, lock it in. Under a
+  false rebuild that word is a merged run of one-character words, or a word
+  whose character gaps are all 5 dits or more. With `flush_gap_dits`
+  configured below 5, the discard range, and that last bound, end lower:
+  at the larger of `flush_gap_dits` and the rebuilt low cluster over
+  `FARNS_MIN_RATIO`. Genuine Farnsworth character gaps between the flush
+  and 5 dits outran the flush and built the pair. At 3.5 dits, ~4.9-dit
+  character gaps undid two rebuilds and cost a repeat at 15 to 22 WPM
+  (`legacy_low_flush_keeps_a_genuine_rebuild`). The low-cluster term keeps
+  the false-rebuild check at a flush of 3 dits or less, where ordinary
+  3-dit character gaps outrun the flush too
+  (`rebuilt_pair_disproof_follows_a_low_flush`). That flush also closes
+  each Farnsworth word gap at `flush_gap_dits` / 5 of the rebuilt boundary,
+  so a flushed word gap confirms the rebuild once it reaches the boundary
+  scaled by that same factor. Checked against the unscaled boundary, no
+  flushed word gap confirmed at 3.5 dits, and one dropped dit in a `4` at
+  15 WPM decoded `GIA X X X G 4 X X X K`
+  (`legacy_low_flush_heavy_farnsworth_survives_a_dropped_dit`).
 
 Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
 timing, `CQ CQ DE G4XXX G4XXX K` eight times:

@@ -706,6 +706,8 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_chars > 1 {
                         self.single_flush_gaps.clear();
+                        self.gaps
+                            .confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms(), None);
                     }
                     self.word_chars = 0;
                 }
@@ -752,6 +754,15 @@ impl TrackDecoder {
                 // Farnsworth spacing, which this censoring hides, is
                 // recovered separately from the closed lengths of gaps
                 // flushed after one-character words (`observe_single_flush`).
+                // A word of two or more characters ends here, so this gap
+                // can confirm such a rebuild (MAN-264).
+                if self.word_chars > 0 {
+                    self.gaps.confirm_rebuilt(
+                        gap_ms,
+                        self.tracker.mu_dit_ms(),
+                        Some(self.cfg.flush_gap_dits),
+                    );
+                }
                 self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
@@ -795,7 +806,9 @@ impl TrackDecoder {
             self.single_flush_gaps.remove(0);
         }
         if self.single_flush_gaps.len() == SINGLE_FLUSH_REINIT
-            && self.gaps.reinit_from_flushed(&self.single_flush_gaps)
+            && self
+                .gaps
+                .reinit_from_flushed(&self.single_flush_gaps, self.cfg.flush_gap_dits)
         {
             self.single_flush_gaps.clear();
         }
@@ -1716,6 +1729,74 @@ mod tests {
         );
     }
 
+    /// MAN-264: one-character words at ordinary spacing, two of them
+    /// followed by a 1.6 s pause, fill the rebuild window with
+    /// `[8, 8, 33, 33, 8]` dits. That split passes
+    /// `GapClassifier::reinit_from_flushed`'s check, so the word gaps
+    /// became the character cluster and every later word merged
+    /// ("W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK"), from a warm start
+    /// and from a cold one.
+    #[test]
+    fn legacy_pauses_after_one_char_words_do_not_merge_later_words() {
+        // rect_envelope("R") ends in an 8-dit tail: concatenated, 8-dit
+        // word gaps that the 7-dit flush closes. 144 + 456 hops = 1.6 s.
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        let mut env = rect_envelope("W1AW", 18);
+        for pause in [0, 0, 456, 456, 0] {
+            env.extend(rect_envelope("R", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        assert_eq!(
+            decode_with(Engine::Legacy, &env),
+            format!("W1AW R R R R R {tail}")
+        );
+
+        let mut env = Vec::new();
+        for pause in [0, 0, 456, 456, 0, 0, 0] {
+            env.extend(rect_envelope("H", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
+    /// MAN-264: five more one-character words after the false rebuild
+    /// above. The rebuilt pair lifts the flush threshold to ~23 dits, so
+    /// their 8-dit word gaps reach `classify`. Counted as confirmations,
+    /// they locked the false rebuild in before the first ordinary
+    /// character gap, and every later word merged
+    /// ("…RRRRRW1AWTESTW1AWTESTCQDEW1AWK"), from a warm start and from a
+    /// cold one. So did a ~0.9 s pause (19 dits) after each of them.
+    #[test]
+    fn legacy_one_char_words_after_a_false_rebuild_do_not_confirm_it() {
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        for extra_pause in [0, 200] {
+            let mut env = rect_envelope("W1AW", 18);
+            for pause in [0, 0, 456, 456, 0] {
+                env.extend(rect_envelope("R", 18));
+                env.extend(std::iter::repeat_n(0.0, pause));
+            }
+            for _ in 0..5 {
+                env.extend(rect_envelope("R", 18));
+                env.extend(std::iter::repeat_n(0.0, extra_pause));
+            }
+            env.extend(rect_envelope(tail, 18));
+            let out = decode_with(Engine::Legacy, &env);
+            assert!(out.ends_with(tail), "{extra_pause}: {out:?}");
+        }
+
+        let mut env = Vec::new();
+        for pause in [0, 0, 456, 456, 0, 0, 0, 0, 0, 0, 0] {
+            env.extend(rect_envelope("H", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
     /// `rect_envelope` with Farnsworth spacing: characters keyed at
     /// `char_wpm`, inter-character and word gaps stretched to the ARRL
     /// Farnsworth timing for `eff_wpm`.
@@ -1765,6 +1846,103 @@ mod tests {
             );
             assert!(
                 out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
+    }
+
+    /// MAN-264: a fade that drops a dit inside a character, after the
+    /// heavy-Farnsworth rebuild has stood a while, leaves an ordinary
+    /// 3-dit gap. It must split only that character ("4" as "IA"), not
+    /// reset the long-gap statistics and decode the characters after it
+    /// as separate words ("GIA X X X G 4 X X X K").
+    #[test]
+    fn legacy_heavy_farnsworth_survives_a_dropped_dit() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let mut damaged = farnsworth_envelope(rep, 18.0, 5.0);
+        let starts: Vec<usize> = (0..damaged.len())
+            .filter(|&i| damaged[i] > 0.0 && (i == 0 || damaged[i - 1] == 0.0))
+            .collect();
+        // Mark 25 is the third dit of "4" (....-), after C Q C Q D E G's
+        // 23 marks and the 4's first two.
+        let dit = (1200.0 / 18.0 / HOP_MS as f32).round() as usize;
+        damaged[starts[25]..starts[25] + dit].fill(0.0);
+        let mut env = farnsworth_envelope(&[rep; 4].join(" "), 18.0, 5.0);
+        env.extend(damaged);
+        env.extend(farnsworth_envelope(&[rep; 3].join(" "), 18.0, 5.0));
+        let out = decode_with(Engine::Legacy, &env);
+        let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
+        assert!(out.ends_with(&expected), "{out:?}");
+    }
+
+    /// MAN-264: with `[decode] flush_gap_dits` below 5, a genuine
+    /// Farnsworth character gap between the two outruns the flush and
+    /// helps rebuild the pair, so it must not discard the rebuild as an
+    /// ordinary character gap would. At 3.5 dits, ~4.9-dit character gaps
+    /// undid two rebuilds and the second repeat decoded
+    /// "C Q CQ D E G 4 X X X G4XXX K".
+    #[test]
+    fn legacy_low_flush_keeps_a_genuine_rebuild() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let text = [rep; 8].join(" ");
+        let settled = [rep; 7].join(" ");
+        for char_wpm in [15.0, 18.0, 20.0, 22.0] {
+            let eff_wpm = 0.82 * char_wpm;
+            let cfg = DecodeConfig {
+                flush_gap_dits: 3.5,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            let env = farnsworth_envelope(&text, char_wpm, eff_wpm);
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let out = events_to_text(&events);
+            assert!(
+                out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
+    }
+
+    /// MAN-264: with `[decode] flush_gap_dits` below 5, the flush closes a
+    /// Farnsworth word gap at `flush_gap_dits * boundary / 5` dits, below
+    /// the rebuilt boundary. Those flushed word gaps must still confirm
+    /// the rebuild, so a dit dropped by a fade splits only its own
+    /// character. Measured at 3.5 dits, they confirmed nothing, and the
+    /// 3-dit gap reset the rebuild.
+    #[test]
+    fn legacy_low_flush_heavy_farnsworth_survives_a_dropped_dit() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        for char_wpm in [15.0, 18.0, 20.0, 22.0] {
+            let eff_wpm = 0.82 * char_wpm;
+            let mut damaged = farnsworth_envelope(rep, char_wpm, eff_wpm);
+            let starts: Vec<usize> = (0..damaged.len())
+                .filter(|&i| damaged[i] > 0.0 && (i == 0 || damaged[i - 1] == 0.0))
+                .collect();
+            // Mark 25 is the third dit of "4", as in
+            // `legacy_heavy_farnsworth_survives_a_dropped_dit`.
+            let dit = (1200.0 / char_wpm / HOP_MS as f32).round() as usize;
+            damaged[starts[25]..starts[25] + dit].fill(0.0);
+            let mut env = farnsworth_envelope(&[rep; 4].join(" "), char_wpm, eff_wpm);
+            env.extend(damaged);
+            env.extend(farnsworth_envelope(&[rep; 3].join(" "), char_wpm, eff_wpm));
+            let cfg = DecodeConfig {
+                flush_gap_dits: 3.5,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let out = events_to_text(&events);
+            let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
+            assert!(
+                out.ends_with(&expected),
                 "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
             );
         }
