@@ -3199,7 +3199,7 @@ fn main() -> Result<()> {
                     // the factor, not the ppm, is what the advertised SETT
                     // bounds are scaled by (MAN-86 review).
                     let freq_calibration =
-                        manta_spot::calibration_factor_from_ppm(freq_correction_ppm)
+                        manta_spot::calibration_factor_from_ppm(filters.freq_correction_ppm)
                             .map_err(|e| anyhow!(e))?;
                     // MAN-122: the banner `start_spot_server` logs names
                     // the source, its sample rate and its dial frequency,
