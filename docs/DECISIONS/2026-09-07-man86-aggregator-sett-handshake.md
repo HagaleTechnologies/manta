@@ -150,6 +150,9 @@ Currently, the RBN recommends a value of "1".
      the validator applies to every emitted spot frequency. At the supported ±1000 ppm limit that
      is ~14 kHz on 20 m, enough for manta to advertise bounds that exclude frequencies in its own
      spot stream.
+   - The wire format carries 0.1 kHz, so each edge is rounded outward (lower down, upper up)
+     rather than to the nearest tenth: the +1000 ppm KiwiSDR upper edge 14059.045 kHz renders as
+     `14059.1`, not `14059.0`, which would have excluded spots between the two.
 
    `sample_rate()` remains the value `SpotBus` uses for sample-index-to-wall-clock conversion;
    only coverage claims use the passband.

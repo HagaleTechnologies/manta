@@ -5866,7 +5866,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
         let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
         assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
-        assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.0");
+        assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.1");
     }
 
     // MAN-89 (PR #131 review, rounds 6 and 7): `station_geography_unresolved`

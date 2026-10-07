@@ -37,7 +37,9 @@ pub struct SettSettings {
     /// ENABLED". Always false today; manta spots CQ, DE and beacon types.
     pub cq_only: bool,
     /// Decodable segments as `(lo_hz, hi_hz)`, ascending. Rendered in kHz
-    /// to one decimal, comma-separated with no spaces.
+    /// to one decimal, comma-separated with no spaces, rounded outward
+    /// (lower edge down, upper edge up) so the advertised range always
+    /// contains every frequency manta can spot.
     pub segments: Vec<(f64, f64)>,
 }
 
@@ -53,11 +55,27 @@ impl fmt::Display for SettSettings {
                 if i > 0 {
                     f.write_str(",")?;
                 }
-                write!(f, "{:.1}-{:.1}", lo / 1000.0, hi / 1000.0)?;
+                write!(f, "{:.1}-{:.1}", tenth_khz_down(*lo), tenth_khz_up(*hi))?;
             }
         }
         Ok(())
     }
+}
+
+/// Tolerance, in units of the 100 Hz wire precision, below which an edge is
+/// treated as already on a tenth of a kHz: f64 arithmetic on a MHz-scale
+/// frequency leaves residues far under a millihertz, and rounding outward on
+/// one of those would widen an exact `14030.0` to `14030.1`.
+const TENTH_KHZ_EPSILON: f64 = 1e-6;
+
+/// `hz` in kHz, rounded down to 0.1 kHz.
+fn tenth_khz_down(hz: f64) -> f64 {
+    (hz / 100.0 + TENTH_KHZ_EPSILON).floor() / 10.0
+}
+
+/// `hz` in kHz, rounded up to 0.1 kHz.
+fn tenth_khz_up(hz: f64) -> f64 {
+    (hz / 100.0 - TENTH_KHZ_EPSILON).ceil() / 10.0
 }
 
 /// The segments manta is actually decoding right now: the live passband
@@ -304,5 +322,32 @@ mod tests {
         assert!(segments_for_passband(14_040_000.0, (3_000.0, 300.0), 1.0).is_empty());
         assert!(segments_for_passband(14_040_000.0, symmetric(10_000.0), f64::NAN).is_empty());
         assert!(segments_for_passband(14_040_000.0, symmetric(10_000.0), 0.0).is_empty());
+    }
+
+    #[test]
+    fn rendered_bounds_round_outward_so_they_contain_the_real_coverage() {
+        // PR #128 review: nearest-tenth rendering turned the +1000 ppm Kiwi
+        // upper edge 14059.045 kHz into `14059.0`, so a spot at 14059.04 fell
+        // outside the coverage just advertised. The lower edge rounds down,
+        // the upper edge rounds up.
+        let s = SettSettings {
+            validation_level: ValidationLevel::Normal,
+            cq_only: false,
+            segments: vec![(14_049_035.0, 14_059_045.0)],
+        };
+        assert_eq!(s.to_string(), "SETT: vlNormal 14049.0-14059.1");
+    }
+
+    #[test]
+    fn bounds_already_on_a_tenth_are_not_widened_by_float_noise() {
+        // 14_027_000 + 3_000 computed in f64 must still render as 14030.0,
+        // not creep up to 14030.1 on a sub-millihertz rounding residue.
+        let segs = segments_for_passband(14_027_000.0, (300.0, 3_000.0), 1.0 + 1e-15);
+        let s = SettSettings {
+            validation_level: ValidationLevel::Normal,
+            cq_only: false,
+            segments: segs,
+        };
+        assert_eq!(s.to_string(), "SETT: vlNormal 14027.3-14030.0");
     }
 }
