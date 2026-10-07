@@ -595,11 +595,22 @@ impl GapClassifier {
     /// decoder's word count is the guard: it passes no gap after a decoded
     /// one-character word, since those gaps built the rebuild. After a
     /// false rebuild, ordinary word gaps classify as `InterChar`, so they
-    /// end no word and never arrive here (MAN-264). The boundary check
-    /// only matters once the pair has drifted out of Farnsworth shape:
-    /// before that, every gap the decoder passes is at least the boundary.
-    pub fn confirm_rebuilt(&mut self, gap_ms: f32, mu_dit_ms: f32) {
-        if self.rebuilt && gap_ms / mu_dit_ms >= self.pair.boundary() {
+    /// end no word and never arrive here (MAN-264). The gap must reach the
+    /// boundary. `flushed` is `Some(nominal_flush_dits)` for a gap
+    /// `check_flush` cut off at the flush threshold, `None` for a closed
+    /// gap. A flushed gap's bar is the boundary scaled by
+    /// `nominal_flush_dits / WORD_GAP_DITS` when the flush is configured
+    /// below `WORD_GAP_DITS`: while the pair is Farnsworth-shaped,
+    /// `flush_threshold_dits` cuts word gaps off that far below the
+    /// boundary. The check only matters once the pair has drifted out of
+    /// Farnsworth shape: before that, every gap the decoder passes reaches
+    /// its bar.
+    pub fn confirm_rebuilt(&mut self, gap_ms: f32, mu_dit_ms: f32, flushed: Option<f32>) {
+        let b = self.pair.boundary();
+        let bar = flushed.map_or(b, |nominal_flush_dits| {
+            (nominal_flush_dits * (b / WORD_GAP_DITS)).min(b)
+        });
+        if self.rebuilt && gap_ms / mu_dit_ms >= bar {
             self.rebuilt_confirms += 1;
             self.rebuilt = self.rebuilt_confirms < FARNS_MIN_COUNT;
         }
@@ -917,7 +928,7 @@ mod tests {
         assert!(g.reinit_from_flushed(&[23.5, 55.0, 23.5, 55.0, 23.5], 7.0));
         for _ in 0..FARNS_MIN_COUNT {
             assert_eq!(g.classify(23.5 * mu, mu), GapClass::InterChar);
-            g.confirm_rebuilt(55.0 * mu, mu);
+            g.confirm_rebuilt(55.0 * mu, mu, None);
         }
         assert_eq!(g.classify(3.0 * mu, mu), GapClass::InterChar);
         assert_eq!(g.classify(23.5 * mu, mu), GapClass::InterChar);
@@ -948,6 +959,33 @@ mod tests {
         assert!(g.reinit_from_flushed(&[8.0, 8.0, 33.0, 33.0, 8.0], 3.0));
         assert_eq!(g.classify(3.0 * mu, mu), GapClass::InterChar);
         assert_eq!(g.flush_threshold_dits(3.0), 3.0);
+    }
+
+    /// MAN-264: with the flush configured below `WORD_GAP_DITS`, a word
+    /// gap the flush cut off at `flush_threshold_dits` sits below the
+    /// rebuilt boundary, and must still confirm the rebuild. A closed gap
+    /// below the boundary confirms nothing.
+    #[test]
+    fn rebuilt_pair_confirms_on_low_flushed_word_gaps() {
+        let mu = 48.0;
+        let us = [4.9, 11.3, 4.9, 4.9, 11.3];
+        let mut g = GapClassifier::new();
+        assert!(g.reinit_from_flushed(&us, 3.5));
+        let flushed = g.flush_threshold_dits(3.5);
+        assert!(flushed < g.pair.boundary());
+        for _ in 0..FARNS_MIN_COUNT {
+            g.confirm_rebuilt(flushed * mu, mu, Some(3.5));
+        }
+        assert_eq!(g.classify(3.0 * mu, mu), GapClass::InterChar);
+        assert!(g.flush_threshold_dits(3.5) > 4.9);
+
+        let mut g = GapClassifier::new();
+        assert!(g.reinit_from_flushed(&us, 3.5));
+        for _ in 0..FARNS_MIN_COUNT {
+            g.confirm_rebuilt(flushed * mu, mu, None);
+        }
+        assert_eq!(g.classify(3.0 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.flush_threshold_dits(3.5), 3.5);
     }
 
     #[test]

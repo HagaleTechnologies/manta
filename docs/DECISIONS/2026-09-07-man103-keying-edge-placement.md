@@ -298,7 +298,13 @@ its own word.
   (`legacy_low_flush_keeps_a_genuine_rebuild`). The low-cluster term keeps
   the false-rebuild check at a flush of 3 dits or less, where ordinary
   3-dit character gaps outrun the flush too
-  (`rebuilt_pair_disproof_follows_a_low_flush`).
+  (`rebuilt_pair_disproof_follows_a_low_flush`). That flush also closes
+  each Farnsworth word gap at `flush_gap_dits` / 5 of the rebuilt boundary,
+  so a flushed word gap confirms the rebuild once it reaches the boundary
+  scaled by that same factor. Checked against the unscaled boundary, no
+  flushed word gap confirmed at 3.5 dits, and one dropped dit in a `4` at
+  15 WPM decoded `GIA X X X G 4 X X X K`
+  (`legacy_low_flush_heavy_farnsworth_survives_a_dropped_dit`).
 
 Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
 timing, `CQ CQ DE G4XXX G4XXX K` eight times:

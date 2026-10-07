@@ -706,7 +706,8 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_chars > 1 {
                         self.single_flush_gaps.clear();
-                        self.gaps.confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms());
+                        self.gaps
+                            .confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms(), None);
                     }
                     self.word_chars = 0;
                 }
@@ -756,7 +757,11 @@ impl TrackDecoder {
                 // A word of two or more characters ends here, so this gap
                 // can confirm such a rebuild (MAN-264).
                 if self.word_chars > 0 {
-                    self.gaps.confirm_rebuilt(gap_ms, self.tracker.mu_dit_ms());
+                    self.gaps.confirm_rebuilt(
+                        gap_ms,
+                        self.tracker.mu_dit_ms(),
+                        Some(self.cfg.flush_gap_dits),
+                    );
                 }
                 self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
@@ -1897,6 +1902,47 @@ mod tests {
             let out = events_to_text(&events);
             assert!(
                 out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
+    }
+
+    /// MAN-264: with `[decode] flush_gap_dits` below 5, the flush closes a
+    /// Farnsworth word gap at `flush_gap_dits * boundary / 5` dits, below
+    /// the rebuilt boundary. Those flushed word gaps must still confirm
+    /// the rebuild, so a dit dropped by a fade splits only its own
+    /// character. Measured at 3.5 dits, they confirmed nothing, and the
+    /// 3-dit gap reset the rebuild.
+    #[test]
+    fn legacy_low_flush_heavy_farnsworth_survives_a_dropped_dit() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        for char_wpm in [15.0, 18.0, 20.0, 22.0] {
+            let eff_wpm = 0.82 * char_wpm;
+            let mut damaged = farnsworth_envelope(rep, char_wpm, eff_wpm);
+            let starts: Vec<usize> = (0..damaged.len())
+                .filter(|&i| damaged[i] > 0.0 && (i == 0 || damaged[i - 1] == 0.0))
+                .collect();
+            // Mark 25 is the third dit of "4", as in
+            // `legacy_heavy_farnsworth_survives_a_dropped_dit`.
+            let dit = (1200.0 / char_wpm / HOP_MS as f32).round() as usize;
+            damaged[starts[25]..starts[25] + dit].fill(0.0);
+            let mut env = farnsworth_envelope(&[rep; 4].join(" "), char_wpm, eff_wpm);
+            env.extend(damaged);
+            env.extend(farnsworth_envelope(&[rep; 3].join(" "), char_wpm, eff_wpm));
+            let cfg = DecodeConfig {
+                flush_gap_dits: 3.5,
+                ..Default::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let mut events = Vec::new();
+            for (i, &a) in env.iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let out = events_to_text(&events);
+            let expected = format!(" {rep} CQ CQ DE GIAXXX G4XXX K {}", [rep; 3].join(" "));
+            assert!(
+                out.ends_with(&expected),
                 "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
             );
         }
