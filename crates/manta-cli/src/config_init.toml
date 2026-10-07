@@ -29,6 +29,12 @@
 # whenever [server] is present.
 #station_callsign = "N0CALL"
 
+# Shown in the greeting telnet clients and RBN's Aggregator see on
+# connect. Optional; each one is left out of the greeting when unset.
+#operator_name = "Art"               # your name
+#operator_qth = "Richmond Hill, ON"  # your location
+#operator_grid = "FN03GW"            # Maidenhead grid square, 4 or 6 characters
+
 # Address all three servers listen on. The default, 0.0.0.0, accepts
 # connections on every network interface, as a public cluster node
 # expects. The metrics endpoint has no password and shares this address:

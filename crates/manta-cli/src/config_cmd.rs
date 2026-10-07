@@ -834,6 +834,9 @@ mod tests {
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
         ("server", "station_callsign"),
+        ("server", "operator_name"),
+        ("server", "operator_qth"),
+        ("server", "operator_grid"),
         ("rbn_uplink", "enabled"),
         ("rbn_uplink", "target_host"),
         ("rbn_uplink", "target_port"),

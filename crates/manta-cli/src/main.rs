@@ -3194,12 +3194,12 @@ fn main() -> Result<()> {
                             .as_nanos(),
                     };
 
-                    // Already validated at clap-parse time by
-                    // `parse_freq_correction_ppm`; re-derived here because
-                    // the factor, not the ppm, is what the advertised SETT
-                    // bounds are scaled by (MAN-86 review).
+                    // The resolved (CLI > env > file, MAN-261) value, already
+                    // validated by `check_freq_correction_ppm`; re-derived
+                    // here because the factor, not the ppm, is what the
+                    // advertised SETT bounds are scaled by (MAN-86 review).
                     let freq_calibration =
-                        manta_spot::calibration_factor_from_ppm(filters.freq_correction_ppm)
+                        manta_spot::calibration_factor_from_ppm(resolved.freq_correction_ppm)
                             .map_err(|e| anyhow!(e))?;
                     // MAN-122: the banner `start_spot_server` logs names
                     // the source, its sample rate and its dial frequency,
@@ -5051,7 +5051,7 @@ mod tests {
     }
 
     // MAN-86: the three new [server] operator-identity keys must load
-    // through the real --server-config path (`start_spot_server`), not
+    // through the real config path (`config::load` + `start_spot_server`), not
     // just through manta-server's own unit tests. Additive on a
     // deny_unknown_fields struct, so a config WITHOUT them (every other
     // test in this module) must keep loading too.
@@ -5072,8 +5072,11 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore)
+            .expect("a config with the operator-identity keys present must load");
         let result = start_spot_server(
-            cfg_file.path(),
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
             SourceInfo {
                 name: "file",
                 sample_rate_hz: 96_000.0,
@@ -5806,6 +5809,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 panic!("{key}: {body:?} was rejected: {e:#}");
             }
         }
+    }
 
     // MAN-86 review: the two ways the source-to-SETT wiring can advertise
     // coverage manta cannot hear. Both go through `station_profile`, the
