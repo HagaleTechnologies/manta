@@ -30,7 +30,10 @@ was the only one.
   `init`'s default output path. With no file, `check` validates the
   built-in defaults plus any `MANTA_*` variables (an env-only systemd
   deployment is legitimate), says so on stderr, and exits 0. The first
-  summary line always names the file and why it was chosen.
+  summary line always names the file and why it was chosen. `run` itself
+  gains no `./manta.toml` discovery, so a file found in the current
+  directory also gets a stderr note saying to pass it to `run` with
+  `--config` or `MANTA_CONFIG`.
 - **D3 — what `check` validates.** Exactly `run`'s config stage before its
   first source I/O: `prepare_live(CliOverrides::none(), path, None)`, which
   is `config::load` with the environment, `resolve` (rejects source types
@@ -55,7 +58,8 @@ was the only one.
 - **D5 — output contract.** The summary goes to stdout, notes to stderr.
   Exit 0 valid, 1 invalid (the loader's error through `main`'s `Result`,
   unchanged), 2 for a clap usage error. The Kiwi password is shown only as
-  `password=set`/`password=none`. Output is deterministic: no timestamps,
+  `password=set`/`password=none`, and a placeholder-shaped password is
+  rejected without echoing it. Output is deterministic: no timestamps,
   and ports print as configured (`0` stays `0`).
 - **D6 — summary format.** One line per table, `key=value` tokens named as
   the config keys, in this order: the origin line

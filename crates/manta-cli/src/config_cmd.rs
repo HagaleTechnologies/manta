@@ -18,18 +18,27 @@ pub(crate) const SCAFFOLD: &str = include_str!("config_init.toml");
 /// The callsign the scaffold shows where a real one belongs (D10).
 const EXAMPLE_CALLSIGN: &str = "N0CALL";
 
+/// Where `check` found the file it checked (D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSource {
+    Flag,
+    Env,
+    /// `./manta.toml`, which `run`/`soak`/`doctor` never read on their own.
+    CurrentDir,
+    None,
+}
+
 /// `manta config check` (D2-D6): `run`'s pre-I/O config pipeline, then a
 /// summary on stdout and notes on stderr.
 pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-    let (path, from) = match (config_flag, crate::config::config_path_from_env(&vars)) {
-        (Some(p), _) => (Some(p), "from --config"),
-        (None, Some(p)) => (Some(p), "from MANTA_CONFIG"),
-        (None, None) if Path::new(DEFAULT_PATH).is_file() => (
-            Some(PathBuf::from(DEFAULT_PATH)),
-            "found in the current directory",
-        ),
-        (None, None) => (None, ""),
+    let (path, source) = match (config_flag, crate::config::config_path_from_env(&vars)) {
+        (Some(p), _) => (Some(p), ConfigSource::Flag),
+        (None, Some(p)) => (Some(p), ConfigSource::Env),
+        (None, None) if Path::new(DEFAULT_PATH).is_file() => {
+            (Some(PathBuf::from(DEFAULT_PATH)), ConfigSource::CurrentDir)
+        }
+        (None, None) => (None, ConfigSource::None),
     };
     // Exactly `run`'s config stage: load + MANTA_* overlay, resolve (which
     // rejects source types this build cannot open), blocklist/notch reads.
@@ -39,16 +48,20 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
 
-    let origin_line = match &path {
-        Some(p) => format!("{}: valid ({from})", p.display()),
-        None => "no config file: valid (built-in defaults plus any MANTA_* variables)".to_string(),
+    let origin_line = match (&path, source) {
+        (Some(p), ConfigSource::Flag) => format!("{}: valid (from --config)", p.display()),
+        (Some(p), ConfigSource::Env) => format!("{}: valid (from MANTA_CONFIG)", p.display()),
+        (Some(p), _) => format!("{}: valid (found in the current directory)", p.display()),
+        (None, _) => {
+            "no config file: valid (built-in defaults plus any MANTA_* variables)".to_string()
+        }
     };
     let mut stdout = std::io::stdout().lock();
     for line in summary(&origin_line, &prepared.loaded) {
         writeln!(stdout, "{line}")?;
     }
     stdout.flush()?;
-    for note in notes(&prepared.loaded, &prepared.resolved, path.is_some()) {
+    for note in notes(&prepared.loaded, &prepared.resolved, source) {
         eprintln!("{note}");
     }
     Ok(())
@@ -93,6 +106,13 @@ pub(crate) fn init(out: &Path, force: bool) -> Result<()> {
 /// example callsign as the station or uplink login.
 fn reject_placeholders(loaded: &Loaded) -> Result<()> {
     if let Some((key, value)) = find_placeholder(&loaded.raw, "") {
+        // Never echo a secret, even one shaped like a placeholder (D5).
+        if key.ends_with("password") {
+            bail!(
+                "{}: {key} is still a placeholder -- replace it",
+                loaded.origin
+            );
+        }
         bail!(
             "{}: {key} is still a placeholder ({value:?}) -- replace it",
             loaded.origin
@@ -369,13 +389,18 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial
 /// note matches the source kind rather than calling `is_rf_aware()`, which
 /// opens IQ WAVs.
-fn notes(loaded: &Loaded, resolved: &crate::Resolved, had_file: bool) -> Vec<String> {
+fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
     let mut notes = Vec::new();
-    if !had_file {
-        notes.push(format!(
+    match source {
+        ConfigSource::None => notes.push(format!(
             "note: no config file given (--config, MANTA_CONFIG) or found ({DEFAULT_PATH} in \
              the current directory); checked the built-in defaults plus any MANTA_* variables"
-        ));
+        )),
+        ConfigSource::CurrentDir => notes.push(format!(
+            "note: manta run does not read {DEFAULT_PATH} from the current directory on its \
+             own -- run it with --config {DEFAULT_PATH} or MANTA_CONFIG={DEFAULT_PATH}"
+        )),
+        ConfigSource::Flag | ConfigSource::Env => {}
     }
     let Some(server) = &loaded.server else {
         return notes;
@@ -643,7 +668,7 @@ mod tests {
     fn notes_of(body: &str) -> Vec<String> {
         let l = loaded(body);
         let r = resolved(&l);
-        notes(&l, &r, true)
+        notes(&l, &r, ConfigSource::Flag)
     }
 
     const DIAL_NOTE: &str = "note: manta run with this config needs your radio's dial frequency";
@@ -706,8 +731,28 @@ mod tests {
     fn note_when_no_config_file_was_found() {
         let l = config::load(None, Env::Ignore).unwrap();
         let r = resolved(&l);
-        assert!(has(&notes(&l, &r, false), "note: no config file given"));
-        assert!(!has(&notes(&l, &r, true), "note: no config file given"));
+        assert!(has(
+            &notes(&l, &r, ConfigSource::None),
+            "note: no config file given"
+        ));
+        for source in [ConfigSource::Flag, ConfigSource::Env] {
+            assert!(notes(&l, &r, source).is_empty(), "{source:?}");
+        }
+    }
+
+    /// `run` reads only --config or MANTA_CONFIG, so a file `check` found
+    /// in the current directory must not read as "what run will use".
+    #[test]
+    fn note_run_needs_config_for_a_file_found_in_the_current_directory() {
+        let l = config::load(None, Env::Ignore).unwrap();
+        let r = resolved(&l);
+        assert_eq!(
+            notes(&l, &r, ConfigSource::CurrentDir),
+            [
+                "note: manta run does not read manta.toml from the current directory on its own \
+              -- run it with --config manta.toml or MANTA_CONFIG=manta.toml"
+            ]
+        );
     }
 
     #[test]
@@ -903,15 +948,16 @@ mod tests {
         }
     }
 
-    /// The typed value of `table`, for an equality check.
-    fn typed(l: &Loaded, table: &str) -> String {
+    /// Whether `table` types identically in `a` and `b`: `==`, except
+    /// `DecodeConfig`, which has no `PartialEq`, by its `Debug` text.
+    fn same_table(a: &Loaded, b: &Loaded, table: &str) -> bool {
         match table {
-            "server" => format!("{:?}", l.server),
-            "rbn_uplink" => format!("{:?}", l.rbn_uplink),
-            "input" => format!("{:?}", l.input),
-            "spot" => format!("{:?}", l.spot),
-            "detector" => format!("{:?}", l.detector),
-            "decode" => format!("{:?}", l.decode),
+            "server" => a.server == b.server,
+            "rbn_uplink" => a.rbn_uplink == b.rbn_uplink,
+            "input" => a.input == b.input,
+            "spot" => a.spot == b.spot,
+            "detector" => a.detector == b.detector,
+            "decode" => format!("{:?}", a.decode) == format!("{:?}", b.decode),
             other => panic!("unknown table {other}"),
         }
     }
@@ -928,17 +974,21 @@ mod tests {
                 let base = base(table, &key);
                 let with = format!("{base}{}\n", uncomment(scaffold_line(n)));
                 let (a, b) = (loaded(&base), loaded(&with));
-                assert_eq!(
-                    typed(&a, table),
-                    typed(&b, table),
+                assert!(
+                    same_table(&a, &b, table),
                     "{table}.{key}: the scaffold line {:?} is not the built-in default",
                     scaffold_line(n)
                 );
-                // The line really was applied (not shadowed by the base).
-                assert!(b.raw[*table].as_table().map_or_else(
-                    || b.raw[*table].as_array().is_some(),
-                    |t| t.contains_key(&key)
-                ));
+                // The line really reached its table (`[[rbn_uplink]]`: the
+                // base's one entry).
+                let applied = match &b.raw[*table] {
+                    toml::Value::Array(items) => items
+                        .last()
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|t| t.contains_key(&key)),
+                    v => v.as_table().is_some_and(|t| t.contains_key(&key)),
+                };
+                assert!(applied, "{table}.{key}: the line did not reach [{table}]");
                 checked += 1;
             }
         }
@@ -1111,6 +1161,14 @@ mod tests {
             err.contains("rbn_uplink.login_callsign is still the example \"N0CALL\""),
             "{err}"
         );
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\npassword = \"<s3cret>\"\n",
+        );
+        assert!(
+            err.contains("input.password is still a placeholder -- replace it"),
+            "{err}"
+        );
+        assert!(!err.contains("s3cret"), "the password leaked: {err}");
         let ok = loaded(
             "[server]\nstation_callsign = \"W1AW\"\n[[rbn_uplink]]\nenabled = true\n\
              target_host = \"rbn.example.org\"\ntarget_port = 7000\n\

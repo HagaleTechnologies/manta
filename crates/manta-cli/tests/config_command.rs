@@ -201,10 +201,18 @@ fn check_with_no_flag_reads_manta_toml_in_the_current_directory() {
     );
 
     write_cfg(dir.path(), "manta.toml", "[detector]\non_snr_db = 15\n");
-    let out = succeeds(&check_in(dir.path(), &[]));
+    let o = check_in(dir.path(), &[]);
+    let out = succeeds(&o);
     assert!(
         out.starts_with("manta.toml: valid (found in the current directory)\n"),
         "{out}"
+    );
+    // `run` never looks in the current directory, so check says how to
+    // point it at the file it just checked.
+    assert!(
+        stderr(&o).contains("note: manta run does not read manta.toml from the current directory"),
+        "{}",
+        stderr(&o)
     );
 }
 
