@@ -942,14 +942,23 @@ async fn handle_client(
                         }
                     }
                     Command::Bye => {
-                        // Best-effort farewell, then close regardless: the
-                        // client asked to leave, so a failed write here is
-                        // not an error worth reporting separately. Whatever
-                        // is still queued on `rx` is abandoned by the
-                        // client's own request, not by a fault -- counted
-                        // the same way every other disconnect path counts
-                        // it.
-                        let _ = write_with_timeout(&mut wr, b"CU AGN!\r\n").await;
+                        // Farewell, then close regardless: the client asked
+                        // to leave. A failed farewell write is a control-
+                        // write failure like the SETT and filter-ack sites
+                        // above, so it gets their accounting: the retained
+                        // live-channel backlog goes to `write_failed`
+                        // (no `1 +`, the farewell isn't a spot). After a
+                        // successful farewell the backlog is abandoned at
+                        // the client's own request, the same as a plain
+                        // client EOF (`n == 0` above), which also counts
+                        // nothing.
+                        if write_with_timeout(&mut wr, b"CU AGN!\r\n").await.is_err() {
+                            if log_enabled {
+                                tracing::warn!("telnet: BYE farewell write failed, disconnecting");
+                            }
+                            metrics.record_write_failed(rx.len() as u64);
+                            return Ok(());
+                        }
                         if log_enabled {
                             tracing::info!("telnet: client sent BYE, closing");
                         }

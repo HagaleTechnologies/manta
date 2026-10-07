@@ -893,8 +893,11 @@ allowlist = []
 # keys are optional, and each one is dropped from the banner when absent
 # rather than rendered as an empty placeholder. All four are validated at
 # deserialize time (a bad value fails daemon start, it is never written to
-# the wire): `station_callsign` against `manta_spot::grammar::is_plausible`,
-# `operator_name`/`operator_qth` as non-empty free text with no control
+# the wire): `station_callsign` by `manta_server::config::
+# check_operator_callsign` (3-20 chars of A-Z, 0-9 and `/`, at most
+# prefix/base/suffix, at least one letter and one digit; deliberately
+# broader than the decoder's `grammar::is_plausible` so real calls such
+# as `JW/LB2PG` and `GB3LER/B` start), `operator_name`/`operator_qth` as non-empty free text with no control
 # characters (they are interpolated verbatim into every client's banner,
 # so an embedded CR/LF would forge cluster lines), `operator_grid` as a 4-
 # or 6-character Maidenhead locator.
