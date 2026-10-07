@@ -34,7 +34,7 @@ No GUI. CLI, a TOML config file, and Prometheus metrics.
 $ telnet manta.example.org 7300
 login: W1XYZ
 de W5AU-# >
-DX de W5AU-#:  14000.7  W1AW     CW   7 dB  20 WPM  CQ  1533Z
+DX de W5AU-#:   14000.70  W1AW           CW     7 dB  20 WPM  CQ      1533Z
 ```
 
 ## Why
