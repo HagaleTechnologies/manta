@@ -53,7 +53,8 @@ KiwiSDR input.
   signals ≥ +6 dB SNR at CER < 10 %) is **not** a blocking M2 gate — measured
   at 1/34 (2.9 %), tracked as issue #28, and reclassified as a known
   classical-decoder fading-robustness limitation in the same family as
-  V2/V5/V6/issue #25. Per this repo's own design ("classical decoder first;
+  V2/V5/V6/issue #25. V8w's spot-validated recall was restored by MAN-213
+  (28/50, 0 bogus); its per-signal CER gate is still open. Per this repo's own design ("classical decoder first;
   ML fusion only at M4, gated on beating the classical baseline under
   simulated fading"), closing that gap is M4's job, not M2's.
 - **Real-conditions vectors VR1–VR8** (`docs/SPEC-decode-core-v2.md` §8.2:

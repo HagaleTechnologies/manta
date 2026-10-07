@@ -173,8 +173,7 @@
 #timing_sigma = 0.25                 # timing tolerance when matching dots and dashes
 #beam_width = 4                      # character guesses kept at each step
 #debounce_ms = 12.0                  # shortest key-down or key-up accepted, ms
-#hyst_up = 1.25                      # keying threshold hysteresis, key-down side
-#hyst_down = 0.8                     # keying threshold hysteresis, key-up side
+#hyst_frac = 0.15                    # keying threshold hysteresis, fraction of keying depth
 #tau_lo_ms = 500.0                   # noise-level tracking time constant, ms
 #tau_hi_bounds_ms = [100.0, 400.0]   # signal-level tracking time constant, [low, high] ms
 #flush_gap_dits = 7.0                # silence, in dot lengths, that ends a word
