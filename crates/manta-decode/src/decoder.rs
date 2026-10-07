@@ -84,6 +84,11 @@ impl Default for DecodeConfig {
 /// see `TrackDecoder::hop_count`.
 pub const META_INTERVAL_HOPS: u64 = 375;
 const WPM_REPORT_DELTA: f32 = 1.0; // SPEC §5: SpeedUpdate on >= 1 WPM change
+/// One-character flushed words whose closed gap lengths
+/// `GapClassifier::reinit_from_flushed` rebuilds the long-gap statistics
+/// from (heavy Farnsworth; see that method). The same 5-sample count the
+/// pair's own init uses.
+const SINGLE_FLUSH_REINIT: usize = 5;
 
 // SPEC §2.3: 10*log10(2500/93.75) -- same bandwidth correction as
 // envelope::Demod's private constant of the same name/value, applied here
@@ -106,6 +111,18 @@ pub struct TrackDecoder {
     pending: Vec<Run>,
     cur_marks: Vec<f32>,
     word_flushed: bool,
+    /// Characters (garbles included) committed since the last word
+    /// boundary; tells `check_flush` its flush closes a one-character word.
+    word_chars: u32,
+    /// Set by `check_flush` when its flush closed a one-character word: the
+    /// gap's length at the flush, in ms. The rest of the gap arrives later
+    /// as the space run `process_run` skips.
+    single_flush_ms: Option<f32>,
+    /// Closed lengths, in dit units, of the latest gaps flushed after
+    /// decoded one-character words (at most `SINGLE_FLUSH_REINIT`). Cleared
+    /// by a word of two or more characters or by a flushed garble; a
+    /// one-character word that `classify` closes leaves it as it is.
+    single_flush_gaps: Vec<f32>,
     last_reported_wpm: Option<f32>,
     freq_hz: f64,
     hop_count: u64,
@@ -163,6 +180,9 @@ impl TrackDecoder {
             pending: Vec::new(),
             cur_marks: Vec::new(),
             word_flushed: false,
+            word_chars: 0,
+            single_flush_ms: None,
+            single_flush_gaps: Vec::new(),
             last_reported_wpm: None,
             freq_hz: 0.0,
             hop_count: 0,
@@ -669,6 +689,9 @@ impl TrackDecoder {
         } else {
             if self.word_flushed {
                 // This gap was already handled by the 7-dit flush.
+                if let Some(flushed_ms) = self.single_flush_ms.take() {
+                    self.observe_single_flush(flushed_ms + dur_ms);
+                }
                 return;
             }
             match self.gaps.classify(dur_ms, self.tracker.mu_dit_ms()) {
@@ -681,6 +704,10 @@ impl TrackDecoder {
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
+                    if self.word_chars > 1 {
+                        self.single_flush_gaps.clear();
+                    }
+                    self.word_chars = 0;
                 }
             }
         }
@@ -721,7 +748,10 @@ impl TrackDecoder {
                 // reaches `classify` instead (replayed from `pending`
                 // during warmup, or open while the held last mark leaves
                 // `cur_marks` empty) still enters at full length -- see
-                // the MAN-103 decision doc, D8 correction.
+                // the MAN-103 decision doc, D8 correction. Heavy
+                // Farnsworth spacing, which this censoring hides, is
+                // recovered separately from the closed lengths of gaps
+                // flushed after one-character words (`observe_single_flush`).
                 self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
@@ -732,12 +762,42 @@ impl TrackDecoder {
                         self.process_run(run, true, events);
                     }
                 }
+                let one_char_word = self.word_chars == 0;
+                let garbles = self.garble_count;
                 self.emit_char(ts, events);
+                // A decoded one-character word: keep the gap's length so far
+                // for `observe_single_flush` once the space closes. A longer
+                // word or a garble ends the run.
+                if one_char_word && self.garble_count == garbles {
+                    self.single_flush_ms = Some(gap_ms);
+                } else {
+                    self.single_flush_ms = None;
+                    self.single_flush_gaps.clear();
+                }
                 if !self.word_flushed {
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
+                self.word_chars = 0;
                 self.word_flushed = true;
             }
+        }
+    }
+
+    /// Record the closed length of a gap `check_flush` flushed after a
+    /// one-character word, and rebuild the Farnsworth long-gap statistics
+    /// from the last `SINGLE_FLUSH_REINIT` of them when they show two gap
+    /// clusters -- heavy Farnsworth spacing the censored `observe_flushed`
+    /// cannot see (`GapClassifier::reinit_from_flushed`).
+    fn observe_single_flush(&mut self, gap_ms: f32) {
+        self.single_flush_gaps
+            .push(gap_ms / self.tracker.mu_dit_ms());
+        if self.single_flush_gaps.len() > SINGLE_FLUSH_REINIT {
+            self.single_flush_gaps.remove(0);
+        }
+        if self.single_flush_gaps.len() == SINGLE_FLUSH_REINIT
+            && self.gaps.reinit_from_flushed(&self.single_flush_gaps)
+        {
+            self.single_flush_gaps.clear();
         }
     }
 
@@ -763,6 +823,7 @@ impl TrackDecoder {
                 if !self.word_flushed {
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
+                self.word_chars = 0;
                 self.word_flushed = true;
             }
         }
@@ -782,6 +843,7 @@ impl TrackDecoder {
         };
         let q = snr.map(|snr| (snr / 20.0).clamp(0.3, 1.0)).unwrap_or(1.0);
         let marks = std::mem::take(&mut self.cur_marks);
+        self.word_chars = self.word_chars.saturating_add(1);
         match decode_char(
             &marks,
             self.tracker.mu_dit_ms(),
@@ -1652,6 +1714,60 @@ mod tests {
             decode_with(Engine::Legacy, &env),
             "W1AW W1AW TEST W1AW TEST"
         );
+    }
+
+    /// `rect_envelope` with Farnsworth spacing: characters keyed at
+    /// `char_wpm`, inter-character and word gaps stretched to the ARRL
+    /// Farnsworth timing for `eff_wpm`.
+    fn farnsworth_envelope(text: &str, char_wpm: f32, eff_wpm: f32) -> Vec<f32> {
+        let hops = |ms: f32| (ms / HOP_MS as f32).round() as u32;
+        let dit = hops(1200.0 / char_wpm);
+        let t_a = (60.0 * char_wpm - 37.2 * eff_wpm) / (eff_wpm * char_wpm);
+        let (cgap, wgap) = (hops(3000.0 * t_a / 19.0), hops(7000.0 * t_a / 19.0));
+        let mut env = Vec::new();
+        for (wi, word) in text.split_whitespace().enumerate() {
+            if wi > 0 {
+                env.extend(std::iter::repeat_n(0.0, wgap as usize));
+            }
+            for (ci, c) in word.chars().enumerate() {
+                if ci > 0 {
+                    env.extend(std::iter::repeat_n(0.0, cgap as usize));
+                }
+                for (ei, e) in pattern_for(c).unwrap().chars().enumerate() {
+                    if ei > 0 {
+                        env.extend(std::iter::repeat_n(0.0, dit as usize));
+                    }
+                    let n = if e == '.' { dit } else { 3 * dit };
+                    env.extend(std::iter::repeat_n(1.0, n as usize));
+                }
+            }
+        }
+        env.extend(std::iter::repeat_n(0.0, wgap as usize));
+        env
+    }
+
+    /// Heavy Farnsworth spacing (W1AW slow code practice keys 18 WPM
+    /// characters at 5-13 WPM): the character gap alone outruns the 7-dit
+    /// safety-net flush, so `observe_flushed` saw character and word gaps
+    /// alike as ~7 dits and the Legacy chain decoded every character as its
+    /// own word for the whole transmission ("C Q C Q D E G 4 X X X ...").
+    /// The long-gap statistics must rebuild from the flushed gaps' closed
+    /// lengths and decode every repeat after the first exactly.
+    #[test]
+    fn legacy_bootstraps_heavy_farnsworth() {
+        let rep = "CQ CQ DE G4XXX G4XXX K";
+        let text = [rep; 8].join(" ");
+        let settled = [rep; 7].join(" ");
+        for (char_wpm, eff_wpm) in [(18.0, 5.0), (20.0, 8.0), (25.0, 10.0), (30.0, 12.0)] {
+            let out = decode_with(
+                Engine::Legacy,
+                &farnsworth_envelope(&text, char_wpm, eff_wpm),
+            );
+            assert!(
+                out.ends_with(&format!(" {settled}")),
+                "{char_wpm}/{eff_wpm} WPM decoded {out:?}"
+            );
+        }
     }
 
     /// MAN-213 Scenario 1: the Legacy chain's character stream stays exact

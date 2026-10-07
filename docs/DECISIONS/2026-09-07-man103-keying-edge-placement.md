@@ -209,8 +209,14 @@ paragraph above, from synthetic legacy-engine envelopes at 25 WPM (dit 48 ms):
   the pair uncensored, through `classify`. A Farnsworth text where none do
   never bootstraps: `5NN TU` repeated (25 WPM characters, 8.3-dit character
   gaps, 19.3-dit word gaps) decodes as `5 N N T U ...` for the whole
-  transmission. `main` at `f0ab9ae` fails the same way, and also
-  decodes the V10 text letter by letter on a clean envelope.
+  transmission. On that short scene `main` at `f0ab9ae` fails the same
+  way, and it also decodes the V10 text letter by letter on a clean
+  envelope. That reading did not hold on a longer stream: MAN-213's third
+  validation keyed `CQ CQ DE G4XXX G4XXX K` eight times at 18/5 through
+  30/12 WPM. `main` decoded letter by letter for about three repeats and then
+  recovered. The censored observations never recovered (CER 0.48 at 18/5).
+  So for heavy Farnsworth spacing the censoring was a regression against
+  `main`, not a pre-existing failure. The resolution below fixes it.
 - **Feeding the true gap is not safe as the improvement above describes it.**
   A track survives up to `hang_ms` (5000 ms) of silence, so a pause between
   calls closes as a long gap (~33 dits for 1.6 s). A prototype that observed
@@ -237,6 +243,42 @@ paragraph above, from synthetic legacy-engine envelopes at 25 WPM (dit 48 ms):
   `W1AW TEST W1AW TEST` decodes as `TEST W1AWTESTW1AWTEST`, on `main` too).
   So the pause-robust fix belongs in the long-gap statistics that
   every path feeds, not at the `observe_flushed` call site alone.
+
+**Resolution (MAN-213, validation round 3).** `observe_flushed` keeps the
+censored value: it still guards against the pause case above. A second path
+recovers heavy Farnsworth from the flushed gaps' true lengths, and it only
+acts on that failure's own signature: every character is force-flushed as
+its own word.
+
+- `check_flush` notes when its flush closes a decoded one-character word.
+- When that space closes, `process_run` adds the post-flush remainder.
+  `TrackDecoder::observe_single_flush` keeps the last five such closed
+  lengths, in dit units. A word of two or more characters, or a flushed
+  garble, clears them. A one-character word that `classify` closes leaves
+  them as they are.
+- `GapClassifier::reinit_from_flushed` rebuilds the long-gap pair from those
+  five lengths, but only on a clean split. The largest-ratio split must leave
+  at least two gaps in each cluster, max/min must be at least 2, and the
+  clusters' nearest members must differ by at least `FARNS_MIN_RATIO` (1.8).
+  So one pause cannot set the word-gap cluster, and irregular fragment
+  spacing such as `[8, 9, 12, 20, 25]` dits cannot either. Two pauses can,
+  but only if both follow one-character words inside one such window.
+
+Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
+timing, `CQ CQ DE G4XXX G4XXX K` eight times:
+
+- **Heavy stretch, 18/5, 20/8, 25/8, 25/10, 30/5 and 30/12 WPM.** Every
+  repeat after the first decodes exactly. Before, it was 0 of 8.
+- **Mild stretch, 18/8, 18/13, 25/15 and 30/15 WPM.** Unchanged at 7 of 8.
+- **`5NN TU` at 25/15 WPM.** Exact from its third repeat.
+
+`decoder.rs`'s `legacy_bootstraps_heavy_farnsworth` pins 18/5, 20/8, 25/10
+and 30/12. `legacy_early_pause_does_not_merge_later_words` still passes.
+V1, V2 WPM, V3, V4, V6, V7, V9, V10, V8 and the V8w spots test still pass,
+as do `wpm_across_channel` and `roundtrip_envelope`.
+
+This does not make the long-gap statistics pause-robust in general. The two
+bypass paths above still feed a pause at full length, on `main` too.
 
 **D9 — Record the fading movement; do not chase it.** A midpoint threshold
 sits further above the noise floor than the old geometric mean at high

@@ -485,6 +485,16 @@ old, inflated `μ_dit`, `flush_gap_dits · μ_dit` sat comfortably above real
 Farnsworth character gaps and this never mattered; with the corrected value
 it can drop below them, so the safety net would otherwise intercept nearly
 every character gap before `classify` ever saw it.
+The folded value is the flush threshold, not the gap's closed length (the
+space is still open), so a pause between calls cannot inflate `μ_wgap`.
+Under heavy Farnsworth spacing the character gap itself outruns the flush,
+and that censoring hides the spacing: every character is flushed as its own
+word. So the closed lengths of the last five gaps flushed after decoded
+one-character words re-initialize the long-gap pair. A word of two or more
+characters, or a flushed garble, clears that window. The rebuild happens
+only on a clean split: the largest-ratio split leaves at least two gaps in
+each cluster, max/min is `≥ 2`, and the clusters' nearest members differ by
+`≥ 1.8` (MAN-213; MAN-103 D8 resolution).
 
 ### 4.3 Per-element likelihoods
 

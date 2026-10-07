@@ -75,6 +75,21 @@ fn mean(xs: &[f32]) -> f32 {
     (acc / xs.len() as f64) as f32
 }
 
+/// Index of the last low-cluster value when ascending `s` is split at the
+/// largest ratio between consecutive values (the first such, on a tie).
+fn largest_ratio_split(s: &[f32]) -> usize {
+    let mut best_i = 0;
+    let mut best_r = 0.0f32;
+    for i in 0..s.len() - 1 {
+        let r = s[i + 1] / s[i];
+        if r > best_r {
+            best_r = r;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
 /// Shared 2-means machinery: init-after-5 with largest-ratio-gap split,
 /// EMA centroid updates, geometric-mean boundary. SPEC §4.1 (marks) and
 /// §4.2 (gaps use "the same 2-means machinery").
@@ -194,16 +209,7 @@ impl ClusterPair {
         let mut s = self.init.clone();
         s.sort_by(f32::total_cmp);
         if s[s.len() - 1] / s[0] >= 2.0 {
-            // Split at the largest ratio gap between consecutive sorted values.
-            let mut best_i = 0;
-            let mut best_r = 0.0f32;
-            for i in 0..s.len() - 1 {
-                let r = s[i + 1] / s[i];
-                if r > best_r {
-                    best_r = r;
-                    best_i = i;
-                }
-            }
+            let best_i = largest_ratio_split(&s);
             self.lo = mean(&s[..=best_i]);
             self.hi = mean(&s[best_i + 1..]);
             self.confirmed = true;
@@ -520,6 +526,39 @@ impl GapClassifier {
         }
     }
 
+    /// Rebuild the long-gap statistics from `us`, the closed lengths (dit
+    /// units) of the latest gaps that `check_flush` force-flushed after a
+    /// one-character word. Returns whether it rebuilt them.
+    ///
+    /// `observe_flushed` censors every flushed gap at the flush threshold
+    /// (~7 dits), which keeps a lone pause out of the statistics but also
+    /// hides heavy Farnsworth spacing: when even the character gap outruns
+    /// the threshold (18/5, 20/8, 25/10 WPM), character and word gaps both
+    /// enter as ~7, the pair never splits, and every character decodes as
+    /// its own word for the whole transmission. A run of one-character
+    /// flushed words is that failure's signature, and the closed lengths
+    /// carry the real spacing. Only a clean split rebuilds: at least two
+    /// gaps in each cluster, and a ratio of at least `FARNS_MIN_RATIO`
+    /// between the clusters' nearest members. So one pause among them
+    /// cannot set the word-gap cluster (`decoder.rs`'s
+    /// `legacy_early_pause_does_not_merge_later_words`), and neither can
+    /// irregular fragment spacing with no gap between clusters.
+    pub fn reinit_from_flushed(&mut self, us: &[f32]) -> bool {
+        let mut s = us.to_vec();
+        s.sort_by(f32::total_cmp);
+        let n = s.len();
+        if n < 4 || s[n - 1] / s[0] < 2.0 {
+            return false;
+        }
+        let best_i = largest_ratio_split(&s);
+        if best_i < 1 || n - best_i - 1 < 2 || s[best_i + 1] / s[best_i] < FARNS_MIN_RATIO {
+            return false;
+        }
+        self.pair.reinit_from(us);
+        self.long_seen = self.long_seen.max(n as u32);
+        true
+    }
+
     /// Classify one gap given the current dit estimate, incorporating it into the
     /// Farnsworth long-gap statistics if applicable. SPEC §4.2.
     pub fn classify(&mut self, gap_ms: f32, mu_dit_ms: f32) -> GapClass {
@@ -767,6 +806,27 @@ mod tests {
         }
         assert_eq!(g.classify(6.0 * mu, mu), GapClass::InterChar);
         assert_eq!(g.classify(14.0 * mu, mu), GapClass::InterWord);
+    }
+
+    /// MAN-213: closed one-character-word gaps rebuild the long-gap pair
+    /// when they hold two cleanly split clusters of at least two gaps each,
+    /// and a lone pause or irregular spacing among them does not.
+    #[test]
+    fn reinit_from_flushed_needs_two_gaps_per_cluster() {
+        let mu = 48.0;
+        let mut g = GapClassifier::new();
+        assert!(!g.reinit_from_flushed(&[7.0, 7.0, 7.0, 7.0, 33.0]));
+        // Irregular fragment spacing, and a split whose clusters sit closer
+        // than FARNS_MIN_RATIO, do not rebuild either.
+        assert!(!g.reinit_from_flushed(&[8.0, 9.0, 12.0, 20.0, 25.0]));
+        assert!(!g.reinit_from_flushed(&[10.0, 10.0, 14.0, 15.0, 20.0]));
+        assert_eq!(g.classify(7.0 * mu, mu), GapClass::InterWord);
+
+        let mut g = GapClassifier::new();
+        assert!(g.reinit_from_flushed(&[23.5, 55.0, 23.5, 55.0, 23.5]));
+        assert_eq!(g.classify(23.5 * mu, mu), GapClass::InterChar);
+        assert_eq!(g.classify(55.0 * mu, mu), GapClass::InterWord);
+        assert!(g.flush_threshold_dits(7.0) > 23.5);
     }
 
     #[test]
