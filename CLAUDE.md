@@ -33,6 +33,9 @@ docs/superpowers/specs/2026-09-09-variable-width-capture-design.md.
 MAN-261: one TOML file (`[server]`/`[[rbn_uplink]]`/`[input]`/`[spot]`/
 `[detector]`/`[decode]`, CLI > `MANTA_*` > file) configures
 `run`/`soak`/`doctor` — see docs/DECISIONS/2026-10-06-man261-config-surface.md.
+MAN-76: `manta config check` validates a config (run's pre-I/O pipeline, no
+source or listener) and `manta config init` writes a commented every-key
+scaffold — see docs/DECISIONS/2026-10-07-man76-config-check-init.md.
 
 ## Documents (read in this order)
 

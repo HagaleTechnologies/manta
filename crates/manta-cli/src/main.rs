@@ -9,6 +9,7 @@ use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
 mod config;
+mod config_cmd;
 mod reconnect;
 use reconnect::ReconnectingSource;
 
@@ -650,6 +651,40 @@ enum Command {
         json: bool,
         #[command(flatten)]
         filters: FilterOpts,
+    },
+    /// Check or create a config file, without starting anything.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+// MAN-76: `manta config check` / `manta config init`; see config_cmd.rs and
+// docs/DECISIONS/2026-10-07-man76-config-check-init.md.
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Validate a config file and print the settings it resolves to.
+    ///
+    /// Runs every check `manta run` applies to its config, including the
+    /// MANTA_* environment variables, without opening the receiver,
+    /// binding a port or starting a server. Exits 0 when the config is
+    /// valid and 1, naming the setting and the problem, when it is not.
+    Check {
+        /// Config file to check. Defaults to $MANTA_CONFIG, then to
+        /// manta.toml in the current directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Write a new config file listing every setting at its default.
+    ///
+    /// Every setting is commented out, so the new file changes nothing
+    /// until you edit it. Refuses to replace an existing file without
+    /// --force.
+    Init {
+        /// Where to write the file; `-` prints it instead.
+        #[arg(long, default_value = config_cmd::DEFAULT_PATH)]
+        out: PathBuf,
+        /// Replace the file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2509,6 +2544,43 @@ struct CliOverrides {
 }
 
 impl CliOverrides {
+    /// No command-line say at all: what `manta config check` resolves with,
+    /// so it validates exactly what the file and environment give `run`.
+    fn none() -> Self {
+        CliOverrides {
+            device: None,
+            source: None,
+            source_iq: false,
+            kiwi: KiwiOpts {
+                host: None,
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            },
+            #[cfg(feature = "soapy")]
+            soapy: SoapyOpts {
+                driver: None,
+                freq: None,
+                rate: None,
+                gain: None,
+            },
+            #[cfg(feature = "hpsdr")]
+            hpsdr: HpsdrOpts {
+                host: None,
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq: None,
+                rate: None,
+            },
+            freq_correction_ppm: None,
+            dial_freq_hz: None,
+            capture_rate_hz: None,
+            replay_epoch: None,
+            allowlist: Vec::new(),
+            blocklist: None,
+            notch: None,
+        }
+    }
+
     /// The flag that selects a source, if any: given one, the command line
     /// defines the whole source (D6).
     fn source_selector(&self) -> Option<&'static str> {
@@ -3677,6 +3749,8 @@ fn main() -> Result<()> {
                 print_doctor_report(&report);
             }
         }
+        Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
+        Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
     }
     Ok(())
 }
@@ -3817,6 +3891,27 @@ mod tests {
         }
     }
 
+    /// Words an operator who has never seen this repo's specs, roadmap or
+    /// ticket tracker must not meet. Case-insensitive and whole-word: `SPEC`
+    /// and `spec` are the same leak to an operator, but "special-event
+    /// call" is ordinary English and must not trip the guard.
+    const JARGON: &[&str] = &[
+        r"(?i)\bspec\b",
+        r"(?i)\barchitecture\b",
+        r"(?i)\broadmap\b",
+        r"(?i)\bappendix\b",
+        r"\u{a7}",
+        r"\bM[0-4]\b",
+        r"(?i)\bMAN-\d+",
+    ];
+
+    fn jargon_res() -> Vec<regex::Regex> {
+        JARGON
+            .iter()
+            .map(|p| regex::Regex::new(p).unwrap())
+            .collect()
+    }
+
     /// MAN-135: `--help` is read by operators who have never seen this
     /// repo's specs, roadmap, or ticket tracker. Contributor-facing
     /// provenance belongs in `//` comments, which clap never republishes;
@@ -3824,22 +3919,7 @@ mod tests {
     #[test]
     fn help_text_is_free_of_internal_process_jargon() {
         use clap::CommandFactory as _;
-        // Case-insensitive and whole-word: `SPEC` and `spec` are the same
-        // leak to an operator, but "special-event call" is ordinary English
-        // and must not trip the guard.
-        let patterns = [
-            r"(?i)\bspec\b",
-            r"(?i)\barchitecture\b",
-            r"(?i)\broadmap\b",
-            r"(?i)\bappendix\b",
-            r"\u{a7}",
-            r"\bM[0-4]\b",
-            r"(?i)\bMAN-\d+",
-        ];
-        let res: Vec<regex::Regex> = patterns
-            .iter()
-            .map(|p| regex::Regex::new(p).unwrap())
-            .collect();
+        let res = jargon_res();
 
         let mut out = Vec::new();
         help_strings(&Cli::command(), "manta", &mut out);
@@ -3855,6 +3935,26 @@ mod tests {
         assert!(
             bad.is_empty(),
             "internal jargon in --help:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// MAN-76: `manta config init` writes the scaffold into an operator's
+    /// own file, so it is operator-facing copy just as `--help` is.
+    #[test]
+    fn scaffold_is_free_of_internal_process_jargon() {
+        let res = jargon_res();
+        let mut bad = Vec::new();
+        for (n, line) in config_cmd::SCAFFOLD.lines().enumerate() {
+            for re in &res {
+                if let Some(m) = re.find(line) {
+                    bad.push(format!("line {}: {:?} -- {line}", n + 1, m.as_str()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "internal jargon in the config scaffold:\n{}",
             bad.join("\n")
         );
     }
@@ -5293,38 +5393,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     // ---- MAN-261: CLI > env > file precedence (`resolve`) and coverage
 
     fn cli_overrides() -> CliOverrides {
-        CliOverrides {
-            device: None,
-            source: None,
-            source_iq: false,
-            kiwi: KiwiOpts {
-                host: None,
-                port: 8073,
-                freq: None,
-                password: String::new(),
-            },
-            #[cfg(feature = "soapy")]
-            soapy: SoapyOpts {
-                driver: None,
-                freq: None,
-                rate: None,
-                gain: None,
-            },
-            #[cfg(feature = "hpsdr")]
-            hpsdr: HpsdrOpts {
-                host: None,
-                port: manta_input::hpsdr::CONTROL_PORT,
-                freq: None,
-                rate: None,
-            },
-            freq_correction_ppm: None,
-            dial_freq_hz: None,
-            capture_rate_hz: None,
-            replay_epoch: None,
-            allowlist: Vec::new(),
-            blocklist: None,
-            notch: None,
-        }
+        CliOverrides::none()
     }
 
     fn loaded_from(body: &str) -> config::Loaded {
