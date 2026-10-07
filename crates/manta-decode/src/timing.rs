@@ -546,7 +546,10 @@ impl GapClassifier {
     /// between the clusters' nearest members. So one pause among them
     /// cannot set the word-gap cluster (`decoder.rs`'s
     /// `legacy_early_pause_does_not_merge_later_words`), and neither can
-    /// irregular fragment spacing with no gap between clusters.
+    /// irregular fragment spacing with no gap between clusters. Two pauses
+    /// can, at ordinary spacing, with the word gaps as the low cluster
+    /// (MAN-264). `classify` discards such a rebuild at the first ordinary
+    /// character gap.
     pub fn reinit_from_flushed(&mut self, us: &[f32]) -> bool {
         let mut s = us.to_vec();
         s.sort_by(f32::total_cmp);

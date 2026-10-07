@@ -262,7 +262,13 @@ its own word.
   clusters' nearest members must differ by at least `FARNS_MIN_RATIO` (1.8).
   So one pause cannot set the word-gap cluster, and irregular fragment
   spacing such as `[8, 9, 12, 20, 25]` dits cannot either. Two pauses can,
-  but only if both follow one-character words inside one such window.
+  if both follow one-character words inside one such window. At ordinary
+  spacing `[8, 8, 33, 33, 8]` passes, and every later word merged (MAN-264:
+  `W1AW R R R R R W1AWTESTW1AWTESTCQDEW1AWK` for pauses of 0.8 to 4.65 s).
+  So `classify` discards a rebuilt pair at the first gap of 2 to 5 dits, an
+  ordinary character gap that the rebuild's premise rules out. Heavy
+  Farnsworth never produces one. The 14-cell grid and `5NN TU` are
+  unchanged.
 
 Measured on synthetic legacy-engine envelopes keyed with ARRL Farnsworth
 timing, `CQ CQ DE G4XXX G4XXX K` eight times:
