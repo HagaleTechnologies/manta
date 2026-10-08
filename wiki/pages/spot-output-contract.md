@@ -8,6 +8,7 @@ sources:
   - ARCHITECTURE.md
   - README.md
   - CLAUDE.md
+  - docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md
 verified:
   commit: 01d1ea1
   date: 2026-09-07
@@ -18,7 +19,8 @@ manta produces spots on two surfaces: a **telnet DX cluster server** (default :7
 
 ## Pointers
 
-- RBN telnet format and the command grammar manta supports (`sh/dx`, filters): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- RBN telnet format and the command grammar manta supports (`sh/dx`, filters, `SKIMMER/SETT`, `BYE`): ARCHITECTURE §7. Ports and station-callsign spotter ID are TOML config keys (ARCHITECTURE §8).
+- **Aggregator compatibility is a gate, not a nicety** (MAN-86): RBN's Aggregator will not forward spots from a source that never answers `SKIMMER/SETT`, so the greeting banner, the `SETT` reply and the `BYE` close are an RBN *admission requirement* on this surface, not a convenience — that is the one thing worth knowing before you touch it. Every wire detail (what the banner lines contain, the `SETT` reply grammar, the close text) is normative in `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md`, together with the four primary sources it was reconstructed from, and summarized in ARCHITECTURE §7 — read it there; this page deliberately does not restate it. The operator identity the banner reports comes from the `[server]` `operator_name`/`operator_qth`/`operator_grid` keys in the canonical config-key table (docs/SPEC-decode-core.md §9).
 - Gotcha (MAN-87): IAC (telnet option negotiation) is `0xFF`, never valid UTF-8 — a strictly-UTF-8 line reader on the telnet listener rejects any real client that negotiates on connect (Windows `telnet.exe`, PuTTY telnet mode). manta strips and refuses negotiation before UTF-8 validation runs; see `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md` for the normative design.
 - What an operator may spell in `station_callsign`/`login_callsign` — including RBN's per-band `CALL-N` SSID, which the de-side identity on both surfaces carries verbatim while the `cty.dat` geography lookup behind `deContinent`/`deLat`/`deLon` sees it stripped: `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`. That record, not this page, is authoritative for the grammar; the server still appends its own `-#`.
 - JSON spot schema: **the schema is an ecosystem contract that lives in the `dispensa` repo** (`contracts/spots/spots.v1.schema.json`, ADR-0011 — noted in CLAUDE.md and ARCHITECTURE §7), not solely in this repo. Do not restate fields here; the contract is authoritative.

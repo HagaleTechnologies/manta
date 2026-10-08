@@ -391,8 +391,11 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 7. Output layer (`manta-server`)
 
-- **Telnet DX cluster server** (default :7300): standard login prompt, emits
-  spots in RBN's fixed-column AK1A layout —
+- **Telnet DX cluster server** (default :7300): on connect, sends a CW-Skimmer-
+  shaped greeting banner (software name/version, operator name/callsign/QTH/
+  grid, then `Please enter your callsign: `), validates the login as a
+  plausible callsign shape (not authentication — see Exposure policy below),
+  then emits spots in RBN's fixed-column AK1A layout —
   `DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      0312Z`
   (frequency to 0.01 kHz ending at column 24, a 15-wide callsign column,
   time at column 71 — MAN-88, measured against a live
@@ -400,8 +403,14 @@ validation (MAN-28). Dedupe (step 5) still applies.
   "skimmer"` selects the CW-Skimmer-native variant (no mode column) for
   operators running manta behind W3OA's Aggregator, which expects CW
   Skimmer's own layout rather than the RBN relay's.
-  Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
-  clients not to choke. This is the RBN/aggregator compatibility surface. The
+  Read-mostly protocol; enough command grammar (`sh/dx`, filters, `SKIMMER/
+  SETT`, `BYE`) for common clients — and RBN's own Aggregator — not to choke.
+  `SKIMMER/SETT` replies with validation level and the live decodable
+  passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
+  spots from a source that never answers it (Aggregator manual v6.0 §9.2).
+  This is the RBN/aggregator compatibility surface — see
+  `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md` for the
+  exact wire format and its primary sources. The
   SNR field is quoted in the 500 Hz reference bandwidth RBN/CW Skimmer use
   (MAN-102 / decision D3), converted from the decoder's native 2500 Hz
   measurement at render time — see `docs/SPEC-decode-core.md` §2.3.

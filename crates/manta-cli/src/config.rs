@@ -60,6 +60,9 @@ const ENV_IGNORED: &[&str] = &["MANTA_GIT_SHA"];
 const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "station_callsign"),
     ("server", "bind_addr"),
+    ("server", "operator_name"),
+    ("server", "operator_qth"),
+    ("server", "operator_grid"),
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
@@ -1083,6 +1086,26 @@ mod tests {
                 "{k}"
             );
         }
+    }
+
+    #[test]
+    fn operator_text_env_values_stay_strings() {
+        // MAN-86: free-text banner fields; `12345` and `true` are a legal
+        // name or QTH, never a TOML integer or boolean.
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_SERVER_STATION_CALLSIGN", "W1AW"),
+                ("MANTA_SERVER_OPERATOR_NAME", "true"),
+                ("MANTA_SERVER_OPERATOR_QTH", "12345"),
+            ],
+        )
+        .unwrap();
+        let server = loaded
+            .server
+            .expect("a [server] table from the environment");
+        assert_eq!(server.operator_name.as_deref(), Some("true"));
+        assert_eq!(server.operator_qth.as_deref(), Some("12345"));
     }
 
     #[test]

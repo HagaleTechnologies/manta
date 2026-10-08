@@ -38,13 +38,29 @@ async fn spawn_server(
     let tasks_handle = tasks.clone();
     let limiter =
         manta_server::tasks::new_connection_limiter(manta_server::telnet::MAX_TELNET_CONNECTIONS);
-    let station_call = station_call.to_string();
+    // MAN-86: `serve` takes the whole station profile. Only `call` matters
+    // to this test; the SETT passband is any valid one.
+    let profile = Arc::new(manta_server::telnet::StationProfile {
+        call: station_call.to_string(),
+        operator_name: None,
+        operator_qth: None,
+        operator_grid: None,
+        sett: manta_server::sett::SettSettings {
+            validation_level: manta_server::sett::ValidationLevel::Normal,
+            cq_only: false,
+            segments: manta_server::sett::segments_for_passband(
+                14_040_000.0,
+                (-SAMPLE_RATE_HZ / 2.0, SAMPLE_RATE_HZ / 2.0),
+                1.0,
+            ),
+        },
+    });
     tokio::spawn(async move {
         manta_server::telnet::serve(
             listener,
             bus2,
             metrics,
-            station_call,
+            profile,
             shutdown_rx,
             tasks,
             limiter,
@@ -92,18 +108,21 @@ async fn a_per_band_ssid_identity_reaches_the_telnet_wire_as_call_n_hash() {
     // if the server accepts the connection but regresses before writing its
     // login prompt, a bare `read_line` blocks forever and holds the whole test
     // binary until the runner's global timeout instead of reporting the
-    // handshake failure.
-    let mut login_prompt = String::new();
-    let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut login_prompt))
-        .await
-        .expect("timed out waiting for the login prompt")
-        .unwrap();
-    assert_ne!(n, 0, "connection closed before the login prompt");
-    assert!(
-        login_prompt.to_lowercase().contains("login")
-            || login_prompt.to_lowercase().contains("call"),
-        "expected a login prompt, got: {login_prompt:?}"
-    );
+    // handshake failure. MAN-86: the greeting is a multi-line banner, so read
+    // through its callsign prompt rather than assuming the first line is it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert_ne!(n, 0, "connection closed before the login prompt");
+            let lower = line.to_lowercase();
+            if lower.contains("login") || lower.contains("callsign") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the login prompt");
 
     wr.write_all(b"N0CALL\r\n").await.unwrap();
 
