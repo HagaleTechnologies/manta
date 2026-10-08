@@ -862,6 +862,19 @@ class ReportTests(unittest.TestCase):
         r = self.report(make_ledger(days=1), "--from", "yesterday")
         self.assertEqual(r.returncode, 2)
 
+    def test_non_finite_or_out_of_range_thresholds_are_usage_errors(self):
+        recs = make_ledger(days=1)
+        for flag, value in (("--min-days", "nan"), ("--min-days", "inf"), ("--min-days", "-1"),
+                            ("--interval-s", "nan"), ("--interval-s", "inf"), ("--interval-s", "1e308"),
+                            ("--interval-s", "0"), ("--min-availability", "nan"),
+                            ("--min-availability", "1.5"), ("--min-aggregator", "nan"),
+                            ("--min-aggregator", "-0.1"), ("--planned-window-max-s", "inf"),
+                            ("--planned-window-max-s", "nan"), ("--planned-window-max-s", "-1")):
+            with self.subTest(flag=flag, value=value):
+                r = self.report(recs, flag, value)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertNotIn("PASS", r.stdout)
+
     def test_missing_ledger_is_usage_error(self):
         r = run_cli("report", "--ledger", os.path.join(self.tmp.name, "nope.jsonl"))
         self.assertEqual(r.returncode, 2)

@@ -1200,6 +1200,30 @@ def render_markdown(s):
     return "\n".join(out) + "\n"
 
 
+# A NaN compares false against everything and inf/huge values overflow the gap
+# arithmetic, so either would turn a failing ledger into a PASS. Reject them up front.
+MAX_REPORT_INTERVAL_S = 86400.0
+
+
+def validate_report_thresholds(args):
+    def finite(flag, v):
+        if not math.isfinite(v):
+            raise UsageError("%s must be a finite number" % flag)
+    finite("--interval-s", args.interval_s)
+    if not 0 < args.interval_s <= MAX_REPORT_INTERVAL_S:
+        raise UsageError("--interval-s must be > 0 and <= %s" % _fmt_num(MAX_REPORT_INTERVAL_S))
+    finite("--min-days", args.min_days)
+    if args.min_days <= 0:
+        raise UsageError("--min-days must be > 0")
+    for flag, v in (("--min-availability", args.min_availability), ("--min-aggregator", args.min_aggregator)):
+        finite(flag, v)
+        if not 0 <= v <= 1:
+            raise UsageError("%s must be between 0 and 1" % flag)
+    finite("--planned-window-max-s", args.planned_window_max_s)
+    if args.planned_window_max_s < 0:
+        raise UsageError("--planned-window-max-s must be >= 0")
+
+
 def cmd_report(args):
     params = {
         "interval_s": args.interval_s,
@@ -1210,8 +1234,7 @@ def cmd_report(args):
         "from_ts": parse_iso_ts(args.from_) if args.from_ else None,
         "to_ts": parse_iso_ts(args.to) if args.to else None,
     }
-    if args.interval_s <= 0:
-        raise UsageError("--interval-s must be > 0")
+    validate_report_thresholds(args)
     records, bad = load_ledger(args.ledger)
     params["unparseable_lines"] = bad
     if args.spots_dir:
