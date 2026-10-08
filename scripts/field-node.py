@@ -943,6 +943,19 @@ def summarize(records, params=None):
             baseline = s
     reach_win = [s for s in reach if start < s["ts"] <= end]
     seq = ([baseline] if baseline is not None else []) + reach_win
+    # Spots emitted after the last in-window sample may precede --to, and
+    # only the first sample after the window counts them. They are not
+    # placed in any day, but spots_missed (D-I) counts the whole delta so
+    # a recorder gap in that tail cannot hide a spot (PR #219 review).
+    tail_emitted = 0
+    after = [s for s in reach if s["ts"] > end]
+    if seq and after and after[0].get("spots_total") is not None:
+        a_, b_ = seq[-1], after[0]
+        bs_, as_t = b_["spots_total"], a_.get("spots_total")
+        if a_["start_time"] == b_["start_time"] and as_t is not None:
+            tail_emitted = int(bs_ - as_t if bs_ >= as_t else bs_)
+        else:
+            tail_emitted = int(bs_)
     pairs = list(zip(seq, seq[1:]))
     restarts = []
     days = {}
@@ -1066,7 +1079,7 @@ def summarize(records, params=None):
         # Emitted spots the archive lacks. Stage 1's D-I gate counts them as
         # uncorroborated (shadow-compare.py --missed-spots): a missed spot
         # may be a false one, so the archive alone cannot vouch for it.
-        spots_missed = max(0, spots_emitted_total - recorded_total)
+        spots_missed = max(0, spots_emitted_total + tail_emitted - recorded_total)
         if spots_emitted_total > 0:
             coverage = recorded_total / float(spots_emitted_total)
             if coverage < RECORDED_COVERAGE_WARN:

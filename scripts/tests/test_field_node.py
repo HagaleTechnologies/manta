@@ -884,6 +884,17 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Spots missed by the recorder: 2 (Stage 1: shadow-compare.py --missed-spots 2)",
                       r.stdout)
 
+    def test_spots_missed_counts_the_post_window_tail(self):
+        # PRRT_kwDOTQvU8M6qlOc0: --to falls between scrapes; 3 spots emitted
+        # after the last in-window sample show only on the first sample
+        # after the window, and the recorder missed them.
+        ov = {i: {"spots_inc": 0} for i in range(1, 145)}
+        ov[144] = {"spots_inc": 3}
+        recs = make_ledger(days=1, end_note=False, overrides=ov)
+        s = summ(recs, from_ts=T0, to_ts=T0 + 143 * IV + 300, recorded_by_day={})
+        self.assertEqual(s["spots_emitted_total"], 0)
+        self.assertEqual(s["spots_missed"], 3)
+
     def test_spots_missed_absent_without_spots_dir(self):
         s = summ(make_ledger(days=1))
         self.assertIsNone(s["spots_missed"])
