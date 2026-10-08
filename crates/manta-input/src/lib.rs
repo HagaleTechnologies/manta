@@ -3,7 +3,7 @@
 //! Center frequency comes from a JSON sidecar `<stem>.json`.
 
 pub mod audio;
-pub use audio::{AudioIqSource, TARGET_RATE_HZ};
+pub use audio::{AudioIqSource, AUDIO_PASSBAND_HI_HZ, AUDIO_PASSBAND_LO_HZ, TARGET_RATE_HZ};
 
 pub mod kiwi;
 pub use kiwi::KiwiIqSource;
@@ -94,6 +94,35 @@ pub trait IqSource {
     fn sample_rate(&self) -> f64;
     /// The source's RF center frequency, Hz (0.0 if unknown).
     fn center_freq_hz(&self) -> f64;
+
+    /// The RF passband this source actually delivers, as `(lo, hi)`
+    /// offsets in Hz from `center_freq_hz()` -- which is NOT always
+    /// `-sample_rate()/2 .. +sample_rate()/2`, and is NOT always
+    /// symmetric about the centre.
+    ///
+    /// MAN-86 review: a source that resamples reports a *processing* rate
+    /// wider than the spectrum it carries, and a source fed from a rig's
+    /// audio output carries spectrum only on ONE side of its dial
+    /// frequency. `KiwiIqSource` upsamples a ~12 kS/s receiver stream to
+    /// 96 kS/s while the receiver itself is configured for a 10 kHz IQ
+    /// passband; `AudioIqSource` Hilbert-transforms a rig's ~3 kHz audio
+    /// output, whose tones are positive offsets above `--dial-freq-hz`.
+    /// Reading half the sample rate as the decodable half-width would
+    /// make `SKIMMER/SETT` advertise centre +/-48 kHz / dial +/-24 kHz of
+    /// coverage to Aggregator that no signal ever occupies. Anything a
+    /// consumer publishes as *coverage* (SETT segments) must use this;
+    /// anything that is a per-sample timing quantity (the channelizer,
+    /// `SpotBus`'s sample-index-to-wall-clock conversion) must keep using
+    /// `sample_rate()`.
+    ///
+    /// Defaults to the full Nyquist span, correct for every source that
+    /// neither resamples nor works from real audio (file, SoapySDR,
+    /// HPSDR), where the delivered spectrum IS the Nyquist span of the
+    /// stream.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        let half = self.sample_rate() / 2.0;
+        (-half, half)
+    }
     /// Fill `buf`, returning the number of samples written; 0 = EOF.
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize>;
 
@@ -113,11 +142,28 @@ pub trait IqSource {
         None
     }
 
+    /// MAN-73: number of samples (at `sample_rate()`) the source *missed*
+    /// immediately before the samples returned by the most recent `read()`
+    /// -- e.g. a live connection that was lost and re-established. Returns
+    /// the value once, then `None` until the next gap. Default `None`:
+    /// file and continuously-streaming sources never have gaps.
+    /// `manta_engine::listen` responds by closing the current track
+    /// segment and starting a fresh one whose sample clock is advanced by
+    /// this many samples, so spot timestamps stay wall-clock-true and no
+    /// audio is spliced across the outage. Deliberately NOT zero-fill: a
+    /// zero-filled outage past ~2.5s pins `manta-dsp::floor`'s 25th-
+    /// percentile noise floor at -140 dBFS and floods false tracks on
+    /// resume (measured; see docs/DECISIONS/2026-10-05-man73-source-reconnect.md).
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        None
+    }
+
     /// Shared packet-loss/malformed counters for sources that can lose or
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
-    /// packets, and KiwiSDR/SoapySDR/audio currently count nothing of the
-    /// kind. A caller with `Some(handle)` may keep polling it after the
+    /// packets. KiwiSDR counts SND `seq` gaps and short frames (MAN-128);
+    /// SoapySDR/audio currently count nothing of the kind. A caller with
+    /// `Some(handle)` may keep polling it after the
     /// source itself has been moved into `manta_engine::listen`, which is
     /// the whole reason this is a shared handle rather than a `&self`
     /// snapshot getter.
@@ -165,8 +211,10 @@ impl WavIqSource {
             (f, b) => bail!("unsupported WAV format {f:?}/{b}-bit (need Float32 or Int16)"),
         };
         let samples = interleaved
-            .chunks_exact(2)
-            .map(|c| Complex32::new(c[0], c[1]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[re, im]| Complex32::new(re, im))
             .collect();
 
         let sidecar_path = path.with_extension("json");
@@ -344,6 +392,15 @@ mod tests {
             ),
             (5, 1, 2)
         );
+    }
+
+    #[test]
+    fn default_take_discontinuity_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("fix.wav");
+        write_f32_wav(&wav, &samples(), 96_000);
+        let mut src = WavIqSource::open(&wav).unwrap();
+        assert_eq!(src.take_discontinuity(), None);
     }
 
     #[test]

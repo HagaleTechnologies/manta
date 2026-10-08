@@ -24,6 +24,10 @@ Each active track runs a classical CW decode chain on its ~375 Hz complex channe
 - Beam search over the Morse tree keeps marginal dit/dah hypotheses alive to the character boundary: SPEC §4.3–4.5 (`manta-decode::beam`, `::tree`). Beam is **character-local** — greedy across characters; word context belongs to the validator (SPEC §10.3).
 - Per-character and per-callsign confidence feed [[spot-validation]]: SPEC §4.5–4.6.
 
+## Gotchas
+
+- The keying-decision band must not gate the rail updates: a mark that fades into the band would then update neither rail, freezing `E_hi` at its pre-fade level and deleting the faded marks (MAN-103 D5 did this; V8w recall fell to 0/50 until MAN-213). See `docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` and SPEC §3.2.
+
 ## Why it is shaped this way
 
 Beam search rather than hard thresholding is what makes a marginal element recoverable — a small-Viterbi, not a guess. A separate tone-finder stage is dropped here because the PFB ([[pfb-channelizer]]) already did the frequency selection. ML fusion is gated on beating this baseline (ROADMAP M4), not assumed.

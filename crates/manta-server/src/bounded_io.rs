@@ -552,4 +552,90 @@ mod tests {
         );
         assert_eq!(filter.take_replies(), vec![255, 254, 24]);
     }
+
+    /// MAN-86/PR #128 review: a `CR NUL`-terminated login must not swallow
+    /// the next command (`SKIMMER/SETT`) sent on the same connection.
+    #[tokio::test]
+    async fn telnet_variant_cr_nul_does_not_swallow_the_next_command() {
+        let mut reader = BufReader::new(&b"N0CALL\r\0SETT\r\0"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "N0CALL\r\0");
+        assert_eq!(n, 8);
+        buf.clear();
+        read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "SETT\r\0");
+    }
+
+    #[tokio::test]
+    async fn telnet_variant_still_terminates_on_a_plain_newline_first() {
+        // An `LF` earlier in the chunk wins over a later `CR NUL`.
+        let mut reader = BufReader::new(&b"BYE\r\nSETT\r\0"[..]);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+        read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "BYE\r\n");
+    }
+
+    #[tokio::test]
+    async fn plain_variant_does_not_treat_cr_nul_as_a_terminator() {
+        // The HTTP/uplink callers keep the strict `LF`-only behavior.
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        write_half.write_all(b"GET / HTTP/1.1\r\0").await.unwrap();
+        tokio::task::yield_now().await;
+
+        let fut = read_line_bounded(&mut reader, &mut buf);
+        tokio::pin!(fut);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Pending),
+            "CR NUL must not terminate a non-Telnet line"
+        );
+    }
+
+    /// The two terminator bytes can arrive in separate TCP segments.
+    #[tokio::test]
+    async fn telnet_variant_recognizes_cr_nul_split_across_chunks() {
+        use std::future::Future;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut write_half, read_half) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let mut filter = IacFilter::new();
+
+        write_half.write_all(b"N0CALL\r").await.unwrap();
+        tokio::task::yield_now().await;
+        {
+            let fut = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter);
+            tokio::pin!(fut);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Pending => {} // no terminator yet
+                std::task::Poll::Ready(r) => panic!("must not complete yet, got {r:?}"),
+            }
+        }
+        assert_eq!(buf, "N0CALL\r");
+
+        write_half.write_all(&[0]).await.unwrap();
+        let n = read_line_bounded_telnet(&mut reader, &mut buf, &mut filter)
+            .await
+            .unwrap();
+        assert_eq!(buf, "N0CALL\r\0");
+        assert_eq!(n, 8);
+    }
 }

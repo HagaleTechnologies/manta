@@ -1,7 +1,8 @@
 //! Minimal HTTP server exposing `Metrics::render_prometheus_text` on
-//! `GET /metrics`. ARCHITECTURE §8: "Prometheus text endpoint (feature
-//! `metrics`)." Hand-rolled rather than pulling in a full HTTP framework --
-//! one static text response to one path is the entire surface.
+//! `GET /metrics` and `Metrics::health_at` on `GET /healthz` (MAN-128).
+//! ARCHITECTURE §8: "Prometheus text endpoint (feature `metrics`)."
+//! Hand-rolled rather than pulling in a full HTTP framework -- two static
+//! text responses to two paths is the entire surface.
 
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
@@ -177,6 +178,44 @@ async fn read_headers<R: AsyncBufRead + Unpin>(
     Ok(false)
 }
 
+pub(crate) struct Response {
+    pub status: &'static str,
+    pub content_type: &'static str,
+    pub body: String,
+}
+
+/// Pure request routing (MAN-128): `GET /metrics ` renders the Prometheus
+/// text body, unchanged from before this ticket. `GET /healthz ` evaluates
+/// `Metrics::health_at(now)` and returns `200`/`ok` or `503`/`unhealthy`
+/// plus the per-check reasons. Everything else 404s, unchanged. Pure and
+/// synchronous (no socket I/O) so it's directly unit-testable.
+pub(crate) fn route(request_line: &str, metrics: &Metrics, now: std::time::Instant) -> Response {
+    if request_line.starts_with("GET /metrics ") {
+        Response {
+            status: "200 OK",
+            content_type: "text/plain; version=0.0.4",
+            body: metrics.render_prometheus_text(),
+        }
+    } else if request_line.starts_with("GET /healthz ") {
+        let report = metrics.health_at(now);
+        Response {
+            status: if report.healthy {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            },
+            content_type: "text/plain; charset=utf-8",
+            body: report.render_text(),
+        }
+    } else {
+        Response {
+            status: "404 Not Found",
+            content_type: "text/plain; version=0.0.4",
+            body: String::new(),
+        }
+    }
+}
+
 async fn handle_request(
     socket: tokio::net::TcpStream,
     metrics: Arc<Metrics>,
@@ -219,14 +258,12 @@ async fn handle_request(
         return Ok(());
     }
 
-    let body = if request_line.starts_with("GET /metrics ") {
-        metrics.render_prometheus_text()
-    } else {
-        String::new()
-    };
-    let status = if request_line.starts_with("GET /metrics ") {
-        "200 OK"
-    } else {
+    let Response {
+        status,
+        content_type,
+        body,
+    } = route(&request_line, &metrics, std::time::Instant::now());
+    if status == "404 Not Found" {
         // MAN-59 review: ordinary probing of this unauthenticated,
         // internet-facing endpoint (a wrong method, an unknown path) was
         // otherwise absent from the audit trail entirely -- only header
@@ -237,11 +274,10 @@ async fn handle_request(
         if connection_log_limiter.allow(peer.ip()) {
             tracing::warn!(peer = %peer, request_line = ?request_line.trim_end(), "metrics_http: rejected request, returning 404");
         }
-        "404 Not Found"
-    };
+    }
 
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     tokio::time::timeout(WRITE_TIMEOUT, async {
@@ -256,6 +292,58 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn healthy_metrics() -> Metrics {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        m
+    }
+
+    #[test]
+    fn get_healthz_returns_200_with_ok_body_when_healthy() {
+        let m = healthy_metrics();
+        let resp = route("GET /healthz HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.status, "200 OK");
+        assert!(resp.body.starts_with("ok\n"));
+    }
+
+    #[test]
+    fn get_healthz_returns_503_with_reasons_when_unhealthy() {
+        let m = healthy_metrics();
+        m.set_listener_up("telnet", false);
+        let resp = route("GET /healthz HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.status, "503 Service Unavailable");
+        assert!(resp.body.starts_with("unhealthy\n"));
+        assert!(resp.body.contains("listener telnet: down"));
+    }
+
+    #[test]
+    fn healthz_uses_plain_utf8_content_type() {
+        let m = healthy_metrics();
+        let resp = route("GET /healthz HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.content_type, "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn metrics_keeps_prometheus_content_type() {
+        let m = healthy_metrics();
+        let resp = route("GET /metrics HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.content_type, "text/plain; version=0.0.4");
+    }
+
+    #[test]
+    fn unknown_path_still_404s() {
+        let m = healthy_metrics();
+        for line in [
+            "GET / HTTP/1.1\r\n",
+            "GET /healthzX HTTP/1.1\r\n",
+            "POST /healthz HTTP/1.1\r\n",
+        ] {
+            let resp = route(line, &m, std::time::Instant::now());
+            assert_eq!(resp.status, "404 Not Found", "line: {line}");
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn header_block_honors_one_absolute_deadline_not_a_per_line_reset() {

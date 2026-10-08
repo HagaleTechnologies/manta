@@ -31,6 +31,108 @@ fn default_dry_run() -> bool {
     true
 }
 
+/// The operator-configured band index in RBN's `CALL-N-#` convention (MAN-89
+/// / D4), stripped back off for lookups that want the operator's actual
+/// callsign rather than the node's wire identity. Returns `call` unchanged
+/// when there is no valid SSID -- the definition of "valid" here is the same
+/// one `check_operator_callsign` enforces, and the two must not drift.
+pub fn strip_ssid(call: &str) -> &str {
+    match call.split_once('-') {
+        Some((base, ssid)) if is_valid_ssid(ssid) => base,
+        _ => call,
+    }
+}
+
+/// One or two ASCII digits, no leading zero: `-1` through `-99` (MAN-89
+/// Decision 2). Digits-only is what keeps the server's OWN generated `-#`
+/// suffix unconfigurable now that `-` is no longer banned outright.
+fn is_valid_ssid(ssid: &str) -> bool {
+    !ssid.is_empty()
+        && ssid.len() <= 2
+        && ssid.chars().all(|c| c.is_ascii_digit())
+        && !ssid.starts_with('0')
+}
+
+/// The shortest thing that can be a callsign: an ITU call is at minimum a
+/// one-character prefix, a digit and a one-character suffix (`W1A`). Bounds
+/// the slash-composed base directly; the `/`-delimited segment that must be
+/// the call itself gets the stronger structural test instead, which implies
+/// this length -- see `is_complete_callsign` and `check_operator_callsign`.
+const MIN_CALLSIGN_LEN: usize = 3;
+
+/// True when this ONE `/`-delimited segment has the structure of a complete
+/// ITU callsign: a prefix, a separating digit, and a letter suffix that runs
+/// to the END of the segment -- i.e. some digit with at least one letter
+/// BEFORE it, and the segment's LAST character a letter. `W1A`, `W5AU`,
+/// `4U1UN`, `3DA0RS`, `GB3LER` and multi-digit special-event forms like
+/// `LZ130LO` all satisfy it, as do the digit-led special-event forms below.
+///
+/// Structure, not just character classes (PR #131 review, round 4): a
+/// predicate that only asks for `MIN_CALLSIGN_LEN` characters plus "some
+/// digit, some letter" still accepts `W12` (and therefore `W12-1` and
+/// `W12/P`, whose only other segment is a portable designator). None of
+/// those has a suffix, so none is a callsign -- and the typo would become
+/// this node's identity on every telnet line and JSON `deCall`.
+///
+/// The suffix must run to the end of the segment, not merely exist somewhere
+/// after a digit (PR #131 review, round 5): "a letter somewhere to the right
+/// of the digit" still accepted `W1A2` (and `W1A2-1`, `W1A2/P`), where the
+/// trailing digit sits OUTSIDE the suffix. ITU RR 19.68A puts a letter last
+/// in every amateur callsign, so a segment ending in a digit is a typo at any
+/// length.
+///
+/// A DIGIT-LED segment satisfies it too (PR #131 review, round 6): the
+/// vendored `master.scp` carries `4AFARU`, `4GRID` and `5NNHR`, whose only
+/// digit PRECEDES the first letter, so "a digit with a letter before it"
+/// alone would lock those operators out of starting the daemon. The
+/// digit-ending forms this predicate exists to reject are unaffected --
+/// `W12` and `W1A2` still fail on the trailing-letter rule, which is what
+/// separates a missing suffix from a leading numeral.
+///
+/// The length bound is restated explicitly for that digit-led shape: the
+/// separating-digit shape implies `MIN_CALLSIGN_LEN` on its own (letter,
+/// digit, letter), but a leading digit plus one letter does not. Prefix
+/// (`JW/`) and portable/beacon suffix (`/P`, `/B`, `/3`) segments
+/// legitimately fail this and stay accepted -- `check_operator_callsign`
+/// only requires that ONE segment pass.
+fn is_complete_callsign(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let Some(first_letter) = bytes.iter().position(u8::is_ascii_alphabetic) else {
+        return false;
+    };
+    // The suffix ENDS the segment: `rposition` alone only proves a letter
+    // exists somewhere after the digit, which `W1A2` also satisfies.
+    let Some(&last) = bytes.last() else {
+        return false;
+    };
+    if !last.is_ascii_alphabetic() {
+        return false;
+    }
+    if bytes.len() < MIN_CALLSIGN_LEN {
+        return false;
+    }
+    // `4GRID`: a SINGLE leading numeral is the prefix, and the letters after
+    // it are the whole call. `first_letter == 1` is what keeps this narrow --
+    // ITU digit-led prefixes carry exactly one numeral (`4U`, `3D`, `5N`), so
+    // `12A` is still a typo -- and the segment already ends in a letter, so
+    // this cannot readmit a suffix-less `W12` either.
+    //
+    // `1..=9`, not "any digit": no ITU prefix begins with `0` (and no entry in
+    // the vendored `master.scp` does either), so `0AB` is a mistyped identity
+    // rather than a digit-led special-event call. Restricting the leading
+    // numeral keeps this shortcut from being the hole the finding it answers
+    // warned against, without touching the separating-digit rule below --
+    // `0A1B` still passes there exactly as it did before.
+    if matches!(bytes[0], b'1'..=b'9') && first_letter == 1 {
+        return true;
+    }
+    let last_letter = bytes.len() - 1;
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(i, b)| b.is_ascii_digit() && i > first_letter && i < last_letter)
+}
+
 /// Validates an operator-supplied station identity -- `[server].station_callsign`
 /// and MAN-32's `login_callsign`. Shared by both so the rule, and the
 /// line-injection concern it guards against (see
@@ -40,43 +142,71 @@ fn default_dry_run() -> bool {
 /// `manta_spot::grammar::is_plausible`. That grammar is a cheap prefilter for
 /// garbled DECODER OUTPUT (ARCHITECTURE §6.2) -- 3-7 alphanumerics with a
 /// fixed portable-suffix allowlist -- and it rejects real operator callsigns
-/// the bundled `cty.dat` itself recognizes: `JW/LB2PG` (DXCC prefix
-/// override, base too short once split) and `GB3LER/B` (beacon suffix, not
-/// in the allowlist) are both in the table. Being over-narrow is correct for
-/// the decoder (a false accept there costs a bogus spot) and wrong here (a
-/// false reject means the station cannot start at all).
+/// the bundled `cty.dat` itself recognizes: `JW/LB2PG` (DXCC prefix override,
+/// base too short once split) and `GB3LER/B` (beacon suffix, not in the
+/// allowlist). Being over-narrow is correct for the decoder (a false accept
+/// costs a bogus spot) and wrong here (a false reject means the station
+/// cannot start at all).
+///
+/// MAN-89 / D4: an optional trailing `-N` SSID is accepted, so a multi-band
+/// node can identify each band the way RBN's own spotters do (`W5AU-1` ->
+/// `W5AU-1-#` on the wire). `N` is 1-99, digits only.
 ///
 /// What this still guarantees, which is the actual reason this field is
-/// validated: the value contains nothing but ASCII alphanumerics and `/`, so
-/// it can never carry a control character, whitespace, or the server's own
-/// generated `-#` RBN suffix into a telnet line or a JSON `deCall`.
+/// validated: the value contains nothing but ASCII alphanumerics, `/`, and a
+/// digits-only trailing SSID -- so it can never carry a control character,
+/// whitespace, or the server's own generated `-#` suffix into a telnet line
+/// or a JSON `deCall`.
 ///
 /// Deliberately NOT gated on `cty.dat`: a newly-issued callsign absent from
 /// the bundled snapshot would be rejected, a worse failure than the one this
 /// fixes, and it would couple config deserialization to table loading.
 fn check_operator_callsign(call: &str) -> Result<(), String> {
-    // Total length: 3 (shortest real base) to 20 (a prefix/base/suffix
+    let (base, ssid) = match call.split_once('-') {
+        Some((b, s)) => (b, Some(s)),
+        None => (call, None),
+    };
+    if ssid.is_some_and(|s| !is_valid_ssid(s)) {
+        return Err(format!(
+            "{call:?} is not a plausible callsign (an SSID must be -1 through -99)"
+        ));
+    }
+    // Base length: `MIN_CALLSIGN_LEN` (the call itself cannot be shorter, so
+    // neither can the base that contains it) to 20 (a prefix/base/suffix
     // triple with room to spare) -- an outer bound on what gets interpolated
     // into every output line, not a claim about callsign structure.
-    if call.len() < 3 || call.len() > 20 {
+    if base.len() < MIN_CALLSIGN_LEN || base.len() > 20 {
         return Err(format!("{call:?} is not a plausible callsign (length)"));
     }
-    if !call.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
-        // Covers control characters, CR/LF, whitespace, non-ASCII, and the
-        // server's own `-#` suffix in one rule.
+    if !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
+        // Covers control characters, CR/LF, whitespace and non-ASCII in one rule.
         return Err(format!(
-            "{call:?} is not a plausible callsign (only A-Z, 0-9 and '/' are allowed)"
+            "{call:?} is not a plausible callsign \
+             (only A-Z, 0-9, '/' and a trailing -N SSID are allowed)"
         ));
     }
     // At most prefix/base/suffix, each non-empty and no longer than any real
     // designator.
-    let segments: Vec<&str> = call.split('/').collect();
+    let segments: Vec<&str> = base.split('/').collect();
     if segments.len() > 3 || segments.iter().any(|s| s.is_empty() || s.len() > 10) {
         return Err(format!("{call:?} is not a plausible callsign (structure)"));
     }
-    if !call.chars().any(|c| c.is_ascii_digit()) || !call.chars().any(|c| c.is_ascii_alphabetic()) {
+    // The letter-and-digit rule belongs to the SEGMENT that is the actual
+    // call, not to the whole string (PR #131 review): applied whole-string it
+    // accepts `ABC/123` and `A/1/B`, where no single segment can be a
+    // callsign, and that malformed identity then goes out on every telnet and
+    // JSON spot. Requiring only that ONE segment satisfy it keeps prefix
+    // (`JW/`) and portable/beacon suffix (`/P`, `/B`) segments -- which
+    // legitimately carry letters or digits alone -- accepted.
+    // That segment must also have the ITU call STRUCTURE, not merely a
+    // qualifying length and one of each character class (PR #131 review,
+    // rounds 3, 4 and 5) -- prefix, separating digit, and a letter suffix
+    // running to the END of the segment; see `is_complete_callsign`.
+    if !segments.iter().any(|s| is_complete_callsign(s)) {
         return Err(format!(
-            "{call:?} is not a plausible callsign (needs at least one letter and one digit)"
+            "{call:?} is not a plausible callsign (one segment must be a complete \
+             callsign: a prefix, a separating digit, and a letter suffix, as in \
+             {MIN_CALLSIGN_LEN}-character W1A)"
         ));
     }
     Ok(())
@@ -112,20 +242,90 @@ where
     }
 }
 
+/// Operator free-text (name, QTH) is interpolated verbatim into the
+/// greeting banner every client sees (MAN-86), so it carries exactly the
+/// line-injection concern `ServerConfig::station_callsign` documents: an
+/// embedded CR/LF would forge additional cluster lines, and other control
+/// characters could manipulate a terminal client's output. Rejected at
+/// deserialize time rather than escaped at render time so an operator finds
+/// out at daemon start, not silently on the wire.
+fn check_operator_text(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
+}
+
+/// Maidenhead locator: two letters A-R, two digits, optionally two letters
+/// A-X. A malformed grid is worse than an absent one -- Aggregator would
+/// record garbage as this node's location.
+fn check_grid(value: &str) -> Result<(), String> {
+    let c: Vec<char> = value.chars().map(|c| c.to_ascii_uppercase()).collect();
+    let ok = matches!(c.len(), 4 | 6)
+        && ('A'..='R').contains(&c[0])
+        && ('A'..='R').contains(&c[1])
+        && c[2].is_ascii_digit()
+        && c[3].is_ascii_digit()
+        // Short-circuits before indexing c[4]/c[5] on a 4-char locator.
+        && (c.len() == 4 || (('A'..='X').contains(&c[4]) && ('A'..='X').contains(&c[5])));
+    if !ok {
+        return Err(format!("{value:?} is not a Maidenhead grid square"));
+    }
+    Ok(())
+}
+
+fn deserialize_optional_operator_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        check_operator_text("operator_name", value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_operator_qth<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        check_operator_text("operator_qth", value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_grid<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        check_grid(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// The spotter's own callsign, used as the telnet `DX de <call>-#:`
     /// identity and the JSON stream's `deCall`. No sensible default --
     /// every real cluster/spot-stream node identifies itself. Validated
-    /// (via `check_operator_callsign` -- MAN-45: deliberately NOT the
-    /// decoder's `manta_spot::grammar::is_plausible`, which is too narrow
-    /// for real operator callsigns like `JW/LB2PG` or `GB3LER/B`) at
-    /// deserialize time: an empty, control-character-laden, or malformed
-    /// value would otherwise be interpolated straight into every telnet
-    /// line and JSON `deCall` unescaped -- e.g. a callsign containing
-    /// `\r\n` could forge additional bogus cluster lines. Normalized to
-    /// ASCII uppercase so config casing never reaches the wire.
+    /// (via `check_operator_callsign`, a purpose-built operator-identity
+    /// validator -- MAN-45/MAN-89, NOT `manta_spot::grammar::is_plausible`,
+    /// which is a narrower decoder-output prefilter) at deserialize time:
+    /// an empty, control-character-laden, or malformed value would
+    /// otherwise be interpolated straight into every telnet line and JSON
+    /// `deCall` unescaped -- e.g. a callsign containing `\r\n` could forge
+    /// additional bogus cluster lines. Accepts `CALL`, `CALL/SUFFIX` (a DXCC
+    /// prefix override or portable designator), and an optional trailing
+    /// `-N` per-band SSID (MAN-89 / D4), e.g. `W5AU-1`, matching RBN's own
+    /// `CALL-N-#` multi-band node convention. Normalized to uppercase.
     #[serde(deserialize_with = "deserialize_station_callsign")]
     pub station_callsign: String,
     #[serde(default = "default_bind_addr")]
@@ -200,6 +400,66 @@ pub struct ServerConfig {
     /// `rate_limit::IpRateLimiter::new_with_override`'s doc comment.
     #[serde(default)]
     pub json_max_pings_per_ip: Option<u32>,
+    /// MAN-122 periodic status line cadence, seconds. `None` (field omitted)
+    /// uses `status::DEFAULT_STATUS_INTERVAL` (60 s); `0` disables the status
+    /// line entirely, for operators who ship logs by the byte.
+    #[serde(default)]
+    pub status_interval_secs: Option<u64>,
+    /// Which telnet wire layout the INBOUND cluster server emits
+    /// (MAN-88). Defaults to `"rbn"`, the RBN relay's fixed-column AK1A
+    /// layout that downstream loggers parse today. `"skimmer"` selects
+    /// the CW-Skimmer-native layout (no mode column) that W3OA's
+    /// Aggregator consumes -- set it only when manta is running behind
+    /// an Aggregator install.
+    ///
+    /// Deliberately scoped to `[server]` and NOT applied to
+    /// `[[rbn_uplink]]` (MAN-88 Decision 1): an uplink's peer is an RBN
+    /// spot-collection endpoint, not an Aggregator reading from manta,
+    /// and MAN-90 has not yet verified what that endpoint accepts --
+    /// letting an inbound-listener key silently change the bytes on that
+    /// unverified path is exactly the coupling
+    /// `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D2 warns
+    /// against. `uplink::forward_loop` pins `LineFormat::Rbn`.
+    #[serde(default)]
+    pub line_format: crate::rbn::LineFormat,
+    // The three `operator_*` keys below feed the telnet greeting banner
+    // (MAN-86). They are ALSO listed, with these same defaults and
+    // validation rules, in `docs/SPEC-decode-core.md` §9's `[server]`
+    // block -- the repository's canonical config-key table, and the only
+    // place an operator who has not read this source file will look for
+    // them. Renaming a key, changing a default, or changing a validation
+    // rule here means changing it there too; each field's own doc comment
+    // below restates the rule so the two can be diffed by eye.
+    /// Operator's given name, e.g. `"Art"`. **Optional; default: absent**
+    /// (the field is omitted from the greeting line rather than rendered
+    /// as an empty placeholder). Appears in the telnet greeting banner CW
+    /// Skimmer clients and RBN Aggregator read on connect (MAN-86) --
+    /// Aggregator's Combined Skimmers tab (manual v6.0 §9.2) exists
+    /// precisely to hand-enter this same information for sources that
+    /// can't supply it. **Validated at deserialize time** by
+    /// `check_operator_text`: must be non-empty after trimming and must
+    /// contain no control characters, because it is interpolated verbatim
+    /// into every connecting client's banner (an embedded CR/LF would
+    /// forge cluster lines). A bad value fails daemon start.
+    #[serde(default, deserialize_with = "deserialize_optional_operator_name")]
+    pub operator_name: Option<String>,
+    /// Operator's QTH as free text, e.g. `"Richmond Hill, ON"`.
+    /// **Optional; default: absent**, dropped from the greeting line when
+    /// unset. **Validated at deserialize time** by the same
+    /// `check_operator_text` rule as `operator_name` above -- non-empty
+    /// after trimming, no control characters -- and for the same
+    /// line-injection reason.
+    #[serde(default, deserialize_with = "deserialize_optional_operator_qth")]
+    pub operator_qth: Option<String>,
+    /// Maidenhead grid square, e.g. `"FN03GW"`. **Optional; default:
+    /// absent**, dropped from the greeting line when unset. **Validated
+    /// at deserialize time** by `check_grid`: exactly 4 or 6 characters,
+    /// field letters `A`-`R`, square digits `0`-`9`, and (when 6)
+    /// subsquare letters `A`-`X`; case-insensitive. A malformed grid is
+    /// worse than an absent one -- Aggregator would record garbage as
+    /// this node's location.
+    #[serde(default, deserialize_with = "deserialize_optional_grid")]
+    pub operator_grid: Option<String>,
 }
 
 /// One `[[rbn_uplink]]` TOML array-of-tables entry -- MAN-32/MAN-42.
@@ -258,7 +518,10 @@ impl RbnUplinkConfig {
 /// level too (an earlier version did) rejected every other real, valid
 /// table in the unified config, making `--config` unusable with
 /// the actual daemon config this repo's own docs describe (round-11
-/// review finding).
+/// review finding). MAN-261: the strict top-level check (an unknown table
+/// such as `[detectr]` is an error naming it) lives once in
+/// `manta-cli`'s `config` module, the only crate that knows the full table
+/// set; the daemon itself now parses `[server]`/`[[rbn_uplink]]` there too.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DaemonConfigFile {
     pub server: ServerConfig,
@@ -363,67 +626,319 @@ mod tests {
     }
 
     #[test]
+    fn operator_identity_keys_are_optional_and_default_to_none() {
+        let cfg: ServerConfig = toml::from_str(r#"station_callsign = "W3XYZ""#).unwrap();
+        assert_eq!(cfg.operator_name, None);
+        assert_eq!(cfg.operator_qth, None);
+        assert_eq!(cfg.operator_grid, None);
+    }
+
+    #[test]
+    fn operator_identity_keys_parse_when_present() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "HB9H"
+            operator_name = "Art"
+            operator_qth = "Switzerland"
+            operator_grid = "JN46la"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.operator_name.as_deref(), Some("Art"));
+        assert_eq!(cfg.operator_qth.as_deref(), Some("Switzerland"));
+        assert_eq!(cfg.operator_grid.as_deref(), Some("JN46la"));
+    }
+
+    #[test]
+    fn operator_name_and_qth_reject_line_injection_and_control_characters() {
+        // Same concern station_callsign already documents: these are
+        // interpolated verbatim into the greeting banner, so an embedded
+        // CRLF could forge additional cluster lines to every connecting
+        // client.
+        for bad in [
+            "operator_name = \"Art\\r\\nDX de EVIL-#:  14000.0  N0CALL\"",
+            "operator_qth = \"Bern\\nEVIL\"",
+            "operator_name = \"Art\\u0007\"",
+            "operator_qth = \"\"",
+            "operator_name = \"   \"",
+        ] {
+            let src = format!("station_callsign = \"HB9H\"\n{bad}");
+            assert!(
+                toml::from_str::<ServerConfig>(&src).is_err(),
+                "{bad} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_grid_rejects_non_maidenhead_values() {
+        for bad in ["ZZ99xx", "JN4", "JN46lax", "1N46la", "JN46l", ""] {
+            let src = format!("station_callsign = \"HB9H\"\noperator_grid = {bad:?}");
+            assert!(
+                toml::from_str::<ServerConfig>(&src).is_err(),
+                "{bad:?} should have been rejected as a grid square"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_grid_accepts_four_and_six_character_locators_in_either_case() {
+        for good in ["FN03", "FN03GW", "fn03gw", "JN46la"] {
+            let src = format!("station_callsign = \"HB9H\"\noperator_grid = {good:?}");
+            assert!(
+                toml::from_str::<ServerConfig>(&src).is_ok(),
+                "{good:?} should have been accepted"
+            );
+        }
+    }
+
+    #[test]
     fn missing_station_callsign_is_a_parse_error() {
         let result: Result<ServerConfig, _> = toml::from_str("");
         assert!(result.is_err());
     }
 
-    /// MAN-45 (PR #63 round-8 finding): `station_callsign` was validated
-    /// with `manta_spot::grammar::is_plausible`, a deliberately narrow
-    /// prefilter for GARBLED DECODER OUTPUT (3-7 alphanumerics, a fixed
-    /// portable-suffix allowlist). Real operator callsigns use DXCC prefix
-    /// overrides and suffixes that grammar was never meant to model and
-    /// that the bundled `cty.dat` recognizes outright -- configuration must
-    /// not reject a call the station legitimately holds.
+    /// MAN-89 / D4: RBN's own per-band SSID convention. A multi-band node
+    /// identifies each band as `CALL-N-#`; the operator configures the `CALL-N`
+    /// half and the server appends its own `-#`. Measured against a live RBN
+    /// capture: 10 of 71 observed spotters use this pattern (7x `-1-#`,
+    /// 2x `-6-#`, 1x `-2-#`).
+    #[test]
+    fn per_band_ssid_station_callsigns_are_accepted() {
+        for good in [
+            "W5AU-1",
+            "W5AU-2",
+            "W5AU-6", // the exact shapes seen in the capture
+            "AC0C-1",
+            "W1NT-2", // the exact spotters seen in the capture
+            "W5AU-12",
+            "W5AU-99",    // two-digit SSIDs (Decision 2)
+            "JW/LB2PG-1", // SSID on a DXCC-prefix-override call
+            "w5au-1",     // lowercase accepted and normalized
+        ] {
+            let cfg: ServerConfig = toml::from_str(&format!(r#"station_callsign = {good:?}"#))
+                .unwrap_or_else(|e| panic!("{good:?} should be accepted: {e}"));
+            assert_eq!(cfg.station_callsign, good.to_ascii_uppercase());
+        }
+    }
+
+    /// MAN-45 (PR #63 round-8 finding), fixed here together with MAN-89 per this
+    /// ticket's technical notes: `station_callsign` was validated with
+    /// `manta_spot::grammar::is_plausible`, a deliberately narrow prefilter for
+    /// GARBLED DECODER OUTPUT. Real operator callsigns use DXCC prefix overrides
+    /// and suffixes that grammar never modelled and that the bundled `cty.dat`
+    /// recognizes outright.
     #[test]
     fn real_world_operator_callsigns_are_accepted() {
         for good in [
             "W3XYZ",     // plain
             "JW/LB2PG",  // DXCC prefix override (Svalbard) -- in cty.dat
             "GB3LER/B",  // beacon suffix -- in cty.dat
-            "K5ARH/QRP", // still accepted (the old allowlist's cases)
+            "K5ARH/QRP", // the old allowlist's cases still pass
             "K5ARH/P",
             "VP2E/K5ARH/M", // prefix AND suffix
             "3DA0RS",       // digit-leading prefix
-            "w3xyz",        // lowercase accepted (as before) ...
+            "4U1UN",        // exact cty.dat alias, digit-leading prefix
+            "LZ130LO",      // special-event call: several separating digits
+            "W1A/P",        // the shortest real call, MIN_CALLSIGN_LEN exactly
+            // PR #131 review round 6: digit-led special-event calls whose ONLY
+            // digit precedes the first letter -- all three are in the vendored
+            // master.scp, and the grammar this validator replaced accepted them.
+            "4AFARU",
+            "4GRID",
+            "5NNHR",
+            "4GRID-1",  // ... and they take a per-band SSID like any other
+            "4GRID/P",  // ... and a portable suffix
+            "JW/4GRID", // ... and a DXCC prefix override
+            "w3xyz",    // lowercase accepted ...
         ] {
             let cfg: ServerConfig = toml::from_str(&format!(r#"station_callsign = {good:?}"#))
                 .unwrap_or_else(|e| panic!("{good:?} should be accepted: {e}"));
-            // ... and normalized, so config casing never reaches the wire.
-            assert_eq!(cfg.station_callsign, good.to_ascii_uppercase());
+            assert_eq!(cfg.station_callsign, good.to_ascii_uppercase()); // ... and normalized
         }
     }
 
-    /// The true positives the old grammar caught must STILL be rejected --
-    /// the point of validating this field at all is that it is
-    /// interpolated unescaped into every telnet line and JSON `deCall` (see
-    /// `ServerConfig::station_callsign`'s doc comment), so a `\r\n` in it
-    /// could forge cluster lines. The server's own generated `-#` RBN
-    /// suffix must not be configurable either. Supersedes the old
-    /// `implausible_station_callsign_is_rejected` -- this is a strict
-    /// superset of its fixtures.
+    /// The true positives the old grammar caught must STILL be rejected -- the
+    /// point of validating this field is that it is interpolated unescaped into
+    /// every telnet line and JSON `deCall` (see `ServerConfig::station_callsign`'s
+    /// doc comment). The server's own generated `-#` suffix must not be
+    /// configurable, and now that `-` is no longer banned outright, that
+    /// guarantee comes from the SSID being digits-only (MAN-89 Decision 2).
     #[test]
     fn malformed_or_injecting_station_callsigns_are_still_rejected() {
         for bad in [
-            "",                   // empty
-            "W3XYZ-#",            // the server's own generated suffix
-            "W3XYZ\r\nEVIL LINE", // CRLF injection
-            "not a callsign",     // whitespace
-            "W3XYZ\u{0}",         // NUL
-            "ZZ",                 // too short, no digit
-            "12345",              // no letter
-            "ABCDEF",             // no digit
-            "W1AW/",              // empty segment
-            "/W1AW",              // empty segment
-            "W1AW//P",            // empty segment
-            "A/B/C/D",            // more segments than prefix/base/suffix
-            "W1AW/ABCDEFGHIJK",   // segment far longer than any real designator
-            "W3XYZ\u{00c9}",      // non-ASCII
+            // MAN-45's fixtures
+            "",
+            "W3XYZ-#",
+            "W3XYZ\r\nEVIL LINE",
+            "not a callsign",
+            "ZZ",
+            "12345",
+            "ABCDEF",
+            "W1AW/",
+            "/W1AW",
+            "W1AW//P",
+            "A/B/C/D",
+            "W1AW/ABCDEFGHIJK",
+            "W3XYZ\u{00c9}",
+            // MAN-89's new SSID-boundary fixtures
+            "W3XYZ-",    // bare trailing hyphen
+            "W3XYZ-0",   // SSID 0 == no SSID in the packet convention
+            "W3XYZ-01",  // leading zero: two spellings of one band index
+            "W3XYZ-100", // beyond the 1-99 cap
+            "W3XYZ-1-2", // only one SSID
+            "W3XYZ--1",
+            "W3XYZ-1A",        // digits only
+            "W3XYZ- 1",        // no whitespace smuggled in behind the hyphen
+            "W3XYZ-1/P",       // the SSID is last; a portable suffix cannot follow it
+            "W3XYZ-1\r\nEVIL", // injection behind a valid-looking SSID
+            "-1",              // no base
+            "ZZ-1",            // base still has to be a callsign
+            // PR #131 review: letters and digits split ACROSS segments means no
+            // single segment can be the call.
+            "ABC/123",
+            "A/1/B",
+            "ABC/123-1",
+            // PR #131 review round 3: the qualifying segment must itself be a
+            // complete callsign -- a two-character segment carrying the letter
+            // and the digit is a typo, not a call, however long the base is.
+            "A1/B",
+            "W1/P",
+            "W1/P-1",
+            "AB/1C",
+            // PR #131 review round 4: length plus "some digit, some letter" is
+            // not the ITU call STRUCTURE -- a call needs a letter SUFFIX after
+            // its separating digit, so a segment that ends in digits is a typo,
+            // not a callsign, at any length.
+            "W12",
+            "W12-1",
+            "W12/P",
+            "AB12",
+            "3DA0",
+            "1W2",
+            // PR #131 review round 5: the letter suffix must run to the END of
+            // the segment (ITU RR 19.68A -- every amateur callsign ends in a
+            // letter). A letter merely somewhere right of the separating digit
+            // leaves the trailing digit outside the suffix: still a typo.
+            "W1A2",
+            "W1A2-1",
+            "W1A2/P",
+            "LZ130LO5",
+            "4U1UN0",
+            // PR #131 review round 6: admitting the digit-led shape must not
+            // readmit anything that ends in a digit, nor drop the length floor
+            // the separating-digit shape used to imply on its own.
+            "4G",
+            "4G-1",
+            "4GRID2",
+            "12A/P",
+            "5NNHR9",
+            // ... and the leading numeral itself is 1-9: no ITU prefix, and no
+            // `master.scp` entry, begins with `0`, so this shape is a typo the
+            // digit-led shortcut must not wave through.
+            "0AB",
+            "0AB-1",
+            "0GRID",
         ] {
             let result: Result<ServerConfig, _> =
                 toml::from_str(&format!(r#"station_callsign = {bad:?}"#));
             assert!(result.is_err(), "{bad:?} should have been rejected");
         }
+    }
+
+    /// GOTCHA: a NUL or other raw control character cannot be tested through the
+    /// TOML fixture above -- `{:?}` renders `"\u{0}"` as `\0`, which TOML's own
+    /// lexer rejects as an invalid escape, so that case would pass without the
+    /// validator ever seeing it. Exercise the validator directly instead.
+    #[test]
+    fn control_characters_are_rejected_by_the_validator_itself() {
+        for bad in ["W3XYZ\u{0}", "W3XYZ\u{7f}", "W3XYZ\t", "W3XYZ-1\u{0}"] {
+            assert!(
+                check_operator_callsign(bad).is_err(),
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    /// MAN-32's `login_callsign` is the same class of value -- an operator's own
+    /// station identity -- so it shares the validator (MAN-89 Decision 3).
+    /// `effective_login_callsign` already defaults it to `station_callsign`, so
+    /// an SSID reaches this field implicitly whether or not it is declarable.
+    #[test]
+    fn login_callsign_shares_the_operator_callsign_rule() {
+        for (call, expect_ok) in [("W3XYZ-2", true), ("JW/LB2PG", true), ("W3XYZ-#", false)] {
+            let result: Result<DaemonConfigFile, _> = toml::from_str(&format!(
+                r#"
+                [server]
+                station_callsign = "W3XYZ"
+                [[rbn_uplink]]
+                enabled = true
+                target_host = "example.invalid"
+                target_port = 7300
+                login_callsign = {call:?}
+                "#
+            ));
+            assert_eq!(result.is_ok(), expect_ok, "login_callsign {call:?}");
+        }
+    }
+
+    /// The strict-superset claim, measured against the WHOLE vendored
+    /// `master.scp` rather than a hand-picked fixture list.
+    ///
+    /// Rounds 4, 5 and 6 of the PR #131 review each narrowed
+    /// `is_complete_callsign`, and round 6 found by hand-reading `master.scp`
+    /// that the previous narrowing had locked real operators (`4AFARU`,
+    /// `4GRID`, `5NNHR`) out of starting the daemon -- while the fixture lists
+    /// above still reported the superset property as holding. Fixtures cannot
+    /// catch that class of regression; the snapshot can. Every one of the
+    /// ~50k real, allocated calls in it that the decoder-output grammar this
+    /// validator REPLACED accepted must remain configurable as a station
+    /// identity, with and without an RBN `-N` per-band SSID.
+    #[test]
+    fn accepts_every_master_scp_call_the_replaced_grammar_accepted() {
+        let mut rejected: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for call in manta_spot::MASTER_SCP
+            .lines()
+            .map(str::trim)
+            .filter(|c| !c.is_empty() && !c.starts_with('#'))
+        {
+            if !manta_spot::grammar::is_plausible(call) {
+                continue;
+            }
+            checked += 1;
+            for candidate in [call.to_string(), format!("{call}-1")] {
+                if check_operator_callsign(&candidate).is_err() {
+                    rejected.push(candidate);
+                }
+            }
+        }
+        assert!(
+            checked > 10_000,
+            "test premise: the vendored snapshot should carry tens of thousands \
+             of grammar-accepted calls, got {checked}"
+        );
+        assert!(
+            rejected.is_empty(),
+            "{} real master.scp callsign(s) accepted by grammar::is_plausible are \
+             rejected by check_operator_callsign, e.g. {:?}",
+            rejected.len(),
+            &rejected[..rejected.len().min(20)]
+        );
+    }
+
+    /// The SSID grammar has exactly one definition; `strip_ssid` must agree with
+    /// `check_operator_callsign` about what an SSID is, or Phase 3's cty lookup
+    /// would strip something the validator never accepted.
+    #[test]
+    fn strip_ssid_removes_only_a_valid_ssid() {
+        assert_eq!(strip_ssid("W5AU-1"), "W5AU");
+        assert_eq!(strip_ssid("W5AU-12"), "W5AU");
+        assert_eq!(strip_ssid("JW/LB2PG-1"), "JW/LB2PG");
+        assert_eq!(strip_ssid("W5AU"), "W5AU");
+        assert_eq!(strip_ssid("W5AU-#"), "W5AU-#"); // not an SSID: unchanged
+        assert_eq!(strip_ssid("W5AU-0"), "W5AU-0");
+        assert_eq!(strip_ssid("W5AU-100"), "W5AU-100");
     }
 
     /// MAN-32's `login_callsign` is the same class of value -- an
@@ -657,6 +1172,41 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn line_format_defaults_to_the_rbn_relay_layout() {
+        let cfg: ServerConfig = toml::from_str(r#"station_callsign = "W3XYZ""#).unwrap();
+        assert_eq!(cfg.line_format, crate::rbn::LineFormat::Rbn);
+    }
+
+    #[test]
+    fn line_format_skimmer_selects_the_cw_skimmer_layout() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            station_callsign = "W3XYZ"
+            line_format = "skimmer"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.line_format, crate::rbn::LineFormat::Skimmer);
+    }
+
+    /// A typo must fail loudly at startup rather than silently falling back to
+    /// the default -- same reasoning as `RbnUplinkConfig`'s `dry_run` guard.
+    #[test]
+    fn an_unknown_line_format_is_rejected() {
+        let err = toml::from_str::<ServerConfig>(
+            r#"
+            station_callsign = "W3XYZ"
+            line_format = "aggregator"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("line_format") || err.to_string().contains("aggregator"),
+            "error was: {err}"
+        );
     }
 
     #[test]

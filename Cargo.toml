@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85.0"
+rust-version = "1.98.0"
 repository = "https://github.com/HagaleTechnologies/manta"
 
 [workspace.dependencies]
@@ -57,7 +57,7 @@ soapysdr = "0.5"
 regex = "1"
 tokio = "1"
 tokio-tungstenite = "0.30"
-toml = "0.8"
+toml = "1.1"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -170,6 +170,11 @@ the separate, lower support floor it has been since M0
 (`docs/DECISIONS/2026-07-11-m0-implementation-pins.md`); the guard enforces
 pin `>=` floor, so the two can never silently contradict each other.
 
+**Superseded 2026-10-05 (MAN-242):** the pin moved to 1.98.0 to match the
+Catalyst runner image, and `rust-version` was raised to equal the pin. The
+1.85.0 floor could not build the workspace any more (`rubato 5.0.0` declares
+1.87), so a separate, lower floor was no longer true.
+
 ### Known accepted cost
 
 One redundant toolchain download per CI job: the

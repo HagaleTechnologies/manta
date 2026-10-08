@@ -7,8 +7,11 @@ use std::collections::VecDeque;
 /// SPEC §9 [decode] table defaults.
 #[derive(Debug, Clone)]
 pub struct DemodConfig {
-    pub hyst_up: f32,
-    pub hyst_down: f32,
+    /// Half-width of the keying decision band, as a fraction of the keying
+    /// depth (E_hi - E_lo). SPEC §3.3 **[DEVIATION]**: replaces the
+    /// multiplicative 1.25/0.80 band -- see
+    /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
+    pub hyst_frac: f32,
     pub debounce_ms: f64,
     pub tau_lo_ms: f64,
     pub tau_hi_init_ms: f64,
@@ -18,8 +21,7 @@ pub struct DemodConfig {
 impl Default for DemodConfig {
     fn default() -> Self {
         DemodConfig {
-            hyst_up: 1.25,
-            hyst_down: 0.80,
+            hyst_frac: 0.15,
             debounce_ms: 12.0,
             tau_lo_ms: 500.0,
             tau_hi_init_ms: 200.0,
@@ -54,6 +56,11 @@ const INIT_HOPS: usize = 375; // SPEC §3.2: rails from the first 1 s
 const AREF_HOPS: usize = 188; // SPEC §3.1: A_ref from the first 500 ms (ms_to_hops(500))
 const MIN_KEYING_RATIO: f32 = 2.0; // SPEC §3.2: < 6 dB apparent depth -> pre-decode
 const E_LO_FLOOR: f32 = 1e-6;
+/// SPEC §3.2 (MAN-213): fade-evidence floor, as a multiple of the rails'
+/// geometric mean -- exactly the pre-MAN-103 key-down threshold
+/// `1.25*sqrt(E_hi*E_lo)`, so the fade margin MAN-103 traded away is
+/// restored without moving the key decision itself.
+const FADE_FLOOR_RATIO: f32 = 1.25;
 /// SPEC §2.3: `10*log10(2500/93.75)`, the channel (93.75 Hz) to 2500 Hz
 /// reference-bandwidth conversion. `pub` (MAN-102) so `manta-engine` can
 /// convert its own floor-based `S - F` estimate with the identical
@@ -80,7 +87,6 @@ pub struct Demod {
     a_ref: f32,
     e_hi: f32,
     e_lo: f32,
-    t: f32,
     alpha_hi: f32,
     alpha_lo: f32,
     key_down: bool,
@@ -88,6 +94,10 @@ pub struct Demod {
     held: Option<Run>,
     reest_done: bool,
     debounce_hops: u32,
+    /// MAN-213: consecutive hops whose sample sits between the fade floor
+    /// and the key-down bound, and their sum (SPEC §3.2 fade re-anchor).
+    fade_run: u32,
+    fade_sum: f32,
 }
 
 impl Demod {
@@ -107,7 +117,6 @@ impl Demod {
             a_ref: 1.0,
             e_hi: 0.0,
             e_lo: 0.0,
-            t: 0.0,
             alpha_hi,
             alpha_lo,
             key_down: false,
@@ -115,6 +124,8 @@ impl Demod {
             held: None,
             reest_done: false,
             debounce_hops,
+            fade_run: 0,
+            fade_sum: 0.0,
         }
     }
 
@@ -201,7 +212,6 @@ impl Demod {
             self.a_ref = a_ref;
             self.e_hi = e_hi;
             self.e_lo = e_lo;
-            self.t = (e_hi * e_lo).sqrt();
             // Pinned decision 4: replay the init window so its elements are
             // decoded. Only the successful window replays (decision 10).
             let start = buf.len() - INIT_HOPS;
@@ -273,23 +283,56 @@ impl Demod {
         out
     }
 
+    /// Additive symmetric keying-decision band about the linear-amplitude
+    /// midpoint of the two rails (MAN-103 D3, replacing the geometric-mean
+    /// threshold `T = sqrt(E_hi*E_lo)` for the key decision). Gates the key
+    /// decision and bounds the fade re-anchor zone from above; the rail
+    /// split itself uses the geometric mean (MAN-213), so an in-band faded
+    /// mark still updates a rail instead of freezing both.
+    fn decision_band(&self) -> (f32, f32) {
+        let lo = self.e_lo.max(E_LO_FLOOR);
+        let mid = 0.5 * (self.e_hi + lo);
+        let half = self.cfg.hyst_frac * (self.e_hi - lo);
+        (mid, half)
+    }
+
     fn step(&mut self, a_raw: f32, sample_ts: u64, out: &mut Vec<Run>) {
         let a = a_raw / self.a_ref;
-        // Pinned decision 9 ordering:
-        // (1) rail update against previous T (SPEC §3.2: update only the rail
-        //     the sample belongs to)
-        if a > self.t {
+        // Pinned decision 9 ordering, MAN-103 D3 + MAN-213:
+        // (1) rail update against the previous rails (SPEC §3.2). Every
+        //     sample updates exactly one rail, split at the geometric mean
+        //     `T_cls = sqrt(E_hi*E_lo)` (the pre-MAN-103 classification):
+        //     gating the rails on the key-decision band (MAN-103 D5) froze
+        //     both rails whenever a mark faded into that band. A sustained
+        //     run of `debounce_hops` samples between the old key-down
+        //     threshold `1.25*T_cls` and the key-down bound `mid + half` is
+        //     a faded mark, and re-anchors `E_hi` to its mean so the band
+        //     follows the fade down -- see
+        //     docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md.
+        let (mid, half) = self.decision_band();
+        let t_cls = (self.e_hi * self.e_lo.max(E_LO_FLOOR)).sqrt();
+        if a > t_cls {
             self.e_hi += self.alpha_hi * (a - self.e_hi);
         } else {
             self.e_lo += self.alpha_lo * (a - self.e_lo);
+        }
+        if a > FADE_FLOOR_RATIO * t_cls && a <= mid + half {
+            self.fade_run += 1;
+            self.fade_sum += a;
+        } else {
+            self.fade_run = 0;
+            self.fade_sum = 0.0;
+        }
+        // `max(1)`: a configured `debounce_ms` that rounds to 0 hops must
+        // not re-anchor on an empty run (0/0 would make `E_hi` NaN).
+        if self.fade_run >= self.debounce_hops.max(1) {
+            self.e_hi = self.fade_sum / self.fade_run as f32;
         }
         // (2) rail-collapse floor (SPEC §3.2)
         if self.e_hi < 2.0 * self.e_lo {
             self.e_hi = 2.0 * self.e_lo;
         }
-        // (3) recompute T
-        self.t = (self.e_hi * self.e_lo.max(E_LO_FLOOR)).sqrt();
-        // SPEC §3.1: one-shot A_ref re-estimation if E_hi drifts 3x.
+        // (3) SPEC §3.1: one-shot A_ref re-estimation if E_hi drifts 3x.
         if !self.reest_done
             && (self.e_hi > 3.0 || self.e_hi < 1.0 / 3.0)
             && self.raw_ring.len() == AREF_HOPS
@@ -300,16 +343,18 @@ impl Demod {
             let factor = self.a_ref / new_ref;
             self.e_hi *= factor;
             self.e_lo *= factor;
-            self.t *= factor;
+            self.fade_sum *= factor;
             self.a_ref = new_ref;
             self.reest_done = true;
         }
-        // (4) key decision with hysteresis (SPEC §3.3)
+        // (4) key decision with hysteresis (SPEC §3.3), symmetric about the
+        // midpoint (D3): recomputed from the (possibly just-rescaled) rails.
+        let (mid, half) = self.decision_band();
         if self.key_down {
-            if a < self.cfg.hyst_down * self.t {
+            if a < mid - half {
                 self.key_down = false;
             }
-        } else if a > self.cfg.hyst_up * self.t {
+        } else if a > mid + half {
             self.key_down = true;
         }
         // Run bookkeeping with debounce (SPEC §3.3, pinned decision 5).
@@ -582,5 +627,168 @@ mod tests {
         let snr = d.snr_2500_db().unwrap();
         // 20*log10(50) - 14.3 = 34.0 - 14.3 = 19.7, with EMA settling slack
         assert!((10.0..30.0).contains(&snr), "snr {snr}");
+    }
+
+    /// MAN-103 mechanism gate: the old `T = sqrt(E_hi*E_lo)` geometric-mean
+    /// threshold sat closer to `E_lo` as keying depth (SNR) grew, so a
+    /// rising edge only had to climb a small fraction of the amplitude
+    /// range while a falling edge had to decay nearly all the way back down
+    /// -- inflating every measured mark, worse at higher depth and wider
+    /// transition width (i.e. worse near a channel edge, where the
+    /// recovered envelope's rise/fall is slower). The additive band about
+    /// the linear-amplitude midpoint (D3) must recover the envelope's true
+    /// 50%-crossing mark duration regardless of depth: within ±1 hop for
+    /// ramps of up to 6 hops. The 12-hop ramp is a degenerate triangular
+    /// pulse (no flat top); MAN-213's fade-tolerant geometric-mean rail
+    /// split lets its transition samples pull `E_hi` slightly low, a
+    /// measured +2..+3 hop residual bounded here to `0..=3`. Feeds a
+    /// synthetic, noiseless, exactly symmetric raised-cosine keyed envelope
+    /// and checks the measured mark against the analytically known
+    /// 50%-crossing duration -- see
+    /// docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md for the
+    /// before/after bias tables this test pins, and
+    /// docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md for
+    /// the MAN-213 edge-bias table.
+    #[test]
+    fn keying_edge_placement_is_unbiased_across_depth_and_ramp() {
+        const ON_HOPS: u32 = 24;
+        const OFF_HOPS: u32 = 24;
+        const CYCLES: u32 = 50;
+        const SKIP_MARKS: usize = 15; // let rails settle past init transients
+
+        for &depth_db in &[12.0f32, 20.0, 30.0, 40.0] {
+            for &ramp_hops in &[2u32, 6, 12] {
+                let e_hi = 1.0f32;
+                let e_lo = e_hi * 10f32.powf(-depth_db / 20.0);
+                let rise = ramp_hops.min(ON_HOPS / 2);
+                let true_mark_hops = ON_HOPS - rise;
+
+                let mut d = Demod::new(DemodConfig::default());
+                let mut ts = 0u64;
+                let mut marks: Vec<u32> = Vec::new();
+                for _ in 0..CYCLES {
+                    for h in 0..ON_HOPS {
+                        let up = if h < rise {
+                            0.5 * (1.0 - (std::f32::consts::PI * h as f32 / rise as f32).cos())
+                        } else {
+                            1.0
+                        };
+                        let t_rem = ON_HOPS - h;
+                        let down = if t_rem < rise {
+                            0.5 * (1.0 - (std::f32::consts::PI * t_rem as f32 / rise as f32).cos())
+                        } else {
+                            1.0
+                        };
+                        let level = e_lo + up.min(down) * (e_hi - e_lo);
+                        for r in d.push(level, ts) {
+                            if r.mark {
+                                marks.push(r.hops);
+                            }
+                        }
+                        ts += 256;
+                    }
+                    for _ in 0..OFF_HOPS {
+                        for r in d.push(e_lo, ts) {
+                            if r.mark {
+                                marks.push(r.hops);
+                            }
+                        }
+                        ts += 256;
+                    }
+                }
+                for r in d.finish() {
+                    if r.mark {
+                        marks.push(r.hops);
+                    }
+                }
+
+                let steady: Vec<u32> = marks.into_iter().skip(SKIP_MARKS).collect();
+                assert!(
+                    !steady.is_empty(),
+                    "no steady-state marks at depth {depth_db} dB ramp {ramp_hops}"
+                );
+                for &m in &steady {
+                    let bias = m as i64 - true_mark_hops as i64;
+                    let ok = if ramp_hops <= 6 {
+                        bias.abs() <= 1
+                    } else {
+                        (0..=3).contains(&bias)
+                    };
+                    assert!(
+                        ok,
+                        "depth {depth_db} dB ramp {ramp_hops} hops: measured mark {m} hops, \
+                         true 50%-crossing mark {true_mark_hops} hops, bias {bias}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// MAN-213 Scenario 1: a mark that fades to half its pre-fade amplitude
+    /// must pull `E_hi` down to the new level and stay keyed, not stall the
+    /// rail at its pre-fade value and vanish inside the decision band.
+    #[test]
+    fn faded_mark_rail_tracks_down_and_stays_keyed() {
+        let mut d = Demod::new(DemodConfig::default());
+        let db = d.debounce_hops;
+        let mut ts = 0u64;
+        let mut runs = Vec::new();
+        let mut feed = |d: &mut Demod, level: f32, hops: u32, runs: &mut Vec<Run>| {
+            for _ in 0..hops {
+                runs.extend(d.push(level, ts));
+                ts += 256;
+            }
+        };
+        for _ in 0..30 {
+            feed(&mut d, 1.0, 30, &mut runs);
+            feed(&mut d, 0.02, 30, &mut runs);
+        }
+        assert!((d.e_hi - 1.0).abs() < 0.05, "warm-up e_hi {}", d.e_hi);
+        // Runs are emitted one confirmation late, so select by timestamp.
+        let fade_start_ts = 30 * 60 * 256;
+        // 2 * debounce_hops into the fade, the rail has re-anchored and the
+        // key is down.
+        feed(&mut d, 0.5, 2 * db, &mut runs);
+        assert!(d.key_down, "faded mark never keyed down (e_hi {})", d.e_hi);
+        feed(&mut d, 0.5, 60 - 2 * db, &mut runs);
+        assert!((d.e_hi - 0.5).abs() < 0.05, "e_hi stalled at {}", d.e_hi);
+        feed(&mut d, 0.02, 30, &mut runs);
+        for _ in 0..5 {
+            feed(&mut d, 0.5, 30, &mut runs);
+            feed(&mut d, 0.02, 30, &mut runs);
+        }
+        runs.extend(d.finish());
+        let marks: Vec<u32> = runs
+            .iter()
+            .filter(|r| r.mark && r.start_ts >= fade_start_ts)
+            .map(|r| r.hops)
+            .collect();
+        assert_eq!(marks.len(), 6, "faded marks lost or split: {marks:?}");
+        assert!(marks[0] >= 60 - db, "first faded mark {marks:?}");
+        for &m in &marks[1..] {
+            assert!(m.abs_diff(30) <= 1, "faded mark length {marks:?}");
+        }
+    }
+
+    /// MAN-213 review: with `debounce_ms` rounding to 0 hops the fade
+    /// re-anchor must still need one in-zone sample, never divide an empty
+    /// run (`0/0` NaN would freeze the key and silence the track).
+    #[test]
+    fn zero_debounce_does_not_poison_e_hi() {
+        let mut d = Demod::new(DemodConfig {
+            debounce_ms: 0.0,
+            ..DemodConfig::default()
+        });
+        assert_eq!(d.debounce_hops, 0);
+        let mut ts = 0u64;
+        let mut marks = 0;
+        for level in [1.0f32, 0.02, 0.5, 0.02].iter().cycle().take(4 * 40) {
+            for _ in 0..30 {
+                marks += d.push(*level, ts).iter().filter(|r| r.mark).count();
+                ts += 256;
+            }
+        }
+        assert!(d.e_hi.is_finite(), "e_hi {}", d.e_hi);
+        assert!(marks > 0, "no marks emitted");
     }
 }
