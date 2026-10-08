@@ -471,9 +471,7 @@ fn check_notes_go_to_stderr_and_do_not_change_the_exit_code() {
         "{err}"
     );
     assert!(
-        err.contains(
-            "note: the telnet, JSON and metrics servers listen on every network interface"
-        ),
+        err.contains("note: the telnet and JSON servers listen on every network interface"),
         "{err}"
     );
 }
@@ -580,8 +578,8 @@ fn uncommented_server_block_with_a_real_callsign_passes_check() {
     let out = succeeds(&o);
     assert!(
         out.contains(
-            "\nserver: station_callsign=W1AW bind_addr=0.0.0.0 telnet_port=7300 json_port=7301 \
-             metrics_port=7302 line_format=rbn\n"
+            "\nserver: station_callsign=W1AW bind_addr=0.0.0.0 metrics_bind_addr=127.0.0.1 \
+             telnet_port=7300 json_port=7301 metrics_port=7302 line_format=rbn\n"
         ),
         "{out}"
     );
@@ -590,8 +588,13 @@ fn uncommented_server_block_with_a_real_callsign_passes_check() {
         err.contains("note: manta run with this config needs your radio's dial frequency"),
         "{err}"
     );
+    // MAN-132: telnet/JSON stay public by default; metrics stays local.
     assert!(
-        err.contains("note: the telnet, JSON and metrics servers listen on every"),
+        err.contains("note: the telnet and JSON servers listen on every"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("note: the metrics endpoint listens on every"),
         "{err}"
     );
 }

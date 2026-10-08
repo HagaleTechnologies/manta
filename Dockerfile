@@ -51,6 +51,9 @@ WORKDIR /home/manta
 
 # Telnet DX cluster (:7300), JSON/WebSocket spot stream (:7301), Prometheus
 # metrics (:7302) -- ARCHITECTURE.md §7/§8. Defaults; override via config.
+# Metrics listens on the container's 127.0.0.1 (metrics_bind_addr, MAN-132),
+# which a published port cannot reach, unless MANTA_SERVER_METRICS_BIND_ADDR
+# is set to 0.0.0.0.
 EXPOSE 7300 7301 7302
 
 # No STOPSIGNAL override. This image carried `STOPSIGNAL SIGINT` from PR

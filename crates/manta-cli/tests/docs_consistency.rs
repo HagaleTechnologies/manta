@@ -999,3 +999,30 @@ fn architecture_section_8_mentions_config_check() {
         "ARCHITECTURE §8 does not mention `manta config init`"
     );
 }
+
+/// MAN-132: metrics has its own bind address (default 127.0.0.1). No
+/// operator-facing doc may still say it shares `bind_addr` or that no
+/// per-listener option exists.
+#[test]
+fn docs_describe_the_separate_metrics_bind_addr() {
+    for rel in [
+        "README.md",
+        "ARCHITECTURE.md",
+        "docs/RUNBOOKS/network-exposure.md",
+        "docs/RUNBOOKS/node-health.md",
+    ] {
+        let text = squash_whitespace(&doc(rel));
+        assert!(
+            text.contains("metrics_bind_addr"),
+            "{rel} never mentions metrics_bind_addr"
+        );
+        for stale in [
+            "A per-listener bind option doesn't exist yet",
+            "omit it and all three servers bind",
+            "shares the same publicly-bound-by-default posture",
+            "default bind `[server].bind_addr`",
+        ] {
+            assert!(!text.contains(stale), "{rel} still says {stale:?}");
+        }
+    }
+}

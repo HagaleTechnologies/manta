@@ -47,6 +47,10 @@ MAN-96: secondary-skimmer field-node kit (outage counters,
 `scripts/field-node.py`, `scripts/shadow-compare.py`, runbook) implemented;
 the 30-day hardware run itself is outstanding — see
 docs/DECISIONS/2026-10-07-man96-secondary-skimmer-field-node.md.
+MAN-132: the metrics listener (`/metrics`, `/healthz`) binds
+`[server].metrics_bind_addr`, default `127.0.0.1`, while telnet/JSON keep
+`bind_addr` (`0.0.0.0`) — see
+docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md.
 
 ## Documents (read in this order)
 

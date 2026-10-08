@@ -139,7 +139,10 @@ was the only one.
 - `run` could also reject unedited placeholders.
 - `--json` output for `check` (needs `Serialize` across the config types).
 - Re-scope the scaffold's `bind_addr` lines when MAN-132 lands
-  per-listener bind addresses.
+  per-listener bind addresses. Done by MAN-132 (2026-10-08): the
+  scaffold now has separate `bind_addr` and `metrics_bind_addr` blocks,
+  and `check`'s notes and duplicate-port rule are per listener — see
+  `docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md`.
 - Generate a shipped `manta.example.toml` from `manta config init --out -`
   if MAN-75's packaging goal is revived.
 

@@ -35,11 +35,19 @@
 #operator_qth = "Richmond Hill, ON"  # your location
 #operator_grid = "FN03GW"            # Maidenhead grid square, 4 or 6 characters
 
-# Address all three servers listen on. The default, 0.0.0.0, accepts
-# connections on every network interface, as a public cluster node
-# expects. The metrics endpoint has no password and shares this address:
-# set "127.0.0.1" to accept connections from this machine only.
+# Address the telnet and JSON servers listen on. The default, 0.0.0.0,
+# accepts connections on every network interface, as a public cluster
+# node expects. Set "127.0.0.1" to accept connections from this machine
+# only.
 #bind_addr = "0.0.0.0"
+
+# Address the metrics endpoint (GET /metrics and GET /healthz) listens
+# on, separately from bind_addr. The endpoint has no password, so the
+# default, 127.0.0.1, accepts connections from this machine only. Set
+# "0.0.0.0" only when a Prometheus server or health probe on another
+# machine, or outside this container, must reach it, and firewall
+# metrics_port to those machines.
+#metrics_bind_addr = "127.0.0.1"
 
 #telnet_port = 7300                  # DX-cluster telnet server
 #json_port = 7301                    # JSON Lines and WebSocket spot stream
