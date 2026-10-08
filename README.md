@@ -116,9 +116,16 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   line above turns it on. `soapy` (RTL-SDR, Airspy, SDRplay, HackRF via
   SoapySDR) needs the native SoapySDR system library installed first;
   once you have it, add it: `--features hpsdr,soapy`.
-- Windows binaries need the [Visual C++
+- Windows binaries from the release workflow link the MSVC runtime
+  statically, so they need no Visual C++ Redistributable. A Windows build
+  from source links it dynamically unless you set
+  `RUSTFLAGS="-C target-feature=+crt-static"` yourself, so a binary built
+  that way needs the [Visual C++
   Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
-  installed if it isn't already.
+  on any machine that doesn't already have it.
+- If the `docker run` above returns an authorization error, the GHCR
+  package still needs its one-time "make public" step — see
+  [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
 
 ## 60-second demo
 
