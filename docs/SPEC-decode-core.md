@@ -280,7 +280,18 @@ edge had to decay nearly all the way back down — inflating every measured
 mark, worse at higher SNR and near a channel edge (where the recovered
 envelope's own rise/fall transient is slower). A band symmetric in *linear
 amplitude* about the midpoint measures a symmetric transition's true
-50%-crossing duration exactly, for any transition width or keying depth.
+50%-crossing duration exactly, for any transition width or keying depth,
+while the rails sit at the true mark and space levels (up to one hop of
+quantization of the continuous crossing point). The rail-update split
+below (MAN-213) lets transition samples pull `E_hi` slightly low, so slow
+transitions read a little long. MAN-213 decision B3
+(`docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md`)
+measured the steady-state mark bias on a synthetic raised-cosine envelope:
+none for ramps up to 6 hops (16 ms), 0 to +2 hops for 8–10-hop ramps and
++2 to +3 hops for a 12-hop ramp (a triangular pulse with no flat top),
+against at most +1 hop with the pre-MAN-213 rails.
+`keying_edge_placement_is_unbiased_across_depth_and_ramp` gates ±1 hop at
+ramps of 2 and 6 hops and `0..=3` hops at 12.
 
 Initialization, from the first 375 hops (1 s) after ACTIVE:
 `E_hi = Q90(a)`, `E_lo = max(Q10(a), 1e-6)`. If `E_hi / E_lo < 2` (< 6 dB
@@ -345,7 +356,9 @@ lowest value the fade re-anchor can drive `E_hi` to.
   symmetric), the rise-crossing delay equals the fall-crossing delay *iff*
   the up/down thresholds are placed symmetrically about the amplitude
   midpoint — and then the measured mark equals the true 50%-point mark
-  exactly, for any transition width and any keying depth. `hyst_frac` is
+  exactly, for any transition width and any keying depth, as long as the
+  rails sit at the true levels, up to one hop of quantization (§3.2 states
+  the slow-ramp residual its rail-update split leaves). `hyst_frac` is
   purely a noise-immunity knob: the underlying timing is provably
   independent of the band width (confirmed by a real-pipeline sweep over
   0.05–0.45 that left on-centre WPM readings unchanged).
@@ -390,8 +403,9 @@ space (i.e. `dit` iff `d < B`), then EMA the assigned centroid:
 **Constraints** — after every update enforce `2.2 ≤ μ_dah/μ_dit ≤ 4.5`
 (weighted keying and Farnsworth stay inside this window); on violation,
 re-anchor `μ_dah = 3·μ_dit`. Clamp `μ_dit` to `[20 ms, 150 ms]`
-(60 WPM .. 8 WPM); PARIS WPM = `1200 / μ_dit_ms`, EMA-smoothed with
-`α = 0.1` for reporting.
+(60 WPM .. 8 WPM); the reported PARIS WPM is `1200 / dit_estimate`
+(§4.1a's symmetric correction of `μ_dit_ms`), EMA-smoothed with
+`α = 0.1`.
 
 **Drift/regime change** — if 12 consecutive marks assign to a single cluster
 *and* their coefficient of variation < 0.35 *and* their mean is off that
