@@ -461,10 +461,12 @@ validation (MAN-28). Dedupe (step 5) still applies.
   choice, not an oversight, and manta-specific client auth would make it
   incompatible with the clients it exists to interoperate with. See
   `docs/DECISIONS/2026-09-02-man23-threat-model.md` findings 10/20 for the full
-  threat-model rationale. The metrics HTTP endpoint (§8) shares the same
-  publicly-bound-by-default posture but is NOT part of this compatibility
-  contract — it's operational tooling, not an RBN-facing surface — see that same
-  doc's finding 11 and `docs/RUNBOOKS/network-exposure.md` for how to restrict it.
+  threat-model rationale. The metrics HTTP endpoint (§8) is NOT part of this
+  compatibility contract — it's operational tooling, not an RBN-facing surface —
+  so it binds loopback by default: `[server].metrics_bind_addr`, `127.0.0.1`,
+  independent of the telnet/JSON `bind_addr` (MAN-132,
+  `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D14). Widen it only
+  deliberately, per `docs/RUNBOOKS/network-exposure.md`.
 
 ## 8. Configuration & observability
 
@@ -588,7 +590,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   every other source — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
-- **`GET /healthz` (MAN-128)**: shares the metrics listener/bind address.
+- **`GET /healthz` (MAN-128)**: shares the metrics listener and its
+  `metrics_bind_addr`.
   Returns `200 OK`/body `ok\n...` only while every registered source is
   healthy, every registered listener (telnet/JSON/metrics) is up, and the
   decode loop has made progress within the last 10 s (or was never armed —

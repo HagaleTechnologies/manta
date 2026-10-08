@@ -21,6 +21,10 @@ fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
 }
 
+fn default_metrics_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
 /// MAN-159: dry-run is ON unless an operator explicitly turns it off.
 /// Enabling a `[[rbn_uplink]]` block is already a deliberate act, but it
 /// should not *also* silently mean "start transmitting to a real RBN
@@ -328,8 +332,23 @@ pub struct ServerConfig {
     /// `CALL-N-#` multi-band node convention. Normalized to uppercase.
     #[serde(deserialize_with = "deserialize_station_callsign")]
     pub station_callsign: String,
+    /// Address the telnet and JSON/WebSocket listeners bind. Defaults to
+    /// `0.0.0.0`: both are public by design, as RBN nodes run
+    /// (ARCHITECTURE §7, D14). Does NOT apply to the metrics listener --
+    /// see `metrics_bind_addr`.
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
+    /// Address the metrics listener (`GET /metrics`, `GET /healthz`) binds
+    /// (MAN-132). Defaults to `127.0.0.1`: the endpoint has no
+    /// authentication and is operational tooling, not an RBN-facing
+    /// surface (D14). Deliberately a SEPARATE field that never follows
+    /// `bind_addr` -- widening the public listeners must not widen this
+    /// one, and narrowing this one must not take them offline (the
+    /// trap `docs/RUNBOOKS/network-exposure.md` warned about while the
+    /// address was shared). Same per-listener reasoning as
+    /// `json_max_connections_per_ip`.
+    #[serde(default = "default_metrics_bind_addr")]
+    pub metrics_bind_addr: String,
     #[serde(default = "default_telnet_port")]
     pub telnet_port: u16,
     /// Shared TCP JSON Lines / WebSocket port, per ARCHITECTURE §7's "tcp/ws
@@ -551,6 +570,7 @@ mod tests {
         assert_eq!(cfg.json_port, 7301);
         assert_eq!(cfg.metrics_port, 7302);
         assert_eq!(cfg.bind_addr, "0.0.0.0");
+        assert_eq!(cfg.metrics_bind_addr, "127.0.0.1");
     }
 
     #[test]
@@ -562,6 +582,7 @@ mod tests {
             json_port = 17301
             metrics_port = 17302
             bind_addr = "127.0.0.1"
+            metrics_bind_addr = "::1"
             "#,
         )
         .unwrap();
@@ -570,6 +591,33 @@ mod tests {
         assert_eq!(cfg.json_port, 17301);
         assert_eq!(cfg.metrics_port, 17302);
         assert_eq!(cfg.bind_addr, "127.0.0.1");
+        assert_eq!(cfg.metrics_bind_addr, "::1");
+    }
+
+    /// MAN-132 / D14: metrics defaults to loopback while telnet/JSON stay
+    /// public, and the two addresses never follow each other.
+    #[test]
+    fn metrics_bind_addr_defaults_to_loopback_independently_of_bind_addr() {
+        let cfg: ServerConfig = toml::from_str(r#"station_callsign = "W3XYZ""#).unwrap();
+        assert_eq!(
+            (cfg.bind_addr.as_str(), cfg.metrics_bind_addr.as_str()),
+            ("0.0.0.0", "127.0.0.1")
+        );
+
+        let cfg: ServerConfig =
+            toml::from_str("station_callsign = \"W3XYZ\"\nbind_addr = \"192.168.1.5\"\n").unwrap();
+        assert_eq!(
+            cfg.metrics_bind_addr, "127.0.0.1",
+            "widening bind_addr must not widen metrics"
+        );
+
+        let cfg: ServerConfig =
+            toml::from_str("station_callsign = \"W3XYZ\"\nmetrics_bind_addr = \"0.0.0.0\"\n")
+                .unwrap();
+        assert_eq!(
+            (cfg.bind_addr.as_str(), cfg.metrics_bind_addr.as_str()),
+            ("0.0.0.0", "0.0.0.0")
+        );
     }
 
     /// PR #81 review, round 3: the three per-IP quota overrides are
@@ -970,7 +1018,8 @@ mod tests {
         // instead of `bind_addr`) must not silently parse and fall back to
         // that field's default -- for `bind_addr` specifically, silently
         // keeping the "0.0.0.0" default instead of the operator's intended
-        // restriction unexpectedly exposes all three listeners publicly.
+        // restriction unexpectedly exposes the telnet and JSON listeners
+        // publicly.
         let result: Result<ServerConfig, _> = toml::from_str(
             r#"
             station_callsign = "W3XYZ"
