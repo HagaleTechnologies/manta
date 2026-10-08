@@ -879,11 +879,15 @@ def summarize(records, params=None):
     if first["ts"] > start:
         account(start, first["ts"],
                 "unobserved" if first["ts"] - start > gap_limit else ("up" if _is_up(first) else "down"))
+    # Pair intervals as [a.ts, b.ts, state, extra_down, same_process],
+    # accounted after the walk so a later pair can move counter-reported
+    # down time into an earlier healthy interval.
+    segs = []
     for a, b in zip(samples, samples[1:]):
         if b["ts"] < start or a["ts"] > end:
             continue
         if b["ts"] - a["ts"] > gap_limit:
-            account(a["ts"], b["ts"], "unobserved")
+            segs.append([a["ts"], b["ts"], "unobserved", 0.0, False])
             continue
         sa, sb = a.get("start_time"), b.get("start_time")
         if sa is not None and sb is not None and sa != sb:
@@ -893,15 +897,36 @@ def summarize(records, params=None):
             # (D-A). Only (sb, b.ts] is observed, by b. A start time outside
             # the interval cannot be placed, so the whole interval is down.
             if a["ts"] < sb < b["ts"]:
-                account(a["ts"], sb, "down")
-                account(sb, b["ts"], "up" if _is_up(b) else "down")
+                segs.append([a["ts"], sb, "down", 0.0, False])
+                segs.append([sb, b["ts"], "up" if _is_up(b) else "down", 0.0, False])
             else:
-                account(a["ts"], b["ts"], "down")
+                segs.append([a["ts"], b["ts"], "down", 0.0, False])
             continue
-        extra = 0.0
-        if _is_up(a) and sa is not None and sa == sb:
-            extra, _ = _counter_delta(a.get("source_down_s"), b.get("source_down_s"))
-        account(a["ts"], b["ts"], "up" if _is_up(a) else "down", extra)
+        same = sa is not None and sa == sb
+        delta, _ = _counter_delta(a.get("source_down_s"), b.get("source_down_s")) if same else (0.0, {})
+        if _is_up(a):
+            seg = [a["ts"], b["ts"], "up", delta, same]
+        else:
+            seg = [a["ts"], b["ts"], "down", 0.0, same]
+            if same and delta > 0:
+                # An outage that ended inside (a.ts, b.ts] but began before
+                # a: its completed counter delta lands on this pair while
+                # the contiguous unhealthy run back to the last healthy
+                # sample is already counted down. Move the remainder out
+                # of the healthy interval just before that run, where the
+                # outage must have started (PR #219 review).
+                run = seg[1] - seg[0]
+                j = len(segs) - 1
+                edge = seg[0]
+                while j >= 0 and segs[j][2] == "down" and segs[j][4] and segs[j][1] == edge:
+                    run += segs[j][1] - segs[j][0]
+                    edge = segs[j][0]
+                    j -= 1
+                if j >= 0 and segs[j][2] == "up" and segs[j][4] and segs[j][1] == edge:
+                    segs[j][3] += max(0.0, delta - run)
+        segs.append(seg)
+    for a_ts, b_ts, state, extra, _same in segs:
+        account(a_ts, b_ts, state, extra)
     if last["ts"] < end:
         account(last["ts"], end,
                 "unobserved" if end - last["ts"] > gap_limit else ("up" if _is_up(last) else "down"))

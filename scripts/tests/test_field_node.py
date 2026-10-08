@@ -785,6 +785,36 @@ class ReportTests(unittest.TestCase):
         r = self.report(recs)
         self.assertIn("Source outages: 2, down 45 s", r.stdout)
 
+    def test_outage_spanning_unhealthy_samples_credits_counter_delta(self):
+        # PRRT_kwDOTQvU8M6qh0kA: an outage from 100 s after sample 1000 to
+        # 500 s after sample 1002 (1600 s) is seen unhealthy at 1001 and
+        # 1002; its counter delta lands on the 1002 -> 1003 pair. Sampled
+        # down covers (1001, 1003] = 1200 s; the other 400 s sit inside the
+        # healthy-looking (1000, 1001] interval and must move to down.
+        ov = {1001: {"healthz": 503, "source_health": {"soapy": 0}},
+              1002: {"healthz": 503, "source_health": {"soapy": 0}}}
+        for i in range(1003, 4321):
+            ov[i] = {"source_outages": {"soapy": 1}, "source_down_s": {"soapy": 1600.0}}
+        for i in (1001, 1002):
+            ov[i]["source_outages"] = {"soapy": 1}
+        recs = make_ledger(overrides=ov)
+        s = summ(recs)
+        self.assertAlmostEqual(s["down_s"], 1600.0)
+        self.assertAlmostEqual(s["counter_down_s"], 400.0)
+        self.assertAlmostEqual(s["availability"], 1 - 1600.0 / (30 * DAY))
+
+    def test_outage_within_unhealthy_samples_not_double_counted(self):
+        # A 1000 s outage fully inside the sampled-down (1001, 1003] span:
+        # the 1200 s already counted down covers it, nothing moves.
+        ov = {1001: {"healthz": 503, "source_health": {"soapy": 0}},
+              1002: {"healthz": 503, "source_health": {"soapy": 0}}}
+        for i in range(1003, 4321):
+            ov[i] = {"source_outages": {"soapy": 1}, "source_down_s": {"soapy": 1000.0}}
+        recs = make_ledger(overrides=ov)
+        s = summ(recs)
+        self.assertAlmostEqual(s["down_s"], 1200.0)
+        self.assertAlmostEqual(s["counter_down_s"], 0.0)
+
     def test_aggregator_fraction_below_95_fails_d_b(self):
         ov = {i: {"telnet_clients": 0} for i in range(0, 4321, 10)}  # 10% without
         recs = make_ledger(overrides=ov)
