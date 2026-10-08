@@ -2417,12 +2417,36 @@ fn start_spot_server(
 
     let rt = tokio::runtime::Runtime::new()?;
     let (status_line, metrics_addr) = rt.block_on(async {
+        // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
+        // default), never `bind_addr`. With two configurable addresses
+        // "which listener failed?" is a real question, so each bind names
+        // its listener, address key and port.
         let telnet_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
-        let json_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "binding the telnet server (bind_addr = {:?}, telnet_port = {})",
+                        cfg.bind_addr, cfg.telnet_port
+                    )
+                })?;
+        let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "binding the JSON server (bind_addr = {:?}, json_port = {})",
+                    cfg.bind_addr, cfg.json_port
+                )
+            })?;
         let metrics_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
+            tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "binding the metrics server (metrics_bind_addr = {:?}, metrics_port = {})",
+                        cfg.metrics_bind_addr, cfg.metrics_port
+                    )
+                })?;
         let metrics_addr = metrics_listener.local_addr()?;
 
         // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
@@ -2945,7 +2969,9 @@ fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str])
 /// Resolves the address(es) `manta status` should DIAL to reach a running
 /// daemon's metrics/status listener (MAN-44). An explicit `--addr` always
 /// wins; otherwise a `--config` file's `[server]` table supplies the
-/// port, with its `bind_addr` translated to a real dialable address --
+/// port, with its `metrics_bind_addr` (MAN-132: the metrics listener's own
+/// address, loopback by default -- never `bind_addr`, which only moves
+/// telnet/JSON) translated to a real dialable address --
 /// `0.0.0.0`/`::` mean "listening on every interface," which isn't itself
 /// something a client can connect TO, so those collapse to loopback (the
 /// one address guaranteed to reach a same-host daemon). With neither,
@@ -2954,8 +2980,8 @@ fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str])
 /// Returns every address a hostname resolves to, not just the first
 /// (code-review fix): `ToSocketAddrs` on a hostname can return several
 /// candidates in resolver-dependent order -- e.g. `localhost` resolving
-/// `::1` before `127.0.0.1` on a dual-stack host -- and the daemon's own
-/// default `bind_addr = "0.0.0.0"` only listens on IPv4. Keeping just
+/// `::1` before `127.0.0.1` on a dual-stack host -- and a daemon bound to
+/// `0.0.0.0` (or the default `127.0.0.1`) only listens on IPv4. Keeping just
 /// `.next()` picked whichever candidate the resolver happened to list
 /// first, reporting a healthy daemon as unreachable whenever that guess
 /// was wrong. `fetch_status` tries every returned address in turn (same
@@ -2986,7 +3012,7 @@ fn resolve_status_addr(
     let Some(server) = server else {
         return Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], 7302))]);
     };
-    match server.bind_addr.as_str() {
+    match server.metrics_bind_addr.as_str() {
         "0.0.0.0" => Ok(vec![std::net::SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
             server.metrics_port,
@@ -2997,10 +3023,10 @@ fn resolve_status_addr(
         )]),
         other => match other.parse::<std::net::IpAddr>() {
             Ok(ip) => Ok(vec![std::net::SocketAddr::new(ip, server.metrics_port)]),
-            // CR-B: the daemon itself binds `bind_addr` through
+            // CR-B: the daemon itself binds `metrics_bind_addr` through
             // `TcpListener::bind((host, port))`, which resolves a
             // hostname via `ToSocketAddrs` (main.rs's `start_spot_server`)
-            // rather than requiring a literal IP -- so `bind_addr =
+            // rather than requiring a literal IP -- so `metrics_bind_addr =
             // "localhost"` is a config the daemon happily runs on. `manta
             // status` must resolve the same way instead of rejecting a
             // config the daemon itself accepts.
@@ -3008,10 +3034,10 @@ fn resolve_status_addr(
                 use std::net::ToSocketAddrs;
                 let addrs: Vec<_> = (other, server.metrics_port)
                     .to_socket_addrs()
-                    .with_context(|| format!("resolving server.bind_addr {other:?}"))?
+                    .with_context(|| format!("resolving server.metrics_bind_addr {other:?}"))?
                     .collect();
                 if addrs.is_empty() {
-                    bail!("server.bind_addr {other:?} resolved to no addresses");
+                    bail!("server.metrics_bind_addr {other:?} resolved to no addresses");
                 }
                 Ok(addrs)
             }
@@ -6523,12 +6549,30 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         shutdown_runtime_after_drain(rt, &server.tasks);
     }
 
-    fn cfg_with(bind_addr: &str, metrics_port: u16) -> manta_server::config::ServerConfig {
+    fn cfg_with(metrics_bind_addr: &str, metrics_port: u16) -> manta_server::config::ServerConfig {
         manta_server::config::ServerConfig {
-            bind_addr: bind_addr.to_string(),
+            metrics_bind_addr: metrics_bind_addr.to_string(),
             metrics_port,
             ..test_server_config("W3XYZ")
         }
+    }
+
+    /// MAN-132 made the metrics listener bind its own `metrics_bind_addr`
+    /// (loopback by default) instead of `bind_addr`, so `manta status`
+    /// must dial that address: a public `bind_addr` says nothing about
+    /// where `/status` listens.
+    #[test]
+    fn status_address_follows_metrics_bind_addr_not_bind_addr() {
+        let server = manta_server::config::ServerConfig {
+            bind_addr: "10.0.0.5".to_string(),
+            metrics_port: 17302,
+            ..test_server_config("W3XYZ")
+        };
+        assert_eq!(server.metrics_bind_addr, "127.0.0.1", "MAN-132 default");
+        assert_eq!(
+            resolve_status_addr(None, Some(&server)).unwrap(),
+            vec!["127.0.0.1:17302".parse().unwrap()]
+        );
     }
 
     #[test]

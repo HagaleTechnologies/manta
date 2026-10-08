@@ -38,11 +38,15 @@ it prints a one-line deprecation notice on stderr.)
 
 `--config` is read the way `manta run` reads it, including `MANTA_*`
 overrides and the `MANTA_CONFIG` fallback, so `status` dials the port the
-daemon actually bound. Its `bind_addr` is translated for you: a wildcard
+daemon actually bound. It dials `[server].metrics_bind_addr` (MAN-132:
+the metrics listener's own address, `127.0.0.1` by default), not
+`bind_addr`, translated for you: a wildcard
 (`0.0.0.0`/`::`) means "the daemon listens everywhere," which isn't itself
 something `manta status` can dial, so it falls back to loopback. If the
 daemon runs on a different host than the one you're checking from, use
-`--addr <that host>:<metrics_port>` instead.
+`--addr <that host>:<metrics_port>` instead; that only works if the
+daemon's `metrics_bind_addr` is reachable from where you are (it is
+loopback-only by default, see `docs/RUNBOOKS/network-exposure.md`).
 
 ## Reading the output
 

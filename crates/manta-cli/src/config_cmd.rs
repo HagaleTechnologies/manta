@@ -167,29 +167,67 @@ fn find_placeholder(table: &toml::Table, prefix: &str) -> Option<(String, String
     })
 }
 
-/// D3: two servers on one non-zero port can never both bind; `run` would
-/// fail only after the receiver is already open.
+/// D3: two servers on one non-zero port and overlapping addresses can
+/// never both bind; `run` would fail only after the receiver is already
+/// open. MAN-132: telnet and JSON share `bind_addr`, metrics has its own
+/// `metrics_bind_addr`.
 fn reject_duplicate_ports(loaded: &Loaded) -> Result<()> {
     let Some(server) = &loaded.server else {
         return Ok(());
     };
-    let ports = [
-        ("telnet_port", server.telnet_port),
-        ("json_port", server.json_port),
-        ("metrics_port", server.metrics_port),
+    let listeners = [
+        (
+            "telnet_port",
+            "bind_addr",
+            server.bind_addr.as_str(),
+            server.telnet_port,
+        ),
+        (
+            "json_port",
+            "bind_addr",
+            server.bind_addr.as_str(),
+            server.json_port,
+        ),
+        (
+            "metrics_port",
+            "metrics_bind_addr",
+            server.metrics_bind_addr.as_str(),
+            server.metrics_port,
+        ),
     ];
-    for (i, (key, port)) in ports.iter().enumerate() {
+    for (i, (key, addr_key, addr, port)) in listeners.iter().enumerate() {
         if *port == 0 {
             continue;
         }
-        if let Some((first, _)) = ports[..i].iter().find(|(_, p)| p == port) {
-            bail!(
-                "{}: [server]: {key} {port} is the same as {first}; each server needs its own port",
-                loaded.origin
-            );
-        }
+        let Some((first, first_addr_key, first_addr, _)) = listeners[..i]
+            .iter()
+            .find(|(_, _, a, p)| p == port && may_overlap(a, addr))
+        else {
+            continue;
+        };
+        let overlap = if addr == first_addr {
+            String::new()
+        } else {
+            format!(", and {addr_key} \"{addr}\" overlaps {first_addr_key} \"{first_addr}\"")
+        };
+        bail!(
+            "{}: [server]: {key} {port} is the same as {first}{overlap}; each server needs its \
+             own port",
+            loaded.origin
+        );
     }
     Ok(())
+}
+
+/// Whether two listeners on one port could fail to both bind. Only two
+/// different, specific IP literals are provably separate: on Linux a
+/// wildcard and a specific address on one port collide (EADDRINUSE),
+/// and a host name is not resolved here (D4: no I/O).
+fn may_overlap(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(x), Ok(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+        _ => true,
+    }
 }
 
 fn engine_name(engine: manta_decode::decoder::Engine) -> &'static str {
@@ -239,10 +277,11 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         None => "server: none (manta run starts no servers)".to_string(),
         Some(s) => {
             let mut l = format!(
-                "server: station_callsign={} bind_addr={} telnet_port={} json_port={} \
-                 metrics_port={} line_format={}",
+                "server: station_callsign={} bind_addr={} metrics_bind_addr={} telnet_port={} \
+                 json_port={} metrics_port={} line_format={}",
                 s.station_callsign,
                 s.bind_addr,
+                s.metrics_bind_addr,
                 s.telnet_port,
                 s.json_port,
                 s.metrics_port,
@@ -430,22 +469,40 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
                 .to_string(),
         );
     }
-    match server.bind_addr.parse::<std::net::IpAddr>() {
-        Ok(ip) if ip.is_unspecified() => notes.push(format!(
-            "note: the telnet, JSON and metrics servers listen on every network interface \
-             (bind_addr = \"{}\"); the metrics endpoint has no password -- set bind_addr = \
-             \"127.0.0.1\" to keep them local",
-            server.bind_addr
-        )),
+    bind_notes(&mut notes, "bind_addr", &server.bind_addr, |addr| {
+        format!(
+            "note: the telnet and JSON servers listen on every network interface (bind_addr = \
+             \"{addr}\"), as a public cluster node does -- set bind_addr = \"127.0.0.1\" to keep \
+             them local"
+        )
+    });
+    bind_notes(
+        &mut notes,
+        "metrics_bind_addr",
+        &server.metrics_bind_addr,
+        |addr| {
+            format!(
+                "note: the metrics endpoint listens on every network interface \
+                 (metrics_bind_addr = \"{addr}\") and has no password -- firewall metrics_port \
+                 to the machines that scrape it, or set metrics_bind_addr = \"127.0.0.1\""
+            )
+        },
+    );
+    notes
+}
+
+/// D3 (MAN-76), split per listener by MAN-132: `bind_addr` serves
+/// telnet/JSON, `metrics_bind_addr` the password-less metrics endpoint.
+fn bind_notes(notes: &mut Vec<String>, key: &str, addr: &str, public: impl Fn(&str) -> String) {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => notes.push(public(addr)),
         Ok(_) => {}
-        Err(_) if server.bind_addr == "localhost" => {}
+        Err(_) if addr == "localhost" => {}
         Err(_) => notes.push(format!(
-            "note: bind_addr = \"{}\" is not an IP address; manta run looks it up as a host \
-             name when it binds, and fails then if it does not resolve",
-            server.bind_addr
+            "note: {key} = \"{addr}\" is not an IP address; manta run looks it up as a host \
+             name when it binds, and fails then if it does not resolve"
         )),
     }
-    notes
 }
 
 #[cfg(test)]
@@ -489,9 +546,13 @@ mod tests {
         let lines = lines_of("[server]\nstation_callsign = \"w1aw\"\n");
         assert_eq!(
             line(&lines, "server:"),
-            "server: station_callsign=W1AW bind_addr=0.0.0.0 telnet_port=7300 json_port=7301 \
-             metrics_port=7302 line_format=rbn"
+            "server: station_callsign=W1AW bind_addr=0.0.0.0 metrics_bind_addr=127.0.0.1 \
+             telnet_port=7300 json_port=7301 metrics_port=7302 line_format=rbn"
         );
+        let lines =
+            lines_of("[server]\nstation_callsign = \"W1AW\"\nmetrics_bind_addr = \"0.0.0.0\"\n");
+        let server = line(&lines, "server:");
+        assert!(server.contains(" metrics_bind_addr=0.0.0.0 "), "{server}");
         let lines = lines_of(
             "[server]\nstation_callsign = \"W1AW\"\ntelnet_port = 0\nstatus_interval_secs = 0\n\
              line_format = \"skimmer\"\n",
@@ -704,7 +765,8 @@ mod tests {
     }
 
     const DIAL_NOTE: &str = "note: manta run with this config needs your radio's dial frequency";
-    const BIND_NOTE: &str = "note: the telnet, JSON and metrics servers listen on every network";
+    const PUBLIC_NOTE: &str = "note: the telnet and JSON servers listen on every network interface";
+    const METRICS_NOTE: &str = "note: the metrics endpoint listens on every network interface";
 
     fn has(notes: &[String], prefix: &str) -> bool {
         notes.iter().any(|n| n.starts_with(prefix))
@@ -734,22 +796,54 @@ mod tests {
         assert!(!has(&notes_of(""), DIAL_NOTE));
     }
 
+    /// MAN-132: `bind_addr` serves telnet/JSON and `metrics_bind_addr` the
+    /// metrics endpoint, so each gets its own exposure note.
     #[test]
-    fn note_public_bind_when_bind_addr_is_unspecified() {
+    fn bind_notes_are_per_listener() {
         for addr in ["0.0.0.0", "::"] {
             let n = notes_of(&format!(
                 "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"{addr}\"\n"
             ));
-            assert!(has(&n, BIND_NOTE), "{addr}: {n:?}");
+            assert!(has(&n, PUBLIC_NOTE), "{addr}: {n:?}");
+            assert!(!has(&n, METRICS_NOTE), "{addr}: {n:?}");
         }
+        // Scenario 1's default: telnet/JSON public, metrics on loopback.
         let n = notes_of("[server]\nstation_callsign = \"W1AW\"\n");
-        assert!(has(&n, BIND_NOTE), "the default is 0.0.0.0: {n:?}");
+        assert!(has(&n, PUBLIC_NOTE), "the default is 0.0.0.0: {n:?}");
+        assert!(
+            !has(&n, METRICS_NOTE),
+            "metrics defaults to 127.0.0.1: {n:?}"
+        );
         let n = notes_of("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n");
-        assert!(!has(&n, BIND_NOTE), "{n:?}");
+        assert!(!has(&n, PUBLIC_NOTE) && !has(&n, METRICS_NOTE), "{n:?}");
+        for addr in ["0.0.0.0", "::"] {
+            let n = notes_of(&format!(
+                "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+                 metrics_bind_addr = \"{addr}\"\n"
+            ));
+            let note = n
+                .iter()
+                .find(|x| x.starts_with(METRICS_NOTE))
+                .unwrap_or_else(|| panic!("{addr}: no metrics note in {n:?}"));
+            assert!(
+                note.contains("no password") && note.contains("firewall metrics_port"),
+                "{note}"
+            );
+            assert!(!has(&n, PUBLIC_NOTE), "{addr}: {n:?}");
+        }
+        let n = notes_of(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"0.0.0.0\"\n\
+             metrics_bind_addr = \"0.0.0.0\"\n",
+        );
+        assert!(has(&n, PUBLIC_NOTE) && has(&n, METRICS_NOTE), "{n:?}");
+        assert!(
+            !n.iter().any(|x| x.contains("telnet, JSON and metrics")),
+            "{n:?}"
+        );
     }
 
     #[test]
-    fn note_bind_addr_that_is_not_an_ip_literal() {
+    fn note_bind_addresses_that_are_not_ip_literals() {
         let n = notes_of("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"0.0.0.0.0\"\n");
         assert!(
             has(&n, "note: bind_addr = \"0.0.0.0.0\" is not an IP address"),
@@ -757,6 +851,22 @@ mod tests {
         );
         let n = notes_of("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"localhost\"\n");
         assert!(!n.iter().any(|x| x.contains("bind_addr")), "{n:?}");
+        let n = notes_of(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+             metrics_bind_addr = \"prom.lan\"\n",
+        );
+        assert!(
+            has(
+                &n,
+                "note: metrics_bind_addr = \"prom.lan\" is not an IP address"
+            ),
+            "{n:?}"
+        );
+        let n = notes_of(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+             metrics_bind_addr = \"localhost\"\n",
+        );
+        assert!(!n.iter().any(|x| x.contains("metrics_bind_addr")), "{n:?}");
     }
 
     #[test]
@@ -807,6 +917,40 @@ mod tests {
             "[server]\nstation_callsign = \"W1AW\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
         );
         assert!(reject_duplicate_ports(&l).is_ok());
+
+        // MAN-132: metrics has its own address, so a shared port is a
+        // collision only when the two addresses can overlap.
+        let err_of =
+            |body: &str| format!("{:#}", reject_duplicate_ports(&loaded(body)).unwrap_err());
+        let err = err_of("[server]\nstation_callsign = \"W1AW\"\nmetrics_port = 7300\n");
+        assert!(
+            err.contains(
+                "metrics_port 7300 is the same as telnet_port, and metrics_bind_addr \
+                 \"127.0.0.1\" overlaps bind_addr \"0.0.0.0\"; each server needs its own port"
+            ),
+            "{err}"
+        );
+        let err = err_of(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_port = 7300\n",
+        );
+        assert!(
+            err.contains(
+                "[server]: metrics_port 7300 is the same as telnet_port; each server needs its own port"
+            ),
+            "{err}"
+        );
+        let l = loaded(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"192.168.1.5\"\nmetrics_port = 7300\n",
+        );
+        assert!(
+            reject_duplicate_ports(&l).is_ok(),
+            "two distinct specific IPs both bind"
+        );
+        // No DNS lookup in `check` (D4), so a host name may overlap.
+        let err = err_of(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"localhost\"\nmetrics_port = 7300\n",
+        );
+        assert!(err.contains("overlaps"), "{err}");
     }
 
     // ---- Phase 3: the scaffold and its drift guards
@@ -1150,6 +1294,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `# ` comment lines directly above scaffold line `n`, joined with
+    /// a space so a phrase that wraps across two lines still matches.
+    fn comment_above(n: usize) -> String {
+        let mut lines = Vec::new();
+        let mut i = n;
+        while i > 0 && scaffold_line(i - 1).starts_with("# ") {
+            i -= 1;
+            lines.push(&scaffold_line(i)[2..]);
+        }
+        lines.reverse();
+        lines.join(" ")
+    }
+
+    /// MAN-132 scenario 2: the metrics exposure choice is explicit in the
+    /// generated file, and bind_addr's comment no longer claims metrics.
+    #[test]
+    fn scaffold_makes_the_metrics_exposure_choice_explicit() {
+        assert_eq!(
+            scaffold_setting("server", "metrics_bind_addr"),
+            r#"metrics_bind_addr = "127.0.0.1""#
+        );
+        let (_, _, m) = setting_lines("server")
+            .into_iter()
+            .find(|(k, _, _)| k == "metrics_bind_addr")
+            .unwrap();
+        let why = comment_above(m);
+        for needle in [
+            "no password",
+            "127.0.0.1",
+            "this machine only",
+            "\"0.0.0.0\"",
+            "firewall",
+        ] {
+            assert!(
+                why.contains(needle),
+                "metrics_bind_addr comment lacks {needle:?}: {why}"
+            );
+        }
+        let (_, _, b) = setting_lines("server")
+            .into_iter()
+            .find(|(k, _, _)| k == "bind_addr")
+            .unwrap();
+        let bind = comment_above(b);
+        assert!(
+            !bind.contains("metrics") && !bind.contains("all three"),
+            "{bind}"
+        );
     }
 
     #[test]

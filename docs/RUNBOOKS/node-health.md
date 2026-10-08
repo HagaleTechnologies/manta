@@ -5,9 +5,10 @@ alone — the question MAN-128 exists to answer. Covers `/healthz` as a
 liveness probe, the new `/metrics` families, and the known caveats.
 
 Both endpoints are served on the metrics listener (`[server].metrics_port`,
-default bind `[server].bind_addr`) — see `docs/RUNBOOKS/network-exposure.md`
-for exposure posture; `/healthz` carries exactly the same posture as
-`/metrics` today, since it's the same listener.
+bound to `[server].metrics_bind_addr`, `127.0.0.1` by default since
+MAN-132) — see `docs/RUNBOOKS/network-exposure.md` for exposure posture;
+`/healthz` carries exactly the same posture as `/metrics`, since it's the
+same listener.
 
 ## `/healthz` as a liveness probe
 
@@ -30,8 +31,16 @@ make things worse, not better. Watch uplink health via the per-target
 
 ### Kubernetes
 
+The kubelet's `httpGet` probe connects to the pod IP, not to the
+container's loopback, so it needs the metrics listener widened: set
+`metrics_bind_addr = "0.0.0.0"` under `[server]` (or
+`MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` in the pod spec), and restrict
+the port with a NetworkPolicy. The runtime image has no `curl` for an
+`exec` probe.
+
 ```yaml
 livenessProbe:
+  # needs [server] metrics_bind_addr = "0.0.0.0": the kubelet probes the pod IP, not loopback
   httpGet:
     path: /healthz
     port: 7302 # metrics_port

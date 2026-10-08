@@ -1,6 +1,6 @@
 # MAN-44: uplink health at a glance — `manta status` + `GET /status`
 
-> **Rebased onto main 2026-10-08 (after MAN-128, MAN-122, MAN-261 landed).**
+> **Rebased onto main 2026-10-08 (after MAN-128, MAN-122, MAN-261, MAN-132 landed).**
 > MAN-128 (`docs/DECISIONS/2026-10-05-man128-node-health-metrics.md` D6/D7)
 > shipped the per-target `UplinkTarget` registry, the derived aggregates and
 > the `manta_uplink_target_*{target}` series this ADR describes, with the same
@@ -13,7 +13,8 @@
 > per-target rows carry `target`/`enabled` but no `host`/`port`/`dry_run`
 > (MAN-128's handle does not hold them, and `target` is already `host:port`);
 > `manta status --config` resolves `[server]` through MAN-261's loader with
-> the same `MANTA_*` overlay and `MANTA_CONFIG` fallback `run` uses; and
+> the same `MANTA_*` overlay and `MANTA_CONFIG` fallback `run` uses, and
+> dials `metrics_bind_addr` (MAN-132), not `bind_addr`; and
 > uplink targets are registered before the metrics endpoint is spawned, so
 > `/status` can never report a configured-but-unregistered target as
 > `disabled` during startup. `/healthz` (MAN-128 D10) still ignores the

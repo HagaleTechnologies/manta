@@ -123,6 +123,12 @@ docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
   that way needs the [Visual C++
   Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
   on any machine that doesn't already have it.
+- In a container, the metrics endpoint (`/metrics`, `/healthz`) listens on
+  the container's own loopback by default, which a published port cannot
+  reach. To scrape or probe it through `-p`, set
+  `MANTA_SERVER_METRICS_BIND_ADDR=0.0.0.0` and publish it as
+  `-p 127.0.0.1:7302:7302`, which keeps it on the host — see
+  [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
 - If the `docker run` above returns an authorization error, the GHCR
   package still needs its one-time "make public" step — see
   [docs/RUNBOOKS/release.md](docs/RUNBOOKS/release.md).
@@ -181,7 +187,8 @@ endpoint alongside the decoder:
 # manta.toml
 [server]
 station_callsign = "W5AU"   # your call; becomes `DX de W5AU-#:` and JSON `deCall`
-bind_addr = "127.0.0.1"     # 0.0.0.0 to accept remote clients
+bind_addr = "127.0.0.1"     # telnet + JSON; 0.0.0.0 to accept remote clients
+metrics_bind_addr = "127.0.0.1"  # the default; metrics stays on this machine
 telnet_port = 7300
 json_port   = 7301
 metrics_port = 7302
@@ -241,10 +248,13 @@ Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
 block. `dry_run` defaults to `true`, so an uplink connects and logs in but
 transmits nothing until you set it to `false` deliberately.
 
-`bind_addr` has no loopback default — omit it and all three servers bind
-`0.0.0.0`, every interface. The example above pins `127.0.0.1` on purpose;
-before you widen it, read
-[docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md).
+`bind_addr` has no loopback default — omit it and the telnet and JSON
+servers bind `0.0.0.0`, every interface, as a public cluster node expects.
+The example above pins `127.0.0.1` on purpose. Metrics is the exception:
+it listens on `metrics_bind_addr`, `127.0.0.1` by default, because it has
+no password. Read
+[docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
+before you widen either.
 
 ## Inputs
 
