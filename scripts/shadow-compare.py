@@ -41,6 +41,9 @@ The tool records the comparison; it does not pass or fail anything. The
 Stage 1 go/no-go (D-I: <= 10% of node spots uncorroborated, with >= 20 node
 spots) is read by the operator from the "Uncorroborated" line in the
 `## Agreement` section; see docs/RUNBOOKS/secondary-skimmer-field-node.md.
+`--missed-spots N` (the `field-node.py report` spots_missed count) adds the
+spots the recorder missed to that line as uncorroborated, so a recorder gap
+cannot hide false spots from the gate.
 
 Calibration deltas are node minus primary on matched pairs (the nearest
 primary row in time among the candidates). SNR is compared at the 500 Hz
@@ -373,7 +376,7 @@ def nearest_primary(node, primary_by_key, freq_tol_hz, time_tol_s):
 
 
 def compare(node_all, rbn_rows, primary, passbands, start, end,
-            freq_tol_hz, time_tol_s, extra_excludes):
+            freq_tol_hz, time_tol_s, extra_excludes, missed_spots=0):
     primary = primary.upper()
     node_calls = sorted({s["de_call"] for s in node_all if s["de_call"]})
     auto_excl = set()
@@ -497,6 +500,13 @@ def compare(node_all, rbn_rows, primary, passbands, start, end,
             "node_only_corroborated_pct": _pct(len(corroborated), n_node),
             "uncorroborated": len(uncorroborated),
             "uncorroborated_pct": _pct(len(uncorroborated), n_node),
+            # D-I input: spots the node emitted but record-spots missed
+            # (`field-node.py report`'s spots_missed) could be false, so
+            # they count as uncorroborated node spots.
+            "missed_spots": missed_spots,
+            "d_i_node_spots": n_node + missed_spots,
+            "d_i_uncorroborated": len(uncorroborated) + missed_spots,
+            "d_i_uncorroborated_pct": _pct(len(uncorroborated) + missed_spots, n_node + missed_spots),
             "primary_rows_grammar_excluded": grammar_excluded,
             "rbn_rows_from_excluded_spotters": own_rows,
         },
@@ -566,11 +576,19 @@ def render_markdown(res, args, files, rbn_counts, node_malformed, show):
       % (a["primary_heard_by_node"], a["primary_spots"], _fmt_pct(a["primary_heard_pct"])))
     w("- Node-only spots corroborated by another RBN spotter: %d / %d node spots (%s)"
       % (a["node_only_corroborated"], a["node_spots"], _fmt_pct(a["node_only_corroborated_pct"])))
-    w("- **Uncorroborated: %d / %d node spots (%s)**"
-      % (a["uncorroborated"], a["node_spots"], _fmt_pct(a["uncorroborated_pct"])))
+    if a["missed_spots"]:
+        w("- **Uncorroborated: %d / %d node spots (%s), counting %d spots the recorder missed "
+          "as uncorroborated**"
+          % (a["d_i_uncorroborated"], a["d_i_node_spots"], _fmt_pct(a["d_i_uncorroborated_pct"]),
+             a["missed_spots"]))
+    else:
+        w("- **Uncorroborated: %d / %d node spots (%s)**"
+          % (a["uncorroborated"], a["node_spots"], _fmt_pct(a["uncorroborated_pct"])))
     w("")
     w("The Uncorroborated line is the D-I Stage 1 input (GO needs <= 10% of node spots "
-      "uncorroborated, with >= 20 node spots). This tool does not judge it.")
+      "uncorroborated, with >= 20 node spots). This tool does not judge it. Pass "
+      "`--missed-spots` the `field-node.py report` spots_missed count, or a recorder gap can "
+      "hide false spots.")
     w("")
     w("Primary rows excluded (callsign shape manta's grammar never accepts, not in any "
       "denominator): %d. RBN rows from excluded spotters (never corroborate): %d."
@@ -655,6 +673,9 @@ def build_parser():
                     help="default 600 s, manta's dedupe SUPPRESSION_SECONDS (D-H)")
     ap.add_argument("--exclude-spotter", action="append", default=[], metavar="CALL",
                     help="also never count this RBN spotter as a corroborator (repeatable)")
+    ap.add_argument("--missed-spots", type=non_negative_int, default=0, metavar="N",
+                    help="spots the node emitted that record-spots missed (`field-node.py report`'s "
+                         "spots_missed); counted as uncorroborated in the D-I line (default 0)")
     ap.add_argument("--show", type=non_negative_int, default=20,
                     help="rows shown in the two listing sections (default 20)")
     ap.add_argument("--json", metavar="OUT", help="also write the numbers as JSON to OUT")
@@ -681,7 +702,7 @@ def run(argv, stdout=None, stderr=None):
         stderr.write("shadow-compare.py: error: %s\n" % e)
         return 2
     res = compare(node_all, rbn_rows, args.primary, args.passband_khz, args.start, args.end,
-                  args.freq_tol_hz, args.time_tol_s, args.exclude_spotter)
+                  args.freq_tol_hz, args.time_tol_s, args.exclude_spotter, args.missed_spots)
     files = node_files + rbn_files
     stdout.write(render_markdown(res, args, files, rbn_counts, node_malformed, args.show))
     if args.json:

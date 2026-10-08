@@ -875,8 +875,18 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(any("coverage 98.0%" in w for w in s["warnings"]))
         r = self.report(recs, "--spots-dir", spots_dir, "--min-days", "1")
         self.assertIn("WARNING: spot archive coverage 98.0%", r.stdout)
-        # informational, not a gate (D-C fails here only because most days are empty)
+        # Not a report criterion; Stage 1's D-I gate takes the missed count
+        # instead (PRRT_kwDOTQvU8M6qktNv).
         self.assertNotIn("coverage", " ".join(c["name"] for c in s["criteria"]))
+        self.assertEqual(s["spots_missed"], 2)
+        self.assertIn("record-spots missed 2 spots; for Stage 1 (D-I) pass --missed-spots 2",
+                      " ".join(s["warnings"]))
+        self.assertIn("Spots missed by the recorder: 2 (Stage 1: shadow-compare.py --missed-spots 2)",
+                      r.stdout)
+
+    def test_spots_missed_absent_without_spots_dir(self):
+        s = summ(make_ledger(days=1))
+        self.assertIsNone(s["spots_missed"])
 
     def test_recorded_spots_skip_out_of_range_timestamps(self):
         spots_dir = os.path.join(self.tmp.name, "spots")

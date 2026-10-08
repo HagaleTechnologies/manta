@@ -222,6 +222,14 @@ python3 /opt/manta/scripts/field-node.py report \
   --from "$START" --to "$END" --min-days 1 --min-aggregator 0
 ```
 
+Note the report's `Spots missed by the recorder: N` line (`## Daily`). Those are spots the node
+emitted that `manta-field-spots` did not archive; any of them could be a false spot, so the
+comparison below counts them as uncorroborated.
+
+```sh
+MISSED=0   # N from "Spots missed by the recorder: N"
+```
+
 Download the RBN daily archive for every UTC date the window touches. A day's file appears after
 that UTC day ends.
 
@@ -241,7 +249,7 @@ python3 /opt/manta/scripts/shadow-compare.py \
   --node-spots /var/lib/manta-field/spots \
   --rbn ~/rbn/20261101.zip ~/rbn/20261102.zip \
   --primary "$PRIMARY" --passband-khz 7000-7060 \
-  --start "$START" --end "$END" \
+  --start "$START" --end "$END" --missed-spots "$MISSED" \
   --json ~/stage1-shadow.json > ~/stage1-shadow.md
 ```
 
@@ -252,7 +260,7 @@ python3 /opt/manta/scripts/shadow-compare.py \
 | Availability ≥ 99% over the 24 h | `report`'s `## Verdict`, the D-A (Availability) line |
 | 0 manual interventions | `report`'s `## Verdict`, the D-D (Manual interventions) line |
 | ≥ 20 node spots in the window | `shadow-compare`'s `## Agreement`, the denominator of the Uncorroborated line |
-| ≤ 10% of node spots uncorroborated | `shadow-compare`'s `## Agreement`, the **Uncorroborated** line's percentage |
+| ≤ 10% of node spots uncorroborated | `shadow-compare`'s `## Agreement`, the **Uncorroborated** line's percentage (run with `--missed-spots`, so recorder gaps count against it) |
 
 "Uncorroborated" means no RBN spotter (other than this node, which `shadow-compare.py` excludes
 by every `deCall` it saw) reported that call within the tolerances. Look at the

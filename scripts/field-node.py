@@ -1060,15 +1060,22 @@ def summarize(records, params=None):
             missing_counts[m] = missing_counts.get(m, 0) + 1
     recorded_total = None
     coverage = None
+    spots_missed = None
     if recorded is not None:
         recorded_total = sum(v for k, v in recorded.items())
+        # Emitted spots the archive lacks. Stage 1's D-I gate counts them as
+        # uncorroborated (shadow-compare.py --missed-spots): a missed spot
+        # may be a false one, so the archive alone cannot vouch for it.
+        spots_missed = max(0, spots_emitted_total - recorded_total)
         if spots_emitted_total > 0:
             coverage = recorded_total / float(spots_emitted_total)
             if coverage < RECORDED_COVERAGE_WARN:
                 warnings.append(
                     "spot archive coverage %.1f%% (recorded %d / emitted %d) is below %.0f%%: "
-                    "record-spots missed spots (informational, not a gate)"
-                    % (coverage * 100, recorded_total, spots_emitted_total, RECORDED_COVERAGE_WARN * 100))
+                    "record-spots missed %d spots; for Stage 1 (D-I) pass --missed-spots %d to "
+                    "shadow-compare.py"
+                    % (coverage * 100, recorded_total, spots_emitted_total, RECORDED_COVERAGE_WARN * 100,
+                       spots_missed, spots_missed))
 
     criteria = [
         {"id": "D-A", "name": "Availability", "value": availability,
@@ -1121,6 +1128,7 @@ def summarize(records, params=None):
         "spots_unplaced_total": spots_unplaced,
         "spots_recorded_total": recorded_total,
         "recorded_coverage": coverage,
+        "spots_missed": spots_missed,
         "builds": builds,
         "notes": [{"at": _iso(n["ts"]), "ts": n["ts"], "note": n.get("note"), "reason": n.get("reason")}
                   for n in win_notes],
@@ -1231,6 +1239,8 @@ def render_markdown(s):
     if s["spots_recorded_total"] is not None:
         cov = s["recorded_coverage"]
         w("Spots recorded: %d (coverage %s)" % (s["spots_recorded_total"], "-" if cov is None else _pct(cov)))
+        w("Spots missed by the recorder: %d (Stage 1: shadow-compare.py --missed-spots %d)"
+          % (s["spots_missed"], s["spots_missed"]))
     w("")
     w("## Builds")
     w("")
@@ -1369,7 +1379,8 @@ def build_parser():
     )
     rep.add_argument("--ledger", required=True, help="ledger JSON Lines file written by `sample`/`note`")
     rep.add_argument("--spots-dir", default=None,
-                     help="record-spots output directory, for recorded-vs-emitted coverage (informational)")
+                     help="record-spots output directory, for recorded-vs-emitted coverage and the "
+                          "spots_missed count Stage 1 passes to shadow-compare.py --missed-spots")
     rep.add_argument("--from", dest="from_", default=None, metavar="ISO",
                      help="ISO-8601 window start (default: the last `start` note, else the first sample)")
     rep.add_argument("--to", default=None, metavar="ISO",

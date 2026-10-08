@@ -132,6 +132,32 @@ class ShadowCompareTest(unittest.TestCase):
         section = md.split("## Node-only, uncorroborated (likely busted or unique)")[1]
         self.assertIn("| W9XYZ |", section.split("## Primary heard, node missed")[0])
 
+    def test_missed_spots_count_as_uncorroborated_in_d_i_line(self):
+        # PRRT_kwDOTQvU8M6qktNv: spots record-spots missed may be false, so
+        # Stage 1's D-I line counts them as uncorroborated node spots.
+        code, md, _, s = self.run_tool(extra=["--missed-spots", "3"])
+        self.assertEqual(code, 0)
+        a = s["agreement"]
+        self.assertEqual((a["uncorroborated"], a["node_spots"]), (2, 5))
+        self.assertEqual(a["missed_spots"], 3)
+        self.assertEqual((a["d_i_uncorroborated"], a["d_i_node_spots"]), (5, 8))
+        self.assertAlmostEqual(a["d_i_uncorroborated_pct"], 62.5)
+        self.assertIn("**Uncorroborated: 5 / 8 node spots (62.5%), counting 3 spots the "
+                      "recorder missed as uncorroborated**", md)
+
+    def test_missed_spots_default_zero_keeps_d_i_line(self):
+        _, md, _, s = self.run_tool()
+        a = s["agreement"]
+        self.assertEqual(a["missed_spots"], 0)
+        self.assertEqual((a["d_i_uncorroborated"], a["d_i_node_spots"]), (2, 5))
+        self.assertIn("**Uncorroborated: 2 / 5 node spots (40.0%)**", md)
+
+    def test_negative_missed_spots_is_usage_error(self):
+        code, md, err, _ = self.run_tool(extra=["--missed-spots", "-1"])
+        self.assertEqual(code, 2)
+        self.assertIn("--missed-spots", err)
+        self.assertEqual(md, "")
+
     def test_own_spotter_rows_never_corroborate(self):
         _, md, _, s = self.run_tool()
         self.assertIn("W9XYZ", self.unc_calls(s))
