@@ -80,8 +80,8 @@ fn v2_char_accuracy_meets_spec() {
 
 /// V2 with Task 5's `EdgeLegacy` engine (SPEC v2 §0), exercising the
 /// `manta decode --engine edge-legacy` CLI surface added alongside it.
-/// Unlike `v2_passes_end_to_end_from_wav` above, this vector is fully
-/// synthetic (`manta_testkit::vectors::v2`) and needs no external corpus.
+/// Like the two V2 tests above, this vector is fully synthetic
+/// (`manta_testkit::vectors::v2`) and needs no external corpus.
 ///
 /// [Finding, Task 5 execution]: measured, this does NOT pass yet -- CER
 /// 0.0244 (need <= 0.01), decoded text starting `"A DE JA1ABC..."` against
@@ -103,7 +103,7 @@ fn v2_char_accuracy_meets_spec() {
 /// analogous to the `Legacy` engine's `Demod::Phase::Init` -- rather than
 /// widening the CER tolerance or hacking the vector generator, per this
 /// plan's own guidance for genuine decoder bugs (see
-/// `v2_passes_end_to_end_from_wav` above for the same policy applied to a
+/// `v2_char_accuracy_meets_spec` above for the same policy applied to a
 /// different bug).
 #[test]
 #[ignore]
