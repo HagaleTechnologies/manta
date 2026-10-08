@@ -515,8 +515,10 @@ jobs:
           set -euo pipefail
           # Re-fetch HERE, after the build: tags fetched at checkout time
           # would answer a question that was current before the build ran,
-          # which is the whole bug this job fixes.
-          git fetch --tags --force --prune origin
+          # which is the whole bug this job fixes. --prune-tags drops a local
+          # tag deleted on the remote meanwhile (the bad-tag correction in
+          # docs/RUNBOOKS/release.md); --prune alone only prunes branches.
+          git fetch --tags --force --prune --prune-tags origin
           NEWEST="$(scripts/release-version.sh is-newest-stable "$GITHUB_REF_NAME")"
           echo "newest=$NEWEST" >> "$GITHUB_OUTPUT"
           echo "publish :latest: $NEWEST"
