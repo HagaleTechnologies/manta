@@ -875,8 +875,21 @@ def summarize(records, params=None):
         if b["ts"] - a["ts"] > gap_limit:
             account(a["ts"], b["ts"], "unobserved")
             continue
+        sa, sb = a.get("start_time"), b.get("start_time")
+        if sa is not None and sb is not None and sa != sb:
+            # The process restarted inside (a.ts, b.ts]: it was down from
+            # some point after a until the new process started at sb, and
+            # that point is unobserved, so count all of (a.ts, sb] as down
+            # (D-A). Only (sb, b.ts] is observed, by b. A start time outside
+            # the interval cannot be placed, so the whole interval is down.
+            if a["ts"] < sb < b["ts"]:
+                account(a["ts"], sb, "down")
+                account(sb, b["ts"], "up" if _is_up(b) else "down")
+            else:
+                account(a["ts"], b["ts"], "down")
+            continue
         extra = 0.0
-        if _is_up(a) and a.get("start_time") is not None and a.get("start_time") == b.get("start_time"):
+        if _is_up(a) and sa is not None and sa == sb:
             extra, _ = _counter_delta(a.get("source_down_s"), b.get("source_down_s"))
         account(a["ts"], b["ts"], "up" if _is_up(a) else "down", extra)
     if last["ts"] < end:

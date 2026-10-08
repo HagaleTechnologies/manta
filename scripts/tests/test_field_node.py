@@ -658,6 +658,16 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("Unexplained restarts (classify from `journalctl -u manta-field`): 1", r.stdout)
 
+    def test_restart_between_two_healthy_samples_counts_as_down(self):
+        # crash + fast restart: samples 200 and 201 are both healthy, but the
+        # process restarted 10 s before sample 201, so (200.ts, start] is down
+        new_st = T0 + 201 * IV - 10
+        ov = {i: {"start_time": new_st} for i in range(201, 4321)}
+        s = summ(make_ledger(overrides=ov))
+        self.assertEqual([r["class"] for r in s["restarts"]], ["unexplained"])
+        self.assertAlmostEqual(s["down_s"], IV - 10)
+        self.assertAlmostEqual(s["availability"], 1 - (IV - 10) / (30 * DAY), places=9)
+
     def test_watchdog_recovery_listed_as_automated(self):
         ov = {i: {"reachable": False} for i in range(300, 312)}
         for i in range(312, 4321):
