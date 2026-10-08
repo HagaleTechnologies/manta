@@ -1,5 +1,24 @@
 # MAN-44: uplink health at a glance — `manta status` + `GET /status`
 
+> **Rebased onto main 2026-10-08 (after MAN-128, MAN-122, MAN-261 landed).**
+> MAN-128 (`docs/DECISIONS/2026-10-05-man128-node-health-metrics.md` D6/D7)
+> shipped the per-target `UplinkTarget` registry, the derived aggregates and
+> the `manta_uplink_target_*{target}` series this ADR describes, with the same
+> `host:port` / `#N` labels, so this PR now adopts MAN-128's registry
+> (`register_uplink_target(label, enabled)`) and keeps only its own layer on
+> top: the windowed reconnect tracking and `UplinkHealth` classification, the
+> `manta_uplink_target_recent_reconnects` gauge, `GET /status`, and
+> `manta status`. Differences from the text below: the status document lives
+> in `status_doc.rs` (MAN-122 took `status.rs` for its log status line);
+> per-target rows carry `target`/`enabled` but no `host`/`port`/`dry_run`
+> (MAN-128's handle does not hold them, and `target` is already `host:port`);
+> `manta status --config` resolves `[server]` through MAN-261's loader with
+> the same `MANTA_*` overlay and `MANTA_CONFIG` fallback `run` uses; and
+> uplink targets are registered before the metrics endpoint is spawned, so
+> `/status` can never report a configured-but-unregistered target as
+> `disabled` during startup. `/healthz` (MAN-128 D10) still ignores the
+> uplink by design; `/status` is the uplink-facing surface.
+
 MAN-32/MAN-42 already collect every counter MAN-44's gherkin asks for
 (`uplink_sent_total`, `uplink_suppressed_total`, `uplink_reconnects_total`,
 a connected count) as `Metrics` atomics, rendered on the existing
@@ -84,7 +103,7 @@ labels already expose.
   produces roughly 5 reconnects per 5-minute window (comfortably over 3),
   while one transient blip — whose backoff resets to `INITIAL_BACKOFF` on
   any connection that reached login — does not trip it.
-- **`crates/manta-server/src/status.rs`**: `StatusDoc`/`UplinkStatus` (a
+- **`crates/manta-server/src/status_doc.rs`**: `StatusDoc`/`UplinkStatus` (a
   `schema_version`-tagged JSON document; `UplinkTargetSnapshot` from
   `metrics.rs` is reused directly as the per-target shape rather than a
   second, parallel struct, so there is exactly one Rust definition of the
@@ -119,7 +138,7 @@ labels already expose.
   `metrics_http`'s own hand-rolled-over-a-framework precedent, bounded by
   both an overall timeout and a 256 KiB response-body cap against a wrong
   or hostile endpoint), then either prints the JSON (`--json`) or
-  `status::render_human`'s summary. Exit codes: `0` every enabled uplink
+  `status_doc::render_human`'s summary. Exit codes: `0` every enabled uplink
   target connected (or none configured), `1` reached the daemon but the
   uplink is unhealthy, `2` couldn't reach or parse the daemon's status at
   all — a cron/Nagios check can tell "broken uplink" from "daemon down"

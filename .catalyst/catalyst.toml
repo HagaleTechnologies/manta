@@ -9,9 +9,10 @@ linear_team = "MAN"
 
 [[environment.toolchains]]
 name = "rust"
-# Catalyst's runner image carries 1.98 (1.98.0), not 1.98.1, so an exact pin fails
-# with toolchain_missing. rust-toolchain.toml still pins 1.98.1 for rustup.
-version = "1.98"
+# Catalyst's runner can't install Rust, so this must equal the image's exact
+# 1.98.0 (a short "1.98" is undocumented); rust-toolchain.toml pins the same
+# release (MAN-242), so no second toolchain is downloaded.
+version = "1.98.0"
 
 [[environment.system_packages]]
 name = "libasound2-dev"

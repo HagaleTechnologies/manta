@@ -146,11 +146,15 @@ fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
 /// Anti-vacuity floor for `v8w_pileup_fading_spots_no_bogus_callsigns`: a
 /// change that simply stopped emitting spots would satisfy "0 bogus" while
 /// destroying the skimmer. Measured baseline at e398d46 is 22/50 genuine
-/// calls validated; MAN-100's arbitration fix measures 20/50. 15 leaves
+/// calls validated; MAN-100's arbitration fix measures 20/50. 15 left
 /// room for a legitimate precision/recall trade while still catching a
-/// collapse. This is NOT a SPEC criterion -- SPEC §7's V8w row states no
-/// recall bar -- it is a guard on this test's own meaning.
-const MIN_V8W_VALIDATED: usize = 15;
+/// collapse. MAN-213 raised it to 20 to encode its acceptance criterion,
+/// "at least the pre-existing ~20 of 50": `main`'s pre-MAN-103 baseline
+/// is 21/50, and MAN-103 + MAN-213's fade-tracking rails measure 28/50
+/// (docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md). This
+/// is NOT a SPEC criterion -- SPEC §7's V8w row states no recall bar -- it
+/// is a guard on this test's own meaning.
+const MIN_V8W_VALIDATED: usize = 20;
 
 /// SPEC §7's V8w row states three independent pass criteria; this is the
 /// second, "0 bogus callsigns". It is deliberately a test of its own, NOT

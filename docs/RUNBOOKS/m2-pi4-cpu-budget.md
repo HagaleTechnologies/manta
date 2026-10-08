@@ -17,8 +17,8 @@ MAN-30's fate.
   a public repo, for that baseline's own rationale).
 - Nothing else competing for the Pi4's cores during the run (no desktop
   environment doing real work, no other soak/benchmark process).
-- A Rust toolchain on the Pi4 itself, **1.85.0 or newer** (this
-  workspace's root `Cargo.toml` sets `rust-version = "1.85.0"`; check with
+- A Rust toolchain on the Pi4 itself, **1.98.0 or newer** (this
+  workspace's root `Cargo.toml` sets `rust-version = "1.98.0"`; check with
   `rustc --version` before the native build below — a fresh Raspberry Pi
   OS install's distro-packaged `rustc` is commonly older than this and
   will fail partway through an otherwise lengthy build. Install/update via

@@ -5,21 +5,19 @@
 //! format and this repo's own reference implementation of that protocol
 //! from the server side.
 
+use crate::backoff::{next_backoff, AttemptOutcome as ConnectAttemptError, INITIAL_BACKOFF};
 use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
 use crate::bus::SpotBus;
 use crate::config::RbnUplinkConfig;
-use crate::metrics::{UplinkTarget, UplinkTargetSpec};
+use crate::metrics::UplinkTarget;
 use crate::rate_limit::RateLimiter;
 use crate::rbn;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch, Semaphore};
 
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Bounds `TcpStream::connect` (MAN-58 comment finding 1): a target that
 /// silently black-holes SYNs (e.g. a firewall drop, not a refusal) would
 /// otherwise leave this attempt pending for the OS's own connect timeout
@@ -43,14 +41,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hard bound otherwise.
 const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Every outbound write to the uplink target gets this long before being
-/// treated as stalled (MAN-58 comment finding 2): if the target stops
-/// reading -- a stalled peer, a full TCP receive window, a half-open
-/// connection the OS hasn't noticed yet -- `write_all` would otherwise
-/// block indefinitely with no back-pressure signal, quietly wedging this
-/// target's whole `serve` task. Mirrors `telnet.rs`'s identically-named
-/// constant, which bounds the same failure mode for the inbound side
-/// (ARCHITECTURE §7's "slow clients are disconnected, never
-/// back-pressured").
+/// treated as stalled (MAN-58 comment finding 2) -- matches `telnet.rs`'s
+/// identical `WRITE_TIMEOUT` for the same class of risk on the inbound
+/// side: a target that completes login but stops reading (TCP receive
+/// window fills, then the local send buffer fills) must not block this
+/// task indefinitely.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Response-line rate budget for the target's post-login discard read
 /// (MAN-58 comment finding 3): RBN's collection server isn't expected to
@@ -66,51 +61,24 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TARGET_RESPONSE_LINES: u32 = 30;
 const TARGET_RESPONSE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Whether a connection attempt got far enough to matter for backoff:
-/// a connection that completed login before dropping was healthy, so the
-/// *next* attempt should retry quickly rather than inherit backoff state
-/// from an unrelated earlier outage. A connection that never got past
-/// `TcpStream::connect`/login (target down, refusing, wrong port) hasn't
-/// demonstrated that, so backoff keeps growing.
-enum ConnectAttemptError {
-    NeverConnected,
-    Disconnected,
-}
-
-/// Pure backoff-transition function, split out so this policy is
-/// unit-testable without any real sleeping/timing.
-fn next_backoff(current: Duration, outcome: &ConnectAttemptError) -> Duration {
-    match outcome {
-        ConnectAttemptError::Disconnected => INITIAL_BACKOFF,
-        ConnectAttemptError::NeverConnected => (current * 2).min(MAX_BACKOFF),
-    }
-}
-
-/// Assigns each configured target its stable display label (MAN-44).
-/// Plain `host:port` in the common case; `#<index>` is appended only to
-/// the second and later occurrences of an identical `host:port`, so a
-/// duplicated entry is still individually addressable without making
-/// every ordinary label ugly. Deterministic from config order, so the
-/// same config always produces the same labels.
-pub fn target_specs(configs: &[RbnUplinkConfig]) -> Vec<UplinkTargetSpec> {
-    let mut seen_counts: HashMap<String, usize> = HashMap::new();
+/// MAN-128 D7: the Prometheus label for each configured `[[rbn_uplink]]`
+/// target is `host:port`; the 2nd and later exact duplicate of the same
+/// `host:port` gets `#N` appended (`N` = occurrence number), so two targets
+/// that happen to share a host:port still render as distinct series rather
+/// than colliding into one. Matches PR #95 (MAN-44)'s convention so the two
+/// converge on one registry shape.
+pub fn target_labels(configs: &[RbnUplinkConfig]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     configs
         .iter()
-        .map(|cfg| {
-            let base = format!("{}:{}", cfg.target_host, cfg.target_port);
-            let count = seen_counts.entry(base.clone()).or_insert(0);
+        .map(|c| {
+            let base = format!("{}:{}", c.target_host, c.target_port);
+            let count = seen.entry(base.clone()).or_insert(0);
             *count += 1;
-            let label = if *count == 1 {
+            if *count == 1 {
                 base
             } else {
                 format!("{base}#{count}")
-            };
-            UplinkTargetSpec {
-                label,
-                host: cfg.target_host.clone(),
-                port: cfg.target_port,
-                enabled: cfg.enabled,
-                dry_run: cfg.dry_run,
             }
         })
         .collect()
@@ -189,37 +157,20 @@ pub async fn serve(
         {
             Ok(()) => return, // clean shutdown-signaled exit
             Err(outcome) => {
-                // No mark_disconnected() here: connect_and_forward
-                // already paired its own mark_connected() with a
-                // mark_disconnected() before returning Err (or never
-                // marked connected at all, if it failed before login
-                // completed).
+                // No mark_disconnected() here: connect_and_forward already
+                // paired its own mark_connected() with a mark_disconnected()
+                // before returning Err (or never marked connected at all, if
+                // it failed before login completed) -- this target's own
+                // `connected` flag is otherwise untouched by this branch.
                 target.record_reconnect();
                 // `Disconnected` resets AND sleeps the reset value
-                // immediately (MAN-44 code review CR-2): the old code
-                // slept the STALE `backoff` value first and only reset it
-                // afterward, so a healthy connection that dropped after
-                // login (`Disconnected`, whose whole point is "retry
-                // quickly") still slept whatever backoff an earlier,
-                // unrelated outage had grown to -- up to `MAX_BACKOFF`
-                // (60s) -- before its first retry got the fast
-                // `INITIAL_BACKOFF` this outcome is supposed to produce
-                // immediately.
-                //
-                // `NeverConnected` keeps the ORIGINAL ordering -- sleep
-                // the CURRENT rung, then grow it for next time -- and must
-                // NOT be folded into the same "compute-then-sleep" step as
-                // `Disconnected` above (MAN-44 remediate, code review
-                // finding CR-1): doing so skipped the first
-                // `INITIAL_BACKOFF` rung entirely and shifted the whole
-                // never-connected ladder to 2s/4s/8s/... instead of
-                // 1s/2s/4s/..., desyncing the shipped code from
-                // `docs/RUNBOOKS/uplink-health.md`'s documented
-                // "roughly t=0s/1s/3s" timeline. A target that has never
-                // connected hasn't demonstrated anything new, so it sleeps
-                // the ladder rung it already earned before that rung
-                // grows -- the plan's "no change to uplink backoff policy"
-                // exclusion applies to this path.
+                // immediately (MAN-44 code review CR-2): sleeping the
+                // stale `backoff` first meant a healthy connection that
+                // dropped after login still waited whatever an earlier,
+                // unrelated outage had grown it to (up to `MAX_BACKOFF`)
+                // before its first fast retry. `NeverConnected` keeps the
+                // original ordering -- sleep the current rung, then grow
+                // it -- so the never-connected ladder stays 1s/2s/4s/...
                 let sleep_for = match outcome {
                     ConnectAttemptError::Disconnected => INITIAL_BACKOFF,
                     ConnectAttemptError::NeverConnected => backoff,
@@ -554,7 +505,15 @@ async fn forward_loop(
                             continue;
                         }
                         let unix_ts = bus.unix_ts_for(bus_spot.spot.sample_ts);
-                        let line = rbn::format_line(&bus_spot.spot, spotter_call, unix_ts);
+                        // MAN-88 Decision 1: the uplink always emits the RBN
+                        // relay layout, independent of [server].line_format
+                        // -- see that key's doc comment in config.rs.
+                        let line = rbn::format_line(
+                            &bus_spot.spot,
+                            spotter_call,
+                            unix_ts,
+                            rbn::LineFormat::Rbn,
+                        );
                         let wire_line = format!("{line}\r\n");
                         // Raced against shutdown too, not just bounded by
                         // WRITE_TIMEOUT (PR #80 review, round 3): once
@@ -654,73 +613,8 @@ async fn write_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use std::net::TcpListener as StdTcpListener;
-
-    fn cfg(host: &str, port: u16) -> RbnUplinkConfig {
-        RbnUplinkConfig {
-            enabled: true,
-            target_host: host.to_string(),
-            target_port: port,
-            login_callsign: None,
-            dry_run: false,
-        }
-    }
-
-    #[test]
-    fn target_labels_are_host_port_and_disambiguate_only_actual_duplicates() {
-        let specs = target_specs(&[
-            cfg("rbn.example", 7000),
-            cfg("other.example", 7000),
-            cfg("rbn.example", 7000), // exact duplicate of #0
-            cfg("rbn.example", 7001), // different port -> not a duplicate
-        ]);
-        let labels: Vec<&str> = specs.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            [
-                "rbn.example:7000",
-                "other.example:7000",
-                "rbn.example:7000#2",
-                "rbn.example:7001",
-            ]
-        );
-    }
-
-    #[test]
-    fn target_specs_carry_enabled_and_dry_run_through_from_config() {
-        let mut disabled_dry_run = cfg("a.example", 7000);
-        disabled_dry_run.enabled = false;
-        disabled_dry_run.dry_run = true;
-        let specs = target_specs(&[cfg("b.example", 7000), disabled_dry_run]);
-        assert!(specs[0].enabled);
-        assert!(!specs[0].dry_run);
-        assert!(!specs[1].enabled);
-        assert!(specs[1].dry_run);
-    }
-
-    #[test]
-    fn backoff_resets_after_a_connection_that_reached_login() {
-        let grown = Duration::from_secs(16);
-        assert_eq!(
-            next_backoff(grown, &ConnectAttemptError::Disconnected),
-            INITIAL_BACKOFF
-        );
-    }
-
-    #[test]
-    fn backoff_doubles_and_caps_when_never_connected() {
-        assert_eq!(
-            next_backoff(Duration::from_secs(1), &ConnectAttemptError::NeverConnected),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            next_backoff(
-                Duration::from_secs(45),
-                &ConnectAttemptError::NeverConnected
-            ),
-            MAX_BACKOFF
-        );
-    }
 
     fn sample_spot_for_loss_tests() -> manta_spot::Spot {
         manta_spot::Spot {
@@ -733,16 +627,6 @@ mod tests {
             track_id: 1,
             sample_ts: 0,
         }
-    }
-
-    fn test_target() -> Arc<UplinkTarget> {
-        crate::metrics::Metrics::new().register_uplink_target(UplinkTargetSpec {
-            label: "test.example:7300".to_string(),
-            host: "test.example".to_string(),
-            port: 7300,
-            enabled: true,
-            dry_run: false,
-        })
     }
 
     /// PR #80 review, rounds 3-8: `record_write_failure_loss` and
@@ -758,7 +642,7 @@ mod tests {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
-        let target = test_target();
+        let target = Metrics::new().register_uplink_target("t".to_string(), true);
 
         // 3 spots queued in the backlog, none yet drained by `rx`.
         let spot = sample_spot_for_loss_tests();
@@ -768,15 +652,15 @@ mod tests {
         assert_eq!(rx.len(), 3);
 
         record_write_failure_loss(&target, &rx, 1); // the failed spot + backlog
-        assert_eq!(target.snapshot().write_failed, 4);
+        assert_eq!(target.write_failed_total(), 4);
         assert_eq!(
-            target.snapshot().disconnected,
+            target.disconnected_total(),
             0,
             "a write failure must not also count against the disconnect counter"
         );
 
         record_write_failure_loss(&target, &rx, 1); // called again: still counts the same still-queued backlog
-        assert_eq!(target.snapshot().write_failed, 8);
+        assert_eq!(target.write_failed_total(), 8);
     }
 
     #[test]
@@ -784,7 +668,7 @@ mod tests {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
-        let target = test_target();
+        let target = Metrics::new().register_uplink_target("t".to_string(), true);
 
         let spot = sample_spot_for_loss_tests();
         bus.publish(spot.clone());
@@ -792,15 +676,15 @@ mod tests {
         assert_eq!(rx.len(), 2);
 
         record_disconnect_loss(&target, &rx, 0); // e.g. a rate-limit disconnect: no single spot to blame
-        assert_eq!(target.snapshot().disconnected, 2);
+        assert_eq!(target.disconnected_total(), 2);
         assert_eq!(
-            target.snapshot().write_failed,
+            target.write_failed_total(),
             0,
             "a non-write disconnect must not also count against the write-failure counter"
         );
 
         record_disconnect_loss(&target, &rx, 1); // e.g. shutdown cancelling an in-flight write
-        assert_eq!(target.snapshot().disconnected, 5);
+        assert_eq!(target.disconnected_total(), 5);
     }
 
     #[test]
@@ -808,16 +692,16 @@ mod tests {
         let epoch = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let bus = crate::bus::SpotBus::new(96_000.0, epoch, 0);
         let rx = bus.subscribe();
-        let target = test_target();
+        let target = Metrics::new().register_uplink_target("t".to_string(), true);
 
         record_write_failure_loss(&target, &rx, 0);
         record_disconnect_loss(&target, &rx, 0);
         assert_eq!(
-            target.snapshot().write_failed,
+            target.write_failed_total(),
             0,
             "must not record a spurious 0-count event"
         );
-        assert_eq!(target.snapshot().disconnected, 0);
+        assert_eq!(target.disconnected_total(), 0);
     }
 
     #[test]
@@ -963,5 +847,32 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
 
         drop(permit);
+    }
+
+    fn cfg(host: &str, port: u16) -> RbnUplinkConfig {
+        RbnUplinkConfig {
+            enabled: true,
+            target_host: host.to_string(),
+            target_port: port,
+            login_callsign: None,
+            dry_run: false,
+        }
+    }
+
+    /// MAN-128 D7: labels are `host:port`, with `#N` appended to the 2nd and
+    /// later exact duplicate of the same `host:port` -- deterministic
+    /// across calls, matching PR #95 (MAN-44)'s convention.
+    #[test]
+    fn target_labels_are_host_port_with_suffix_only_on_duplicates() {
+        let configs = vec![cfg("a", 1), cfg("b", 2), cfg("a", 1), cfg("a", 1)];
+        assert_eq!(
+            target_labels(&configs),
+            vec!["a:1", "b:2", "a:1#2", "a:1#3"]
+        );
+        // Deterministic across repeated calls against the same input.
+        assert_eq!(
+            target_labels(&configs),
+            vec!["a:1", "b:2", "a:1#2", "a:1#3"]
+        );
     }
 }

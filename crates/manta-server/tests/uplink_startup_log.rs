@@ -55,12 +55,8 @@ async fn logs_from_serve(toml_src: &str) -> String {
 
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(96_000.0, epoch, 0));
-    // MAN-44 registered per-target uplink state: `serve()` now takes the
-    // target handle its own counters live on, not the whole `Metrics`.
-    let metrics = Arc::new(Metrics::new());
-    let target = metrics.register_uplink_target(
-        manta_server::uplink::target_specs(std::slice::from_ref(&cfg)).remove(0),
-    );
+    let metrics = Metrics::new();
+    let target = metrics.register_uplink_target("127.0.0.1:1".to_string(), true);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let _ = shutdown_tx.send(true);
 

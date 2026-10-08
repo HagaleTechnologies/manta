@@ -77,6 +77,18 @@ impl IqSource for DecimatingSource {
         self.inner.center_freq_hz()
     }
 
+    /// MAN-86: the inner source's delivered passband, clipped to the
+    /// decimated Nyquist span -- the anti-alias low-pass removes anything
+    /// beyond `+/- fs_out / 2`. Without this override the trait default
+    /// would report the full output Nyquist span, re-introducing the
+    /// "advertise the processing rate" SETT bug for a decimated rig-audio
+    /// or KiwiSDR source (see `IqSource::rf_passband_hz`).
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        let half = self.fs_out / 2.0;
+        let (lo, hi) = self.inner.rf_passband_hz();
+        (lo.max(-half), hi.min(half))
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         while self.pending.is_empty() {
             let n = self.inner.read(&mut self.raw)?;
@@ -368,5 +380,41 @@ mod tests {
         counters.record_dropped(5);
         // Verify the forwarded reference sees the same update
         assert_eq!(forwarded_counters.dropped_packets(), 5);
+    }
+
+    /// MAN-86: a decimated source must report the inner source's delivered
+    /// passband (so SETT never advertises the processing rate), clipped to
+    /// the post-decimation Nyquist span.
+    #[test]
+    fn rf_passband_forwards_the_inner_passband_clipped_to_the_output_nyquist() {
+        struct NarrowSource;
+        impl IqSource for NarrowSource {
+            fn sample_rate(&self) -> f64 {
+                192_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                (300.0, 3_000.0)
+            }
+            fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        let narrow = DecimatingSource::new(Box::new(NarrowSource), 48_000.0).unwrap();
+        assert_eq!(narrow.rf_passband_hz(), (300.0, 3_000.0));
+
+        // Inner default = full 192 kS/s Nyquist span; output is 48 kS/s.
+        let wide: Box<dyn IqSource> = Box::new(InMemorySource {
+            samples: Vec::new(),
+            cursor: 0,
+            fs: 192_000.0,
+            center_freq_hz: 14_000_000.0,
+            live: None,
+            counters: None,
+        });
+        let wide = DecimatingSource::new(wide, 48_000.0).unwrap();
+        assert_eq!(wide.rf_passband_hz(), (-24_000.0, 24_000.0));
     }
 }

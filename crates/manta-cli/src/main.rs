@@ -1,5 +1,5 @@
-//! `manta` CLI: decode a WAV fixture, generate golden vectors, and run the
-//! daemon (SDR input, telnet/JSON/metrics servers, RBN uplinks) via `run`.
+//! `manta` CLI: decode CW from a recorded file or a live receiver, and run
+//! the spotting daemon.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -7,6 +7,11 @@ use manta_decode::decoder::Engine;
 use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
+
+mod config;
+mod config_cmd;
+mod reconnect;
+use reconnect::ReconnectingSource;
 
 #[derive(Parser)]
 #[command(
@@ -18,7 +23,16 @@ use std::path::{Path, PathBuf};
     // identical across platforms.
     bin_name = "manta",
     version,
-    about = "Open-source wideband CW skimmer: every CW signal in an SDR passband, decoded at once, emitted as RBN-compatible spots"
+    about = "Open-source wideband CW skimmer: every CW signal in an SDR passband, decoded at once, emitted as RBN-compatible spots",
+    after_help = "\
+Examples:
+  manta gen v1 --out /tmp/v1          Make a synthetic test recording
+  manta decode /tmp/v1/v1.wav         Decode it, no radio needed
+  manta listen                        Copy from the default sound card
+  manta listen --kiwi-host rx.example.org --kiwi-freq-hz 7030000
+                                      Copy from a public KiwiSDR on 40 m
+
+Run `manta <command> --help` for a command's full options."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,500 +41,736 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Decode a single CW signal from an IQ WAV file (M0 pipeline).
+    /// Decode CW from a recorded IQ WAV file.
+    ///
+    /// Reads a stereo WAV file (channel 0 = I, channel 1 = Q), decodes the
+    /// CW in it, and prints the copied text plus a spot summary. Fully
+    /// deterministic: the same file always produces the same output.
     Decode {
-        /// Stereo IQ WAV (ch0 = I, ch1 = Q); center freq from <stem>.json sidecar.
+        /// Stereo IQ WAV file. Its centre frequency is read from the
+        /// matching `<name>.json` sidecar next to it.
         path: PathBuf,
-        /// Emit the full DecodeReport as one JSON object on stdout.
-        #[arg(long)]
+        /// Print the full decode report as one JSON object.
+        #[arg(long, help_heading = "Output")]
         json: bool,
-        /// Per-source frequency-calibration correction, in ppm (config key
-        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
-        /// correction). Applied to `freq_hz` and every spot's `freq_hz`.
-        /// Corrects a drifted source clock/LO -- legacy precedent: CW
-        /// Skimmer/SkimSrv's `FreqCalibration=` .ini key (a raw
-        /// multiplier; this flag is ppm, per the spec's contract).
-        #[arg(
-            long,
-            default_value_t = 0.0,
-            value_parser = parse_freq_correction_ppm,
-            allow_negative_numbers = true
-        )]
-        freq_correction_ppm: f64,
-        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
-        /// bypasses grammar/cty validation and the repetition gate
-        /// entirely -- legacy precedent: CW Skimmer's Watch List
-        /// (Aggregator manual Appendix A2). Repeatable.
-        #[arg(long)]
-        allowlist: Vec<String>,
-        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
-        #[arg(long)]
-        blocklist: Option<PathBuf>,
-        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
-        /// range per line (MAN-31).
-        #[arg(long)]
-        notch: Option<PathBuf>,
-        /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
-        /// given, its values are the baseline; an explicit --engine overrides
-        /// just the `engine` key (merge_cli_engine). `--server-config` is a
-        /// deprecated alias, matching `run`/`listen`'s D11/MAN-77 rename.
+        /// TOML config file; the whole file is validated.
+        ///
+        /// Its `[decode]` values are the baseline; an explicit --engine
+        /// overrides just the engine setting. The environment (MANTA_CONFIG,
+        /// MANTA_*) is not read here, so output never depends on it.
+        // `--server-config` stays as a hidden alias for the flag's old
+        // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config")]
         config: Option<PathBuf>,
-        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
-        /// `hsmm` (fully implemented and reviewed since Task 8; still
-        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
-        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
-        /// an explicit flag can be told apart from an absent one: when
-        /// --config's `[decode]` table also sets `engine`, this flag
-        /// takes precedence over it when given, and the file's value is the
-        /// baseline otherwise (SPEC v2 §7).
+        /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
+        ///
+        /// `hsmm` is experimental: it was tested and did not pass the accuracy
+        /// and CPU-cost checks needed to become the default. Left unset
+        /// rather than defaulting, so that an explicit choice can be told
+        /// apart from no choice at all: when --config also names an engine,
+        /// this flag wins if given, and the file's value is used otherwise.
+        // hsmm's promotion gate was measured and failed on 2026-09-09, on both
+        // accuracy and CPU budget:
+        // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        #[command(flatten)]
+        filters: FilterOpts,
     },
-    /// Real-signal decode oracle: decode each RBN-spotted station's channel
-    /// directly (tracker bypassed) and report callsign recovery (SPEC v2 §8.3).
+    /// Score the decoder against a reference recording and a spot log.
+    ///
+    /// Decodes each station a reference skimmer reported, one channel at a
+    /// time with the tracker bypassed, and reports how many callsigns came
+    /// back. For measuring decode quality, not for day-to-day operating.
     Oracle {
-        /// Stereo IQ WAV with <stem>.json sidecar.
+        /// Stereo IQ WAV file. Its centre frequency is read from the
+        /// matching `<name>.json` sidecar next to it.
         path: PathBuf,
-        /// RBN daily-dump CSV pre-filtered to the recording's window.
+        /// Reverse Beacon Network daily-dump CSV, pre-filtered to the
+        /// recording's time window.
         rbn_csv: PathBuf,
-        /// Spotter whose spots define the reference set (the co-located skimmer).
+        /// Spotter callsign whose spots are the reference set -- normally
+        /// the skimmer that sat next to this receiver.
         #[arg(long, default_value = "K5TR")]
         spotter: String,
-        /// Recording's capture start, ISO-8601 UTC (e.g.
-        /// 2025-11-29T00:00:00Z). Anchors RBN spot times to the actual
-        /// recording, rather than assuming the capture starts exactly on
-        /// the hour (Codex review, PR #161).
+        /// When the recording starts, as ISO-8601 UTC (for example
+        /// 2025-11-29T00:00:00Z).
+        ///
+        /// Anchors the reference spot times to the recording instead of
+        /// assuming it began exactly on the hour.
         #[arg(long, value_parser = parse_capture_start)]
         capture_start: i64,
+        /// How many seconds around each reference spot to decode.
         #[arg(long, default_value_t = 40.0, value_parser = parse_window_s)]
         window_s: f64,
-        /// TOML config with a `[decode]`-shaped table (SPEC v2 §7 keys). When
-        /// given, its values are the baseline; an explicit --engine overrides
-        /// just the `engine` key (merge_cli_engine). `--server-config` is a
-        /// deprecated alias, matching `run`/`listen`'s D11/MAN-77 rename.
+        /// TOML config file; the whole file is validated.
+        ///
+        /// Its `[decode]` values are the baseline; an explicit --engine
+        /// overrides just the engine setting. The environment (MANTA_CONFIG,
+        /// MANTA_*) is not read here, so output never depends on it.
+        // `--server-config` stays as a hidden alias for the flag's old
+        // name; help advertises the canonical spelling only (D11/MAN-77).
         #[arg(long, alias = "server-config")]
         config: Option<PathBuf>,
-        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
-        /// `hsmm` (fully implemented and reviewed since Task 8; still
-        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
-        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
-        /// an explicit flag can be told apart from an absent one: when
-        /// --config's `[decode]` table also sets `engine`, this flag
-        /// takes precedence over it when given, and the file's value is the
-        /// baseline otherwise (SPEC v2 §7).
+        /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
+        ///
+        /// `hsmm` is experimental: it was tested and did not pass the accuracy
+        /// and CPU-cost checks needed to become the default. Left unset
+        /// rather than defaulting, so that an explicit choice can be told
+        /// apart from no choice at all: when --config also names an engine,
+        /// this flag wins if given, and the file's value is used otherwise.
+        // hsmm's promotion gate was measured and failed on 2026-09-09, on both
+        // accuracy and CPU budget:
+        // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
-        /// Write per-spot results as JSON Lines here (summary always goes to stdout).
+        /// Write one JSON object per reference spot to this file. The
+        /// summary always goes to stdout as well.
         #[arg(long)]
         jsonl: Option<PathBuf>,
     },
-    /// Generate a golden test vector fixture set (SPEC §7).
+    /// Generate a synthetic CW test recording.
+    ///
+    /// Writes a WAV file plus its sidecar and manifest, for testing a
+    /// decode without any radio hardware. Each named recording is a fixed,
+    /// reproducible scenario -- clean signal, weak signal, fading, high
+    /// speed, two stations sharing one channel -- so the same name always
+    /// produces the same file.
     Gen {
-        /// Vector name (M0: "v1").
+        /// Which test recording to generate: v1 to v6, vr1 to vr5, vr6a,
+        /// vr6b, vr7 or vr8.
         vector: String,
-        /// Output directory for <name>.wav / .json / .manifest.json.
+        /// Directory to write `<name>.wav`, `<name>.json` and
+        /// `<name>.manifest.json` into.
         #[arg(long)]
         out: PathBuf,
     },
-    /// Run manta as a daemon, or copy live off-air CW continuously.
+    /// Decode CW live from a receiver or sound card, or run the spotting
+    /// daemon.
     ///
-    /// D11/MAN-77: `run` is the daemon entry point. `listen` is kept as a
-    /// visible alias for ad hoc audio/dev testing (see
-    /// docs/DECISIONS/2026-09-06-broad-review-decisions.md).
+    /// Prints each decode as it happens. With --config, also runs the full
+    /// spotting daemon: the telnet cluster server, the JSON Lines /
+    /// WebSocket stream, and the metrics endpoint.
+    // `run` is the daemon entry point; `listen` stays as a visible alias
+    // for ad hoc audio/dev testing (D11/MAN-77, see
+    // docs/DECISIONS/2026-09-06-broad-review-decisions.md).
     #[command(visible_alias = "listen")]
     Run {
-        /// Input device name substring (default input device if omitted).
-        #[arg(long, conflicts_with = "source")]
+        /// Sound-card input device; matched by substring. Defaults to the
+        /// system default input.
+        #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
         device: Option<String>,
-        /// Replay a WAV file instead of a live device (paced by its own
-        /// sample rate via AudioIqSource; used for demos and testing).
-        #[arg(long, conflicts_with = "device")]
+        /// Replay a WAV file instead of listening to a live device.
+        ///
+        /// Decoded as fast as the machine manages, not in real time, so a
+        /// 60-second file usually finishes sooner than that. Useful for
+        /// demos and repeatable testing.
+        #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
-        /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
+        #[arg(help_heading = "KiwiSDR source")]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
-        /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
-        #[arg(long, default_value = "8073", requires = "kiwi_host")]
-        kiwi_port: u16,
-        /// RF center frequency in Hz. Required with --kiwi-host.
-        #[arg(long, requires = "kiwi_host")]
-        kiwi_freq: Option<f64>,
-        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
-        #[arg(long, requires = "kiwi_host", default_value = "")]
-        kiwi_password: String,
-        /// Emit DecoderEvents as JSON Lines instead of plain text.
-        #[arg(long)]
-        json: bool,
-        /// Per-source frequency-calibration correction, in ppm (config key
-        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
-        /// correction). Applied to a spot's reported frequency before
-        /// emission. Corrects a drifted source clock/LO -- legacy
-        /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
-        /// (a raw multiplier; this flag is ppm, per the spec's contract).
+        /// KiwiSDR receiver port.
         #[arg(
             long,
-            default_value_t = 0.0,
-            value_parser = parse_freq_correction_ppm,
-            allow_negative_numbers = true
+            default_value = "8073",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
         )]
-        freq_correction_ppm: f64,
-        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
-        /// bypasses grammar/cty validation and the repetition gate
-        /// entirely -- legacy precedent: CW Skimmer's Watch List
-        /// (Aggregator manual Appendix A2). Repeatable.
-        #[arg(long)]
-        allowlist: Vec<String>,
-        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
-        #[arg(long)]
-        blocklist: Option<PathBuf>,
-        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
-        /// range per line (MAN-31).
-        #[arg(long)]
-        notch: Option<PathBuf>,
-        /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
-        /// Requires --soapy-freq and --soapy-rate.
+        kiwi_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --kiwi-host.
+        #[arg(
+            long = "kiwi-freq-hz",
+            alias = "kiwi-freq",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_freq_hz: Option<f64>,
+        /// KiwiSDR password. Leave empty for public receivers that do not
+        /// ask for one.
+        #[arg(
+            long,
+            requires = "kiwi_host",
+            default_value = "",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_password: String,
+        /// SoapySDR device arguments, e.g. "driver=rtlsdr".
+        ///
+        /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
+        /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
+        #[arg(help_heading = "SoapySDR source")]
         #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
         #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
-        /// RF center frequency in Hz. Required with --soapy-driver.
+        /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
-        soapy_freq: Option<f64>,
-        /// Sample rate in Hz. Required with --soapy-driver.
+        #[arg(
+            long = "soapy-freq-hz",
+            alias = "soapy-freq",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
-        soapy_rate: Option<f64>,
-        /// Gain in dB (omit for AGC, if the device supports it).
+        #[arg(
+            long = "soapy-rate-hz",
+            alias = "soapy-rate",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_rate_hz: Option<f64>,
+        /// Receiver gain, in dB. Omit to let the device use AGC.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
+        #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
-        /// Requires --hpsdr-freq and --hpsdr-rate.
+        /// HPSDR/Hermes device hostname or IP address.
+        ///
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
+        /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
+        #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port (default 1024, the standard Metis
-        /// discovery/control port).
+        /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        #[arg(
+            long,
+            default_value_t = manta_input::hpsdr::CONTROL_PORT,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
         hpsdr_port: u16,
-        /// RF center frequency in Hz. Required with --hpsdr-host.
+        /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
-        hpsdr_freq: Option<f64>,
-        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[arg(
+            long = "hpsdr-freq-hz",
+            alias = "hpsdr-freq",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_freq_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
-        hpsdr_rate: Option<f64>,
-        /// Decimate the source down to this rate before the channelizer
-        /// (issue #169) -- must evenly divide the source's native rate by
-        /// a power of two, and the result must itself be a valid
-        /// channelizer table rate (fs/93.75 a power of two). Omit to use
-        /// the source's native rate unchanged (today's behavior).
+        #[arg(
+            long = "hpsdr-rate-hz",
+            alias = "hpsdr-rate",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_rate_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_rate_hz: Option<f64>,
+        /// Decimate the source to this sample rate, in Hz, before decoding.
+        ///
+        /// Must divide the source's own rate by a power of two, and the
+        /// result must itself be a rate the channelizer supports. Omit to
+        /// decode at the source's native rate.
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
-        /// Declare `--source` as a raw complex-IQ WAV (any rate, routed
-        /// through `WavIqSource`) rather than the default mono real-audio
-        /// interpretation (`AudioIqSource`, Hilbert transform, 48000 Hz
-        /// only). Channel count alone can't reliably distinguish the two
-        /// formats -- a stereo real-audio recording and a 2-channel raw IQ
-        /// capture are indistinguishable by header alone -- so this must be
-        /// explicit (MAN-169 round-4 Codex finding: sniffing channel count
-        /// silently reinterpreted ordinary stereo audio recordings as IQ,
-        /// decoding them with an image at the negative-frequency mirror).
+        /// Read --source as a raw complex-IQ recording rather than ordinary
+        /// mono audio.
+        ///
+        /// Without this, --source is taken as mono real audio at 48000 Hz.
+        /// A stereo audio recording and a two-channel IQ capture cannot be
+        /// told apart from the WAV header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
-        /// TOML config with a `[server]`-shaped `ServerConfig` (station
-        /// callsign + ports). When given, also starts the telnet cluster
-        /// server, JSON Lines/WebSocket stream, and metrics endpoint
-        /// (ARCHITECTURE §7-§8) alongside the decode loop.
-        #[arg(long, alias = "server-config")]
+        /// Print each decode as a JSON object, one per line, instead of
+        /// plain text.
+        #[arg(long, help_heading = "Output")]
+        json: bool,
+        /// TOML config file that turns this into the full spotting daemon.
+        ///
+        /// Needs a `[server]` table with the station callsign and ports.
+        /// Starts the telnet cluster server, the JSON Lines / WebSocket
+        /// stream, and the metrics endpoint alongside the decode loop.
+        // `--server-config` stays as a hidden alias for the flag's old
+        // name; help advertises the canonical spelling only (D11/MAN-77).
+        #[arg(long, alias = "server-config", help_heading = "Server")]
         config: Option<PathBuf>,
-        /// RF dial frequency in Hz, overriding the source's own
-        /// `center_freq_hz()`. Required with --config when the
-        /// source is a plain audio device or --source WAV file, since
-        /// neither reports a real RF frequency (KiwiSDR/SoapySDR already
-        /// know theirs from --kiwi-freq/--soapy-freq) -- without it, spots
-        /// would publish an audio-tone offset (e.g. 700 Hz) as if it were
-        /// the actual DX frequency.
-        #[arg(long, value_parser = parse_dial_freq_hz)]
+        /// Radio dial frequency, in Hz.
+        ///
+        /// For a sound card or an ordinary (real-audio) --source WAV this
+        /// becomes the source's centre frequency; for KiwiSDR, SoapySDR and
+        /// HPSDR inputs, and for a --source-iq recording whose sidecar already
+        /// carries a centre frequency, it overrides what the source reports.
+        /// Required with --config when the input is a sound card or a
+        /// real-audio --source WAV, because neither knows what frequency the
+        /// radio was on -- without it, spots would be published at the audio
+        /// tone frequency (for example 700 Hz) instead of the real one. A
+        /// --source-iq recording with a sidecar centre frequency does not need
+        /// it. Outside --config it is optional, but omitting it for an audio
+        /// source prints a warning and reported frequencies stay baseband
+        /// offsets.
+        ///
+        /// Enter the suppressed-carrier (USB) dial reading: manta adds the
+        /// decoded tone offset to this value as-is. On a rig in CW mode the
+        /// displayed dial frequency is usually already offset by your sidetone
+        /// pitch -- subtract it (for example 700-800 Hz) first, or spots read
+        /// high by that amount (CW-R inverts the sign and doubles the error).
+        #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Server")]
         dial_freq_hz: Option<f64>,
-        /// Fixed replay epoch, Unix seconds -- overrides the replayed
-        /// file's own mtime as the wall-clock instant SpotBus treats as
-        /// `sample_ts == 0`. Only meaningful with --source (file replay)
-        /// and --config; ignored for a live source. Without this,
-        /// the epoch is the file's mtime, which is real and reproducible
-        /// for an untouched file but changes if the file is copied,
-        /// downloaded, or restored without preserving filesystem metadata
-        /// -- pass this explicitly when byte-identical JSON `timestamp`/
-        /// RBN Zulu output across environments matters more than "whatever
-        /// this machine's copy of the file happens to say."
-        #[arg(long, value_parser = parse_replay_epoch)]
+        /// Timestamp to treat as the start of a replayed file, in Unix
+        /// seconds.
+        ///
+        /// Only meaningful with --source and --config; ignored for a live
+        /// input. Without it, the file's modification time is used, which
+        /// is stable for an untouched file but changes when the file is
+        /// copied or downloaded. Set it explicitly when spot timestamps
+        /// must be identical across machines.
+        #[arg(long, value_parser = parse_replay_epoch, help_heading = "Server")]
         replay_epoch: Option<i64>,
-        /// Decode engine (SPEC v2 §0): `legacy` (default), `edge-legacy`, or
-        /// `hsmm` (fully implemented and reviewed since Task 8; still
-        /// experimental/unmeasured for production use -- SPEC v2 §8.4/Tasks
-        /// 11-12 measure it). Unset (rather than defaulting to `legacy`) so
-        /// an explicit flag can be told apart from an absent one: when
-        /// `--config`'s `[decode]` table also sets `engine`, this
-        /// flag takes precedence over it when given, and the file's value
-        /// is the baseline otherwise (SPEC v2 §7).
+        /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
+        ///
+        /// `hsmm` is experimental: it was tested and did not pass the accuracy
+        /// and CPU-cost checks needed to become the default. Left unset
+        /// rather than defaulting, so that an explicit choice can be told
+        /// apart from no choice at all: when --config also names an engine,
+        /// this flag wins if given, and the file's value is used otherwise.
+        // hsmm's promotion gate was measured and failed on 2026-09-09, on both
+        // accuracy and CPU budget:
+        // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        #[command(flatten)]
+        filters: FilterOpts,
     },
-    /// Run the listen pipeline for a fixed duration, checking for panics
-    /// and unbounded memory growth (ROADMAP M1 accept criterion).
+    /// Run the live decoder for a fixed duration as a stability check.
+    ///
+    /// Reads from the same sources `listen` does, decodes for --duration
+    /// seconds, and exits non-zero if the pipeline panics or its memory
+    /// use keeps growing. Intended for unattended stability runs, not for
+    /// day-to-day operating.
     Soak {
-        /// Duration in seconds.
+        /// How long to run, in seconds.
         #[arg(long)]
         duration: u64,
-        #[arg(long, conflicts_with = "source")]
+        /// Sound-card input device; matched by substring. Defaults to the
+        /// system default input.
+        #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
         device: Option<String>,
-        #[arg(long, conflicts_with = "device")]
+        /// Replay a WAV file instead of listening to a live device.
+        ///
+        /// Decoded as fast as the machine manages, not in real time, so a
+        /// 60-second file usually finishes sooner than that. Useful for
+        /// demos and repeatable testing.
+        #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
-        /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
+        #[arg(help_heading = "KiwiSDR source")]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
-        /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
-        #[arg(long, default_value = "8073", requires = "kiwi_host")]
-        kiwi_port: u16,
-        /// RF center frequency in Hz. Required with --kiwi-host.
-        #[arg(long, requires = "kiwi_host")]
-        kiwi_freq: Option<f64>,
-        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
-        #[arg(long, requires = "kiwi_host", default_value = "")]
-        kiwi_password: String,
-        /// Per-source frequency-calibration correction, in ppm (config key
-        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
-        /// correction). Applied to a spot's reported frequency before
-        /// emission. Corrects a drifted source clock/LO -- legacy
-        /// precedent: CW Skimmer/SkimSrv's `FreqCalibration=` .ini key
-        /// (a raw multiplier; this flag is ppm, per the spec's contract).
+        /// KiwiSDR receiver port.
         #[arg(
             long,
-            default_value_t = 0.0,
-            value_parser = parse_freq_correction_ppm,
-            allow_negative_numbers = true
+            default_value = "8073",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
         )]
-        freq_correction_ppm: f64,
-        /// Operator Watch List (ARCHITECTURE §6, MAN-28): a callsign that
-        /// bypasses grammar/cty validation and the repetition gate
-        /// entirely -- legacy precedent: CW Skimmer's Watch List
-        /// (Aggregator manual Appendix A2). Repeatable.
-        #[arg(long)]
-        allowlist: Vec<String>,
-        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
-        #[arg(long)]
-        blocklist: Option<PathBuf>,
-        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
-        /// range per line (MAN-31).
-        #[arg(long)]
-        notch: Option<PathBuf>,
-        /// SoapySDR driver args (e.g. "driver=rtlsdr"), feature `soapy`.
-        /// Requires --soapy-freq and --soapy-rate.
+        kiwi_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --kiwi-host.
+        #[arg(
+            long = "kiwi-freq-hz",
+            alias = "kiwi-freq",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_freq_hz: Option<f64>,
+        /// KiwiSDR password. Leave empty for public receivers that do not
+        /// ask for one.
+        #[arg(
+            long,
+            requires = "kiwi_host",
+            default_value = "",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_password: String,
+        /// SoapySDR device arguments, e.g. "driver=rtlsdr".
+        ///
+        /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
+        /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
+        #[arg(help_heading = "SoapySDR source")]
         #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
         #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
-        /// RF center frequency in Hz. Required with --soapy-driver.
+        /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
-        soapy_freq: Option<f64>,
-        /// Sample rate in Hz. Required with --soapy-driver.
+        #[arg(
+            long = "soapy-freq-hz",
+            alias = "soapy-freq",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
-        soapy_rate: Option<f64>,
-        /// Gain in dB (omit for AGC, if the device supports it).
+        #[arg(
+            long = "soapy-rate-hz",
+            alias = "soapy-rate",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_rate_hz: Option<f64>,
+        /// Receiver gain, in dB. Omit to let the device use AGC.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
+        #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
-        /// Requires --hpsdr-freq and --hpsdr-rate.
+        /// HPSDR/Hermes device hostname or IP address.
+        ///
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
+        /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
+        #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port (default 1024, the standard Metis
-        /// discovery/control port).
+        /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        #[arg(
+            long,
+            default_value_t = manta_input::hpsdr::CONTROL_PORT,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
         hpsdr_port: u16,
-        /// RF center frequency in Hz. Required with --hpsdr-host.
+        /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
-        hpsdr_freq: Option<f64>,
-        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[arg(
+            long = "hpsdr-freq-hz",
+            alias = "hpsdr-freq",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_freq_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
-        hpsdr_rate: Option<f64>,
-        /// Decimate the source down to this rate before the channelizer
-        /// (issue #169) -- must evenly divide the source's native rate by
-        /// a power of two, and the result must itself be a valid
-        /// channelizer table rate (fs/93.75 a power of two). Omit to use
-        /// the source's native rate unchanged (today's behavior).
+        #[arg(
+            long = "hpsdr-rate-hz",
+            alias = "hpsdr-rate",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_rate_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_rate_hz: Option<f64>,
+        /// Decimate the source to this sample rate, in Hz, before decoding.
+        ///
+        /// Must divide the source's own rate by a power of two, and the
+        /// result must itself be a rate the channelizer supports. Omit to
+        /// decode at the source's native rate.
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
-        /// Declare `--source` as a raw complex-IQ WAV (any rate, routed
-        /// through `WavIqSource`) rather than the default mono real-audio
-        /// interpretation (`AudioIqSource`, Hilbert transform, 48000 Hz
-        /// only). Channel count alone can't reliably distinguish the two
-        /// formats -- a stereo real-audio recording and a 2-channel raw IQ
-        /// capture are indistinguishable by header alone -- so this must be
-        /// explicit (MAN-169 round-4 Codex finding: sniffing channel count
-        /// silently reinterpreted ordinary stereo audio recordings as IQ,
-        /// decoding them with an image at the negative-frequency mirror).
+        /// Read --source as a raw complex-IQ recording rather than ordinary
+        /// mono audio.
+        ///
+        /// Without this, --source is taken as mono real audio at 48000 Hz.
+        /// A stereo audio recording and a two-channel IQ capture cannot be
+        /// told apart from the WAV header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
-    },
-    /// Query a running manta daemon's health (MAN-44). Reads the same
-    /// `/status` document the metrics listener serves on `GET /status` --
-    /// no separate control socket, so this works identically on every
-    /// platform manta builds for.
-    Status {
-        /// Daemon config to read the metrics bind address/port from. A
-        /// wildcard `bind_addr` (e.g. `0.0.0.0`) resolves to loopback for
-        /// dialing purposes -- see `resolve_status_addr`.
+        #[command(flatten)]
+        filters: FilterOpts,
+        /// Radio dial frequency, in Hz. See `run --dial-freq-hz`; without it
+        /// an audio source's reported frequencies are baseband offsets.
+        #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
+        dial_freq_hz: Option<f64>,
+        /// TOML config file whose `[input]`, `[spot]`, `[detector]` and
+        /// `[decode]` tables supply what the flags leave unset.
         ///
-        /// `--server-config` is a deprecated alias, exactly as on
-        /// `run`/`listen`/`decode` (D11/MAN-77). It has to be spelled
-        /// this way round: `warn_deprecations` scans raw argv without
-        /// knowing the verb, so `manta status --server-config m.toml`
-        /// prints "use `--config` instead" -- and before this alias
-        /// existed, that advice named a flag clap then rejected
-        /// (Codex review, PR #95).
+        /// Falls back to $MANTA_CONFIG. Flags override the file, and
+        /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
+        /// `soak` never starts the spot servers.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Ask a running daemon whether its RBN uplink is healthy.
+    ///
+    // MAN-44.
+    /// Reads the `GET /status` document the daemon's metrics listener
+    /// serves and prints a one-screen summary, or the raw JSON
+    /// with --json. Exits 0 when every enabled uplink target is connected
+    /// (or none is configured), 1 when any is down or flapping, and 2 when
+    /// the daemon cannot be reached or its answer cannot be read.
+    Status {
+        /// Daemon config to read the metrics `bind_addr`/`metrics_port`
+        /// from, with the same `MANTA_*` overlay `run` applies (falls back
+        /// to `MANTA_CONFIG`). A wildcard `bind_addr` (`0.0.0.0`/`::`)
+        /// dials loopback.
+        // `--server-config` stays a hidden alias, as on `run`: the
+        // deprecation notice names `--config`, so `status` must accept it.
         #[arg(long, alias = "server-config", conflicts_with = "addr")]
         config: Option<PathBuf>,
         /// Explicit `host:port` of the daemon's metrics listener (default
         /// 127.0.0.1:7302, the documented default metrics port).
         #[arg(long)]
         addr: Option<String>,
-        /// Emit the raw status JSON instead of the human-readable summary.
+        /// Print the raw status JSON instead of the human-readable summary.
         #[arg(long)]
         json: bool,
-        /// Give up after this many seconds if the daemon doesn't respond.
+        /// Give up after this many seconds if the daemon doesn't answer.
         #[arg(long, default_value_t = 5)]
         timeout_secs: u64,
     },
-    /// Bounded-duration health check: is this source hearing anything real?
-    /// Runs the real decode pipeline for --duration, then reports track/SNR/
-    /// spot stats and a verdict -- distinguishes "no signal" from "signal but
-    /// not decoding" from "working end to end," which a bare `listen` run
-    /// with zero spots can't tell apart on its own.
+    /// Check whether a source is hearing anything, and say what it found.
+    ///
+    /// Runs the real decode pipeline for --duration seconds, then reports
+    /// track, SNR and spot counts plus a verdict. Tells "nothing is coming
+    /// in" apart from "signal is coming in but nothing decodes" and from
+    /// "working end to end" -- which a quiet `listen` run cannot.
     Doctor {
-        /// Duration in seconds (3-3600; see manta_engine::doctor::{MIN_DURATION,MAX_DURATION}).
+        /// How long to listen for, in seconds (3 to 3600).
         #[arg(long, default_value_t = 10)]
         duration: u64,
-        #[arg(long, conflicts_with = "source")]
+        /// Sound-card input device; matched by substring. Defaults to the
+        /// system default input.
+        #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
         device: Option<String>,
-        #[arg(long, conflicts_with = "device")]
+        /// Replay a WAV file instead of listening to a live device.
+        ///
+        /// Decoded as fast as the machine manages, not in real time, so a
+        /// 60-second file usually finishes sooner than that. Useful for
+        /// demos and repeatable testing.
+        #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
         source: Option<PathBuf>,
-        /// KiwiSDR receiver hostname. Requires --kiwi-freq.
-        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq"))]
-        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq"))]
-        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq"))]
-        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq"))]
+        /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
+        #[arg(help_heading = "KiwiSDR source")]
+        #[cfg_attr(all(feature = "hpsdr", feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(feature = "hpsdr", not(feature = "soapy")), arg(long, conflicts_with_all = ["device", "source", "hpsdr_host"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(all(not(feature = "hpsdr"), feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "soapy_driver"], requires = "kiwi_freq_hz"))]
+        #[cfg_attr(not(any(feature = "hpsdr", feature = "soapy")), arg(long, conflicts_with_all = ["device", "source"], requires = "kiwi_freq_hz"))]
         kiwi_host: Option<String>,
-        /// KiwiSDR receiver port (default 8073, the standard KiwiSDR port).
-        #[arg(long, default_value = "8073", requires = "kiwi_host")]
-        kiwi_port: u16,
-        /// RF center frequency in Hz. Required with --kiwi-host.
-        #[arg(long, requires = "kiwi_host")]
-        kiwi_freq: Option<f64>,
-        /// KiwiSDR password (empty for anonymous/no-password receivers, the common case for public nodes).
-        #[arg(long, requires = "kiwi_host", default_value = "")]
-        kiwi_password: String,
-        /// Per-source frequency-calibration correction, in ppm (config key
-        /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4; 0 = no
-        /// correction).
+        /// KiwiSDR receiver port.
         #[arg(
             long,
-            default_value_t = 0.0,
-            value_parser = parse_freq_correction_ppm,
-            allow_negative_numbers = true
+            default_value = "8073",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
         )]
-        freq_correction_ppm: f64,
-        /// Operator Watch List (ARCHITECTURE §6, MAN-28). Repeatable.
-        #[arg(long)]
-        allowlist: Vec<String>,
-        /// Operator bad-callsign blocklist file, one callsign per line (MAN-31).
-        #[arg(long)]
-        blocklist: Option<PathBuf>,
-        /// Operator notched-frequency-range list file, one `low_hz-high_hz`
-        /// range per line (MAN-31).
-        #[arg(long)]
-        notch: Option<PathBuf>,
-        /// SoapySDR driver args (e.g. "driver=sdrplay"), feature `soapy`.
-        /// Requires --soapy-freq and --soapy-rate.
+        kiwi_port: u16,
+        /// Receiver centre frequency, in Hz. Required with --kiwi-host.
+        #[arg(
+            long = "kiwi-freq-hz",
+            alias = "kiwi-freq",
+            requires = "kiwi_host",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_freq_hz: Option<f64>,
+        /// KiwiSDR password. Leave empty for public receivers that do not
+        /// ask for one.
+        #[arg(
+            long,
+            requires = "kiwi_host",
+            default_value = "",
+            help_heading = "KiwiSDR source"
+        )]
+        kiwi_password: String,
+        /// SoapySDR device arguments, e.g. "driver=rtlsdr".
+        ///
+        /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
+        /// builds made with the `soapy` feature.
         #[cfg(feature = "soapy")]
+        #[arg(help_heading = "SoapySDR source")]
         #[cfg_attr(feature = "hpsdr", arg(long, conflicts_with_all = ["device", "source", "hpsdr_host", "kiwi_host"]))]
         #[cfg_attr(not(feature = "hpsdr"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         soapy_driver: Option<String>,
-        /// RF center frequency in Hz. Required with --soapy-driver.
+        /// Receiver centre frequency, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
-        soapy_freq: Option<f64>,
-        /// Sample rate in Hz. Required with --soapy-driver.
+        #[arg(
+            long = "soapy-freq-hz",
+            alias = "soapy-freq",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --soapy-driver.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
-        soapy_rate: Option<f64>,
-        /// Gain in dB (omit for AGC, if the device supports it).
+        #[arg(
+            long = "soapy-rate-hz",
+            alias = "soapy-rate",
+            requires = "soapy_driver",
+            help_heading = "SoapySDR source"
+        )]
+        soapy_rate_hz: Option<f64>,
+        /// Receiver gain, in dB. Omit to let the device use AGC.
         #[cfg(feature = "soapy")]
-        #[arg(long, requires = "soapy_driver")]
+        #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
-        /// HPSDR/Hermes (Metis) device hostname or IP, feature `hpsdr`.
-        /// Requires --hpsdr-freq and --hpsdr-rate.
+        /// HPSDR/Hermes device hostname or IP address.
+        ///
+        /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Available only in
+        /// builds made with the `hpsdr` feature.
         #[cfg(feature = "hpsdr")]
+        #[arg(help_heading = "HPSDR source")]
         #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "soapy_driver"]))]
         #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host"]))]
         hpsdr_host: Option<String>,
-        /// HPSDR/Hermes control port (default 1024, the standard Metis
-        /// discovery/control port).
+        /// HPSDR/Hermes control port.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, default_value_t = manta_input::hpsdr::CONTROL_PORT, requires = "hpsdr_host")]
+        #[arg(
+            long,
+            default_value_t = manta_input::hpsdr::CONTROL_PORT,
+            requires = "hpsdr_host",
+            help_heading = "HPSDR source"
+        )]
         hpsdr_port: u16,
-        /// RF center frequency in Hz. Required with --hpsdr-host.
+        /// Receiver centre frequency, in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_freq_hz)]
-        hpsdr_freq: Option<f64>,
-        /// Sample rate in Hz. Required with --hpsdr-host.
+        #[arg(
+            long = "hpsdr-freq-hz",
+            alias = "hpsdr-freq",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_freq_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_freq_hz: Option<f64>,
+        /// Sample rate, in Hz. Required with --hpsdr-host.
         #[cfg(feature = "hpsdr")]
-        #[arg(long, requires = "hpsdr_host", value_parser = parse_hpsdr_rate_hz)]
-        hpsdr_rate: Option<f64>,
-        /// Decimate the source down to this rate before the channelizer
-        /// (issue #169) -- must evenly divide the source's native rate by
-        /// a power of two, and the result must itself be a valid
-        /// channelizer table rate (fs/93.75 a power of two). Omit to use
-        /// the source's native rate unchanged (today's behavior).
+        #[arg(
+            long = "hpsdr-rate-hz",
+            alias = "hpsdr-rate",
+            requires = "hpsdr_host",
+            value_parser = parse_hpsdr_rate_hz,
+            help_heading = "HPSDR source"
+        )]
+        hpsdr_rate_hz: Option<f64>,
+        /// Decimate the source to this sample rate, in Hz, before decoding.
+        ///
+        /// Must divide the source's own rate by a power of two, and the
+        /// result must itself be a rate the channelizer supports. Omit to
+        /// decode at the source's native rate.
         #[arg(long, value_parser = parse_capture_rate_hz)]
         capture_rate_hz: Option<f64>,
-        /// Declare `--source` as a raw complex-IQ WAV (any rate, routed
-        /// through `WavIqSource`) rather than the default mono real-audio
-        /// interpretation (`AudioIqSource`, Hilbert transform, 48000 Hz
-        /// only). Channel count alone can't reliably distinguish the two
-        /// formats -- a stereo real-audio recording and a 2-channel raw IQ
-        /// capture are indistinguishable by header alone -- so this must be
-        /// explicit (MAN-169 round-4 Codex finding: sniffing channel count
-        /// silently reinterpreted ordinary stereo audio recordings as IQ,
-        /// decoding them with an image at the negative-frequency mirror).
+        /// Read --source as a raw complex-IQ recording rather than ordinary
+        /// mono audio.
+        ///
+        /// Without this, --source is taken as mono real audio at 48000 Hz.
+        /// A stereo audio recording and a two-channel IQ capture cannot be
+        /// told apart from the WAV header alone, so say which you have.
         #[arg(long)]
         source_iq: bool,
-        /// Emit the DoctorReport as one JSON object on stdout instead of a
-        /// human-readable summary.
+        /// Radio dial frequency, in Hz. See `run --dial-freq-hz`; without it
+        /// an audio source's reported frequencies, and the report's
+        /// `center_freq_hz`, are baseband offsets.
+        #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
+        dial_freq_hz: Option<f64>,
+        /// TOML config file whose `[input]`, `[spot]`, `[detector]` and
+        /// `[decode]` tables supply what the flags leave unset.
+        ///
+        /// Falls back to $MANTA_CONFIG. Flags override the file, and
+        /// MANTA_<TABLE>_<KEY> environment variables sit between the two.
+        /// `doctor` never starts the spot servers.
         #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print the full report as one JSON object instead of a readable
+        /// summary.
+        #[arg(long, help_heading = "Output")]
         json: bool,
+        #[command(flatten)]
+        filters: FilterOpts,
+    },
+    /// Check or create a config file, without starting anything.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+// MAN-76: `manta config check` / `manta config init`; see config_cmd.rs and
+// docs/DECISIONS/2026-10-07-man76-config-check-init.md.
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Validate a config file and print the settings it resolves to.
+    ///
+    /// Runs every check `manta run` applies to its config, including the
+    /// MANTA_* environment variables, without opening the receiver,
+    /// binding a port or starting a server. Exits 0 when the config is
+    /// valid and 1, naming the setting and the problem, when it is not.
+    Check {
+        /// Config file to check. Defaults to $MANTA_CONFIG, then to
+        /// manta.toml in the current directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Write a new config file listing every setting at its default.
+    ///
+    /// Every setting is commented out, so the new file changes nothing
+    /// until you edit it. Refuses to replace an existing file without
+    /// --force.
+    Init {
+        /// Where to write the file; `-` prints it instead.
+        #[arg(long, default_value = config_cmd::DEFAULT_PATH)]
+        out: PathBuf,
+        /// Replace the file if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 }
 
+// Provenance for the flags below (contributor-facing, deliberately `//` and
+// not `///`: clap republishes `///` verbatim into operator-facing `--help`,
+// and MAN-135 is specifically about not doing that):
+//   - freq_correction_ppm: config key `input.freq_correction_ppm`,
+//     SPEC-decode-core.md §1.4. Legacy precedent is CW Skimmer/SkimSrv's
+//     `FreqCalibration=` .ini key, which is a raw multiplier; this flag is
+//     ppm per the spec's contract.
+//   - allowlist: the Operator Watch List of ARCHITECTURE §6 / MAN-28.
+//     Legacy precedent: CW Skimmer's Watch List (Aggregator manual App. A2).
+//   - blocklist / notch: MAN-31.
+/// Flags that decide which decodes become spots. Shared by `decode`,
+/// `listen` and `soak`.
+#[derive(clap::Args, Clone, Debug)]
+#[command(next_help_heading = "Filtering")]
+struct FilterOpts {
+    /// Correct a receiver whose clock reads off-frequency, in parts per
+    /// million.
+    ///
+    /// Decoded and spotted frequencies are scaled by 1 + ppm/1000000, so
+    /// a receiver reading about 20 Hz high on 14 MHz is corrected with
+    /// roughly -1.4. 0 disables the correction. `doctor` still prints the
+    /// source's own centre frequency uncorrected; the correction only
+    /// affects the frequencies it validates. This is the same idea as CW
+    /// Skimmer's FreqCalibration setting, expressed in ppm rather than as
+    /// a raw multiplier.
+    ///
+    /// Defaults to 0, or to `input.freq_correction_ppm` from --config.
+    #[arg(
+        long,
+        value_parser = parse_freq_correction_ppm,
+        allow_negative_numbers = true
+    )]
+    freq_correction_ppm: Option<f64>,
+    /// Spot this callsign even when the usual validity checks reject it.
+    ///
+    /// Repeat the flag for more than one call. Use it for a station you
+    /// know is on the air but that manta keeps rejecting -- an unusual
+    /// prefix, a special-event call. Bypasses callsign-grammar and
+    /// country checks and the repeat-before-spotting rule. --blocklist and
+    /// --notch still win: a call named by both is not spotted.
+    #[arg(long)]
+    allowlist: Vec<String>,
+    /// File of callsigns never to spot, one per line.
+    #[arg(long)]
+    blocklist: Option<PathBuf>,
+    /// File of frequency ranges never to spot, one `low_hz-high_hz` range
+    /// per line.
+    #[arg(long)]
+    notch: Option<PathBuf>,
+}
+
 /// KiwiSDR connection flags, grouped to keep `open_source`'s arity down.
+/// `Clone`: MAN-73's `LiveSourceSpec` carries one of these so a live source
+/// can be re-opened by `ReconnectingSource` after a loss.
+#[derive(Clone)]
 struct KiwiOpts {
     host: Option<String>,
     port: u16,
@@ -530,6 +780,7 @@ struct KiwiOpts {
 
 /// SoapySDR connection flags (feature `soapy`), grouped for the same reason.
 #[cfg(feature = "soapy")]
+#[derive(Clone)]
 struct SoapyOpts {
     driver: Option<String>,
     freq: Option<f64>,
@@ -539,6 +790,7 @@ struct SoapyOpts {
 
 /// HPSDR/Hermes connection flags (feature `hpsdr`), grouped for the same reason.
 #[cfg(feature = "hpsdr")]
+#[derive(Clone)]
 struct HpsdrOpts {
     host: Option<String>,
     port: u16,
@@ -546,92 +798,143 @@ struct HpsdrOpts {
     rate: Option<f64>,
 }
 
-/// Open a single-DDC HPSDR/Hermes device (feature `hpsdr`) as an
-/// `IqSource`, or `None` if `--hpsdr-host` wasn't given. Checked ahead of
-/// `open_source`'s kiwi/soapy/audio chain, so `--hpsdr-host` takes priority
-/// over those the same way `kiwi.host` already takes priority over
-/// `soapy.driver` inside that chain -- in practice only one of
-/// kiwi/soapy/hpsdr is ever set, since each already `conflicts_with_all`
-/// `device`/`source`.
-#[cfg(feature = "hpsdr")]
-fn open_hpsdr_source(hpsdr: HpsdrOpts) -> Result<Option<Box<dyn IqSource>>> {
-    let Some(host) = hpsdr.host else {
-        return Ok(None);
-    };
-    let freq = hpsdr
-        .freq
-        .ok_or_else(|| anyhow!("--hpsdr-freq is required with --hpsdr-host"))?;
-    let rate = hpsdr
-        .rate
-        .ok_or_else(|| anyhow!("--hpsdr-rate is required with --hpsdr-host"))?;
-    let cfg = manta_input::hpsdr::HpsdrConfig {
-        host,
-        port: hpsdr.port,
-        ddc_count: 1,
-        sample_rate_hz: rate,
-        center_freq_hz: vec![freq],
-    };
-    let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
-    Ok(Some(Box::new(sources.remove(0))))
+/// Everything needed to (re)open the configured live input. MAN-73: a
+/// reconnectable kind (every variant but `File`) is re-opened by
+/// `ReconnectingSource` after a loss; `File` (deterministic replay) never
+/// is. `name()` must keep returning the same label `set_source_health`
+/// always used for that kind, since dashboards/scrapes key on it.
+#[derive(Clone)]
+enum LiveSourceSpec {
+    Kiwi(KiwiOpts),
+    #[cfg(feature = "soapy")]
+    Soapy(SoapyOpts),
+    #[cfg(feature = "hpsdr")]
+    Hpsdr(HpsdrOpts),
+    AudioDevice(Option<String>),
+    /// `source_iq` selects `WavIqSource` over `AudioIqSource`; see
+    /// `open_audio_source`.
+    File {
+        path: PathBuf,
+        source_iq: bool,
+    },
 }
 
-/// Open a live audio device, WAV replay, KiwiSDR network source, or
-/// SoapySDR device (feature `soapy`) based on which CLI flags were set.
-/// `kiwi.host` takes priority over `soapy.driver` (clap's
-/// `conflicts_with_all` on each already rules out `device`/`source` being
-/// set alongside either).
-#[cfg(feature = "soapy")]
-fn open_source(
-    device: Option<String>,
-    source: Option<PathBuf>,
-    source_iq: bool,
-    kiwi: KiwiOpts,
-    soapy: SoapyOpts,
-) -> Result<Box<dyn IqSource>> {
-    if let Some(host) = kiwi.host {
-        let freq = kiwi
-            .freq
-            .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
-        return Ok(Box::new(manta_input::kiwi::KiwiIqSource::connect(
-            &host,
-            kiwi.port,
-            freq,
-            &kiwi.password,
-        )?));
+impl LiveSourceSpec {
+    fn name(&self) -> &'static str {
+        match self {
+            LiveSourceSpec::Kiwi(_) => "kiwi",
+            #[cfg(feature = "soapy")]
+            LiveSourceSpec::Soapy(_) => "soapy",
+            #[cfg(feature = "hpsdr")]
+            LiveSourceSpec::Hpsdr(_) => "hpsdr",
+            LiveSourceSpec::AudioDevice(_) => "audio",
+            LiveSourceSpec::File { .. } => "file",
+        }
     }
-    if let Some(driver) = soapy.driver {
-        let freq = soapy
-            .freq
-            .ok_or_else(|| anyhow!("--soapy-freq is required with --soapy-driver"))?;
-        let rate = soapy
-            .rate
-            .ok_or_else(|| anyhow!("--soapy-rate is required with --soapy-driver"))?;
-        return Ok(Box::new(manta_input::soapy::SoapySdrIqSource::open(
-            &driver, rate, freq, soapy.gain,
-        )?));
-    }
-    open_audio_source(device, source, source_iq)
-}
 
-#[cfg(not(feature = "soapy"))]
-fn open_source(
-    device: Option<String>,
-    source: Option<PathBuf>,
-    source_iq: bool,
-    kiwi: KiwiOpts,
-) -> Result<Box<dyn IqSource>> {
-    if let Some(host) = kiwi.host {
-        let freq = kiwi
-            .freq
-            .ok_or_else(|| anyhow!("--kiwi-freq is required with --kiwi-host"))?;
-        return Ok(Box::new(manta_input::kiwi::KiwiIqSource::connect(
-            &host,
-            kiwi.port,
-            freq,
-            &kiwi.password,
-        )?));
+    /// Kiwi/Soapy/Hpsdr, or an IQ WAV whose sidecar reports a real (> 0)
+    /// center frequency: a source that already knows its own tuned
+    /// frequency, so `--dial-freq-hz` is an override and not a requirement.
+    fn is_rf_aware(&self) -> bool {
+        match self {
+            LiveSourceSpec::AudioDevice(_) => false,
+            LiveSourceSpec::File { path, source_iq } => {
+                source_iq_has_real_rf_center(path, *source_iq)
+            }
+            _ => true,
+        }
     }
-    open_audio_source(device, source, source_iq)
+
+    /// Whether a loss of this source should be retried by
+    /// `ReconnectingSource` (MAN-73) rather than ending the daemon. File
+    /// replay's errors and EOF are deterministic and must reach `listen()`
+    /// unchanged -- see AGENTS.md's byte-identical-replay requirement.
+    fn is_reconnectable(&self) -> bool {
+        !matches!(self, LiveSourceSpec::File { .. })
+    }
+
+    /// Open (or re-open) the described source, applying `maybe_decimate`
+    /// for `capture_rate_hz` and then `FixedCenterFreqSource` when
+    /// `dial_freq_hz` is set -- so every call through this one method
+    /// produces a fully-composed source and nothing above it (in particular
+    /// `ReconnectingSource`) needs to know about either wrapper. A reopen
+    /// therefore also starts a fresh decimator, with no filter state carried
+    /// across the outage.
+    fn open(
+        &self,
+        capture_rate_hz: Option<f64>,
+        dial_freq_hz: Option<f64>,
+    ) -> Result<Box<dyn IqSource>> {
+        let src: Box<dyn IqSource> = match self {
+            LiveSourceSpec::Kiwi(kiwi) => {
+                let host = kiwi
+                    .host
+                    .as_deref()
+                    .expect("LiveSourceSpec::Kiwi always carries a host");
+                let freq = kiwi
+                    .freq
+                    .ok_or_else(|| anyhow!("--kiwi-freq-hz is required with --kiwi-host"))?;
+                Box::new(manta_input::kiwi::KiwiIqSource::connect(
+                    host,
+                    kiwi.port,
+                    freq,
+                    &kiwi.password,
+                )?)
+            }
+            #[cfg(feature = "soapy")]
+            LiveSourceSpec::Soapy(soapy) => {
+                let driver = soapy
+                    .driver
+                    .as_deref()
+                    .expect("LiveSourceSpec::Soapy always carries a driver");
+                let freq = soapy
+                    .freq
+                    .ok_or_else(|| anyhow!("--soapy-freq-hz is required with --soapy-driver"))?;
+                let rate = soapy
+                    .rate
+                    .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
+                Box::new(manta_input::soapy::SoapySdrIqSource::open(
+                    driver, rate, freq, soapy.gain,
+                )?)
+            }
+            #[cfg(feature = "hpsdr")]
+            LiveSourceSpec::Hpsdr(hpsdr) => {
+                let host = hpsdr
+                    .host
+                    .clone()
+                    .expect("LiveSourceSpec::Hpsdr always carries a host");
+                let freq = hpsdr
+                    .freq
+                    .ok_or_else(|| anyhow!("--hpsdr-freq-hz is required with --hpsdr-host"))?;
+                let rate = hpsdr
+                    .rate
+                    .ok_or_else(|| anyhow!("--hpsdr-rate-hz is required with --hpsdr-host"))?;
+                let cfg = manta_input::hpsdr::HpsdrConfig {
+                    host,
+                    port: hpsdr.port,
+                    ddc_count: 1,
+                    sample_rate_hz: rate,
+                    center_freq_hz: vec![freq],
+                };
+                let mut sources = manta_input::hpsdr::HpsdrDevice::open(cfg)?;
+                Box::new(sources.remove(0))
+            }
+            LiveSourceSpec::AudioDevice(device) => {
+                Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?)
+            }
+            LiveSourceSpec::File { path, source_iq } => {
+                open_audio_source(None, Some(path.clone()), *source_iq, None)?
+            }
+        };
+        let src = maybe_decimate(src, capture_rate_hz)?;
+        Ok(match dial_freq_hz {
+            Some(freq_hz) => Box::new(FixedCenterFreqSource {
+                inner: src,
+                freq_hz,
+            }),
+            None => src,
+        })
+    }
 }
 
 /// `--source <path>.wav` covers two distinct file formats sharing the same
@@ -657,17 +960,45 @@ fn open_audio_source(
     device: Option<String>,
     source: Option<PathBuf>,
     source_iq: bool,
+    dial_freq_hz: Option<f64>,
 ) -> Result<Box<dyn IqSource>> {
     Ok(match source {
-        Some(path) => {
-            if source_iq {
-                Box::new(manta_input::WavIqSource::open(&path)?)
-            } else {
-                Box::new(manta_input::AudioIqSource::from_wav_file(&path)?)
+        // A raw-IQ WAV is a `WavIqSource`, not an `AudioIqSource`, so it
+        // has no `with_center_freq_hz`: `--dial-freq-hz` is applied with
+        // the same override wrapper RF-aware sources use. (MAN-34 moved
+        // audio sources to a native dial frequency; this keeps the IQ
+        // replay path honoring `--dial-freq-hz` exactly as before.)
+        Some(path) if source_iq => {
+            let src: Box<dyn IqSource> = Box::new(manta_input::WavIqSource::open(&path)?);
+            match dial_freq_hz {
+                Some(freq_hz) => Box::new(FixedCenterFreqSource {
+                    inner: src,
+                    freq_hz,
+                }),
+                None => src,
             }
         }
-        None => Box::new(manta_input::AudioIqSource::from_device(device.as_deref())?),
+        Some(path) => audio_with_dial(
+            manta_input::AudioIqSource::from_wav_file(&path)?,
+            dial_freq_hz,
+        )?,
+        None => audio_with_dial(
+            manta_input::AudioIqSource::from_device(device.as_deref())?,
+            dial_freq_hz,
+        )?,
     })
+}
+
+/// Gives an `AudioIqSource` the operator's dial frequency natively
+/// (`AudioIqSource::with_center_freq_hz`, MAN-34), or returns it unchanged.
+fn audio_with_dial(
+    src: manta_input::AudioIqSource,
+    dial_freq_hz: Option<f64>,
+) -> Result<Box<dyn IqSource>> {
+    Ok(Box::new(match dial_freq_hz {
+        Some(hz) => src.with_center_freq_hz(hz)?,
+        None => src,
+    }))
 }
 
 /// Whether `source` (only meaningful when `source_iq` is set -- see
@@ -681,23 +1012,23 @@ fn open_audio_source(
 /// negative `center_freq_hz` passed the old `!= 0.0` check and would have
 /// published negative/invalid RF frequencies through spot outputs) -- an
 /// RF dial frequency in this domain is never zero or negative.
-fn source_iq_has_real_rf_center(source: &Option<PathBuf>, source_iq: bool) -> bool {
+fn source_iq_has_real_rf_center(path: &Path, source_iq: bool) -> bool {
     if !source_iq {
         return false;
     }
-    let Some(path) = source else {
-        return false;
-    };
     manta_input::WavIqSource::open(path)
         .map(|src| src.center_freq_hz() > 0.0)
         .unwrap_or(false)
 }
 
-/// Overrides an inner source's `center_freq_hz()` with a fixed value --
-/// `AudioIqSource` always reports `0.0` (audio-passband mode has no real
-/// RF dial frequency of its own), so without this a spot's `freq_hz` would
-/// publish a bare audio-tone offset (e.g. 700 Hz) as if it were the actual
-/// DX frequency. See `--dial-freq-hz`.
+/// Overrides an inner source's `center_freq_hz()` with a fixed value.
+/// Audio sources now carry the operator's dial frequency natively
+/// (`open_audio_source` -> `AudioIqSource::with_center_freq_hz`, MAN-34);
+/// this decorator remains for the RF-aware sources (KiwiSDR/SoapySDR/HPSDR,
+/// and IQ WAVs with a real sidecar frequency), which already report a tuned
+/// frequency of their own that `--dial-freq-hz` is allowed to supersede, and
+/// for raw-IQ WAV replay, which has no native dial setter. See
+/// `--dial-freq-hz`.
 struct FixedCenterFreqSource {
     inner: Box<dyn IqSource>,
     freq_hz: f64,
@@ -712,6 +1043,17 @@ impl IqSource for FixedCenterFreqSource {
         self.freq_hz
     }
 
+    /// Only the centre frequency is overridden -- the wrapped source's own
+    /// RF passband must still reach `SKIMMER/SETT`, or wrapping a
+    /// resampling source (KiwiSDR) or a rig-audio source in
+    /// `--dial-freq-hz` would silently re-introduce the "advertise the
+    /// processing rate" bug this method exists to prevent (MAN-86 review).
+    /// The wrapped bounds are offsets from the centre, so overriding the
+    /// centre alone relocates them correctly.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.inner.rf_passband_hz()
+    }
+
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -720,8 +1062,33 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.confirmed_live_handle()
     }
 
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.inner.take_discontinuity()
+    }
+
     fn health_counters(&self) -> Option<std::sync::Arc<manta_input::InputHealthCounters>> {
         self.inner.health_counters()
+    }
+}
+
+/// Warn on stderr when the opened source is audio-derived (not RF-aware)
+/// and no `--dial-freq-hz` was given -- MAN-34. A missing dial frequency in
+/// this case means every downstream frequency is a bare baseband offset,
+/// not an absolute RF frequency. This is a warning, not a `bail!`: a bare
+/// `manta listen --device` watching decoded text locally, with no interest
+/// in frequency, is a legitimate and documented use (README.md, the M1
+/// manual-acceptance runbook). The harm this ticket names -- a wrong
+/// frequency reaching the network -- is already a hard error via
+/// `--config`'s own check; this covers the local case without
+/// regressing it.
+fn warn_if_audio_source_has_no_rf_reference(has_rf_aware_source: bool, dial_freq_hz: Option<f64>) {
+    if !has_rf_aware_source && dial_freq_hz.is_none() {
+        eprintln!(
+            "warning: no --dial-freq-hz given for an audio source -- \
+             reported frequencies are baseband offsets within the \
+             audio passband, not absolute RF frequencies. Pass the \
+             rig's dial frequency, e.g. --dial-freq-hz 14030000."
+        );
     }
 }
 
@@ -768,9 +1135,15 @@ fn parse_capture_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --capture-rate-hz {s:?}: {e}"))?;
+    check_capture_rate_hz("--capture-rate-hz", hz)
+}
+
+/// `parse_capture_rate_hz`'s check, shared with `input.capture_rate_hz`
+/// (MAN-261); `name` is the flag or config key the message cites.
+fn check_capture_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz < MIN_CAPTURE_RATE_HZ {
         return Err(format!(
-            "--capture-rate-hz must be a finite number of Hz >= {MIN_CAPTURE_RATE_HZ}, got {hz}"
+            "{name} must be a finite number of Hz >= {MIN_CAPTURE_RATE_HZ}, got {hz}"
         ));
     }
     Ok(hz)
@@ -784,16 +1157,23 @@ fn parse_freq_correction_ppm(s: &str) -> std::result::Result<f64, String> {
     let ppm: f64 = s
         .parse()
         .map_err(|e| format!("invalid --freq-correction-ppm {s:?}: {e}"))?;
+    check_freq_correction_ppm(ppm)
+}
+
+/// `parse_freq_correction_ppm`'s check, shared with
+/// `input.freq_correction_ppm` (MAN-261). The message already names
+/// `freq_correction_ppm`, so it serves both spellings unchanged.
+fn check_freq_correction_ppm(ppm: f64) -> std::result::Result<f64, String> {
     manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| e.to_string())?;
     Ok(ppm)
 }
 
 /// `Engine::Hsmm` (Task 8: `TrackDecoder::push_hop_hsmm`) is a real, fully
 /// implemented and reviewed engine as of Task 11 -- it parses through like
-/// `legacy`/`edge-legacy`. It remains experimental/unmeasured for
-/// production use (SPEC v2 §8.4, Tasks 11-12 measure it), but that's a
-/// deployment/support-posture question for operators choosing `--engine
-/// hsmm` explicitly, not a reason to reject it at the CLI.
+/// `legacy`/`edge-legacy`. It remains experimental (its stage-2 gate was
+/// measured and failed, docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md),
+/// but that's a deployment/support-posture question for operators choosing
+/// `--engine hsmm` explicitly, not a reason to reject it at the CLI.
 fn parse_engine(s: &str) -> std::result::Result<Engine, String> {
     s.parse()
 }
@@ -959,15 +1339,21 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
         .map_err(|e| format!("invalid --dial-freq-hz {s:?}: {e}"))?;
+    check_dial_freq_hz("--dial-freq-hz", hz)
+}
+
+/// `parse_dial_freq_hz`'s check, shared with `input.center_freq_hz`
+/// (MAN-261); `name` is the flag or config key the message cites.
+fn check_dial_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
-            "--dial-freq-hz must be a finite, positive number of Hz, got {hz}"
+            "{name} must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)
 }
 
-/// Lower bound for `--hpsdr-rate`: comfortably below every real HPSDR/
+/// Lower bound for `--hpsdr-rate-hz`: comfortably below every real HPSDR/
 /// Hermes sample rate (48 kHz-1.536 MHz) while still guaranteeing
 /// `GapDetector::new`'s `Duration::from_secs_f64(126.0 / sample_rate_hz)`
 /// (126 = `USB_FRAMES_PER_PACKET * samples_per_usb_frame(1)`, this CLI's
@@ -975,16 +1361,21 @@ fn parse_dial_freq_hz(s: &str) -> std::result::Result<f64, String> {
 /// -- a finite, positive but tiny rate like `1e-20` still overflows it and
 /// panics (round-2 review finding: the round-1 fix rejected NaN/inf/<=0 but
 /// not an unrealistically small positive value).
-#[cfg(feature = "hpsdr")]
 const MIN_HPSDR_RATE_HZ: f64 = 1_000.0;
-/// Upper bound for `--hpsdr-rate`: generous headroom above any real
+/// Upper bound for `--hpsdr-rate-hz`: generous headroom above any real
 /// HPSDR/Hermes rate, purely to keep the range symmetric and reject
 /// obviously-wrong input (e.g. a value with stray zeros) rather than to
 /// pin an exact hardware ceiling this CLI layer has no authority over.
-#[cfg(feature = "hpsdr")]
 const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
 
-/// Clap value parser for `--hpsdr-rate`: rejects non-finite (NaN/infinity)
+/// Default HPSDR/Hermes control port for `[input] type = "hpsdr"`, defined
+/// on every build so the table validates identically with or without
+/// `--features hpsdr` (MAN-261); pinned to manta-input's own constant below.
+const HPSDR_CONTROL_PORT: u16 = 1024;
+#[cfg(feature = "hpsdr")]
+const _: () = assert!(HPSDR_CONTROL_PORT == manta_input::hpsdr::CONTROL_PORT);
+
+/// Clap value parser for `--hpsdr-rate-hz`: rejects non-finite (NaN/infinity)
 /// and out-of-range values at CLI-parse time. `HpsdrConfig::validate`'s own
 /// `validate_ddc_config` bandwidth check silently passes a NaN rate
 /// (comparisons against NaN are always false), and the value then reaches
@@ -996,30 +1387,41 @@ const MAX_HPSDR_RATE_HZ: f64 = 10_000_000.0;
 fn parse_hpsdr_rate_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --hpsdr-rate {s:?}: {e}"))?;
+        .map_err(|e| format!("invalid --hpsdr-rate-hz {s:?}: {e}"))?;
+    check_hpsdr_rate_hz("--hpsdr-rate-hz", hz)
+}
+
+/// `parse_hpsdr_rate_hz`'s check, un-gated so `[input] type = "hpsdr"`
+/// validates identically on every build (MAN-261).
+fn check_hpsdr_rate_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || !(MIN_HPSDR_RATE_HZ..=MAX_HPSDR_RATE_HZ).contains(&hz) {
         return Err(format!(
-            "--hpsdr-rate must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
+            "{name} must be a finite number of Hz between {MIN_HPSDR_RATE_HZ} and \
              {MAX_HPSDR_RATE_HZ}, got {hz}"
         ));
     }
     Ok(hz)
 }
 
-/// Clap value parser for `--hpsdr-freq`: rejects non-finite (NaN/infinity)
+/// Clap value parser for `--hpsdr-freq-hz`: rejects non-finite (NaN/infinity)
 /// and non-positive values at CLI-parse time, matching
 /// `parse_dial_freq_hz`'s pattern (round-2 review finding: an unvalidated
-/// `--hpsdr-freq NaN`/`inf` reaches `HpsdrConfig.center_freq_hz`, which is
-/// only length-checked, not value-checked, and then propagates into every
-/// emitted spot's frequency field).
+/// `--hpsdr-freq-hz NaN`/`inf` reaches `HpsdrConfig.center_freq_hz`, which
+/// is only length-checked, not value-checked, and then propagates into
+/// every emitted spot's frequency field).
 #[cfg(feature = "hpsdr")]
 fn parse_hpsdr_freq_hz(s: &str) -> std::result::Result<f64, String> {
     let hz: f64 = s
         .parse()
-        .map_err(|e| format!("invalid --hpsdr-freq {s:?}: {e}"))?;
+        .map_err(|e| format!("invalid --hpsdr-freq-hz {s:?}: {e}"))?;
+    check_hpsdr_freq_hz("--hpsdr-freq-hz", hz)
+}
+
+/// `parse_hpsdr_freq_hz`'s check, un-gated like `check_hpsdr_rate_hz`.
+fn check_hpsdr_freq_hz(name: &str, hz: f64) -> std::result::Result<f64, String> {
     if !hz.is_finite() || hz <= 0.0 {
         return Err(format!(
-            "--hpsdr-freq must be a finite, positive number of Hz, got {hz}"
+            "{name} must be a finite, positive number of Hz, got {hz}"
         ));
     }
     Ok(hz)
@@ -1048,9 +1450,15 @@ fn parse_replay_epoch(s: &str) -> std::result::Result<i64, String> {
     let secs: i64 = s
         .parse()
         .map_err(|e| format!("invalid --replay-epoch {s:?}: {e}"))?;
+    check_replay_epoch("--replay-epoch", secs)
+}
+
+/// `parse_replay_epoch`'s check, shared with `input.replay_epoch`
+/// (MAN-261); `name` is the flag or config key the message cites.
+fn check_replay_epoch(name: &str, secs: i64) -> std::result::Result<i64, String> {
     if !(0..=MAX_REPLAY_EPOCH_SECS).contains(&secs) {
         return Err(format!(
-            "--replay-epoch must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
+            "{name} must be Unix seconds between 0 and {MAX_REPLAY_EPOCH_SECS} \
              (2100-01-01), got {secs}"
         ));
     }
@@ -1075,11 +1483,13 @@ fn build_pipeline_config(
     allowlist: Vec<String>,
     blocklist: Option<PathBuf>,
     notch: Option<PathBuf>,
+    detector: manta_engine::DetectorConfig,
     engine: Engine,
 ) -> Result<PipelineConfig> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist,
+        detector,
         ..Default::default()
     };
     cfg.decode.engine = engine;
@@ -1096,27 +1506,13 @@ fn build_pipeline_config(
     Ok(cfg)
 }
 
-/// Loads the `[decode]` TOML table (SPEC v2 §7) from `--server-config`, if
-/// given, into a full `manta_decode::decoder::DecodeConfig`. Parses the
-/// same file's raw text a SECOND time, independent of
-/// `manta_server::config::DaemonConfigFile` -- that struct deliberately
-/// does not model `[decode]` (see its own doc comment), and re-parsing the
-/// same text into a separately-modeled top-level table is the existing
-/// pattern for this unified daemon config (`ServerConfig`/`RbnUplinkConfig`
-/// already work this way). `Ok(DecodeConfig::default())` when no
-/// `--server-config` path is given, matching `PipelineConfig::default()`'s
-/// own decode baseline.
-fn load_decode_config_file(
-    server_config: Option<&Path>,
+/// Range-checks a `[decode]` table (SPEC v2 §7) loaded by `config::load`
+/// from `origin` (the config file's path, or "environment"). Every message
+/// names `origin`; `config::load` adds no context layer on top.
+fn validate_decode_config(
+    cfg: manta_decode::decoder::DecodeConfig,
+    origin: &str,
 ) -> Result<manta_decode::decoder::DecodeConfig> {
-    let Some(path) = server_config else {
-        return Ok(manta_decode::decoder::DecodeConfig::default());
-    };
-    let cfg_text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading --server-config {}", path.display()))?;
-    let file: manta_decode::config_file::DecodeConfigFile = toml::from_str(&cfg_text)
-        .with_context(|| format!("parsing [decode] table in {}", path.display()))?;
-    let cfg = file.decode.into_decode_config();
     // Codex review, PR #161: `fallback_hops = 0` deserializes successfully (it's a
     // plain u32 with no serde-level range check) but Evidence::push's anchor
     // computation divides by it (`self.hop_out % self.cfg.fallback_hops as u64`),
@@ -1127,7 +1523,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] fallback_hops must be nonzero in {} (0 would divide by zero on the \
              first evidence hop)",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 2: `tau_hi_bounds_ms = [400, 100]` (or any
@@ -1143,14 +1539,14 @@ fn load_decode_config_file(
             "[decode] tau_hi_bounds_ms must be a finite [low, high] pair with 0 < low <= high \
              in {} (got [{tau_hi_lo}, {tau_hi_hi}], which would panic in f64::clamp on the \
              first speed update)",
-            path.display()
+            origin
         );
     }
     if !cfg.demod.tau_lo_ms.is_finite() || cfg.demod.tau_lo_ms <= 0.0 {
         bail!(
             "[decode] tau_lo_ms must be a finite, positive number of milliseconds in {} \
              (got {})",
-            path.display(),
+            origin,
             cfg.demod.tau_lo_ms
         );
     }
@@ -1172,14 +1568,14 @@ fn load_decode_config_file(
         bail!(
             "[decode] timing_sigma must be finite and >= {MIN_TIMING_SIGMA} in {} (got {}; \
              smaller values can underflow log_likelihood's denominator to a NaN score)",
-            path.display(),
+            origin,
             cfg.beam.sigma
         );
     }
     if cfg.beam.width == 0 {
         bail!(
             "[decode] beam_width must be nonzero in {} (0 disables the beam decoder entirely)",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 3: `[decode] beam = 0` (the hsmm
@@ -1194,7 +1590,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] hsmm beam must be nonzero in {} (0 empties the live hypothesis set on the \
              first anchor step, silently emitting no decoded text)",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 4: `sigma_u = 0` puts a hop exactly on
@@ -1213,7 +1609,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] sigma_u must be finite and >= {MIN_SIGMA_U} in {} (got {}; smaller values \
              can underflow the LLR denominator to 0/0)",
-            path.display(),
+            origin,
             cfg.evidence.sigma_u
         );
     }
@@ -1228,7 +1624,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] seed_units_hops must have at least one entry in {} (an empty list seeds \
              zero tokens at every keying onset, silently emitting no decoded text)",
-            path.display()
+            origin
         );
     }
     if let Some(bad) = cfg
@@ -1239,7 +1635,7 @@ fn load_decode_config_file(
     {
         bail!(
             "[decode] every seed_units_hops entry must be finite and positive in {} (got {bad})",
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 18: a seed outside the decoder's
@@ -1260,7 +1656,7 @@ fn load_decode_config_file(
              valid initial mark transition for any real signal)",
             cfg.hsmm.u_min,
             cfg.hsmm.u_max,
-            path.display()
+            origin
         );
     }
     // Codex review, PR #161 round 4: `conf_kappa = 0` makes the common
@@ -1272,7 +1668,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] conf_kappa must be finite and strictly positive in {} (got {}; 0 makes the \
              no-competing-hypothesis confidence path compute 0/0)",
-            path.display(),
+            origin,
             cfg.hsmm.conf_kappa
         );
     }
@@ -1290,7 +1686,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] dur_sigma must be finite and >= {MIN_DUR_SIGMA} in {} (got {}; smaller \
              values can underflow log_dur_prior's denominator to 0/0)",
-            path.display(),
+            origin,
             cfg.hsmm.dur_sigma
         );
     }
@@ -1308,7 +1704,7 @@ fn load_decode_config_file(
     if !cfg.evidence.hold_dits.is_finite() || cfg.evidence.hold_dits <= 0.0 || !max_h.is_finite() {
         bail!(
             "[decode] hold_dits must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.evidence.hold_dits
         );
     }
@@ -1327,7 +1723,7 @@ fn load_decode_config_file(
              Evidence's internal retention cap ({}), silently truncating the delay line and \
              discarding evidence centers",
             cfg.evidence.hold_dits,
-            path.display(),
+            origin,
             cfg.hsmm.u_max,
             manta_decode::evidence::MAX_RETAIN,
         );
@@ -1342,7 +1738,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] speed_alpha must be finite in {} (got {}; a non-finite value poisons \
              every subsequent speed update and duration prior with NaN)",
-            path.display(),
+            origin,
             cfg.hsmm.speed_alpha
         );
     }
@@ -1355,7 +1751,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] speed_alpha must be nonnegative in {} (got {}; a negative gain moves the \
              speed estimate away from observed durations instead of toward them)",
-            path.display(),
+            origin,
             cfg.hsmm.speed_alpha
         );
     }
@@ -1367,7 +1763,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] mark_insert_penalty must be finite in {} (got {}; a non-finite value \
              poisons every Dit/Dah transition's score with NaN)",
-            path.display(),
+            origin,
             cfg.hsmm.mark_insert_penalty
         );
     }
@@ -1379,7 +1775,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] noise_min_bias_db must be finite in {} (got {}; a non-finite value makes \
              every temporal noise estimate infinite, silently closing the evidence gate)",
-            path.display(),
+            origin,
             cfg.noise.noise_min_bias_db
         );
     }
@@ -1394,7 +1790,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] spectral_min_bias_db must be finite in {} (got {}; a non-finite value \
              makes every spectral noise estimate infinite, silently closing the evidence gate)",
-            path.display(),
+            origin,
             cfg.noise.spectral_min_bias_db
         );
     }
@@ -1402,7 +1798,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] spectral_beta must be finite in {} (got {}; a non-finite value makes \
              every spectral noise estimate infinite, silently closing the evidence gate)",
-            path.display(),
+            origin,
             cfg.noise.spectral_beta
         );
     }
@@ -1418,7 +1814,7 @@ fn load_decode_config_file(
             "[decode] spectral_beta must be nonnegative in {} (got {}; a negative value makes \
              the spectral term always lose to max(), silently disabling the spectral \
              noise discount)",
-            path.display(),
+            origin,
             cfg.noise.spectral_beta
         );
     }
@@ -1432,7 +1828,7 @@ fn load_decode_config_file(
             "[decode] lookahead_dits must be finite and nonnegative in {} (got {}; a negative \
              value forces every non-consensus entry immediately, and a non-finite value \
              disables forced commits entirely)",
-            path.display(),
+            origin,
             cfg.hsmm.lookahead_dits
         );
     }
@@ -1445,47 +1841,49 @@ fn load_decode_config_file(
     if !cfg.noise.noise_window_ms.is_finite() || cfg.noise.noise_window_ms <= 0.0 {
         bail!(
             "[decode] noise_window_ms must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.noise.noise_window_ms
         );
     }
     // Codex review, PR #161 round 4: the remaining newly-exposed v1 §9
-    // fields have the same class of gap -- `hyst_up`/`hyst_down` reaching
-    // `Demod::step`'s `a < hyst_down * t` / `a > hyst_up * t` comparisons
-    // with NaN makes every comparison false (Legacy silently emits nothing
-    // at all, no error, no panic); a non-positive or inverted hysteresis
-    // band (hyst_up <= hyst_down) breaks the open/close asymmetry
-    // hysteresis exists for; `flush_gap_dits <= 0` forces an instant/
-    // premature word flush on every hop. Validate all of them here too,
-    // for the same reason as every check above: this is the one place a
-    // `[decode]` table from disk enters the process.
-    if !cfg.demod.hyst_up.is_finite() || !cfg.demod.hyst_down.is_finite() {
+    // fields have the same class of gap -- `hyst_frac` reaching
+    // `Demod::decision_band`'s `hyst_frac * (e_hi - lo)` with NaN makes
+    // every keying comparison false (Legacy silently emits nothing at all,
+    // no error, no panic); a non-positive or too-wide band (hyst_frac <= 0
+    // collapses the band to a single point, no hysteresis at all;
+    // hyst_frac >= 0.5 pushes the band's outer edges to or past the rails
+    // themselves) breaks the open/close asymmetry hysteresis exists for
+    // (MAN-103 replaced the multiplicative `hyst_up`/`hyst_down` pair with
+    // this single additive fraction; see `envelope.rs`'s
+    // `DemodConfig::hyst_frac` doc comment); `flush_gap_dits <= 0` forces
+    // an instant/premature word flush on every hop. Validate all of them
+    // here too, for the same reason as every check above: this is the one
+    // place a `[decode]` table from disk enters the process.
+    if !cfg.demod.hyst_frac.is_finite() {
         bail!(
-            "[decode] hyst_up/hyst_down must be finite in {} (got hyst_up={}, hyst_down={})",
-            path.display(),
-            cfg.demod.hyst_up,
-            cfg.demod.hyst_down
+            "[decode] hyst_frac must be finite in {} (got {})",
+            origin,
+            cfg.demod.hyst_frac
         );
     }
-    if cfg.demod.hyst_down <= 0.0 || cfg.demod.hyst_up <= cfg.demod.hyst_down {
+    if cfg.demod.hyst_frac <= 0.0 || cfg.demod.hyst_frac >= 0.5 {
         bail!(
-            "[decode] hyst_up must be > hyst_down > 0 in {} (got hyst_up={}, hyst_down={})",
-            path.display(),
-            cfg.demod.hyst_up,
-            cfg.demod.hyst_down
+            "[decode] hyst_frac must be > 0.0 and < 0.5 in {} (got {})",
+            origin,
+            cfg.demod.hyst_frac
         );
     }
     if !cfg.demod.debounce_ms.is_finite() || cfg.demod.debounce_ms <= 0.0 {
         bail!(
             "[decode] debounce_ms must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.demod.debounce_ms
         );
     }
     if !cfg.flush_gap_dits.is_finite() || cfg.flush_gap_dits <= 0.0 {
         bail!(
             "[decode] flush_gap_dits must be finite and positive in {} (got {})",
-            path.display(),
+            origin,
             cfg.flush_gap_dits
         );
     }
@@ -1497,7 +1895,7 @@ fn load_decode_config_file(
         bail!(
             "[decode] llr_clip must be finite and positive in {} (got {}; f32::clamp panics on \
              a negative or non-finite bound)",
-            path.display(),
+            origin,
             cfg.evidence.llr_clip
         );
     }
@@ -1518,11 +1916,18 @@ fn load_decode_config_file(
         bail!(
             "[decode] refine_bw_hz must be finite and nonnegative in {} (got {}; use 0.0 to \
              disable refinement, not a negative value)",
-            path.display(),
+            origin,
             cfg.refine_bw_hz
         );
     }
     Ok(cfg)
+}
+
+/// Test-only entry point over the production loader (`config::load`), kept
+/// so the `[decode]` validation tests exercise the real path unmodified.
+#[cfg(test)]
+fn load_decode_config_file(config: Option<&Path>) -> Result<manta_decode::decoder::DecodeConfig> {
+    Ok(config::load(config, config::Env::Ignore)?.decode)
 }
 
 /// SPEC v2 §7: an explicit `--engine` flag overrides the `[decode]` table's
@@ -1544,13 +1949,6 @@ fn merge_cli_engine(
 struct SpotServer {
     bus: std::sync::Arc<manta_server::bus::SpotBus>,
     metrics: std::sync::Arc<manta_server::metrics::Metrics>,
-    /// The metrics/status HTTP listener's real bound address (MAN-44) --
-    /// captured from `TcpListener::local_addr()` so a port-0 (OS-assigned)
-    /// bind is still reachable by `manta status`/tests without guessing or
-    /// binding a fixed port (CLAUDE.md multi-agent hygiene: don't bind
-    /// fixed ports).
-    #[cfg_attr(not(test), allow(dead_code))]
-    metrics_addr: std::net::SocketAddr,
     /// Signals the telnet/JSON/WS client tasks to drain their already-
     /// queued spots and exit, instead of being forcibly cut off by
     /// `Runtime::shutdown_timeout`'s raw deadline with no chance to finish
@@ -1575,34 +1973,38 @@ struct SpotServer {
     /// life of the process, so re-running the same binary search on every
     /// spot only re-derives a constant.
     station_geography_unresolved: bool,
+    /// MAN-122 review round 4 (P2): the periodic status task's `JoinHandle`
+    /// is RETAINED, not discarded, so the shutdown sequence can AWAIT the
+    /// task's actual exit right after `shutdown_tx.send(true)` and before
+    /// the client drain begins. The task's own two shutdown guards (a
+    /// `biased` select and a re-borrow after the sleep) still leave a
+    /// check-to-log window: shutdown can be signalled between the second
+    /// borrow returning `false` and the `tracing::info!` that follows, so a
+    /// status line could still land in the middle of the drain. Awaiting
+    /// the handle here is what makes shutdown and emission mutually
+    /// ordered -- once the join returns, the task is gone and no further
+    /// line can be emitted. `None` when the status line is disabled
+    /// (`status_interval_secs = 0`), in which case there is nothing to
+    /// await. `Mutex<Option<..>>` because shutdown only ever holds
+    /// `&SpotServer` and must `take()` the handle to join it.
+    status_line: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The metrics/status HTTP listener's real bound address (MAN-44),
+    /// from `TcpListener::local_addr()`, so a port-0 bind is reachable by
+    /// tests without guessing or binding a fixed port.
+    #[cfg_attr(not(test), allow(dead_code))]
+    metrics_addr: std::net::SocketAddr,
 }
 
-/// True when `SpotMessage::from_spot` would emit the `UNKNOWN_DXCC` /
-/// `UNKNOWN_CONTINENT` / `UNKNOWN_CQ_ZONE` sentinels for `callsign`, i.e.
-/// exactly the condition `manta_spots_unresolved_geography_total` counts.
-///
-/// Deliberately keyed on the RESOLVED ADIF entity number, not merely on
-/// whether `lookup` returned an entry: `from_spot` emits `UNKNOWN_DXCC` on
-/// `dx.and_then(|e| e.dxcc).is_none()`, which is also true when `cty.dat`
-/// resolves the call but the vendored `dxcc.tsv` has no row for its primary
-/// prefix -- the drift state that arises when `cty.dat` is hand-refreshed
-/// (data/SOURCES.md) without regenerating the TSV. Counting `lookup`
-/// alone would let those spots go out carrying `dxDxcc: -1` with the
-/// counter still at zero, silently withholding the one signal this metric
-/// exists to give (round-1 validate code-review finding 1).
-///
-/// A maritime-mobile (`/MM`) or aeronautical-mobile (`/AM`) call counts too
-/// (round-7 review finding 2): `cty.lookup` answers for it through the base
-/// call's prefix, but `from_spot` deliberately discards that answer and emits
-/// `UNKNOWN_CONTINENT`/`UNKNOWN_CQ_ZONE` with null lat/lon -- the station's
-/// real position is unknown -- so the spot does carry the sentinels this
-/// counter is defined over. Its `dxDxcc` is ADIF's `NO_DXCC_ENTITY` (0)
-/// rather than `UNKNOWN_DXCC`, which is why the entity number alone can't be
-/// the whole test.
-fn geography_is_unresolved(cty: &manta_spot::cty::Table, callsign: &str) -> bool {
-    manta_server::spot_message::is_outside_any_dxcc_entity(callsign)
-        || cty.lookup(callsign).and_then(|e| e.dxcc).is_none()
-}
+// MAN-89 (PR #131 review, round 7): the "would `from_spot` emit the
+// `UNKNOWN_*` sentinels?" predicate that
+// `manta_spots_unresolved_geography_total` is defined over used to be
+// defined HERE, one crate away from the `SpotMessage::from_spot` it has to
+// agree with -- and it drifted: the station side was classified from the raw
+// configured `station_callsign` while `from_spot` resolved the SSID-stripped
+// one. It now lives beside that code in `manta-server::spot_message`, with
+// the station-side entry point doing the stripping itself so no call site
+// can forget it.
+use manta_server::spot_message::{geography_is_unresolved, station_geography_unresolved};
 
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
 /// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
@@ -1757,6 +2159,34 @@ const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// costs one relaxed atomic load per tick.
 const ACTIVE_TRACKS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// MAN-73: the `manta_source_health` sink a `ReconnectingSource` reports
+/// through. The unhealthy transition also zeroes the shared active-track
+/// gauge (PR #207 review): for the whole outage `listen()` is blocked in
+/// the reconnecting `read()`, so it can't publish a count itself, and the
+/// poller above would keep exporting the pre-drop tracks -- MAN-45's ghost
+/// count. `listen()` publishes the real count again after its first
+/// post-reconnect chunk.
+fn source_health_sink(
+    name: &'static str,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+    active_tracks: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> reconnect::HealthSink {
+    Box::new(move |healthy| {
+        if !healthy {
+            if let Some(gauge) = &active_tracks {
+                gauge.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(metrics) = &metrics {
+            metrics.set_source_health(name, healthy);
+        }
+    })
+}
+/// How often the daemon copies the engine's decode-latency observer into
+/// `Metrics` (MAN-128). Same bridge shape and tuning rationale as
+/// `ACTIVE_TRACKS_POLL_INTERVAL`.
+const DECODE_LATENCY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Shuts down `rt`, first AWAITING (not just giving scheduler time to)
 /// every spawned client-connection task tracked in `tasks`, bounded by
 /// `SHUTDOWN_DRAIN_DEADLINE`. `Runtime::shutdown_timeout`'s `duration`
@@ -1784,6 +2214,46 @@ fn shutdown_runtime_after_drain(
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
 }
 
+/// What the MAN-122 startup banner names about the live source; carried as
+/// one struct so `start_spot_server`'s argument list stays at four.
+struct SourceInfo<'a> {
+    name: &'a str,
+    sample_rate_hz: f64,
+    /// Also the RF centre the MAN-86 `SKIMMER/SETT` segments are derived
+    /// around (`IqSource::center_freq_hz`, after any `--dial-freq-hz`
+    /// override).
+    dial_freq_hz: f64,
+    /// MAN-86 review: deliberately SEPARATE from `sample_rate_hz`, not
+    /// derived from it. `sample_rate_hz` is the per-sample timing quantity
+    /// `SpotBus` needs to turn a sample index into wall clock;
+    /// `rf_passband_hz` is the `(lo, hi)` offsets from `dial_freq_hz` of
+    /// the spectrum the receiver actually delivers, and only that may be
+    /// advertised to Aggregator as decodable coverage. The two differ for
+    /// any resampling source, and the passband is not even symmetric for a
+    /// rig-audio source -- see `IqSource::rf_passband_hz`.
+    rf_passband_hz: (f64, f64),
+    /// The same multiplicative factor `manta-engine::listen` applies to
+    /// every emitted spot frequency (`--freq-correction-ppm`). MAN-86
+    /// review: the advertised segments have to move with the spots, or at
+    /// the supported +/-1000 ppm limit manta advertises bounds that exclude
+    /// frequencies from its own spot stream.
+    freq_calibration: f64,
+}
+
+/// MAN-128: the engine's `DecodeLatencySnapshot` and `manta-server`'s
+/// `LatencyHistogram` are deliberately disjoint types (the same dependency-
+/// free-`manta-server` boundary `input_health_of` crosses above) -- this is
+/// where the engine's bucket bounds get attached to its own snapshot.
+fn latency_histogram_of(
+    s: &manta_engine::DecodeLatencySnapshot,
+) -> manta_server::metrics::LatencyHistogram {
+    manta_server::metrics::LatencyHistogram {
+        bounds_seconds: manta_engine::DECODE_LATENCY_BUCKETS_SECONDS.to_vec(),
+        bucket_counts: s.bucket_counts.clone(),
+        sum_seconds: s.sum_seconds,
+    }
+}
+
 /// How often the daemon samples an input source's `InputHealthCounters`
 /// into `Metrics` (MAN-56). An order of magnitude below any realistic
 /// Prometheus scrape interval, so a scrape never sees more than ~1 s of
@@ -1808,9 +2278,93 @@ fn input_health_of(
     }
 }
 
+/// MAN-128: feeds `manta_build_info`. `git_sha` comes from `build.rs`
+/// (`MANTA_GIT_SHA`, "unknown" with no `.git` -- e.g. a Docker build
+/// context, which `.dockerignore` excludes it from). Deliberately separate
+/// from `decoder_version` below: that string is the JSON spot wire
+/// contract and a byte-identical-replay input, neither of which may vary
+/// with the commit a binary happens to be built from.
+fn daemon_build_info() -> manta_server::metrics::BuildInfo {
+    let mut features = Vec::new();
+    if cfg!(feature = "hpsdr") {
+        features.push("hpsdr");
+    }
+    if cfg!(feature = "soapy") {
+        features.push("soapy");
+    }
+    manta_server::metrics::BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_sha: env!("MANTA_GIT_SHA").to_string(),
+        features: if features.is_empty() {
+            "none".to_string()
+        } else {
+            features.join(",")
+        },
+    }
+}
+
+/// The identity and `SKIMMER/SETT` settings every telnet client is told
+/// about this station. Split out of `start_spot_server` (which can only be
+/// exercised through a real bound listener) so the source-to-SETT wiring
+/// itself is unit-testable -- MAN-86 review found two ways for it to
+/// advertise coverage manta cannot actually hear, and neither was visible
+/// from `sett.rs`'s own tests.
+fn station_profile(
+    cfg: &manta_server::config::ServerConfig,
+    center_freq_hz: f64,
+    rf_passband_hz: (f64, f64),
+    freq_calibration: f64,
+) -> manta_server::telnet::StationProfile {
+    manta_server::telnet::StationProfile {
+        call: cfg.station_callsign.clone(),
+        operator_name: cfg.operator_name.clone(),
+        operator_qth: cfg.operator_qth.clone(),
+        operator_grid: cfg.operator_grid.clone(),
+        sett: manta_server::sett::SettSettings {
+            validation_level: manta_server::sett::ValidationLevel::Normal,
+            cq_only: false,
+            segments: manta_server::sett::segments_for_passband(
+                center_freq_hz,
+                rf_passband_hz,
+                freq_calibration,
+            ),
+        },
+    }
+}
+
+/// The three listener names `/healthz`/`manta_listener_up` track (MAN-128)
+/// -- named constants so `set_listener_up`'s and `spawn_tracked_listener`'s
+/// call sites below can't drift apart via a typo in one of the two paired
+/// string literals (code-review finding, round 1).
+const LISTENER_TELNET: &str = "telnet";
+const LISTENER_JSON: &str = "json";
+const LISTENER_METRICS: &str = "metrics";
+
+/// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
+/// the moment that task ends, whether by panic or by returning (the
+/// daemon's own listener loops only return via `shutdown_tx`, but a
+/// probe reading `manta_listener_up`/`/healthz` during the drain that
+/// follows should see the true state, not a stale "up"). `name` is
+/// `&'static str` because it's always one of the three fixed listener
+/// names below, never operator-supplied.
+fn spawn_tracked_listener(
+    name: &'static str,
+    metrics: std::sync::Arc<manta_server::metrics::Metrics>,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let handle = tokio::spawn(fut);
+    tokio::spawn(async move {
+        if let Err(err) = handle.await {
+            tracing::error!(listener = name, error = %err, "listener task panicked");
+        }
+        metrics.set_listener_up(name, false);
+    });
+}
+
 fn start_spot_server(
-    config_path: &std::path::Path,
-    sample_rate_hz: f64,
+    cfg: manta_server::config::ServerConfig,
+    rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
+    source: SourceInfo<'_>,
     epoch: std::time::SystemTime,
     session_nonce: u128,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
@@ -1841,33 +2395,71 @@ fn start_spot_server(
         )
         .try_init();
 
-    let cfg_text = std::fs::read_to_string(config_path)?;
-    let file: manta_server::config::DaemonConfigFile = toml::from_str(&cfg_text)?;
-    let rbn_uplink_cfgs = file.rbn_uplink.clone();
-    let cfg = file.server;
-
+    // MAN-261: `[server]`/`[[rbn_uplink]]` arrive already parsed and
+    // validated by `config::load`, before any source was opened.
     let bus = std::sync::Arc::new(manta_server::bus::SpotBus::new(
-        sample_rate_hz,
+        source.sample_rate_hz,
         epoch,
         session_nonce,
     ));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
+    metrics.set_build_info(daemon_build_info());
     let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
+    // MAN-128: stays SHA-free and feature-free on purpose -- this is the
+    // JSON spot wire contract (ARCHITECTURE §7) and a byte-identical-
+    // replay input (AGENTS.md's "file input -> byte-identical spot logs"
+    // hard requirement), neither of which may vary with the commit or
+    // build flags a given binary happens to carry. `manta_build_info`
+    // above is the right place for that information instead.
     let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let metrics_addr = rt.block_on(async {
+    let (status_line, metrics_addr) = rt.block_on(async {
         let telnet_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
         let json_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
         let metrics_listener =
             tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
-        // Captured before the listener moves into metrics_http::serve
-        // below (MAN-44) -- see SpotServer::metrics_addr's doc comment.
         let metrics_addr = metrics_listener.local_addr()?;
+
+        // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
+        // failure never produces a banner at all) but BEFORE any listener task is
+        // spawned -- on a multi-thread runtime a spawned accept loop can admit a
+        // client immediately, and its per-connection line would otherwise be able
+        // to land ahead of the banner. `local_addr()`, not the configured port,
+        // so a `*_port = 0` (ephemeral) config still names the real address.
+        //
+        // Review round 2: this line says `listening:`, not `ready:`. Three
+        // bound sockets are not evidence that anything will ever be decoded --
+        // a replay shorter than `manta_engine`'s two-second calibration window,
+        // or a live source that fails its first reads, exits here with the
+        // pipeline never having started. The readiness event proper is emitted
+        // from the decode loop's first batch (see `format_pipeline_ready`'s
+        // call site).
+        tracing::info!(
+            "{}",
+            manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                source: source.name,
+                sample_rate_hz: source.sample_rate_hz,
+                dial_freq_hz: source.dial_freq_hz,
+                station_callsign: &cfg.station_callsign,
+                telnet_addr: telnet_listener.local_addr()?,
+                json_addr: json_listener.local_addr()?,
+                metrics_addr: metrics_listener.local_addr()?,
+            })
+        );
+
+        // MAN-128: all three binds above already succeeded (a failed bind
+        // returns via `?` before this point), so every listener starts
+        // "up" -- `spawn_tracked_listener` below flips each back to "down"
+        // the moment its own task actually ends.
+        metrics.set_listener_up(LISTENER_TELNET, true);
+        metrics.set_listener_up(LISTENER_JSON, true);
+        metrics.set_listener_up(LISTENER_METRICS, true);
 
         let telnet_ip_command_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::telnet::MAX_TELNET_COMMANDS,
@@ -1875,103 +2467,132 @@ fn start_spot_server(
             cfg.telnet_max_commands_per_ip,
         );
         manta_server::rate_limit::spawn_stale_entry_reaper(telnet_ip_command_limiter.clone());
-        tokio::spawn(manta_server::telnet::serve(
-            telnet_listener,
-            bus.clone(),
-            metrics.clone(),
-            cfg.station_callsign.clone(),
-            shutdown_rx.clone(),
-            tasks.clone(),
-            manta_server::tasks::new_connection_limiter(
-                manta_server::telnet::MAX_TELNET_CONNECTIONS,
-            ),
-            manta_server::tasks::IpQuota::new_with_override(
-                manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
-                cfg.telnet_max_connections_per_ip,
-            ),
-            telnet_ip_command_limiter,
-            manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        // MAN-86: Aggregator will not forward spots from a source that
+        // never answers SKIMMER/SETT (Aggregator manual v6.0 §9.2) --
+        // `profile` carries the operator identity for the greeting banner
+        // and the live-passband segments for the SETT reply.
+        if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
+            tracing::warn!(
+                "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
+                 operator_grid so RBN Aggregator can record this node's location \
+                 (Aggregator manual v6.0 §9.2)"
+            );
+        }
+        let profile = std::sync::Arc::new(station_profile(
+            &cfg,
+            source.dial_freq_hz,
+            source.rf_passband_hz,
+            source.freq_calibration,
         ));
+        spawn_tracked_listener(
+            LISTENER_TELNET,
+            metrics.clone(),
+            manta_server::telnet::serve(
+                telnet_listener,
+                bus.clone(),
+                metrics.clone(),
+                profile,
+                shutdown_rx.clone(),
+                tasks.clone(),
+                manta_server::tasks::new_connection_limiter(
+                    manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                ),
+                manta_server::tasks::IpQuota::new_with_override(
+                    manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                    cfg.telnet_max_connections_per_ip,
+                ),
+                telnet_ip_command_limiter,
+                manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                cfg.line_format,
+            ),
+        );
         let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
             manta_server::json_stream::MAX_INBOUND_PINGS,
             manta_server::json_stream::PING_RATE_WINDOW,
             cfg.json_max_pings_per_ip,
         );
         manta_server::rate_limit::spawn_stale_entry_reaper(json_ip_ping_limiter.clone());
-        tokio::spawn(manta_server::json_stream::serve(
-            json_listener,
-            manta_server::json_stream::JsonStreamConfig {
-                bus: bus.clone(),
-                metrics: metrics.clone(),
-                cty: cty.clone(),
-                station_call: cfg.station_callsign.clone(),
-                decoder_version,
-                // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
-                // need shutdown_rx -- can't let this be the moving consumer
-                // anymore now that there are more consumers.
-                shutdown: shutdown_rx.clone(),
-                drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
-            },
-            tasks.clone(),
-            manta_server::tasks::new_connection_limiter(
-                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+        spawn_tracked_listener(
+            LISTENER_JSON,
+            metrics.clone(),
+            manta_server::json_stream::serve(
+                json_listener,
+                manta_server::json_stream::JsonStreamConfig {
+                    bus: bus.clone(),
+                    metrics: metrics.clone(),
+                    cty: cty.clone(),
+                    station_call: cfg.station_callsign.clone(),
+                    decoder_version,
+                    // .clone(): MAN-32/MAN-42's uplink::serve spawns below also
+                    // need shutdown_rx -- can't let this be the moving consumer
+                    // anymore now that there are more consumers.
+                    shutdown: shutdown_rx.clone(),
+                    drain_deadline: manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                },
+                tasks.clone(),
+                manta_server::tasks::new_connection_limiter(
+                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS,
+                ),
+                manta_server::tasks::IpQuota::new_with_override(
+                    manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
+                    cfg.json_max_connections_per_ip,
+                ),
+                json_ip_ping_limiter,
             ),
-            manta_server::tasks::IpQuota::new_with_override(
-                manta_server::json_stream::MAX_JSON_STREAM_CONNECTIONS_PER_IP,
-                cfg.json_max_connections_per_ip,
-            ),
-            json_ip_ping_limiter,
-        ));
+        );
         // Reaps completed per-client tasks continuously, independent of
         // shutdown -- without this, `tasks` only ever shrinks at
         // shutdown_runtime_after_drain's one-time `await_all`, so ordinary
         // connect/disconnect churn grows it without bound for the life of
         // the process (round-11 review finding).
         manta_server::tasks::spawn_reaper(tasks.clone());
-        // MAN-44 review: the ENTIRE uplink registry is published before
-        // `metrics_http::serve` is spawned below, never after. This is a
-        // multi-thread runtime, so the metrics/status endpoint starts
-        // accepting on another worker the instant its task is spawned --
-        // a readiness probe that raced this loop could observe a
-        // half-registered (or empty) registry and be told `disabled`, or
-        // a healthy-looking subset, for a daemon whose configured
-        // targets are in fact down. Registering first makes "every
-        // configured target is visible" true before the endpoint that
-        // reports it can be reached at all. The uplink tasks themselves
-        // are spawned afterwards -- a registered-but-not-yet-connected
-        // target reads as down/flapping, which is the honest answer
-        // during startup, whereas an unregistered one reads as
-        // not-configured, which is a lie.
-        let uplink_specs = manta_server::uplink::target_specs(&rbn_uplink_cfgs);
+        // MAN-44: the WHOLE uplink registry is published before the
+        // metrics/status endpoint is spawned below. On this multi-thread
+        // runtime that endpoint accepts on another worker the instant its
+        // task is spawned, so a probe racing a later registration loop
+        // could read a half-registered (or empty) registry and be told
+        // `disabled` -- `manta status` exit 0 -- for a daemon whose
+        // configured targets are in fact down. Registered-but-unconnected
+        // reads as down, the honest startup answer. `target_labels`
+        // assigns the Prometheus label (`host:port`, `#N`-suffixed only on
+        // an exact duplicate; MAN-128 D7).
+        let uplink_labels = manta_server::uplink::target_labels(&rbn_uplink_cfgs);
+        let enabled_uplinks = rbn_uplink_cfgs.iter().filter(|u| u.enabled).count();
         let uplink_tasks: Vec<_> = rbn_uplink_cfgs
             .into_iter()
-            .zip(uplink_specs)
-            .map(|(uplink_cfg, spec)| (uplink_cfg, metrics.register_uplink_target(spec)))
+            .zip(uplink_labels)
+            .map(|(uplink_cfg, label)| {
+                let target = metrics.register_uplink_target(label, uplink_cfg.enabled);
+                (uplink_cfg, target)
+            })
             .collect();
-        tokio::spawn(manta_server::metrics_http::serve(
-            metrics_listener,
+        spawn_tracked_listener(
+            LISTENER_METRICS,
             metrics.clone(),
-            manta_server::tasks::new_connection_limiter(
-                manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+            manta_server::metrics_http::serve(
+                metrics_listener,
+                metrics.clone(),
+                manta_server::tasks::new_connection_limiter(
+                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+                ),
+                manta_server::tasks::IpQuota::new_with_override(
+                    manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+                    cfg.metrics_max_connections_per_ip,
+                ),
             ),
-            manta_server::tasks::IpQuota::new_with_override(
-                manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
-                cfg.metrics_max_connections_per_ip,
-            ),
-        ));
-        // MAN-32/MAN-42/MAN-44: one independent uplink::serve task per
-        // configured [[rbn_uplink]] entry -- the common case for existing
-        // single-node operators is no [[rbn_uplink]] tables at all (empty
-        // Vec, loop body never runs), and uplink::serve itself also
-        // no-ops when `enabled = false` (belt-and-suspenders, not a
-        // duplicate check: this loop additionally avoids spawning a task
-        // at all when the Vec is empty). Each task owns its own SpotBus
-        // subscription and backoff state, so one target being down never
-        // affects another's delivery or retry timing. Registered BEFORE
-        // spawning (MAN-44, loop above) -- so a target that is disabled,
-        // or that never manages a single successful connection, still
-        // appears in `manta status`: an operator must be able to tell
-        // "configured and stuck" from "not configured at all".
+        );
+        // MAN-32/MAN-42: one independent uplink::serve task per configured
+        // [[rbn_uplink]] entry -- the common case for existing single-node
+        // operators is no [[rbn_uplink]] tables at all (empty Vec, loop
+        // body never runs), and uplink::serve itself also no-ops when
+        // `enabled = false` (belt-and-suspenders, not a duplicate check:
+        // this loop additionally avoids spawning a task at all when the
+        // Vec is empty). Each task owns its own SpotBus subscription and
+        // backoff state, so one target being down never affects another's
+        // delivery or retry timing.
+        // MAN-128 D6/D7: each target was registered above, before both its
+        // `serve` task and the metrics endpoint, so a scrape landing before
+        // the first connect attempt still sees it.
         for (uplink_cfg, target) in uplink_tasks {
             tokio::spawn(manta_server::uplink::serve(
                 uplink_cfg,
@@ -1982,7 +2603,20 @@ fn start_spot_server(
             ));
         }
 
-        anyhow::Ok(metrics_addr)
+        // MAN-122 scenario 2. The handle travels out of this block and
+        // into `SpotServer::status_line` so shutdown can join the task --
+        // see that field's doc comment.
+        let status_line = manta_server::status::spawn_status_line(
+            metrics.clone(),
+            cfg.status_interval_secs
+                .map_or(manta_server::status::DEFAULT_STATUS_INTERVAL, |secs| {
+                    std::time::Duration::from_secs(secs)
+                }),
+            enabled_uplinks,
+            shutdown_rx.clone(),
+        );
+
+        anyhow::Ok((status_line, metrics_addr))
     })?;
 
     Ok((
@@ -1990,18 +2624,327 @@ fn start_spot_server(
         SpotServer {
             bus,
             metrics,
-            metrics_addr,
             shutdown_tx,
             tasks,
-            station_geography_unresolved: geography_is_unresolved(&cty, &cfg.station_callsign),
+            // MAN-89: `station_geography_unresolved` strips the RBN `-N`
+            // per-band SSID itself, so this flag is classified through the
+            // SAME string `SpotMessage::from_spot` resolves the de side
+            // through -- see its doc comment for what an unstripped
+            // classification costs.
+            station_geography_unresolved: station_geography_unresolved(&cty, &cfg.station_callsign),
             cty,
+            status_line: std::sync::Mutex::new(status_line),
+            metrics_addr,
         },
     ))
 }
 
+/// The command line's say in source/input/spot selection, before it is
+/// merged over the config file and environment (`resolve`, MAN-261).
+struct CliOverrides {
+    device: Option<String>,
+    source: Option<PathBuf>,
+    source_iq: bool,
+    kiwi: KiwiOpts,
+    #[cfg(feature = "soapy")]
+    soapy: SoapyOpts,
+    #[cfg(feature = "hpsdr")]
+    hpsdr: HpsdrOpts,
+    freq_correction_ppm: Option<f64>,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+    replay_epoch: Option<i64>,
+    allowlist: Vec<String>,
+    blocklist: Option<PathBuf>,
+    notch: Option<PathBuf>,
+}
+
+impl CliOverrides {
+    /// No command-line say at all: what `manta config check` resolves with,
+    /// so it validates exactly what the file and environment give `run`.
+    fn none() -> Self {
+        CliOverrides {
+            device: None,
+            source: None,
+            source_iq: false,
+            kiwi: KiwiOpts {
+                host: None,
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            },
+            #[cfg(feature = "soapy")]
+            soapy: SoapyOpts {
+                driver: None,
+                freq: None,
+                rate: None,
+                gain: None,
+            },
+            #[cfg(feature = "hpsdr")]
+            hpsdr: HpsdrOpts {
+                host: None,
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq: None,
+                rate: None,
+            },
+            freq_correction_ppm: None,
+            dial_freq_hz: None,
+            capture_rate_hz: None,
+            replay_epoch: None,
+            allowlist: Vec::new(),
+            blocklist: None,
+            notch: None,
+        }
+    }
+
+    /// The flag that selects a source, if any: given one, the command line
+    /// defines the whole source (D6).
+    fn source_selector(&self) -> Option<&'static str> {
+        #[cfg(feature = "hpsdr")]
+        if self.hpsdr.host.is_some() {
+            return Some("--hpsdr-host");
+        }
+        #[cfg(feature = "soapy")]
+        if self.soapy.driver.is_some() {
+            return Some("--soapy-driver");
+        }
+        if self.kiwi.host.is_some() {
+            Some("--kiwi-host")
+        } else if self.source.is_some() {
+            Some("--source")
+        } else if self.device.is_some() {
+            Some("--device")
+        } else {
+            None
+        }
+    }
+
+    /// The source the flags describe, in today's priority order: hpsdr,
+    /// then kiwi, then soapy, then a WAV file or audio device.
+    fn into_spec(self) -> LiveSourceSpec {
+        #[cfg(feature = "hpsdr")]
+        if self.hpsdr.host.is_some() {
+            return LiveSourceSpec::Hpsdr(self.hpsdr);
+        }
+        if self.kiwi.host.is_some() {
+            return LiveSourceSpec::Kiwi(self.kiwi);
+        }
+        #[cfg(feature = "soapy")]
+        if self.soapy.driver.is_some() {
+            return LiveSourceSpec::Soapy(self.soapy);
+        }
+        match self.source {
+            Some(path) => LiveSourceSpec::File {
+                path,
+                source_iq: self.source_iq,
+            },
+            None => LiveSourceSpec::AudioDevice(self.device),
+        }
+    }
+}
+
+/// `[spot]` after the CLI is merged over the file/env layer (D6).
+#[derive(Debug, PartialEq)]
+struct SpotResolved {
+    allowlist: Vec<String>,
+    blocklist: Option<PathBuf>,
+    notch: Option<PathBuf>,
+}
+
+/// A non-empty `--allowlist` replaces the file's list (never concatenated);
+/// `--blocklist`/`--notch` beat `blocklist_path`/`notch_path`.
+fn resolve_spot(
+    cli_allowlist: Vec<String>,
+    cli_blocklist: Option<PathBuf>,
+    cli_notch: Option<PathBuf>,
+    spot: &config::SpotFile,
+) -> SpotResolved {
+    SpotResolved {
+        allowlist: if cli_allowlist.is_empty() {
+            spot.allowlist.clone()
+        } else {
+            cli_allowlist
+        },
+        blocklist: cli_blocklist.or_else(|| spot.blocklist_path.clone()),
+        notch: cli_notch.or_else(|| spot.notch_path.clone()),
+    }
+}
+
+/// Everything a live command needs after CLI > env > file > default.
+struct Resolved {
+    spec: LiveSourceSpec,
+    freq_correction_ppm: f64,
+    dial_freq_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
+    replay_epoch: Option<i64>,
+    spot: SpotResolved,
+    /// Printed to stderr by the caller, never stdout.
+    notes: Vec<String>,
+}
+
+/// D6: merges the command line over the loaded file + environment layer.
+fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
+    let mut notes = Vec::new();
+    let spot = resolve_spot(
+        cli.allowlist.clone(),
+        cli.blocklist.clone(),
+        cli.notch.clone(),
+        &loaded.spot,
+    );
+    let mut shared = loaded.input.shared.clone();
+    let (freq_correction_ppm, dial_freq_hz, capture_rate_hz, replay_epoch) = (
+        cli.freq_correction_ppm,
+        cli.dial_freq_hz,
+        cli.capture_rate_hz,
+        cli.replay_epoch,
+    );
+    let spec = match (cli.source_selector(), &loaded.input.source) {
+        (Some(flag), Some(file_source)) => {
+            // A typed [input] describes one receiver: its ppm and dial
+            // belong to it, not to whatever the command line names instead.
+            notes.push(format!(
+                "note: {flag} selects the source; ignoring [input] (type = \"{}\") from {}, \
+                 including its freq_correction_ppm/center_freq_hz",
+                file_source.kind().name(),
+                loaded.origin
+            ));
+            shared = config::SharedInput::default();
+            cli.into_spec()
+        }
+        (Some(_), None) | (None, None) => cli.into_spec(),
+        (None, Some(file_source)) => spec_from_file(file_source, cli.source_iq)?,
+    };
+    Ok(Resolved {
+        spec,
+        freq_correction_ppm: freq_correction_ppm
+            .or(shared.freq_correction_ppm)
+            .unwrap_or(0.0),
+        dial_freq_hz: dial_freq_hz.or(shared.center_freq_hz),
+        capture_rate_hz: capture_rate_hz.or(shared.capture_rate_hz),
+        replay_epoch: replay_epoch.or(shared.replay_epoch),
+        spot,
+        notes,
+    })
+}
+
+/// The `LiveSourceSpec` a typed `[input]` describes. `--source-iq` without
+/// `--source` sets `iq` on a `type = "file"` source (D6).
+fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Result<LiveSourceSpec> {
+    Ok(match source {
+        config::SourceFromFile::Audio { device } => LiveSourceSpec::AudioDevice(device.clone()),
+        config::SourceFromFile::File { path, iq } => LiveSourceSpec::File {
+            path: path.clone(),
+            source_iq: *iq || cli_source_iq,
+        },
+        config::SourceFromFile::Kiwi {
+            host,
+            port,
+            freq_hz,
+            password,
+        } => LiveSourceSpec::Kiwi(KiwiOpts {
+            host: Some(host.clone()),
+            port: *port,
+            freq: Some(*freq_hz),
+            password: password.clone(),
+        }),
+        #[cfg(feature = "soapy")]
+        config::SourceFromFile::Soapy {
+            driver,
+            freq_hz,
+            rate_hz,
+            gain_db,
+        } => LiveSourceSpec::Soapy(SoapyOpts {
+            driver: Some(driver.clone()),
+            freq: Some(*freq_hz),
+            rate: Some(*rate_hz),
+            gain: *gain_db,
+        }),
+        #[cfg(not(feature = "soapy"))]
+        config::SourceFromFile::Soapy { .. } => {
+            bail!("input.type = \"soapy\" needs a manta built with --features soapy")
+        }
+        #[cfg(feature = "hpsdr")]
+        config::SourceFromFile::Hpsdr {
+            host,
+            port,
+            freq_hz,
+            rate_hz,
+        } => LiveSourceSpec::Hpsdr(HpsdrOpts {
+            host: Some(host.clone()),
+            port: *port,
+            freq: Some(*freq_hz),
+            rate: Some(*rate_hz),
+        }),
+        #[cfg(not(feature = "hpsdr"))]
+        config::SourceFromFile::Hpsdr { .. } => {
+            bail!("input.type = \"hpsdr\" needs a manta built with --features hpsdr")
+        }
+    })
+}
+
+/// `run`/`soak`/`doctor`'s shared start: load the config (`--config`, else
+/// `MANTA_CONFIG`) with the `MANTA_*` overlay, merge the CLI over it, print
+/// the merge notes, and build the pipeline config. The environment is read
+/// here and only here, with `vars_os` so a non-UTF-8 variable is never a
+/// panic (MAN-261 scenario 4).
+struct Prepared {
+    config_path: Option<PathBuf>,
+    loaded: config::Loaded,
+    resolved: Resolved,
+    pipeline: PipelineConfig,
+}
+
+fn prepare_live(
+    cli: CliOverrides,
+    config_flag: Option<PathBuf>,
+    cli_engine: Option<Engine>,
+) -> Result<Prepared> {
+    let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+    let config_path = config_flag.or_else(|| config::config_path_from_env(&vars));
+    let loaded = config::load(config_path.as_deref(), config::Env::Read(&vars))?;
+    let resolved = resolve(cli, &loaded)?;
+    for note in &resolved.notes {
+        eprintln!("{note}");
+    }
+    let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
+    let mut pipeline = build_pipeline_config(
+        resolved.freq_correction_ppm,
+        resolved.spot.allowlist.clone(),
+        resolved.spot.blocklist.clone(),
+        resolved.spot.notch.clone(),
+        loaded.detector,
+        decode.engine,
+    )?;
+    pipeline.decode = decode;
+    Ok(Prepared {
+        config_path,
+        loaded,
+        resolved,
+        pipeline,
+    })
+}
+
+/// `decode`/`oracle`: one stderr note naming the tables present in the file
+/// that the command does not apply (D7).
+fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str]) {
+    let ignored: Vec<&str> = loaded
+        .present
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !applied.contains(t))
+        .collect();
+    if !ignored.is_empty() {
+        eprintln!(
+            "note: {command} ignores [{}] from {}",
+            ignored.join("], ["),
+            loaded.origin
+        );
+    }
+}
+
 /// Resolves the address(es) `manta status` should DIAL to reach a running
 /// daemon's metrics/status listener (MAN-44). An explicit `--addr` always
-/// wins; otherwise a `--server-config`'s `[server]` table supplies the
+/// wins; otherwise a `--config` file's `[server]` table supplies the
 /// port, with its `bind_addr` translated to a real dialable address --
 /// `0.0.0.0`/`::` mean "listening on every interface," which isn't itself
 /// something a client can connect TO, so those collapse to loopback (the
@@ -2108,17 +3051,25 @@ fn run_status(
     server_config: Option<&std::path::Path>,
     addr: Option<&str>,
     timeout_secs: u64,
-) -> Result<manta_server::status::StatusDoc> {
-    let file = server_config
-        .map(|path| -> Result<manta_server::config::DaemonConfigFile> {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-        })
-        .transpose()?;
+) -> Result<manta_server::status_doc::StatusDoc> {
+    // MAN-261: the same loader and `MANTA_*` overlay `run` uses, so the
+    // port `status` dials is the port the daemon bound -- including a
+    // `MANTA_SERVER_METRICS_PORT` override and the `MANTA_CONFIG` fallback.
+    // An explicit `--addr` needs no config at all.
+    let server = if addr.is_some() {
+        None
+    } else {
+        let vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        let config_path = server_config
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| config::config_path_from_env(&vars));
+        match config_path {
+            Some(path) => config::load(Some(&path), config::Env::Read(&vars))?.server,
+            None => None,
+        }
+    };
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let addr_owned = addr.map(str::to_string);
-    let server = file.map(|f| f.server);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -2170,7 +3121,7 @@ fn run_status(
 /// third case -- `2`, "could not reach or parse the daemon's status at
 /// all" -- is returned directly by `Command::Status`'s handler, since it
 /// never gets as far as a `StatusDoc` to pass here.)
-fn status_exit_code(doc: &manta_server::status::StatusDoc) -> i32 {
+fn status_exit_code(doc: &manta_server::status_doc::StatusDoc) -> i32 {
     use manta_server::metrics::OverallUplinkHealth;
     match doc.uplink.health {
         OverallUplinkHealth::Ok | OverallUplinkHealth::Disabled => 0,
@@ -2211,7 +3162,7 @@ const MAX_STATUS_HEADER_LINES: usize = 100;
 async fn fetch_status(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
-) -> Result<manta_server::status::StatusDoc> {
+) -> Result<manta_server::status_doc::StatusDoc> {
     tokio::time::timeout(timeout, fetch_status_inner(addrs, timeout))
         .await
         .map_err(|_| anyhow!("timed out talking to {}", format_addrs(addrs)))?
@@ -2280,7 +3231,7 @@ where
 async fn fetch_status_inner(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
-) -> Result<manta_server::status::StatusDoc> {
+) -> Result<manta_server::status_doc::StatusDoc> {
     use manta_server::bounded_io::read_line_bounded;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -2302,7 +3253,7 @@ async fn fetch_status_inner(
     if !status_line.starts_with("HTTP/1.1 200") {
         bail!(
             "daemon returned {}",
-            manta_server::status::escape_for_terminal(status_line.trim_end())
+            manta_server::status_doc::escape_for_terminal(status_line.trim_end())
         );
     }
 
@@ -2363,8 +3314,8 @@ async fn fetch_status_inner(
 ///
 /// Separated from `fetch_status_inner` so this is testable without a
 /// socket; `fetch_status_inner` has no other post-read logic to keep.
-fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
-    use manta_server::status::STATUS_SCHEMA_VERSION;
+fn parse_status_doc(body: &str) -> Result<manta_server::status_doc::StatusDoc> {
+    use manta_server::status_doc::STATUS_SCHEMA_VERSION;
 
     let value: serde_json::Value = serde_json::from_str(body).map_err(invalid_status_doc)?;
     if let Some(version) = value
@@ -2380,7 +3331,7 @@ fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
             );
         }
     }
-    let doc: manta_server::status::StatusDoc =
+    let doc: manta_server::status_doc::StatusDoc =
         serde_json::from_value(value).map_err(invalid_status_doc)?;
     Ok(doc)
 }
@@ -2392,7 +3343,7 @@ fn parse_status_doc(body: &str) -> Result<manta_server::status::StatusDoc> {
 fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
     anyhow!(
         "status body was not a valid status document: {}",
-        manta_server::status::escape_for_terminal(&e.to_string())
+        manta_server::status_doc::escape_for_terminal(&e.to_string())
     )
 }
 
@@ -2402,20 +3353,42 @@ fn main() -> Result<()> {
         Command::Decode {
             path,
             json,
-            freq_correction_ppm,
-            allowlist,
-            blocklist,
-            notch,
+            filters,
             config,
             engine,
         } => {
-            let decode_from_file = load_decode_config_file(config.as_deref())?;
-            let decode_cfg = merge_cli_engine(engine, decode_from_file);
-            let mut cfg = build_pipeline_config(
+            let FilterOpts {
                 freq_correction_ppm,
                 allowlist,
                 blocklist,
                 notch,
+            } = filters;
+            // D7/D8: the whole file is validated, the environment is never
+            // read; [decode], [detector], [spot] and input.freq_correction_ppm
+            // apply, with the CLI over the file.
+            let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
+            note_ignored_tables(&loaded, "decode", &["decode", "detector", "spot", "input"]);
+            let shared = &loaded.input.shared;
+            if loaded.input.source.is_some()
+                || shared.center_freq_hz.is_some()
+                || shared.capture_rate_hz.is_some()
+                || shared.replay_epoch.is_some()
+            {
+                eprintln!(
+                    "note: decode applies only input.freq_correction_ppm from [input] in {}",
+                    loaded.origin
+                );
+            }
+            let spot = resolve_spot(allowlist, blocklist, notch, &loaded.spot);
+            let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
+            let mut cfg = build_pipeline_config(
+                freq_correction_ppm
+                    .or(loaded.input.shared.freq_correction_ppm)
+                    .unwrap_or(0.0),
+                spot.allowlist,
+                spot.blocklist,
+                spot.notch,
+                loaded.detector,
                 decode_cfg.engine,
             )?;
             cfg.decode = decode_cfg;
@@ -2438,12 +3411,13 @@ fn main() -> Result<()> {
             engine,
             jsonl,
         } => {
+            let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
+            note_ignored_tables(&loaded, "oracle", &["decode"]);
             let mut src = manta_input::WavIqSource::open(&path)?;
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
             let iq = manta_input::read_all(&mut src)?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
-            let decode_from_file = load_decode_config_file(config.as_deref())?;
-            let cfg = merge_cli_engine(engine, decode_from_file);
+            let cfg = merge_cli_engine(engine, loaded.decode);
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
@@ -2492,19 +3466,14 @@ fn main() -> Result<()> {
             source,
             kiwi_host,
             kiwi_port,
-            kiwi_freq,
+            kiwi_freq_hz,
             kiwi_password,
-            json,
-            freq_correction_ppm,
-            allowlist,
-            blocklist,
-            notch,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
-            soapy_freq,
+            soapy_freq_hz,
             #[cfg(feature = "soapy")]
-            soapy_rate,
+            soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
             #[cfg(feature = "hpsdr")]
@@ -2512,115 +3481,125 @@ fn main() -> Result<()> {
             #[cfg(feature = "hpsdr")]
             hpsdr_port,
             #[cfg(feature = "hpsdr")]
-            hpsdr_freq,
+            hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
-            hpsdr_rate,
+            hpsdr_rate_hz,
             capture_rate_hz,
             source_iq,
+            filters,
+            json,
             config,
             dial_freq_hz,
             replay_epoch,
             engine,
         } => {
-            let is_file_replay = source.is_some();
-            // Captured before `open_source` consumes `source` below --
-            // needed to derive a recording-specific replay epoch.
-            let replay_path = source.clone();
-            #[cfg(feature = "soapy")]
-            let has_soapy_source = soapy_driver.is_some();
-            #[cfg(not(feature = "soapy"))]
-            let has_soapy_source = false;
-            #[cfg(feature = "hpsdr")]
-            let has_hpsdr_source = hpsdr_host.is_some();
-            #[cfg(not(feature = "hpsdr"))]
-            let has_hpsdr_source = false;
-            let has_rf_aware_source = kiwi_host.is_some()
-                || has_soapy_source
-                || has_hpsdr_source
-                || source_iq_has_real_rf_center(&source, source_iq);
-            let source_name = if kiwi_host.is_some() {
-                "kiwi"
-            } else if has_soapy_source {
-                "soapy"
-            } else if has_hpsdr_source {
-                "hpsdr"
-            } else if is_file_replay {
-                "file"
-            } else {
-                "audio"
-            };
-
-            if config.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
-                bail!(
-                    "--dial-freq-hz is required with --config when using a plain \
-                     audio device or --source WAV file -- neither reports a real RF \
-                     frequency (KiwiSDR/SoapySDR already know theirs from \
-                     --kiwi-freq/--soapy-freq)"
-                );
-            }
-
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq,
-                password: kiwi_password,
-            };
-            // SPEC v2 §7: `[decode]` (from --config, if given) is
-            // the baseline; an explicit --engine overrides just its
-            // `engine` key (merge_cli_engine). `engine = "hsmm"` is a fully
-            // implemented and reviewed engine (Task 8) and needs no gate
-            // here as of Task 11.
-            let decode_from_file = load_decode_config_file(config.as_deref())?;
-            let decode_cfg = merge_cli_engine(engine, decode_from_file);
-            let mut cfg = build_pipeline_config(
+            let FilterOpts {
                 freq_correction_ppm,
                 allowlist,
                 blocklist,
                 notch,
-                decode_cfg.engine,
-            )?;
-            cfg.decode = decode_cfg;
-            #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq,
-                rate: hpsdr_rate,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
+            } = filters;
+            let Prepared {
+                config_path,
+                loaded,
+                resolved,
+                pipeline: cfg,
+            } = prepare_live(
+                CliOverrides {
+                    device,
+                    source,
+                    source_iq,
+                    kiwi: KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq_hz,
+                        password: kiwi_password,
+                    },
                     #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            source_iq,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq,
-                                rate: soapy_rate,
-                                gain: soapy_gain,
-                            },
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, source_iq, kiwi)?
-                    }
-                }
+                    soapy: SoapyOpts {
+                        driver: soapy_driver,
+                        freq: soapy_freq_hz,
+                        rate: soapy_rate_hz,
+                        gain: soapy_gain,
+                    },
+                    #[cfg(feature = "hpsdr")]
+                    hpsdr: HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq_hz,
+                        rate: hpsdr_rate_hz,
+                    },
+                    freq_correction_ppm,
+                    dial_freq_hz,
+                    capture_rate_hz,
+                    replay_epoch,
+                    allowlist,
+                    blocklist,
+                    notch,
+                },
+                config,
+                engine,
+            )?;
+            let spec = &resolved.spec;
+            let dial_freq_hz = resolved.dial_freq_hz;
+            // Needed to derive a recording-specific replay epoch/nonce.
+            let replay_path = match spec {
+                LiveSourceSpec::File { path, .. } => Some(path.clone()),
+                _ => None,
             };
-            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
-            let src: Box<dyn IqSource> = match dial_freq_hz {
-                Some(freq_hz) => Box::new(FixedCenterFreqSource {
-                    inner: src,
-                    freq_hz,
-                }),
-                None => src,
-            };
+            let has_rf_aware_source = spec.is_rf_aware();
+            let source_name = spec.name();
+
+            // Servers start iff the resolved config has a [server] table
+            // (D7); the guard runs after the load and before any source I/O.
+            if loaded.server.is_some() && !has_rf_aware_source && dial_freq_hz.is_none() {
+                bail!(
+                    "--dial-freq-hz is required with --config when using a plain \
+                     audio device or --source WAV file -- neither reports a real RF \
+                     frequency (KiwiSDR/SoapySDR already know theirs from \
+                     --kiwi-freq/--soapy-freq); set it with --dial-freq-hz, \
+                     MANTA_INPUT_CENTER_FREQ_HZ, or input.center_freq_hz"
+                );
+            }
+            if config_path.is_some() && loaded.server.is_none() {
+                eprintln!(
+                    "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
+                     started",
+                    loaded.origin
+                );
+            }
+            warn_if_audio_source_has_no_rf_reference(has_rf_aware_source, dial_freq_hz);
+            let first = spec.open(resolved.capture_rate_hz, dial_freq_hz)?;
+            let replay_epoch = resolved.replay_epoch;
+
+            // MAN-122 review round 6 (P2): installed HERE -- before
+            // `start_spot_server` binds the sockets and logs the
+            // `listening:` startup banner naming them -- and not after it,
+            // as an earlier revision did. That banner is an advertisement:
+            // a supervisor or operator that reacts to it by immediately
+            // sending SIGINT/SIGTERM must not hit the signal's DEFAULT
+            // disposition, which terminates the daemon outright and skips
+            // the client/status shutdown drain that MAN-85's handler
+            // exists to guarantee. Installing the handler first makes the
+            // whole observable window -- banner included -- covered by the
+            // drain. A signal landing before the decode loop starts is
+            // observed by `listen_with_observers` before its next startup-
+            // calibration read (review round 7; before that round it was
+            // observed only once the two-second calibration buffer had
+            // filled); it processes only what it has already read and
+            // returns `Ok` without reading again. A read already in flight is not
+            // interrupted: it returns with whatever the source yields next,
+            // or fails after that source's own stall bound, and the shutdown
+            // sequence below runs on both the `Ok` and the error path,
+            // exactly as it does for a signal arriving mid-decode. The
+            // banner itself still precedes the listener
+            // tasks (see `start_spot_server`), so its ordering against
+            // per-connection lines is unchanged.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_handler = stop.clone();
+            ctrlc::set_handler(move || {
+                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+            })?;
 
             // Kept alive for the process lifetime: dropping it would stop
             // the spawned server tasks. `None` when --config wasn't
@@ -2631,164 +3610,266 @@ fn main() -> Result<()> {
             // the entire replayed file a second time after it's already
             // been opened; skip that full-file pass entirely when nothing
             // downstream needs it (round-7 review finding).
-            let (server_runtime, spot_server, active_tracks, mut active_tracks_poller) =
-                match config {
-                    Some(path) => {
-                        // `epoch` feeds SpotBus's wall-clock conversion (every
-                        // JSON `timestamp`/RBN Zulu field a client observes) --
-                        // a live session's epoch is this process's real start
-                        // time; a replay session's defaults to the replayed
-                        // file's own mtime, a genuine timestamp that's stable
-                        // across reruns of the SAME untouched file, but changes
-                        // across a copy/download/restore that doesn't preserve
-                        // filesystem metadata even though the recording's
-                        // content is identical -- pass --replay-epoch to pin an
-                        // exact value when that matters more than "whatever
-                        // this machine's copy says" (round-7 review finding;
-                        // see the flag's own doc comment for the full
-                        // rationale, and `epoch_for_replay_path`'s for why
-                        // neither "always now()" nor a content-hash alone was
-                        // right before this flag existed). `session_nonce` is
-                        // the separate, spot-id-uniqueness-only value:
-                        // recording-content-derived for file replay (so
-                        // different recordings never collide on id even at the
-                        // same track/sample position), nanosecond-precision-now
-                        // for a live session (so two live sessions started
-                        // within the same wall-clock second don't collide
-                        // either).
-                        let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
-                        let session_nonce: u128 = match &replay_path {
-                            Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
-                            // Live session: `epoch` above is already SystemTime::now().
-                            None => epoch
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .expect("epoch predates the Unix epoch")
-                                .as_nanos(),
-                        };
+            let (
+                server_runtime,
+                spot_server,
+                active_tracks,
+                mut active_tracks_poller,
+                decode_latency,
+                mut decode_latency_poller,
+            ) = match loaded.server.clone() {
+                Some(server_cfg) => {
+                    // `epoch` feeds SpotBus's wall-clock conversion (every
+                    // JSON `timestamp`/RBN Zulu field a client observes) --
+                    // a live session's epoch is this process's real start
+                    // time; a replay session's defaults to the replayed
+                    // file's own mtime, a genuine timestamp that's stable
+                    // across reruns of the SAME untouched file, but changes
+                    // across a copy/download/restore that doesn't preserve
+                    // filesystem metadata even though the recording's
+                    // content is identical -- pass --replay-epoch to pin an
+                    // exact value when that matters more than "whatever
+                    // this machine's copy says" (round-7 review finding;
+                    // see the flag's own doc comment for the full
+                    // rationale, and `epoch_for_replay_path`'s for why
+                    // neither "always now()" nor a content-hash alone was
+                    // right before this flag existed). `session_nonce` is
+                    // the separate, spot-id-uniqueness-only value:
+                    // recording-content-derived for file replay (so
+                    // different recordings never collide on id even at the
+                    // same track/sample position), nanosecond-precision-now
+                    // for a live session (so two live sessions started
+                    // within the same wall-clock second don't collide
+                    // either).
+                    let epoch = resolve_epoch(replay_path.as_deref(), replay_epoch)?;
+                    let session_nonce: u128 = match &replay_path {
+                        Some(replay_path) => session_nonce_for_replay_path(replay_path)?,
+                        // Live session: `epoch` above is already SystemTime::now().
+                        None => epoch
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .expect("epoch predates the Unix epoch")
+                            .as_nanos(),
+                    };
 
-                        let (rt, server) =
-                            start_spot_server(&path, src.sample_rate(), epoch, session_nonce)?;
-                        // MAN-45 (round-9 finding): the daemon's own copy of the
-                        // gauge `manta_engine::listen_with_observers` updates as
-                        // it runs (on the MAIN thread, outside this tokio
-                        // runtime) -- polled into `Metrics` below, the same
-                        // bridge shape MAN-55's `confirmed_live_handle` watcher
-                        // uses for source liveness.
-                        let active_tracks =
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                        // MAN-45 remediate (code-review finding 1): the
-                        // `JoinHandle` is kept, not discarded, so the shutdown
-                        // sequence below can abort this poller and WAIT for it
-                        // to actually stop before writing the deterministic
-                        // zero -- otherwise a tick already in flight can read
-                        // the still-stale gauge and write it right back after
-                        // the zero, undoing it.
-                        let active_tracks_poller = {
-                            let gauge = active_tracks.clone();
-                            let track_metrics = server.metrics.clone();
-                            rt.spawn(async move {
-                                loop {
-                                    track_metrics.set_active_tracks(
-                                        gauge.load(std::sync::atomic::Ordering::Relaxed),
-                                    );
-                                    tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
-                                }
-                            })
-                        };
-                        // MAN-55: for a source where `open()` succeeding
-                        // doesn't confirm a live device (HPSDR's UDP
-                        // connect/send need no peer response at all),
-                        // `confirmed_live_handle()` returns Some, and health
-                        // starts false, flipping true only once the source's
-                        // own read loop has actually processed a valid
-                        // packet. Every other source type (Kiwi/Soapy/audio/
-                        // file) returns None from the trait's default and
-                        // keeps the original immediate-true behavior, since
-                        // opening those already implies liveness.
-                        match src.confirmed_live_handle() {
-                            Some(live) => {
-                                server.metrics.set_source_health(source_name, false);
-                                let metrics = server.metrics.clone();
-                                rt.spawn(async move {
-                                    while !live.load(std::sync::atomic::Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(200))
-                                            .await;
-                                    }
-                                    metrics.set_source_health(source_name, true);
-                                });
+                    // The resolved (CLI > env > file, MAN-261) value, already
+                    // validated by `check_freq_correction_ppm`; re-derived
+                    // here because the factor, not the ppm, is what the
+                    // advertised SETT bounds are scaled by (MAN-86 review).
+                    let freq_calibration =
+                        manta_spot::calibration_factor_from_ppm(resolved.freq_correction_ppm)
+                            .map_err(|e| anyhow!(e))?;
+                    // MAN-122: the banner `start_spot_server` logs names
+                    // the source, its sample rate and its dial frequency,
+                    // so all three are read HERE, from `first` (the
+                    // startup connection), before it is moved into the
+                    // pipeline below.
+                    let (rt, server) = start_spot_server(
+                        server_cfg,
+                        loaded.rbn_uplink.clone(),
+                        SourceInfo {
+                            name: source_name,
+                            sample_rate_hz: first.sample_rate(),
+                            dial_freq_hz: first.center_freq_hz(),
+                            rf_passband_hz: first.rf_passband_hz(),
+                            freq_calibration,
+                        },
+                        epoch,
+                        session_nonce,
+                    )?;
+                    // MAN-45 (round-9 finding): the daemon's own copy of the
+                    // gauge `manta_engine::listen_with_observers` updates as
+                    // it runs (on the MAIN thread, outside this tokio
+                    // runtime) -- polled into `Metrics` below, the same
+                    // bridge shape MAN-55's `confirmed_live_handle` watcher
+                    // uses for source liveness. MAN-122 additionally takes
+                    // the same count synchronously off `listen`'s per-batch
+                    // `on_tracks` callback, for the status line's
+                    // decode-progress heartbeat, which a polled gauge value
+                    // cannot express (a steady count and a wedged decode
+                    // loop look identical through the atomic alone).
+                    let active_tracks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    // MAN-45 remediate (code-review finding 1): the
+                    // `JoinHandle` is kept, not discarded, so the shutdown
+                    // sequence below can abort this poller and WAIT for it
+                    // to actually stop before writing the deterministic
+                    // zero -- otherwise a tick already in flight can read
+                    // the still-stale gauge and write it right back after
+                    // the zero, undoing it.
+                    let active_tracks_poller = {
+                        let gauge = active_tracks.clone();
+                        let track_metrics = server.metrics.clone();
+                        rt.spawn(async move {
+                            loop {
+                                track_metrics.set_active_tracks(
+                                    gauge.load(std::sync::atomic::Ordering::Relaxed),
+                                );
+                                tokio::time::sleep(ACTIVE_TRACKS_POLL_INTERVAL).await;
                             }
-                            None => server.metrics.set_source_health(source_name, true),
-                        }
-
-                        // MAN-56: HPSDR's packet loss/malformed counters are
-                        // input-layer state manta-server cannot compute itself
-                        // (it has no manta-input dependency). Sample them into
-                        // Metrics on a timer, the same wiring-layer-injection
-                        // shape `set_source_health` uses above -- and read the
-                        // handle HERE, before `listen(src, ..)` below takes
-                        // ownership of the source for the rest of the run.
-                        // Sources with no wire-packet loss model return None
-                        // and publish no series at all, which is deliberate:
-                        // a permanently-zero counter reads as "no loss" rather
-                        // than "not measured" (ARCHITECTURE §8's
-                        // "absent means not measured" distinction).
-                        if let Some(counters) = src.health_counters() {
-                            let metrics = server.metrics.clone();
-                            // Published once eagerly so the series exists (at
-                            // 0) from the very first scrape rather than only
-                            // after one poll interval.
-                            metrics.set_input_health(source_name, input_health_of(&counters));
-                            rt.spawn(async move {
-                                loop {
-                                    tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
-                                    metrics
-                                        .set_input_health(source_name, input_health_of(&counters));
-                                }
-                            });
-                        }
-
-                        (
-                            Some(rt),
-                            Some(server),
-                            Some(active_tracks),
-                            Some(active_tracks_poller),
-                        )
+                        })
+                    };
+                    // MAN-128: same bridge shape as `active_tracks`
+                    // above -- the engine's decode loop runs on the
+                    // main thread, outside this tokio runtime, so a
+                    // poller copies its lock-free observer into
+                    // `Metrics` on a timer.
+                    let decode_latency =
+                        std::sync::Arc::new(manta_engine::DecodeLatencyObserver::new());
+                    server
+                        .metrics
+                        .set_decode_latency(latency_histogram_of(&decode_latency.snapshot()));
+                    let decode_latency_poller = {
+                        let obs = decode_latency.clone();
+                        let latency_metrics = server.metrics.clone();
+                        rt.spawn(async move {
+                            loop {
+                                tokio::time::sleep(DECODE_LATENCY_POLL_INTERVAL).await;
+                                latency_metrics
+                                    .set_decode_latency(latency_histogram_of(&obs.snapshot()));
+                            }
+                        })
+                    };
+                    // MAN-128: armed right after the listeners are up
+                    // and before the decode loop starts below, so
+                    // `/healthz`'s decode check is live for the entire
+                    // run -- `mark_decode_stopped()` on the shutdown
+                    // path (below) is what makes it catch a source
+                    // that has died during the drain that follows.
+                    server.metrics.arm_decode_watchdog();
+                    // MAN-73: for every reconnectable source kind, ALL
+                    // health reporting (including this initial value) is
+                    // now owned by `ReconnectingSource` below, which reads
+                    // the same `confirmed_live_handle()` signal the old
+                    // MAN-55 watcher task used to, and additionally flips
+                    // health false/true across every later reconnect, not
+                    // just the first connection. File replay is the only
+                    // kind that bypasses `ReconnectingSource` entirely
+                    // (determinism; see `is_reconnectable`'s doc comment),
+                    // so its health is set true here, once, immediately.
+                    if !spec.is_reconnectable() {
+                        server.metrics.set_source_health(source_name, true);
                     }
-                    None => (None, None, None, None),
-                };
 
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stop_handler = stop.clone();
-            ctrlc::set_handler(move || {
-                stop_handler.store(true, std::sync::atomic::Ordering::Relaxed);
-            })?;
-            // Printed AFTER the handler is installed, and via `eprintln!`
-            // rather than `tracing::info!` because the subscriber is only
-            // initialized inside `start_spot_server` -- a plain `listen`
-            // (no --server-config) has no subscriber at all. Two jobs:
-            // `listen` otherwise prints nothing at startup (2026-09-05
-            // review, lens 1 #4/#7), and it is the readiness handshake
-            // `tests/signal_shutdown.rs` waits for -- signalling any
-            // earlier races `set_handler` and kills the child under the OS
-            // default disposition regardless of MAN-85's fix. If the
-            // fuller startup banner (lens 1 #7) ever replaces this line,
-            // it must still be emitted here, after `set_handler`, and
-            // `READY_MARKER` updated to match. stdout stays pure JSON
-            // under `--json` (MAN-59 round 6); this goes to stderr.
+                    (
+                        Some(rt),
+                        Some(server),
+                        Some(active_tracks),
+                        Some(active_tracks_poller),
+                        Some(decode_latency),
+                        Some(decode_latency_poller),
+                    )
+                }
+                None => (None, None, None, None, None, None),
+            };
+
+            // MAN-73: wrap every reconnectable source so a later read
+            // error/EOF is retried with `manta-server::backoff`'s policy
+            // instead of propagating out of `listen()` and ending the
+            // process. File replay is passed through unwrapped -- its
+            // errors and EOF must reach `listen()` unchanged for
+            // byte-identical replay.
+            let input_health: Option<std::sync::Arc<reconnect::InputHealthTotals>>;
+            let src: Box<dyn IqSource> = if spec.is_reconnectable() {
+                let initial_healthy = first.confirmed_live_handle().is_none();
+                let name = spec.name();
+                let on_health = source_health_sink(
+                    name,
+                    spot_server.as_ref().map(|server| server.metrics.clone()),
+                    active_tracks.clone(),
+                );
+                let reopen_spec = spec.clone();
+                let wrapped = ReconnectingSource::new(
+                    name,
+                    first,
+                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                    stop.clone(),
+                    initial_healthy,
+                    on_health,
+                );
+                input_health = wrapped.input_health();
+                Box::new(wrapped)
+            } else {
+                input_health = reconnect::InputHealthTotals::for_source(first.as_ref());
+                first
+            };
+
+            // MAN-56: a source's packet loss/malformed counters are
+            // input-layer state manta-server cannot compute itself (it
+            // has no manta-input dependency). Sample them into Metrics on
+            // a timer, the same wiring-layer-injection shape
+            // `set_source_health` uses -- and take the handle HERE, before
+            // `listen(src, ..)` below takes ownership of the source for
+            // the rest of the run. MAN-228: the handle is the
+            // `InputHealthTotals` summed over every connection, so the
+            // series keep counting across a MAN-73 reconnect instead of
+            // freezing at the startup connection's values. Sources with
+            // no wire-packet loss model publish no series at all, which
+            // is deliberate: a permanently-zero counter reads as "no
+            // loss" rather than "not measured" (ARCHITECTURE §8's
+            // "absent means not measured" distinction).
+            if let (Some(rt), Some(server), Some(counters)) =
+                (&server_runtime, &spot_server, input_health)
+            {
+                let metrics = server.metrics.clone();
+                // Published once eagerly so the series exists (at 0) from
+                // the very first scrape rather than only after one poll
+                // interval.
+                metrics.set_input_health(source_name, counters.snapshot());
+                rt.spawn(async move {
+                    loop {
+                        tokio::time::sleep(INPUT_HEALTH_POLL_INTERVAL).await;
+                        metrics.set_input_health(source_name, counters.snapshot());
+                    }
+                });
+            }
+
+            // Printed via `eprintln!` rather than `tracing::info!` because
+            // the subscriber is only initialized inside
+            // `start_spot_server` -- a plain `listen` (no --server-config)
+            // has no subscriber at all. Two jobs: `listen` otherwise prints
+            // nothing at startup (2026-09-05 review, lens 1 #4/#7), and it
+            // is the readiness handshake `tests/signal_shutdown.rs` waits
+            // for. It remains AFTER `ctrlc::set_handler`, which as of
+            // review round 6 runs further above (before `start_spot_server`
+            // and its `listening:` banner), so every startup line this
+            // daemon emits -- this marker and the banner alike -- is now
+            // published with the handler already installed; no line
+            // advertises a daemon that would still die on the signal's
+            // default disposition. If the fuller startup banner (lens 1 #7)
+            // ever replaces this line, `READY_MARKER` must be updated to
+            // match. stdout stays pure JSON under `--json` (MAN-59
+            // round 6); this goes to stderr.
             eprintln!("manta: listening; send SIGINT or SIGTERM to stop");
+            // Captured before `src` is moved into the pipeline, for the
+            // readiness event below.
+            let source_sample_rate_hz = src.sample_rate();
+            let mut pipeline_ready_logged = false;
+            // MAN-122 review round 5 (P2): `stop` is moved into
+            // `listen_with_observers` below, so the readiness observer needs
+            // its own handle to read the cancellation flag. The engine runs
+            // the padding and calibration `on_tracks` callbacks BEFORE its
+            // loop first examines `stop` (manta-engine/src/listen.rs: the
+            // two `on_tracks(n_tracks)` calls above `loop { if
+            // stop.load(..) { break } }`) -- also when a stop request cut
+            // the calibration fill short (review round 7), since what was
+            // read is still processed -- so a SIGINT arriving during the
+            // two-second startup calibration would otherwise publish
+            // `ready: decoding` for a run that shuts down without ever
+            // decoding a chunk.
+            let stop_ready = stop.clone();
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
                 stop,
                 manta_engine::ListenObservers {
                     active_tracks: active_tracks.clone(),
+                    decode_latency: decode_latency.clone(),
                 },
                 |ev| {
+                    use manta_decode::events::DecoderEvent;
                     if json {
                         println!("{}", serde_json::to_string(ev).unwrap());
                         return;
                     }
-                    use manta_decode::events::DecoderEvent;
                     use std::io::Write as _;
                     match ev {
                         DecoderEvent::CharDecoded { glyph, .. } => {
@@ -2811,7 +3892,7 @@ fn main() -> Result<()> {
                 |spot| {
                     if let Some(server) = &spot_server {
                         server.bus.publish(spot.clone());
-                        server.metrics.record_spot();
+                        server.metrics.record_spot(spot);
                         // MAN-136/MAN-45: counted ONCE per spot here, NOT
                         // inside `SpotMessage::from_spot` -- that runs once
                         // per connected JSON/WS client (json_stream.rs:126),
@@ -2841,6 +3922,55 @@ fn main() -> Result<()> {
                         spot.confidence
                     );
                 },
+                // MAN-122 review round 1: the live track gauge comes from
+                // `TrackManager`'s own lifecycle -- how many tracks are
+                // promoted and holding a decoder right now -- not from the
+                // `DecoderEvent` stream above. A promoted track whose
+                // demodulator has not latched emits nothing for up to the
+                // ~30 s silent-GC window, so an event-derived count reports
+                // `tracks=0` on a node that is genuinely decoding weak
+                // signals.
+                //
+                // Review round 2: this observer fires once per processed
+                // batch (repeats included), so it is also the daemon's
+                // decode-progress heartbeat. Two relaxed atomics per
+                // ~43 ms chunk, immediately after that chunk's channelizer
+                // + TrackManager work -- unmeasurable against it, and the
+                // only thing that lets the status line say "stalled"
+                // instead of republishing a frozen `tracks=N` forever.
+                |n_tracks| {
+                    if let Some(server) = &spot_server {
+                        server.metrics.set_active_tracks(n_tracks as u64);
+                        server.metrics.record_pipeline_batch();
+                        // The first batch is the earliest moment the daemon
+                        // can honestly claim to be decoding: `listen`'s
+                        // calibration read has returned, the channelizer is
+                        // built and the TrackManager has processed real
+                        // hops. The startup banner above only ever claimed
+                        // bound sockets (review round 2).
+                        // Checked here rather than only at first-batch
+                        // time so a cancelled startup cannot publish a
+                        // false readiness event: `stop` is already `true`
+                        // by the time the calibration callbacks run, and
+                        // the decode loop breaks out immediately after
+                        // them. Not latching `pipeline_ready_logged` on
+                        // this path is deliberate -- the flag means "we
+                        // have claimed readiness", and no claim was made.
+                        if !pipeline_ready_logged
+                            && !stop_ready.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            pipeline_ready_logged = true;
+                            tracing::info!(
+                                "{}",
+                                manta_server::status::format_pipeline_ready(
+                                    env!("CARGO_PKG_VERSION"),
+                                    source_name,
+                                    source_sample_rate_hz,
+                                )
+                            );
+                        }
+                    }
+                },
             );
 
             // Run the same server-shutdown sequence on BOTH the success and
@@ -2852,6 +3982,30 @@ fn main() -> Result<()> {
             // tasks to drain (e.g. spots from TrackManager::finish() just
             // before `listen` returned) before tearing the runtime down.
             if let Some(server) = &spot_server {
+                // MAN-128: `listen_with_observers` has just returned, which
+                // means the decode loop has genuinely stopped (success or
+                // error alike -- `listen_result` is captured above rather
+                // than `?`-ed for exactly this reason). This is the first
+                // thing done in this block, before touching any poller or
+                // sending `shutdown_tx`, so `/healthz` reports unhealthy for
+                // the entire up-to-`SHUTDOWN_DRAIN_DEADLINE` drain that
+                // follows -- the window in which `source_health` alone
+                // would otherwise still read healthy for a source that has
+                // already died. One final snapshot is published first so a
+                // scrape during the drain sees the decode loop's true last
+                // latency distribution rather than a stale mid-run one.
+                if let Some(obs) = &decode_latency {
+                    server
+                        .metrics
+                        .set_decode_latency(latency_histogram_of(&obs.snapshot()));
+                }
+                server.metrics.mark_decode_stopped();
+                if let Some(poller) = decode_latency_poller.take() {
+                    poller.abort();
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(poller);
+                    }
+                }
                 // MAN-45 remediate (code-review finding 1): the engine's
                 // own gauge is already 0 on the SUCCESS path
                 // (TrackManager::finish() closed every track before
@@ -2879,6 +4033,27 @@ fn main() -> Result<()> {
                 }
                 server.metrics.set_active_tracks(0);
                 let _ = server.shutdown_tx.send(true);
+                // MAN-122 review round 4 (P2): shutdown is signalled ABOVE
+                // and the periodic status task is joined HERE, before the
+                // client drain below starts -- the task's own guards order
+                // shutdown against its two `select!` poll points, but not
+                // against the wall clock between its last `shutdown.borrow()`
+                // and the `tracing::info!` that follows, so a line could
+                // otherwise still be emitted into the middle of the drain.
+                // Joining makes the two mutually ordered: `spawn_status_line`
+                // returns from its `shutdown.changed()` arm as soon as the
+                // send above is observed, so this wait is bounded by one
+                // scheduler poll, not by `status_interval_secs`.
+                if let Some(status_line) = server
+                    .status_line
+                    .lock()
+                    .expect("status-line handle mutex poisoned")
+                    .take()
+                {
+                    if let Some(rt) = server_runtime.as_ref() {
+                        let _ = rt.block_on(status_line);
+                    }
+                }
             }
             // `server_runtime`/`spot_server` are always constructed as a
             // matched pair (both `Some` or both `None`, see their
@@ -2895,18 +4070,14 @@ fn main() -> Result<()> {
             source,
             kiwi_host,
             kiwi_port,
-            kiwi_freq,
+            kiwi_freq_hz,
             kiwi_password,
-            freq_correction_ppm,
-            allowlist,
-            blocklist,
-            notch,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
-            soapy_freq,
+            soapy_freq_hz,
             #[cfg(feature = "soapy")]
-            soapy_rate,
+            soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
             #[cfg(feature = "hpsdr")]
@@ -2914,59 +4085,72 @@ fn main() -> Result<()> {
             #[cfg(feature = "hpsdr")]
             hpsdr_port,
             #[cfg(feature = "hpsdr")]
-            hpsdr_freq,
+            hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
-            hpsdr_rate,
+            hpsdr_rate_hz,
             capture_rate_hz,
             source_iq,
+            filters,
+            dial_freq_hz,
+            config,
         } => {
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq,
-                password: kiwi_password,
-            };
-            let cfg = build_pipeline_config(
+            let FilterOpts {
                 freq_correction_ppm,
                 allowlist,
                 blocklist,
                 notch,
-                Engine::Legacy,
-            )?;
-            #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq,
-                rate: hpsdr_rate,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
+            } = filters;
+            let Prepared {
+                loaded,
+                resolved,
+                pipeline: cfg,
+                ..
+            } = prepare_live(
+                CliOverrides {
+                    device,
+                    source,
+                    source_iq,
+                    kiwi: KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq_hz,
+                        password: kiwi_password,
+                    },
                     #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            source_iq,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq,
-                                rate: soapy_rate,
-                                gain: soapy_gain,
-                            },
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, source_iq, kiwi)?
-                    }
-                }
-            };
-            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
+                    soapy: SoapyOpts {
+                        driver: soapy_driver,
+                        freq: soapy_freq_hz,
+                        rate: soapy_rate_hz,
+                        gain: soapy_gain,
+                    },
+                    #[cfg(feature = "hpsdr")]
+                    hpsdr: HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq_hz,
+                        rate: hpsdr_rate_hz,
+                    },
+                    freq_correction_ppm,
+                    dial_freq_hz,
+                    capture_rate_hz,
+                    replay_epoch: None,
+                    allowlist,
+                    blocklist,
+                    notch,
+                },
+                config,
+                None,
+            )?;
+            if loaded.server.is_some() {
+                eprintln!(
+                    "note: soak does not start the spot servers; ignoring [server] from {}",
+                    loaded.origin
+                );
+            }
+            let spec = &resolved.spec;
+            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
+            let src: Box<dyn IqSource> =
+                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::soak(src, &cfg, std::time::Duration::from_secs(duration))?;
             eprintln!("{report:?}");
             if !manta_engine::soak_passed(&report) {
@@ -2999,7 +4183,7 @@ fn main() -> Result<()> {
             if json {
                 print!("{}", doc.to_json());
             } else {
-                print!("{}", manta_server::status::render_human(&doc));
+                print!("{}", manta_server::status_doc::render_human(&doc));
             }
             std::process::exit(status_exit_code(&doc));
         }
@@ -3009,18 +4193,15 @@ fn main() -> Result<()> {
             source,
             kiwi_host,
             kiwi_port,
-            kiwi_freq,
+            kiwi_freq_hz,
             kiwi_password,
-            freq_correction_ppm,
-            allowlist,
-            blocklist,
-            notch,
+            filters,
             #[cfg(feature = "soapy")]
             soapy_driver,
             #[cfg(feature = "soapy")]
-            soapy_freq,
+            soapy_freq_hz,
             #[cfg(feature = "soapy")]
-            soapy_rate,
+            soapy_rate_hz,
             #[cfg(feature = "soapy")]
             soapy_gain,
             #[cfg(feature = "hpsdr")]
@@ -3028,13 +4209,21 @@ fn main() -> Result<()> {
             #[cfg(feature = "hpsdr")]
             hpsdr_port,
             #[cfg(feature = "hpsdr")]
-            hpsdr_freq,
+            hpsdr_freq_hz,
             #[cfg(feature = "hpsdr")]
-            hpsdr_rate,
+            hpsdr_rate_hz,
             capture_rate_hz,
             source_iq,
+            dial_freq_hz,
+            config,
             json,
         } => {
+            let FilterOpts {
+                freq_correction_ppm,
+                allowlist,
+                blocklist,
+                notch,
+            } = filters;
             // Checked before any source is opened -- otherwise an invalid
             // --duration only surfaces after a KiwiSDR/SoapySDR/HPSDR
             // connect/activate already spent real time (or hung/failed for
@@ -3050,53 +4239,57 @@ fn main() -> Result<()> {
                     manta_engine::MAX_DURATION.as_secs()
                 );
             }
-            let kiwi = KiwiOpts {
-                host: kiwi_host,
-                port: kiwi_port,
-                freq: kiwi_freq,
-                password: kiwi_password,
-            };
-            let cfg = build_pipeline_config(
-                freq_correction_ppm,
-                allowlist,
-                blocklist,
-                notch,
-                Engine::Legacy,
-            )?;
-            #[cfg(feature = "hpsdr")]
-            let hpsdr_source = open_hpsdr_source(HpsdrOpts {
-                host: hpsdr_host,
-                port: hpsdr_port,
-                freq: hpsdr_freq,
-                rate: hpsdr_rate,
-            })?;
-            #[cfg(not(feature = "hpsdr"))]
-            let hpsdr_source: Option<Box<dyn IqSource>> = None;
-            let src = match hpsdr_source {
-                Some(src) => src,
-                None => {
+            let Prepared {
+                loaded,
+                resolved,
+                pipeline: cfg,
+                ..
+            } = prepare_live(
+                CliOverrides {
+                    device,
+                    source,
+                    source_iq,
+                    kiwi: KiwiOpts {
+                        host: kiwi_host,
+                        port: kiwi_port,
+                        freq: kiwi_freq_hz,
+                        password: kiwi_password,
+                    },
                     #[cfg(feature = "soapy")]
-                    {
-                        open_source(
-                            device,
-                            source,
-                            source_iq,
-                            kiwi,
-                            SoapyOpts {
-                                driver: soapy_driver,
-                                freq: soapy_freq,
-                                rate: soapy_rate,
-                                gain: soapy_gain,
-                            },
-                        )?
-                    }
-                    #[cfg(not(feature = "soapy"))]
-                    {
-                        open_source(device, source, source_iq, kiwi)?
-                    }
-                }
-            };
-            let src: Box<dyn IqSource> = maybe_decimate(src, capture_rate_hz)?;
+                    soapy: SoapyOpts {
+                        driver: soapy_driver,
+                        freq: soapy_freq_hz,
+                        rate: soapy_rate_hz,
+                        gain: soapy_gain,
+                    },
+                    #[cfg(feature = "hpsdr")]
+                    hpsdr: HpsdrOpts {
+                        host: hpsdr_host,
+                        port: hpsdr_port,
+                        freq: hpsdr_freq_hz,
+                        rate: hpsdr_rate_hz,
+                    },
+                    freq_correction_ppm,
+                    dial_freq_hz,
+                    capture_rate_hz,
+                    replay_epoch: None,
+                    allowlist,
+                    blocklist,
+                    notch,
+                },
+                config,
+                None,
+            )?;
+            if loaded.server.is_some() {
+                eprintln!(
+                    "note: doctor does not start the spot servers; ignoring [server] from {}",
+                    loaded.origin
+                );
+            }
+            let spec = &resolved.spec;
+            warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
+            let src: Box<dyn IqSource> =
+                spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
             let report = manta_engine::doctor(src, &cfg, std::time::Duration::from_secs(duration))?;
             if json {
                 // `verdict()` is computed, not a stored field, so a plain
@@ -3116,6 +4309,8 @@ fn main() -> Result<()> {
                 print_doctor_report(&report);
             }
         }
+        Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
+        Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
     }
     Ok(())
 }
@@ -3229,6 +4424,197 @@ mod tests {
         f
     }
 
+    /// Walk every command/subcommand and every argument, collecting
+    /// (path, flag-or-<command>, help text) for each help string clap would
+    /// actually show an operator. `Arg::get_id()` is the Rust field name, so
+    /// use `get_long()` for the spelling a user types.
+    fn help_strings(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, String)>) {
+        let mut push = |who: String, text: Option<&clap::builder::StyledStr>| {
+            if let Some(t) = text {
+                out.push((path.to_string(), who, t.to_string()));
+            }
+        };
+        push("<command>".into(), cmd.get_about());
+        push("<command-long>".into(), cmd.get_long_about());
+        push("<after-help>".into(), cmd.get_after_help());
+        push("<after-long-help>".into(), cmd.get_after_long_help());
+        for a in cmd.get_arguments() {
+            let name = a
+                .get_long()
+                .map(|l| format!("--{l}"))
+                .unwrap_or_else(|| format!("<{}>", a.get_id()));
+            push(name.clone(), a.get_help());
+            push(name, a.get_long_help());
+        }
+        for sub in cmd.get_subcommands() {
+            help_strings(sub, &format!("{path} {}", sub.get_name()), out);
+        }
+    }
+
+    /// Words an operator who has never seen this repo's specs, roadmap or
+    /// ticket tracker must not meet. Case-insensitive and whole-word: `SPEC`
+    /// and `spec` are the same leak to an operator, but "special-event
+    /// call" is ordinary English and must not trip the guard.
+    const JARGON: &[&str] = &[
+        r"(?i)\bspec\b",
+        r"(?i)\barchitecture\b",
+        r"(?i)\broadmap\b",
+        r"(?i)\bappendix\b",
+        r"\u{a7}",
+        r"\bM[0-4]\b",
+        r"(?i)\bMAN-\d+",
+    ];
+
+    fn jargon_res() -> Vec<regex::Regex> {
+        JARGON
+            .iter()
+            .map(|p| regex::Regex::new(p).unwrap())
+            .collect()
+    }
+
+    /// MAN-135: `--help` is read by operators who have never seen this
+    /// repo's specs, roadmap, or ticket tracker. Contributor-facing
+    /// provenance belongs in `//` comments, which clap never republishes;
+    /// `///` on a clap field or variant IS user-facing copy.
+    #[test]
+    fn help_text_is_free_of_internal_process_jargon() {
+        use clap::CommandFactory as _;
+        let res = jargon_res();
+
+        let mut out = Vec::new();
+        help_strings(&Cli::command(), "manta", &mut out);
+
+        let mut bad = Vec::new();
+        for (path, who, text) in out {
+            for re in &res {
+                if let Some(m) = re.find(&text) {
+                    bad.push(format!("{path} {who}: {:?} -- {text}", m.as_str()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "internal jargon in --help:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// MAN-76: `manta config init` writes the scaffold into an operator's
+    /// own file, so it is operator-facing copy just as `--help` is.
+    #[test]
+    fn scaffold_is_free_of_internal_process_jargon() {
+        let res = jargon_res();
+        let mut bad = Vec::new();
+        for (n, line) in config_cmd::SCAFFOLD.lines().enumerate() {
+            for re in &res {
+                if let Some(m) = re.find(line) {
+                    bad.push(format!("line {}: {:?} -- {line}", n + 1, m.as_str()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "internal jargon in the config scaffold:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// `hsmm` was measured against `legacy` and failed its promotion gate
+    /// (docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md), so no
+    /// `--engine` help may tell an operator it is unmeasured.
+    #[test]
+    fn engine_help_does_not_call_hsmm_unmeasured() {
+        use clap::CommandFactory as _;
+        let re = regex::Regex::new(r"(?i)unmeasured|not\s+(yet\s+)?measured").unwrap();
+        let mut out = Vec::new();
+        help_strings(&Cli::command(), "manta", &mut out);
+        let engine: Vec<_> = out.iter().filter(|(_, who, _)| who == "--engine").collect();
+        // decode, oracle and run each take --engine; an empty walk would
+        // pass vacuously. Count commands, not strings: each arg yields both
+        // a short and a long help string.
+        let commands: std::collections::BTreeSet<_> =
+            engine.iter().map(|(path, _, _)| path).collect();
+        assert!(
+            commands.len() >= 3,
+            "found --engine on {commands:?}, expected decode, oracle and run"
+        );
+        let bad: Vec<String> = engine
+            .iter()
+            .filter(|(_, _, text)| re.is_match(text))
+            .map(|(path, _, text)| format!("{path}: {text}"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "--engine help calls hsmm unmeasured:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// MAN-135: a flag with no `///` comment renders as a blank line under
+    /// `--help`, which tells an operator nothing at all.
+    #[test]
+    fn every_flag_has_non_empty_help() {
+        use clap::CommandFactory as _;
+        fn walk(cmd: &clap::Command, path: &str, bad: &mut Vec<String>) {
+            for a in cmd.get_arguments() {
+                let text = a
+                    .get_help()
+                    .or_else(|| a.get_long_help())
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    // `get_id()` is the Rust field name (`kiwi_freq_hz`);
+                    // report the spelling an operator actually types.
+                    let name = a
+                        .get_long()
+                        .map(|l| format!("--{l}"))
+                        .unwrap_or_else(|| format!("<{}>", a.get_id()));
+                    bad.push(format!("{path} {name}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), bad);
+            }
+        }
+        let mut bad = Vec::new();
+        walk(&Cli::command(), "manta", &mut bad);
+        assert!(bad.is_empty(), "flags with empty help:\n{}", bad.join("\n"));
+    }
+
+    /// MAN-135: frequencies and sample rates should end in `-hz`; ports and
+    /// gains should not. Catches the next `--foo-rate` before review does.
+    #[test]
+    fn every_hz_valued_flag_is_named_hz() {
+        use clap::CommandFactory as _;
+        // A frequency-ish name that already carries a DIFFERENT explicit unit
+        // is self-describing and must not be forced to `-hz`:
+        // `--freq-correction-ppm` is parts-per-million, not hertz. Only
+        // unitless frequency/rate names are ambiguous to an operator.
+        const OTHER_UNIT_SUFFIXES: [&str; 1] = ["-ppm"];
+        fn walk(cmd: &clap::Command, path: &str, bad: &mut Vec<String>) {
+            for a in cmd.get_arguments() {
+                if let Some(long) = a.get_long() {
+                    let is_freq_or_rate = long.contains("freq") || long.contains("rate");
+                    let has_explicit_unit = long.ends_with("-hz")
+                        || OTHER_UNIT_SUFFIXES.iter().any(|s| long.ends_with(s));
+                    if is_freq_or_rate && !has_explicit_unit {
+                        bad.push(format!("{path} --{long}"));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), bad);
+            }
+        }
+        let mut bad = Vec::new();
+        walk(&Cli::command(), "manta", &mut bad);
+        assert!(
+            bad.is_empty(),
+            "frequency/rate flags without a -hz suffix:\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
     /// must never fire before a handler's own drain deadline, or
     /// `shutdown_timeout` aborts a drain that was still inside its budget
@@ -3258,6 +4644,69 @@ mod tests {
              a handler can already be running when shutdown fires, plus \
              CLIENT_DRAIN_DEADLINE = {:?} for its own drain loop once it gets there)",
             manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        );
+    }
+
+    /// MAN-122 review round 4 (P2): `spawn_status_line`'s in-task guards
+    /// cannot close the window between its post-sleep `shutdown.borrow()`
+    /// and its `tracing::info!`, so the daemon must order the two from the
+    /// outside -- retain the task's `JoinHandle` and AWAIT it right after
+    /// signalling shutdown, before the client drain starts. This pins both
+    /// halves of that: the handle really is retained on `SpotServer` for a
+    /// config that enables the status line (a discarded handle is
+    /// unjoinable and the ordering is unenforceable), and joining it after
+    /// `shutdown_tx.send(true)` completes promptly rather than blocking for
+    /// a whole `status_interval_secs`.
+    #[test]
+    fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
+        let cfg_file = write_temp_file(
+            br#"
+                [server]
+                station_callsign = "W3XYZ"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                status_interval_secs = 3600
+                "#,
+        );
+
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        let (rt, server) = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        )
+        .unwrap();
+
+        let handle =
+            server.status_line.lock().unwrap().take().expect(
+                "a non-zero status_interval_secs must leave a joinable handle on SpotServer",
+            );
+
+        let _ = server.shutdown_tx.send(true);
+        // One hour of configured interval against a one-second budget: this
+        // can only pass because the task's `shutdown.changed()` arm is
+        // `biased`-first and returns without waiting for the next tick.
+        let joined = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle).await
+        });
+        assert!(
+            joined.is_ok(),
+            "the status task must be joinable within a scheduler poll of shutdown, \
+             not at the next status_interval_secs tick"
+        );
+        assert!(
+            joined.unwrap().is_ok(),
+            "the status task must exit cleanly, not panic"
         );
     }
 
@@ -3612,15 +5061,17 @@ mod tests {
     fn load_decode_config_file_rejects_nan_hysteresis() {
         // Codex review, PR #161 round 4: NaN makes every `Demod::step`
         // comparison false, silently disabling Legacy's decode entirely.
-        let f = write_temp_file(b"[decode]\nhyst_up = nan\n");
+        let f = write_temp_file(b"[decode]\nhyst_frac = nan\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
     #[test]
-    fn load_decode_config_file_rejects_inverted_hysteresis() {
-        let f = write_temp_file(b"[decode]\nhyst_up = 0.5\nhyst_down = 0.8\n");
+    fn load_decode_config_file_rejects_out_of_range_hysteresis() {
+        // hyst_frac >= 0.5 pushes the band's outer edges to or past the
+        // rails; <= 0.0 collapses it to a single point (no hysteresis).
+        let f = write_temp_file(b"[decode]\nhyst_frac = 0.5\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
-        let f = write_temp_file(b"[decode]\nhyst_down = -1.0\n");
+        let f = write_temp_file(b"[decode]\nhyst_frac = -1.0\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
     }
 
@@ -3738,88 +5189,6 @@ mod tests {
     /// "use `--config` instead" while `status` accepted no `--config` at
     /// all -- the notice pointed operators at a spelling clap rejected.
     /// Both spellings must now parse to the same field.
-    #[test]
-    fn status_accepts_the_canonical_config_flag_the_deprecation_notice_names() {
-        use clap::Parser;
-
-        for spelling in ["--config", "--server-config"] {
-            let cli = Cli::try_parse_from(["manta", "status", spelling, "m.toml"])
-                .unwrap_or_else(|e| panic!("`manta status {spelling}` must parse: {e}"));
-            match cli.command {
-                Command::Status { config, .. } => {
-                    assert_eq!(config.as_deref(), Some(std::path::Path::new("m.toml")));
-                }
-                _ => panic!("`manta status {spelling}` must parse as Command::Status"),
-            }
-        }
-    }
-
-    /// Codex review, PR #95: a newer daemon's document can stay
-    /// structurally deserializable while its fields mean something else,
-    /// so the version has to be checked rather than merely carried.
-    #[test]
-    fn a_status_document_with_an_unknown_schema_version_is_rejected() {
-        let doc =
-            manta_server::status::StatusDoc::from_metrics(&manta_server::metrics::Metrics::new());
-        let ok = serde_json::to_string(&doc).unwrap();
-        assert_eq!(
-            parse_status_doc(&ok).unwrap().schema_version,
-            manta_server::status::STATUS_SCHEMA_VERSION,
-            "the version this build emits must be the version it accepts"
-        );
-
-        let mut v: serde_json::Value = serde_json::from_str(&ok).unwrap();
-        v["schema_version"] = serde_json::json!(2);
-        let err = parse_status_doc(&v.to_string())
-            .expect_err("a schema_version this build does not understand must not be rendered")
-            .to_string();
-        assert!(
-            err.contains("schema_version 2") && err.contains("understands only 1"),
-            "the error must name both versions so an operator knows which side to upgrade: {err}"
-        );
-    }
-
-    /// The version check must not depend on the newer document still
-    /// deserializing into THIS build's `StatusDoc`: the incompatible
-    /// schema that motivates the check is precisely the one that may have
-    /// dropped a field this build requires. Reading the version after a
-    /// structural parse would report that document as malformed and never
-    /// name the skew, so an operator would go looking for a broken daemon
-    /// instead of an out-of-date CLI.
-    #[test]
-    fn version_skew_is_reported_even_when_the_newer_document_no_longer_deserializes() {
-        let doc =
-            manta_server::status::StatusDoc::from_metrics(&manta_server::metrics::Metrics::new());
-        let mut v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&doc).unwrap())
-            .expect("this build's own document must be JSON");
-        v["schema_version"] = serde_json::json!(2);
-        // A v2 that removed a field this build requires -- the case a
-        // parse-then-check order would misdiagnose.
-        v.as_object_mut().unwrap().remove("spots_total");
-
-        let err = parse_status_doc(&v.to_string())
-            .expect_err("a schema_version this build does not understand must not be rendered")
-            .to_string();
-        assert!(
-            err.contains("schema_version 2") && err.contains("understands only 1"),
-            "version skew must be named even when the document is also structurally \
-             incompatible, otherwise the operator only learns the daemon is 'invalid': {err}"
-        );
-    }
-
-    /// The neighbouring failure mode: a body that is not a status
-    /// document at all (a wrong port answering `GET /status`) must still
-    /// fail on its own message, not on the new version check.
-    #[test]
-    fn a_body_that_is_not_a_status_document_fails_before_the_version_check() {
-        let err = parse_status_doc("{\"hello\":\"world\"}")
-            .expect_err("a non-status body must not parse")
-            .to_string();
-        assert!(
-            err.contains("not a valid status document"),
-            "unexpected error: {err}"
-        );
-    }
 
     #[test]
     fn shutdown_runtime_after_drain_awaits_a_tracked_task_to_completion() {
@@ -4094,9 +5463,17 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
-            96_000.0,
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4144,9 +5521,17 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
-            96_000.0,
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4166,6 +5551,50 @@ mod tests {
         assert!(
             accepted.unwrap_or(false),
             "enabled=true must connect to the configured target"
+        );
+    }
+
+    // MAN-86: the three new [server] operator-identity keys must load
+    // through the real config path (`config::load` + `start_spot_server`), not
+    // just through manta-server's own unit tests. Additive on a
+    // deny_unknown_fields struct, so a config WITHOUT them (every other
+    // test in this module) must keep loading too.
+    #[test]
+    fn server_config_accepts_the_operator_identity_keys() {
+        let cfg_file = write_temp_file(
+            r#"
+            [server]
+            station_callsign = "HB9H"
+            bind_addr = "127.0.0.1"
+            telnet_port = 0
+            json_port = 0
+            metrics_port = 0
+            operator_name = "Art"
+            operator_qth = "Switzerland"
+            operator_grid = "JN46la"
+            "#
+            .as_bytes(),
+        );
+
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore)
+            .expect("a config with the operator-identity keys present must load");
+        let result = start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_040_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+        );
+        assert!(
+            result.is_ok(),
+            "a config with the operator-identity keys present must still start: {:?}",
+            result.err()
         );
     }
 
@@ -4203,9 +5632,17 @@ mod tests {
             .as_bytes(),
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, _server) = start_spot_server(
-            cfg_file.path(),
-            96_000.0,
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0), // no resampling source here
+                freq_calibration: 1.0,                 // --freq-correction-ppm 0
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4227,6 +5664,751 @@ mod tests {
             .block_on(async { tokio::join!(wait_for_accept(&target1), wait_for_accept(&target2)) });
         assert!(accepted1, "first configured target must be connected to");
         assert!(accepted2, "second configured target must be connected to");
+    }
+
+    #[test]
+    fn live_source_spec_reports_reconnectable_only_for_live_kinds() {
+        assert!(LiveSourceSpec::Kiwi(KiwiOpts {
+            host: Some("h".into()),
+            port: 8073,
+            freq: Some(14_000_000.0),
+            password: String::new(),
+        })
+        .is_reconnectable());
+        assert!(LiveSourceSpec::AudioDevice(None).is_reconnectable());
+        assert!(!LiveSourceSpec::File {
+            path: PathBuf::from("rec.wav"),
+            source_iq: false,
+        }
+        .is_reconnectable());
+    }
+
+    #[test]
+    fn live_source_spec_name_matches_metrics_label() {
+        // MAN-73: `name()` feeds `set_source_health`'s label directly --
+        // a mismatch here would silently split one source's health series
+        // across two metric labels.
+        assert_eq!(
+            LiveSourceSpec::Kiwi(KiwiOpts {
+                host: Some("h".into()),
+                port: 8073,
+                freq: Some(14_000_000.0),
+                password: String::new(),
+            })
+            .name(),
+            "kiwi"
+        );
+        assert_eq!(LiveSourceSpec::AudioDevice(None).name(), "audio");
+        assert_eq!(
+            LiveSourceSpec::File {
+                path: PathBuf::from("rec.wav"),
+                source_iq: false,
+            }
+            .name(),
+            "file"
+        );
+    }
+
+    fn open_error(spec: LiveSourceSpec) -> String {
+        match spec.open(None, None) {
+            Ok(_) => panic!("expected {} open to fail", spec.name()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// MAN-135 renamed the frequency/rate flags to `*-hz`; `run` opens its
+    /// input through `LiveSourceSpec::open`, so its "missing flag" errors
+    /// must name the same flags `doctor`/`soak` (`open_source`) do.
+    #[test]
+    fn live_source_spec_open_errors_name_the_hz_flags() {
+        assert_eq!(
+            open_error(LiveSourceSpec::Kiwi(KiwiOpts {
+                host: Some("h".into()),
+                port: 8073,
+                freq: None,
+                password: String::new(),
+            })),
+            "--kiwi-freq-hz is required with --kiwi-host"
+        );
+    }
+
+    #[cfg(feature = "hpsdr")]
+    #[test]
+    fn live_source_spec_open_errors_name_the_hpsdr_hz_flags() {
+        let hpsdr = |freq, rate| {
+            LiveSourceSpec::Hpsdr(HpsdrOpts {
+                host: Some("192.168.1.100".into()),
+                port: manta_input::hpsdr::CONTROL_PORT,
+                freq,
+                rate,
+            })
+        };
+        assert_eq!(
+            open_error(hpsdr(None, None)),
+            "--hpsdr-freq-hz is required with --hpsdr-host"
+        );
+        assert_eq!(
+            open_error(hpsdr(Some(7_030_000.0), None)),
+            "--hpsdr-rate-hz is required with --hpsdr-host"
+        );
+    }
+
+    struct GapProbeSource {
+        gap: Option<u64>,
+    }
+
+    impl IqSource for GapProbeSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            14_000_000.0
+        }
+        fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+    }
+
+    /// MAN-73 (PR #207 review): during an outage `listen()` is blocked in
+    /// the reconnecting `read()` and can't republish the active-track
+    /// count, so the unhealthy transition itself must zero the shared
+    /// gauge, or `manta_active_tracks` exports the pre-drop tracks until
+    /// samples resume.
+    #[test]
+    fn source_health_sink_zeroes_active_tracks_when_the_source_goes_unhealthy() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        let gauge = Arc::new(AtomicU64::new(3));
+        let mut sink = source_health_sink("kiwi", Some(metrics.clone()), Some(gauge.clone()));
+
+        sink(true);
+        assert_eq!(
+            gauge.load(Ordering::Relaxed),
+            3,
+            "a healthy report leaves the live count alone"
+        );
+        sink(false);
+        assert_eq!(
+            gauge.load(Ordering::Relaxed),
+            0,
+            "an unhealthy source has no active tracks"
+        );
+        assert!(metrics
+            .render_prometheus_text()
+            .contains(r#"manta_source_health{source="kiwi"} 0"#));
+    }
+
+    #[test]
+    fn fixed_center_freq_source_forwards_take_discontinuity() {
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(GapProbeSource { gap: Some(48_000) }),
+            freq_hz: 14_000_000.0,
+        };
+        assert_eq!(src.take_discontinuity(), Some(48_000));
+        assert_eq!(src.take_discontinuity(), None);
+    }
+
+    // MAN-56: input-layer health counters wiring.
+
+    /// A wrapper `IqSource` that forgets to forward `health_counters`
+    /// silently swallows the inner source's counters via the trait's
+    /// `None` default -- the metrics would just be absent, with nothing
+    /// failing loudly. Same hazard `confirmed_live_handle` carries; both
+    /// are asserted here.
+    #[test]
+    fn fixed_center_freq_source_forwards_both_optional_trait_signals() {
+        use manta_input::InputHealthCounters;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        struct StubSource {
+            counters: Arc<InputHealthCounters>,
+            live: Arc<AtomicBool>,
+        }
+        impl IqSource for StubSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
+                Some(self.live.clone())
+            }
+            fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+                Some(self.counters.clone())
+            }
+        }
+
+        let counters = Arc::new(InputHealthCounters::new());
+        let live = Arc::new(AtomicBool::new(false));
+        let wrapped = FixedCenterFreqSource {
+            inner: Box::new(StubSource {
+                counters: counters.clone(),
+                live: live.clone(),
+            }),
+            freq_hz: 14_025_000.0,
+        };
+
+        assert!(Arc::ptr_eq(&wrapped.health_counters().unwrap(), &counters));
+        assert!(Arc::ptr_eq(
+            &wrapped.confirmed_live_handle().unwrap(),
+            &live
+        ));
+    }
+
+    #[test]
+    fn input_health_of_snapshots_all_three_counters_without_transposing_them() {
+        // Three same-typed u64s: a transposition would be invisible to any
+        // test that used equal values (MAN-56 D7).
+        let c = manta_input::InputHealthCounters::new();
+        c.record_dropped(7);
+        c.record_gap();
+        c.record_gap();
+        c.record_malformed();
+        let h = input_health_of(&c);
+        assert_eq!(h.dropped_packets, 7);
+        assert_eq!(h.gaps_detected, 2);
+        assert_eq!(h.malformed_packets, 1);
+    }
+
+    /// MAN-128: `daemon_build_info` must never fail or panic (it feeds a
+    /// gauge any scrape can trigger), and `version` is the crate's own
+    /// Cargo-reported version, not whatever happens to be in `Cargo.lock`.
+    #[test]
+    fn build_info_carries_the_crate_version_and_a_non_empty_git_sha() {
+        let info = daemon_build_info();
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert!(!info.git_sha.is_empty());
+        assert!(!info.features.is_empty());
+    }
+
+    #[test]
+    fn build_info_reports_none_when_no_optional_feature_is_compiled_in() {
+        if !cfg!(feature = "hpsdr") && !cfg!(feature = "soapy") {
+            assert_eq!(daemon_build_info().features, "none");
+        }
+    }
+
+    #[test]
+    fn latency_histogram_of_copies_the_engines_bucket_bounds() {
+        let obs = manta_engine::DecodeLatencyObserver::new();
+        obs.observe(std::time::Duration::from_millis(1));
+        let h = latency_histogram_of(&obs.snapshot());
+        assert_eq!(
+            h.bounds_seconds,
+            manta_engine::DECODE_LATENCY_BUCKETS_SECONDS
+        );
+        assert_eq!(h.bucket_counts.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn a_source_without_counters_publishes_no_input_health_series() {
+        struct StubSourceNoCounters;
+        impl IqSource for StubSourceNoCounters {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                0.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let m = manta_server::metrics::Metrics::new();
+        // Mirrors the wiring above: `None` means we never call
+        // set_input_health.
+        let src: Box<dyn IqSource> = Box::new(StubSourceNoCounters);
+        if let Some(c) = src.health_counters() {
+            m.set_input_health("file", input_health_of(&c));
+        }
+        assert!(!m
+            .render_prometheus_text()
+            .contains("manta_input_malformed_packets_total{"));
+    }
+
+    /// MAN-128: pins the label path for a non-HPSDR source. The daemon's
+    /// `health_counters()` wiring (above `input_health_of`) is already
+    /// generic over `source_name` -- this confirms a Kiwi-shaped source's
+    /// counters reach `/metrics` under `source="kiwi"` with no CLI change.
+    #[test]
+    fn kiwi_like_source_counters_reach_metrics_under_kiwi_label() {
+        let counters = manta_input::InputHealthCounters::new();
+        counters.record_gap();
+        counters.record_dropped(3);
+
+        let m = manta_server::metrics::Metrics::new();
+        m.set_input_health("kiwi", input_health_of(&counters));
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_input_gaps_detected_total{source="kiwi"} 1"#));
+        assert!(text.contains(r#"manta_input_dropped_packets_total{source="kiwi"} 3"#));
+    }
+
+    // MAN-136 round-1 validate code-review finding 1: the increment
+    // condition for `manta_spots_unresolved_geography_total` must match the
+    // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
+    // sentinels -- the RESOLVED ADIF entity number, not merely whether
+    // `cty.lookup` returned an entry.
+
+    const GEOGRAPHY_CTY_FIXTURE: &str = "\
+United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
+    K,W,N;
+";
+    /// One `dxcc.tsv` row for the fixture above, in the vendored file's
+    /// `<primary-prefix>\t<adif-number>\t<name>` shape.
+    const GEOGRAPHY_DXCC_FIXTURE: &str = "K\t291\tUnited States\n";
+
+    #[test]
+    fn a_callsign_with_a_resolved_entity_number_is_not_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(cty.lookup("W1AW").and_then(|e| e.dxcc), Some(291));
+        assert!(!geography_is_unresolved(&cty, "W1AW"));
+    }
+
+    #[test]
+    fn an_unresolvable_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(cty.lookup("QQ1AAA").is_none(), "test premise");
+        assert!(geography_is_unresolved(&cty, "QQ1AAA"));
+    }
+
+    #[test]
+    fn a_maritime_or_aeronautical_mobile_callsign_is_counted_as_unresolved() {
+        // /MM and /AM resolve through the base prefix, so the entity-number
+        // test alone reads them as resolved -- but `SpotMessage::from_spot`
+        // emits UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE and null lat/lon for them,
+        // so the counter must not sit at zero while those go out.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert_eq!(
+            cty.lookup("W1AW/MM").and_then(|e| e.dxcc),
+            Some(291),
+            "test premise: the base prefix still resolves"
+        );
+        assert!(geography_is_unresolved(&cty, "W1AW/MM"));
+        assert!(geography_is_unresolved(&cty, "W1AW/AM"));
+        assert!(!geography_is_unresolved(&cty, "W1AW/P"));
+    }
+
+    #[test]
+    fn a_cty_resolvable_callsign_with_no_dxcc_row_is_still_counted_as_unresolved() {
+        // The cty.dat/dxcc.tsv drift state: `cty.dat` was hand-refreshed
+        // (data/SOURCES.md has no refresh automation) without regenerating
+        // the TSV, so geography resolves -- non-null dxLat/dxLon -- while
+        // the entity number does not, and the spot goes out with
+        // `dxDxcc: -1`. Counting `lookup().is_none()` missed exactly this.
+        let cty = manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, "");
+        let entry = cty.lookup("W1AW").expect("geography still resolves");
+        assert_eq!(entry.dxcc, None, "test premise: only the number is missing");
+        assert_eq!(entry.continent, "NA");
+        assert!(
+            geography_is_unresolved(&cty, "W1AW"),
+            "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
+        );
+    }
+
+    // ---- MAN-261: CLI > env > file precedence (`resolve`) and coverage
+
+    fn cli_overrides() -> CliOverrides {
+        CliOverrides::none()
+    }
+
+    fn loaded_from(body: &str) -> config::Loaded {
+        let f = write_temp_file(body.as_bytes());
+        config::load(Some(f.path()), config::Env::Ignore).unwrap()
+    }
+
+    const KIWI_INPUT: &str =
+        "[input]\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\nfreq_hz = 14025000.0\n\
+                              freq_correction_ppm = 2.5\ncenter_freq_hz = 14000000.0\n";
+
+    #[test]
+    fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
+        let loaded = loaded_from(KIWI_INPUT);
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("v1.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert!(matches!(r.spec, LiveSourceSpec::File { .. }));
+        assert_eq!(r.freq_correction_ppm, 0.0);
+        assert_eq!(r.dial_freq_hz, None);
+        assert_eq!(r.notes.len(), 1);
+        assert!(
+            r.notes[0].contains("--source selects the source; ignoring [input] (type = \"kiwi\")")
+        );
+    }
+
+    #[test]
+    fn untyped_input_shared_keys_survive_a_cli_source() {
+        let loaded = loaded_from("[input]\nfreq_correction_ppm = 2.5\n");
+        let cli = CliOverrides {
+            source: Some(PathBuf::from("v1.wav")),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded).unwrap();
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert!(r.notes.is_empty());
+    }
+
+    #[test]
+    fn config_source_is_used_when_no_cli_source_is_given() {
+        let r = resolve(cli_overrides(), &loaded_from(KIWI_INPUT)).unwrap();
+        let LiveSourceSpec::Kiwi(kiwi) = &r.spec else {
+            panic!("expected the kiwi source from [input]");
+        };
+        assert_eq!(kiwi.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(kiwi.freq, Some(14_025_000.0));
+        assert_eq!(r.freq_correction_ppm, 2.5);
+        assert_eq!(r.dial_freq_hz, Some(14_000_000.0));
+    }
+
+    #[test]
+    fn cli_ppm_beats_file_ppm() {
+        let cli = CliOverrides {
+            freq_correction_ppm: Some(4.0),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert_eq!(r.freq_correction_ppm, 4.0);
+    }
+
+    #[test]
+    fn explicit_cli_ppm_zero_beats_file_ppm() {
+        let cli = CliOverrides {
+            freq_correction_ppm: Some(0.0),
+            ..cli_overrides()
+        };
+        let r = resolve(cli, &loaded_from(KIWI_INPUT)).unwrap();
+        assert_eq!(r.freq_correction_ppm, 0.0);
+    }
+
+    #[test]
+    fn source_iq_flag_sets_iq_on_a_config_file_source() {
+        let cli = CliOverrides {
+            source_iq: true,
+            ..cli_overrides()
+        };
+        let r = resolve(
+            cli,
+            &loaded_from("[input]\ntype = \"file\"\npath = \"/x/v1.wav\"\n"),
+        )
+        .unwrap();
+        let LiveSourceSpec::File { path, source_iq } = &r.spec else {
+            panic!("expected the file source from [input]");
+        };
+        assert_eq!(path, &PathBuf::from("/x/v1.wav"));
+        assert!(*source_iq);
+    }
+
+    #[test]
+    fn cli_allowlist_replaces_file_allowlist() {
+        let spot = config::SpotFile {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        let r = resolve_spot(vec!["K1ABC".into()], None, None, &spot);
+        assert_eq!(r.allowlist, vec!["K1ABC".to_string()]);
+    }
+
+    #[test]
+    fn empty_cli_allowlist_keeps_file_allowlist() {
+        let spot = config::SpotFile {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        let r = resolve_spot(Vec::new(), None, None, &spot);
+        assert_eq!(r.allowlist, vec!["W1AW".to_string()]);
+    }
+
+    #[test]
+    fn cli_blocklist_beats_blocklist_path() {
+        let spot = config::SpotFile {
+            blocklist_path: Some(PathBuf::from("/cfg/bad.txt")),
+            notch_path: Some(PathBuf::from("/cfg/n.txt")),
+            ..Default::default()
+        };
+        let r = resolve_spot(Vec::new(), Some(PathBuf::from("cli.txt")), None, &spot);
+        assert_eq!(r.blocklist, Some(PathBuf::from("cli.txt")));
+        assert_eq!(r.notch, Some(PathBuf::from("/cfg/n.txt")));
+    }
+
+    #[test]
+    fn name_matches_today_source_names() {
+        let kiwi = || KiwiOpts {
+            host: Some("h".into()),
+            port: 8073,
+            freq: Some(7e6),
+            password: String::new(),
+        };
+        assert_eq!(LiveSourceSpec::Kiwi(kiwi()).name(), "kiwi");
+        assert_eq!(LiveSourceSpec::AudioDevice(None).name(), "audio");
+        assert_eq!(
+            LiveSourceSpec::File {
+                path: PathBuf::from("x.wav"),
+                source_iq: false
+            }
+            .name(),
+            "file"
+        );
+        #[cfg(feature = "soapy")]
+        assert_eq!(
+            LiveSourceSpec::Soapy(SoapyOpts {
+                driver: Some("d".into()),
+                freq: Some(7e6),
+                rate: Some(48e3),
+                gain: None
+            })
+            .name(),
+            "soapy"
+        );
+        #[cfg(feature = "hpsdr")]
+        assert_eq!(
+            LiveSourceSpec::Hpsdr(HpsdrOpts {
+                host: Some("h".into()),
+                port: 1024,
+                freq: Some(7e6),
+                rate: Some(48e3)
+            })
+            .name(),
+            "hpsdr"
+        );
+    }
+
+    #[cfg(not(feature = "soapy"))]
+    #[test]
+    fn soapy_input_type_needs_the_soapy_feature() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"soapy\"\ndriver = \"d\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+        );
+        let err = resolve(cli_overrides(), &loaded).err().unwrap().to_string();
+        assert!(
+            err.contains("input.type = \"soapy\" needs a manta built with --features soapy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(not(feature = "hpsdr"))]
+    #[test]
+    fn hpsdr_input_type_needs_the_hpsdr_feature() {
+        let loaded = loaded_from(
+            "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+        );
+        let err = resolve(cli_overrides(), &loaded).err().unwrap().to_string();
+        assert!(
+            err.contains("input.type = \"hpsdr\" needs a manta built with --features hpsdr"),
+            "{err}"
+        );
+    }
+
+    /// D10: every config-backed flag maps to the key it overrides.
+    const FLAG_KEYS: &[(&str, &str)] = &[
+        ("device", "input.device"),
+        ("source", "input.path"),
+        ("source_iq", "input.iq"),
+        ("kiwi_host", "input.host"),
+        ("kiwi_port", "input.port"),
+        ("kiwi_freq_hz", "input.freq_hz"),
+        ("kiwi_password", "input.password"),
+        ("soapy_driver", "input.driver"),
+        ("soapy_freq_hz", "input.freq_hz"),
+        ("soapy_rate_hz", "input.rate_hz"),
+        ("soapy_gain", "input.gain_db"),
+        ("hpsdr_host", "input.host"),
+        ("hpsdr_port", "input.port"),
+        ("hpsdr_freq_hz", "input.freq_hz"),
+        ("hpsdr_rate_hz", "input.rate_hz"),
+        ("freq_correction_ppm", "input.freq_correction_ppm"),
+        ("dial_freq_hz", "input.center_freq_hz"),
+        ("capture_rate_hz", "input.capture_rate_hz"),
+        ("replay_epoch", "input.replay_epoch"),
+        ("allowlist", "spot.allowlist"),
+        ("blocklist", "spot.blocklist_path"),
+        ("notch", "spot.notch_path"),
+        ("engine", "decode.engine"),
+    ];
+    /// Flags with no config key, by design.
+    const CLI_ONLY: &[&str] = &["json", "duration", "config", "path", "help", "version"];
+
+    #[test]
+    fn every_config_backed_flag_maps_to_a_key() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        for name in ["run", "soak", "doctor", "decode"] {
+            let sub = cli.find_subcommand(name).unwrap();
+            for arg in sub.get_arguments() {
+                let id = arg.get_id().as_str();
+                assert!(
+                    FLAG_KEYS.iter().any(|(flag, _)| *flag == id) || CLI_ONLY.contains(&id),
+                    "`manta {name} --{id}` has no config key: add it to FLAG_KEYS (and the \
+                     loader) or to CLI_ONLY"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_flag_key_is_accepted_by_the_loader() {
+        const TYPED: &[(&str, &str)] = &[
+            ("audio", "type = \"audio\"\ndevice = \"d\"\n"),
+            ("file", "type = \"file\"\npath = \"x.wav\"\niq = true\n"),
+            (
+                "kiwi",
+                "type = \"kiwi\"\nhost = \"h\"\nport = 8073\nfreq_hz = 7e6\npassword = \"\"\n",
+            ),
+            (
+                "soapy",
+                "type = \"soapy\"\ndriver = \"d\"\nfreq_hz = 7e6\nrate_hz = 48000.0\ngain_db = 10.0\n",
+            ),
+            (
+                "hpsdr",
+                "type = \"hpsdr\"\nhost = \"h\"\nport = 1024\nfreq_hz = 7e6\nrate_hz = 48000.0\n",
+            ),
+        ];
+        const SHARED: &[(&str, &str)] = &[
+            (
+                "input.freq_correction_ppm",
+                "[input]\nfreq_correction_ppm = 1.0\n",
+            ),
+            ("input.center_freq_hz", "[input]\ncenter_freq_hz = 7e6\n"),
+            (
+                "input.capture_rate_hz",
+                "[input]\ncapture_rate_hz = 6000.0\n",
+            ),
+            ("input.replay_epoch", "[input]\nreplay_epoch = 0\n"),
+            ("spot.allowlist", "[spot]\nallowlist = [\"W1AW\"]\n"),
+            (
+                "spot.blocklist_path",
+                "[spot]\nblocklist_path = \"b.txt\"\n",
+            ),
+            ("spot.notch_path", "[spot]\nnotch_path = \"n.txt\"\n"),
+            ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+        ];
+        for (_, key) in FLAG_KEYS {
+            let body = match SHARED.iter().find(|(k, _)| k == key) {
+                Some((_, body)) => body.to_string(),
+                None => {
+                    let field = key.strip_prefix("input.").unwrap();
+                    let (_, table) = TYPED
+                        .iter()
+                        .find(|(_, t)| t.lines().any(|l| l.starts_with(&format!("{field} ="))))
+                        .unwrap_or_else(|| panic!("no [input] type takes {key}"));
+                    format!("[input]\n{table}")
+                }
+            };
+            let f = write_temp_file(body.as_bytes());
+            if let Err(e) = config::load(Some(f.path()), config::Env::Ignore) {
+                panic!("{key}: {body:?} was rejected: {e:#}");
+            }
+        }
+    }
+
+    // MAN-86 review: the two ways the source-to-SETT wiring can advertise
+    // coverage manta cannot hear. Both go through `station_profile`, the
+    // exact code path `start_spot_server` uses, rather than calling
+    // `segments_for_passband` directly.
+
+    fn test_server_config(callsign: &str) -> manta_server::config::ServerConfig {
+        let cfg_file = write_temp_file(
+            format!(
+                r#"
+                [server]
+                station_callsign = "{callsign}"
+                bind_addr = "127.0.0.1"
+                telnet_port = 0
+                json_port = 0
+                metrics_port = 0
+                "#
+            )
+            .as_bytes(),
+        );
+        let text = std::fs::read_to_string(cfg_file.path()).unwrap();
+        let file: manta_server::config::DaemonConfigFile = toml::from_str(&text).unwrap();
+        file.server
+    }
+
+    #[test]
+    fn sett_advertises_a_rig_audio_source_only_above_its_dial_frequency() {
+        // `--source` WAV / an audio device with --dial-freq-hz: analytic
+        // audio carries spectrum ONLY above the dial, over the rig's ~3 kHz
+        // AF passband -- not the +/-24 kHz its 48 kS/s stream could hold.
+        let cfg = test_server_config("W3XYZ");
+        let profile = station_profile(
+            &cfg,
+            14_027_000.0,
+            (
+                manta_input::AUDIO_PASSBAND_LO_HZ,
+                manta_input::AUDIO_PASSBAND_HI_HZ,
+            ),
+            1.0,
+        );
+        assert_eq!(
+            profile.sett.to_string(),
+            "SETT: vlNormal 14027.3-14030.0",
+            "audio coverage must be dial+0.3..dial+3.0 kHz"
+        );
+    }
+
+    #[test]
+    fn sett_advertises_the_frequency_corrected_passband_not_the_raw_one() {
+        // --freq-correction-ppm moves every emitted spot; the advertised
+        // bounds have to move with them.
+        let cfg = test_server_config("W3XYZ");
+        let factor = manta_spot::calibration_factor_from_ppm(1_000.0).unwrap();
+        let corrected = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), factor);
+        let raw = station_profile(&cfg, 14_040_000.0, (-5_000.0, 5_000.0), 1.0);
+        assert_eq!(raw.sett.to_string(), "SETT: vlNormal 14035.0-14045.0");
+        assert_eq!(corrected.sett.to_string(), "SETT: vlNormal 14049.0-14059.1");
+    }
+
+    // MAN-89 (PR #131 review, rounds 6 and 7): `station_geography_unresolved`
+    // is precomputed from the operator's configured `station_callsign`, which
+    // may carry an RBN `-N` per-band SSID. It must be classified through the
+    // SAME string `SpotMessage::from_spot` resolves -- the SSID-stripped one
+    // -- or a mobile node's spots go out with the de-side sentinels while
+    // `manta_spots_unresolved_geography_total` stays at zero. These drive the
+    // production entry point directly rather than stripping in the test, so
+    // the strip cannot silently move back out to the call sites.
+
+    #[test]
+    fn an_ssid_bearing_mobile_station_callsign_is_counted_as_unresolved() {
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        for call in ["K5ARH/MM-1", "K5ARH/AM-1", "K5ARH/MM-99"] {
+            assert!(
+                !geography_is_unresolved(&cty, call),
+                "test premise: unstripped, {call} reads as resolved -- this is the bug"
+            );
+            assert!(
+                station_geography_unresolved(&cty, call),
+                "{call} carries the de-side sentinels and must be counted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ssid_bearing_ordinary_station_callsign_is_not_counted_as_unresolved() {
+        // The other direction: stripping must not turn a perfectly resolvable
+        // node identity into a counted one.
+        let cty =
+            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
+        assert!(!station_geography_unresolved(&cty, "W1AW-1"));
+        assert!(!station_geography_unresolved(&cty, "W1AW/P-2"));
+        // An SSID-free identity is classified exactly as before.
+        assert!(!station_geography_unresolved(&cty, "W1AW"));
+        assert!(station_geography_unresolved(&cty, "W1AW/MM"));
     }
 
     // MAN-44: uplink health at a glance -- `manta status` + `GET /status`.
@@ -4258,9 +6440,17 @@ mod tests {
             "#,
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (_rt, server) = start_spot_server(
-            cfg_file.path(),
-            96_000.0,
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4296,9 +6486,17 @@ mod tests {
             "#,
         );
 
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
         let (rt, server) = start_spot_server(
-            cfg_file.path(),
-            96_000.0,
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+            },
             std::time::SystemTime::UNIX_EPOCH,
             0,
         )
@@ -4327,16 +6525,9 @@ mod tests {
 
     fn cfg_with(bind_addr: &str, metrics_port: u16) -> manta_server::config::ServerConfig {
         manta_server::config::ServerConfig {
-            station_callsign: "W3XYZ".to_string(),
             bind_addr: bind_addr.to_string(),
-            telnet_port: 7300,
-            json_port: 7301,
             metrics_port,
-            telnet_max_connections_per_ip: None,
-            json_max_connections_per_ip: None,
-            metrics_max_connections_per_ip: None,
-            telnet_max_commands_per_ip: None,
-            json_max_pings_per_ip: None,
+            ..test_server_config("W3XYZ")
         }
     }
 
@@ -4624,8 +6815,8 @@ mod tests {
 
     fn doc_with(
         health: manta_server::metrics::OverallUplinkHealth,
-    ) -> manta_server::status::StatusDoc {
-        manta_server::status::StatusDoc {
+    ) -> manta_server::status_doc::StatusDoc {
+        manta_server::status_doc::StatusDoc {
             schema_version: 1,
             version: "test".to_string(),
             uptime_seconds: 0,
@@ -4634,7 +6825,7 @@ mod tests {
             json_clients: 0,
             ws_clients: 0,
             active_tracks: None,
-            uplink: manta_server::status::UplinkStatus {
+            uplink: manta_server::status_doc::UplinkStatus {
                 health,
                 connected_targets: 0,
                 enabled_targets: 0,
@@ -4764,165 +6955,6 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "must not have hung past the configured timeout"
-        );
-    }
-
-    // MAN-56: input-layer health counters wiring.
-
-    /// A wrapper `IqSource` that forgets to forward `health_counters`
-    /// silently swallows the inner source's counters via the trait's
-    /// `None` default -- the metrics would just be absent, with nothing
-    /// failing loudly. Same hazard `confirmed_live_handle` carries; both
-    /// are asserted here.
-    #[test]
-    fn fixed_center_freq_source_forwards_both_optional_trait_signals() {
-        use manta_input::InputHealthCounters;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-
-        struct StubSource {
-            counters: Arc<InputHealthCounters>,
-            live: Arc<AtomicBool>,
-        }
-        impl IqSource for StubSource {
-            fn sample_rate(&self) -> f64 {
-                48_000.0
-            }
-            fn center_freq_hz(&self) -> f64 {
-                0.0
-            }
-            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
-                Ok(0)
-            }
-            fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
-                Some(self.live.clone())
-            }
-            fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
-                Some(self.counters.clone())
-            }
-        }
-
-        let counters = Arc::new(InputHealthCounters::new());
-        let live = Arc::new(AtomicBool::new(false));
-        let wrapped = FixedCenterFreqSource {
-            inner: Box::new(StubSource {
-                counters: counters.clone(),
-                live: live.clone(),
-            }),
-            freq_hz: 14_025_000.0,
-        };
-
-        assert!(Arc::ptr_eq(&wrapped.health_counters().unwrap(), &counters));
-        assert!(Arc::ptr_eq(
-            &wrapped.confirmed_live_handle().unwrap(),
-            &live
-        ));
-    }
-
-    #[test]
-    fn input_health_of_snapshots_all_three_counters_without_transposing_them() {
-        // Three same-typed u64s: a transposition would be invisible to any
-        // test that used equal values (MAN-56 D7).
-        let c = manta_input::InputHealthCounters::new();
-        c.record_dropped(7);
-        c.record_gap();
-        c.record_gap();
-        c.record_malformed();
-        let h = input_health_of(&c);
-        assert_eq!(h.dropped_packets, 7);
-        assert_eq!(h.gaps_detected, 2);
-        assert_eq!(h.malformed_packets, 1);
-    }
-
-    #[test]
-    fn a_source_without_counters_publishes_no_input_health_series() {
-        struct StubSourceNoCounters;
-        impl IqSource for StubSourceNoCounters {
-            fn sample_rate(&self) -> f64 {
-                48_000.0
-            }
-            fn center_freq_hz(&self) -> f64 {
-                0.0
-            }
-            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
-                Ok(0)
-            }
-        }
-
-        let m = manta_server::metrics::Metrics::new();
-        // Mirrors the wiring above: `None` means we never call
-        // set_input_health.
-        let src: Box<dyn IqSource> = Box::new(StubSourceNoCounters);
-        if let Some(c) = src.health_counters() {
-            m.set_input_health("file", input_health_of(&c));
-        }
-        assert!(!m
-            .render_prometheus_text()
-            .contains("manta_input_malformed_packets_total{"));
-    }
-
-    // MAN-136 round-1 validate code-review finding 1: the increment
-    // condition for `manta_spots_unresolved_geography_total` must match the
-    // condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
-    // sentinels -- the RESOLVED ADIF entity number, not merely whether
-    // `cty.lookup` returned an entry.
-
-    const GEOGRAPHY_CTY_FIXTURE: &str = "\
-United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
-    K,W,N;
-";
-    /// One `dxcc.tsv` row for the fixture above, in the vendored file's
-    /// `<primary-prefix>\t<adif-number>\t<name>` shape.
-    const GEOGRAPHY_DXCC_FIXTURE: &str = "K\t291\tUnited States\n";
-
-    #[test]
-    fn a_callsign_with_a_resolved_entity_number_is_not_counted_as_unresolved() {
-        let cty =
-            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
-        assert_eq!(cty.lookup("W1AW").and_then(|e| e.dxcc), Some(291));
-        assert!(!geography_is_unresolved(&cty, "W1AW"));
-    }
-
-    #[test]
-    fn an_unresolvable_callsign_is_counted_as_unresolved() {
-        let cty =
-            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
-        assert!(cty.lookup("QQ1AAA").is_none(), "test premise");
-        assert!(geography_is_unresolved(&cty, "QQ1AAA"));
-    }
-
-    #[test]
-    fn a_maritime_or_aeronautical_mobile_callsign_is_counted_as_unresolved() {
-        // /MM and /AM resolve through the base prefix, so the entity-number
-        // test alone reads them as resolved -- but `SpotMessage::from_spot`
-        // emits UNKNOWN_CONTINENT/UNKNOWN_CQ_ZONE and null lat/lon for them,
-        // so the counter must not sit at zero while those go out.
-        let cty =
-            manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, GEOGRAPHY_DXCC_FIXTURE);
-        assert_eq!(
-            cty.lookup("W1AW/MM").and_then(|e| e.dxcc),
-            Some(291),
-            "test premise: the base prefix still resolves"
-        );
-        assert!(geography_is_unresolved(&cty, "W1AW/MM"));
-        assert!(geography_is_unresolved(&cty, "W1AW/AM"));
-        assert!(!geography_is_unresolved(&cty, "W1AW/P"));
-    }
-
-    #[test]
-    fn a_cty_resolvable_callsign_with_no_dxcc_row_is_still_counted_as_unresolved() {
-        // The cty.dat/dxcc.tsv drift state: `cty.dat` was hand-refreshed
-        // (data/SOURCES.md has no refresh automation) without regenerating
-        // the TSV, so geography resolves -- non-null dxLat/dxLon -- while
-        // the entity number does not, and the spot goes out with
-        // `dxDxcc: -1`. Counting `lookup().is_none()` missed exactly this.
-        let cty = manta_spot::cty::Table::parse_with_dxcc(GEOGRAPHY_CTY_FIXTURE, "");
-        let entry = cty.lookup("W1AW").expect("geography still resolves");
-        assert_eq!(entry.dxcc, None, "test premise: only the number is missing");
-        assert_eq!(entry.continent, "NA");
-        assert!(
-            geography_is_unresolved(&cty, "W1AW"),
-            "a spot emitted with UNKNOWN_DXCC must be counted, even though cty.dat resolved it"
         );
     }
 }

@@ -5,17 +5,20 @@ designed to be internet-reachable with no authentication, matching the DX
 cluster/RBN ecosystem's own long-standing convention (ARCHITECTURE.md §7).
 The Prometheus metrics endpoint is different: it's operationally useful, not
 part of that public-facing contract, and carries no authentication either.
-**`GET /status`** (MAN-44, the JSON document `manta status` reads) is served
-by that same metrics listener and shares its exact exposure posture —
-everything below about `/metrics` applies to `/status` too. `/status`
-additionally lists every configured RBN uplink target's `host:port` — public
-infrastructure by nature (it's who your daemon forwards spots to), but
-enumerable by anyone who can reach the port, same as `/metrics`'s existing
-`manta_source_health` labels already are.
+**`GET /healthz` (MAN-128) shares the metrics listener and its bind
+address/port** — it is not a separate port, so every mitigation below that
+applies to `[server].metrics_port` covers `/healthz` too. See
+`docs/RUNBOOKS/node-health.md` for its semantics. **`GET /status`**
+(MAN-44, the JSON document `manta status` reads) is served by that same
+listener too, with the same exposure posture. It additionally lists every
+configured RBN uplink target's `host:port` — public infrastructure by
+nature, but enumerable by anyone who can reach the port, as `/metrics`'s
+`manta_uplink_target_*{target}` labels already are. See
+`docs/RUNBOOKS/uplink-health.md`.
 
 By default all three bind to `[server].bind_addr`, which defaults to
 `0.0.0.0` — every configured port is reachable from any network that can
-route to the host, metrics (and status) included.
+route to the host, metrics (and `/healthz`/`/status`) included.
 
 **If you don't want `/metrics`/`/status` reachable outside your own
 network**, the only safe option today is:

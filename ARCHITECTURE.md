@@ -157,6 +157,20 @@ endpoint today — a different layer (lost/rejected datagrams before demux, not
 ring backpressure after it), not a partial implementation of the ring gauge
 above.
 
+**Reconnect (MAN-73).** A live source's `IqSource::read()` can fail -- a
+stalled Kiwi socket, an HPSDR stall-escalation, a dropped audio device.
+`manta-cli` wraps every such source (not file replay) in
+`ReconnectingSource`, which reopens it with `manta-server::backoff`'s
+1s-60s policy instead of letting the error reach `listen()` and end the
+process. Samples lost to the outage are reported once via the trait's
+`take_discontinuity()` method; `manta_engine::listen` responds by closing
+the current track segment and starting a fresh one with the sample clock
+advanced by the gap, so spot timestamps stay wall-clock-true with no
+audio spliced across the gap and no zero-fill (see
+`docs/DECISIONS/2026-10-05-man73-source-reconnect.md` for why zero-fill
+was rejected). File replay is exempt: its errors and EOF must reach
+`listen()` unchanged for byte-identical replay.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
@@ -217,13 +231,19 @@ Per track, operating on the ~375 Hz complex channel stream:
    block AGC is not used) → smoothed magnitude.
    (A separate tone-finder stage is unnecessary here — the PFB already did the
    frequency selection.)
-2. **Keying detection**: dual-rail noise/signal EMA estimators → adaptive
-   threshold at their geometric mean → key-down/key-up decisions with hysteresis
-   and minimum-duration debounce (the same keying-decision approach as dit,
-   simplified).
+2. **Keying detection**: dual-rail noise/signal EMA estimators → key-down/
+   key-up decisions from an additive band about the rails' linear-amplitude
+   midpoint (SPEC §3.2/§3.3; superseding the geometric mean this section
+   originally described — a geometric-mean threshold sits closer to the
+   noise rail as apparent keying depth grows, biasing every measured mark
+   long, worse at higher SNR and near a channel edge; see
+   `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`) → debounce.
 3. **Speed tracking**: online 2-means clustering of mark durations into
-   {dit, dah}; WPM = 1200/dit_ms, tracked with EMA. Handles 10–40+ WPM and drift;
-   Farnsworth spacing tolerated by decoupling inter-element and inter-word gap
+   {dit, dah}; WPM = 1200/dit_estimate_ms (a symmetric mark/gap period
+   estimate, SPEC §4.1a — not dit_ms directly, which stays uncorrected for
+   the classification/likelihood consumers that want it), tracked with EMA.
+   Handles 10–40+ WPM and drift; Farnsworth spacing tolerated by decoupling
+   inter-element and inter-word gap
    thresholds (dit's speed-detector lesson).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over
@@ -371,14 +391,33 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 7. Output layer (`manta-server`)
 
-- **Telnet DX cluster server** (default :7300): standard login prompt, emits
-  RBN-format spots —
-  `DX de W3XYZ-#:  14027.1  JA1ABC   CW  30 dB  28 WPM  CQ  0312Z`.
-  Read-mostly protocol; enough command grammar (`sh/dx`, filters) for common
-  clients not to choke. This is the RBN/aggregator compatibility surface. The
+- **Telnet DX cluster server** (default :7300): on connect, sends a CW-Skimmer-
+  shaped greeting banner (software name/version, operator name/callsign/QTH/
+  grid, then `Please enter your callsign: `), validates the login as a
+  plausible callsign shape (not authentication — see Exposure policy below),
+  then emits spots in RBN's fixed-column AK1A layout —
+  `DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      0312Z`
+  (frequency to 0.01 kHz ending at column 24, a 15-wide callsign column,
+  time at column 71 — MAN-88, measured against a live
+  `telnet.reversebeacon.net:7000` capture). `[server].line_format =
+  "skimmer"` selects the CW-Skimmer-native variant (no mode column) for
+  operators running manta behind W3OA's Aggregator, which expects CW
+  Skimmer's own layout rather than the RBN relay's.
+  Read-mostly protocol; enough command grammar (`sh/dx`, filters, `SKIMMER/
+  SETT`, `BYE`) for common clients — and RBN's own Aggregator — not to choke.
+  `SKIMMER/SETT` replies with validation level and the live decodable
+  passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
+  spots from a source that never answers it (Aggregator manual v6.0 §9.2).
+  This is the RBN/aggregator compatibility surface — see
+  `docs/DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md` for the
+  exact wire format and its primary sources. The
   SNR field is quoted in the 500 Hz reference bandwidth RBN/CW Skimmer use
   (MAN-102 / decision D3), converted from the decoder's native 2500 Hz
   measurement at render time — see `docs/SPEC-decode-core.md` §2.3.
+  Telnet option negotiation (RFC 854 IAC) is stripped from the client's byte
+  stream and refused — every option, always — so that clients which negotiate
+  on connect can log in; manta implements no telnet options. See
+  `docs/DECISIONS/2026-09-07-man87-telnet-iac-policy.md`.
 - **JSON Lines stream** (TCP and WebSocket, :7301): full-fidelity spot objects
   (adds confidence, track id, decoder text context). This is the cqdx ingest
   surface; schema published in `dispensa` as a JSON Schema contract alongside the
@@ -429,9 +468,29 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 ## 8. Configuration & observability
 
-- Single TOML config (coppa convention): device, center freq, band plan
-  (CW segment limits — don't decode/spot outside them), thresholds, track cap,
-  server ports, cty/scp paths, station callsign (spotter ID).
+- **Single TOML config** (MAN-261,
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with six
+  tables — `[server]` (station callsign, which may carry an RBN `-N`
+  per-band SSID per
+  `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
+  bind address; ports),
+  `[[rbn_uplink]]`, `[input]` (source type and its keys, dial frequency,
+  capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
+  files), `[detector]` (thresholds, timers, track cap) and `[decode]` —
+  read by `run`, `soak` and `doctor` (`--config`, else `MANTA_CONFIG`) and
+  by `decode`/`oracle`. Precedence is flag, then `MANTA_<TABLE>_<KEY>`
+  environment variable, then file, then default; `decode` and `oracle`
+  never read the environment. Unknown tables, keys and `MANTA_*` variables
+  are errors. `docs/SPEC-decode-core.md` §9 is the key table. Not yet
+  configurable: a band plan (CW segment limits), cty/scp paths, and the
+  compile-time constants SPEC §9 marks `not configurable yet`.
+  `manta config check` runs `run`'s config pipeline up to its first source
+  I/O (load, environment overlay, source resolution, blocklist/notch
+  reads), then prints a per-table summary of the resolved settings without
+  opening the receiver or binding a port; `manta config init` writes a
+  scaffold with every key commented out at its default, pinned to the code
+  defaults and the loader's key list by tests (MAN-76,
+  `docs/DECISIONS/2026-10-07-man76-config-check-init.md`).
 - **`tracing` + `tracing-subscriber` with `EnvFilter`, implemented for
   `manta-server`'s three listeners (telnet, JSON/WS, metrics)** — landed
   2026-09-03 (MAN-59, `docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`):
@@ -439,31 +498,53 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `bounded_io` read rejections, malformed-WS-frame disconnects, and
   rejected metrics-endpoint requests are all logged (plain `fmt` output,
   `RUST_LOG`-controlled, default `info`) to give an operator a durable
-  record to reconstruct an abuse incident after the fact. Still
-  aspirational: `manta-input`/`manta-engine` carry no logging of their
-  own yet (decode-pipeline internals, not the network-facing surface
-  MAN-59 scoped to). **`manta status` implemented** (2026-09-04, MAN-44,
+  record to reconstruct an abuse incident after the fact. **The daemon
+  also logs its own liveness** — landed 2026-09-07 (MAN-122,
+  `docs/DECISIONS/2026-09-07-man122-operator-liveness-logging.md`): one
+  startup banner (version, source, sample rate, dial frequency, station
+  callsign, real bound telnet/JSON/metrics addresses) logged once every
+  bind succeeds and before any listener task is spawned, plus a
+  rate-limited periodic status line (`manta_server::status`,
+  `status_interval_secs` in `[server]`, default 60 s, `0` disables) naming
+  pipeline state, active track count, spots/min, connected client count,
+  and uplink connection state. The banner says `listening:`, not `ready:`
+  (review round 2): bound sockets are not evidence anything will decode,
+  since a replay shorter than the two-second calibration window or a live
+  source that fails its first reads exits with the pipeline never having
+  started. Readiness is a second, strictly later line
+  (`manta <ver> ready: decoding source=...`) emitted from the decode
+  loop's first processed batch. The status line's `pipeline=` field
+  (`starting`/`decoding`/`stalled`) is derived from a per-batch progress
+  counter, so a wedged decode loop — a blocked `IqSource::read`, say —
+  reads as `stalled` instead of republishing a frozen `tracks=N`
+  indefinitely. Still aspirational: `manta-input`'s and
+  `manta-engine`'s own internals carry no logging of their own yet
+  (decode-pipeline internals, not the network-facing surface MAN-59
+  scoped to, nor the daemon-lifecycle surface MAN-122 scoped to).
+  **`manta status` implemented** (MAN-44,
   `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`): reads a
-  JSON `StatusDoc` (`crates/manta-server/src/status.rs`) served on
-  `GET /status` by the same metrics listener that already served
-  `GET /metrics` — deliberately NOT the local-control-socket design this
-  section previously sketched as unimplemented; the ADR records why a
-  Unix-only control socket was evaluated and not taken. Reports daemon
-  uptime, spot/client counts, and — the ticket's actual scope — **per-target
-  RBN uplink health**: each configured `[[rbn_uplink]]` target's own
-  connected/sent/suppressed/reconnect counts plus a derived
-  `connected`/`flapping`/`down`/`disabled` verdict from a windowed
-  reconnect rate (`RECONNECT_WINDOW`/`FLAPPING_RECONNECTS` in
-  `metrics.rs`), so a stuck reconnect loop reads as unhealthy even while
-  technically connected at the instant it's checked. Exit code doubles as
-  a cron/Nagios check. Inherits `/metrics`'s unauthenticated,
-  `0.0.0.0`-by-default exposure posture (`docs/RUNBOOKS/network-exposure.md`).
-  Prometheus text
+  JSON `StatusDoc` (`crates/manta-server/src/status_doc.rs`) served on
+  `GET /status` by the same metrics listener that serves `GET /metrics`
+  and `GET /healthz` — deliberately NOT the local-control-socket design
+  this section previously sketched; the ADR records why a Unix-only
+  control socket was evaluated and not taken. Reports daemon uptime,
+  spot/client counts, and — the ticket's actual scope — **per-target RBN
+  uplink health**: each configured `[[rbn_uplink]]` target's own
+  connected/sent/suppressed/reconnect counts (MAN-128's per-target
+  registry) plus a derived `connected`/`flapping`/`down`/`disabled`
+  verdict from a windowed reconnect rate
+  (`RECONNECT_WINDOW`/`FLAPPING_RECONNECTS` in `metrics.rs`), so a stuck
+  reconnect loop reads as unhealthy even while technically connected at
+  the instant it's checked. Exit code doubles as a cron/Nagios check.
+  Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
+  `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
+  `0.0.0.0`-by-default exposure posture
+  (`docs/RUNBOOKS/network-exposure.md`). Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
-  `--config` is set — `--server-config` is MAN-77's deprecated alias of
-  that flag): input overruns, active tracks, evictions, decode rate,
+  the resolved config has a `[server]` table — `--server-config` is
+  MAN-77's deprecated alias of `--config`): input overruns, active tracks, evictions, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
   aspirational for several of these fields; the currently-implemented
   subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
@@ -494,35 +575,102 @@ validation (MAN-28). Dedupe (step 5) still applies.
   de callsign didn't resolve against `cty.dat`, *or* it resolved but its
   entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
   or `/AM` designator that places it outside any DXCC entity),
-  `manta_active_tracks`, per-protocol client-connected gauges,
-  `manta_source_health`, the uplink counters, (MAN-44) per-target
-  `manta_uplink_target_*` series, and (MAN-56, landed 2026-09-04)
-  `manta_input_dropped_packets_total`/
+  `manta_active_tracks` (MAN-45/MAN-122, below), per-protocol
+  client-connected gauges, `manta_source_health`, the uplink counters,
+  (MAN-44) `manta_uplink_target_recent_reconnects{target}`, and
+  (MAN-56, landed 2026-09-04) `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
-  (`crates/manta-server/src/metrics.rs`). What's still genuinely missing:
-  per-stage queue depths, decode rate, spots/min, spot-confidence
-  histogram, and **ring**-overrun counting for live audio (§3 — blocked on
+  (`crates/manta-server/src/metrics.rs`). **MAN-128 (landed 2026-10-05)
+  added**: `manta_spots_by_band_total{band,type}` (a new family alongside
+  the unchanged `manta_spots_total` rollup — the two are incremented
+  together and the labeled family sums to the aggregate);
+  `manta_decode_latency_seconds` (a real Prometheus histogram: wall-clock
+  time per steady-state input chunk, excluding the source-read wait and
+  calibration — its `_count` rate is spots-pipeline throughput, closing
+  the "decode rate" gap noted below); `manta_start_time_seconds`/
+  `manta_uptime_seconds`/`manta_build_info{version,git_sha,features}`
+  (process uptime and build metadata — `git_sha` is `"unknown"` in a
+  Docker build, since `.dockerignore` excludes `.git`);
+  `manta_uplink_target_*{target="host:port"}` (per-target labels for every
+  uplink counter, derived-sum aggregates preserved under their old
+  unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`
+  (the same verdict `/healthz`, below, reports). What's still genuinely
+  missing: per-stage queue depths, spots/min, spot-confidence histogram,
+  and **ring**-overrun counting for live audio (§3 — blocked on
   a `coppa-audio` API addition, `manta-engine::soak`'s documented
   deviation, a different gap from MAN-56's wire-level packet counters).
   The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss (HPSDR today; kiwi/soapy/audio
-  report none) and are **absent**, not a frozen zero, for every other
-  source — the same "absent means not measured" distinction that motivated
+  actually count wire-level packet loss (HPSDR and KiwiSDR — MAN-128
+  generalized MAN-56's gap-stat wiring to KiwiSDR's SND `seq` field;
+  soapy/audio report none) and are **absent**, not a frozen zero, for
+  every other source — "absent means not measured", so an operator never
+  reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
+- **`GET /healthz` (MAN-128)**: shares the metrics listener/bind address.
+  Returns `200 OK`/body `ok\n...` only while every registered source is
+  healthy, every registered listener (telnet/JSON/metrics) is up, and the
+  decode loop has made progress within the last 10 s (or was never armed —
+  library use only; the daemon always arms it). Otherwise `503 Service
+  Unavailable`/body `unhealthy\n...`, with one line per failing check so an
+  operator can see why. The RBN uplink is deliberately **excluded** from
+  this verdict — an uplink outage must not make an orchestrator restart a
+  node that is decoding fine; uplink health is visible per target on
+  `/metrics` only. `manta_healthy`/`manta_listener_up` on `/metrics` are
+  computed by the exact same evaluation, so a Prometheus-only operator and
+  a liveness probe can never disagree.
   **`manta_active_tracks` is now populated** (MAN-45, corrected
-  2026-09-04): `manta_engine::listen_with_observers` publishes
-  `TrackManager::active_track_count()` into a shared handle as the decode
-  loop runs (`ListenObservers`); the daemon's server runtime polls it into
-  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms). Plain `listen()`
-  (every other caller — `soak()`, the CPU-budget bench, both integration
-  tests) is unchanged and pays nothing for this.
-  **`manta_source_health` is one-sided** (corrected 2026-09-03, review
-  round 7, filed as **MAN-64**): the only production call site
-  (`main.rs:1082`) ever sets it `true`; nothing transitions it to `false`
-  on a later failure, and a fatal source read tears the daemon down
-  instead. It's a startup-success marker, not live health reporting —
-  don't read it as the latter until MAN-64 either wires real transitions
-  or this note is the accepted-permanent behavior.
+  2026-09-04; its *source* corrected again 2026-09-07 by MAN-122). It had
+  been served-but-frozen at a constant `0` since 2026-09-03 because
+  `manta_engine::listen()` exposed no hook for it. Two observers now carry
+  the count out of the decode loop, both fed from the same number:
+  `manta_engine::listen_with_observers` stores it into a shared handle
+  (`ListenObservers`), which the daemon's server runtime polls into
+  `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250 ms); and the same
+  function hands it synchronously to an `on_tracks` callback after every
+  processed batch — repeats included, since that call is also the daemon's
+  decode-progress heartbeat (MAN-122 review round 2), which a polled gauge
+  value alone cannot express. Plain `listen()` (every other caller —
+  `soak()`, the CPU-budget bench, both integration tests) registers
+  neither and pays nothing for this.
+  The number itself comes from `TrackManager`'s own lifecycle, not from
+  the decode event stream: `TrackManager::decoding_track_count()` reports
+  how many tracks are currently promoted and holding a leased decoder
+  (`Active` or `Hang`). So `manta_active_tracks` and the status line's
+  `tracks=` field both report a real, moving count instead of the previous
+  permanent `0`. An event-derived count was tried first and rejected in
+  review: a track `TrackManager` has promoted but whose demodulator has
+  not latched emits no events at all — `TrackDecoder` withholds
+  `TrackMeta` until `snr_2500_db()` is `Some` — and such a track can stay
+  ACTIVE until the ~30 s `gc_hops` silent GC, so a weak or unmodulated
+  signal that real decoders are working on would have reported `tracks=0`.
+  The gauge is driven back to `0` at end of stream and on a mid-stream
+  read failure, so it doesn't stay stuck at the last live value after EOF
+  or a fatal source error. A reconnectable source's disconnect never
+  reaches `listen()` as a read failure (MAN-73, below): its unhealthy
+  transition zeroes the shared handle instead, which the poller publishes
+  within one `ACTIVE_TRACKS_POLL_INTERVAL`. Note this is deliberately *not*
+  `TrackManager::active_track_count()` (what MAN-45 first published here),
+  which also counts unconfirmed CANDIDATEs — noise-blip rise crossings
+  that lease no decoder and would inflate an operator-facing "is it
+  decoding?" reading — and which keeps its own meaning for `soak_metrics`.
+  **`manta_source_health` tracks live reconnect state** (MAN-73, closing
+  MAN-64's one-sided-gauge finding): every reconnectable source kind
+  (Kiwi, HPSDR, Soapy, a plain audio device — everything but file replay)
+  is wrapped at startup by `manta-cli::reconnect::ReconnectingSource`,
+  which owns this gauge for that source's whole process lifetime. It
+  reads `0` while the source is down and retrying with backoff (reusing
+  `manta-server::backoff`'s 1s-60s policy) and `1` once samples are
+  flowing again — including the very first connection, for a source kind
+  (HPSDR) where opening a socket proves nothing about a device actually
+  being present (see `IqSource::confirmed_live_handle`). File replay's
+  health is set `1` once, immediately, and never read again: its errors
+  and EOF are deterministic and must reach `listen()` unchanged, so it is
+  never wrapped. A source that keeps failing to reopen now retries
+  forever instead of ending the daemon — see
+  `docs/DECISIONS/2026-10-05-man73-source-reconnect.md`. The
+  `manta_input_*` series sum every connection a reconnectable source makes
+  (MAN-228, `manta-cli::reconnect::InputHealthTotals`), so they keep
+  counting across a reconnect and never reset mid-process.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 

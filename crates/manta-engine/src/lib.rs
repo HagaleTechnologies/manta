@@ -1,8 +1,11 @@
 //! M0 pipeline: WAV -> frequency estimate -> single channel -> decoder.
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
+pub mod config_file;
 pub mod listen;
 pub use listen::{listen, listen_with_observers, ListenObservers};
+pub mod latency;
+pub use latency::{DecodeLatencyObserver, DecodeLatencySnapshot, DECODE_LATENCY_BUCKETS_SECONDS};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;

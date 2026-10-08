@@ -37,7 +37,7 @@
 
 use manta_server::bus::SpotBus;
 use manta_server::config::RbnUplinkConfig;
-use manta_server::metrics::{Metrics, UplinkTarget};
+use manta_server::metrics::Metrics;
 use manta_server::rbn;
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
@@ -74,10 +74,6 @@ fn uplink_config(target_port: u16, dry_run: bool) -> RbnUplinkConfig {
 struct Harness {
     bus: Arc<SpotBus>,
     metrics: Arc<Metrics>,
-    /// One registered per-target handle per configured `[[rbn_uplink]]`
-    /// entry, in config order (MAN-44) -- lets a test assert on a SPECIFIC
-    /// target's own state instead of only the metrics-wide aggregate.
-    targets: Vec<Arc<UplinkTarget>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -85,24 +81,37 @@ struct Harness {
 /// test itself controls) and returns the shared bus/metrics/shutdown
 /// handles the test drives.
 fn spawn_uplink(target_port: u16, dry_run: bool) -> Harness {
-    spawn_uplinks(vec![uplink_config(target_port, dry_run)])
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
+    let metrics = Arc::new(Metrics::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let cfg = uplink_config(target_port, dry_run);
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{target_port}"), true);
+    let bus2 = bus.clone();
+    tokio::spawn(async move {
+        manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx).await;
+    });
+
+    Harness {
+        bus,
+        metrics,
+        shutdown_tx,
+    }
 }
 
 /// Spawns one `uplink::serve` task per config, all sharing the same
-/// bus/metrics/shutdown -- mirroring `start_spot_server`'s real MAN-42/
-/// MAN-44 wiring (one independent task per configured `[[rbn_uplink]]`
-/// target, each registered against `metrics` before it's spawned).
+/// bus/metrics/shutdown -- mirroring `start_spot_server`'s real MAN-42
+/// wiring (one independent task per configured `[[rbn_uplink]]` target).
 fn spawn_uplinks(configs: Vec<RbnUplinkConfig>) -> Harness {
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let specs = manta_server::uplink::target_specs(&configs);
-    let mut targets = Vec::with_capacity(configs.len());
-    for (cfg, spec) in configs.into_iter().zip(specs) {
-        let target = metrics.register_uplink_target(spec);
-        targets.push(target.clone());
+    let labels = manta_server::uplink::target_labels(&configs);
+    for (cfg, label) in configs.into_iter().zip(labels) {
+        let target = metrics.register_uplink_target(label, cfg.enabled);
         let bus2 = bus.clone();
         let shutdown_rx2 = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -114,7 +123,6 @@ fn spawn_uplinks(configs: Vec<RbnUplinkConfig>) -> Harness {
     Harness {
         bus,
         metrics,
-        targets,
         shutdown_tx,
     }
 }
@@ -151,7 +159,12 @@ async fn logs_in_and_forwards_a_published_spot() {
     assert_eq!(login_line.trim_end(), STATION_CALL);
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     harness.bus.publish(spot);
 
     let mut line = String::new();
@@ -364,16 +377,12 @@ async fn disabled_uplink_makes_no_connection_attempt() {
 
     let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Metrics::new();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let mut cfg = uplink_config(addr.port(), false);
     cfg.enabled = false;
-    let spec = manta_server::uplink::target_specs(std::slice::from_ref(&cfg))
-        .into_iter()
-        .next()
-        .unwrap();
-    let target = metrics.register_uplink_target(spec);
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{}", addr.port()), false);
     tokio::spawn(async move {
         manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus, target, shutdown_rx).await;
     });
@@ -420,16 +429,8 @@ async fn omitted_dry_run_key_logs_in_but_does_not_transmit() {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, epoch, 0));
     let metrics = Arc::new(Metrics::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let target = metrics.register_uplink_target(format!("127.0.0.1:{}", addr.port()), true);
     let bus2 = bus.clone();
-    // MAN-44: `serve()` writes to a registered per-target handle, and the
-    // aggregate `uplink_*_total()` figures asserted below are DERIVED by
-    // summing the registry -- so the target has to be registered here for
-    // this scenario's counters to be visible at all.
-    let spec = manta_server::uplink::target_specs(std::slice::from_ref(&cfg))
-        .into_iter()
-        .next()
-        .unwrap();
-    let target = metrics.register_uplink_target(spec);
     tokio::spawn(async move {
         manta_server::uplink::serve(cfg, STATION_CALL.to_string(), bus2, target, shutdown_rx).await;
     });
@@ -469,7 +470,12 @@ async fn spot_is_forwarded_to_every_configured_target() {
     assert_eq!(login2.trim_end(), STATION_CALL);
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     harness.bus.publish(spot);
 
     let mut line1 = String::new();
@@ -511,7 +517,12 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
     assert_eq!(login_up.trim_end(), STATION_CALL);
 
     let spot = sample_spot();
-    let expected = rbn::format_line(&spot, STATION_CALL, harness.bus.unix_ts_for(spot.sample_ts));
+    let expected = rbn::format_line(
+        &spot,
+        STATION_CALL,
+        harness.bus.unix_ts_for(spot.sample_ts),
+        rbn::LineFormat::Rbn,
+    );
     harness.bus.publish(spot);
 
     let mut line = String::new();
@@ -549,6 +560,7 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
         &spot2,
         STATION_CALL,
         harness.bus.unix_ts_for(spot2.sample_ts),
+        rbn::LineFormat::Rbn,
     );
     harness.bus.publish(spot2);
     let mut line2 = String::new();
@@ -561,82 +573,14 @@ async fn one_target_down_does_not_block_delivery_to_the_reachable_target_and_ret
     let _ = harness.shutdown_tx.send(true);
 }
 
-// MAN-44 acceptance scenarios:
-//   Scenario: An operator checks whether the uplink is currently connected
-//     Given the RBN uplink is enabled
-//     When an operator checks manta's status
-//     Then they can see whether the uplink is currently connected to its
-//       RBN target, and how many spots have been sent/suppressed
-//
-//   Scenario: An operator notices a stuck reconnect loop
-//     Given the RBN uplink has been reconnecting repeatedly
-//     When an operator checks manta's status
-//     Then they can see WHICH target is unhealthy, without reading logs
-
-/// MAN-44 scenario 1: an operator can see THIS target is connected and how
-/// much it has sent since start.
+/// MAN-128 Scenario 4: with two targets, one connected and one stuck
+/// reconnecting, an operator must be able to tell WHICH target is down from
+/// labeled per-target series, not just the aggregate count.
 #[tokio::test]
-async fn per_target_state_reports_connection_and_sent_counts_for_that_target() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let harness = spawn_uplink(addr.port(), false);
-
-    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
-
-    harness.bus.publish(sample_spot());
-
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for the forwarded spot")
-        .unwrap();
-
-    let snap = harness.targets[0].snapshot();
-    assert!(
-        snap.connected,
-        "the target's own snapshot must read connected"
-    );
-    assert_eq!(snap.sent, 1);
-    assert_eq!(snap.suppressed, 0);
-
-    let _ = harness.shutdown_tx.send(true);
-}
-
-/// MAN-44 scenario 1, dry-run leg: suppressed is attributed to the right
-/// target, not just the metrics-wide aggregate.
-#[tokio::test]
-async fn dry_run_target_reports_suppressed_not_sent_on_its_own_snapshot() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let harness = spawn_uplink(addr.port(), true);
-
-    let (_login_line, _reader, _wr) = mock_rbn_accept_and_login(&listener).await;
-    harness.bus.publish(sample_spot());
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while harness.targets[0].snapshot().suppressed < 1 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("target snapshot never reflected the suppressed spot");
-
-    let snap = harness.targets[0].snapshot();
-    assert_eq!(snap.sent, 0);
-    assert_eq!(snap.suppressed, 1);
-
-    let _ = harness.shutdown_tx.send(true);
-}
-
-/// MAN-44 scenario 2, the whole point of per-target state: with one
-/// healthy and one dead target, the snapshot names WHICH one is
-/// unhealthy, and the reachable target's own reading is untouched.
-#[tokio::test]
-async fn one_dead_target_is_individually_identifiable_while_the_other_stays_connected() {
+async fn two_targets_one_down_are_distinguishable_per_target() {
     let listener_up = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port_up = listener_up.local_addr().unwrap().port();
 
-    // Bind then immediately drop to get a port nothing listens on.
     let temp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port_down = temp.local_addr().unwrap().port();
     drop(temp);
@@ -650,22 +594,57 @@ async fn one_dead_target_is_individually_identifiable_while_the_other_stays_conn
     assert_eq!(login_up.trim_end(), STATION_CALL);
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        while harness.targets[1].snapshot().reconnects < 1 {
+        while harness.metrics.uplink_reconnects_total() < 1 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the dead target never recorded a reconnect attempt");
+    .expect("the down target never attempted a retry");
 
-    let up = harness.targets[0].snapshot();
-    let down = harness.targets[1].snapshot();
-    assert!(
-        up.connected,
-        "the reachable target must still read connected"
-    );
-    assert_eq!(up.reconnects, 0);
-    assert!(!down.connected, "the dead target must not read connected");
-    assert!(down.reconnects >= 1);
+    let text = harness.metrics.render_prometheus_text();
+    assert!(text.contains(&format!(
+        r#"manta_uplink_target_connected{{target="127.0.0.1:{port_up}"}} 1"#
+    )));
+    assert!(text.contains(&format!(
+        r#"manta_uplink_target_connected{{target="127.0.0.1:{port_down}"}} 0"#
+    )));
+    assert!(text.contains(&format!(
+        r#"manta_uplink_target_reconnects_total{{target="127.0.0.1:{port_up}"}} 0"#
+    )));
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-88 Decision 1: `[server].line_format` does not reach the uplink --
+/// `RbnUplinkConfig` has no `line_format` field of its own, and
+/// `forward_loop` pins `rbn::LineFormat::Rbn` unconditionally. Asserted
+/// against literal columns (mode column present, time at column 71), the
+/// bytes actually read back off the mock target's socket, not just the
+/// return value of `rbn::format_line` the other tests in this file build
+/// their expectation from.
+#[tokio::test]
+async fn the_uplink_always_emits_the_rbn_layout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spot = sample_spot();
+    let unix_ts = harness.bus.unix_ts_for(spot.sample_ts);
+    harness.bus.publish(spot);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for the forwarded spot line")
+        .unwrap();
+    let line = line.trim_end();
+
+    assert_eq!(line.find("CW").unwrap() + 1, 42, "line was: {line:?}");
+    let secs_of_day = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+    assert_eq!(line.find(&zulu).unwrap() + 1, 71, "line was: {line:?}");
 
     let _ = harness.shutdown_tx.send(true);
 }

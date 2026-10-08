@@ -1,480 +1,470 @@
-//! Operator-facing status document (MAN-44). ARCHITECTURE §8's "manta
-//! status ... live stats" is served as JSON on the metrics listener's
-//! `GET /status` (`metrics_http::route`) and rendered for humans by
-//! `manta status` (`manta-cli`).
-//!
-//! Deliberately NOT a `dispensa` ecosystem contract (CLAUDE.md assigns
-//! that to the spot schema): this is single-daemon operator tooling, not
-//! an ingest contract shared across the ecosystem. `schema_version` is
-//! here so a future field removal is detectable by an older CLI talking
-//! to a newer daemon. The CLI parses this exact struct (via
-//! `manta-server` as a library dependency), so there is no second,
-//! independently-drifting definition of the wire shape.
+//! MAN-122: operator-liveness logging. A startup banner (Scenario 1) and a
+//! rate-limited periodic status line (Scenario 2) so an operator can tell
+//! from the daemon's own log output that it came up and is decoding,
+//! without waiting for a client to connect. Follows the plain-message,
+//! `RUST_LOG`-gated, stderr-only `tracing` conventions MAN-59 established
+//! (`docs/DECISIONS/2026-09-03-man59-connection-audit-logging.md`).
 
-use crate::metrics::{
-    overall_uplink_health_of, Metrics, OverallUplinkHealth, UplinkHealth, UplinkTargetSnapshot,
-    FLAPPING_RECONNECTS, RECONNECT_WINDOW,
-};
-use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use crate::metrics::Metrics;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
-/// The one `schema_version` this build both emits and understands.
+/// Default periodic status-line cadence when `status_interval_secs` is
+/// omitted from `[server]`.
+pub const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Everything Scenario 1's startup banner names.
+pub struct StartupInfo<'a> {
+    pub version: &'a str,
+    pub source: &'a str,
+    pub sample_rate_hz: f64,
+    pub dial_freq_hz: f64,
+    pub station_callsign: &'a str,
+    pub telnet_addr: SocketAddr,
+    pub json_addr: SocketAddr,
+    pub metrics_addr: SocketAddr,
+}
+
+/// Scenario 1's one-line banner. The verb is `listening:`, not `ready:`
+/// (MAN-122 review round 2): at the point every field here is known the
+/// daemon has bound its three sockets and nothing more -- the decode
+/// pipeline has not initialized, and a replay shorter than
+/// `manta_engine`'s two-second calibration window (or a live source that
+/// fails its first reads) still exits without ever decoding a sample.
+/// Readiness to decode is a separate, later event; see
+/// `format_pipeline_ready`.
+pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
+    format!(
+        "manta {} listening: source={} sample_rate_hz={:.0} dial_freq_hz={:.0} station={} \
+         telnet={} json={} metrics={}",
+        info.version,
+        info.source,
+        info.sample_rate_hz,
+        info.dial_freq_hz,
+        info.station_callsign,
+        info.telnet_addr,
+        info.json_addr,
+        info.metrics_addr,
+    )
+}
+
+/// The readiness event proper: emitted once, by the daemon wiring layer,
+/// when the decode pipeline has actually initialized (channelizer built,
+/// calibration window read, first batch processed) -- the point after
+/// which a bound socket is backed by a running decoder. Split from
+/// `format_startup_banner` in MAN-122 review round 2, because binding
+/// sockets is not evidence that anything will ever be decoded.
+pub fn format_pipeline_ready(version: &str, source: &str, sample_rate_hz: f64) -> String {
+    format!("manta {version} ready: decoding source={source} sample_rate_hz={sample_rate_hz:.0}")
+}
+
+/// What the status line's `uplink=` field reports. `NotConfigured` is
+/// distinct from `Disconnected` on purpose: an operator with no
+/// `[[rbn_uplink]]` must not read a permanent "disconnected" as a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UplinkState {
+    NotConfigured,
+    Connected,
+    Disconnected,
+}
+
+impl UplinkState {
+    fn as_str(self) -> &'static str {
+        match self {
+            UplinkState::NotConfigured => "none",
+            UplinkState::Connected => "connected",
+            UplinkState::Disconnected => "disconnected",
+        }
+    }
+}
+
+/// What the status line's `pipeline=` field reports, derived from
+/// `Metrics::pipeline_batches()` moving (or not) between two consecutive
+/// status samples (MAN-122 review round 2). Without this the status line
+/// happily republishes a stale `tracks=N` forever after the synchronous
+/// decode loop stops progressing -- exactly the "is it still decoding?"
+/// question the line exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineState {
+    /// No batch has been processed yet, and the daemon is still inside
+    /// `STARTUP_GRACE`. Expected for the first interval or two of a live
+    /// source, whose `manta_engine` calibration window is two real seconds
+    /// of samples; NOT reported as a stall, which would be a false alarm on
+    /// every cold start.
+    Starting,
+    Decoding,
+    /// Either batches were being processed and then stopped, or none was
+    /// ever processed and the startup grace period has expired -- a daemon
+    /// wedged before its first batch (a blocked first `IqSource::read`, a
+    /// source that never fills the calibration window) is stalled, not
+    /// perpetually starting (MAN-122 review round 3).
+    Stalled,
+}
+
+/// How long zero decode progress still reads as `starting` rather than
+/// `stalled` (MAN-122 review round 3). Without a bound, a daemon whose very
+/// first `IqSource::read` blocks -- or which never accumulates
+/// `manta_engine`'s two-second calibration window -- keeps
+/// `pipeline_batches` at zero forever and every status line for the rest of
+/// the process's life reports `starting`, so the liveness signal never fires
+/// for exactly the wedge it was added to catch.
 ///
-/// Public because it is half of a wire contract, not a private detail:
-/// `manta-cli`'s `parse_status_doc` rejects any other version outright
-/// rather than reading a newer daemon's document with this build's
-/// semantics (Codex review, PR #95). A bump here means an INCOMPATIBLE
-/// change -- a removed or re-meaning'd field. Purely additive fields do
-/// not bump it: `serde` ignores unknown keys, so an older CLI keeps
-/// reading a newer daemon correctly, which is the whole reason a version
-/// mismatch can be treated as fatal rather than best-effort.
-pub const STATUS_SCHEMA_VERSION: u32 = 1;
+/// 30 s is ~15x the two-second calibration window: ample for a live source
+/// to open its device and deliver its first samples (a KiwiSDR TCP connect,
+/// a SoapySDR device init) and still well inside the 60 s default status
+/// interval, so the very first status line of a wedged startup already reads
+/// `stalled`.
+pub const STARTUP_GRACE: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StatusDoc {
-    pub schema_version: u32,
-    pub version: String,
-    pub uptime_seconds: u64,
+impl PipelineState {
+    fn as_str(self) -> &'static str {
+        match self {
+            PipelineState::Starting => "starting",
+            PipelineState::Decoding => "decoding",
+            PipelineState::Stalled => "stalled",
+        }
+    }
+
+    /// Classify from two consecutive samples of `Metrics::pipeline_batches()`
+    /// plus how long the daemon has been up: zero progress is only
+    /// `starting` while `since_start` is within `STARTUP_GRACE`, and reads
+    /// as `stalled` after it.
+    pub fn from_progress(previous: u64, current: u64, since_start: Duration) -> Self {
+        if current == 0 {
+            if since_start <= STARTUP_GRACE {
+                PipelineState::Starting
+            } else {
+                PipelineState::Stalled
+            }
+        } else if current == previous {
+            PipelineState::Stalled
+        } else {
+            PipelineState::Decoding
+        }
+    }
+}
+
+pub struct StatusSnapshot {
+    pub uptime_s: u64,
+    pub active_tracks: u64,
+    pub spots_per_min: f64,
     pub spots_total: u64,
     pub telnet_clients: i64,
     pub json_clients: i64,
     pub ws_clients: i64,
-    /// The live decoder-track count, from the same gauge `/metrics`
-    /// publishes as `manta_active_tracks`. `Some` for any daemon that
-    /// builds this document: MAN-45 (ARCHITECTURE.md §8, corrected
-    /// 2026-09-04) gave `Metrics::set_active_tracks` a real production
-    /// call site -- `manta-cli`'s server runtime polls
-    /// `manta_engine::listen_with_observers`'s shared handle into
-    /// `Metrics` every `ACTIVE_TRACKS_POLL_INTERVAL` (250ms) -- so this
-    /// is a live number, not the frozen `0` the earlier "served but never
-    /// populated" caution warned about (MAN-44 review CR-B).
-    ///
-    /// Stays `Option` for the schema contract, not because the daemon
-    /// still withholds it: an older daemon (or a future one that drops
-    /// the field) serializes `null`, and `render_human` prints "n/a"
-    /// rather than a fabricated `0`.
-    pub active_tracks: Option<u64>,
-    pub uplink: UplinkStatus,
+    pub uplink: UplinkState,
+    pub pipeline: PipelineState,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UplinkStatus {
-    pub health: OverallUplinkHealth,
-    pub connected_targets: usize,
-    pub enabled_targets: usize,
-    pub sent_total: u64,
-    pub suppressed_total: u64,
-    pub reconnects_total: u64,
-    pub reconnect_window_seconds: u64,
-    pub flapping_threshold: u32,
-    /// Never includes `login_callsign` (MAN-44 decision 9) -- knowing
-    /// *which* target is broken is the whole point of this document; the
-    /// login callsign adds nothing to that question. `UplinkTargetSnapshot`
-    /// (from `metrics.rs`) has no such field to begin with, so there is
-    /// nothing here that could leak it even by future accident.
-    pub targets: Vec<UplinkTargetSnapshot>,
+pub fn format_status_line(s: &StatusSnapshot) -> String {
+    format!(
+        "manta status: uptime_s={} pipeline={} tracks={} spots_per_min={:.1} spots_total={} \
+         clients={} (telnet={} json={} ws={}) uplink={}",
+        s.uptime_s,
+        s.pipeline.as_str(),
+        s.active_tracks,
+        s.spots_per_min,
+        s.spots_total,
+        s.telnet_clients + s.json_clients + s.ws_clients,
+        s.telnet_clients,
+        s.json_clients,
+        s.ws_clients,
+        s.uplink.as_str(),
+    )
 }
 
-impl StatusDoc {
-    pub fn from_metrics(metrics: &Metrics) -> Self {
-        // One `now`, one registry walk: every uplink field below --
-        // `targets`, `connected_targets`, `health`, and the three
-        // aggregate totals -- is derived from this SAME snapshot, so none
-        // of them can disagree with each other or with the rows in
-        // `targets` (MAN-44 code review CR-1, CR-2, CR-3). Before this,
-        // `connected_targets` counted the raw `connected` bool while
-        // `health` counted `health == Connected` from a second, later
-        // snapshot (CR-1); and the three `_total` fields each called a
-        // `Metrics` getter that took its own fresh registry read at its
-        // own later instant (CR-2), so `/status` could report totals that
-        // disagreed with `sum(targets[].sent/suppressed/reconnects)` for a
-        // spot forwarded in between.
-        let targets = metrics.uplink_snapshot_at(Instant::now());
-        let enabled_targets = targets.iter().filter(|t| t.enabled).count();
-        let connected_targets = targets
-            .iter()
-            .filter(|t| t.health == UplinkHealth::Connected)
-            .count();
-        let sent_total = targets.iter().map(|t| t.sent).sum();
-        let suppressed_total = targets.iter().map(|t| t.suppressed).sum();
-        let reconnects_total = targets.iter().map(|t| t.reconnects).sum();
-        let health = overall_uplink_health_of(&targets);
-        StatusDoc {
-            schema_version: STATUS_SCHEMA_VERSION,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: metrics.uptime().as_secs(),
-            spots_total: metrics.spots_total(),
-            telnet_clients: metrics.telnet_clients(),
-            json_clients: metrics.json_clients(),
-            ws_clients: metrics.ws_clients(),
-            // MAN-44 review CR-B: the live gauge, not a hardcoded `None`.
-            // `manta-cli`'s poller (`ACTIVE_TRACKS_POLL_INTERVAL`, 250ms)
-            // has fed `set_active_tracks` since MAN-45, so discarding it
-            // here made `/status` and every `manta status` report
-            // `null`/"n/a" while `/metrics` reported the real count.
-            active_tracks: Some(metrics.active_tracks()),
-            uplink: UplinkStatus {
-                health,
-                connected_targets,
-                enabled_targets,
-                sent_total,
-                suppressed_total,
-                reconnects_total,
-                reconnect_window_seconds: RECONNECT_WINDOW.as_secs(),
-                flapping_threshold: FLAPPING_RECONNECTS,
-                targets,
-            },
-        }
+/// Spots per minute over the elapsed window. Returns 0.0 for a zero window
+/// rather than an `inf`/`NaN` an operator would have to decode.
+pub fn spots_per_min(delta_spots: u64, elapsed: Duration) -> f64 {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return 0.0;
     }
+    delta_spots as f64 * 60.0 / secs
+}
 
-    /// Pretty-printed JSON with DEL and the C1 controls (U+007F-U+009F)
-    /// `\u`-escaped as well (Codex review, PR #95): serde_json escapes only
-    /// U+0000-U+001F, so those would otherwise reach the terminal raw
-    /// through `manta status --json` when a spoofed endpoint puts them in a
-    /// label. serde_json never emits them outside a string literal, so
-    /// escaping each one keeps the output valid JSON with the same decoded
-    /// value.
-    pub fn to_json(&self) -> String {
-        let json =
-            serde_json::to_string_pretty(self).expect("StatusDoc is infallibly serializable");
-        let mut out = String::with_capacity(json.len());
-        for c in json.chars() {
-            if ('\u{7f}'..='\u{9f}').contains(&c) {
-                out.push_str(&format!("\\u{:04x}", u32::from(c)));
-            } else {
-                out.push(c);
+/// Spawns the periodic status-line task. `interval` of zero disables it
+/// (returns `None`, nothing is spawned). Follows the codebase's existing
+/// periodic-task idiom (`tasks::spawn_reaper`, `rate_limit::
+/// spawn_stale_entry_reaper`): a bare sleep loop, not `tokio::time::
+/// interval` (unused anywhere in this workspace), but additionally raced
+/// against the shutdown watch so the task cannot emit a status line into
+/// the middle of the shutdown drain.
+///
+/// **The returned `JoinHandle` is part of the contract, not a convenience:
+/// a caller that signals shutdown MUST await it before it starts draining
+/// clients** (MAN-122 review round 4, P2). The two in-task guards below
+/// order shutdown against this task's own `select!` poll points, but
+/// nothing orders it against the wall clock between the post-sleep
+/// `shutdown.borrow()` returning `false` and the `tracing::info!` that
+/// follows -- a shutdown landing inside that window still yields one
+/// status line printed into the middle of the drain, claiming a liveness
+/// the daemon no longer has. Joining the handle is what makes shutdown and
+/// emission mutually ordered from the outside, and it is cheap: the
+/// `shutdown.changed()` arm is `biased`-first, so the task returns within
+/// one scheduler poll of the signal rather than at the next `interval`
+/// tick. `manta-cli`'s `main` does exactly this, via
+/// `SpotServer::status_line`.
+pub fn spawn_status_line(
+    metrics: Arc<Metrics>,
+    interval: Duration,
+    uplink_targets: usize,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval.is_zero() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let started = Instant::now();
+        let mut last_sample = started;
+        let mut last_spots = metrics.spots_total();
+        let mut last_batches = metrics.pipeline_batches();
+        loop {
+            // `biased`: without it `select!` picks a ready branch at random,
+            // so on the poll where the sleep and the shutdown notification
+            // both come ready the sleep can win and this task emits one more
+            // status line into the shutdown drain (MAN-122 review round 2).
+            // Shutdown first makes that unrepresentable.
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    // `Err` means every `watch::Sender` has dropped -- there is no
+                    // shutdown signal left to observe, ever. Reading the stale
+                    // borrowed value and `continue`-ing here (as an earlier
+                    // revision did) would re-fire this arm instantly on every
+                    // future `select!` iteration, busy-spinning a core on a
+                    // project whose hard budget is one Raspberry Pi 4 core.
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                _ = tokio::time::sleep(interval) => {}
             }
+            // Second guard, for a shutdown that lands between the sleep
+            // completing and this line: `biased` orders the two futures
+            // within one poll, it does not order them against the wall
+            // clock. Cheap (one `watch` borrow).
+            //
+            // MAN-122 review round 4 (P2): this guard narrows the window,
+            // it does NOT close it -- a shutdown signalled after this
+            // borrow reads `false` but before the `tracing::info!` at the
+            // bottom of the loop still produces one line inside the drain,
+            // and no in-task check can close that (the check and the log
+            // cannot be made atomic against an external signal). The
+            // ordering is established from the OUTSIDE instead, by the
+            // caller joining this task's `JoinHandle` immediately after
+            // sending shutdown and before starting the client drain -- see
+            // this function's doc comment and `SpotServer::status_line` in
+            // `manta-cli`. Once that join returns, this task is gone and no
+            // further line is possible.
+            if *shutdown.borrow() {
+                return;
+            }
+            let now = Instant::now();
+            let since_start = now.duration_since(started);
+            let spots_total = metrics.spots_total();
+            let batches = metrics.pipeline_batches();
+            let snapshot = StatusSnapshot {
+                uptime_s: since_start.as_secs(),
+                active_tracks: metrics.active_tracks(),
+                spots_per_min: spots_per_min(
+                    spots_total.saturating_sub(last_spots),
+                    now.duration_since(last_sample),
+                ),
+                spots_total,
+                telnet_clients: metrics.telnet_clients(),
+                json_clients: metrics.json_clients(),
+                ws_clients: metrics.ws_clients(),
+                uplink: if uplink_targets == 0 {
+                    UplinkState::NotConfigured
+                } else if metrics.uplink_connected() {
+                    UplinkState::Connected
+                } else {
+                    UplinkState::Disconnected
+                },
+                pipeline: PipelineState::from_progress(last_batches, batches, since_start),
+            };
+            last_sample = now;
+            last_spots = spots_total;
+            last_batches = batches;
+            tracing::info!("{}", format_status_line(&snapshot));
         }
-        out
-    }
-}
-
-fn overall_health_label(health: OverallUplinkHealth) -> &'static str {
-    match health {
-        OverallUplinkHealth::Ok => "OK",
-        OverallUplinkHealth::Degraded => "DEGRADED",
-        OverallUplinkHealth::Down => "DOWN",
-        OverallUplinkHealth::Disabled => "DISABLED",
-    }
-}
-
-fn target_health_label(health: UplinkHealth) -> &'static str {
-    match health {
-        UplinkHealth::Disabled => "disabled",
-        UplinkHealth::Connected => "connected",
-        UplinkHealth::Flapping => "flapping",
-        UplinkHealth::Down => "down",
-    }
-}
-
-/// Makes a daemon-supplied string safe to write to the operator's terminal
-/// (Codex review, PR #95). `manta status --addr` can be pointed at any
-/// endpoint, and serde_json decodes `\u001b`, `\n` and friends inside a
-/// JSON string, so a spoofed or hostile endpoint could otherwise inject
-/// ANSI/OSC sequences or forge extra rows through a target label. Every
-/// Unicode control character (`char::is_control`: C0, DEL, C1) is replaced
-/// by its `char::escape_default` spelling (`\u{1b}`, `\n`, ...); all other
-/// characters, including non-control format characters, pass through
-/// unchanged. Only human-facing text goes through this: `StatusDoc` keeps
-/// the original value, and `--json` output is escaped by `to_json` instead.
-pub fn escape_for_terminal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// One screen an operator can read without a manual (MAN-44). Fixed-width
-/// columns, kept inside 80 (the target table renders 78 for the plan's own
-/// worked example -- `telnet.reversebeacon.net:7000`, the longest
-/// realistic RBN hostname, plus a 5-digit sent count); the uplink verdict
-/// comes first because that is the question `manta status` exists to
-/// answer.
-pub fn render_human(doc: &StatusDoc) -> String {
-    let mut out = String::new();
-    let hours = doc.uptime_seconds / 3600;
-    let minutes = (doc.uptime_seconds % 3600) / 60;
-    out.push_str(&format!("manta status — daemon up {hours}h {minutes}m\n\n"));
-    out.push_str(&format!("  spots published      {}\n", doc.spots_total));
-    out.push_str(&format!(
-        "  telnet clients       {}      json/ws clients  {}\n",
-        doc.telnet_clients,
-        doc.json_clients + doc.ws_clients
-    ));
-    // A daemon that reports no `active_tracks` at all (an older one, or a
-    // future one that drops the field) is shown as "n/a" rather than a
-    // fabricated 0 -- a live daemon always sends the real count.
-    out.push_str(&format!(
-        "  active tracks  {}\n\n",
-        match doc.active_tracks {
-            Some(n) => n.to_string(),
-            None => "n/a".to_string(),
-        }
-    ));
-
-    if doc.uplink.targets.is_empty() {
-        out.push_str("RBN uplink: not configured\n");
-        return out;
-    }
-
-    out.push_str(&format!(
-        "RBN uplink: {} — {} of {} enabled targets connected\n\n",
-        overall_health_label(doc.uplink.health),
-        doc.uplink.connected_targets,
-        doc.uplink.enabled_targets
-    ));
-    out.push_str(&format!(
-        "  {:<30} {:<9} {:>6} {:>8} {:>8} {:>10}\n",
-        "TARGET", "STATE", "SENT", "SUPPR", "RECONN", "RECENT(5m)"
-    ));
-    for t in &doc.uplink.targets {
-        out.push_str(&format!(
-            "  {:<30} {:<9} {:>6} {:>8} {:>8} {:>10}\n",
-            escape_for_terminal(&t.label),
-            target_health_label(t.health),
-            t.sent,
-            t.suppressed,
-            t.reconnects,
-            t.recent_reconnects
-        ));
-    }
-    out
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::UplinkTargetSpec;
 
-    fn metrics_fixture() -> Metrics {
-        let m = Metrics::new();
-        let a = m.register_uplink_target(UplinkTargetSpec {
-            label: "a.example:7000".to_string(),
-            host: "a.example".to_string(),
-            port: 7000,
-            enabled: true,
-            dry_run: false,
+    #[test]
+    fn the_banner_names_every_field_scenario_1_requires() {
+        let line = format_startup_banner(&StartupInfo {
+            version: "0.1.0",
+            source: "file",
+            sample_rate_hz: 48_000.0,
+            dial_freq_hz: 14_060_000.0,
+            station_callsign: "W5AU",
+            telnet_addr: "127.0.0.1:7300".parse().unwrap(),
+            json_addr: "127.0.0.1:7301".parse().unwrap(),
+            metrics_addr: "127.0.0.1:7302".parse().unwrap(),
         });
-        a.mark_connected();
-        a.record_sent();
+        for needle in [
+            "0.1.0",
+            "source=file",
+            "sample_rate_hz=48000",
+            "dial_freq_hz=14060000",
+            "telnet=127.0.0.1:7300",
+            "json=127.0.0.1:7301",
+            "metrics=127.0.0.1:7302",
+        ] {
+            assert!(line.contains(needle), "{needle:?} missing from {line:?}");
+        }
+    }
 
-        let b = m.register_uplink_target(UplinkTargetSpec {
-            label: "b.example:7000".to_string(),
-            host: "b.example".to_string(),
-            port: 7000,
-            enabled: true,
-            dry_run: false,
+    #[test]
+    fn the_status_line_names_every_field_scenario_2_requires() {
+        let line = format_status_line(&StatusSnapshot {
+            uptime_s: 120,
+            active_tracks: 3,
+            spots_per_min: 12.0,
+            spots_total: 24,
+            telnet_clients: 1,
+            json_clients: 2,
+            ws_clients: 0,
+            uplink: UplinkState::Connected,
+            pipeline: PipelineState::Decoding,
         });
-        b.record_reconnect();
-        b.record_reconnect();
-        b.record_reconnect();
-
-        m
+        for needle in [
+            "pipeline=decoding",
+            "tracks=3",
+            "spots_per_min=12.0",
+            "clients=3",
+            "uplink=connected",
+        ] {
+            assert!(line.contains(needle), "{needle:?} missing from {line:?}");
+        }
     }
 
     #[test]
-    fn status_doc_serializes_a_stable_versioned_shape() {
-        let doc = StatusDoc::from_metrics(&metrics_fixture());
-        let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
-        assert_eq!(v["schema_version"], 1);
-        assert!(v["uptime_seconds"].is_u64());
-        assert_eq!(v["uplink"]["health"], "degraded");
-        assert_eq!(v["uplink"]["targets"][0]["target"], "a.example:7000");
-        assert_eq!(v["uplink"]["targets"][0]["health"], "connected");
-        // Decision 9: the login callsign is never exposed.
-        assert!(!serde_json::to_string(&doc)
-            .unwrap()
-            .contains("login_callsign"));
+    fn spots_per_min_scales_the_window_and_never_divides_by_zero() {
+        assert_eq!(spots_per_min(10, Duration::from_secs(60)), 10.0);
+        assert_eq!(spots_per_min(10, Duration::from_secs(30)), 20.0);
+        assert_eq!(spots_per_min(0, Duration::ZERO), 0.0);
+        assert_eq!(spots_per_min(5, Duration::ZERO), 0.0);
     }
 
-    #[test]
-    fn status_doc_round_trips_so_the_cli_parses_exactly_what_the_daemon_emits() {
-        let doc = StatusDoc::from_metrics(&metrics_fixture());
-        let back: StatusDoc = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
-        assert_eq!(back, doc);
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_disables_the_status_task() {
+        let (_tx, rx) = watch::channel(false);
+        assert!(spawn_status_line(Arc::new(Metrics::new()), Duration::ZERO, 0, rx).is_none());
     }
 
+    /// MAN-122 review round 2: a wedged decode loop (a blocked
+    /// `IqSource::read`, say) leaves every other field in the snapshot
+    /// frozen at its last live value, so `pipeline=` is the only thing that
+    /// can tell an operator the difference between "quiet band" and "not
+    /// running".
     #[test]
-    fn human_render_shows_each_target_state_sent_suppressed_and_recent_reconnects() {
-        let out = render_human(&StatusDoc::from_metrics(&metrics_fixture()));
-        assert!(out.contains("RBN uplink: DEGRADED"));
-        assert!(out.contains("a.example:7000"));
-        assert!(out.contains("connected"));
-        assert!(out.contains("flapping"));
-    }
-
-    #[test]
-    fn active_tracks_reports_the_live_gauge_rather_than_a_null_placeholder() {
-        // MAN-44 review CR-B: `manta-cli`'s poller feeds
-        // `set_active_tracks` every 250ms (MAN-45), so `/status` and
-        // `manta status` must show that count -- they used to hardcode
-        // `None` and report "n/a" while `/metrics` reported the truth.
-        let m = metrics_fixture();
-        m.set_active_tracks(12);
-        let doc = StatusDoc::from_metrics(&m);
-        assert_eq!(doc.active_tracks, Some(12));
-        assert!(render_human(&doc).contains("active tracks  12"));
-    }
-
-    #[test]
-    fn a_status_doc_without_active_tracks_renders_n_a_rather_than_a_fabricated_zero() {
-        // The field stays `Option` for the schema contract: a daemon that
-        // sends no count at all must not be rendered as "0 tracks".
-        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
-        doc.active_tracks = None;
-        assert!(render_human(&doc).contains("active tracks  n/a"));
-    }
-
-    #[test]
-    fn human_render_escapes_control_characters_in_a_daemon_supplied_target_label() {
-        // Codex review, PR #95: `manta status --addr` can reach a spoofed
-        // endpoint, and serde_json decodes `\u001b`/`\n` inside a JSON
-        // string, so a label written verbatim could inject ANSI/OSC
-        // sequences or forge an extra table row on the operator's terminal.
-        let clean = render_human(&StatusDoc::from_metrics(&metrics_fixture()));
-        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
-        let hostile = "evil:7000\u{1b}]0;pwned\u{7}\n  forged.example:7000 connected";
-        doc.uplink.targets[0].label = hostile.to_string();
-
-        let out = render_human(&doc);
-        assert!(
-            !out.chars().any(|c| c.is_control() && c != '\n'),
-            "no control character but the renderer's own line breaks may reach the terminal: {out:?}"
+    fn the_pipeline_field_separates_a_stalled_loop_from_a_running_one() {
+        let fresh = Duration::from_secs(1);
+        assert_eq!(
+            PipelineState::from_progress(0, 0, fresh),
+            PipelineState::Starting
         );
         assert_eq!(
-            out.lines().count(),
-            clean.lines().count(),
-            "an embedded newline must not forge an extra row: {out:?}"
+            PipelineState::from_progress(0, 7, fresh),
+            PipelineState::Decoding
         );
-        assert!(out.contains(r"evil:7000\u{1b}]0;pwned\u{7}\n  forged.example:7000 connected"));
-        // The document keeps the original value: `--json` output is
-        // serde_json-escaped already and stays faithful to what was sent.
-        assert_eq!(doc.uplink.targets[0].label, hostile);
-        assert!(doc.to_json().contains(r"evil:7000\u001b]0;pwned\u0007\n"));
-    }
-
-    #[test]
-    fn json_output_escapes_del_and_c1_controls_that_serde_json_leaves_raw() {
-        // serde_json \u-escapes only U+0000-U+001F, so DEL and the C1
-        // controls (U+009B is a one-character CSI) in a spoofed endpoint's
-        // label would reach the terminal raw through `manta status --json`.
-        let mut doc = StatusDoc::from_metrics(&metrics_fixture());
-        let hostile = "evil:7000\u{9b}2J\u{9d}0;pwned\u{9c}\u{7f}";
-        doc.uplink.targets[0].label = hostile.to_string();
-
-        let json = doc.to_json();
-        assert!(
-            !json.chars().any(|c| c.is_control() && c != '\n'),
-            "no control character but the pretty-printer's line breaks may reach the terminal: {json:?}"
-        );
-        assert!(
-            json.contains(r"evil:7000\u009b2J\u009d0;pwned\u009c\u007f"),
-            "{json:?}"
-        );
-        let back: StatusDoc = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            back.uplink.targets[0].label, hostile,
-            "the decoded value must be unchanged"
+            PipelineState::from_progress(7, 12, fresh),
+            PipelineState::Decoding
         );
-    }
-
-    #[test]
-    fn human_render_of_a_daemon_with_no_uplink_configured_says_so_plainly() {
-        let doc = StatusDoc::from_metrics(&Metrics::new());
-        let out = render_human(&doc);
-        assert!(out.contains("RBN uplink: not configured"));
-    }
-
-    #[test]
-    fn status_doc_from_a_healthy_single_target_daemon_reports_ok() {
-        let m = Metrics::new();
-        let a = m.register_uplink_target(UplinkTargetSpec {
-            label: "a.example:7000".to_string(),
-            host: "a.example".to_string(),
-            port: 7000,
-            enabled: true,
-            dry_run: false,
-        });
-        a.mark_connected();
-        let doc = StatusDoc::from_metrics(&m);
-        assert_eq!(doc.uplink.health, OverallUplinkHealth::Ok);
-        assert_eq!(doc.uplink.connected_targets, 1);
-        assert_eq!(doc.uplink.enabled_targets, 1);
-        let out = render_human(&doc);
-        assert!(out.contains("RBN uplink: OK"));
-    }
-
-    #[test]
-    fn a_target_that_is_flapping_and_momentarily_connected_does_not_count_as_connected() {
-        // CR-1 regression: `connected_targets` must come from the same
-        // classification as `health` (health == Connected), not the raw
-        // `connected` bool -- otherwise a target that is flapping AND
-        // currently connected made `from_metrics` say both "DOWN" and "1
-        // of 1 enabled targets connected" at once. That is exactly
-        // scenario 2's steady state (plan decision 5): a target
-        // reconnecting every 60s is momentarily connected whenever you
-        // happen to look.
-        let m = Metrics::new();
-        let a = m.register_uplink_target(UplinkTargetSpec {
-            label: "a.example:7000".to_string(),
-            host: "a.example".to_string(),
-            port: 7000,
-            enabled: true,
-            dry_run: false,
-        });
-        a.mark_connected();
-        let t0 = std::time::Instant::now();
-        for _ in 0..FLAPPING_RECONNECTS {
-            a.record_reconnect_at(t0);
-        }
-
-        let doc = StatusDoc::from_metrics(&m);
-        assert_eq!(doc.uplink.targets[0].health, UplinkHealth::Flapping);
-        assert_eq!(doc.uplink.health, OverallUplinkHealth::Down);
+        // Batches were flowing, and then stopped: the gauge below still says
+        // `tracks=N`, but nothing is being decoded.
         assert_eq!(
-            doc.uplink.connected_targets, 0,
-            "a flapping target must not count toward connected_targets even though its raw `connected` bit is set"
-        );
-
-        let out = render_human(&doc);
-        assert!(
-            out.contains("RBN uplink: DOWN — 0 of 1 enabled targets connected"),
-            "summary must not name a connected count that contradicts the DOWN verdict: {out}"
+            PipelineState::from_progress(12, 12, fresh),
+            PipelineState::Stalled
         );
     }
 
+    /// MAN-122 review round 3: a daemon wedged BEFORE its first batch --
+    /// a first `IqSource::read` that blocks, or a source that never fills
+    /// the two-second calibration window -- holds `pipeline_batches` at
+    /// zero for the whole process lifetime. Classifying that as `starting`
+    /// forever means the liveness signal never fires for the one failure
+    /// it was added to catch, so the grace period is bounded.
     #[test]
-    fn rendered_target_table_fits_in_eighty_columns_for_the_longest_documented_hostname() {
-        // D3: the plan's manual verification step is "confirm the summary
-        // fits in 80 columns with a long RBN hostname" -- exercised here
-        // with the real hostname the runbook and ADR both use as that
-        // "long" example, plus a 5-digit sent count matching the
-        // runbook's own sample.
-        let m = Metrics::new();
-        let a = m.register_uplink_target(UplinkTargetSpec {
-            label: "telnet.reversebeacon.net:7000".to_string(),
-            host: "telnet.reversebeacon.net".to_string(),
-            port: 7000,
-            enabled: true,
-            dry_run: false,
+    fn zero_progress_stops_reading_as_starting_once_the_grace_period_expires() {
+        assert_eq!(
+            PipelineState::from_progress(0, 0, STARTUP_GRACE),
+            PipelineState::Starting,
+            "the grace period itself is still startup, not a stall"
+        );
+        assert_eq!(
+            PipelineState::from_progress(0, 0, STARTUP_GRACE + Duration::from_secs(1)),
+            PipelineState::Stalled
+        );
+        // The default 60 s interval is longer than the grace period, so the
+        // FIRST status line of a wedged startup already says `stalled`.
+        assert_eq!(
+            PipelineState::from_progress(0, 0, DEFAULT_STATUS_INTERVAL),
+            PipelineState::Stalled,
+            "DEFAULT_STATUS_INTERVAL ({DEFAULT_STATUS_INTERVAL:?}) must exceed \
+             STARTUP_GRACE ({STARTUP_GRACE:?})"
+        );
+        // Real progress is never reclassified by elapsed time alone.
+        assert_eq!(
+            PipelineState::from_progress(7, 12, Duration::from_secs(86_400)),
+            PipelineState::Decoding
+        );
+    }
+
+    /// The two events are distinct on purpose (MAN-122 review round 2): the
+    /// banner names bound sockets, which is not evidence the pipeline will
+    /// ever start.
+    #[test]
+    fn the_banner_claims_only_that_the_listeners_are_bound() {
+        let banner = format_startup_banner(&StartupInfo {
+            version: "0.1.0",
+            source: "file",
+            sample_rate_hz: 48_000.0,
+            dial_freq_hz: 14_060_000.0,
+            station_callsign: "W5AU",
+            telnet_addr: "127.0.0.1:7300".parse().unwrap(),
+            json_addr: "127.0.0.1:7301".parse().unwrap(),
+            metrics_addr: "127.0.0.1:7302".parse().unwrap(),
         });
-        a.mark_connected();
-        for _ in 0..18001 {
-            a.record_sent();
-        }
-        let doc = StatusDoc::from_metrics(&m);
-        let out = render_human(&doc);
-        for line in out.lines() {
-            let width = line.chars().count();
-            assert!(
-                width <= 80,
-                "line exceeds 80 columns ({width} chars): {line:?}"
-            );
-        }
+        assert!(banner.contains("listening:"), "{banner:?}");
+        assert!(!banner.contains("ready:"), "{banner:?}");
+        let ready = format_pipeline_ready("0.1.0", "file", 48_000.0);
+        assert!(ready.contains("ready: decoding"), "{ready:?}");
+        assert!(ready.contains("source=file"), "{ready:?}");
+    }
+
+    /// A status line must never land after shutdown has been signalled --
+    /// it would interleave into the shutdown drain and claim liveness the
+    /// daemon no longer has. The one-poll tie between the sleep and the
+    /// notification is not constructible from a test (the sender wakes the
+    /// task before the paused clock advances), so it is closed structurally
+    /// instead, by `biased` plus the post-sleep `shutdown.borrow()` guard;
+    /// what this test pins is the observable half -- the task returns on
+    /// shutdown, promptly, of its own accord, rather than surviving to the
+    /// next tick.
+    #[tokio::test(start_paused = true)]
+    async fn the_status_task_returns_on_shutdown_instead_of_ticking_again() {
+        let (tx, rx) = watch::channel(false);
+        let metrics = Arc::new(Metrics::new());
+        let handle = spawn_status_line(metrics, Duration::from_secs(1), 0, rx)
+            .expect("a non-zero interval must spawn the task");
+        tokio::time::sleep(Duration::from_millis(999)).await;
+        tx.send(true).unwrap();
+        // The task must return of its own accord rather than being aborted.
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the status task must exit on shutdown, not outlive it")
+            .expect("the status task must not panic");
     }
 }

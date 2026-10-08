@@ -26,6 +26,7 @@ manta-engine = { workspace = true }
 manta-input = { workspace = true }
 manta-server = { workspace = true }
 num-complex = { workspace = true }
+serde = { workspace = true }
 manta-spot = { workspace = true }
 manta-testkit = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
@@ -40,5 +41,8 @@ serde_json = { workspace = true }
 manta-dsp = { workspace = true }
 manta-testkit = { workspace = true }
 tempfile = { workspace = true }
+hound = { workspace = true }
+regex = { workspace = true }
 sha2 = { workspace = true }
+tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

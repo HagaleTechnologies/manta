@@ -66,18 +66,14 @@ fn v1_passes_end_to_end_from_wav() {
     }
 
     // WPM sanity (V1 is 20 WPM; SPEC only gates WPM at V2 but it's free
-    // here). Re-measured (Task 11 Step 2) against SPEC's original +/-2 WPM:
-    // still doesn't clear it -- measured error 2.353 WPM (17.647 reported),
-    // deterministic (reproduced identically across 3 runs). Left at the
-    // wider +/-3 WPM bound (pin 10,
-    // docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md), which the
-    // measured error clears with a real (~28 %) margin: the real detector's
-    // element on/off transient response narrows the gap from M2 sub-project
-    // 1's original measurement but doesn't fully close it. Not SPEC-gated
-    // (this check is a "free" bonus), so left as a measured, explained
-    // deviation rather than pursued further.
+    // here). MAN-103 fixed the keying-threshold placement (SPEC §3.2/§3.3)
+    // and the mark/gap symmetric dit-period estimate (SPEC §4.1) that
+    // caused the previous, widened +/-3 WPM bound (pin 10,
+    // docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md; measured
+    // 17.647, 2.353 WPM off SPEC's original +/-2). Back to SPEC's nominal
+    // +/-2 WPM -- see docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md.
     let wpm = report["wpm"].as_f64().unwrap();
-    assert!((wpm - 20.0).abs() < 3.0, "wpm {wpm}");
+    assert!((wpm - 20.0).abs() < 2.0, "wpm {wpm}");
 }
 
 /// SPEC v2 §8.4 Task 12: V1 with `--engine hsmm`. Checks only CER < 0.02

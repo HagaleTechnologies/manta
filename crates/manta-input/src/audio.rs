@@ -6,6 +6,12 @@
 //! TARGET_RATE_HZ (48000 Hz) natively; a rate mismatch is a hard error, not
 //! a resample attempt (coppa-audio's ResamplingSource is unreachable -- no
 //! `rubato` dependency and no `mod resampler;` declaration upstream).
+//!
+//! An RF reference is optional but supported: `with_center_freq_hz` accepts
+//! an operator-supplied dial frequency (MAN-34), superseding design doc
+//! §2's original "audio has no RF reference" scope decision. Without it,
+//! `center_freq_hz()` still reports `0.0` and downstream frequencies are
+//! bare baseband offsets.
 
 use crate::IqSource;
 use anyhow::{anyhow, Context, Result};
@@ -18,11 +24,37 @@ use std::path::Path;
 /// power of two), the constraint SingleChannelExtractor::new requires.
 pub const TARGET_RATE_HZ: u32 = 48_000;
 
+/// The rig-audio passband this source actually delivers, as offsets in Hz
+/// ABOVE the dial frequency (`--dial-freq-hz`).
+///
+/// MAN-86 review: these are what `SKIMMER/SETT` advertises to Aggregator as
+/// decodable coverage, and they are deliberately NOT derived from
+/// `TARGET_RATE_HZ`. Two independent reasons: `read` Hilbert-transforms
+/// real audio into an analytic signal, so all of its energy sits at
+/// POSITIVE offsets from the dial -- the negative half of a
+/// `+/- TARGET_RATE_HZ / 2` claim is on the wrong side of the dial
+/// entirely; and a receiver's AF output is the ~3 kHz passband its IF
+/// filter passes (ARCHITECTURE §3, "Degenerate ~3 kHz wideband mode"), not
+/// the 24 kHz its sound card happens to sample.
+///
+/// The values are the nominal SSB/CW-wide AF passband a rig in its widest
+/// setting delivers. A rig running a narrow CW filter passes less than
+/// this, so the claim is a superset for that operator; making it exact
+/// needs a config key for the rig's actual filter, which is out of MAN-86's
+/// scope and is why these are named constants rather than literals.
+pub const AUDIO_PASSBAND_LO_HZ: f64 = 300.0;
+/// Upper edge of the rig-audio passband -- see `AUDIO_PASSBAND_LO_HZ`.
+pub const AUDIO_PASSBAND_HI_HZ: f64 = 3_000.0;
+
 /// A real audio source (device or file) converted to analytic Complex32,
 /// implementing IqSource. ARCHITECTURE §3 "Audio passband" input.
 pub struct AudioIqSource {
     src: Box<dyn AudioSource>,
     hilbert: HilbertTransformer,
+    /// Operator-supplied RF dial frequency this audio passband sits on, Hz.
+    /// `0.0` = no RF reference supplied: reported frequencies are baseband
+    /// offsets. See `with_center_freq_hz` (MAN-34).
+    center_freq_hz: f64,
 }
 
 impl AudioIqSource {
@@ -37,7 +69,34 @@ impl AudioIqSource {
         Ok(AudioIqSource {
             src,
             hilbert: HilbertTransformer::new(),
+            center_freq_hz: 0.0,
         })
+    }
+
+    /// Attach the operator-supplied RF dial frequency the rig is tuned to
+    /// (MAN-34). An audio passband carries no RF reference of its own, so
+    /// without this a track's reported frequency is a bare audio-tone
+    /// offset (e.g. 700 Hz) rather than an absolute RBN frequency. This is
+    /// the manual equivalent of entering the dial frequency once -- manta
+    /// does not poll the rig (no CAT; README non-goals).
+    ///
+    /// Sideband convention: `center_freq_hz()` is added to the decoded
+    /// audio-tone offset as-is, so pass the suppressed-carrier/USB dial
+    /// reading. On a CW-mode dial display, subtract your sidetone pitch
+    /// first, or the reported frequency reads high by the pitch amount.
+    ///
+    /// Rejects non-finite and non-positive values, matching the CLI's
+    /// `--dial-freq-hz` parser: "no reference" is expressed by not calling
+    /// this, not by passing 0.0.
+    pub fn with_center_freq_hz(mut self, center_freq_hz: f64) -> Result<Self> {
+        if !center_freq_hz.is_finite() || center_freq_hz <= 0.0 {
+            return Err(anyhow!(
+                "center frequency must be a finite, positive number of Hz, \
+                 got {center_freq_hz}"
+            ));
+        }
+        self.center_freq_hz = center_freq_hz;
+        Ok(self)
     }
 
     /// Open the named input device (default device if `None`). Requires the
@@ -75,7 +134,13 @@ impl IqSource for AudioIqSource {
     }
 
     fn center_freq_hz(&self) -> f64 {
-        0.0 // audio has no RF reference; offset-only reporting (design doc §2)
+        self.center_freq_hz // 0.0 when no dial frequency was supplied -- MAN-34.
+    }
+
+    /// The rig's AF passband, ABOVE the dial frequency only -- never
+    /// `+/- TARGET_RATE_HZ / 2`. See `AUDIO_PASSBAND_LO_HZ`.
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        (AUDIO_PASSBAND_LO_HZ, AUDIO_PASSBAND_HI_HZ)
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
@@ -105,6 +170,17 @@ mod tests {
         let mut aiq = AudioIqSource::new(src).unwrap();
         assert_eq!(aiq.sample_rate(), fs as f64);
         assert_eq!(aiq.center_freq_hz(), 0.0);
+        // MAN-86 review: coverage is the rig's AF passband above the dial,
+        // NOT the analytic stream's +/- 24 kHz Nyquist span.
+        assert_eq!(
+            aiq.rf_passband_hz(),
+            (AUDIO_PASSBAND_LO_HZ, AUDIO_PASSBAND_HI_HZ)
+        );
+        assert!(
+            aiq.rf_passband_hz().0 > 0.0,
+            "analytic audio carries no spectrum below the dial frequency"
+        );
+        assert!(aiq.rf_passband_hz().1 < aiq.sample_rate() / 2.0);
         let mut buf = vec![Complex32::new(0.0, 0.0); 4000];
         let n = aiq.read(&mut buf).unwrap();
         assert!(n > 0);
@@ -133,5 +209,50 @@ mod tests {
         let mut buf = vec![Complex32::new(0.0, 0.0); 5];
         assert_eq!(aiq.read(&mut buf).unwrap(), 5);
         assert_eq!(aiq.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn center_freq_hz_defaults_to_zero_without_an_rf_reference() {
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 10],
+            TARGET_RATE_HZ,
+        ));
+        assert_eq!(AudioIqSource::new(src).unwrap().center_freq_hz(), 0.0);
+    }
+
+    #[test]
+    fn with_center_freq_hz_is_reported_as_the_sources_rf_reference() {
+        let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.0; 10],
+            TARGET_RATE_HZ,
+        ));
+        let aiq = AudioIqSource::new(src)
+            .unwrap()
+            .with_center_freq_hz(14_030_000.0)
+            .unwrap();
+        assert_eq!(aiq.center_freq_hz(), 14_030_000.0);
+    }
+
+    #[test]
+    fn with_center_freq_hz_rejects_non_finite_and_non_positive_values() {
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -14_030_000.0,
+        ] {
+            let src: Box<dyn AudioSource> = Box::new(coppa_audio::WavSource::from_samples(
+                vec![0.0; 10],
+                TARGET_RATE_HZ,
+            ));
+            assert!(
+                AudioIqSource::new(src)
+                    .unwrap()
+                    .with_center_freq_hz(bad)
+                    .is_err(),
+                "with_center_freq_hz({bad}) should have been rejected"
+            );
+        }
     }
 }

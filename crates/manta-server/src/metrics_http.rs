@@ -1,13 +1,13 @@
 //! Minimal HTTP server exposing `Metrics::render_prometheus_text` on
-//! `GET /metrics` and `status::StatusDoc` (MAN-44) on `GET /status`.
-//! ARCHITECTURE §8: "Prometheus text endpoint (feature `metrics`)... manta
-//! status ... GET /status." Hand-rolled rather than pulling in a full HTTP
-//! framework -- two static routes is the entire surface.
+//! `GET /metrics` and `Metrics::health_at` on `GET /healthz` (MAN-128).
+//! ARCHITECTURE §8: "Prometheus text endpoint (feature `metrics`)."
+//! Hand-rolled rather than pulling in a full HTTP framework -- two static
+//! text responses to two paths is the entire surface.
 
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
-use crate::status::StatusDoc;
+use crate::status_doc::StatusDoc;
 use crate::tasks::{ConnectionLimiter, IpQuota};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,27 +33,26 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `accept()` return immediately, and retrying with no delay turns this
 /// into a tight loop that starves other tasks on the same runtime.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-/// Upper bound on concurrently in-flight `/metrics`/`/status` requests.
-/// Each is short-lived (one request, one response, connection closed), but
-/// with no cap at all an unauthenticated client could still open
-/// connections without bound, each holding a socket and a tracked task
-/// open for up to `HEADER_READ_TIMEOUT` (round-15 review finding). A much
-/// smaller budget than the spot-stream listeners -- legitimate traffic
-/// here is a low-cardinality set of Prometheus scrapers and `manta status`
-/// invocations, not end-user clients.
+/// Upper bound on concurrently in-flight `/metrics` requests. Each is
+/// short-lived (one request, one response, connection closed), but with no
+/// cap at all an unauthenticated client could still open connections
+/// without bound, each holding a socket and a tracked task open for up to
+/// `HEADER_READ_TIMEOUT` (round-15 review finding). A much smaller budget
+/// than the spot-stream listeners -- legitimate traffic here is a
+/// low-cardinality set of Prometheus scrapers, not end-user clients.
 pub const MAX_METRICS_CONNECTIONS: usize = 64;
-/// Upper bound on concurrently admitted `/metrics`/`/status` connections
-/// from a SINGLE source IP (MAN-61, `docs/DECISIONS/2026-09-03-man61-per-ip-
+/// Upper bound on concurrently admitted `/metrics` connections from a
+/// SINGLE source IP (MAN-61, `docs/DECISIONS/2026-09-03-man61-per-ip-
 /// connection-quota.md`, scope-expanded from the telnet/JSON finding in
 /// PR #76 review round 2): each permit is held for up to
 /// `HEADER_READ_TIMEOUT` even for a client sending an incomplete request,
 /// so one unauthenticated peer continuously opening and holding
 /// connections just under that deadline could occupy all
-/// `MAX_METRICS_CONNECTIONS` permits, denying every legitimate scrape/
-/// status check. A smaller value than the spot-stream listeners' per-IP
-/// cap -- legitimate traffic here is a low-cardinality set of scrapers/
-/// operators, not end-user clients (matching `MAX_METRICS_CONNECTIONS`'s
-/// own, proportionally smaller, total ceiling).
+/// `MAX_METRICS_CONNECTIONS` permits, denying every legitimate Prometheus
+/// scrape. A smaller value than the spot-stream listeners' per-IP cap --
+/// legitimate traffic here is a low-cardinality set of scrapers, not
+/// end-user clients (matching `MAX_METRICS_CONNECTIONS`'s own,
+/// proportionally smaller, total ceiling).
 pub const MAX_METRICS_CONNECTIONS_PER_IP: usize = 8;
 
 /// MAN-59 review round 2: same rationale as `telnet::QUOTA_REJECT_LOG_MAX_PER_WINDOW`
@@ -180,33 +179,47 @@ async fn read_headers<R: AsyncBufRead + Unpin>(
     Ok(false)
 }
 
-/// One routed response: status line, `Content-Type`, and body.
 pub(crate) struct Response {
     pub status: &'static str,
     pub content_type: &'static str,
     pub body: String,
 }
 
-/// Extracts the request path from an HTTP request line
-/// (`"GET /status?x=1 HTTP/1.1\r\n"` -> `Some("/status")`), requiring GET
-/// and tolerating a trailing query string -- the pre-MAN-44 route check
-/// (`starts_with("GET /metrics ")`) rejected `GET /metrics?x=1`, and some
-/// scrapers append a query string.
+/// The path of a `GET` request line, minus any query string (MAN-44):
+/// `"GET /status?x=1 HTTP/1.1\r\n"` -> `Some("/status")`. Any other
+/// method yields `None`. Tolerating a query string matters because some
+/// scrapers append one, and `starts_with("GET /metrics ")` rejected it.
 fn parse_get_path(request_line: &str) -> Option<&str> {
     let rest = request_line.strip_prefix("GET ")?;
     let raw_path = rest.split(' ').next()?;
     Some(raw_path.split('?').next().unwrap_or(raw_path))
 }
 
-/// Pure routing: request line in, response out (MAN-44). Split from
-/// `handle_request` so both routes are unit-testable without a socket.
-pub(crate) fn route(request_line: &str, metrics: &Metrics) -> Response {
+/// Pure request routing (MAN-128, MAN-44): `GET /metrics` renders the
+/// Prometheus text body. `GET /healthz` evaluates `Metrics::health_at(now)`
+/// and returns `200`/`ok` or `503`/`unhealthy` plus the per-check reasons.
+/// `GET /status` returns the versioned JSON `status_doc::StatusDoc` that
+/// `manta status` renders. Everything else 404s. Pure and synchronous (no
+/// socket I/O) so it's directly unit-testable.
+pub(crate) fn route(request_line: &str, metrics: &Metrics, now: std::time::Instant) -> Response {
     match parse_get_path(request_line) {
         Some("/metrics") => Response {
             status: "200 OK",
             content_type: "text/plain; version=0.0.4",
             body: metrics.render_prometheus_text(),
         },
+        Some("/healthz") => {
+            let report = metrics.health_at(now);
+            Response {
+                status: if report.healthy {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                },
+                content_type: "text/plain; charset=utf-8",
+                body: report.render_text(),
+            }
+        }
         Some("/status") => Response {
             status: "200 OK",
             content_type: "application/json",
@@ -262,8 +275,12 @@ async fn handle_request(
         return Ok(());
     }
 
-    let response = route(&request_line, &metrics);
-    if response.status == "404 Not Found" {
+    let Response {
+        status,
+        content_type,
+        body,
+    } = route(&request_line, &metrics, std::time::Instant::now());
+    if status == "404 Not Found" {
         // MAN-59 review: ordinary probing of this unauthenticated,
         // internet-facing endpoint (a wrong method, an unknown path) was
         // otherwise absent from the audit trail entirely -- only header
@@ -276,15 +293,12 @@ async fn handle_request(
         }
     }
 
-    let wire = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response.status,
-        response.content_type,
-        response.body.len(),
-        response.body
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     tokio::time::timeout(WRITE_TIMEOUT, async {
-        wr.write_all(wire.as_bytes()).await?;
+        wr.write_all(response.as_bytes()).await?;
         wr.shutdown().await
     })
     .await
@@ -299,22 +313,82 @@ mod tests {
     #[test]
     fn route_serves_status_json_metrics_text_and_404s_everything_else() {
         let m = Metrics::new();
+        let now = std::time::Instant::now();
         assert_eq!(
-            route("GET /status HTTP/1.1", &m).content_type,
+            route("GET /status HTTP/1.1", &m, now).content_type,
             "application/json"
         );
-        assert_eq!(route("GET /metrics HTTP/1.1", &m).status, "200 OK");
-        assert_eq!(route("GET /statuses HTTP/1.1", &m).status, "404 Not Found");
-        assert_eq!(route("POST /status HTTP/1.1", &m).status, "404 Not Found");
-        assert_eq!(route("GET /status?x=1 HTTP/1.1", &m).status, "200 OK");
+        assert_eq!(route("GET /metrics HTTP/1.1", &m, now).status, "200 OK");
+        assert_eq!(
+            route("GET /statuses HTTP/1.1", &m, now).status,
+            "404 Not Found"
+        );
+        assert_eq!(
+            route("POST /status HTTP/1.1", &m, now).status,
+            "404 Not Found"
+        );
+        assert_eq!(route("GET /status?x=1 HTTP/1.1", &m, now).status, "200 OK");
+        assert_eq!(route("GET /metrics?x=1 HTTP/1.1", &m, now).status, "200 OK");
     }
 
     #[test]
     fn status_route_body_parses_as_the_status_doc_json() {
         let m = Metrics::new();
-        let response = route("GET /status HTTP/1.1", &m);
-        let doc: crate::status::StatusDoc = serde_json::from_str(&response.body).unwrap();
+        let response = route("GET /status HTTP/1.1", &m, std::time::Instant::now());
+        let doc: StatusDoc = serde_json::from_str(&response.body).unwrap();
         assert_eq!(doc.schema_version, 1);
+    }
+
+    fn healthy_metrics() -> Metrics {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        m
+    }
+
+    #[test]
+    fn get_healthz_returns_200_with_ok_body_when_healthy() {
+        let m = healthy_metrics();
+        let resp = route("GET /healthz HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.status, "200 OK");
+        assert!(resp.body.starts_with("ok\n"));
+    }
+
+    #[test]
+    fn get_healthz_returns_503_with_reasons_when_unhealthy() {
+        let m = healthy_metrics();
+        m.set_listener_up("telnet", false);
+        let resp = route("GET /healthz HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.status, "503 Service Unavailable");
+        assert!(resp.body.starts_with("unhealthy\n"));
+        assert!(resp.body.contains("listener telnet: down"));
+    }
+
+    #[test]
+    fn healthz_uses_plain_utf8_content_type() {
+        let m = healthy_metrics();
+        let resp = route("GET /healthz HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.content_type, "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn metrics_keeps_prometheus_content_type() {
+        let m = healthy_metrics();
+        let resp = route("GET /metrics HTTP/1.1\r\n", &m, std::time::Instant::now());
+        assert_eq!(resp.content_type, "text/plain; version=0.0.4");
+    }
+
+    #[test]
+    fn unknown_path_still_404s() {
+        let m = healthy_metrics();
+        for line in [
+            "GET / HTTP/1.1\r\n",
+            "GET /healthzX HTTP/1.1\r\n",
+            "POST /healthz HTTP/1.1\r\n",
+        ] {
+            let resp = route(line, &m, std::time::Instant::now());
+            assert_eq!(resp.status, "404 Not Found", "line: {line}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

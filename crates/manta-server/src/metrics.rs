@@ -1,29 +1,28 @@
-//! Prometheus text-format metrics, plus the per-target RBN uplink health
-//! registry `status.rs`'s `GET /status` document and `manta status` are
-//! built on (MAN-44). ARCHITECTURE §8: "manta status ... GET /status on
-//! the metrics listener... Prometheus text endpoint... spot rate, active
+//! Prometheus text-format metrics. ARCHITECTURE §8: "manta --status hits a
+//! local control socket... Prometheus text endpoint... spot rate, active
 //! tracks..."; MAN-12 scenario 3 ("operators can inspect health without
 //! reading source"). `Metrics` owns what `manta-server` genuinely knows
-//! (spots published, connected clients per protocol, per-target uplink
-//! state) and exposes
+//! (spots published, connected clients per protocol) and exposes
 //! `set_active_tracks`/`set_source_health`/`set_input_health` for the
 //! daemon wiring layer to inject engine-owned numbers manta-server has no
 //! way to compute itself.
 
+use crate::health::{DecodeWatch, HealthCheck, HealthReport};
+use manta_spot::SpotType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Rolling window over which "recent" reconnects are counted (MAN-44).
 /// Matches the ticket's "reconnecting repeatedly over several minutes".
 pub const RECONNECT_WINDOW: Duration = Duration::from_secs(300);
 /// Recent reconnects at or above this count read as a stuck reconnect
-/// loop. `uplink::MAX_BACKOFF` is 60s, so a target that is simply down
+/// loop. `backoff::MAX_BACKOFF` is 60s, so a target that is simply down
 /// produces ~5 reconnects per window -- comfortably over this -- while a
 /// single transient blip (whose backoff then resets to
-/// `uplink::INITIAL_BACKOFF`) does not trip it.
+/// `backoff::INITIAL_BACKOFF`) does not trip it.
 pub const FLAPPING_RECONNECTS: u32 = 3;
 /// Hard cap on retained reconnect timestamps per target. A target
 /// flapping far faster than the window would otherwise grow this
@@ -31,18 +30,6 @@ pub const FLAPPING_RECONNECTS: u32 = 3;
 /// only `recent_reconnects` saturates. Same bounded-cardinality
 /// discipline as MAN-62's `OccurrenceTracker` (see `bus.rs`).
 const MAX_TRACKED_RECONNECTS: usize = 256;
-
-/// Immutable description of one configured `[[rbn_uplink]]` target
-/// (MAN-44). Plain data so `metrics` needs no dependency on `config` --
-/// `uplink::target_specs` builds these from `RbnUplinkConfig`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UplinkTargetSpec {
-    pub label: String,
-    pub host: String,
-    pub port: u16,
-    pub enabled: bool,
-    pub dry_run: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,13 +67,9 @@ fn classify_uplink_health(enabled: bool, connected: bool, recent_reconnects: u32
 }
 
 /// Pure function over an already-taken snapshot, so a caller that also
-/// needs per-target rows (`status::StatusDoc::from_metrics`) can derive
-/// both from the SAME snapshot at the SAME `now` instead of walking the
-/// registry twice at two different instants (MAN-44 code review CR-3) --
-/// which is also what previously let `connected_targets` (raw
-/// `connected` bool) disagree with this verdict (`health ==
-/// UplinkHealth::Connected`) for a target that is flapping but
-/// momentarily connected (CR-1).
+/// needs per-target rows (`status_doc::StatusDoc::from_metrics`) derives
+/// both from the SAME snapshot at the SAME `now` (MAN-44 code review
+/// CR-1/CR-3).
 pub(crate) fn overall_uplink_health_of(snapshot: &[UplinkTargetSnapshot]) -> OverallUplinkHealth {
     let enabled: Vec<&UplinkTargetSnapshot> = snapshot.iter().filter(|t| t.enabled).collect();
     if enabled.is_empty() {
@@ -118,38 +101,14 @@ fn prune_reconnects(recent: &mut VecDeque<Instant>, now: Instant) {
     }
 }
 
-/// One configured uplink target's live state (MAN-44). Handed to that
-/// target's `uplink::serve` task, which is the ONLY writer -- every
-/// counter here has a real call site in `uplink.rs`, deliberately unlike
-/// `active_tracks` (ARCHITECTURE.md's "served but never populated"
-/// caution), which stays frozen at its initial value in production.
-///
-/// Replaces MAN-32/MAN-42's single shared `uplink_connected_count`
-/// last-writer-wins-prone atomic: each target now owns its own
-/// `AtomicBool`, so one target's failed reconnect can never clear
-/// another's connected reading even under an unbalanced call (the
-/// structural fix for the round-1 MAN-42 review finding -- previously
-/// only a testing/calling discipline).
-pub struct UplinkTarget {
-    spec: UplinkTargetSpec,
-    connected: AtomicBool,
-    sent: AtomicU64,
-    suppressed: AtomicU64,
-    lagged: AtomicU64,
-    write_failed: AtomicU64,
-    disconnected: AtomicU64,
-    reconnects: AtomicU64,
-    recent: Mutex<VecDeque<Instant>>,
-}
-
+/// One target's point-in-time state, as `GET /status` reports it
+/// (MAN-44). Taken by `UplinkTarget::snapshot_at` so a whole registry is
+/// read against one consistent `now`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UplinkTargetSnapshot {
     #[serde(rename = "target")]
     pub label: String,
-    pub host: String,
-    pub port: u16,
     pub enabled: bool,
-    pub dry_run: bool,
     pub connected: bool,
     pub sent: u64,
     pub suppressed: u64,
@@ -159,121 +118,6 @@ pub struct UplinkTargetSnapshot {
     pub reconnects: u64,
     pub recent_reconnects: u32,
     pub health: UplinkHealth,
-}
-
-impl UplinkTarget {
-    pub fn record_sent(&self) {
-        self.sent.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_suppressed(&self) {
-        self.suppressed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_lagged(&self, n: u64) {
-        self.lagged.fetch_add(n, Ordering::Relaxed);
-    }
-
-    pub fn record_write_failed(&self, n: u64) {
-        self.write_failed.fetch_add(n, Ordering::Relaxed);
-    }
-
-    pub fn record_disconnected(&self, n: u64) {
-        self.disconnected.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Call exactly once per connect transition, paired with exactly one
-    /// `mark_disconnected` -- same contract as MAN-32's original
-    /// `Metrics::mark_uplink_connected`, but now per target, so an
-    /// unbalanced call can never desync any OTHER target's reading
-    /// (MAN-42's round-1 bug class).
-    pub fn mark_connected(&self) {
-        self.connected.store(true, Ordering::Relaxed);
-    }
-
-    /// See `mark_connected` -- call only to undo a prior `mark_connected`
-    /// from this same target's same connection.
-    pub fn mark_disconnected(&self) {
-        self.connected.store(false, Ordering::Relaxed);
-    }
-
-    pub fn record_reconnect(&self) {
-        self.record_reconnect_at(Instant::now());
-    }
-
-    /// `_at` variant so the reconnect window is testable without sleeping
-    /// or a paused runtime; `record_reconnect` above is the only
-    /// production caller.
-    pub fn record_reconnect_at(&self, now: Instant) {
-        self.reconnects.fetch_add(1, Ordering::Relaxed);
-        let mut recent = self
-            .recent
-            .lock()
-            .expect("uplink recent-reconnects lock poisoned");
-        prune_reconnects(&mut recent, now);
-        if recent.len() == MAX_TRACKED_RECONNECTS {
-            recent.pop_front();
-        }
-        recent.push_back(now);
-    }
-
-    #[cfg(test)]
-    fn recent_len(&self) -> usize {
-        self.recent
-            .lock()
-            .expect("uplink recent-reconnects lock poisoned")
-            .len()
-    }
-
-    pub fn snapshot(&self) -> UplinkTargetSnapshot {
-        self.snapshot_at(Instant::now())
-    }
-
-    /// `_at` variant so callers (`Metrics::uplink_snapshot_at`) can render
-    /// a whole registry's worth of targets against one consistent `now`,
-    /// and so window behavior stays testable without sleeping.
-    pub fn snapshot_at(&self, now: Instant) -> UplinkTargetSnapshot {
-        let recent_reconnects = {
-            let mut recent = self
-                .recent
-                .lock()
-                .expect("uplink recent-reconnects lock poisoned");
-            prune_reconnects(&mut recent, now);
-            recent.len() as u32
-        };
-        let connected = self.connected.load(Ordering::Relaxed);
-        UplinkTargetSnapshot {
-            label: self.spec.label.clone(),
-            host: self.spec.host.clone(),
-            port: self.spec.port,
-            enabled: self.spec.enabled,
-            dry_run: self.spec.dry_run,
-            connected,
-            sent: self.sent.load(Ordering::Relaxed),
-            suppressed: self.suppressed.load(Ordering::Relaxed),
-            lagged: self.lagged.load(Ordering::Relaxed),
-            write_failed: self.write_failed.load(Ordering::Relaxed),
-            disconnected: self.disconnected.load(Ordering::Relaxed),
-            reconnects: self.reconnects.load(Ordering::Relaxed),
-            recent_reconnects,
-            health: classify_uplink_health(self.spec.enabled, connected, recent_reconnects),
-        }
-    }
-}
-
-/// Escapes a Prometheus label value per the text-exposition-format spec
-/// (backslash, double-quote, newline) -- MAN-44: an uplink target's
-/// `host:port` label comes from operator config, not a validated grammar
-/// (unlike a callsign), so an unescaped value could otherwise produce a
-/// malformed exposition line. Applied to `source` below too (a one-line
-/// correctness fix made while already touching this rendering code): that
-/// label is also an operator-supplied string and was previously
-/// unescaped.
-fn escape_label_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 /// Spots abandoned when a client connection terminates on a failed write,
@@ -323,6 +167,237 @@ pub struct InputHealth {
     pub malformed_packets: u64,
 }
 
+/// Escapes a Prometheus label VALUE (not a label name, which is always one
+/// of this codebase's own `&'static str`s). MAN-128: the uplink target
+/// label is the first one in this codebase derived from operator-supplied
+/// TOML rather than a fixed, compile-time set of names -- shared by the
+/// (unmerged, at plan time) MAN-44 PR #95 so the two converge on one name.
+pub(crate) fn escape_label_value(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn spot_type_metric_label(t: SpotType) -> &'static str {
+    match t {
+        SpotType::Cq => "cq",
+        SpotType::De => "de",
+        SpotType::Beacon => "beacon",
+        SpotType::Unknown => "unknown",
+    }
+}
+
+/// Build metadata, rendered as a Prometheus "info metric" (a gauge that is
+/// always `1`, carrying the real payload as labels) -- MAN-128.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildInfo {
+    pub version: String,
+    pub git_sha: String,
+    pub features: String,
+}
+
+/// A snapshot of `manta-engine`'s decode-latency observer, ready to render
+/// as a Prometheus histogram (MAN-128). `bucket_counts` is
+/// NON-cumulative (length = `bounds_seconds.len() + 1`, the last being the
+/// `+Inf` overflow bucket) -- `render_prometheus_text` does the running
+/// sum Prometheus's `_bucket{le=...}` convention requires.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatencyHistogram {
+    pub bounds_seconds: Vec<f64>,
+    pub bucket_counts: Vec<u64>,
+    pub sum_seconds: f64,
+}
+
+impl LatencyHistogram {
+    fn total_count(&self) -> u64 {
+        self.bucket_counts.iter().sum()
+    }
+}
+
+/// Captured once, at `Metrics::new()` -- the moment the metrics endpoint
+/// comes into existence. `instant` (monotonic) backs `manta_uptime_seconds`
+/// so an NTP step never distorts it; `unix_seconds` (wall-clock) backs
+/// `manta_start_time_seconds` for a human-readable timestamp. NOT seeded
+/// from `resolve_epoch` -- that's the *recording's* mtime on file replay,
+/// not this process's actual start time (MAN-128 plan, Key Discoveries).
+struct StartedAt {
+    instant: Instant,
+    unix_seconds: f64,
+}
+
+impl Default for StartedAt {
+    fn default() -> Self {
+        Self {
+            instant: Instant::now(),
+            unix_seconds: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+        }
+    }
+}
+
+/// One configured RBN uplink target's own counters (MAN-128 D6). Replaces
+/// the pre-MAN-128 shared atomics: deriving the aggregate families by
+/// summing over a `Vec<Arc<UplinkTarget>>` removes the MAN-42 class of
+/// desync bug structurally (a target can only ever affect its OWN
+/// `connected` flag) rather than by convention (the old
+/// `mark_uplink_connected`/`mark_uplink_disconnected` pairing discipline).
+pub struct UplinkTarget {
+    label: String,
+    enabled: bool,
+    connected: AtomicBool,
+    sent: AtomicU64,
+    suppressed: AtomicU64,
+    lagged: AtomicU64,
+    write_failed: AtomicU64,
+    disconnected: AtomicU64,
+    reconnects: AtomicU64,
+    /// Reconnect instants inside `RECONNECT_WINDOW` (MAN-44), bounded by
+    /// `MAX_TRACKED_RECONNECTS`.
+    recent: Mutex<VecDeque<Instant>>,
+}
+
+impl UplinkTarget {
+    fn new(label: String, enabled: bool) -> Self {
+        Self {
+            label,
+            enabled,
+            connected: AtomicBool::new(false),
+            sent: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+            lagged: AtomicU64::new(0),
+            write_failed: AtomicU64::new(0),
+            disconnected: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn record_sent(&self) {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_suppressed(&self) {
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lagged(&self, n: u64) {
+        self.lagged.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn record_write_failed(&self, n: u64) {
+        self.write_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn record_disconnected(&self, n: u64) {
+        self.disconnected.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn record_reconnect(&self) {
+        self.record_reconnect_at(Instant::now());
+    }
+
+    /// `_at` variant so the MAN-44 reconnect window is testable without
+    /// sleeping; `record_reconnect` above is the only production caller.
+    pub fn record_reconnect_at(&self, now: Instant) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+        let mut recent = self
+            .recent
+            .lock()
+            .expect("uplink recent-reconnects lock poisoned");
+        prune_reconnects(&mut recent, now);
+        if recent.len() == MAX_TRACKED_RECONNECTS {
+            recent.pop_front();
+        }
+        recent.push_back(now);
+    }
+
+    #[cfg(test)]
+    fn recent_len(&self) -> usize {
+        self.recent
+            .lock()
+            .expect("uplink recent-reconnects lock poisoned")
+            .len()
+    }
+
+    /// Reconnects inside the trailing `RECONNECT_WINDOW` as of `now`.
+    pub fn recent_reconnects_at(&self, now: Instant) -> u32 {
+        let mut recent = self
+            .recent
+            .lock()
+            .expect("uplink recent-reconnects lock poisoned");
+        prune_reconnects(&mut recent, now);
+        recent.len() as u32
+    }
+
+    pub fn snapshot_at(&self, now: Instant) -> UplinkTargetSnapshot {
+        let recent_reconnects = self.recent_reconnects_at(now);
+        let connected = self.connected();
+        UplinkTargetSnapshot {
+            label: self.label.clone(),
+            enabled: self.enabled,
+            connected,
+            sent: self.sent_total(),
+            suppressed: self.suppressed_total(),
+            lagged: self.lagged_total(),
+            write_failed: self.write_failed_total(),
+            disconnected: self.disconnected_total(),
+            reconnects: self.reconnects_total(),
+            recent_reconnects,
+            health: classify_uplink_health(self.enabled, connected, recent_reconnects),
+        }
+    }
+
+    /// Call exactly once per connect transition -- unlike the pre-MAN-128
+    /// shared counter, this is a plain per-target flag: another target's
+    /// calls can never touch it.
+    pub fn mark_connected(&self) {
+        self.connected.store(true, Ordering::Relaxed);
+    }
+
+    pub fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    pub fn sent_total(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    pub fn suppressed_total(&self) -> u64 {
+        self.suppressed.load(Ordering::Relaxed)
+    }
+
+    pub fn lagged_total(&self) -> u64 {
+        self.lagged.load(Ordering::Relaxed)
+    }
+
+    pub fn write_failed_total(&self) -> u64 {
+        self.write_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn disconnected_total(&self) -> u64 {
+        self.disconnected.load(Ordering::Relaxed)
+    }
+
+    pub fn reconnects_total(&self) -> u64 {
+        self.reconnects.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
     spots_dropped_lagged_total: AtomicU64,
@@ -367,10 +442,26 @@ pub struct Metrics {
     /// inside `SpotMessage::from_spot` (which runs once per connected
     /// client).
     spots_unresolved_geography_total: AtomicU64,
+    /// MAN-128: `(band, spot_type)` counter, additive to
+    /// `spots_total` -- a NEW family, not a replacement, so an existing
+    /// `sum()` over the unlabeled series is unaffected. Bounded cardinality:
+    /// the fixed `band::BANDS_HZ` table (plus `"unknown"`) times the four
+    /// `SpotType` variants.
+    spots_by_band: Mutex<BTreeMap<(&'static str, &'static str), u64>>,
     telnet_clients: AtomicI64,
     json_clients: AtomicI64,
     ws_clients: AtomicI64,
     active_tracks: AtomicU64,
+    /// Monotonic count of batches the decode pipeline has processed, bumped
+    /// once per pipeline batch by the daemon wiring layer (MAN-122 review
+    /// round 2). Its VALUE is meaningless to an operator; what matters is
+    /// that it keeps moving -- a status line that reports `tracks=N` off a
+    /// stale gauge while the synchronous decode loop is wedged (a blocked
+    /// `IqSource::read` after an audio device stops delivering callbacks,
+    /// say) claims the daemon is decoding when it is not. Deliberately not
+    /// exported in the Prometheus text: it is a liveness edge, not a figure
+    /// worth graphing.
+    pipeline_batches: AtomicU64,
     source_health: RwLock<BTreeMap<String, bool>>,
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
     /// counters. Engine/input-owned figures, injected by the daemon wiring
@@ -378,47 +469,47 @@ pub struct Metrics {
     /// Sources with no wire-packet loss model never call `set_input_health`,
     /// so they publish no series rather than a permanently-zero one.
     input_health: RwLock<BTreeMap<String, InputHealth>>,
-    /// Registered uplink targets, in config order (MAN-44). Written once
-    /// per target at daemon wiring time (`start_spot_server`'s call to
-    /// `register_uplink_target`), read on every render/status snapshot.
-    /// Every aggregate uplink figure (`uplink_sent_total` etc.) is now
-    /// DERIVED by summing over this registry rather than maintained as a
-    /// separate counter -- two independently incremented sources of the
-    /// same number is exactly how MAN-42's round-1 last-writer-wins bug
-    /// happened; deriving removes the class entirely.
+    /// MAN-128: one handle per configured `[[rbn_uplink]]` target,
+    /// registered in config order before `uplink::serve` is spawned for it
+    /// (so a never-connected or disabled target still renders). The seven
+    /// pre-MAN-128 aggregate series are now DERIVED by summing over this
+    /// registry rather than tracked as separate shared atomics.
     uplink_targets: RwLock<Vec<Arc<UplinkTarget>>>,
-    started_at: Instant,
-}
-
-impl Default for Metrics {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// MAN-128: captured once at construction -- see `StartedAt`'s doc
+    /// comment for why this is not `#[derive(Default)]`-trivial and not
+    /// seeded from `resolve_epoch`.
+    started: StartedAt,
+    build_info: RwLock<Option<BuildInfo>>,
+    decode_latency: RwLock<Option<LatencyHistogram>>,
+    /// MAN-128: which listeners (telnet/json/metrics) are currently up, per
+    /// `/healthz`'s "listeners are up" check and the `manta_listener_up`
+    /// gauge.
+    listener_up: RwLock<BTreeMap<String, bool>>,
+    /// MAN-128: the decode loop's own liveness, as last observed by the
+    /// daemon wiring layer -- see `crate::health::DecodeWatch`.
+    decode_watch: Mutex<DecodeWatch>,
 }
 
 impl Metrics {
     pub fn new() -> Self {
-        Self {
-            spots_total: AtomicU64::new(0),
-            spots_dropped_lagged_total: AtomicU64::new(0),
-            spots_suppressed_by_filter_total: AtomicU64::new(0),
-            spots_dropped_write_failed_total: AtomicU64::new(0),
-            spots_dropped_shutdown_total: AtomicU64::new(0),
-            spots_replay_abandoned_total: AtomicU64::new(0),
-            spots_unresolved_geography_total: AtomicU64::new(0),
-            telnet_clients: AtomicI64::new(0),
-            json_clients: AtomicI64::new(0),
-            ws_clients: AtomicI64::new(0),
-            active_tracks: AtomicU64::new(0),
-            source_health: RwLock::new(BTreeMap::new()),
-            input_health: RwLock::new(BTreeMap::new()),
-            uplink_targets: RwLock::new(Vec::new()),
-            started_at: Instant::now(),
-        }
+        Self::default()
     }
 
-    pub fn record_spot(&self) {
+    /// MAN-128: also breaks the count out by `(band, type)` into the
+    /// `manta_spots_by_band_total` family -- see `spots_by_band`'s doc
+    /// comment. `freq_hz.round()` matches `spot_message.rs`'s own rounding
+    /// so a spot within 0.5 Hz of a band edge is never counted under a
+    /// different band than the one the JSON stream reports.
+    pub fn record_spot(&self, spot: &manta_spot::Spot) {
         self.spots_total.fetch_add(1, Ordering::Relaxed);
+        let band = crate::band::band_for_freq_hz(spot.freq_hz.round());
+        let kind = spot_type_metric_label(spot.spot_type);
+        *self
+            .spots_by_band
+            .lock()
+            .expect("spots_by_band lock poisoned")
+            .entry((band, kind))
+            .or_insert(0) += 1;
     }
 
     /// A subscriber fell behind and `n` spots it never saw were dropped
@@ -529,6 +620,36 @@ impl Metrics {
         self.ws_clients.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Engine-owned figure, injected by the daemon wiring layer (see
+    /// module doc) -- `manta-server` has no track manager of its own.
+    pub fn set_active_tracks(&self, count: u64) {
+        self.active_tracks.store(count, Ordering::Relaxed);
+    }
+
+    /// Live-state getters for MAN-122's periodic status line. `Metrics` is
+    /// already the daemon's one shared, synchronously-readable handle on live
+    /// state (every subsystem holds an `Arc` clone of it), so the status task
+    /// reads it directly instead of parsing `render_prometheus_text()` back
+    /// out of a String.
+    pub fn spots_total(&self) -> u64 {
+        self.spots_total.load(Ordering::Relaxed)
+    }
+
+    pub fn active_tracks(&self) -> u64 {
+        self.active_tracks.load(Ordering::Relaxed)
+    }
+
+    /// One decode batch finished. Called by the daemon wiring layer from
+    /// `manta_engine::listen_with_observers`'s per-batch `on_tracks` observer -- see
+    /// `pipeline_batches`.
+    pub fn record_pipeline_batch(&self) {
+        self.pipeline_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pipeline_batches(&self) -> u64 {
+        self.pipeline_batches.load(Ordering::Relaxed)
+    }
+
     pub fn telnet_clients(&self) -> i64 {
         self.telnet_clients.load(Ordering::Relaxed)
     }
@@ -541,35 +662,11 @@ impl Metrics {
         self.ws_clients.load(Ordering::Relaxed)
     }
 
-    pub fn spots_total(&self) -> u64 {
-        self.spots_total.load(Ordering::Relaxed)
-    }
-
-    /// Engine-owned figure, injected by the daemon wiring layer (see
-    /// module doc) -- `manta-server` has no track manager of its own.
-    /// `None` until a real call site sets it (ARCHITECTURE.md: no
-    /// production caller exists yet) -- `status.rs` renders that as
-    /// "n/a", not a misleading live-looking `0`.
-    pub fn set_active_tracks(&self, count: u64) {
-        self.active_tracks.store(count, Ordering::Relaxed);
-    }
-
-    pub fn active_tracks(&self) -> u64 {
-        self.active_tracks.load(Ordering::Relaxed)
-    }
-
     pub fn set_source_health(&self, source: &str, healthy: bool) {
         self.source_health
             .write()
             .expect("source_health lock poisoned")
             .insert(source.to_string(), healthy);
-    }
-
-    /// Wall-clock time since this `Metrics` (and so the daemon) started
-    /// (MAN-44) -- `status.rs` renders this as `manta status`'s "daemon
-    /// up ..." line.
-    pub fn uptime(&self) -> Duration {
-        self.started_at.elapsed()
     }
 
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
@@ -584,27 +681,19 @@ impl Metrics {
             .insert(source.to_string(), health);
     }
 
-    // MAN-44: per-target uplink registry.
+    // MAN-32/MAN-128: RBN uplink counters. ARCHITECTURE §8's "every
+    // dropped/evicted/suppressed item is counted" invariant applies here
+    // too -- a dry-run-suppressed or lag-dropped spot must be visible,
+    // not silent. MAN-128: now a registry of per-target handles; the
+    // aggregate getters below sum over it.
 
-    /// Registers a newly configured uplink target, returning the handle
-    /// its `uplink::serve` task owns and writes to for its whole
-    /// lifetime. Registered once per `[[rbn_uplink]]` entry at daemon
-    /// wiring time (`start_spot_server`), in config order -- including
-    /// disabled entries, so `manta status` shows "configured but off"
-    /// rather than silently omitting them (a target that never manages a
-    /// single successful connection must still be visible).
-    pub fn register_uplink_target(&self, spec: UplinkTargetSpec) -> Arc<UplinkTarget> {
-        let target = Arc::new(UplinkTarget {
-            spec,
-            connected: AtomicBool::new(false),
-            sent: AtomicU64::new(0),
-            suppressed: AtomicU64::new(0),
-            lagged: AtomicU64::new(0),
-            write_failed: AtomicU64::new(0),
-            disconnected: AtomicU64::new(0),
-            reconnects: AtomicU64::new(0),
-            recent: Mutex::new(VecDeque::new()),
-        });
+    /// Registers one `[[rbn_uplink]]` target and returns its handle, for
+    /// `uplink::serve` to record against. Call BEFORE spawning `serve` for
+    /// it, and for every configured target including disabled ones (D8):
+    /// registration, not a live connection, is what makes a target appear
+    /// on `/metrics` at all.
+    pub fn register_uplink_target(&self, label: String, enabled: bool) -> Arc<UplinkTarget> {
+        let target = Arc::new(UplinkTarget::new(label, enabled));
         self.uplink_targets
             .write()
             .expect("uplink_targets lock poisoned")
@@ -612,100 +701,246 @@ impl Metrics {
         target
     }
 
-    pub fn uplink_snapshot(&self) -> Vec<UplinkTargetSnapshot> {
-        self.uplink_snapshot_at(Instant::now())
-    }
-
-    pub fn uplink_snapshot_at(&self, now: Instant) -> Vec<UplinkTargetSnapshot> {
+    fn uplink_targets_snapshot(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<UplinkTarget>>> {
         self.uplink_targets
             .read()
             .expect("uplink_targets lock poisoned")
+    }
+
+    pub fn uplink_sent_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.sent_total())
+            .sum()
+    }
+
+    pub fn uplink_suppressed_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.suppressed_total())
+            .sum()
+    }
+
+    pub fn uplink_lagged_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.lagged_total())
+            .sum()
+    }
+
+    pub fn uplink_write_failed_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.write_failed_total())
+            .sum()
+    }
+
+    pub fn uplink_disconnected_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.disconnected_total())
+            .sum()
+    }
+
+    pub fn uplink_reconnects_total(&self) -> u64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.reconnects_total())
+            .sum()
+    }
+
+    /// Count of currently-connected targets -- unchanged name/semantics
+    /// from the pre-MAN-128 gauge, now derived from the registry instead
+    /// of a separately-tracked shared atomic.
+    pub fn uplink_connected(&self) -> bool {
+        self.uplink_targets_snapshot().iter().any(|t| t.connected())
+    }
+
+    fn uplink_connected_count(&self) -> i64 {
+        self.uplink_targets_snapshot()
+            .iter()
+            .filter(|t| t.connected())
+            .count() as i64
+    }
+
+    /// MAN-44: every registered target's state against one `now`, in
+    /// config order (disabled targets included).
+    pub fn uplink_snapshot_at(&self, now: Instant) -> Vec<UplinkTargetSnapshot> {
+        self.uplink_targets_snapshot()
             .iter()
             .map(|t| t.snapshot_at(now))
             .collect()
     }
 
+    pub fn uplink_snapshot(&self) -> Vec<UplinkTargetSnapshot> {
+        self.uplink_snapshot_at(Instant::now())
+    }
+
     /// `Ok` only when every ENABLED target's own health classifies as
     /// `Connected` (MAN-44 decision 5) -- a flapping target counts the
-    /// same as a down one here, since it being momentarily connected
-    /// whenever observed is exactly the state this ticket exists to make
-    /// visible, not paper over. `Disabled` when there are no enabled
-    /// targets at all (including zero configured targets).
+    /// same as a down one. `Disabled` when no target is enabled
+    /// (including zero configured targets).
     pub fn uplink_overall_health(&self) -> OverallUplinkHealth {
         overall_uplink_health_of(&self.uplink_snapshot())
     }
 
-    fn sum_uplink_u64<F: Fn(&Arc<UplinkTarget>) -> u64>(&self, f: F) -> u64 {
-        self.uplink_targets
+    /// Time since this `Metrics` (and so the daemon's spot server)
+    /// started -- the same monotonic origin as `manta_uptime_seconds`.
+    pub fn uptime(&self) -> Duration {
+        self.started.instant.elapsed()
+    }
+
+    // MAN-128: build-info, uptime, listener/decode health.
+
+    pub fn set_build_info(&self, info: BuildInfo) {
+        *self.build_info.write().expect("build_info lock poisoned") = Some(info);
+    }
+
+    pub fn set_listener_up(&self, listener: &str, up: bool) {
+        self.listener_up
+            .write()
+            .expect("listener_up lock poisoned")
+            .insert(listener.to_string(), up);
+    }
+
+    /// Arms the decode watchdog `/healthz`'s decode check reads -- call
+    /// once, right after the daemon's listeners are up and before the
+    /// decode loop starts. Library use that never arms this leaves the
+    /// decode check reporting "not monitored" (and healthy), which is the
+    /// correct state for non-daemon use of `Metrics`.
+    pub fn arm_decode_watchdog(&self) {
+        self.arm_decode_watchdog_at(Instant::now());
+    }
+
+    /// Test seam for `arm_decode_watchdog` with a synthetic `Instant`.
+    #[doc(hidden)]
+    pub fn arm_decode_watchdog_at(&self, now: Instant) {
+        *self
+            .decode_watch
+            .lock()
+            .expect("decode_watch lock poisoned") = DecodeWatch::Running {
+            last_progress: now,
+            last_count: 0,
+        };
+    }
+
+    /// Marks the decode loop as having stopped -- makes `/healthz` report
+    /// unhealthy regardless of how recently progress was observed. Call
+    /// once `listen_with_observers` has returned, before the shutdown
+    /// drain begins: that's exactly the window in which `source_health`
+    /// alone would otherwise still read healthy for a source that already
+    /// died.
+    pub fn mark_decode_stopped(&self) {
+        *self
+            .decode_watch
+            .lock()
+            .expect("decode_watch lock poisoned") = DecodeWatch::Stopped;
+    }
+
+    pub fn set_decode_latency(&self, h: LatencyHistogram) {
+        self.set_decode_latency_at(h, Instant::now());
+    }
+
+    /// Test seam for `set_decode_latency` with a synthetic `Instant`.
+    #[doc(hidden)]
+    pub fn set_decode_latency_at(&self, h: LatencyHistogram, now: Instant) {
+        let total_count = h.total_count();
+        *self
+            .decode_latency
+            .write()
+            .expect("decode_latency lock poisoned") = Some(h);
+        self.decode_watch
+            .lock()
+            .expect("decode_watch lock poisoned")
+            .observe_progress(now, total_count);
+    }
+
+    /// Evaluates `/healthz`'s verdict (and `manta_healthy`/
+    /// `manta_listener_up`'s values) at `now`. Healthy only when every
+    /// registered source is healthy, every registered listener is up, AND
+    /// the decode watchdog is either not armed or has seen progress within
+    /// `health::DECODE_STALL_THRESHOLD` (MAN-128 D9). Takes its own locks
+    /// and returns a value -- never call this while already holding a
+    /// `Metrics` lock it also takes (see `render_prometheus_text`).
+    pub fn health_at(&self, now: Instant) -> HealthReport {
+        let mut checks = Vec::new();
+
+        let sources = self
+            .source_health
             .read()
-            .expect("uplink_targets lock poisoned")
-            .iter()
-            .map(f)
-            .sum()
-    }
+            .expect("source_health lock poisoned");
+        if sources.is_empty() {
+            checks.push(HealthCheck {
+                name: "source".to_string(),
+                ok: false,
+                detail: "source: none registered".to_string(),
+            });
+        } else {
+            for (name, healthy) in sources.iter() {
+                checks.push(HealthCheck {
+                    name: format!("source:{name}"),
+                    ok: *healthy,
+                    detail: format!(
+                        "source {name}: {}",
+                        if *healthy { "healthy" } else { "unhealthy" }
+                    ),
+                });
+            }
+        }
+        drop(sources);
 
-    pub fn uplink_sent_total(&self) -> u64 {
-        self.sum_uplink_u64(|t| t.sent.load(Ordering::Relaxed))
-    }
+        let listeners = self.listener_up.read().expect("listener_up lock poisoned");
+        if listeners.is_empty() {
+            checks.push(HealthCheck {
+                name: "listener".to_string(),
+                ok: false,
+                detail: "listener: none registered".to_string(),
+            });
+        } else {
+            for (name, up) in listeners.iter() {
+                checks.push(HealthCheck {
+                    name: format!("listener:{name}"),
+                    ok: *up,
+                    detail: format!("listener {name}: {}", if *up { "up" } else { "down" }),
+                });
+            }
+        }
+        drop(listeners);
 
-    pub fn uplink_suppressed_total(&self) -> u64 {
-        self.sum_uplink_u64(|t| t.suppressed.load(Ordering::Relaxed))
-    }
+        checks.push(
+            self.decode_watch
+                .lock()
+                .expect("decode_watch lock poisoned")
+                .check(now),
+        );
 
-    pub fn uplink_lagged_total(&self) -> u64 {
-        self.sum_uplink_u64(|t| t.lagged.load(Ordering::Relaxed))
-    }
-
-    pub fn uplink_write_failed_total(&self) -> u64 {
-        self.sum_uplink_u64(|t| t.write_failed.load(Ordering::Relaxed))
-    }
-
-    pub fn uplink_disconnected_total(&self) -> u64 {
-        self.sum_uplink_u64(|t| t.disconnected.load(Ordering::Relaxed))
-    }
-
-    pub fn uplink_reconnects_total(&self) -> u64 {
-        self.sum_uplink_u64(|t| t.reconnects.load(Ordering::Relaxed))
-    }
-
-    /// Count of currently-connected uplink targets, not a single 0/1 flag
-    /// -- MAN-42 can spawn multiple independent `uplink::serve` tasks,
-    /// each owning its own registered `UplinkTarget` (MAN-44), so this is
-    /// simply a count over the registry rather than a separately
-    /// maintained value. For the common single-target case this is still
-    /// exactly 0 or 1, same as before MAN-32/MAN-42.
-    pub fn uplink_connected_count(&self) -> i64 {
-        self.uplink_targets
-            .read()
-            .expect("uplink_targets lock poisoned")
-            .iter()
-            .filter(|t| t.connected.load(Ordering::Relaxed))
-            .count() as i64
-    }
-
-    pub fn uplink_connected(&self) -> bool {
-        self.uplink_connected_count() > 0
+        let healthy = checks.iter().all(|c| c.ok);
+        HealthReport { healthy, checks }
     }
 
     pub fn render_prometheus_text(&self) -> String {
         let mut out = String::new();
-        // MAN-44 remediate: one snapshot for BOTH the aggregate
-        // `manta_uplink_*` lines below and the per-target
-        // `manta_uplink_target_*` block -- the aggregates used to be read
-        // via separate `sum_uplink_*` calls, each its own `RwLock`
-        // acquisition at a different instant from the per-target block's,
-        // so a spot forwarded mid-render could make
-        // `sum(manta_uplink_target_sent_total) != manta_uplink_sent_total`
-        // within a single scrape body. `StatusDoc::from_metrics` already
-        // took exactly this precaution (CR-2/CR-3); this brings the
-        // Prometheus renderer in line with it.
-        let targets = self.uplink_snapshot();
         out.push_str("# HELP manta_spots_total Total spots published to the broadcast bus.\n");
         out.push_str("# TYPE manta_spots_total counter\n");
         out.push_str(&format!(
             "manta_spots_total {}\n",
             self.spots_total.load(Ordering::Relaxed)
         ));
+
+        out.push_str(
+            "# HELP manta_spots_by_band_total Spots published to the broadcast bus, by amateur band and spot type (sums to manta_spots_total).\n",
+        );
+        out.push_str("# TYPE manta_spots_by_band_total counter\n");
+        for ((band, kind), count) in self
+            .spots_by_band
+            .lock()
+            .expect("spots_by_band lock poisoned")
+            .iter()
+        {
+            out.push_str(&format!(
+                "manta_spots_by_band_total{{band=\"{band}\",type=\"{kind}\"}} {count}\n"
+            ));
+        }
 
         out.push_str(
             "# HELP manta_spots_dropped_lagged_total Spots dropped because a slow client fell behind and was disconnected.\n",
@@ -805,8 +1040,7 @@ impl Metrics {
             .iter()
         {
             out.push_str(&format!(
-                "manta_source_health{{source=\"{}\"}} {}\n",
-                escape_label_value(source),
+                "manta_source_health{{source=\"{source}\"}} {}\n",
                 if *healthy { 1 } else { 0 }
             ));
         }
@@ -859,7 +1093,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
         out.push_str(&format!(
             "manta_uplink_sent_total {}\n",
-            targets.iter().map(|t| t.sent).sum::<u64>()
+            self.uplink_sent_total()
         ));
 
         out.push_str(
@@ -868,7 +1102,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_suppressed_total counter\n");
         out.push_str(&format!(
             "manta_uplink_suppressed_total {}\n",
-            targets.iter().map(|t| t.suppressed).sum::<u64>()
+            self.uplink_suppressed_total()
         ));
 
         out.push_str(
@@ -877,7 +1111,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_dropped_lagged_total counter\n");
         out.push_str(&format!(
             "manta_uplink_dropped_lagged_total {}\n",
-            targets.iter().map(|t| t.lagged).sum::<u64>()
+            self.uplink_lagged_total()
         ));
 
         out.push_str(
@@ -886,7 +1120,7 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_dropped_write_failed_total counter\n");
         out.push_str(&format!(
             "manta_uplink_dropped_write_failed_total {}\n",
-            targets.iter().map(|t| t.write_failed).sum::<u64>()
+            self.uplink_write_failed_total()
         ));
 
         out.push_str(
@@ -895,14 +1129,14 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_dropped_disconnected_total counter\n");
         out.push_str(&format!(
             "manta_uplink_dropped_disconnected_total {}\n",
-            targets.iter().map(|t| t.disconnected).sum::<u64>()
+            self.uplink_disconnected_total()
         ));
 
-        out.push_str("# HELP manta_uplink_reconnects_total Reconnect attempts made by the RBN uplink after a connection attempt failed or dropped, including targets that have never once connected.\n");
+        out.push_str("# HELP manta_uplink_reconnects_total Times the RBN uplink connection was reestablished after dropping.\n");
         out.push_str("# TYPE manta_uplink_reconnects_total counter\n");
         out.push_str(&format!(
             "manta_uplink_reconnects_total {}\n",
-            targets.iter().map(|t| t.reconnects).sum::<u64>()
+            self.uplink_reconnects_total()
         ));
 
         out.push_str(
@@ -911,23 +1145,31 @@ impl Metrics {
         out.push_str("# TYPE manta_uplink_connected gauge\n");
         out.push_str(&format!(
             "manta_uplink_connected {}\n",
-            targets.iter().filter(|t| t.connected).count()
+            self.uplink_connected_count()
         ));
 
-        // MAN-44: per-target uplink series, additive to the aggregate
-        // series above (unchanged in name/type/value) -- new metric
-        // NAMES, not labels bolted onto the existing ones, so an existing
-        // scrape config/dashboard built against the pre-MAN-44 series
-        // shape keeps working untouched.
-        out.push_str(
-            "# HELP manta_uplink_target_connected Whether this RBN uplink target is currently connected (1/0).\n",
-        );
+        // MAN-128: per-target uplink families -- one read guard for all
+        // eight, so a concurrent `register_uplink_target` can't interleave
+        // a partial view across them.
+        let targets = self.uplink_targets_snapshot();
+
+        out.push_str("# HELP manta_uplink_target_enabled Whether this configured RBN uplink target is enabled (1) or configured but disabled (0).\n");
+        out.push_str("# TYPE manta_uplink_target_enabled gauge\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_enabled{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                if t.enabled() { 1 } else { 0 }
+            ));
+        }
+
+        out.push_str("# HELP manta_uplink_target_connected Whether this RBN uplink target is currently connected.\n");
         out.push_str("# TYPE manta_uplink_target_connected gauge\n");
-        for t in &targets {
+        for t in targets.iter() {
             out.push_str(&format!(
                 "manta_uplink_target_connected{{target=\"{}\"}} {}\n",
-                escape_label_value(&t.label),
-                if t.connected { 1 } else { 0 }
+                escape_label_value(t.label()),
+                if t.connected() { 1 } else { 0 }
             ));
         }
 
@@ -935,48 +1177,175 @@ impl Metrics {
             "# HELP manta_uplink_target_sent_total Spots forwarded to this RBN uplink target.\n",
         );
         out.push_str("# TYPE manta_uplink_target_sent_total counter\n");
-        for t in &targets {
+        for t in targets.iter() {
             out.push_str(&format!(
                 "manta_uplink_target_sent_total{{target=\"{}\"}} {}\n",
-                escape_label_value(&t.label),
-                t.sent
+                escape_label_value(t.label()),
+                t.sent_total()
             ));
         }
 
-        out.push_str(
-            "# HELP manta_uplink_target_suppressed_total Spots suppressed by dry-run instead of sent to this RBN uplink target.\n",
-        );
+        out.push_str("# HELP manta_uplink_target_suppressed_total Spots suppressed by dry-run instead of sent to this RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_target_suppressed_total counter\n");
-        for t in &targets {
+        for t in targets.iter() {
             out.push_str(&format!(
                 "manta_uplink_target_suppressed_total{{target=\"{}\"}} {}\n",
-                escape_label_value(&t.label),
-                t.suppressed
+                escape_label_value(t.label()),
+                t.suppressed_total()
             ));
         }
 
-        out.push_str(
-            "# HELP manta_uplink_target_reconnects_total Reconnect attempts made by this RBN uplink target after a connection attempt failed or dropped, including a target that has never once connected.\n",
-        );
+        out.push_str("# HELP manta_uplink_target_dropped_lagged_total Spots this target fell behind on and lost before its next reconnect.\n");
+        out.push_str("# TYPE manta_uplink_target_dropped_lagged_total counter\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_dropped_lagged_total{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                t.lagged_total()
+            ));
+        }
+
+        out.push_str("# HELP manta_uplink_target_dropped_write_failed_total Spots dropped because a write to this target's socket timed out or failed.\n");
+        out.push_str("# TYPE manta_uplink_target_dropped_write_failed_total counter\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_dropped_write_failed_total{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                t.write_failed_total()
+            ));
+        }
+
+        out.push_str("# HELP manta_uplink_target_dropped_disconnected_total Spots dropped when this target's connection was torn down for a reason other than a failed write.\n");
+        out.push_str("# TYPE manta_uplink_target_dropped_disconnected_total counter\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_dropped_disconnected_total{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                t.disconnected_total()
+            ));
+        }
+
+        out.push_str("# HELP manta_uplink_target_reconnects_total Times this RBN uplink target's connection was reestablished after dropping.\n");
         out.push_str("# TYPE manta_uplink_target_reconnects_total counter\n");
-        for t in &targets {
+        for t in targets.iter() {
             out.push_str(&format!(
                 "manta_uplink_target_reconnects_total{{target=\"{}\"}} {}\n",
-                escape_label_value(&t.label),
-                t.reconnects
+                escape_label_value(t.label()),
+                t.reconnects_total()
             ));
         }
 
+        // MAN-44: the flapping-window gauge `GET /status` classifies on.
+        let now = Instant::now();
         out.push_str(&format!(
             "# HELP manta_uplink_target_recent_reconnects Reconnects for this RBN uplink target within the last {}s (MAN-44 flapping window).\n",
             RECONNECT_WINDOW.as_secs()
         ));
         out.push_str("# TYPE manta_uplink_target_recent_reconnects gauge\n");
-        for t in &targets {
+        for t in targets.iter() {
             out.push_str(&format!(
                 "manta_uplink_target_recent_reconnects{{target=\"{}\"}} {}\n",
-                escape_label_value(&t.label),
-                t.recent_reconnects
+                escape_label_value(t.label()),
+                t.recent_reconnects_at(now)
+            ));
+        }
+        drop(targets);
+
+        // MAN-128: process uptime/build-info.
+        out.push_str(
+            "# HELP manta_start_time_seconds Unix time at which this daemon's spot server and metrics endpoint started.\n",
+        );
+        out.push_str("# TYPE manta_start_time_seconds gauge\n");
+        out.push_str(&format!(
+            "manta_start_time_seconds {:.3}\n",
+            self.started.unix_seconds
+        ));
+
+        out.push_str(
+            "# HELP manta_uptime_seconds Seconds since this daemon's spot server and metrics endpoint started (monotonic).\n",
+        );
+        out.push_str("# TYPE manta_uptime_seconds gauge\n");
+        out.push_str(&format!(
+            "manta_uptime_seconds {:.3}\n",
+            self.started.instant.elapsed().as_secs_f64()
+        ));
+
+        out.push_str(
+            "# HELP manta_build_info Build metadata (value is always 1): crate version, git commit, and compiled-in optional features.\n",
+        );
+        out.push_str("# TYPE manta_build_info gauge\n");
+        if let Some(info) = self
+            .build_info
+            .read()
+            .expect("build_info lock poisoned")
+            .as_ref()
+        {
+            out.push_str(&format!(
+                "manta_build_info{{version=\"{}\",git_sha=\"{}\",features=\"{}\"}} 1\n",
+                escape_label_value(&info.version),
+                escape_label_value(&info.git_sha),
+                escape_label_value(&info.features)
+            ));
+        }
+
+        // MAN-128: decode-latency histogram.
+        out.push_str(
+            "# HELP manta_decode_latency_seconds Wall-clock time the decode thread spent processing one input chunk (channelize, track, decode, validate), excluding the wait for source data. Keeping up with real time requires this to stay below the chunk duration (2048 samples / sample rate).\n",
+        );
+        out.push_str("# TYPE manta_decode_latency_seconds histogram\n");
+        if let Some(h) = self
+            .decode_latency
+            .read()
+            .expect("decode_latency lock poisoned")
+            .as_ref()
+        {
+            let mut cumulative = 0u64;
+            for (bound, count) in h.bounds_seconds.iter().zip(h.bucket_counts.iter()) {
+                cumulative += count;
+                out.push_str(&format!(
+                    "manta_decode_latency_seconds_bucket{{le=\"{bound}\"}} {cumulative}\n"
+                ));
+            }
+            cumulative += h.bucket_counts.last().copied().unwrap_or(0);
+            out.push_str(&format!(
+                "manta_decode_latency_seconds_bucket{{le=\"+Inf\"}} {cumulative}\n"
+            ));
+            out.push_str(&format!(
+                "manta_decode_latency_seconds_sum {}\n",
+                h.sum_seconds
+            ));
+            out.push_str(&format!(
+                "manta_decode_latency_seconds_count {cumulative}\n"
+            ));
+        }
+
+        // MAN-128: health gauges, computed from the SAME `health_at` that
+        // backs `/healthz` -- a Prometheus-only operator never sees a
+        // different verdict than the probe. Computed before any lock in
+        // this function is still held (health_at takes its own).
+        let report = self.health_at(Instant::now());
+        out.push_str(
+            "# HELP manta_healthy Whether /healthz currently reports this node healthy.\n",
+        );
+        out.push_str("# TYPE manta_healthy gauge\n");
+        out.push_str(&format!(
+            "manta_healthy {}\n",
+            if report.healthy { 1 } else { 0 }
+        ));
+
+        out.push_str(
+            "# HELP manta_listener_up Whether this listener (telnet/json/metrics) is currently up.\n",
+        );
+        out.push_str("# TYPE manta_listener_up gauge\n");
+        for (name, up) in self
+            .listener_up
+            .read()
+            .expect("listener_up lock poisoned")
+            .iter()
+        {
+            out.push_str(&format!(
+                "manta_listener_up{{listener=\"{name}\"}} {}\n",
+                if *up { 1 } else { 0 }
             ));
         }
 
@@ -987,22 +1356,18 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn spec(label: &str) -> UplinkTargetSpec {
-        let (host, port) = label.rsplit_once(':').unwrap();
-        UplinkTargetSpec {
-            label: label.to_string(),
-            host: host.to_string(),
-            port: port.parse().unwrap(),
-            enabled: true,
-            dry_run: false,
-        }
-    }
-
-    fn disabled_spec(label: &str) -> UplinkTargetSpec {
-        UplinkTargetSpec {
-            enabled: false,
-            ..spec(label)
+    fn spot(freq_hz: f64, spot_type: SpotType) -> manta_spot::Spot {
+        manta_spot::Spot {
+            callsign: "W1AW".to_string(),
+            freq_hz,
+            snr_db: 20.0,
+            wpm: 20.0,
+            spot_type,
+            confidence: 0.9,
+            track_id: 1,
+            sample_ts: 0,
         }
     }
 
@@ -1035,11 +1400,76 @@ mod tests {
     #[test]
     fn renders_spot_count_as_a_prometheus_counter() {
         let m = Metrics::new();
-        m.record_spot();
-        m.record_spot();
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
         let text = m.render_prometheus_text();
         assert!(text.contains("# TYPE manta_spots_total counter"));
         assert!(text.contains("manta_spots_total 2"));
+    }
+
+    /// MAN-128 Scenario 1: spots broken out by band and type, additive to
+    /// (not a replacement for) `manta_spots_total`.
+    #[test]
+    fn record_spot_breaks_counts_out_by_band_and_type() {
+        let m = Metrics::new();
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.record_spot(&spot(7_030_000.0, SpotType::De));
+        m.record_spot(&spot(1_000.0, SpotType::Unknown));
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_spots_by_band_total counter"));
+        assert!(text.contains(r#"manta_spots_by_band_total{band="20m",type="cq"} 2"#));
+        assert!(text.contains(r#"manta_spots_by_band_total{band="40m",type="de"} 1"#));
+        assert!(text.contains(r#"manta_spots_by_band_total{band="unknown",type="unknown"} 1"#));
+        assert!(text.contains("manta_spots_total 4"));
+    }
+
+    #[test]
+    fn spots_by_band_sum_equals_spots_total() {
+        let m = Metrics::new();
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.record_spot(&spot(7_030_000.0, SpotType::De));
+        m.record_spot(&spot(21_025_000.0, SpotType::Beacon));
+        let text = m.render_prometheus_text();
+        let by_band_sum: u64 = text
+            .lines()
+            .filter(|l| l.starts_with("manta_spots_by_band_total{"))
+            .map(|l| l.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+            .sum();
+        let total: u64 = text
+            .lines()
+            .find(|l| l.starts_with("manta_spots_total "))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(by_band_sum, total);
+    }
+
+    #[test]
+    fn band_label_uses_the_same_rounding_as_the_json_stream() {
+        let m = Metrics::new();
+        m.record_spot(&spot(13_999_999.6, SpotType::Cq)); // rounds to 14_000_000.0
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_spots_by_band_total{band="20m",type="cq"} 1"#));
+    }
+
+    #[test]
+    fn spots_by_band_family_has_header_but_no_samples_before_any_spot() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("# HELP manta_spots_by_band_total"));
+        assert!(text.contains("# TYPE manta_spots_by_band_total counter"));
+        assert!(!text.contains("manta_spots_by_band_total{"));
+    }
+
+    #[test]
+    fn beacon_type_maps_to_lowercase_label() {
+        let m = Metrics::new();
+        m.record_spot(&spot(14_025_000.0, SpotType::Beacon));
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_spots_by_band_total{band="20m",type="beacon"} 1"#));
     }
 
     #[test]
@@ -1160,14 +1590,6 @@ mod tests {
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
     }
 
-    #[test]
-    fn source_health_label_is_escaped_in_prometheus_output() {
-        let m = Metrics::new();
-        m.set_source_health("weird\"source", true);
-        let text = m.render_prometheus_text();
-        assert!(text.contains(r#"manta_source_health{source="weird\"source"} 1"#));
-    }
-
     // MAN-56: input-layer packet loss/malformed counters.
 
     #[test]
@@ -1244,55 +1666,487 @@ mod tests {
         assert!(dropped < gaps_help);
     }
 
-    // MAN-44: per-target uplink registry.
+    // MAN-32/MAN-128: RBN uplink counters, now registry-backed.
 
     #[test]
-    fn registered_target_records_its_own_counters_and_aggregates_sum_them() {
+    fn uplink_aggregates_are_sums_over_registered_targets() {
         let m = Metrics::new();
-        let a = m.register_uplink_target(spec("a.example:7000"));
-        let b = m.register_uplink_target(spec("b.example:7000"));
+        let a = m.register_uplink_target("a.example:7000".to_string(), true);
+        let b = m.register_uplink_target("b.example:7000".to_string(), true);
 
         a.record_sent();
         a.record_sent();
         b.record_sent();
-        b.record_suppressed();
+        b.record_reconnect();
+        b.record_reconnect();
+        b.record_reconnect();
+        a.mark_connected();
 
-        assert_eq!(a.snapshot().sent, 2);
-        assert_eq!(b.snapshot().sent, 1);
-        assert_eq!(b.snapshot().suppressed, 1);
-        // Aggregates are derived, never separately maintained.
         assert_eq!(m.uplink_sent_total(), 3);
-        assert_eq!(m.uplink_suppressed_total(), 1);
+        assert_eq!(m.uplink_reconnects_total(), 3);
+        assert!(m.uplink_connected());
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_uplink_sent_total 3"));
+        assert!(text.contains("manta_uplink_reconnects_total 3"));
+        assert!(text.contains("manta_uplink_connected 1"));
     }
 
     #[test]
-    fn connected_count_is_per_target_so_one_targets_failure_cannot_clear_another() {
-        // MAN-42's round-1 last-writer-wins regression, now enforced
-        // structurally: each target owns its own AtomicBool, so
-        // unbalanced calls cannot desync a shared counter at all.
+    fn renders_per_target_uplink_families_with_labels() {
         let m = Metrics::new();
-        let a = m.register_uplink_target(spec("a.example:7000"));
-        let b = m.register_uplink_target(spec("b.example:7000"));
+        let a = m.register_uplink_target("a.example:7000".to_string(), true);
+        let b = m.register_uplink_target("b.example:7000".to_string(), true);
+        a.mark_connected();
+        b.record_reconnect();
+        b.record_reconnect();
+        b.record_reconnect();
+
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_uplink_target_connected{target="a.example:7000"} 1"#));
+        assert!(text.contains(r#"manta_uplink_target_connected{target="b.example:7000"} 0"#));
+        assert!(text.contains(r#"manta_uplink_target_reconnects_total{target="b.example:7000"} 3"#));
+    }
+
+    #[test]
+    fn disabled_target_is_rendered_with_enabled_zero() {
+        let m = Metrics::new();
+        m.register_uplink_target("a.example:7000".to_string(), false);
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"manta_uplink_target_enabled{target="a.example:7000"} 0"#));
+    }
+
+    #[test]
+    fn uplink_target_label_is_escaped() {
+        let m = Metrics::new();
+        m.register_uplink_target(r#"a"host:7000"#.to_string(), true);
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"target="a\"host:7000""#));
+    }
+
+    #[test]
+    fn per_target_families_render_contiguously_in_registration_order() {
+        let m = Metrics::new();
+        m.register_uplink_target("a:1".to_string(), true);
+        m.register_uplink_target("b:2".to_string(), true);
+        let text = m.render_prometheus_text();
+        let enabled_header = text.find("# TYPE manta_uplink_target_enabled").unwrap();
+        let connected_header = text.find("# TYPE manta_uplink_target_connected").unwrap();
+        let a_enabled = text
+            .find(r#"manta_uplink_target_enabled{target="a:1"}"#)
+            .unwrap();
+        let b_enabled = text
+            .find(r#"manta_uplink_target_enabled{target="b:2"}"#)
+            .unwrap();
+        assert!(enabled_header < a_enabled);
+        assert!(a_enabled < b_enabled);
+        assert!(b_enabled < connected_header);
+    }
+
+    // MAN-42 (structural now, MAN-128): each target owns its own
+    // `connected` flag, so one target's failed reconnects can never touch
+    // another's -- the pre-MAN-128 shared-atomic desync class is no longer
+    // reachable, not just avoided by calling-convention discipline.
+    #[test]
+    fn uplink_connected_reflects_multiple_independently_tracked_targets() {
+        let m = Metrics::new();
+        assert!(!m.uplink_connected());
+
+        let a = m.register_uplink_target("a".to_string(), true);
+        let b = m.register_uplink_target("b".to_string(), true);
 
         a.mark_connected();
         assert!(m.uplink_connected());
+
         b.record_reconnect();
         b.record_reconnect();
         b.record_reconnect();
         assert!(
             m.uplink_connected(),
-            "b's failures must not clear a's connection"
+            "an unrelated target's failed reconnects must not clear the gauge \
+             while another target is genuinely connected"
         );
-        assert_eq!(m.uplink_connected_count(), 1);
 
         a.mark_disconnected();
         assert!(!m.uplink_connected());
     }
 
+    // MAN-122: the periodic status line reads these getters directly
+    // instead of parsing render_prometheus_text() back out of a String.
+    #[test]
+    fn live_state_getters_read_back_what_the_recorders_wrote() {
+        let m = Metrics::new();
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.record_spot(&spot(14_025_000.0, SpotType::Cq));
+        m.set_active_tracks(4);
+        m.inc_telnet_clients();
+        m.inc_json_clients();
+        m.inc_ws_clients();
+        m.dec_ws_clients();
+        assert_eq!(m.spots_total(), 2);
+        assert_eq!(m.active_tracks(), 4);
+        assert_eq!(
+            (m.telnet_clients(), m.json_clients(), m.ws_clients()),
+            (1, 1, 0)
+        );
+    }
+
+    // MAN-122 review round 2: the status line's stall detection compares
+    // this counter against its own previous sample, so the only property
+    // that matters is that it advances once per recorded batch and never
+    // goes backwards.
+    #[test]
+    fn the_pipeline_batch_counter_advances_once_per_batch() {
+        let m = Metrics::new();
+        assert_eq!(m.pipeline_batches(), 0);
+        m.record_pipeline_batch();
+        m.record_pipeline_batch();
+        assert_eq!(m.pipeline_batches(), 2);
+    }
+
+    #[test]
+    fn no_targets_registered_renders_aggregates_at_zero_and_per_target_headers_only() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("manta_uplink_sent_total 0"));
+        assert!(text.contains("manta_uplink_connected 0"));
+        assert!(text.contains("# TYPE manta_uplink_target_enabled gauge"));
+        assert!(!text.contains("manta_uplink_target_enabled{"));
+    }
+
+    // MAN-128: uptime/build-info.
+
+    #[test]
+    fn renders_start_time_and_uptime_gauges() {
+        let m = Metrics::new();
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_start_time_seconds gauge"));
+        assert!(text.contains("# TYPE manta_uptime_seconds gauge"));
+
+        let start: f64 = text
+            .lines()
+            .find(|l| l.starts_with("manta_start_time_seconds "))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!((start - now).abs() < 5.0);
+
+        let uptime: f64 = text
+            .lines()
+            .find(|l| l.starts_with("manta_uptime_seconds "))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(uptime >= 0.0);
+    }
+
+    #[test]
+    fn uptime_increases_monotonically() {
+        let m = Metrics::new();
+        let first = m.render_prometheus_text();
+        std::thread::sleep(Duration::from_millis(20));
+        let second = m.render_prometheus_text();
+        let get = |t: &str| -> f64 {
+            t.lines()
+                .find(|l| l.starts_with("manta_uptime_seconds "))
+                .unwrap()
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(get(&second) > get(&first));
+    }
+
+    #[test]
+    fn build_info_is_absent_until_set_then_rendered_as_info_metric() {
+        let m = Metrics::new();
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_build_info gauge"));
+        assert!(!text.contains("manta_build_info{"));
+
+        m.set_build_info(BuildInfo {
+            version: "0.1.0".to_string(),
+            git_sha: "abc123".to_string(),
+            features: "hpsdr".to_string(),
+        });
+        let text = m.render_prometheus_text();
+        assert!(text
+            .contains(r#"manta_build_info{version="0.1.0",git_sha="abc123",features="hpsdr"} 1"#));
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+
+        let m = Metrics::new();
+        m.set_build_info(BuildInfo {
+            version: "0.1.0".to_string(),
+            git_sha: "a\"b".to_string(),
+            features: "none".to_string(),
+        });
+        let text = m.render_prometheus_text();
+        assert!(text.contains(r#"git_sha="a\"b""#));
+    }
+
+    // MAN-128: decode-latency histogram.
+
+    #[test]
+    fn decode_latency_renders_cumulative_prometheus_histogram() {
+        let m = Metrics::new();
+        m.set_decode_latency(LatencyHistogram {
+            bounds_seconds: vec![0.001, 0.01],
+            bucket_counts: vec![2, 3, 1],
+            sum_seconds: 0.05,
+        });
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_decode_latency_seconds histogram"));
+        assert!(text.contains(r#"manta_decode_latency_seconds_bucket{le="0.001"} 2"#));
+        assert!(text.contains(r#"manta_decode_latency_seconds_bucket{le="0.01"} 5"#));
+        assert!(text.contains(r#"manta_decode_latency_seconds_bucket{le="+Inf"} 6"#));
+        assert!(text.contains("manta_decode_latency_seconds_sum 0.05"));
+        assert!(text.contains("manta_decode_latency_seconds_count 6"));
+    }
+
+    #[test]
+    fn histogram_count_always_equals_inf_bucket() {
+        let m = Metrics::new();
+        m.set_decode_latency(LatencyHistogram {
+            bounds_seconds: vec![0.001],
+            bucket_counts: vec![4, 2],
+            sum_seconds: 0.01,
+        });
+        let text = m.render_prometheus_text();
+        let inf: u64 = text
+            .lines()
+            .find(|l| l.contains(r#"le="+Inf""#))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let count: u64 = text
+            .lines()
+            .find(|l| l.starts_with("manta_decode_latency_seconds_count "))
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(inf, count);
+    }
+
+    #[test]
+    fn decode_latency_family_header_only_when_never_set() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("# TYPE manta_decode_latency_seconds histogram"));
+        assert!(!text.contains("manta_decode_latency_seconds_bucket{"));
+        assert!(!text.contains("manta_decode_latency_seconds_count"));
+    }
+
+    #[test]
+    fn decode_latency_samples_are_contiguous_and_bucket_ordered() {
+        let m = Metrics::new();
+        m.set_decode_latency(LatencyHistogram {
+            bounds_seconds: vec![0.001, 0.01, 0.1],
+            bucket_counts: vec![1, 1, 1, 1],
+            sum_seconds: 0.05,
+        });
+        let text = m.render_prometheus_text();
+        let b1 = text.find(r#"le="0.001""#).unwrap();
+        let b2 = text.find(r#"le="0.01""#).unwrap();
+        let b3 = text.find(r#"le="0.1""#).unwrap();
+        let binf = text.find(r#"le="+Inf""#).unwrap();
+        let sum = text.find("manta_decode_latency_seconds_sum").unwrap();
+        let count = text.find("manta_decode_latency_seconds_count").unwrap();
+        assert!(b1 < b2 && b2 < b3 && b3 < binf && binf < sum && sum < count);
+    }
+
+    // MAN-128: health evaluation (`/healthz`'s backing state).
+
+    #[test]
+    fn healthy_when_source_listeners_and_decode_all_ok() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        m.set_listener_up("json", true);
+        m.set_listener_up("metrics", true);
+        let t0 = Instant::now();
+        m.arm_decode_watchdog_at(t0);
+        m.set_decode_latency_at(
+            LatencyHistogram {
+                bounds_seconds: vec![0.001],
+                bucket_counts: vec![5, 0],
+                sum_seconds: 0.001,
+            },
+            t0 + Duration::from_secs(1),
+        );
+        assert!(m.health_at(t0 + Duration::from_secs(2)).healthy);
+    }
+
+    #[test]
+    fn unhealthy_when_any_source_unhealthy() {
+        let m = Metrics::new();
+        m.set_source_health("file", false);
+        m.set_listener_up("telnet", true);
+        assert!(!m.health_at(Instant::now()).healthy);
+    }
+
+    #[test]
+    fn unhealthy_when_no_source_registered() {
+        let m = Metrics::new();
+        m.set_listener_up("telnet", true);
+        assert!(!m.health_at(Instant::now()).healthy);
+    }
+
+    #[test]
+    fn unhealthy_when_a_listener_is_down() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        m.set_listener_up("json", false);
+        assert!(!m.health_at(Instant::now()).healthy);
+    }
+
+    #[test]
+    fn unhealthy_when_no_listener_registered() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        assert!(!m.health_at(Instant::now()).healthy);
+    }
+
+    #[test]
+    fn unhealthy_when_decode_progress_stalls_past_threshold() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        let t0 = Instant::now();
+        m.arm_decode_watchdog_at(t0);
+        m.set_decode_latency_at(
+            LatencyHistogram {
+                bounds_seconds: vec![0.001],
+                bucket_counts: vec![1, 0],
+                sum_seconds: 0.001,
+            },
+            t0 + Duration::from_secs(1),
+        );
+        let report = m.health_at(
+            t0 + Duration::from_secs(1)
+                + crate::health::DECODE_STALL_THRESHOLD
+                + Duration::from_millis(1),
+        );
+        assert!(!report.healthy);
+        assert!(report.render_text().contains("stalled"));
+    }
+
+    #[test]
+    fn progress_requires_count_to_increase_not_just_a_snapshot() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        let t0 = Instant::now();
+        m.arm_decode_watchdog_at(t0);
+        let same = LatencyHistogram {
+            bounds_seconds: vec![0.001],
+            bucket_counts: vec![1, 0],
+            sum_seconds: 0.001,
+        };
+        m.set_decode_latency_at(same.clone(), t0 + Duration::from_secs(1));
+        m.set_decode_latency_at(same, t0 + Duration::from_secs(5));
+        let report = m.health_at(
+            t0 + Duration::from_secs(1)
+                + crate::health::DECODE_STALL_THRESHOLD
+                + Duration::from_millis(1),
+        );
+        assert!(
+            !report.healthy,
+            "an unchanged count must not refresh progress"
+        );
+    }
+
+    #[test]
+    fn unhealthy_once_decode_marked_stopped_even_if_recent_progress() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        let t0 = Instant::now();
+        m.arm_decode_watchdog_at(t0);
+        m.set_decode_latency_at(
+            LatencyHistogram {
+                bounds_seconds: vec![0.001],
+                bucket_counts: vec![1, 0],
+                sum_seconds: 0.001,
+            },
+            t0,
+        );
+        m.mark_decode_stopped();
+        assert!(!m.health_at(t0 + Duration::from_millis(1)).healthy);
+    }
+
+    #[test]
+    fn startup_grace_counts_from_arming() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        let t0 = Instant::now();
+        m.arm_decode_watchdog_at(t0);
+        assert!(m.health_at(t0 + Duration::from_secs(5)).healthy);
+        assert!(
+            !m.health_at(t0 + crate::health::DECODE_STALL_THRESHOLD + Duration::from_secs(1))
+                .healthy
+        );
+    }
+
+    #[test]
+    fn decode_check_skipped_when_watchdog_never_armed() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        let report = m.health_at(Instant::now());
+        assert!(report.healthy);
+        assert!(report.render_text().contains("not monitored"));
+    }
+
+    #[test]
+    fn health_report_text_lists_every_check_one_per_line() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        let text = m.health_at(Instant::now()).render_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "ok");
+        assert!(lines.contains(&"source file: healthy"));
+        assert!(lines.contains(&"listener telnet: up"));
+    }
+
+    #[test]
+    fn manta_healthy_and_listener_up_gauges_match_health_at() {
+        let m = Metrics::new();
+        m.set_source_health("file", true);
+        m.set_listener_up("telnet", true);
+        m.set_listener_up("json", false);
+        let text = m.render_prometheus_text();
+        assert!(text.contains("manta_healthy 0"));
+        assert!(text.contains(r#"manta_listener_up{listener="json"} 0"#));
+    }
+
+    // MAN-44: reconnect window + health classification.
+
     #[test]
     fn reconnects_outside_the_window_do_not_count_as_recent() {
         let m = Metrics::new();
-        let t = m.register_uplink_target(spec("a.example:7000"));
+        let t = m.register_uplink_target("a.example:7000".into(), true);
         let t0 = Instant::now();
 
         t.record_reconnect_at(t0);
@@ -1311,7 +2165,7 @@ mod tests {
     #[test]
     fn recent_reconnect_ring_is_bounded_under_sustained_flapping() {
         let m = Metrics::new();
-        let t = m.register_uplink_target(spec("a.example:7000"));
+        let t = m.register_uplink_target("a.example:7000".into(), true);
         let t0 = Instant::now();
         for i in 0..10_000u64 {
             t.record_reconnect_at(t0 + Duration::from_millis(i));
@@ -1349,9 +2203,9 @@ mod tests {
     #[test]
     fn overall_uplink_health_is_ok_only_when_every_enabled_target_is_connected() {
         let m = Metrics::new();
-        let a = m.register_uplink_target(spec("a.example:7000"));
-        let b = m.register_uplink_target(spec("b.example:7000"));
-        let _disabled = m.register_uplink_target(disabled_spec("c.example:7000"));
+        let a = m.register_uplink_target("a.example:7000".into(), true);
+        let b = m.register_uplink_target("b.example:7000".into(), true);
+        let _disabled = m.register_uplink_target("c.example:7000".into(), false);
         a.mark_connected();
         assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Degraded);
         b.mark_connected();
@@ -1362,23 +2216,21 @@ mod tests {
     fn overall_uplink_health_is_disabled_when_no_targets_are_enabled() {
         let m = Metrics::new();
         assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Disabled);
-        let _disabled = m.register_uplink_target(disabled_spec("a.example:7000"));
+        let _disabled = m.register_uplink_target("a.example:7000".into(), false);
         assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Disabled);
     }
 
     #[test]
     fn overall_uplink_health_is_down_when_every_enabled_target_is_down() {
         let m = Metrics::new();
-        let _a = m.register_uplink_target(spec("a.example:7000"));
+        let _a = m.register_uplink_target("a.example:7000".into(), true);
         assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Down);
     }
 
     #[test]
     fn a_registered_but_never_connected_target_still_appears_in_snapshots() {
-        // Scenario 2 depends on this: a target that has NEVER succeeded
-        // must be visible, not absent.
         let m = Metrics::new();
-        let _ = m.register_uplink_target(spec("never.example:7000"));
+        let _ = m.register_uplink_target("never.example:7000".into(), true);
         let snap = m.uplink_snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].label, "never.example:7000");
@@ -1386,63 +2238,14 @@ mod tests {
     }
 
     #[test]
-    fn renders_uplink_counters_as_prometheus_metrics() {
+    fn renders_the_recent_reconnects_gauge_per_target() {
         let m = Metrics::new();
-        let t = m.register_uplink_target(spec("a.example:7000"));
-        t.record_sent();
-        t.record_sent();
-        t.record_suppressed();
+        let t = m.register_uplink_target("a.example:7000".into(), true);
         t.record_reconnect();
-        t.record_write_failed(1);
-        t.record_disconnected(2);
-        t.mark_connected();
+        t.record_reconnect();
         let text = m.render_prometheus_text();
-        assert!(text.contains("manta_uplink_sent_total 2"));
-        assert!(text.contains("manta_uplink_suppressed_total 1"));
-        assert!(text.contains("manta_uplink_reconnects_total 1"));
-        assert!(text.contains("manta_uplink_dropped_write_failed_total 1"));
-        assert!(text.contains("manta_uplink_dropped_disconnected_total 2"));
-        assert!(text.contains("manta_uplink_connected 1"));
-    }
-
-    #[test]
-    fn renders_per_target_uplink_series_without_changing_the_aggregate_series() {
-        let m = Metrics::new();
-        let a = m.register_uplink_target(spec("a.example:7000"));
-        a.mark_connected();
-        a.record_sent();
-        let text = m.render_prometheus_text();
-        assert!(text.contains(r#"manta_uplink_target_connected{target="a.example:7000"} 1"#));
-        assert!(text.contains(r#"manta_uplink_target_sent_total{target="a.example:7000"} 1"#));
-        // Existing series keep their exact pre-MAN-44 names and values.
-        assert!(text.contains("manta_uplink_sent_total 1"));
-        assert!(text.contains("manta_uplink_connected 1"));
-    }
-
-    #[test]
-    fn target_labels_are_escaped_in_prometheus_output() {
-        // Labels come from operator config; a quote or backslash in a
-        // hostname must not be able to produce a malformed exposition
-        // line.
-        let m = Metrics::new();
-        let weird = UplinkTargetSpec {
-            label: "weird\"host:7000".to_string(),
-            host: "weird\"host".to_string(),
-            port: 7000,
-            enabled: true,
-            dry_run: false,
-        };
-        m.register_uplink_target(weird);
-        let text = m.render_prometheus_text();
-        assert!(text.contains(r#"manta_uplink_target_connected{target="weird\"host:7000"} 0"#));
-    }
-
-    #[test]
-    fn uptime_grows_and_never_goes_backwards() {
-        let m = Metrics::new();
-        let first = m.uptime();
-        std::thread::sleep(Duration::from_millis(5));
-        let second = m.uptime();
-        assert!(second >= first);
+        assert!(
+            text.contains(r#"manta_uplink_target_recent_reconnects{target="a.example:7000"} 2"#)
+        );
     }
 }
