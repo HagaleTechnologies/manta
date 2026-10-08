@@ -76,21 +76,35 @@ jobs:
   # independent required matrix legs instead of one aggregate. push/merge_group need none of
   # this: github.sha there already names the real commit under test, so this job is skipped
   # entirely and the native per-job check-run attribution is already correct.
+  #
+  # HAG-106/HAG-108: the check-runs are written with a hagale-agent App token, not
+  # github.token. A github.token POST lands in the OLDEST github-actions check suite on the SHA
+  # (often a pull_request_target Auto-Merge/Codex run or a branch-ref dispatch); when that suite
+  # is superseded the PR rollup hides it and the merge queue refuses the PR with 'Required status
+  # check "test (ubuntu-latest)" is expected'. hagale-agent gets exactly one suite of its own per
+  # commit, which the rollup always shows.
   create-ci-check:
     name: Create required test check-runs on the reviewed SHA
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      checks: write
+    permissions: {}
     outputs:
       ubuntu_check_id: ${{ steps.create.outputs.ubuntu_check_id }}
       macos_check_id: ${{ steps.create.outputs.macos_check_id }}
     steps:
+      - name: Mint a hagale-agent installation token for the test check-runs
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
       - name: Create in_progress check-runs on head_sha
         id: create
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ inputs.head_sha || github.sha }}
         run: |
@@ -223,11 +237,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      checks: write
     steps:
+      # Only the App that created a check-run can update it, so the PATCH uses the same
+      # hagale-agent identity as create-ci-check; github.token still reads this run's jobs.
+      - name: Mint a hagale-agent installation token for the test check-runs
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
       - name: Patch each required check-run with its own matrix leg's real conclusion
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           UBUNTU_CHECK_ID: ${{ needs.create-ci-check.outputs.ubuntu_check_id }}
           MACOS_CHECK_ID: ${{ needs.create-ci-check.outputs.macos_check_id }}
@@ -245,7 +269,7 @@ jobs:
               echo "::error::Could not find a conclusion for job '$job_name' in this run -- marking its check-run failed rather than leaving it stuck in_progress."
               conclusion="failure"
             fi
-            gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="$conclusion"
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="$conclusion"
           }
           relay "test (ubuntu-latest)" "$UBUNTU_CHECK_ID"
           relay "test (macos-latest)" "$MACOS_CHECK_ID"
