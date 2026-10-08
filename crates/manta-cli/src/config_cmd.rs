@@ -309,6 +309,10 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                     "json_max_pings_per_ip",
                     s.json_max_pings_per_ip.map(u64::from),
                 ),
+                (
+                    "metrics_max_requests_per_ip",
+                    s.metrics_max_requests_per_ip.map(u64::from),
+                ),
             ];
             for (key, value) in optional {
                 if let Some(v) = value {
@@ -1041,6 +1045,7 @@ mod tests {
         ("server", "metrics_max_connections_per_ip"),
         ("server", "telnet_max_commands_per_ip"),
         ("server", "json_max_pings_per_ip"),
+        ("server", "metrics_max_requests_per_ip"),
         ("input", "freq_correction_ppm"),
     ];
 
@@ -1204,6 +1209,10 @@ mod tests {
             u64::from(json_stream::MAX_INBOUND_PINGS)
         );
         assert_eq!(
+            int("metrics_max_requests_per_ip"),
+            u64::from(metrics_http::MAX_METRICS_REQUESTS_PER_IP)
+        );
+        assert_eq!(
             int("status_interval_secs"),
             status::DEFAULT_STATUS_INTERVAL.as_secs()
         );
@@ -1223,6 +1232,12 @@ mod tests {
             scaffold_setting("server", "json_max_pings_per_ip").contains(&format!(
                 "per {} seconds",
                 json_stream::PING_RATE_WINDOW.as_secs()
+            ))
+        );
+        assert!(
+            scaffold_setting("server", "metrics_max_requests_per_ip").contains(&format!(
+                "per {} seconds",
+                metrics_http::METRICS_REQUEST_RATE_WINDOW.as_secs()
             ))
         );
     }
