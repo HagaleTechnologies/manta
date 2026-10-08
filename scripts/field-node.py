@@ -662,8 +662,11 @@ def parse_iso_ts(text):
 
 
 def load_ledger(path):
-    """Returns (records, unparseable_line_count)."""
-    records, bad = [], 0
+    """Returns (records, unparseable_line_count, interior_unparseable_count).
+
+    Only a final line with no newline (a write torn by a kill) is tolerated;
+    any other unparseable line lost a record, so it is "interior"."""
+    records, bad, interior, torn = [], 0, 0, False
     try:
         f = open(path, "rb")
     except OSError as e:
@@ -672,16 +675,22 @@ def load_ledger(path):
         for raw in f:
             if not raw.strip():
                 continue
+            if torn:
+                interior += 1  # the torn line was not the last one after all
+                torn = False
             try:
                 rec = json.loads(raw.decode("utf-8"))
             except Exception:  # noqa: BLE001
-                bad += 1
-                continue
+                rec = None
             if not isinstance(rec, dict) or not isinstance(rec.get("ts"), (int, float)):
                 bad += 1
+                if raw.endswith(b"\n"):
+                    interior += 1
+                else:
+                    torn = True
                 continue
             records.append(rec)
-    return records, bad
+    return records, bad, interior
 
 
 def load_recorded_spots(spots_dir, start=None, end=None):
@@ -716,6 +725,7 @@ DEFAULT_PARAMS = {
     "to_ts": None,
     "recorded_by_day": None,
     "unparseable_lines": 0,
+    "interior_unparseable_lines": 0,
 }
 
 
@@ -1051,7 +1061,7 @@ def summarize(records, params=None):
     # blind to what that family detects (a restart without start_time, an
     # outage without the outage counters), so no verdict can rest on it:
     # an integrity failure fails the run, like unobserved time (D-F).
-    integrity_ok = not missing_counts
+    integrity_ok = not missing_counts and not int(p["interior_unparseable_lines"])
     if not all(c["pass"] for c in criteria) or not integrity_ok:
         verdict = "FAIL"
     elif in_progress:
@@ -1091,6 +1101,7 @@ def summarize(records, params=None):
                   for n in win_notes],
         "manual_interventions": len(manual),
         "integrity": {"unparseable_lines": int(p["unparseable_lines"]),
+                      "interior_unparseable_lines": int(p["interior_unparseable_lines"]),
                       "samples": len(win_samples),
                       "reachable_samples": len(reachable_win),
                       "missing_metrics": missing_counts,
@@ -1130,7 +1141,8 @@ def render_markdown(s):
     span_label = s["progress"] if s["in_progress"] else "PASS (span)"
     w("- Span: %.1f/%s days: %s" % (s["window"]["span_days"], _fmt_num(s["params"]["min_days"]), span_label))
     if not s["integrity"]["pass"]:
-        w("- Ledger integrity: required metrics missing (see Ledger integrity): FAIL (integrity)")
+        w("- Ledger integrity: required metrics missing or ledger lines lost (see Ledger integrity): "
+          "FAIL (integrity)")
     w("")
     w("## Window")
     w("")
@@ -1212,7 +1224,8 @@ def render_markdown(s):
     w("## Ledger integrity")
     w("")
     integ = s["integrity"]
-    w("- unparseable ledger lines: %d" % integ["unparseable_lines"])
+    w("- unparseable ledger lines: %d (%d not a torn final line)" % (
+        integ["unparseable_lines"], integ["interior_unparseable_lines"]))
     w("- samples in window: %d (%d reachable)" % (integ["samples"], integ["reachable_samples"]))
     for m in sorted(integ["missing_metrics"]):
         w("- required metric %s missing in %d samples" % (m, integ["missing_metrics"][m]))
@@ -1256,8 +1269,9 @@ def cmd_report(args):
         "to_ts": parse_iso_ts(args.to) if args.to else None,
     }
     validate_report_thresholds(args)
-    records, bad = load_ledger(args.ledger)
+    records, bad, interior = load_ledger(args.ledger)
     params["unparseable_lines"] = bad
+    params["interior_unparseable_lines"] = interior
     if args.spots_dir:
         params["recorded_by_day"] = load_recorded_spots(args.spots_dir, params["from_ts"], params["to_ts"])
     summary = summarize(records, params)

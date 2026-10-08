@@ -80,7 +80,8 @@ the MAN-96 research document's section N.
   the D-G watchdog), `note` (D-D/D-E), `record-spots` (the node's own spot archive from the JSON
   Lines port) and `report` (the scenario-1 verdict, D-A…D-F; exit 0 PASS, 1 FAIL or in progress).
   A reachable sample missing any `REQUIRED_METRICS` family also fails the run (ledger
-  integrity): the ledger was blind to what that family detects.
+  integrity): the ledger was blind to what that family detects. So does any unparseable
+  ledger line other than a torn final line (no newline), since it lost a record.
   For D-C, a `manta_spots_total` rise between two samples on different UTC days (after a
   restart, between the restart and the later sample) is credited to neither day. A full day passes
   D-C when a rise falls inside it, or when the spot archive (`--spots-dir`, which the runbook

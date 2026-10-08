@@ -801,6 +801,19 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("unparseable ledger lines: 1", r.stdout)
 
+    def test_corrupt_interior_line_fails_integrity(self):
+        # a torn write followed by a restart's append leaves a bad line mid-ledger
+        recs = make_ledger()
+        write_ledger(self.ledger, recs[:500])
+        with open(self.ledger, "ab") as f:
+            f.write(b'{"v":1,"kind":"sample","ts":17{"v":1}\n')
+            for rec in recs[500:]:
+                f.write(json.dumps(rec).encode() + b"\n")
+        r = run_cli("report", "--ledger", self.ledger, "--interval-s", str(IV))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("unparseable ledger lines: 1 (1 not a torn final line)", r.stdout)
+        self.assertIn("FAIL (integrity)", r.stdout)
+
     def test_span_starts_at_start_note_and_ends_at_end_note(self):
         recs = make_ledger(days=10)
         recs.append({"v": 1, "kind": "note", "ts": T0 + DAY + 0.5, "note": "start", "reason": "restart clock"})
