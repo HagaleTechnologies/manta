@@ -114,6 +114,11 @@ pub struct TrackDecoder {
     /// Characters (garbles included) committed since the last word
     /// boundary; tells `check_flush` its flush closes a one-character word.
     word_chars: u32,
+    /// Characters actually decoded since the last word boundary (garbles
+    /// excluded). Only a gap after two or more of them confirms a Farnsworth
+    /// rebuild: a garble is no evidence the preceding gap was a character
+    /// gap (MAN-264).
+    word_decoded: u32,
     /// Set by `check_flush` when its flush closed a one-character word: the
     /// gap's length at the flush, in ms. The rest of the gap arrives later
     /// as the space run `process_run` skips.
@@ -181,6 +186,7 @@ impl TrackDecoder {
             cur_marks: Vec::new(),
             word_flushed: false,
             word_chars: 0,
+            word_decoded: 0,
             single_flush_ms: None,
             single_flush_gaps: Vec::new(),
             last_reported_wpm: None,
@@ -704,12 +710,13 @@ impl TrackDecoder {
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
-                    if self.word_chars > 1 {
+                    if self.word_decoded > 1 {
                         self.single_flush_gaps.clear();
                         self.gaps
                             .confirm_rebuilt(dur_ms, self.tracker.mu_dit_ms(), None);
                     }
                     self.word_chars = 0;
+                    self.word_decoded = 0;
                 }
             }
         }
@@ -754,16 +761,9 @@ impl TrackDecoder {
                 // Farnsworth spacing, which this censoring hides, is
                 // recovered separately from the closed lengths of gaps
                 // flushed after one-character words (`observe_single_flush`).
-                // A word of two or more characters ends here, so this gap
-                // can confirm such a rebuild (MAN-264).
-                if self.word_chars > 0 {
-                    self.gaps.confirm_rebuilt(
-                        gap_ms,
-                        self.tracker.mu_dit_ms(),
-                        Some(self.cfg.flush_gap_dits),
-                    );
-                }
-                self.gaps.observe_flushed(gap_ms, self.tracker.mu_dit_ms());
+                // Both are folded in below, after the final character's
+                // decode is known, at the dit length measured here.
+                let mu_dit_ms = self.tracker.mu_dit_ms();
                 // Drain any held mark into cur_marks (live: it's a real
                 // keyed event and should count for speed tracking); the
                 // drained space itself is not separately gap-classified —
@@ -776,6 +776,15 @@ impl TrackDecoder {
                 let one_char_word = self.word_chars == 0;
                 let garbles = self.garble_count;
                 self.emit_char(ts, events);
+                // A word of two or more decoded characters ends here, so this
+                // gap can confirm such a rebuild (MAN-264) -- checked once the
+                // final character's decode is known, since a garble confirms
+                // nothing.
+                if self.word_decoded > 1 {
+                    self.gaps
+                        .confirm_rebuilt(gap_ms, mu_dit_ms, Some(self.cfg.flush_gap_dits));
+                }
+                self.gaps.observe_flushed(gap_ms, mu_dit_ms);
                 // A decoded one-character word: keep the gap's length so far
                 // for `observe_single_flush` once the space closes. A longer
                 // word or a garble ends the run.
@@ -789,6 +798,7 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_chars = 0;
+                self.word_decoded = 0;
                 self.word_flushed = true;
             }
         }
@@ -837,6 +847,7 @@ impl TrackDecoder {
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_chars = 0;
+                self.word_decoded = 0;
                 self.word_flushed = true;
             }
         }
@@ -864,12 +875,15 @@ impl TrackDecoder {
             q,
             &self.cfg.beam,
         ) {
-            Some(cd) => events.push(DecoderEvent::char_decoded(
-                self.track_id,
-                sample_ts,
-                cd.glyph,
-                cd.confidence,
-            )),
+            Some(cd) => {
+                self.word_decoded = self.word_decoded.saturating_add(1);
+                events.push(DecoderEvent::char_decoded(
+                    self.track_id,
+                    sample_ts,
+                    cd.glyph,
+                    cd.confidence,
+                ));
+            }
             None => self.garble_count += 1,
         }
     }
@@ -1791,6 +1805,38 @@ mod tests {
         for pause in [0, 0, 456, 456, 0, 0, 0, 0, 0, 0, 0] {
             env.extend(rect_envelope("H", 18));
             env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        env.extend(rect_envelope(tail, 18));
+        let out = decode_with(Engine::Legacy, &env);
+        assert!(out.ends_with(tail), "{out:?}");
+    }
+
+    /// MAN-264 (Codex review, PR #217): a garble is no decoded character.
+    /// After the false rebuild above, a 10-dit gap sits between the
+    /// disproof bound and the rebuilt boundary, so it classifies `InterChar`
+    /// without discarding the rebuild. Five words of one decoded character,
+    /// that gap, and a garble (eight dahs, which `decode_char` rejects) must
+    /// not confirm the rebuild as two-character words, or every later word
+    /// merges.
+    #[test]
+    fn legacy_words_padded_with_garbles_do_not_confirm_a_false_rebuild() {
+        let tail = "W1AW TEST W1AW TEST CQ DE W1AW K";
+        let mut env = rect_envelope("W1AW", 18);
+        for pause in [0, 0, 456, 456, 0] {
+            env.extend(rect_envelope("R", 18));
+            env.extend(std::iter::repeat_n(0.0, pause));
+        }
+        let r_marks = rect_envelope("R", 18).len() - 8 * 18;
+        for _ in 0..5 {
+            env.extend(rect_envelope("R", 18).into_iter().take(r_marks));
+            env.extend(std::iter::repeat_n(0.0, 10 * 18));
+            for i in 0..8 {
+                if i > 0 {
+                    env.extend(std::iter::repeat_n(0.0, 18));
+                }
+                env.extend(std::iter::repeat_n(1.0, 3 * 18));
+            }
+            env.extend(std::iter::repeat_n(0.0, 30 * 18));
         }
         env.extend(rect_envelope(tail, 18));
         let out = decode_with(Engine::Legacy, &env);
