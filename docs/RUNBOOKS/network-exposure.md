@@ -9,11 +9,17 @@ part of that public-facing contract, and carries no authentication either.
 `metrics_bind_addr` and its port** — it is not a separate port, so every
 mitigation below that applies to `[server].metrics_port` covers
 `/healthz` too. See `docs/RUNBOOKS/node-health.md` for its semantics.
+**`GET /status`** (MAN-44, the JSON document `manta status` reads) is
+served by that same listener too, with the same exposure posture. It
+additionally lists every configured RBN uplink target's `host:port` —
+public infrastructure by nature, but enumerable by anyone who can reach
+the port, as `/metrics`'s `manta_uplink_target_*{target}` labels already
+are. See `docs/RUNBOOKS/uplink-health.md`.
 
 The telnet and JSON listeners bind `[server].bind_addr`, which defaults to
 `0.0.0.0`: both ports are reachable from any network that can route to
 the host, as a public cluster node expects. The metrics listener (and
-`/healthz` with it) binds its own `[server].metrics_bind_addr`, which
+`/healthz`/`/status` with it) binds its own `[server].metrics_bind_addr`, which
 defaults to `127.0.0.1` (MAN-132,
 `docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md`): out of the
 box, only this machine can reach it.

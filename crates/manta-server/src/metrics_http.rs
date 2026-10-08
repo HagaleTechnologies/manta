@@ -7,6 +7,7 @@
 use crate::bounded_io::read_line_bounded;
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
+use crate::status_doc::StatusDoc;
 use crate::tasks::{ConnectionLimiter, IpQuota};
 use std::sync::Arc;
 use std::time::Duration;
@@ -185,35 +186,51 @@ pub(crate) struct Response {
     pub body: String,
 }
 
-/// Pure request routing (MAN-128): `GET /metrics ` renders the Prometheus
-/// text body, unchanged from before this ticket. `GET /healthz ` evaluates
-/// `Metrics::health_at(now)` and returns `200`/`ok` or `503`/`unhealthy`
-/// plus the per-check reasons. Everything else 404s, unchanged. Pure and
-/// synchronous (no socket I/O) so it's directly unit-testable.
+/// The path of a `GET` request line, minus any query string (MAN-44):
+/// `"GET /status?x=1 HTTP/1.1\r\n"` -> `Some("/status")`. Any other
+/// method yields `None`. Tolerating a query string matters because some
+/// scrapers append one, and `starts_with("GET /metrics ")` rejected it.
+fn parse_get_path(request_line: &str) -> Option<&str> {
+    let rest = request_line.strip_prefix("GET ")?;
+    let raw_path = rest.split(' ').next()?;
+    Some(raw_path.split('?').next().unwrap_or(raw_path))
+}
+
+/// Pure request routing (MAN-128, MAN-44): `GET /metrics` renders the
+/// Prometheus text body. `GET /healthz` evaluates `Metrics::health_at(now)`
+/// and returns `200`/`ok` or `503`/`unhealthy` plus the per-check reasons.
+/// `GET /status` returns the versioned JSON `status_doc::StatusDoc` that
+/// `manta status` renders. Everything else 404s. Pure and synchronous (no
+/// socket I/O) so it's directly unit-testable.
 pub(crate) fn route(request_line: &str, metrics: &Metrics, now: std::time::Instant) -> Response {
-    if request_line.starts_with("GET /metrics ") {
-        Response {
+    match parse_get_path(request_line) {
+        Some("/metrics") => Response {
             status: "200 OK",
             content_type: "text/plain; version=0.0.4",
             body: metrics.render_prometheus_text(),
+        },
+        Some("/healthz") => {
+            let report = metrics.health_at(now);
+            Response {
+                status: if report.healthy {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                },
+                content_type: "text/plain; charset=utf-8",
+                body: report.render_text(),
+            }
         }
-    } else if request_line.starts_with("GET /healthz ") {
-        let report = metrics.health_at(now);
-        Response {
-            status: if report.healthy {
-                "200 OK"
-            } else {
-                "503 Service Unavailable"
-            },
-            content_type: "text/plain; charset=utf-8",
-            body: report.render_text(),
-        }
-    } else {
-        Response {
+        Some("/status") => Response {
+            status: "200 OK",
+            content_type: "application/json",
+            body: StatusDoc::from_metrics(metrics).to_json(),
+        },
+        _ => Response {
             status: "404 Not Found",
             content_type: "text/plain; version=0.0.4",
             body: String::new(),
-        }
+        },
     }
 }
 
@@ -293,6 +310,35 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_serves_status_json_metrics_text_and_404s_everything_else() {
+        let m = Metrics::new();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            route("GET /status HTTP/1.1", &m, now).content_type,
+            "application/json"
+        );
+        assert_eq!(route("GET /metrics HTTP/1.1", &m, now).status, "200 OK");
+        assert_eq!(
+            route("GET /statuses HTTP/1.1", &m, now).status,
+            "404 Not Found"
+        );
+        assert_eq!(
+            route("POST /status HTTP/1.1", &m, now).status,
+            "404 Not Found"
+        );
+        assert_eq!(route("GET /status?x=1 HTTP/1.1", &m, now).status, "200 OK");
+        assert_eq!(route("GET /metrics?x=1 HTTP/1.1", &m, now).status, "200 OK");
+    }
+
+    #[test]
+    fn status_route_body_parses_as_the_status_doc_json() {
+        let m = Metrics::new();
+        let response = route("GET /status HTTP/1.1", &m, std::time::Instant::now());
+        let doc: StatusDoc = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(doc.schema_version, 1);
+    }
 
     fn healthy_metrics() -> Metrics {
         let m = Metrics::new();

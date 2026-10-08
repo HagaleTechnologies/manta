@@ -17,6 +17,7 @@ pub mod rbn;
 pub mod sett;
 pub mod spot_message;
 pub mod status;
+pub mod status_doc;
 pub mod tasks;
 pub mod telnet;
 pub mod uplink;

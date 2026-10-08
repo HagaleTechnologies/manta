@@ -250,3 +250,37 @@ async fn healthz_reports_decode_stopped_over_tcp() {
     assert!(status.starts_with("HTTP/1.1 503"), "status: {status:?}");
     assert!(body.contains("decode: stopped"), "body: {body}");
 }
+
+/// MAN-44 scenario 1+2 over the real wire: an operator hitting `/status`
+/// sees per-target connection state and sent/suppressed/reconnect counts,
+/// without reading logs.
+#[tokio::test]
+async fn operator_get_status_sees_uplink_connection_state_and_counts() {
+    let metrics = Arc::new(Metrics::new());
+    let target = metrics.register_uplink_target("rbn.example:7000".to_string(), true);
+    target.mark_connected();
+    target.record_sent();
+    target.record_sent();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let metrics2 = metrics.clone();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+    );
+    let ip_quota = manta_server::tasks::IpQuota::new(
+        manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+    );
+    tokio::spawn(async move {
+        manta_server::metrics_http::serve(listener, metrics2, limiter, ip_quota).await;
+    });
+
+    let (status, body) = get(addr, "/status").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "status: {status:?}");
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["uplink"]["targets"][0]["target"], "rbn.example:7000");
+    assert_eq!(doc["uplink"]["targets"][0]["connected"], true);
+    assert_eq!(doc["uplink"]["targets"][0]["health"], "connected");
+    assert_eq!(doc["uplink"]["sent_total"], 2);
+    assert_eq!(doc["uplink"]["health"], "ok");
+}
