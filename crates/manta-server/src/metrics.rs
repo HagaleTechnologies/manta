@@ -9,10 +9,116 @@
 
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
 use manta_spot::SpotType;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Rolling window over which "recent" reconnects are counted (MAN-44).
+/// Matches the ticket's "reconnecting repeatedly over several minutes".
+pub const RECONNECT_WINDOW: Duration = Duration::from_secs(300);
+/// Recent reconnects at or above this count read as a stuck reconnect
+/// loop. `backoff::MAX_BACKOFF` is 60s, so a target that is simply down
+/// produces ~5 reconnects per window -- comfortably over this -- while a
+/// single transient blip (whose backoff then resets to
+/// `backoff::INITIAL_BACKOFF`) does not trip it.
+pub const FLAPPING_RECONNECTS: u32 = 3;
+/// Hard cap on retained reconnect timestamps per target. A target
+/// flapping far faster than the window would otherwise grow this
+/// unbounded; the cumulative reconnect counter stays exact regardless,
+/// only `recent_reconnects` saturates. Same bounded-cardinality
+/// discipline as MAN-62's `OccurrenceTracker` (see `bus.rs`).
+const MAX_TRACKED_RECONNECTS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkHealth {
+    Disabled,
+    Connected,
+    /// Reconnecting repeatedly -- `recent_reconnects >= FLAPPING_RECONNECTS`.
+    Flapping,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverallUplinkHealth {
+    Ok,
+    Degraded,
+    Down,
+    Disabled,
+}
+
+/// Priority order is deliberate (MAN-44 decision 5): `Flapping` outranks
+/// `Connected` because a target reconnecting every 60s is momentarily
+/// connected whenever you happen to look, and reporting that as healthy
+/// is exactly the failure this ticket exists to prevent.
+fn classify_uplink_health(enabled: bool, connected: bool, recent_reconnects: u32) -> UplinkHealth {
+    if !enabled {
+        UplinkHealth::Disabled
+    } else if recent_reconnects >= FLAPPING_RECONNECTS {
+        UplinkHealth::Flapping
+    } else if connected {
+        UplinkHealth::Connected
+    } else {
+        UplinkHealth::Down
+    }
+}
+
+/// Pure function over an already-taken snapshot, so a caller that also
+/// needs per-target rows (`status_doc::StatusDoc::from_metrics`) derives
+/// both from the SAME snapshot at the SAME `now` (MAN-44 code review
+/// CR-1/CR-3).
+pub(crate) fn overall_uplink_health_of(snapshot: &[UplinkTargetSnapshot]) -> OverallUplinkHealth {
+    let enabled: Vec<&UplinkTargetSnapshot> = snapshot.iter().filter(|t| t.enabled).collect();
+    if enabled.is_empty() {
+        return OverallUplinkHealth::Disabled;
+    }
+    let connected = enabled
+        .iter()
+        .filter(|t| t.health == UplinkHealth::Connected)
+        .count();
+    if connected == enabled.len() {
+        OverallUplinkHealth::Ok
+    } else if connected == 0 {
+        OverallUplinkHealth::Down
+    } else {
+        OverallUplinkHealth::Degraded
+    }
+}
+
+fn prune_reconnects(recent: &mut VecDeque<Instant>, now: Instant) {
+    while let Some(front) = recent.front() {
+        // saturating: a synthetic `now` earlier than an entry (possible
+        // only from a test driving `_at` with out-of-order instants) must
+        // not panic.
+        if now.saturating_duration_since(*front) > RECONNECT_WINDOW {
+            recent.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// One target's point-in-time state, as `GET /status` reports it
+/// (MAN-44). Taken by `UplinkTarget::snapshot_at` so a whole registry is
+/// read against one consistent `now`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UplinkTargetSnapshot {
+    #[serde(rename = "target")]
+    pub label: String,
+    pub enabled: bool,
+    pub connected: bool,
+    pub sent: u64,
+    pub suppressed: u64,
+    pub lagged: u64,
+    pub write_failed: u64,
+    pub disconnected: u64,
+    pub reconnects: u64,
+    pub recent_reconnects: u32,
+    pub health: UplinkHealth,
+}
 
 /// Spots abandoned when a client connection terminates on a failed write,
 /// or (via `Metrics::record_dropped_shutdown`) on a clean shutdown with no
@@ -147,6 +253,9 @@ pub struct UplinkTarget {
     write_failed: AtomicU64,
     disconnected: AtomicU64,
     reconnects: AtomicU64,
+    /// Reconnect instants inside `RECONNECT_WINDOW` (MAN-44), bounded by
+    /// `MAX_TRACKED_RECONNECTS`.
+    recent: Mutex<VecDeque<Instant>>,
 }
 
 impl UplinkTarget {
@@ -161,6 +270,7 @@ impl UplinkTarget {
             write_failed: AtomicU64::new(0),
             disconnected: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -193,7 +303,58 @@ impl UplinkTarget {
     }
 
     pub fn record_reconnect(&self) {
+        self.record_reconnect_at(Instant::now());
+    }
+
+    /// `_at` variant so the MAN-44 reconnect window is testable without
+    /// sleeping; `record_reconnect` above is the only production caller.
+    pub fn record_reconnect_at(&self, now: Instant) {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
+        let mut recent = self
+            .recent
+            .lock()
+            .expect("uplink recent-reconnects lock poisoned");
+        prune_reconnects(&mut recent, now);
+        if recent.len() == MAX_TRACKED_RECONNECTS {
+            recent.pop_front();
+        }
+        recent.push_back(now);
+    }
+
+    #[cfg(test)]
+    fn recent_len(&self) -> usize {
+        self.recent
+            .lock()
+            .expect("uplink recent-reconnects lock poisoned")
+            .len()
+    }
+
+    /// Reconnects inside the trailing `RECONNECT_WINDOW` as of `now`.
+    pub fn recent_reconnects_at(&self, now: Instant) -> u32 {
+        let mut recent = self
+            .recent
+            .lock()
+            .expect("uplink recent-reconnects lock poisoned");
+        prune_reconnects(&mut recent, now);
+        recent.len() as u32
+    }
+
+    pub fn snapshot_at(&self, now: Instant) -> UplinkTargetSnapshot {
+        let recent_reconnects = self.recent_reconnects_at(now);
+        let connected = self.connected();
+        UplinkTargetSnapshot {
+            label: self.label.clone(),
+            enabled: self.enabled,
+            connected,
+            sent: self.sent_total(),
+            suppressed: self.suppressed_total(),
+            lagged: self.lagged_total(),
+            write_failed: self.write_failed_total(),
+            disconnected: self.disconnected_total(),
+            reconnects: self.reconnects_total(),
+            recent_reconnects,
+            health: classify_uplink_health(self.enabled, connected, recent_reconnects),
+        }
     }
 
     /// Call exactly once per connect transition -- unlike the pre-MAN-128
@@ -600,6 +761,33 @@ impl Metrics {
             .iter()
             .filter(|t| t.connected())
             .count() as i64
+    }
+
+    /// MAN-44: every registered target's state against one `now`, in
+    /// config order (disabled targets included).
+    pub fn uplink_snapshot_at(&self, now: Instant) -> Vec<UplinkTargetSnapshot> {
+        self.uplink_targets_snapshot()
+            .iter()
+            .map(|t| t.snapshot_at(now))
+            .collect()
+    }
+
+    pub fn uplink_snapshot(&self) -> Vec<UplinkTargetSnapshot> {
+        self.uplink_snapshot_at(Instant::now())
+    }
+
+    /// `Ok` only when every ENABLED target's own health classifies as
+    /// `Connected` (MAN-44 decision 5) -- a flapping target counts the
+    /// same as a down one. `Disabled` when no target is enabled
+    /// (including zero configured targets).
+    pub fn uplink_overall_health(&self) -> OverallUplinkHealth {
+        overall_uplink_health_of(&self.uplink_snapshot())
+    }
+
+    /// Time since this `Metrics` (and so the daemon's spot server)
+    /// started -- the same monotonic origin as `manta_uptime_seconds`.
+    pub fn uptime(&self) -> Duration {
+        self.started.instant.elapsed()
     }
 
     // MAN-128: build-info, uptime, listener/decode health.
@@ -1044,6 +1232,21 @@ impl Metrics {
                 "manta_uplink_target_reconnects_total{{target=\"{}\"}} {}\n",
                 escape_label_value(t.label()),
                 t.reconnects_total()
+            ));
+        }
+
+        // MAN-44: the flapping-window gauge `GET /status` classifies on.
+        let now = Instant::now();
+        out.push_str(&format!(
+            "# HELP manta_uplink_target_recent_reconnects Reconnects for this RBN uplink target within the last {}s (MAN-44 flapping window).\n",
+            RECONNECT_WINDOW.as_secs()
+        ));
+        out.push_str("# TYPE manta_uplink_target_recent_reconnects gauge\n");
+        for t in targets.iter() {
+            out.push_str(&format!(
+                "manta_uplink_target_recent_reconnects{{target=\"{}\"}} {}\n",
+                escape_label_value(t.label()),
+                t.recent_reconnects_at(now)
             ));
         }
         drop(targets);
@@ -1936,5 +2139,113 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_healthy 0"));
         assert!(text.contains(r#"manta_listener_up{listener="json"} 0"#));
+    }
+
+    // MAN-44: reconnect window + health classification.
+
+    #[test]
+    fn reconnects_outside_the_window_do_not_count_as_recent() {
+        let m = Metrics::new();
+        let t = m.register_uplink_target("a.example:7000".into(), true);
+        let t0 = Instant::now();
+
+        t.record_reconnect_at(t0);
+        t.record_reconnect_at(t0 + Duration::from_secs(10));
+        assert_eq!(
+            t.snapshot_at(t0 + Duration::from_secs(20))
+                .recent_reconnects,
+            2
+        );
+        // Cumulative never decays; the window does.
+        let later = t0 + Duration::from_secs(10) + RECONNECT_WINDOW + Duration::from_secs(1);
+        assert_eq!(t.snapshot_at(later).recent_reconnects, 0);
+        assert_eq!(t.snapshot_at(later).reconnects, 2);
+    }
+
+    #[test]
+    fn recent_reconnect_ring_is_bounded_under_sustained_flapping() {
+        let m = Metrics::new();
+        let t = m.register_uplink_target("a.example:7000".into(), true);
+        let t0 = Instant::now();
+        for i in 0..10_000u64 {
+            t.record_reconnect_at(t0 + Duration::from_millis(i));
+        }
+        assert!(t.recent_len() <= MAX_TRACKED_RECONNECTS);
+        assert_eq!(
+            t.snapshot_at(t0 + Duration::from_secs(1)).reconnects,
+            10_000
+        );
+    }
+
+    #[test]
+    fn health_classifies_disabled_flapping_connected_and_down_in_that_priority() {
+        assert_eq!(
+            classify_uplink_health(false, true, 0),
+            UplinkHealth::Disabled
+        );
+        // Flapping outranks connected: reconnecting every 60s while
+        // momentarily up is not healthy.
+        assert_eq!(
+            classify_uplink_health(true, true, FLAPPING_RECONNECTS),
+            UplinkHealth::Flapping
+        );
+        assert_eq!(
+            classify_uplink_health(true, false, FLAPPING_RECONNECTS),
+            UplinkHealth::Flapping
+        );
+        assert_eq!(
+            classify_uplink_health(true, true, FLAPPING_RECONNECTS - 1),
+            UplinkHealth::Connected
+        );
+        assert_eq!(classify_uplink_health(true, false, 0), UplinkHealth::Down);
+    }
+
+    #[test]
+    fn overall_uplink_health_is_ok_only_when_every_enabled_target_is_connected() {
+        let m = Metrics::new();
+        let a = m.register_uplink_target("a.example:7000".into(), true);
+        let b = m.register_uplink_target("b.example:7000".into(), true);
+        let _disabled = m.register_uplink_target("c.example:7000".into(), false);
+        a.mark_connected();
+        assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Degraded);
+        b.mark_connected();
+        assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Ok);
+    }
+
+    #[test]
+    fn overall_uplink_health_is_disabled_when_no_targets_are_enabled() {
+        let m = Metrics::new();
+        assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Disabled);
+        let _disabled = m.register_uplink_target("a.example:7000".into(), false);
+        assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Disabled);
+    }
+
+    #[test]
+    fn overall_uplink_health_is_down_when_every_enabled_target_is_down() {
+        let m = Metrics::new();
+        let _a = m.register_uplink_target("a.example:7000".into(), true);
+        assert_eq!(m.uplink_overall_health(), OverallUplinkHealth::Down);
+    }
+
+    #[test]
+    fn a_registered_but_never_connected_target_still_appears_in_snapshots() {
+        let m = Metrics::new();
+        let _ = m.register_uplink_target("never.example:7000".into(), true);
+        let snap = m.uplink_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].label, "never.example:7000");
+        assert_eq!(snap[0].health, UplinkHealth::Down);
+    }
+
+    #[test]
+    fn renders_the_recent_reconnects_gauge_per_target() {
+        let m = Metrics::new();
+        let t = m.register_uplink_target("a.example:7000".into(), true);
+        t.record_reconnect();
+        t.record_reconnect();
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_uplink_target_recent_reconnects{target="a.example:7000"} 2"#)
+        );
     }
 }

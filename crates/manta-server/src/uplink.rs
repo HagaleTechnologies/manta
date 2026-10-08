@@ -163,8 +163,19 @@ pub async fn serve(
                 // it failed before login completed) -- this target's own
                 // `connected` flag is otherwise untouched by this branch.
                 target.record_reconnect();
-                let sleep_for = backoff;
-                backoff = next_backoff(backoff, &outcome);
+                // `Disconnected` resets AND sleeps the reset value
+                // immediately (MAN-44 code review CR-2): sleeping the
+                // stale `backoff` first meant a healthy connection that
+                // dropped after login still waited whatever an earlier,
+                // unrelated outage had grown it to (up to `MAX_BACKOFF`)
+                // before its first fast retry. `NeverConnected` keeps the
+                // original ordering -- sleep the current rung, then grow
+                // it -- so the never-connected ladder stays 1s/2s/4s/...
+                let sleep_for = match outcome {
+                    ConnectAttemptError::Disconnected => INITIAL_BACKOFF,
+                    ConnectAttemptError::NeverConnected => backoff,
+                };
+                backoff = next_backoff(sleep_for, &outcome);
                 tokio::select! {
                     _ = tokio::time::sleep(sleep_for) => {}
                     _ = shutdown.changed() => {

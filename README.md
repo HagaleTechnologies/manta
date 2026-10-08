@@ -237,6 +237,13 @@ nc localhost 7301              # one JSON object per spot
 curl -s localhost:7302/metrics # Prometheus text
 ```
 
+Check a running daemon's health at a glance (spot counts, RBN uplink
+connection and reconnect state per target) instead of reading its logs:
+
+```sh
+manta status --config server.toml
+```
+
 Forwarding to an upstream RBN-style collector is a `[[rbn_uplink]]`
 block. `dry_run` defaults to `true`, so an uplink connects and logs in but
 transmits nothing until you set it to `false` deliberately.

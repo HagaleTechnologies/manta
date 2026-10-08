@@ -522,9 +522,26 @@ validation (MAN-28). Dedupe (step 5) still applies.
   indefinitely. Still aspirational: `manta-input`'s and
   `manta-engine`'s own internals carry no logging of their own yet
   (decode-pipeline internals, not the network-facing surface MAN-59
-  scoped to, nor the daemon-lifecycle surface MAN-122 scoped to), and
-  `manta --status` hitting a local control socket for live stats is
-  similarly not yet implemented (MAN-44). Prometheus text
+  scoped to, nor the daemon-lifecycle surface MAN-122 scoped to).
+  **`manta status` implemented** (MAN-44,
+  `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`): reads a
+  JSON `StatusDoc` (`crates/manta-server/src/status_doc.rs`) served on
+  `GET /status` by the same metrics listener that serves `GET /metrics`
+  and `GET /healthz` — deliberately NOT the local-control-socket design
+  this section previously sketched; the ADR records why a Unix-only
+  control socket was evaluated and not taken. Reports daemon uptime,
+  spot/client counts, and — the ticket's actual scope — **per-target RBN
+  uplink health**: each configured `[[rbn_uplink]]` target's own
+  connected/sent/suppressed/reconnect counts (MAN-128's per-target
+  registry) plus a derived `connected`/`flapping`/`down`/`disabled`
+  verdict from a windowed reconnect rate
+  (`RECONNECT_WINDOW`/`FLAPPING_RECONNECTS` in `metrics.rs`), so a stuck
+  reconnect loop reads as unhealthy even while technically connected at
+  the instant it's checked. Exit code doubles as a cron/Nagios check.
+  Unlike `/healthz`, which deliberately ignores the uplink (MAN-128 D10),
+  `/status` is about the uplink. Inherits `/metrics`'s unauthenticated,
+  `0.0.0.0`-by-default exposure posture
+  (`docs/RUNBOOKS/network-exposure.md`). Prometheus text
   endpoint (compiled in unconditionally, no feature flag — the "(feature
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
@@ -561,7 +578,8 @@ validation (MAN-28). Dedupe (step 5) still applies.
   entity has no row in the vendored `dxcc.tsv`, *or* it carries a `/MM`
   or `/AM` designator that places it outside any DXCC entity),
   `manta_active_tracks` (MAN-45/MAN-122, below), per-protocol
-  client-connected gauges, `manta_source_health`, the uplink counters, and
+  client-connected gauges, `manta_source_health`, the uplink counters,
+  (MAN-44) `manta_uplink_target_recent_reconnects{target}`, and
   (MAN-56, landed 2026-09-04) `manta_input_dropped_packets_total`/
   `manta_input_gaps_detected_total`/`manta_input_malformed_packets_total`
   (`crates/manta-server/src/metrics.rs`). **MAN-128 (landed 2026-10-05)
