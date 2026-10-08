@@ -687,8 +687,8 @@ class ReportTests(unittest.TestCase):
 
     def test_zero_spot_utc_day_fails_d_c(self):
         per_day = int(DAY / IV)
-        # deltas are attributed to the UTC day of the later sample: samples
-        # 00:00..23:50 on 2026-01-04 carry no new spots
+        # samples 00:00..23:50 on 2026-01-04 carry no new spots; the 01-05
+        # 00:00 sample's interval crosses midnight, so it credits neither day
         ov = {i: {"spots_inc": 0} for i in range(3 * per_day, 4 * per_day)}
         recs = make_ledger(overrides=ov)
         s = summ(recs)
@@ -697,6 +697,50 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(c["zero_spot_days"], ["2026-01-04"])
         r = self.report(recs)
         self.assertIn("FAIL (D-C)", r.stdout)
+
+    def test_cross_midnight_spot_delta_not_credited_to_later_day(self):
+        # samples at hh:m0:30. 2026-01-04's only spot is at 23:59:30, seen by
+        # the 00:00:30 sample on 2026-01-05, which emits nothing itself.
+        per_day = int(DAY / IV)
+        ov = {i: {"spots_inc": 0} for i in range(3 * per_day, 5 * per_day + 1)}
+        ov[4 * per_day] = {"spots_inc": 1}
+        recs = make_ledger(start=T0 + 30, overrides=ov)
+        spots_dir = os.path.join(self.tmp.name, "spots")
+        os.makedirs(spots_dir)
+        with open(os.path.join(spots_dir, "spots-2026-01-04.jsonl"), "wb") as f:
+            f.write(spot_line("W1AW", int(T0 + 4 * DAY - 30)) + b"\n")
+        s = summ(recs, recorded_by_day=fn.load_recorded_spots(spots_dir))
+        self.assertEqual(crit(s, "D-C")["zero_spot_days"], ["2026-01-05"])
+        self.assertEqual([r["spots_emitted"] for r in s["daily"] if r["day"] == "2026-01-05"], [0])
+        # 30 intervals cross a midnight; the ones into 01-04 and 01-06 emit nothing
+        self.assertEqual(s["spots_unplaced_total"], 28)
+        self.assertEqual(s["spots_emitted_total"], 30 * per_day - 2 * per_day)
+        # without the archive the counters cannot place it: neither day is proven
+        s = summ(recs)
+        self.assertEqual(crit(s, "D-C")["zero_spot_days"], ["2026-01-04", "2026-01-05"])
+        self.assertTrue(any("--spots-dir places them" in w for w in s["warnings"]))
+        r = self.report(recs, "--spots-dir", spots_dir)
+        self.assertIn("zero-spot days: 2026-01-05)", r.stdout)
+        self.assertIn("28 in sample intervals that cross UTC midnight", r.stdout)
+
+    def test_spot_emitted_after_its_midnight_counts_for_its_day(self):
+        # the 23:59:30 spot on 2026-01-04 is emitted (counted) only after
+        # the 00:00:30 sample, so the counters put it inside 2026-01-05
+        per_day = int(DAY / IV)
+        ov = {i: {"spots_inc": 0} for i in range(3 * per_day, 4 * per_day + 1)}
+        recs = make_ledger(start=T0 + 30, overrides=ov)
+        self.assertEqual(crit(summ(recs), "D-C")["zero_spot_days"], ["2026-01-04"])
+        s = summ(recs, recorded_by_day={"2026-01-04": 1})
+        self.assertTrue(crit(s, "D-C")["pass"])
+
+    def test_restart_after_midnight_credits_its_day(self):
+        # restart at 00:00:05 on 2026-01-05; its 1 spot is that day's only one
+        per_day = int(DAY / IV)
+        ov = {i: {"spots_inc": 0} for i in range(4 * per_day + 1, 5 * per_day + 1)}
+        ov[4 * per_day] = {"start_time": T0 + 4 * DAY + 5, "spots_inc": 1}
+        s = summ(make_ledger(start=T0 + 30, overrides=ov))
+        self.assertEqual([r["spots_emitted"] for r in s["daily"] if r["day"] == "2026-01-05"], [1])
+        self.assertTrue(crit(s, "D-C")["pass"])
 
     def test_spot_deltas_survive_restart(self):
         ov = {}

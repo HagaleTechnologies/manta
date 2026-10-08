@@ -906,9 +906,16 @@ def summarize(records, params=None):
     outages_total = 0.0
     outage_down_total = 0.0
     outages_by_source = {}
+    # A pair's spots fell somewhere in (a.ts, b.ts], or (b.start_time, b.ts]
+    # after a restart. Only a pair inside one UTC day credits that day; one
+    # that crosses midnight cannot say which side they fell on, so they are
+    # "unplaced" (D-C below).
+    spots_unplaced = 0
     for a, b in pairs:
-        d = day_entry(_utc_day(b["ts"]))
         same = a["start_time"] == b["start_time"]
+        since = a["ts"] if same else min(max(a["ts"], b["start_time"]), b["ts"])
+        in_day = _utc_day(since) == _utc_day(b["ts"])
+        d = day_entry(_utc_day(b["ts"])) if in_day else None
         if not same:
             lo, hi = a["ts"] - RESTART_ATTRIBUTION_LOOKBACK_S, b["ts"]
             if any(n.get("note") == "planned" and lo < n["ts"] <= hi for n in notes):
@@ -925,10 +932,13 @@ def summarize(records, params=None):
                 delta = bs - as_ if bs >= as_ else bs
             else:
                 delta = bs
-            d["spots_emitted"] += int(delta)
+            if in_day:
+                d["spots_emitted"] += int(delta)
+            else:
+                spots_unplaced += int(delta)
         bsum, bcnt = b.get("decode_latency_sum"), b.get("decode_latency_count")
         asum, acnt = a.get("decode_latency_sum"), a.get("decode_latency_count")
-        if same and None not in (bsum, bcnt, asum, acnt) and bcnt > acnt:
+        if in_day and same and None not in (bsum, bcnt, asum, acnt) and bcnt > acnt:
             d["lat_sum"] += bsum - asum
             d["lat_count"] += bcnt - acnt
         if same:
@@ -969,8 +979,15 @@ def summarize(records, params=None):
             "median_rss_kb": rss[len(rss) // 2] if rss else None,
         }
         daily.append(row)
-    zero_days = [r["day"] for r in daily if r["full_day"] and r["spots_emitted"] < 1]
-    spots_emitted_total = sum(r["spots_emitted"] for r in daily)
+    # The archive's exact timestamps also prove a day spotted: they place
+    # unplaced spots, and spots emitted after their timestamp's midnight.
+    zero_days = [r["day"] for r in daily if r["full_day"] and r["spots_emitted"] < 1
+                 and (r["spots_recorded"] or 0) < 1]
+    spots_emitted_total = sum(r["spots_emitted"] for r in daily) + spots_unplaced
+    if zero_days and spots_unplaced and recorded is None:
+        warnings.append(
+            "D-C: %d spots fell in sample intervals that cross UTC midnight and count for no "
+            "day; --spots-dir places them by timestamp" % spots_unplaced)
 
     # aggregator (D-B)
     reachable_win = [s for s in win_samples if s.get("reachable")]
@@ -1048,6 +1065,7 @@ def summarize(records, params=None):
                            "by_source": outages_by_source},
         "daily": daily,
         "spots_emitted_total": spots_emitted_total,
+        "spots_unplaced_total": spots_unplaced,
         "spots_recorded_total": recorded_total,
         "recorded_coverage": coverage,
         "builds": builds,
@@ -1150,7 +1168,8 @@ def render_markdown(s):
             "-" if r["mean_decode_latency_s"] is None else "%.4f" % r["mean_decode_latency_s"],
             "-" if r["median_rss_kb"] is None else r["median_rss_kb"]))
     w("")
-    w("Spots emitted: %d" % s["spots_emitted_total"])
+    w("Spots emitted: %d (%d in sample intervals that cross UTC midnight, credited to no day)"
+      % (s["spots_emitted_total"], s["spots_unplaced_total"]))
     if s["spots_recorded_total"] is not None:
         cov = s["recorded_coverage"]
         w("Spots recorded: %d (coverage %s)" % (s["spots_recorded_total"], "-" if cov is None else _pct(cov)))

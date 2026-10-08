@@ -79,6 +79,12 @@ the MAN-96 research document's section N.
 - **`scripts/field-node.py`** (stdlib, Python ≥ 3.9): `sample` (one ledger record per minute and
   the D-G watchdog), `note` (D-D/D-E), `record-spots` (the node's own spot archive from the JSON
   Lines port) and `report` (the scenario-1 verdict, D-A…D-F; exit 0 PASS, 1 FAIL or in progress).
+  For D-C, a `manta_spots_total` rise between two samples on different UTC days (after a
+  restart, between the restart and the later sample) is credited to neither day. A full day passes
+  D-C when a rise falls inside it, or when the spot archive (`--spots-dir`, which the runbook
+  always passes) recorded a spot timestamped that day. That also covers a spot emitted just after
+  the midnight following its timestamp. Without the archive, a day whose only spots fall in such
+  a crossing interval fails D-C, and the report warns.
 - **`scripts/shadow-compare.py`**: the scenario-2 comparison per D-H, and the uncorroborated
   share the D-I go/no-go reads. It has no pass/fail of its own: the ticket asks for the
   comparison to be recorded.
