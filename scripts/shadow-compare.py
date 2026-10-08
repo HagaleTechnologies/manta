@@ -191,7 +191,11 @@ def expand_paths(paths, dir_glob_suffixes, dir_prefix=""):
 
 
 def load_node_spots(paths):
-    """SpotMessage JSONL -> (spots, file_infos, malformed_count)."""
+    """SpotMessage JSONL -> (spots, file_infos, malformed_count).
+
+    Only a file's final line with no newline (a write torn by a kill) may be
+    malformed. Any other malformed record would silently leave the
+    uncorroborated share D-I reads, so it is an input error."""
     spots, infos, malformed = [], [], 0
     for path in expand_paths(paths, (".jsonl",), dir_prefix="spots-"):
         rows = 0
@@ -200,10 +204,13 @@ def load_node_spots(paths):
         except OSError as e:
             raise InputError("cannot read %s: %s" % (path, e))
         with f:
-            for line in f:
-                line = line.strip()
+            torn = None
+            for raw in f:
+                line = raw.strip()
                 if not line:
                     continue
+                if torn is not None:
+                    raise InputError("%s line %d: malformed node spot record" % (path, torn))
                 rows += 1
                 try:
                     d = json.loads(line)
@@ -213,7 +220,10 @@ def load_node_spots(paths):
                     de = str(d.get("deCall") or "").upper()
                     when = datetime.fromtimestamp(ts, tz=timezone.utc)
                 except (ValueError, KeyError, TypeError, OverflowError, OSError):
-                    malformed += 1
+                    if raw.endswith("\n"):
+                        raise InputError("%s line %d: malformed node spot record" % (path, rows))
+                    malformed += 1  # torn final line; an error if another line follows
+                    torn = rows
                     continue
                 snr = _num(d.get("snr"))
                 ref = _num(d.get("snrRefHz")) or DEFAULT_SNR_REF_HZ

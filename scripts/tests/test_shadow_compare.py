@@ -304,9 +304,19 @@ class ShadowCompareTest(unittest.TestCase):
         bad = json.loads(node_line("2026-09-09 12:00:00", 14025.0, "W1AW"))
         bad["timestamp"] = 1e20
         write_lines(npath, [json.dumps(bad), node_line("2026-09-09 12:00:00", 14025.0, "W1AW")])
+        code, _, err, _ = self.run_tool(node=[npath])
+        self.assertEqual(code, 2)
+        self.assertIn("bad-ts.jsonl line 1: malformed node spot record", err)
+
+    def test_torn_final_node_line_is_tolerated(self):
+        npath = os.path.join(self.d, "torn.jsonl")
+        with open(npath, "w", encoding="utf-8") as f:
+            f.write(node_line("2026-09-09 12:00:00", 14025.0, "W1AW") + "\n")
+            f.write('{"timestamp": 17')
         code, md, _, s = self.run_tool(node=[npath])
         self.assertEqual(code, 0)
         self.assertEqual(s["agreement"]["node_spots"], 1)
+        self.assertEqual(s["inputs"]["node_malformed_lines"], 1)
 
     def test_empty_window_reports_zero_without_dividing_by_zero(self):
         code, md, _, s = self.run_tool(window=["--start", "2020-01-01T00:00:00Z",
