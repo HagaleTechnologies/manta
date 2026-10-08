@@ -1058,10 +1058,11 @@ without it they read `MANTA_CONFIG`. An environment value is parsed as a
 TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
 back to a bare string -- except for the string-typed keys, which are
 always taken verbatim: `server.station_callsign`, `server.bind_addr`,
-`server.operator_name`, `server.operator_qth`, `server.operator_grid`,
-`input.type`, `input.device`, `input.path`, `input.host`,
-`input.password`, `input.driver`, `spot.blocklist_path`,
-`spot.notch_path` and `decode.engine`. Relative paths from the file
+`server.metrics_bind_addr`, `server.operator_name`,
+`server.operator_qth`, `server.operator_grid`, `input.type`,
+`input.device`, `input.path`, `input.host`, `input.password`,
+`input.driver`, `spot.blocklist_path`, `spot.notch_path` and
+`decode.engine`. Relative paths from the file
 resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
 cannot be set from the environment.

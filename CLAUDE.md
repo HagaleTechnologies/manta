@@ -43,6 +43,10 @@ MAN-261: one TOML file (`[server]`/`[[rbn_uplink]]`/`[input]`/`[spot]`/
 MAN-76: `manta config check` validates a config (run's pre-I/O pipeline, no
 source or listener) and `manta config init` writes a commented every-key
 scaffold — see docs/DECISIONS/2026-10-07-man76-config-check-init.md.
+MAN-132: the metrics listener (`/metrics`, `/healthz`) binds
+`[server].metrics_bind_addr`, default `127.0.0.1`, while telnet/JSON keep
+`bind_addr` (`0.0.0.0`) — see
+docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md.
 
 ## Documents (read in this order)
 

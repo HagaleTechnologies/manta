@@ -13,7 +13,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-/// Publicly bound (ARCHITECTURE §7), so both bounds below matter: an
+/// Publicly reachable whenever an operator widens `metrics_bind_addr`
+/// (MAN-132; loopback by default), so both bounds below matter: an
 /// unauthenticated client must not be able to hold this connection's task
 /// open by trickling headers, one every few seconds, forever.
 const MAX_HEADER_LINES: usize = 100;

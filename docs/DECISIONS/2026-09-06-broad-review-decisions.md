@@ -209,6 +209,9 @@ ARCHITECTURE.md's exposure-policy note, and the network-exposure runbook's mitig
 need updating to reflect the new default and the fact that telnet/JSON's public-by-default posture
 is unchanged and still deliberate.
 
+**Implemented by MAN-132 (2026-10-08)** — `[server].metrics_bind_addr`, default `127.0.0.1`,
+independent of `bind_addr`; see `docs/DECISIONS/2026-10-08-man132-metrics-loopback-bind.md`.
+
 ### D15 — README "Why" framing: soften now
 
 Soften the "closed-source, single point of failure... maintained by a single author" framing (MAN-146)

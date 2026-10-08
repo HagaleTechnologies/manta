@@ -60,6 +60,7 @@ const ENV_IGNORED: &[&str] = &["MANTA_GIT_SHA"];
 const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "station_callsign"),
     ("server", "bind_addr"),
+    ("server", "metrics_bind_addr"),
     ("server", "operator_name"),
     ("server", "operator_qth"),
     ("server", "operator_grid"),
@@ -1054,6 +1055,21 @@ mod tests {
                 iq: true,
             })
         );
+    }
+
+    #[test]
+    fn metrics_bind_addr_from_the_environment_is_a_string() {
+        // "1234" would TOML-probe to an integer and fail serde if the key
+        // were not string-typed.
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_SERVER_STATION_CALLSIGN", "W1AW"),
+                ("MANTA_SERVER_METRICS_BIND_ADDR", "1234"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(loaded.server.unwrap().metrics_bind_addr, "1234");
     }
 
     #[test]

@@ -2384,12 +2384,36 @@ fn start_spot_server(
 
     let rt = tokio::runtime::Runtime::new()?;
     let status_line = rt.block_on(async {
+        // MAN-132: metrics binds its own `metrics_bind_addr` (loopback by
+        // default), never `bind_addr`. With two configurable addresses
+        // "which listener failed?" is a real question, so each bind names
+        // its listener, address key and port.
         let telnet_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port)).await?;
-        let json_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port)).await?;
+            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.telnet_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "binding the telnet server (bind_addr = {:?}, telnet_port = {})",
+                        cfg.bind_addr, cfg.telnet_port
+                    )
+                })?;
+        let json_listener = tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.json_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "binding the JSON server (bind_addr = {:?}, json_port = {})",
+                    cfg.bind_addr, cfg.json_port
+                )
+            })?;
         let metrics_listener =
-            tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), cfg.metrics_port)).await?;
+            tokio::net::TcpListener::bind((cfg.metrics_bind_addr.as_str(), cfg.metrics_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "binding the metrics server (metrics_bind_addr = {:?}, metrics_port = {})",
+                        cfg.metrics_bind_addr, cfg.metrics_port
+                    )
+                })?;
 
         // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
         // failure never produces a banner at all) but BEFORE any listener task is
