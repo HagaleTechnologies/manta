@@ -453,9 +453,11 @@ wpm  residual_ch   reported      err
 
 Worst-case error across the whole grid: -0.391 WPM (20 WPM, near-edge),
 comfortably inside the +/-2 WPM tolerance at every cell — the offset
-dependence the ticket names is gone. This is the same grid
-`crates/manta-engine/tests/wpm_across_channel.rs` gates (3 speeds x 4
-offsets, asserting `<= 2.0` at each cell).
+dependence the ticket names is gone. `crates/manta-engine/tests/wpm_across_channel.rs`
+gates the same 4 offsets at 20/25/35/40 WPM, asserting `<= 2.0` WPM error
+and CER `<= 0.10` at each cell (the 40 WPM row and the CER ceiling were
+added in this ticket's validation round; the 12 WPM row above is
+measured here but not gated).
 
 ### Mechanism, isolated (`Demod` fed a synthetic symmetric raised-cosine
 envelope, no noise, no channelizer — this session)
@@ -490,6 +492,12 @@ quantization of a continuous 50%-crossing point, not from the SNR/offset
 mechanism this fix targets. `crates/manta-decode/src/envelope.rs`'s
 `keying_edge_placement_is_unbiased_across_depth_and_ramp` unit test pins this
 (tolerance +/-1 hop) as a permanent regression gate.
+
+**Correction (MAN-213).** That tolerance no longer holds for the 12-hop
+ramp. MAN-213's rail-update split lets transition samples pull `E_hi`
+slightly low, so the 12-hop case now measures +2 to +3 hops, and the test
+bounds it at `0..=3` hops; ramps of 2 and 6 hops keep the +/-1 hop bound
+(`docs/DECISIONS/2026-10-05-man213-fade-tracking-keying-rails.md` B3).
 
 ### Golden-vector suite, full run (this session, `--include-ignored`)
 

@@ -285,7 +285,7 @@ impl SpeedTracker {
         self.pair.boundary()
     }
 
-    /// EMA-smoothed PARIS WPM (SPEC §4.1: 1200/mu_dit, alpha 0.1). None until ready.
+    /// EMA-smoothed PARIS WPM (SPEC §4.1a: 1200/dit_estimate_ms, alpha 0.1). None until ready.
     pub fn wpm(&self) -> Option<f32> {
         self.wpm_ema
     }
