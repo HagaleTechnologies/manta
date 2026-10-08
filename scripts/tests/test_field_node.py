@@ -668,6 +668,16 @@ class ReportTests(unittest.TestCase):
         self.assertAlmostEqual(s["down_s"], IV - 10)
         self.assertAlmostEqual(s["availability"], 1 - (IV - 10) / (30 * DAY), places=9)
 
+    def test_missing_required_metric_fails_the_run(self):
+        # an otherwise clean run whose ledger lacked start_time in one sample
+        recs = make_ledger(overrides={500: {"missing": ["manta_start_time_seconds"]}})
+        s = summ(recs)
+        self.assertFalse(s["integrity"]["pass"])
+        self.assertEqual(s["verdict"], "FAIL")
+        r = self.report(recs)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("FAIL (integrity)", r.stdout)
+
     def test_watchdog_recovery_listed_as_automated(self):
         ov = {i: {"reachable": False} for i in range(300, 312)}
         for i in range(312, 4321):

@@ -1047,7 +1047,12 @@ def summarize(records, params=None):
     ]
     in_progress = span_days < float(p["min_days"])
     progress = "IN PROGRESS: %.1f/%s days" % (span_days, _fmt_num(float(p["min_days"])))
-    if not all(c["pass"] for c in criteria):
+    # A reachable sample missing a required family means the ledger was
+    # blind to what that family detects (a restart without start_time, an
+    # outage without the outage counters), so no verdict can rest on it:
+    # an integrity failure fails the run, like unobserved time (D-F).
+    integrity_ok = not missing_counts
+    if not all(c["pass"] for c in criteria) or not integrity_ok:
         verdict = "FAIL"
     elif in_progress:
         verdict = "IN PROGRESS"
@@ -1088,7 +1093,8 @@ def summarize(records, params=None):
         "integrity": {"unparseable_lines": int(p["unparseable_lines"]),
                       "samples": len(win_samples),
                       "reachable_samples": len(reachable_win),
-                      "missing_metrics": missing_counts},
+                      "missing_metrics": missing_counts,
+                      "pass": integrity_ok},
         "warnings": warnings,
     }
 
@@ -1123,6 +1129,8 @@ def render_markdown(s):
             w("- %s: %d: %s" % (c["name"], c["value"], label))
     span_label = s["progress"] if s["in_progress"] else "PASS (span)"
     w("- Span: %.1f/%s days: %s" % (s["window"]["span_days"], _fmt_num(s["params"]["min_days"]), span_label))
+    if not s["integrity"]["pass"]:
+        w("- Ledger integrity: required metrics missing (see Ledger integrity): FAIL (integrity)")
     w("")
     w("## Window")
     w("")
