@@ -38,6 +38,13 @@ container's loopback, so it needs the metrics listener widened: set
 the port with a NetworkPolicy. The runtime image has no `curl` for an
 `exec` probe.
 
+Each probe counts against the metrics listener's per-IP request budget
+(`[server].metrics_max_requests_per_ip`, 60 per 60 s per source address by
+default, MAN-64), shared with any scraper or other client on the same
+address. An over-budget probe gets `429 Too Many Requests`, which the
+kubelet counts as a failure; raise the key if probes and scrapers share an
+address at a combined rate above it. See `docs/RUNBOOKS/network-exposure.md`.
+
 ```yaml
 livenessProbe:
   # needs [server] metrics_bind_addr = "0.0.0.0": the kubelet probes the pod IP, not loopback

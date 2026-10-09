@@ -411,6 +411,23 @@ struct SourceOutages {
     down_since: Option<Instant>,
 }
 
+/// MAN-64 round 7 (V-2): a source's health value, plus whether that value
+/// is final. Added when a MAN-55 liveness watcher task could race the
+/// fatal-exit write in `record_terminal_source_health`
+/// (`manta-cli/src/main.rs`) and flip the gauge back to healthy after it.
+/// MAN-73 has since removed that task: apart from file replay's one-time
+/// startup write, every regular write now comes from `ReconnectingSource`'s
+/// health sink, called synchronously inside a `read()` on the decode
+/// thread. `listen` has returned (and dropped the source) before the
+/// fatal-exit write runs, so no current writer can land after it. The
+/// marker stays so the fatal write remains final against any later
+/// asynchronous writer: see `set_source_health_terminal`.
+#[derive(Clone, Copy)]
+struct SourceHealthEntry {
+    healthy: bool,
+    terminal: bool,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -476,7 +493,7 @@ pub struct Metrics {
     /// exported in the Prometheus text: it is a liveness edge, not a figure
     /// worth graphing.
     pipeline_batches: AtomicU64,
-    source_health: RwLock<BTreeMap<String, bool>>,
+    source_health: RwLock<BTreeMap<String, SourceHealthEntry>>,
     /// MAN-96: per-source outage bookkeeping behind
     /// `manta_source_outages_total` / `manta_source_down_seconds_total`.
     /// Updated under `source_health`'s write guard (the only place both
@@ -689,13 +706,40 @@ impl Metrics {
     /// outage counters are testable without sleeping. A healthy -> unhealthy
     /// edge counts one outage and starts its clock; the next unhealthy ->
     /// healthy edge adds the elapsed time to the completed down seconds.
-    /// Repeated reports of the same state change nothing.
+    /// Repeated reports of the same state change nothing, and a write after
+    /// a terminal one (MAN-64) changes neither the gauge nor the counters.
     pub fn set_source_health_at(&self, source: &str, healthy: bool, now: Instant) {
+        self.write_source_health(source, healthy, false, now);
+    }
+
+    /// The definitive, final health value for `source`: once written, no
+    /// later `set_source_health` call for the same source can change it.
+    /// See `SourceHealthEntry`'s doc comment for why this is needed instead
+    /// of always taking the most recent write. A healthy -> unhealthy
+    /// terminal write still counts as an outage (MAN-96).
+    pub fn set_source_health_terminal(&self, source: &str, healthy: bool) {
+        self.write_source_health(source, healthy, true, Instant::now());
+    }
+
+    fn write_source_health(&self, source: &str, healthy: bool, terminal: bool, now: Instant) {
         let mut health = self
             .source_health
             .write()
             .expect("source_health lock poisoned");
-        let prev = health.insert(source.to_string(), healthy);
+        let prev = match health.get_mut(source) {
+            // A terminal entry is this source's final word for the rest of
+            // the process's life -- see `set_source_health_terminal`.
+            Some(entry) if entry.terminal && !terminal => return,
+            Some(entry) => {
+                let prev = entry.healthy;
+                *entry = SourceHealthEntry { healthy, terminal };
+                Some(prev)
+            }
+            None => {
+                health.insert(source.to_string(), SourceHealthEntry { healthy, terminal });
+                None
+            }
+        };
         let mut outages = self
             .source_outages
             .lock()
@@ -922,13 +966,17 @@ impl Metrics {
                 detail: "source: none registered".to_string(),
             });
         } else {
-            for (name, healthy) in sources.iter() {
+            for (name, entry) in sources.iter() {
                 checks.push(HealthCheck {
                     name: format!("source:{name}"),
-                    ok: *healthy,
+                    ok: entry.healthy,
                     detail: format!(
                         "source {name}: {}",
-                        if *healthy { "healthy" } else { "unhealthy" }
+                        if entry.healthy {
+                            "healthy"
+                        } else {
+                            "unhealthy"
+                        }
                     ),
                 });
             }
@@ -1086,10 +1134,10 @@ impl Metrics {
             .source_health
             .read()
             .expect("source_health lock poisoned");
-        for (source, healthy) in source_health.iter() {
+        for (source, entry) in source_health.iter() {
             out.push_str(&format!(
                 "manta_source_health{{source=\"{source}\"}} {}\n",
-                if *healthy { 1 } else { 0 }
+                if entry.healthy { 1 } else { 0 }
             ));
         }
         {
@@ -1763,6 +1811,44 @@ mod tests {
             text.contains(r#"manta_source_down_seconds_total{source="soapy"} 0.000"#),
             "{text}"
         );
+    }
+
+    /// MAN-64 round 7 (V-2): a regular `set_source_health(true)` landing
+    /// after the fatal-exit `set_source_health_terminal(false)` must never
+    /// win, regardless of which one happens to run last.
+    #[test]
+    fn terminal_source_health_cannot_be_overwritten_by_a_later_regular_write() {
+        let m = Metrics::new();
+        m.set_source_health("hpsdr", true);
+        m.set_source_health_terminal("hpsdr", false);
+        // A regular (non-terminal) write arriving after the terminal write
+        // has already landed.
+        m.set_source_health("hpsdr", true);
+        assert!(m
+            .render_prometheus_text()
+            .contains(r#"manta_source_health{source="hpsdr"} 0"#));
+    }
+
+    /// MAN-96 x MAN-64: a fatal-exit terminal write is a real outage edge,
+    /// and a regular write after it moves neither the gauge nor the
+    /// outage counters.
+    #[test]
+    fn terminal_unhealthy_write_counts_one_outage_and_freezes_the_counters() {
+        let m = Metrics::new();
+        m.set_source_health("hpsdr", true);
+        m.set_source_health_terminal("hpsdr", false);
+        m.set_source_health("hpsdr", true);
+        m.set_source_health("hpsdr", false);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="hpsdr"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_down_seconds_total{source="hpsdr"} 0.000"#),
+            "{text}"
+        );
+        assert!(text.contains(r#"manta_source_health{source="hpsdr"} 0"#));
     }
 
     // MAN-56: input-layer packet loss/malformed counters.

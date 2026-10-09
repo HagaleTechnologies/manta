@@ -68,6 +68,7 @@
 #metrics_max_connections_per_ip = 8  # open metrics connections
 #telnet_max_commands_per_ip = 30     # telnet commands per 10 seconds
 #json_max_pings_per_ip = 10          # WebSocket pings per 60 seconds
+#metrics_max_requests_per_ip = 60    # metrics connections per 60 seconds
 
 
 # --- Uplink to an RBN-style collector ----------------------------------------

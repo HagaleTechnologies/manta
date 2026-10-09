@@ -681,6 +681,21 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `manta_input_*` series sum every connection a reconnectable source makes
   (MAN-228, `manta-cli::reconnect::InputHealthTotals`), so they keep
   counting across a reconnect and never reset mid-process.
+  **MAN-64's terminal write** covers the one exit `ReconnectingSource`
+  cannot report: when `manta_engine::listen` itself returns an error (file
+  replay failed, a reopened source came back at a different sample rate
+  or centre frequency, or the pipeline behind the source failed),
+  `Command::Listen` writes a final `0` for the source before signalling the
+  shutdown drain, through `Metrics::set_source_health_terminal` so no later
+  regular write can flip it back. A clean end (EOF, Ctrl-C) leaves the
+  gauge alone. **A scrape can see that `0` only while the metrics listener
+  is still up**, and that window is not guaranteed: the listener runs
+  outside `ClientTasks`, so it outlives the write only while a
+  telnet/JSON/WS client is still draining under
+  `shutdown_runtime_after_drain` (up to `SHUTDOWN_DRAIN_DEADLINE`); with
+  no such client connected, the ordinary state for a scrape-only
+  deployment, the runtime tears down microseconds later. See
+  `docs/DECISIONS/2026-09-04-man64-metrics-request-rate-and-source-health.md`.
 - Every dropped/evicted/suppressed item is counted. **No silent loss anywhere in
   the pipeline** — if coverage was bounded, the metrics say so.
 
