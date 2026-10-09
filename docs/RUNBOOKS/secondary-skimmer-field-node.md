@@ -212,7 +212,9 @@ tail -n 1 /var/lib/manta-field/ledger.jsonl
 ```
 
 After 24 h, evaluate the ledger over the 24 h window. No Aggregator is connected in Stage 1, so
-pass `--min-aggregator 0` to switch off the D-B criterion:
+pass `--min-aggregator 0` to switch off the D-B criterion. Wait at least one scrape interval (60 s)
+after `END` first: spots emitted between the last scrape and `END` only show on the next scrape,
+and without it the missed-spot count below can come out low (MAN-291 makes `report` enforce this):
 
 ```sh
 START=2026-11-01T12:00:00Z   # the stage 1 start note's time, UTC
