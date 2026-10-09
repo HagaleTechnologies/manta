@@ -1087,13 +1087,20 @@ def summarize(records, params=None):
         # uncorroborated (shadow-compare.py --missed-spots): a missed spot
         # may be a false one, so the archive alone cannot vouch for it.
         # A restart in (or just after) the window resets the per-process
-        # spot counter, so the count is indeterminate and D-I fails closed.
+        # spot counter, and with no reachable sample at or before the window
+        # start the spots (and any restart) before the first sample are
+        # unseen, so either way the count is indeterminate and D-I fails
+        # closed (PR #219 review).
+        why = []
         if restarts or tail_restart:
+            why.append("manta restarted in the window (manta_spots_total is per process)")
+        if baseline is None:
+            why.append("no reachable sample at or before the window start")
+        if why:
             spots_missed_indeterminate = True
             warnings.append(
-                "spots missed by the recorder are indeterminate: manta restarted in the window "
-                "(manta_spots_total is per process), so Stage 1 (D-I) cannot GO; pass "
-                "--missed-spots indeterminate to shadow-compare.py")
+                "spots missed by the recorder are indeterminate: %s, so Stage 1 (D-I) cannot GO; "
+                "pass --missed-spots indeterminate to shadow-compare.py" % "; ".join(why))
         else:
             spots_missed = max(0, spots_emitted_total + tail_emitted - recorded_total)
         if spots_emitted_total > 0:
@@ -1270,7 +1277,7 @@ def render_markdown(s):
         cov = s["recorded_coverage"]
         w("Spots recorded: %d (coverage %s)" % (s["spots_recorded_total"], "-" if cov is None else _pct(cov)))
         if s["spots_missed_indeterminate"]:
-            w("Spots missed by the recorder: indeterminate, manta restarted in the window "
+            w("Spots missed by the recorder: indeterminate, see the warnings "
               "(Stage 1: shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
         else:
             w("Spots missed by the recorder: %d (Stage 1: shadow-compare.py --missed-spots %d)"

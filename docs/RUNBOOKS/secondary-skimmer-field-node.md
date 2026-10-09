@@ -201,10 +201,13 @@ Aggregator forwarding is all or nothing: once the node is a secondary, its spots
 the Aggregator operator stops all forwarding (Aggregator manual §5.6). So the quality gate runs
 **before** the node joins. Do not tell the Aggregator operator to add the node yet.
 
-Start the three units and write the start note:
+Start the three units, wait for the ledger's first scrape (one sample line in the ledger, about
+60 s), then write the start note. A start note before the first sample leaves the spots emitted
+before it uncounted, and `report` marks the missed-spot count indeterminate (NO-GO):
 
 ```sh
 sudo systemctl enable --now manta-field.service manta-field-ledger.service manta-field-spots.service
+until grep -q '"kind": *"sample"' /var/lib/manta-field/ledger.jsonl 2>/dev/null; do sleep 5; done
 sudo -u manta python3 /opt/manta/scripts/field-node.py note \
   --ledger /var/lib/manta-field/ledger.jsonl --kind start --reason "stage 1"
 curl -s http://127.0.0.1:7302/healthz   # "ok" and one line per check
@@ -228,8 +231,9 @@ Note the report's `Spots missed by the recorder: N` line (`## Daily`). Those are
 emitted that `manta-field-spots` did not archive; any of them could be a false spot, so the
 comparison below counts them as uncorroborated.
 
-If manta restarted in the window, that line reads `indeterminate` (the spot counter is per
-process, so missed spots cannot be counted); pass `indeterminate` and Stage 1 is NO-GO.
+If manta restarted in the window, or no sample precedes the start note, that line reads
+`indeterminate` (the spot counter is per process, and spots before the first sample are unseen);
+pass `indeterminate` and Stage 1 is NO-GO.
 
 ```sh
 MISSED=0   # N from "Spots missed by the recorder: N", or indeterminate

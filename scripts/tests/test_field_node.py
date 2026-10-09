@@ -919,6 +919,25 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Spots missed by the recorder: indeterminate", r.stdout)
         self.assertIn("--missed-spots indeterminate; D-I cannot GO", r.stdout)
 
+    def test_no_sample_before_window_start_makes_spots_missed_indeterminate(self):
+        # PRRT_kwDOTQvU8M6qtQQX, Codex's example: the start note lands
+        # before the first sample; 3 spots the recorder missed are emitted
+        # before that sample, then 20 recorded ones. With no baseline the
+        # first sample's counter (3) is never differenced, so spots_missed
+        # read 0 (a 0/20 GO); it must be indeterminate.
+        ov = {i: {"spots_inc": 1 if 1 <= i <= 20 else 0} for i in range(0, 145)}
+        recs = make_ledger(days=1, start_note=False, overrides=ov)
+        for r in recs:
+            if r["kind"] == "sample":
+                r["spots_total"] += 3
+        start = T0 - 120.0
+        s = summ(recs, from_ts=start, to_ts=T0 + DAY, recorded_by_day={"2026-01-01": 20})
+        self.assertEqual(s["restarts"], [])
+        self.assertIsNone(s["spots_missed"])
+        self.assertTrue(s["spots_missed_indeterminate"])
+        self.assertTrue(any("no reachable sample at or before the window start" in w
+                            for w in s["warnings"]))
+
     def test_no_restart_keeps_spots_missed_a_count(self):
         ov = {i: {"spots_inc": 1 if 1 <= i <= 20 else 0} for i in range(0, 145)}
         s = summ(make_ledger(days=1, overrides=ov), recorded_by_day={"2026-01-01": 20})

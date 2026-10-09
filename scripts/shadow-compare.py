@@ -44,7 +44,8 @@ spots) is read by the operator from the "Uncorroborated" line in the
 `--missed-spots N` (the `field-node.py report` spots_missed count) adds the
 spots the recorder missed to that line as uncorroborated, so a recorder gap
 cannot hide false spots from the gate. `--missed-spots indeterminate` (a
-restart in the window) makes the line INDETERMINATE: D-I cannot GO.
+restart in the window, or no sample before it) makes the line INDETERMINATE:
+D-I cannot GO.
 
 Calibration deltas are node minus primary on matched pairs (the nearest
 primary row in time among the candidates). SNR is compared at the 500 Hz
@@ -591,7 +592,7 @@ def render_markdown(res, args, files, rbn_counts, node_malformed, show):
       % (a["node_only_corroborated"], a["node_spots"], _fmt_pct(a["node_only_corroborated_pct"])))
     if a["d_i_indeterminate"]:
         w("- **Uncorroborated: INDETERMINATE (%d / %d archived node spots, but the spots the "
-          "recorder missed cannot be counted: manta restarted in the window). D-I cannot GO.**"
+          "recorder missed cannot be counted; see field-node.py report). D-I cannot GO.**"
           % (a["uncorroborated"], a["node_spots"]))
     elif a["missed_spots"]:
         w("- **Uncorroborated: %d / %d node spots (%s), counting %d spots the recorder missed "
