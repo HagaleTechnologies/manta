@@ -228,8 +228,11 @@ Note the report's `Spots missed by the recorder: N` line (`## Daily`). Those are
 emitted that `manta-field-spots` did not archive; any of them could be a false spot, so the
 comparison below counts them as uncorroborated.
 
+If manta restarted in the window, that line reads `indeterminate` (the spot counter is per
+process, so missed spots cannot be counted); pass `indeterminate` and Stage 1 is NO-GO.
+
 ```sh
-MISSED=0   # N from "Spots missed by the recorder: N"
+MISSED=0   # N from "Spots missed by the recorder: N", or indeterminate
 ```
 
 Download the RBN daily archive for every UTC date the window touches. A day's file appears after

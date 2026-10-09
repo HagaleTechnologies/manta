@@ -895,6 +895,36 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(s["spots_emitted_total"], 0)
         self.assertEqual(s["spots_missed"], 3)
 
+    def test_restart_makes_spots_missed_indeterminate(self):
+        # PRRT_kwDOTQvU8M6qo5Ff, Codex's example: 20 spots emitted and
+        # recorded, then 3 more the recorder missed and a restart before the
+        # next scrape. The new process's manta_spots_total starts at 0, so
+        # the 3 vanish from the emitted count; spots_missed must not read 0
+        # (a 0/20 GO) but indeterminate, so D-I fails closed.
+        ov = {i: {"spots_inc": 1 if 1 <= i <= 20 else 0} for i in range(0, 145)}
+        ov[21] = {"spots_inc": 0, "start_time": T0 + 20 * IV + 300}
+        recs = make_ledger(days=1, overrides=ov)
+        s = summ(recs, recorded_by_day={"2026-01-01": 20})
+        self.assertEqual(len(s["restarts"]), 1)
+        self.assertEqual(s["spots_emitted_total"], 20)
+        self.assertIsNone(s["spots_missed"])
+        self.assertTrue(s["spots_missed_indeterminate"])
+        self.assertTrue(any("indeterminate" in w and "cannot GO" in w for w in s["warnings"]))
+        spots_dir = os.path.join(self.tmp.name, "spots")
+        os.makedirs(spots_dir)
+        with open(os.path.join(spots_dir, "spots-2026-01-01.jsonl"), "wb") as f:
+            for k in range(20):
+                f.write(spot_line("W1AW", int(T0 + 60 * k + 30)) + b"\n")
+        r = self.report(recs, "--spots-dir", spots_dir, "--min-days", "1")
+        self.assertIn("Spots missed by the recorder: indeterminate", r.stdout)
+        self.assertIn("--missed-spots indeterminate; D-I cannot GO", r.stdout)
+
+    def test_no_restart_keeps_spots_missed_a_count(self):
+        ov = {i: {"spots_inc": 1 if 1 <= i <= 20 else 0} for i in range(0, 145)}
+        s = summ(make_ledger(days=1, overrides=ov), recorded_by_day={"2026-01-01": 20})
+        self.assertEqual(s["spots_missed"], 0)
+        self.assertFalse(s["spots_missed_indeterminate"])
+
     def test_spots_missed_absent_without_spots_dir(self):
         s = summ(make_ledger(days=1))
         self.assertIsNone(s["spots_missed"])

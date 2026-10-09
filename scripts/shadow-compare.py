@@ -43,7 +43,8 @@ spots) is read by the operator from the "Uncorroborated" line in the
 `## Agreement` section; see docs/RUNBOOKS/secondary-skimmer-field-node.md.
 `--missed-spots N` (the `field-node.py report` spots_missed count) adds the
 spots the recorder missed to that line as uncorroborated, so a recorder gap
-cannot hide false spots from the gate.
+cannot hide false spots from the gate. `--missed-spots indeterminate` (a
+restart in the window) makes the line INDETERMINATE: D-I cannot GO.
 
 Calibration deltas are node minus primary on matched pairs (the nearest
 primary row in time among the candidates). SNR is compared at the 500 Hz
@@ -135,6 +136,14 @@ def non_negative_int(s):
     if v < 0:
         raise argparse.ArgumentTypeError("must be >= 0, got %r" % s)
     return v
+
+
+def missed_spots_arg(s):
+    """--missed-spots: a count, or `indeterminate` (field-node.py report
+    could not count them: manta restarted in the window) -> None."""
+    if s == "indeterminate":
+        return None
+    return non_negative_int(s)
 
 
 def sha256_of(path):
@@ -503,10 +512,14 @@ def compare(node_all, rbn_rows, primary, passbands, start, end,
             # D-I input: spots the node emitted but record-spots missed
             # (`field-node.py report`'s spots_missed) could be false, so
             # they count as uncorroborated node spots.
-            "missed_spots": missed_spots,
-            "d_i_node_spots": n_node + missed_spots,
-            "d_i_uncorroborated": len(uncorroborated) + missed_spots,
-            "d_i_uncorroborated_pct": _pct(len(uncorroborated) + missed_spots, n_node + missed_spots),
+            # An indeterminate count (None) leaves D-I without a number:
+            # the gate fails closed rather than reading the archive alone.
+            "missed_spots": "indeterminate" if missed_spots is None else missed_spots,
+            "d_i_indeterminate": missed_spots is None,
+            "d_i_node_spots": None if missed_spots is None else n_node + missed_spots,
+            "d_i_uncorroborated": None if missed_spots is None else len(uncorroborated) + missed_spots,
+            "d_i_uncorroborated_pct": (None if missed_spots is None else
+                                       _pct(len(uncorroborated) + missed_spots, n_node + missed_spots)),
             "primary_rows_grammar_excluded": grammar_excluded,
             "rbn_rows_from_excluded_spotters": own_rows,
         },
@@ -576,7 +589,11 @@ def render_markdown(res, args, files, rbn_counts, node_malformed, show):
       % (a["primary_heard_by_node"], a["primary_spots"], _fmt_pct(a["primary_heard_pct"])))
     w("- Node-only spots corroborated by another RBN spotter: %d / %d node spots (%s)"
       % (a["node_only_corroborated"], a["node_spots"], _fmt_pct(a["node_only_corroborated_pct"])))
-    if a["missed_spots"]:
+    if a["d_i_indeterminate"]:
+        w("- **Uncorroborated: INDETERMINATE (%d / %d archived node spots, but the spots the "
+          "recorder missed cannot be counted: manta restarted in the window). D-I cannot GO.**"
+          % (a["uncorroborated"], a["node_spots"]))
+    elif a["missed_spots"]:
         w("- **Uncorroborated: %d / %d node spots (%s), counting %d spots the recorder missed "
           "as uncorroborated**"
           % (a["d_i_uncorroborated"], a["d_i_node_spots"], _fmt_pct(a["d_i_uncorroborated_pct"]),
@@ -673,9 +690,10 @@ def build_parser():
                     help="default 600 s, manta's dedupe SUPPRESSION_SECONDS (D-H)")
     ap.add_argument("--exclude-spotter", action="append", default=[], metavar="CALL",
                     help="also never count this RBN spotter as a corroborator (repeatable)")
-    ap.add_argument("--missed-spots", type=non_negative_int, default=0, metavar="N",
+    ap.add_argument("--missed-spots", type=missed_spots_arg, default=0, metavar="N",
                     help="spots the node emitted that record-spots missed (`field-node.py report`'s "
-                         "spots_missed); counted as uncorroborated in the D-I line (default 0)")
+                         "spots_missed), counted as uncorroborated in the D-I line; `indeterminate` "
+                         "when the report could not count them, which makes D-I fail closed (default 0)")
     ap.add_argument("--show", type=non_negative_int, default=20,
                     help="rows shown in the two listing sections (default 20)")
     ap.add_argument("--json", metavar="OUT", help="also write the numbers as JSON to OUT")

@@ -152,6 +152,25 @@ class ShadowCompareTest(unittest.TestCase):
         self.assertEqual((a["d_i_uncorroborated"], a["d_i_node_spots"]), (2, 5))
         self.assertIn("**Uncorroborated: 2 / 5 node spots (40.0%)**", md)
 
+    def test_indeterminate_missed_spots_fails_d_i_closed(self):
+        # PRRT_kwDOTQvU8M6qo5Ff: a restart in the window leaves the missed
+        # count unknown; the D-I line must carry no percentage to GO on.
+        code, md, _, s = self.run_tool(extra=["--missed-spots", "indeterminate"])
+        self.assertEqual(code, 0)
+        a = s["agreement"]
+        self.assertTrue(a["d_i_indeterminate"])
+        self.assertEqual(a["missed_spots"], "indeterminate")
+        self.assertIsNone(a["d_i_uncorroborated_pct"])
+        self.assertIsNone(a["d_i_node_spots"])
+        self.assertIn("**Uncorroborated: INDETERMINATE (2 / 5 archived node spots", md)
+        self.assertIn("D-I cannot GO.**", md)
+        self.assertNotIn("**Uncorroborated: 2 / 5 node spots (40.0%)**", md)
+
+    def test_bad_missed_spots_word_is_usage_error(self):
+        code, md, err, _ = self.run_tool(extra=["--missed-spots", "unknown"])
+        self.assertEqual(code, 2)
+        self.assertIn("--missed-spots", err)
+
     def test_negative_missed_spots_is_usage_error(self):
         code, md, err, _ = self.run_tool(extra=["--missed-spots", "-1"])
         self.assertEqual(code, 2)

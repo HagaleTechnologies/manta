@@ -948,6 +948,11 @@ def summarize(records, params=None):
     # placed in any day, but spots_missed (D-I) counts the whole delta so
     # a recorder gap in that tail cannot hide a spot (PR #219 review).
     tail_emitted = 0
+    # manta_spots_total is per process: across a restart the spots the old
+    # process emitted after its last sample are lost to both the emitted
+    # count and (if the recorder missed them) the archive, so spots_missed
+    # cannot be counted and the D-I gate must not GO (PR #219 review).
+    tail_restart = False
     after = [s for s in reach if s["ts"] > end]
     if seq and after and after[0].get("spots_total") is not None:
         a_, b_ = seq[-1], after[0]
@@ -956,6 +961,7 @@ def summarize(records, params=None):
             tail_emitted = int(bs_ - as_t if bs_ >= as_t else bs_)
         else:
             tail_emitted = int(bs_)
+            tail_restart = a_["start_time"] != b_["start_time"]
     pairs = list(zip(seq, seq[1:]))
     restarts = []
     days = {}
@@ -1074,15 +1080,25 @@ def summarize(records, params=None):
     recorded_total = None
     coverage = None
     spots_missed = None
+    spots_missed_indeterminate = False
     if recorded is not None:
         recorded_total = sum(v for k, v in recorded.items())
         # Emitted spots the archive lacks. Stage 1's D-I gate counts them as
         # uncorroborated (shadow-compare.py --missed-spots): a missed spot
         # may be a false one, so the archive alone cannot vouch for it.
-        spots_missed = max(0, spots_emitted_total + tail_emitted - recorded_total)
+        # A restart in (or just after) the window resets the per-process
+        # spot counter, so the count is indeterminate and D-I fails closed.
+        if restarts or tail_restart:
+            spots_missed_indeterminate = True
+            warnings.append(
+                "spots missed by the recorder are indeterminate: manta restarted in the window "
+                "(manta_spots_total is per process), so Stage 1 (D-I) cannot GO; pass "
+                "--missed-spots indeterminate to shadow-compare.py")
+        else:
+            spots_missed = max(0, spots_emitted_total + tail_emitted - recorded_total)
         if spots_emitted_total > 0:
             coverage = recorded_total / float(spots_emitted_total)
-            if coverage < RECORDED_COVERAGE_WARN:
+            if coverage < RECORDED_COVERAGE_WARN and spots_missed is not None:
                 warnings.append(
                     "spot archive coverage %.1f%% (recorded %d / emitted %d) is below %.0f%%: "
                     "record-spots missed %d spots; for Stage 1 (D-I) pass --missed-spots %d to "
@@ -1142,6 +1158,7 @@ def summarize(records, params=None):
         "spots_recorded_total": recorded_total,
         "recorded_coverage": coverage,
         "spots_missed": spots_missed,
+        "spots_missed_indeterminate": spots_missed_indeterminate,
         "builds": builds,
         "notes": [{"at": _iso(n["ts"]), "ts": n["ts"], "note": n.get("note"), "reason": n.get("reason")}
                   for n in win_notes],
@@ -1252,8 +1269,12 @@ def render_markdown(s):
     if s["spots_recorded_total"] is not None:
         cov = s["recorded_coverage"]
         w("Spots recorded: %d (coverage %s)" % (s["spots_recorded_total"], "-" if cov is None else _pct(cov)))
-        w("Spots missed by the recorder: %d (Stage 1: shadow-compare.py --missed-spots %d)"
-          % (s["spots_missed"], s["spots_missed"]))
+        if s["spots_missed_indeterminate"]:
+            w("Spots missed by the recorder: indeterminate, manta restarted in the window "
+              "(Stage 1: shadow-compare.py --missed-spots indeterminate; D-I cannot GO)")
+        else:
+            w("Spots missed by the recorder: %d (Stage 1: shadow-compare.py --missed-spots %d)"
+              % (s["spots_missed"], s["spots_missed"]))
     w("")
     w("## Builds")
     w("")
