@@ -397,6 +397,23 @@ impl UplinkTarget {
     }
 }
 
+/// MAN-64 round 7 (V-2): a source's health value, plus whether that value
+/// is final. Added when a MAN-55 liveness watcher task could race the
+/// fatal-exit write in `record_terminal_source_health`
+/// (`manta-cli/src/main.rs`) and flip the gauge back to healthy after it.
+/// MAN-73 has since removed that task: apart from file replay's one-time
+/// startup write, every regular write now comes from `ReconnectingSource`'s
+/// health sink, called synchronously inside a `read()` on the decode
+/// thread. `listen` has returned (and dropped the source) before the
+/// fatal-exit write runs, so no current writer can land after it. The
+/// marker stays so the fatal write remains final against any later
+/// asynchronous writer: see `set_source_health_terminal`.
+#[derive(Clone, Copy)]
+struct SourceHealthEntry {
+    healthy: bool,
+    terminal: bool,
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -462,7 +479,7 @@ pub struct Metrics {
     /// exported in the Prometheus text: it is a liveness edge, not a figure
     /// worth graphing.
     pipeline_batches: AtomicU64,
-    source_health: RwLock<BTreeMap<String, bool>>,
+    source_health: RwLock<BTreeMap<String, SourceHealthEntry>>,
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
     /// counters. Engine/input-owned figures, injected by the daemon wiring
     /// layer on a timer -- see `manta-cli`'s `INPUT_HEALTH_POLL_INTERVAL`.
@@ -663,10 +680,42 @@ impl Metrics {
     }
 
     pub fn set_source_health(&self, source: &str, healthy: bool) {
+        let mut map = self
+            .source_health
+            .write()
+            .expect("source_health lock poisoned");
+        match map.get_mut(source) {
+            // A terminal entry is this source's final word for the rest of
+            // the process's life -- see `set_source_health_terminal`.
+            Some(entry) if entry.terminal => {}
+            Some(entry) => entry.healthy = healthy,
+            None => {
+                map.insert(
+                    source.to_string(),
+                    SourceHealthEntry {
+                        healthy,
+                        terminal: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The definitive, final health value for `source`: once written, no
+    /// later `set_source_health` call for the same source can change it.
+    /// See `SourceHealthEntry`'s doc comment for why this is needed instead
+    /// of always taking the most recent write.
+    pub fn set_source_health_terminal(&self, source: &str, healthy: bool) {
         self.source_health
             .write()
             .expect("source_health lock poisoned")
-            .insert(source.to_string(), healthy);
+            .insert(
+                source.to_string(),
+                SourceHealthEntry {
+                    healthy,
+                    terminal: true,
+                },
+            );
     }
 
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
@@ -876,13 +925,17 @@ impl Metrics {
                 detail: "source: none registered".to_string(),
             });
         } else {
-            for (name, healthy) in sources.iter() {
+            for (name, entry) in sources.iter() {
                 checks.push(HealthCheck {
                     name: format!("source:{name}"),
-                    ok: *healthy,
+                    ok: entry.healthy,
                     detail: format!(
                         "source {name}: {}",
-                        if *healthy { "healthy" } else { "unhealthy" }
+                        if entry.healthy {
+                            "healthy"
+                        } else {
+                            "unhealthy"
+                        }
                     ),
                 });
             }
@@ -1033,7 +1086,7 @@ impl Metrics {
             "# HELP manta_source_health Per-input-source health (1 = healthy, 0 = unhealthy).\n",
         );
         out.push_str("# TYPE manta_source_health gauge\n");
-        for (source, healthy) in self
+        for (source, entry) in self
             .source_health
             .read()
             .expect("source_health lock poisoned")
@@ -1041,7 +1094,7 @@ impl Metrics {
         {
             out.push_str(&format!(
                 "manta_source_health{{source=\"{source}\"}} {}\n",
-                if *healthy { 1 } else { 0 }
+                if entry.healthy { 1 } else { 0 }
             ));
         }
 
@@ -1588,6 +1641,22 @@ mod tests {
         let text = m.render_prometheus_text();
         assert!(text.contains(r#"manta_source_health{source="kiwi-remote"} 0"#));
         assert!(text.contains(r#"manta_source_health{source="soapy0"} 1"#));
+    }
+
+    /// MAN-64 round 7 (V-2): a regular `set_source_health(true)` landing
+    /// after the fatal-exit `set_source_health_terminal(false)` must never
+    /// win, regardless of which one happens to run last.
+    #[test]
+    fn terminal_source_health_cannot_be_overwritten_by_a_later_regular_write() {
+        let m = Metrics::new();
+        m.set_source_health("hpsdr", true);
+        m.set_source_health_terminal("hpsdr", false);
+        // A regular (non-terminal) write arriving after the terminal write
+        // has already landed.
+        m.set_source_health("hpsdr", true);
+        assert!(m
+            .render_prometheus_text()
+            .contains(r#"manta_source_health{source="hpsdr"} 0"#));
     }
 
     // MAN-56: input-layer packet loss/malformed counters.
