@@ -108,6 +108,20 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   beyond HPSDR). Under normal conditions the gap/malformed counters should
   stay at 0; a steadily increasing `manta_input_gaps_detected_total` means
   the receiver's network path is dropping SND frames.
+- `manta_source_outages_total{source}` / `manta_source_down_seconds_total{source}`
+  (MAN-96) — how many times each input source went from healthy to unhealthy
+  (a lost connection or failed read), and the seconds it spent in outages
+  that have ended. Both start at 0 for every registered source; a source that
+  starts unhealthy (HPSDR until confirmed live) is not an outage. They catch
+  drops shorter than a scrape interval, which `manta_source_health` alone
+  misses. Source drops per day:
+  ```promql
+  increase(manta_source_outages_total[1d])
+  ```
+  An outage still in progress shows only as `manta_source_health == 0`; its
+  seconds are added to `manta_source_down_seconds_total` when it ends. The
+  30-day field-node ledger reads both
+  (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).
 
 ## Known gaps
 

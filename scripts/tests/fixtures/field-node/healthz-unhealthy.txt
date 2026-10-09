@@ -1,0 +1,6 @@
+unhealthy
+source soapy: unhealthy
+listener json: up
+listener metrics: up
+listener telnet: up
+decode: ok

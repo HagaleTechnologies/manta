@@ -97,6 +97,8 @@ KiwiSDR input.
 - 24 h soak on live 40 m CW segment via SDR: no crash, no overrun, track
   count and evictions visible in metrics. **Outstanding** — needs a real SDR
   and 24 unattended hours.
+  Procedure: `docs/RUNBOOKS/secondary-skimmer-field-node.md` (MAN-96); still
+  outstanding until a run's evidence is recorded.
 
 M2 sub-project 1 (PFB channelizer, `manta-dsp::channelizer`) is complete —
 see `docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md` and
@@ -134,6 +136,8 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
   published in the repo, whatever they are.
 - cqdx ingests the JSON stream in a dev environment.
 - 7-day unattended soak feeding spots continuously.
+  Procedure: `docs/RUNBOOKS/secondary-skimmer-field-node.md` (MAN-96); still
+  outstanding until a run's evidence is recorded.
 
 `manta-spot` (callsign/CQ-DE validation, cty.dat/SCP cross-check,
 repetition gate, dedupe) is complete as a standalone crate -- see

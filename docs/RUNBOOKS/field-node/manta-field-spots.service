@@ -1,0 +1,16 @@
+[Unit]
+Description=manta MAN-96 field-node spot recorder (JSON Lines port to daily files)
+Wants=network-online.target
+After=network-online.target manta-field.service
+
+[Service]
+Type=simple
+User=manta
+Group=manta
+StateDirectory=manta-field
+ExecStart=/usr/bin/python3 /opt/manta/scripts/field-node.py record-spots --json-addr 127.0.0.1:7301 --out-dir /var/lib/manta-field/spots
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

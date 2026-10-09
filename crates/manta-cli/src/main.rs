@@ -5925,6 +5925,25 @@ mod tests {
             .contains(r#"manta_source_health{source="kiwi"} 0"#));
     }
 
+    /// MAN-96: a reconnecting source's healthy -> unhealthy -> healthy
+    /// round trip through the real sink is one `manta_source_outages_total`
+    /// increment.
+    #[test]
+    fn source_health_sink_counts_a_source_outage() {
+        use std::sync::Arc;
+
+        let metrics = Arc::new(manta_server::metrics::Metrics::new());
+        let mut sink = source_health_sink("kiwi", Some(metrics.clone()), None);
+        sink(true);
+        sink(false);
+        sink(true);
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="kiwi"} 1"#),
+            "{text}"
+        );
+    }
+
     #[test]
     fn fixed_center_freq_source_forwards_take_discontinuity() {
         let mut src = FixedCenterFreqSource {

@@ -39,3 +39,6 @@ back, or spot timestamps jump backwards relative to the outage.
 `manta-cli::reconnect::ReconnectingSource` wraps every reconnectable source (everything but file
 replay) and retries with `manta-server::backoff`'s shared 1s-60s policy; `manta_source_health`
 tracks it live (ARCHITECTURE §8).
+`manta_source_outages_total`/`manta_source_down_seconds_total` (MAN-96) count each drop and its
+completed down time, so a reconnect between two scrapes still shows; the 30-day field-node
+procedure reads them (`docs/RUNBOOKS/secondary-skimmer-field-node.md`).

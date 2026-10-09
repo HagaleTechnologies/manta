@@ -391,6 +391,8 @@ criteria.
 
 **Running a node:** [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
+[docs/RUNBOOKS/secondary-skimmer-field-node.md](docs/RUNBOOKS/secondary-skimmer-field-node.md)
+(a 30-day secondary-skimmer field node behind an RBN Aggregator, MAN-96) ·
 `manta <subcommand> --help` for every flag.
 
 **Contributing:** [ARCHITECTURE.md](ARCHITECTURE.md) — the nine-crate
