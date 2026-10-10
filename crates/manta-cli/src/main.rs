@@ -8,6 +8,7 @@ use manta_engine::{decode_wav, PipelineConfig};
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
+mod bench;
 mod build_info;
 mod config;
 mod config_cmd;
@@ -688,6 +689,28 @@ enum Command {
     /// Check or create a config file, without starting anything.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Measure decode quality on synthetic signals, no radio needed.
+    #[command(subcommand)]
+    Bench(BenchCommand),
+}
+
+// MAN-116: `manta bench sensitivity`; see bench.rs and
+// docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md.
+#[derive(Subcommand)]
+enum BenchCommand {
+    /// Measure how recall and copy accuracy fall off as SNR drops.
+    ///
+    /// Generates synthetic CW recordings for every combination of channel
+    /// condition, speed and SNR, decodes each one with the same pipeline
+    /// `manta decode` uses, and prints a recall and character-error-rate
+    /// table. Each recording holds ten stations sending "CQ CQ DE <call>
+    /// <call> K" for its whole length. The same manta version and flags
+    /// always print the same table, so a published result can be
+    /// regenerated and checked.
+    ///
+    /// SNR is quoted the way RBN and CW Skimmer quote it: the transmitted
+    /// carrier against the noise in a 500 Hz bandwidth.
+    Sensitivity(bench::SensitivityArgs),
 }
 
 // MAN-76: `manta config check` / `manta config init`; see config_cmd.rs and
@@ -3030,19 +3053,27 @@ fn prepare_live(
 /// `decode`/`oracle`: one stderr note naming the tables present in the file
 /// that the command does not apply (D7).
 fn note_ignored_tables(loaded: &config::Loaded, command: &str, applied: &[&str]) {
+    if let Some(note) = ignored_tables_note(loaded, command, applied) {
+        eprintln!("{note}");
+    }
+}
+
+/// The text of `note_ignored_tables`'s note, or `None` when every present
+/// table applies (`bench sensitivity` returns it instead of printing it).
+fn ignored_tables_note(loaded: &config::Loaded, command: &str, applied: &[&str]) -> Option<String> {
     let ignored: Vec<&str> = loaded
         .present
         .iter()
         .map(String::as_str)
         .filter(|t| !applied.contains(t))
         .collect();
-    if !ignored.is_empty() {
-        eprintln!(
+    (!ignored.is_empty()).then(|| {
+        format!(
             "note: {command} ignores [{}] from {}",
             ignored.join("], ["),
             loaded.origin
-        );
-    }
+        )
+    })
 }
 
 /// Resolves the address(es) `manta status` should DIAL to reach a running
@@ -4484,6 +4515,7 @@ fn real_main() -> Result<()> {
         }
         Command::Config(ConfigCommand::Check { config }) => config_cmd::check(config)?,
         Command::Config(ConfigCommand::Init { out, force }) => config_cmd::init(&out, force)?,
+        Command::Bench(BenchCommand::Sensitivity(args)) => bench::sensitivity(args)?,
     }
     Ok(())
 }

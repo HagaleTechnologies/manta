@@ -419,6 +419,10 @@ Pre-1.0, and pre-first-release. What is true today:
   over `legacy` (`as_word` 27%→56%, `framed` 13%→32%) but falls short of
   the 60%/40% bar, and most VR/V golden vectors still fail. Not yet a
   default-engine candidate.
+- **Measured sensitivity:** `manta bench sensitivity` regenerates recall
+  and character error rate against SNR (500 Hz) on synthetic AWGN and
+  Watterson-faded signals; the curve at landing is in
+  [docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md](docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md).
 - **No tagged release yet**, so the container image above is empty until
   the first tag.
 
@@ -470,7 +474,8 @@ versioning rule.
 channelizer constants, noise-floor estimator, track state machine,
 decoder equations, confidence formulas, determinism rules, golden
 vectors, config-key table · [ROADMAP.md](ROADMAP.md) — milestones M0 to
-M4 with acceptance criteria.
+M4 with acceptance criteria · `manta bench sensitivity` — the
+recall/CER-vs-SNR curve on synthetic signals, regenerable from any build.
 
 ## Related projects
 
