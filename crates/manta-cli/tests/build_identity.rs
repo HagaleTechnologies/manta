@@ -39,8 +39,14 @@ fn expected_features() -> String {
     }
 }
 
-/// `git rev-parse --short=12 HEAD` for this checkout, or None without git.
+/// `git rev-parse --short=12 HEAD` for this checkout, or None without git
+/// or when build.rs's own check finds the repository is not manta's (it then
+/// embeds unknown). `build_script_ignores_an_enclosing_repository` covers
+/// that check, so a check that always failed could not skip this one quietly.
 fn checkout_head() -> Option<String> {
+    if !build_script::in_own_checkout(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
+        return None;
+    }
     let out = Command::new("git")
         .args([
             "-C",
@@ -89,6 +95,54 @@ fn version_flag_commit_is_the_checkouts_head() {
     assert!(
         stdout.contains(&format!("(git {head};")),
         "{stdout:?} does not name HEAD {head}"
+    );
+}
+
+/// build.rs itself, so its checkout check runs against real git layouts.
+#[allow(dead_code)]
+#[path = "../build.rs"]
+mod build_script;
+
+/// A source tree with no `.git` of its own (an unpacked archive, a vendored
+/// copy) built beneath an unrelated repository must not take that
+/// repository's HEAD as manta's commit; a checkout rooted at the workspace
+/// root still counts. Skipped when git is unavailable, or when an exported
+/// `GIT_DIR`/`GIT_WORK_TREE` replaces the discovery this test exercises.
+#[test]
+fn build_script_ignores_an_enclosing_repository() {
+    if std::env::var_os("GIT_DIR").is_some() || std::env::var_os("GIT_WORK_TREE").is_some() {
+        return;
+    }
+    let outer = tempfile::tempdir().unwrap();
+    let workspace = outer.path().join("manta-src");
+    let crate_dir = workspace.join("crates").join("manta-cli");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+    let git_init = |at: &std::path::Path| {
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(at)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !git_init(outer.path()) {
+        return;
+    }
+    // Precondition: git's own discovery does walk up to the outer repo.
+    let found = Command::new("git")
+        .arg("-C")
+        .arg(&crate_dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .unwrap();
+    assert!(found.status.success(), "{found:?}");
+    assert!(
+        !build_script::in_own_checkout(&crate_dir),
+        "an enclosing repository was taken for manta's checkout"
+    );
+    assert!(git_init(&workspace));
+    assert!(
+        build_script::in_own_checkout(&crate_dir),
+        "a checkout rooted at the workspace root was rejected"
     );
 }
 

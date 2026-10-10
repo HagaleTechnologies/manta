@@ -1,6 +1,8 @@
 //! MAN-128: embeds the git commit into `manta_build_info`. Never fails the
 //! build: a Docker context (`.dockerignore` excludes `.git`) or a source
-//! tarball has no git metadata and reports "unknown". `MANTA_GIT_SHA`
+//! tarball has no git metadata and reports "unknown" -- as does one unpacked
+//! beneath an unrelated repository, whose HEAD is not manta's commit (MAN-83:
+//! git's top level must be this workspace's root). `MANTA_GIT_SHA`
 //! overrides (for release images that pass it as a build-arg).
 //!
 //! MAN-83: the same commit also feeds `manta --version` and the JSON
@@ -62,6 +64,21 @@ fn sha_override() -> Option<String> {
     Some(s)
 }
 
+/// MAN-83: whether `git`, run in `crate_dir`, finds manta's own checkout. A
+/// source tree with no `.git` of its own (an unpacked archive, a vendored
+/// copy) built beneath an unrelated repository would otherwise report that
+/// repository's HEAD as manta's commit, so the checkout's top level must be
+/// the workspace root, two directories above this crate (`crates/manta-cli`).
+/// `--show-cdup` is relative, so no absolute path (whose form differs
+/// between Git for Windows, MSYS2 and Cygwin) is parsed. `pub` for
+/// tests/build_identity.rs, which compiles this file as a module.
+pub fn in_own_checkout(crate_dir: &std::path::Path) -> bool {
+    crate_dir
+        .to_str()
+        .and_then(|dir| git(&["-C", dir, "rev-parse", "--show-cdup"]))
+        .is_some_and(|up| up == "../../")
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=MANTA_GIT_SHA");
     println!("cargo::rustc-check-cfg=cfg(manta_git_sha_override)");
@@ -69,28 +86,38 @@ fn main() {
     if overridden.is_some() {
         println!("cargo::rustc-cfg=manta_git_sha_override");
     }
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let own_checkout = in_own_checkout(std::path::Path::new(&manifest_dir));
     let sha = overridden
-        .or_else(|| git(&["rev-parse", "--short=12", "HEAD"]))
+        .or_else(|| {
+            if own_checkout {
+                git(&["rev-parse", "--short=12", "HEAD"])
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     // Rebuild when HEAD moves -- only for paths that exist (a missing
-    // rerun-if-changed path makes Cargo rerun this script on every build).
-    // The paths `git rev-parse` returns are relative to this script's cwd
-    // (the crate directory), so join against CARGO_MANIFEST_DIR.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    for (flag, rel) in [("--git-dir", "HEAD"), ("--git-common-dir", "packed-refs")] {
-        if let Some(dir) = git(&["rev-parse", flag]) {
-            let p = std::path::Path::new(&manifest_dir).join(&dir).join(rel);
-            if p.exists() {
-                println!("cargo:rerun-if-changed={}", p.display());
+    // rerun-if-changed path makes Cargo rerun this script on every build),
+    // and only in manta's own checkout. The paths `git rev-parse` returns
+    // are relative to this script's cwd (the crate directory), so join
+    // against CARGO_MANIFEST_DIR.
+    if own_checkout {
+        for (flag, rel) in [("--git-dir", "HEAD"), ("--git-common-dir", "packed-refs")] {
+            if let Some(dir) = git(&["rev-parse", flag]) {
+                let p = std::path::Path::new(&manifest_dir).join(&dir).join(rel);
+                if p.exists() {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                }
             }
         }
-    }
-    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(dir) = git(&["rev-parse", "--git-common-dir"]) {
-            let p = std::path::Path::new(&manifest_dir).join(&dir).join(&r);
-            if p.exists() {
-                println!("cargo:rerun-if-changed={}", p.display());
+        if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+            if let Some(dir) = git(&["rev-parse", "--git-common-dir"]) {
+                let p = std::path::Path::new(&manifest_dir).join(&dir).join(&r);
+                if p.exists() {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                }
             }
         }
     }

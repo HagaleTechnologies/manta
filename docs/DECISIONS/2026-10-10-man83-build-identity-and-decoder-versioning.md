@@ -132,7 +132,10 @@ MAN-128 (`2026-10-05-man128-node-health-metrics.md`, D5) had already added
   `manta <version> (git <sha>; features: <list>)`, for example
   `manta 0.1.0 (git 1a2b3c4d5e6f; features: hpsdr)`. The first two tokens
   stay `manta <semver>`. `<sha>` is the 12-hex commit, a validated override,
-  or `unknown`. `<list>` is the sorted, comma-separated compiled-in Cargo
+  or `unknown`. `build.rs` takes the commit from git only when git's top
+  level is the workspace root, so a source tree with no `.git` of its own,
+  built beneath some other repository, reports `unknown` rather than that
+  repository's HEAD. `<list>` is the sorted, comma-separated compiled-in Cargo
   features, or `none`, and is the same string as `manta_build_info`'s
   `features` label.
 - JSON spot `decoderVersion`: `manta-<version>+<sha>`, for example
