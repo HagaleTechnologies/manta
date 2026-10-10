@@ -199,6 +199,8 @@ jobs:
       # workflows' ubuntu-latest runners.
       - if: runner.os != 'Windows'
         run: bash scripts/tests/release-version.test.sh
+      - if: runner.os != 'Windows'
+        run: bash scripts/tests/release-ancestry.test.sh
       # MAN-243: the CI trust boundary (who may run in main's context, who writes the shared cache,
       # cold release builds) rides the already-required `test` check, like release-version above.
       - if: runner.os != 'Windows'
