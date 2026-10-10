@@ -410,7 +410,16 @@ validation (MAN-28). Dedupe (step 5) still applies.
   operators running manta behind W3OA's Aggregator, which expects CW
   Skimmer's own layout rather than the RBN relay's.
   Read-mostly protocol; enough command grammar (`sh/dx`, filters, `SKIMMER/
-  SETT`, `BYE`) for common clients — and RBN's own Aggregator — not to choke.
+  SETT`, `BYE`, `sh/version`) for common clients — and RBN's own Aggregator —
+  not to choke. An unrecognised or malformed command gets a fixed
+  `Unknown command` reply, and `sh/version` gets `manta <version>`.
+  Valid `sh/dx` queries with no results send no reply (no error, header or
+  trailer).
+  `sh/dx` follows Aggregator's documented forms: `sh/dx N` is a count and
+  `sh/dx Nm` a minutes window, never a band. Either can take a ` CW`/` RTTY`
+  suffix, and the manta extension `BAND <band>` selects a band. Every query
+  reaches back at most the fifty retained spots. See
+  `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`.
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).
