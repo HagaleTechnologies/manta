@@ -6,9 +6,10 @@
 //! MAN-83: the same commit also feeds `manta --version` and the JSON
 //! stream's `decoderVersion` (`manta-<version>+<sha>`), so the override must
 //! be SemVer build metadata (dot-separated `[0-9A-Za-z-]` identifiers, at
-//! most 64 characters); anything else is warned about and ignored. An
-//! all-hex override longer than 12 characters (CI's 40-hex `github.sha`) is
-//! cut to 12 and lowercased, so it matches a native build of that commit.
+//! most 64 characters); anything else is warned about and ignored. A full
+//! git object name (40 or 64 hex digits, e.g. CI's `github.sha`) is cut to
+//! 12 and lowercased, so it matches a native build of that commit; any
+//! other override, such as a long numeric build ID, is kept as given.
 //! This script also exports `MANTA_FEATURES`, the compiled-in Cargo feature
 //! list, derived from Cargo's `CARGO_FEATURE_*` variables and never read
 //! from the environment. Both names are still on `config.rs`'s
@@ -49,7 +50,7 @@ fn sha_override() -> Option<String> {
         );
         return None;
     }
-    if s.len() > 12 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Some(s[..12].to_ascii_lowercase());
     }
     Some(s)

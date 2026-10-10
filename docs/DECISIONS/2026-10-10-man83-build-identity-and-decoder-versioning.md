@@ -61,10 +61,12 @@ MAN-128 (`2026-10-05-man128-node-health-metrics.md`, D5) had already added
   emits a `cargo:warning` (value `{:?}`-escaped) and falls through to `git`,
   keeping MAN-128's "never fails the build" rule. This keeps `decoderVersion`
   a valid SemVer string and stops a newline in the override from injecting a
-  second `cargo:` directive. An all-hex override longer than 12 characters,
-  such as CI's 40-hex `github.sha`, is cut to 12 and lowercased, so a later
-  Docker build-arg build and a native build of the same commit report the
-  same value. A valid override also sets the `manta_git_sha_override` cfg,
+  second `cargo:` directive. A full git object name (exactly 40 or 64 hex
+  digits), such as CI's `github.sha`, is cut to 12 and lowercased, so a
+  later Docker build-arg build and a native build of the same commit report
+  the same value. Any other override is kept as given: a looser "all-hex
+  and longer than 12" test would also clip a numeric build ID such as
+  `20261010123045`. A valid override also sets the `manta_git_sha_override` cfg,
   which tests use to skip their independent check against the checkout's
   HEAD.
 - **D6 — the decoder-output rule.** See the next section; it is normative
