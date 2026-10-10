@@ -53,7 +53,7 @@ not open, the object holds only `checks` and `checks_status`.
 
 | Check | What it proves | What it does not prove |
 |---|---|---|
-| `config` | `manta run` will not refuse this config for either reason it checks before starting: the example `N0CALL` callsign in `server.station_callsign` or `rbn_uplink.login_callsign`, or a `[server]` table with a receiver that reports no radio frequency and no dial frequency set. `SKIP` without a config file | Everything `manta config check` checks; a config that does not load at all stops doctor with an `Error:` line, as before |
+| `config` | `manta run` will not refuse this config for either reason it checks before starting: the example `N0CALL` callsign in `server.station_callsign` or `rbn_uplink.login_callsign`, or a `[server]` table with a receiver that reports no radio frequency and no dial frequency set. `SKIP` with neither a config file nor `MANTA_SERVER_*` variables | Everything `manta config check` checks; a config that does not load at all stops doctor with an `Error:` line, as before |
 | `audio` | The audio library loaded. For a sound-card receiver, the audio system lists at least one input; the line names up to four | That the listed input is the radio. On a headless Linux host the list can hold only ALSA's "Discard all samples" null device |
 | `telnet port`, `json port`, `metrics port` | Each `[server]` listener can bind its address and port right now. Two listeners on one port fail without binding. Port 0 is a `SKIP`: the system picks a free port when `manta run` starts | That the port is still free when `manta run` starts: another program can take it in between |
 | `ports` | One `SKIP` row instead of the three above when there is no `[server]` table, because `manta run` then starts no servers | |

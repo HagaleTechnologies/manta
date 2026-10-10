@@ -431,10 +431,13 @@ mod tests {
         }
     }
 
+    /// SNTP result, kernel sync state, expected status and detail.
+    type Case = (Result<f64, String>, Option<bool>, Status, &'static str);
+
     #[test]
     fn classify_covers_each_offset_and_kernel_state() {
         let fix = platform_clock_fix();
-        let cases: &[(Result<f64, String>, Option<bool>, Status, &str)] = &[
+        let cases: &[Case] = &[
             (
                 Ok(0.004),
                 Some(true),

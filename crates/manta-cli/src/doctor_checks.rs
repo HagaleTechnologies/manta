@@ -208,13 +208,16 @@ pub(crate) fn run_setup_checks(inputs: &SetupInputs<'_>, sink: &mut Sink) {
 }
 
 /// `manta run`'s two refusals before any I/O: the example callsign, and a
-/// missing dial frequency when `[server]` would start.
+/// missing dial frequency when `[server]` would start. `MANTA_SERVER_*`
+/// alone can build a `[server]` table that `run` checks the same way, so
+/// only a run with neither a file nor a `[server]` is skipped.
 pub(crate) fn config_check(config_path: Option<&Path>, loaded: &Loaded, needs_dial: bool) -> Check {
     const NAME: &str = "config";
-    let Some(path) = config_path else {
-        return Check::skip(NAME, "no config file (--config or MANTA_CONFIG)");
+    let path = match config_path {
+        Some(path) => path.display().to_string(),
+        None if loaded.server.is_some() => "the MANTA_* environment variables".to_string(),
+        None => return Check::skip(NAME, "no config file (--config or MANTA_CONFIG)"),
     };
-    let path = path.display();
     if let Some(key) = config_cmd::example_callsign_key(loaded) {
         return Check::fail(
             NAME,
@@ -872,7 +875,7 @@ mod tests {
         let warn = Check::warn("c", "d", "f");
         let fail = Check::fail("e", "d", "f");
         assert_eq!(worst(&[pass.clone(), skip.clone()]), Status::Pass);
-        assert_eq!(worst(&[skip.clone()]), Status::Pass);
+        assert_eq!(worst(std::slice::from_ref(&skip)), Status::Pass);
         assert_eq!(worst(&[pass.clone(), warn.clone()]), Status::Warn);
         assert_eq!(worst(&[warn, fail, pass, skip]), Status::Fail);
     }
@@ -898,6 +901,34 @@ mod tests {
             render(&config_check(None, &l, false)),
             "SKIP  config: no config file (--config or MANTA_CONFIG)\n"
         );
+    }
+
+    #[test]
+    fn config_check_runs_on_a_server_table_from_the_environment_alone() {
+        use std::ffi::OsString;
+        let vars = [(
+            OsString::from("MANTA_SERVER_STATION_CALLSIGN"),
+            OsString::from("N0CALL"),
+        )];
+        let l = config::load(None, Env::Read(&vars)).unwrap();
+        assert!(l.server.is_some());
+        let check = config_check(None, &l, false);
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check
+                .detail
+                .starts_with("server.station_callsign is still the example"),
+            "{}",
+            check.detail
+        );
+        assert!(check.fix.unwrap().contains("MANTA_* environment variables"));
+        let vars = [(
+            OsString::from("MANTA_SERVER_STATION_CALLSIGN"),
+            OsString::from("W1AW"),
+        )];
+        let l = config::load(None, Env::Read(&vars)).unwrap();
+        assert_eq!(config_check(None, &l, true).status, Status::Fail);
+        assert_eq!(config_check(None, &l, false).status, Status::Pass);
     }
 
     #[test]
