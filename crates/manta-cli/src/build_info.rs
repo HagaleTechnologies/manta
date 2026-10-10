@@ -69,6 +69,17 @@ mod tests {
         assert_eq!(FEATURES, want);
     }
 
+    /// MAN-128's "never fails the build": `std::env::vars()` panics on any
+    /// non-UTF-8 name or value in the environment build.rs inherits.
+    #[test]
+    fn build_script_never_decodes_the_whole_environment() {
+        let build_rs = include_str!("../build.rs");
+        assert!(
+            !build_rs.contains("env::vars()"),
+            "build.rs must scan the environment with env::vars_os()"
+        );
+    }
+
     #[test]
     fn git_sha_is_semver_build_metadata() {
         assert!(is_build_metadata(GIT_SHA), "{GIT_SHA:?}");

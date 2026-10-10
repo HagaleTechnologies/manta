@@ -2465,8 +2465,6 @@ fn start_spot_server(
     ));
     let metrics = std::sync::Arc::new(manta_server::metrics::Metrics::new());
     metrics.set_build_info(daemon_build_info());
-<<<<<<< HEAD
-    let cty = std::sync::Arc::new(manta_spot::cty::Table::parse(manta_spot::CTY_DAT));
     // MAN-83: the commit rides as SemVer build metadata, so every spot names
     // the binary that produced it (`manta-<version>+<sha>`). Same-binary
     // byte-identity (SPEC §6 item 4) holds because this is a compile-time
@@ -2475,15 +2473,6 @@ fn start_spot_server(
     // the commit; see
     // docs/DECISIONS/2026-10-10-man83-build-identity-and-decoder-versioning.md.
     let decoder_version = build_info::DECODER_VERSION.to_string();
-=======
-    // MAN-128: stays SHA-free and feature-free on purpose -- this is the
-    // JSON spot wire contract (ARCHITECTURE §7) and a byte-identical-
-    // replay input (AGENTS.md's "file input -> byte-identical spot logs"
-    // hard requirement), neither of which may vary with the commit or
-    // build flags a given binary happens to carry. `manta_build_info`
-    // above is the right place for that information instead.
-    let decoder_version = format!("manta-{}", env!("CARGO_PKG_VERSION"));
->>>>>>> 0f9c2f8edb354d38141f0f6195685db85e2051b8
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
 

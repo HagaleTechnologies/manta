@@ -37,12 +37,18 @@ fn is_build_metadata(s: &str) -> bool {
 }
 
 /// The `MANTA_GIT_SHA` override, validated (MAN-83 D5). `None` when unset,
-/// empty, or not build metadata -- the last with a `cargo:warning`, and the
-/// caller then falls through to `git` exactly as if it were unset.
+/// empty, not UTF-8, or not build metadata -- the last two with a
+/// `cargo:warning`, and the caller then falls through to `git` exactly as if
+/// it were unset.
 fn sha_override() -> Option<String> {
-    let s = std::env::var("MANTA_GIT_SHA")
-        .ok()
-        .filter(|s| !s.is_empty())?;
+    let s = match std::env::var("MANTA_GIT_SHA") {
+        Ok(s) if !s.is_empty() => s,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            println!("cargo:warning=MANTA_GIT_SHA={raw:?} is not UTF-8; ignoring it");
+            return None;
+        }
+        _ => return None,
+    };
     if !is_build_metadata(&s) {
         println!(
             "cargo:warning=MANTA_GIT_SHA={s:?} is not SemVer build metadata \
@@ -92,10 +98,13 @@ fn main() {
 
     // MAN-83: compiled-in optional features, for `--version` and
     // `manta_build_info`. Cargo sets CARGO_FEATURE_<NAME> for each enabled
-    // feature and reruns this script when the set changes.
-    let mut features: Vec<String> = std::env::vars()
+    // feature and reruns this script when the set changes. `vars_os`, not
+    // `vars`: the latter panics on any non-UTF-8 name or value the build
+    // inherits, while the keys Cargo sets here are always UTF-8.
+    let mut features: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| {
-            k.strip_prefix("CARGO_FEATURE_")
+            k.to_str()?
+                .strip_prefix("CARGO_FEATURE_")
                 .map(|f| f.to_ascii_lowercase().replace('_', "-"))
         })
         .filter(|f| f != "default")
